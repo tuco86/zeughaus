@@ -1,0 +1,9 @@
+[package]
+name = "zeughaus-editor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zeughaus-core.workspace = true
+iced.workspace = true
+iced_nodegraph.workspace = true

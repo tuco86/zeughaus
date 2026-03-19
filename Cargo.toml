@@ -1,0 +1,18 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+zeughaus-core = { path = "crates/zeughaus-core" }
+zeughaus-runtime = { path = "crates/zeughaus-runtime" }
+zeughaus-transform = { path = "crates/zeughaus-transform" }
+
+iced = { version = "0.14", features = ["advanced", "wgpu", "tokio"] }
+iced_nodegraph = { path = "../iced_nodegraph/iced_nodegraph" }
+
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"

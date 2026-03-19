@@ -1,0 +1,7 @@
+[package]
+name = "zeughaus-transform"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zeughaus-core.workspace = true
