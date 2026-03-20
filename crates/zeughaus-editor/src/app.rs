@@ -4,8 +4,8 @@ use iced::keyboard;
 use iced::widget::{column, container, stack, text};
 use iced::{Color, Element, Event, Length, Point, Subscription, Task, Theme};
 use iced_nodegraph::{
-    NodeContentStyle, NodeGraph, NodeStatus, PinDirection as NgPinDirection, PinRef, PinSide,
-    node_pin, simple_node,
+    NodeConfig as NgNodeConfig, NodeContentStyle, NodeGraph, NodeStatus,
+    PinDirection as NgPinDirection, PinRef, PinSide, node_pin, simple_node,
 };
 use iced_palette::{get_filtered_command_index, is_toggle_shortcut};
 use zeughaus_core::{
@@ -333,11 +333,13 @@ impl App {
                 NodeStatus::Idle => base,
             });
 
+        let node_cfg = NgNodeConfig::new().corner_radius(8.0).opacity(0.88);
+
         for id in &self.node_order {
             if let Some(node) = self.nodes.get(id) {
                 let display_val = self.display_values.get(id).map(|s| s.as_str());
                 let content = build_node_element(node, display_val);
-                ng.push_node(node.id.0, node.position, content);
+                ng.push_node_styled(node.id.0, node.position, content, node_cfg.clone());
             }
         }
 
@@ -441,7 +443,8 @@ fn build_node_element<'a>(
     }
 
     let body: Element<'_, Message, Theme> = column(items).spacing(4).into();
-    simple_node(&node.display_name, style, body)
+    let node_el = simple_node(&node.display_name, style, body);
+    container(node_el).width(180.0).into()
 }
 
 fn pin_color(type_name: &str) -> Color {
