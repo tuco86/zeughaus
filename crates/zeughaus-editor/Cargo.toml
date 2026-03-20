@@ -5,5 +5,7 @@ edition.workspace = true
 
 [dependencies]
 zeughaus-core.workspace = true
+zeughaus-runtime.workspace = true
+zeughaus-transform.workspace = true
 iced.workspace = true
 iced_nodegraph.workspace = true

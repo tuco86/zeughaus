@@ -3,10 +3,9 @@ use iced_nodegraph::PinRef;
 
 pub type PinLabel = &'static str;
 
-/// Messages use raw u64 IDs (matching the NodeGraph widget's ID type).
-/// Conversion to/from zeughaus_core::NodeId happens in App::update().
 #[derive(Debug, Clone)]
 pub enum Message {
+    // Graph events (u64 IDs from iced_nodegraph)
     EdgeConnected {
         from: PinRef<u64, PinLabel>,
         to: PinRef<u64, PinLabel>,
@@ -25,4 +24,6 @@ pub enum Message {
         position: Point,
         zoom: f32,
     },
+    // Keyboard shortcuts for spawning (temporary, replaced by palette in P10)
+    KeyPressed(iced::keyboard::Key),
 }
