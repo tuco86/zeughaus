@@ -1,20 +1,22 @@
 use std::collections::{HashMap, HashSet};
 
 use iced::keyboard;
-use iced::widget::text;
-use iced::{Element, Event, Length, Point, Subscription, Task, Theme};
+use iced::widget::{column, container, stack, text};
+use iced::{Color, Element, Event, Length, Point, Subscription, Task, Theme};
 use iced_nodegraph::{
     NodeContentStyle, NodeGraph, NodeStatus, PinDirection as NgPinDirection, PinRef, PinSide,
     node_pin, simple_node,
 };
+use iced_palette::{get_filtered_command_index, is_toggle_shortcut};
 use zeughaus_core::{
     DomainPlugin, EdgeId, EdgeSemantic, NodeConfig, NodeDefinition, NodeId, PinDefinition,
     PinDirection, Value,
 };
-use zeughaus_runtime::{GraphEdge, GraphExecutor, GraphNode, Graph};
+use zeughaus_runtime::{Graph, GraphEdge, GraphExecutor, GraphNode};
 use zeughaus_transform::TransformPlugin;
 
 use crate::message::{Message, PinLabel};
+use crate::palette;
 
 pub struct EditorNode {
     pub id: NodeId,
@@ -48,6 +50,11 @@ pub struct App {
 
     // Display values (node_id -> display string)
     display_values: HashMap<NodeId, String>,
+
+    // Command palette state
+    palette_open: bool,
+    palette_input: String,
+    palette_selected: usize,
 }
 
 impl App {
@@ -67,24 +74,21 @@ impl App {
             plugins,
             catalog,
             display_values: HashMap::new(),
+            palette_open: false,
+            palette_input: String::new(),
+            palette_selected: 0,
         };
 
         (app, Task::none())
     }
 
     fn spawn_node(&mut self, type_id: &str, position: Point) {
-        // Find the plugin that can create this node
-        let exec = self
-            .plugins
-            .iter()
-            .find_map(|p| p.create_node(type_id));
-
+        let exec = self.plugins.iter().find_map(|p| p.create_node(type_id));
         let Some(exec) = exec else { return };
 
         let pin_defs = exec.pin_definitions().to_vec();
         let id = NodeId::next();
 
-        // Find display name from catalog
         let display_name = self
             .catalog
             .iter()
@@ -92,7 +96,6 @@ impl App {
             .map(|d| d.display_name.to_string())
             .unwrap_or_else(|| type_id.to_string());
 
-        // Add to runtime graph
         self.executor.graph.add_node(GraphNode {
             id,
             type_id: type_id.to_string(),
@@ -102,7 +105,6 @@ impl App {
         });
         self.executor.register_node(id, exec);
 
-        // Add to editor state
         self.nodes.insert(
             id,
             EditorNode {
@@ -114,15 +116,17 @@ impl App {
             },
         );
         self.node_order.push(id);
-
-        // Execute to get initial values
         self.execute_graph();
     }
 
-    fn connect_edge(&mut self, from_node: NodeId, from_pin: PinLabel, to_node: NodeId, to_pin: PinLabel) {
+    fn connect_edge(
+        &mut self,
+        from_node: NodeId,
+        from_pin: PinLabel,
+        to_node: NodeId,
+        to_pin: PinLabel,
+    ) {
         let edge_id = EdgeId::next();
-
-        // Add to runtime graph
         self.executor.graph.add_edge(GraphEdge {
             id: edge_id,
             from_node,
@@ -131,8 +135,6 @@ impl App {
             to_pin,
             semantic: EdgeSemantic::default(),
         });
-
-        // Add to editor state
         self.edges.push(EditorEdge {
             id: edge_id,
             from_node,
@@ -140,14 +142,17 @@ impl App {
             to_node,
             to_pin,
         });
-
-        // Mark downstream dirty and execute
         self.executor.mark_dirty_downstream(from_node);
         self.execute_graph();
     }
 
-    fn disconnect_edge(&mut self, from_node: NodeId, from_pin: PinLabel, to_node: NodeId, to_pin: PinLabel) {
-        // Find and remove the edge
+    fn disconnect_edge(
+        &mut self,
+        from_node: NodeId,
+        from_pin: PinLabel,
+        to_node: NodeId,
+        to_pin: PinLabel,
+    ) {
         if let Some(pos) = self.edges.iter().position(|e| {
             e.from_node == from_node
                 && e.from_pin == from_pin
@@ -156,7 +161,6 @@ impl App {
         }) {
             let edge = self.edges.remove(pos);
             self.executor.graph.remove_edge(edge.id);
-            // Mark downstream dirty and re-execute
             self.executor.mark_dirty_downstream(to_node);
             self.execute_graph();
         }
@@ -172,43 +176,79 @@ impl App {
 
     fn update_display_values(&mut self) {
         self.display_values.clear();
-
         for (&node_id, node) in &self.nodes {
             if node.type_id == "transform.display" {
-                // Read the value from incoming edges
                 for edge in &self.edges {
                     if edge.to_node == node_id
                         && let Some(val) = self.executor.edge_value(edge.id)
                     {
-                        let text = format_value(val);
-                        self.display_values.insert(node_id, text);
+                        self.display_values.insert(node_id, format_value(val));
                     }
                 }
             } else if node.type_id == "transform.const_f64" {
-                // Show current const value from outgoing edges
                 for edge in &self.edges {
                     if edge.from_node == node_id
                         && let Some(val) = self.executor.edge_value(edge.id)
                     {
-                        let text = format_value(val);
-                        self.display_values.insert(node_id, text);
+                        self.display_values.insert(node_id, format_value(val));
                     }
                 }
             }
         }
     }
 
+    fn viewport_center(&self) -> Point {
+        let screen_center = Point::new(640.0, 400.0);
+        Point::new(
+            screen_center.x / self.camera_zoom - self.camera_position.x,
+            screen_center.y / self.camera_zoom - self.camera_position.y,
+        )
+    }
+
+    fn palette_confirm(&mut self) -> Option<Message> {
+        let commands = palette::build_commands(&self.catalog);
+        let original_idx = get_filtered_command_index(
+            &self.palette_input,
+            &commands,
+            self.palette_selected,
+        )?;
+
+        let cmd = commands.get(original_idx)?;
+        if let iced_palette::CommandAction::Message(msg) = &cmd.action {
+            let msg = msg.clone();
+            self.palette_close();
+            Some(msg)
+        } else {
+            None
+        }
+    }
+
+    fn palette_close(&mut self) {
+        self.palette_open = false;
+        self.palette_input.clear();
+        self.palette_selected = 0;
+    }
+
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::EdgeConnected { from, to } => {
-                self.connect_edge(NodeId(from.node_id), from.pin_id, NodeId(to.node_id), to.pin_id);
+                self.connect_edge(
+                    NodeId(from.node_id),
+                    from.pin_id,
+                    NodeId(to.node_id),
+                    to.pin_id,
+                );
             }
             Message::EdgeDisconnected { from, to } => {
-                self.disconnect_edge(NodeId(from.node_id), from.pin_id, NodeId(to.node_id), to.pin_id);
+                self.disconnect_edge(
+                    NodeId(from.node_id),
+                    from.pin_id,
+                    NodeId(to.node_id),
+                    to.pin_id,
+                );
             }
             Message::NodeMoved { node_id, position } => {
-                let id = NodeId(node_id);
-                if let Some(node) = self.nodes.get_mut(&id) {
+                if let Some(node) = self.nodes.get_mut(&NodeId(node_id)) {
                     node.position = position;
                 }
             }
@@ -220,8 +260,6 @@ impl App {
                     let id = NodeId(*raw_id);
                     self.nodes.remove(&id);
                     self.node_order.retain(|n| *n != id);
-
-                    // Remove edges connected to this node
                     let edge_ids: Vec<EdgeId> = self
                         .edges
                         .iter()
@@ -232,8 +270,6 @@ impl App {
                         self.executor.graph.remove_edge(*eid);
                     }
                     self.edges.retain(|e| e.from_node != id && e.to_node != id);
-
-                    // Remove from runtime
                     self.executor.graph.remove_node(id);
                 }
             }
@@ -241,44 +277,42 @@ impl App {
                 self.camera_position = position;
                 self.camera_zoom = zoom;
             }
-            Message::KeyPressed(key) => {
-                // Temporary keyboard shortcuts for spawning nodes
-                let center = self.viewport_center();
-                match key {
-                    keyboard::Key::Character(ref c) if c.as_str() == "1" => {
-                        self.spawn_node("transform.const_f64", center);
-                    }
-                    keyboard::Key::Character(ref c) if c.as_str() == "2" => {
-                        self.spawn_node("transform.add", center);
-                    }
-                    keyboard::Key::Character(ref c) if c.as_str() == "3" => {
-                        self.spawn_node("transform.multiply", center);
-                    }
-                    keyboard::Key::Character(ref c) if c.as_str() == "4" => {
-                        self.spawn_node("transform.to_string", center);
-                    }
-                    keyboard::Key::Character(ref c) if c.as_str() == "5" => {
-                        self.spawn_node("transform.display", center);
-                    }
-                    keyboard::Key::Character(ref c) if c.as_str() == "e" => {
-                        // Execute all
-                        self.executor.execute_all().ok();
-                        self.update_display_values();
-                    }
-                    _ => {}
+            // Palette
+            Message::TogglePalette => {
+                self.palette_open = !self.palette_open;
+                if self.palette_open {
+                    self.palette_input.clear();
+                    self.palette_selected = 0;
+                    return iced_palette::focus_input();
                 }
+            }
+            Message::PaletteInput(input) => {
+                self.palette_input = input;
+                self.palette_selected = 0;
+            }
+            Message::PaletteSelect(idx) => {
+                self.palette_selected = idx;
+                if let Some(msg) = self.palette_confirm() {
+                    return self.update(msg);
+                }
+            }
+            Message::PaletteConfirm => {
+                if let Some(msg) = self.palette_confirm() {
+                    return self.update(msg);
+                }
+            }
+            Message::PaletteCancel => {
+                self.palette_close();
+            }
+            Message::PaletteNavigate(idx) => {
+                self.palette_selected = idx;
+            }
+            Message::SpawnNode { type_id } => {
+                let pos = self.viewport_center();
+                self.spawn_node(&type_id, pos);
             }
         }
         Task::none()
-    }
-
-    fn viewport_center(&self) -> Point {
-        // Approximate center of viewport in world coordinates
-        let screen_center = Point::new(640.0, 400.0);
-        Point::new(
-            screen_center.x / self.camera_zoom - self.camera_position.x,
-            screen_center.y / self.camera_zoom - self.camera_position.y,
-        )
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -294,7 +328,7 @@ impl App {
             .initial_camera(self.camera_position, self.camera_zoom)
             .node_style(|_theme, status, base| match status {
                 NodeStatus::Selected => base
-                    .border_color(iced::Color::from_rgb(0.3, 0.6, 1.0))
+                    .border_color(Color::from_rgb(0.3, 0.6, 1.0))
                     .border_width(2.5),
                 NodeStatus::Idle => base,
             });
@@ -314,10 +348,25 @@ impl App {
             );
         }
 
-        iced::widget::container(ng)
+        let graph_view: Element<'_, Message> = container(ng)
             .width(Length::Fill)
             .height(Length::Fill)
-            .into()
+            .into();
+
+        if self.palette_open {
+            let commands = palette::build_commands(&self.catalog);
+            let palette_view = palette::view(&self.palette_input, &commands, self.palette_selected);
+
+            // Empty spacer to keep palette not full screen
+            let overlay = container(palette_view)
+                .width(Length::Fill)
+                .padding(80.0)
+                .align_x(iced::Alignment::Center);
+
+            stack![graph_view, overlay].into()
+        } else {
+            graph_view
+        }
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -326,9 +375,18 @@ impl App {
                 key, modifiers, ..
             }) = event
             {
-                // Only handle when no modifiers (avoid capturing Ctrl+C etc.)
-                if modifiers.is_empty() {
-                    return Some(Message::KeyPressed(key));
+                if is_toggle_shortcut(&key, modifiers) {
+                    return Some(Message::TogglePalette);
+                }
+
+                match key {
+                    keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                        return Some(Message::PaletteCancel);
+                    }
+                    keyboard::Key::Named(keyboard::key::Named::Enter) => {
+                        return Some(Message::PaletteConfirm);
+                    }
+                    _ => {}
                 }
             }
             None
@@ -351,7 +409,7 @@ fn build_node_element<'a>(
         _ => NodeContentStyle::process(&theme),
     };
 
-    let mut pins: Vec<Element<'_, Message, Theme>> = Vec::new();
+    let mut items: Vec<Element<'_, Message, Theme>> = Vec::new();
 
     for pin_def in &node.pin_defs {
         let side = match pin_def.direction {
@@ -363,21 +421,37 @@ fn build_node_element<'a>(
             PinDirection::Output => NgPinDirection::Output,
         };
 
+        let color = pin_color(pin_def.type_name);
+
         let pin: Element<'_, Message, Theme> =
             node_pin(side, pin_def.name, text(pin_def.name).size(12))
                 .direction(direction)
+                .color(color)
                 .into();
-        pins.push(pin);
+        items.push(pin);
     }
 
-    // Show display value in node body if available
     if let Some(val) = display_value {
-        pins.push(text(val).size(14).into());
+        items.push(
+            text(val)
+                .size(14)
+                .color(Color::from_rgb(0.9, 0.9, 0.5))
+                .into(),
+        );
     }
 
-    let body: Element<'_, Message, Theme> = iced::widget::column(pins).spacing(4).into();
-
+    let body: Element<'_, Message, Theme> = column(items).spacing(4).into();
     simple_node(&node.display_name, style, body)
+}
+
+fn pin_color(type_name: &str) -> Color {
+    match type_name {
+        "f64" => Color::from_rgb(0.3, 0.8, 0.4),
+        "String" => Color::from_rgb(0.9, 0.7, 0.2),
+        "bool" => Color::from_rgb(0.3, 0.5, 0.9),
+        "any" => Color::from_rgb(0.7, 0.7, 0.7),
+        _ => Color::from_rgb(0.6, 0.6, 0.6),
+    }
 }
 
 fn format_value(val: &Value) -> String {

@@ -9,3 +9,4 @@ zeughaus-runtime.workspace = true
 zeughaus-transform.workspace = true
 iced.workspace = true
 iced_nodegraph.workspace = true
+iced_palette.workspace = true

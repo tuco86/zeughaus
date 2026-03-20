@@ -24,6 +24,13 @@ pub enum Message {
         position: Point,
         zoom: f32,
     },
-    // Keyboard shortcuts for spawning (temporary, replaced by palette in P10)
-    KeyPressed(iced::keyboard::Key),
+    // Command palette
+    TogglePalette,
+    PaletteInput(String),
+    PaletteSelect(usize),
+    PaletteConfirm,
+    PaletteCancel,
+    PaletteNavigate(usize),
+    // Spawning
+    SpawnNode { type_id: String },
 }

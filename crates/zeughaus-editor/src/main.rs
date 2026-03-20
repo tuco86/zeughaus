@@ -1,5 +1,6 @@
 mod app;
 mod message;
+mod palette;
 
 use app::App;
 

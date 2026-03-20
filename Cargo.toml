@@ -13,6 +13,7 @@ zeughaus-transform = { path = "crates/zeughaus-transform" }
 
 iced = { version = "0.14", features = ["advanced", "wgpu", "tokio"] }
 iced_nodegraph = { path = "../iced_nodegraph/iced_nodegraph" }
+iced_palette = { git = "https://github.com/tuco86/iced_palette.git", branch = "main" }
 
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
