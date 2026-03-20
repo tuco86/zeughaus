@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use iced::keyboard;
-use iced::widget::{column, container, stack, text};
+use iced::widget::{column, container, row, stack, text, text_input};
 use iced::{Color, Element, Event, Length, Point, Subscription, Task, Theme};
 use iced_nodegraph::{
     NodeConfig as NgNodeConfig, NodeContentStyle, NodeGraph, NodeStatus,
@@ -51,6 +51,9 @@ pub struct App {
     // Display values (node_id -> display string)
     display_values: HashMap<NodeId, String>,
 
+    // Const node text inputs (node_id -> current text)
+    const_inputs: HashMap<NodeId, String>,
+
     // Command palette state
     palette_open: bool,
     palette_input: String,
@@ -74,6 +77,7 @@ impl App {
             plugins,
             catalog,
             display_values: HashMap::new(),
+            const_inputs: HashMap::new(),
             palette_open: false,
             palette_input: String::new(),
             palette_selected: 0,
@@ -116,6 +120,11 @@ impl App {
             },
         );
         self.node_order.push(id);
+
+        if type_id == "transform.const_f64" {
+            self.const_inputs.insert(id, "0".to_string());
+        }
+
         self.execute_graph();
     }
 
@@ -176,21 +185,26 @@ impl App {
 
     fn update_display_values(&mut self) {
         self.display_values.clear();
-        for (&node_id, node) in &self.nodes {
-            if node.type_id == "transform.display" {
+        for &node_id in self.nodes.keys() {
+            // Show values from outgoing edges (what this node produced)
+            for edge in &self.edges {
+                if edge.from_node == node_id
+                    && let Some(val) = self.executor.edge_value(edge.id)
+                {
+                    self.display_values
+                        .entry(node_id)
+                        .or_insert_with(|| format_value(val));
+                }
+            }
+            // For sink nodes (no outgoing edges), show incoming values
+            if !self.display_values.contains_key(&node_id) {
                 for edge in &self.edges {
                     if edge.to_node == node_id
                         && let Some(val) = self.executor.edge_value(edge.id)
                     {
-                        self.display_values.insert(node_id, format_value(val));
-                    }
-                }
-            } else if node.type_id == "transform.const_f64" {
-                for edge in &self.edges {
-                    if edge.from_node == node_id
-                        && let Some(val) = self.executor.edge_value(edge.id)
-                    {
-                        self.display_values.insert(node_id, format_value(val));
+                        self.display_values
+                            .entry(node_id)
+                            .or_insert_with(|| format_value(val));
                     }
                 }
             }
@@ -271,6 +285,7 @@ impl App {
                     }
                     self.edges.retain(|e| e.from_node != id && e.to_node != id);
                     self.executor.graph.remove_node(id);
+                    self.const_inputs.remove(&id);
                 }
             }
             Message::CameraChanged { position, zoom } => {
@@ -311,6 +326,14 @@ impl App {
                 let pos = self.viewport_center();
                 self.spawn_node(&type_id, pos);
             }
+            Message::ConstValueChanged { node_id, value } => {
+                let id = NodeId(node_id);
+                self.const_inputs.insert(id, value.clone());
+                if let Ok(f) = value.parse::<f64>() {
+                    let _ = self.executor.set_parameter(id, "value", Value::new(f));
+                    self.execute_graph();
+                }
+            }
         }
         Task::none()
     }
@@ -338,7 +361,8 @@ impl App {
         for id in &self.node_order {
             if let Some(node) = self.nodes.get(id) {
                 let display_val = self.display_values.get(id).map(|s| s.as_str());
-                let content = build_node_element(node, display_val);
+                let const_input = self.const_inputs.get(id).map(|s| s.as_str());
+                let content = build_node_element(node, display_val, const_input);
                 ng.push_node_styled(node.id.0, node.position, content, node_cfg.clone());
             }
         }
@@ -403,6 +427,7 @@ impl App {
 fn build_node_element<'a>(
     node: &EditorNode,
     display_value: Option<&'a str>,
+    const_input: Option<&'a str>,
 ) -> Element<'a, Message, Theme> {
     let theme = Theme::Dark;
     let style = match node.type_id.as_str() {
@@ -413,32 +438,57 @@ fn build_node_element<'a>(
 
     let mut items: Vec<Element<'_, Message, Theme>> = Vec::new();
 
-    for pin_def in &node.pin_defs {
-        let side = match pin_def.direction {
-            PinDirection::Input => PinSide::Left,
-            PinDirection::Output => PinSide::Right,
-        };
-        let direction = match pin_def.direction {
-            PinDirection::Input => NgPinDirection::Input,
-            PinDirection::Output => NgPinDirection::Output,
-        };
-
-        let color = pin_color(pin_def.type_name);
+    // For const nodes: render a text_input + output pin in a row
+    if node.type_id == "transform.const_f64" {
+        let input_text = const_input.unwrap_or("0");
+        let node_raw_id = node.id.0;
+        let input_field = text_input("0", input_text)
+            .on_input(move |v| Message::ConstValueChanged {
+                node_id: node_raw_id,
+                value: v,
+            })
+            .size(13)
+            .width(Length::Fill);
 
         let pin: Element<'_, Message, Theme> =
-            node_pin(side, pin_def.name, text(pin_def.name).size(12))
-                .direction(direction)
-                .color(color)
+            node_pin(PinSide::Right, "value", input_field)
+                .direction(NgPinDirection::Output)
+                .color(pin_color("f64"))
                 .into();
         items.push(pin);
+    } else {
+        for pin_def in &node.pin_defs {
+            let side = match pin_def.direction {
+                PinDirection::Input => PinSide::Left,
+                PinDirection::Output => PinSide::Right,
+            };
+            let direction = match pin_def.direction {
+                PinDirection::Input => NgPinDirection::Input,
+                PinDirection::Output => NgPinDirection::Output,
+            };
+
+            let color = pin_color(pin_def.type_name);
+
+            let pin: Element<'_, Message, Theme> =
+                node_pin(side, pin_def.name, text(pin_def.name).size(12))
+                    .direction(direction)
+                    .color(color)
+                    .into();
+            items.push(pin);
+        }
     }
 
-    if let Some(val) = display_value {
+    // Show output/result value for all nodes (except const, which shows its input)
+    if node.type_id != "transform.const_f64"
+        && let Some(val) = display_value
+    {
         items.push(
-            text(val)
-                .size(14)
-                .color(Color::from_rgb(0.9, 0.9, 0.5))
-                .into(),
+            row![
+                text("= ").size(12).color(Color::from_rgb(0.6, 0.6, 0.6)),
+                text(val).size(13).color(Color::from_rgb(0.9, 0.9, 0.5))
+            ]
+            .spacing(2)
+            .into(),
         );
     }
 

@@ -33,4 +33,6 @@ pub enum Message {
     PaletteNavigate(usize),
     // Spawning
     SpawnNode { type_id: String },
+    // Node parameter editing
+    ConstValueChanged { node_id: u64, value: String },
 }
