@@ -41,6 +41,11 @@ impl DomainPlugin for TransformPlugin {
             catalog_entry("transform.greater_than", "Greater Than", "Logic", &GreaterThanNode::new()),
             catalog_entry("transform.equal", "Equal", "Logic", &EqualNode::new()),
             catalog_entry("transform.select", "Select", "Logic", &SelectNode::new()),
+            catalog_entry("transform.not", "Not", "Logic", &NotNode::new()),
+            catalog_entry("transform.and", "And", "Logic", &AndNode::new()),
+            catalog_entry("transform.or", "Or", "Logic", &OrNode::new()),
+            // Utility
+            catalog_entry("transform.map_range", "Map Range", "Utility", &MapRangeNode::new()),
             // Convert
             catalog_entry("transform.to_string", "To String", "Convert", &ToStringNode::new()),
             // Output
@@ -75,6 +80,10 @@ impl DomainPlugin for TransformPlugin {
             "transform.greater_than" => Some(Box::new(GreaterThanNode::new())),
             "transform.equal" => Some(Box::new(EqualNode::new())),
             "transform.select" => Some(Box::new(SelectNode::new())),
+            "transform.not" => Some(Box::new(NotNode::new())),
+            "transform.and" => Some(Box::new(AndNode::new())),
+            "transform.or" => Some(Box::new(OrNode::new())),
+            "transform.map_range" => Some(Box::new(MapRangeNode::new())),
             "transform.to_string" => Some(Box::new(ToStringNode::new())),
             "transform.display" => Some(Box::new(DisplayNode::new())),
             _ => None,
@@ -104,7 +113,7 @@ mod tests {
     fn catalog_has_all_nodes() {
         let plugin = TransformPlugin;
         let catalog = plugin.node_catalog();
-        assert_eq!(catalog.len(), 27);
+        assert_eq!(catalog.len(), 31);
     }
 
     #[test]
