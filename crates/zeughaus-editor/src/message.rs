@@ -1,4 +1,4 @@
-use iced::Point;
+use iced::{Point, Vector};
 use iced_nodegraph::PinRef;
 
 pub type PinLabel = &'static str;
@@ -18,7 +18,12 @@ pub enum Message {
         node_id: u64,
         position: Point,
     },
+    GroupMoved {
+        node_ids: Vec<u64>,
+        delta: Vector,
+    },
     SelectionChanged(Vec<u64>),
+    CloneNodes(Vec<u64>),
     DeleteNodes(Vec<u64>),
     CameraChanged {
         position: Point,

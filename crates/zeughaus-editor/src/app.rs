@@ -54,6 +54,9 @@ pub struct App {
     // Const node text inputs (node_id -> current text)
     const_inputs: HashMap<NodeId, String>,
 
+    // Spawn offset counter (staggers new nodes so they don't overlap)
+    spawn_counter: u32,
+
     // Command palette state
     palette_open: bool,
     palette_input: String,
@@ -78,6 +81,7 @@ impl App {
             catalog,
             display_values: HashMap::new(),
             const_inputs: HashMap::new(),
+            spawn_counter: 0,
             palette_open: false,
             palette_input: String::new(),
             palette_selected: 0,
@@ -89,6 +93,11 @@ impl App {
     fn spawn_node(&mut self, type_id: &str, position: Point) {
         let exec = self.plugins.iter().find_map(|p| p.create_node(type_id));
         let Some(exec) = exec else { return };
+
+        // Stagger each new node so they don't pile up
+        let offset = (self.spawn_counter % 10) as f32 * 30.0;
+        self.spawn_counter += 1;
+        let position = Point::new(position.x + offset, position.y + offset);
 
         let pin_defs = exec.pin_definitions().to_vec();
         let id = NodeId::next();
@@ -266,8 +275,32 @@ impl App {
                     node.position = position;
                 }
             }
+            Message::GroupMoved { node_ids, delta } => {
+                for raw_id in &node_ids {
+                    let id = NodeId(*raw_id);
+                    if let Some(node) = self.nodes.get_mut(&id) {
+                        node.position = Point::new(
+                            node.position.x + delta.x,
+                            node.position.y + delta.y,
+                        );
+                    }
+                }
+            }
             Message::SelectionChanged(sel) => {
                 self.selected = sel.into_iter().map(NodeId).collect();
+            }
+            Message::CloneNodes(ids) => {
+                let positions: Vec<_> = ids
+                    .iter()
+                    .filter_map(|raw_id| {
+                        let node = self.nodes.get(&NodeId(*raw_id))?;
+                        Some((node.type_id.clone(), node.position))
+                    })
+                    .collect();
+                for (type_id, pos) in positions {
+                    let offset_pos = Point::new(pos.x + 30.0, pos.y + 30.0);
+                    self.spawn_node(&type_id, offset_pos);
+                }
             }
             Message::DeleteNodes(ids) => {
                 for raw_id in &ids {
@@ -346,7 +379,9 @@ impl App {
             .on_disconnect(|from, to| Message::EdgeDisconnected { from, to })
             .on_move(|node_id, position| Message::NodeMoved { node_id, position })
             .on_select(Message::SelectionChanged)
+            .on_clone(Message::CloneNodes)
             .on_delete(Message::DeleteNodes)
+            .on_group_move(|node_ids, delta| Message::GroupMoved { node_ids, delta })
             .on_camera_change(|position, zoom| Message::CameraChanged { position, zoom })
             .initial_camera(self.camera_position, self.camera_zoom)
             .node_style(|_theme, status, base| match status {
