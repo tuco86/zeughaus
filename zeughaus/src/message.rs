@@ -40,4 +40,8 @@ pub enum Message {
     SpawnNode { type_id: String },
     // Node parameter editing
     ConstValueChanged { node_id: u64, value: String },
+    // File operations
+    SaveGraph,
+    LoadGraph,
+    GraphLoaded(zeughaus_core::GraphDocument),
 }

@@ -1,4 +1,5 @@
 pub mod context;
+pub mod document;
 pub mod edge;
 pub mod error;
 pub mod event;
@@ -16,4 +17,5 @@ pub use id::{EdgeId, NodeId, PinId};
 pub use node::{NodeConfig, NodeDefinition};
 pub use pin::{DataMode, PinDefinition, PinDirection, PinKind};
 pub use plugin::{DomainPlugin, ExecutableNode};
+pub use document::{EdgeData, GraphDocument, NodeData};
 pub use value::Value;

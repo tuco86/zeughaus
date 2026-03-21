@@ -9,8 +9,8 @@ use iced_nodegraph::{
 };
 use iced_palette::{get_filtered_command_index, is_toggle_shortcut};
 use zeughaus_core::{
-    DomainPlugin, EdgeId, EdgeSemantic, NodeConfig, NodeDefinition, NodeId, PinDefinition,
-    PinDirection, Value,
+    DomainPlugin, EdgeData, EdgeId, EdgeSemantic, GraphDocument, NodeConfig, NodeData,
+    NodeDefinition, NodeId, PinDefinition, PinDirection, Value,
 };
 use zeughaus_runtime::{Graph, GraphEdge, GraphExecutor, GraphNode};
 use zeughaus_transform::TransformPlugin;
@@ -223,6 +223,133 @@ impl App {
         }
     }
 
+    fn to_document(&self) -> GraphDocument {
+        let nodes = self
+            .node_order
+            .iter()
+            .filter_map(|id| {
+                let node = self.nodes.get(id)?;
+                let params = self
+                    .const_inputs
+                    .get(id)
+                    .map(|v| vec![("value".to_string(), v.clone())])
+                    .unwrap_or_default();
+                Some(NodeData {
+                    id: node.id.0,
+                    type_id: node.type_id.clone(),
+                    display_name: node.display_name.clone(),
+                    x: node.position.x,
+                    y: node.position.y,
+                    params,
+                })
+            })
+            .collect();
+
+        let edges = self
+            .edges
+            .iter()
+            .map(|e| EdgeData {
+                id: e.id.0,
+                from_node: e.from_node.0,
+                from_pin: e.from_pin.to_string(),
+                to_node: e.to_node.0,
+                to_pin: e.to_pin.to_string(),
+            })
+            .collect();
+
+        GraphDocument { nodes, edges }
+    }
+
+    fn load_document(&mut self, doc: GraphDocument) {
+        // Clear current state
+        self.nodes.clear();
+        self.node_order.clear();
+        self.edges.clear();
+        self.const_inputs.clear();
+        self.display_values.clear();
+        self.executor = GraphExecutor::new(Graph::new());
+
+        // Rebuild from document
+        for node_data in &doc.nodes {
+            let type_id = &node_data.type_id;
+            let exec = self.plugins.iter().find_map(|p| p.create_node(type_id));
+            let Some(mut exec) = exec else { continue };
+
+            let id = NodeId(node_data.id);
+            let pin_defs = exec.pin_definitions().to_vec();
+            let position = Point::new(node_data.x, node_data.y);
+
+            // Apply saved parameters
+            for (name, value_str) in &node_data.params {
+                match type_id.as_str() {
+                    "transform.const_f64" => {
+                        if let Ok(f) = value_str.parse::<f64>() {
+                            let _ = exec.set_parameter(name, Value::new(f));
+                        }
+                    }
+                    "transform.const_bool" => {
+                        let b = value_str == "true" || value_str == "1";
+                        let _ = exec.set_parameter(name, Value::new(b));
+                    }
+                    "transform.const_string" => {
+                        let _ = exec.set_parameter(name, Value::new(value_str.clone()));
+                    }
+                    _ => {}
+                }
+                self.const_inputs.insert(id, value_str.clone());
+            }
+
+            self.executor.graph.add_node(GraphNode {
+                id,
+                type_id: type_id.clone(),
+                config: NodeConfig::default(),
+                pin_defs: pin_defs.clone(),
+                position: (position.x, position.y),
+            });
+            self.executor.register_node(id, exec);
+
+            self.nodes.insert(
+                id,
+                EditorNode {
+                    id,
+                    type_id: type_id.clone(),
+                    display_name: node_data.display_name.clone(),
+                    position,
+                    pin_defs,
+                },
+            );
+            self.node_order.push(id);
+        }
+
+        // Rebuild edges
+        for edge_data in &doc.edges {
+            let edge_id = EdgeId(edge_data.id);
+            let from_pin: &'static str = leak_string(&edge_data.from_pin);
+            let to_pin: &'static str = leak_string(&edge_data.to_pin);
+
+            self.executor.graph.add_edge(GraphEdge {
+                id: edge_id,
+                from_node: NodeId(edge_data.from_node),
+                from_pin,
+                to_node: NodeId(edge_data.to_node),
+                to_pin,
+                semantic: EdgeSemantic::default(),
+            });
+
+            self.edges.push(EditorEdge {
+                id: edge_id,
+                from_node: NodeId(edge_data.from_node),
+                from_pin,
+                to_node: NodeId(edge_data.to_node),
+                to_pin,
+            });
+        }
+
+        // Execute full graph
+        let _ = self.executor.execute_all();
+        self.update_display_values();
+    }
+
     fn viewport_center(&self) -> Point {
         let screen_center = Point::new(640.0, 400.0);
         Point::new(
@@ -385,6 +512,53 @@ impl App {
                     _ => {}
                 }
             }
+            Message::SaveGraph => {
+                let doc = self.to_document();
+                return Task::perform(
+                    async move {
+                        let file = rfd::AsyncFileDialog::new()
+                            .set_title("Save Graph")
+                            .add_filter("Zeughaus Graph", &["zgh"])
+                            .add_filter("JSON", &["json"])
+                            .save_file()
+                            .await;
+                        if let Some(handle) = file {
+                            let json = serde_json::to_string_pretty(&doc).unwrap_or_default();
+                            let _ = handle.write(json.as_bytes()).await;
+                        }
+                    },
+                    |()| Message::PaletteCancel, // no-op after save
+                );
+            }
+            Message::LoadGraph => {
+                return Task::perform(
+                    async {
+                        let file = rfd::AsyncFileDialog::new()
+                            .set_title("Load Graph")
+                            .add_filter("Zeughaus Graph", &["zgh"])
+                            .add_filter("JSON", &["json"])
+                            .pick_file()
+                            .await;
+                        if let Some(handle) = file {
+                            let bytes = handle.read().await;
+                            if let Ok(doc) = serde_json::from_slice::<GraphDocument>(&bytes) {
+                                return Some(doc);
+                            }
+                        }
+                        None
+                    },
+                    |doc| {
+                        if let Some(d) = doc {
+                            Message::GraphLoaded(d)
+                        } else {
+                            Message::PaletteCancel // no-op on cancel
+                        }
+                    },
+                );
+            }
+            Message::GraphLoaded(doc) => {
+                self.load_document(doc);
+            }
         }
         Task::none()
     }
@@ -488,6 +662,17 @@ impl App {
             {
                 if is_toggle_shortcut(&key, modifiers) {
                     return Some(Message::TogglePalette);
+                }
+
+                // Ctrl+S = Save, Ctrl+O = Load
+                if (modifiers.control() || modifiers.command())
+                    && let keyboard::Key::Character(ref c) = key
+                {
+                    match c.as_str() {
+                        "s" => return Some(Message::SaveGraph),
+                        "o" => return Some(Message::LoadGraph),
+                        _ => {}
+                    }
                 }
 
                 match key {
@@ -611,5 +796,35 @@ fn format_value(val: &Value) -> String {
         format!("{b}")
     } else {
         format!("<{}>", val.type_name())
+    }
+}
+
+/// Leaks a string to get a &'static str. Used for pin labels loaded from JSON.
+/// Acceptable for graph loading since pin labels are a small, bounded set.
+fn leak_string(s: &str) -> &'static str {
+    // Check common pin names first to avoid leaking
+    match s {
+        "value" => "value",
+        "result" => "result",
+        "input" => "input",
+        "a" => "a",
+        "b" => "b",
+        "t" => "t",
+        "condition" => "condition",
+        "true_val" => "true_val",
+        "false_val" => "false_val",
+        "min" => "min",
+        "max" => "max",
+        "base" => "base",
+        "exp" => "exp",
+        "in_min" => "in_min",
+        "in_max" => "in_max",
+        "out_min" => "out_min",
+        "out_max" => "out_max",
+        "sep" => "sep",
+        "text" => "text",
+        "length" => "length",
+        "epsilon" => "epsilon",
+        other => Box::leak(other.to_string().into_boxed_str()),
     }
 }
