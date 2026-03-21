@@ -8,12 +8,23 @@ through a unified node graph interface with pluggable domain subgraphs.
 
 **Design Document**: See `DESIGN.md` for the full architecture specification.
 
-**Status**: Project setup phase. No code written yet.
+**Status**: MVP functional. Editor opens, nodes can be created via command palette (Ctrl+Space),
+connected, and data flows live through the graph.
+
+## Workspace Structure
+
+```
+zeughaus/              # binary (zeughaus.exe) - iced UI + iced_nodegraph
+zeughaus-core/         # types, traits (Value, ExecutableNode, DomainPlugin)
+zeughaus-runtime/      # graph execution engine (topo sort, dirty propagation, edge cache)
+zeughaus-transform/    # first domain plugin (17 math/logic/convert nodes)
+```
 
 ## Related Projects
 
 - `C:/workspace/iced_nodegraph` - The node graph widget library this project builds on
-- `C:/workspace/tamagotchi` - Contains DLL injection and memory analysis code to be extracted as plugins later
+- `C:/workspace/tamagotchi` - DLL injection and memory analysis code (future plugin source)
+- `C:/workspace/arma3-afsc-rs` - Screen capture + TensorFlow inference pipeline (reference for video/AI nodes)
 
 ## Development Workflow
 
@@ -89,6 +100,5 @@ regex patterns, or when the LSP server is unavailable.
 - IPC: gRPC (tonic)
 - Serialization: serde
 
-### WASM Compatibility
-Maintain `wasm32-unknown-unknown` compilation for the editor/UI crate.
-Execution-related crates (runners, DLL inject, GPU) are native-only.
+### WASM
+Deferred until SpacetimeDB WASM support lands. No wasm32 target for now.
