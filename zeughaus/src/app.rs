@@ -4,7 +4,7 @@ use iced::keyboard;
 use iced::widget::{column, container, row, stack, text, text_input};
 use iced::{Color, Element, Event, Length, Point, Subscription, Task, Theme};
 use iced_nodegraph::{
-    NodeConfig as NgNodeConfig, NodeContentStyle, NodeGraph, NodeStatus,
+    EdgeConfig as NgEdgeConfig, NodeConfig as NgNodeConfig, NodeContentStyle, NodeGraph, NodeStatus,
     PinDirection as NgPinDirection, PinRef, PinSide, node_pin, simple_node,
 };
 use iced_palette::{get_filtered_command_index, is_toggle_shortcut};
@@ -389,6 +389,29 @@ impl App {
                     .border_color(Color::from_rgb(0.3, 0.6, 1.0))
                     .border_width(2.5),
                 NodeStatus::Idle => base,
+            })
+            .can_connect({
+                let nodes = &self.nodes;
+                move |from, to| {
+                    let from_node = nodes.get(&NodeId(from.node_id));
+                    let to_node = nodes.get(&NodeId(to.node_id));
+                    match (from_node, to_node) {
+                        (Some(f), Some(t)) => {
+                            let from_type = f.pin_defs.iter()
+                                .find(|p| p.name == from.pin_id)
+                                .map(|p| p.type_name);
+                            let to_type = t.pin_defs.iter()
+                                .find(|p| p.name == to.pin_id)
+                                .map(|p| p.type_name);
+                            match (from_type, to_type) {
+                                (Some("any"), _) | (_, Some("any")) => true,
+                                (Some(a), Some(b)) => a == b,
+                                _ => true,
+                            }
+                        }
+                        _ => true,
+                    }
+                }
             });
 
         let node_cfg = NgNodeConfig::new().corner_radius(8.0).opacity(0.88);
@@ -403,9 +426,18 @@ impl App {
         }
 
         for edge in &self.edges {
-            ng.push_edge(
+            // Color edge based on source pin type
+            let edge_color = self
+                .nodes
+                .get(&edge.from_node)
+                .and_then(|n| n.pin_defs.iter().find(|p| p.name == edge.from_pin))
+                .map(|p| pin_color(p.type_name))
+                .unwrap_or(Color::from_rgb(0.6, 0.6, 0.6));
+
+            ng.push_edge_styled(
                 PinRef::new(edge.from_node.0, edge.from_pin),
                 PinRef::new(edge.to_node.0, edge.to_pin),
+                NgEdgeConfig::new().solid_color(edge_color),
             );
         }
 
