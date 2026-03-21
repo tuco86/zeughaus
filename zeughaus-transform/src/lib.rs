@@ -13,8 +13,11 @@ impl DomainPlugin for TransformPlugin {
 
     fn node_catalog(&self) -> Vec<NodeDefinition> {
         vec![
+            // Constants
+            catalog_entry("transform.const_f64", "Const (f64)", "Const", &ConstF64Node::new(0.0)),
+            catalog_entry("transform.const_bool", "Const (bool)", "Const", &ConstBoolNode::new(false)),
+            catalog_entry("transform.const_string", "Const (String)", "Const", &ConstStringNode::new("")),
             // Math
-            catalog_entry("transform.const_f64", "Const (f64)", "Math", &ConstF64Node::new(0.0)),
             catalog_entry("transform.add", "Add", "Math", &AddNode::new()),
             catalog_entry("transform.subtract", "Subtract", "Math", &SubtractNode::new()),
             catalog_entry("transform.multiply", "Multiply", "Math", &MultiplyNode::new()),
@@ -46,8 +49,10 @@ impl DomainPlugin for TransformPlugin {
             catalog_entry("transform.or", "Or", "Logic", &OrNode::new()),
             // Utility
             catalog_entry("transform.map_range", "Map Range", "Utility", &MapRangeNode::new()),
-            // Convert
-            catalog_entry("transform.to_string", "To String", "Convert", &ToStringNode::new()),
+            // String
+            catalog_entry("transform.to_string", "To String", "String", &ToStringNode::new()),
+            catalog_entry("transform.concat", "Concat", "String", &ConcatNode::new()),
+            catalog_entry("transform.string_len", "String Length", "String", &StringLenNode::new()),
             // Output
             catalog_entry("transform.display", "Display", "Output", &DisplayNode::new()),
         ]
@@ -56,6 +61,8 @@ impl DomainPlugin for TransformPlugin {
     fn create_node(&self, type_id: &str) -> Option<Box<dyn ExecutableNode>> {
         match type_id {
             "transform.const_f64" => Some(Box::new(ConstF64Node::new(0.0))),
+            "transform.const_bool" => Some(Box::new(ConstBoolNode::new(false))),
+            "transform.const_string" => Some(Box::new(ConstStringNode::new(""))),
             "transform.add" => Some(Box::new(AddNode::new())),
             "transform.subtract" => Some(Box::new(SubtractNode::new())),
             "transform.multiply" => Some(Box::new(MultiplyNode::new())),
@@ -85,6 +92,8 @@ impl DomainPlugin for TransformPlugin {
             "transform.or" => Some(Box::new(OrNode::new())),
             "transform.map_range" => Some(Box::new(MapRangeNode::new())),
             "transform.to_string" => Some(Box::new(ToStringNode::new())),
+            "transform.concat" => Some(Box::new(ConcatNode::new())),
+            "transform.string_len" => Some(Box::new(StringLenNode::new())),
             "transform.display" => Some(Box::new(DisplayNode::new())),
             _ => None,
         }
@@ -113,7 +122,7 @@ mod tests {
     fn catalog_has_all_nodes() {
         let plugin = TransformPlugin;
         let catalog = plugin.node_catalog();
-        assert_eq!(catalog.len(), 31);
+        assert_eq!(catalog.len(), 35);
     }
 
     #[test]

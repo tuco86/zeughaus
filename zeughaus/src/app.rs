@@ -130,8 +130,11 @@ impl App {
         );
         self.node_order.push(id);
 
-        if type_id == "transform.const_f64" {
-            self.const_inputs.insert(id, "0".to_string());
+        match type_id {
+            "transform.const_f64" => { self.const_inputs.insert(id, "0".to_string()); }
+            "transform.const_bool" => { self.const_inputs.insert(id, "false".to_string()); }
+            "transform.const_string" => { self.const_inputs.insert(id, String::new()); }
+            _ => {}
         }
 
         self.execute_graph();
@@ -362,9 +365,24 @@ impl App {
             Message::ConstValueChanged { node_id, value } => {
                 let id = NodeId(node_id);
                 self.const_inputs.insert(id, value.clone());
-                if let Ok(f) = value.parse::<f64>() {
-                    let _ = self.executor.set_parameter(id, "value", Value::new(f));
-                    self.execute_graph();
+                let node_type = self.nodes.get(&id).map(|n| n.type_id.as_str());
+                match node_type {
+                    Some("transform.const_f64") => {
+                        if let Ok(f) = value.parse::<f64>() {
+                            let _ = self.executor.set_parameter(id, "value", Value::new(f));
+                            self.execute_graph();
+                        }
+                    }
+                    Some("transform.const_bool") => {
+                        let b = value == "true" || value == "1";
+                        let _ = self.executor.set_parameter(id, "value", Value::new(b));
+                        self.execute_graph();
+                    }
+                    Some("transform.const_string") => {
+                        let _ = self.executor.set_parameter(id, "value", Value::new(value));
+                        self.execute_graph();
+                    }
+                    _ => {}
                 }
             }
         }
@@ -497,19 +515,29 @@ fn build_node_element<'a>(
     const_input: Option<&'a str>,
 ) -> Element<'a, Message, Theme> {
     let theme = Theme::Dark;
+    let is_const = node.type_id.starts_with("transform.const_");
+
     let style = match node.type_id.as_str() {
-        "transform.const_f64" => NodeContentStyle::input(&theme),
+        t if t.starts_with("transform.const_") => NodeContentStyle::input(&theme),
         "transform.display" => NodeContentStyle::output(&theme),
         _ => NodeContentStyle::process(&theme),
     };
 
     let mut items: Vec<Element<'_, Message, Theme>> = Vec::new();
 
-    // For const nodes: render a text_input + output pin in a row
-    if node.type_id == "transform.const_f64" {
-        let input_text = const_input.unwrap_or("0");
+    if is_const {
+        // Const nodes get an inline text input with output pin
+        let input_text = const_input.unwrap_or("");
         let node_raw_id = node.id.0;
-        let input_field = text_input("0", input_text)
+        let placeholder = match node.type_id.as_str() {
+            "transform.const_f64" => "0",
+            "transform.const_bool" => "false",
+            "transform.const_string" => "text",
+            _ => "",
+        };
+        let pin_type = node.pin_defs.first().map(|p| p.type_name).unwrap_or("any");
+
+        let input_field = text_input(placeholder, input_text)
             .on_input(move |v| Message::ConstValueChanged {
                 node_id: node_raw_id,
                 value: v,
@@ -520,7 +548,7 @@ fn build_node_element<'a>(
         let pin: Element<'_, Message, Theme> =
             node_pin(PinSide::Right, "value", input_field)
                 .direction(NgPinDirection::Output)
-                .color(pin_color("f64"))
+                .color(pin_color(pin_type))
                 .into();
         items.push(pin);
     } else {
@@ -545,8 +573,8 @@ fn build_node_element<'a>(
         }
     }
 
-    // Show output/result value for all nodes (except const, which shows its input)
-    if node.type_id != "transform.const_f64"
+    // Show output/result value for non-const nodes
+    if !is_const
         && let Some(val) = display_value
     {
         items.push(
