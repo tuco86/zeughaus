@@ -26,6 +26,17 @@ impl DomainPlugin for TransformPlugin {
             catalog_entry("transform.power", "Power", "Math", &PowerNode::new()),
             catalog_entry("transform.min", "Min", "Math", &MinNode::new()),
             catalog_entry("transform.max", "Max", "Math", &MaxNode::new()),
+            catalog_entry("transform.lerp", "Lerp", "Math", &LerpNode::new()),
+            // Trig
+            catalog_entry("transform.sin", "Sin", "Trig", &SinNode::new()),
+            catalog_entry("transform.cos", "Cos", "Trig", &CosNode::new()),
+            catalog_entry("transform.tan", "Tan", "Trig", &TanNode::new()),
+            catalog_entry("transform.sqrt", "Sqrt", "Trig", &SqrtNode::new()),
+            catalog_entry("transform.floor", "Floor", "Trig", &FloorNode::new()),
+            catalog_entry("transform.ceil", "Ceil", "Trig", &CeilNode::new()),
+            catalog_entry("transform.round", "Round", "Trig", &RoundNode::new()),
+            catalog_entry("transform.log2", "Log2", "Trig", &Log2Node::new()),
+            catalog_entry("transform.ln", "Ln", "Trig", &LnNode::new()),
             // Logic
             catalog_entry("transform.greater_than", "Greater Than", "Logic", &GreaterThanNode::new()),
             catalog_entry("transform.equal", "Equal", "Logic", &EqualNode::new()),
@@ -51,6 +62,16 @@ impl DomainPlugin for TransformPlugin {
             "transform.power" => Some(Box::new(PowerNode::new())),
             "transform.min" => Some(Box::new(MinNode::new())),
             "transform.max" => Some(Box::new(MaxNode::new())),
+            "transform.lerp" => Some(Box::new(LerpNode::new())),
+            "transform.sin" => Some(Box::new(SinNode::new())),
+            "transform.cos" => Some(Box::new(CosNode::new())),
+            "transform.tan" => Some(Box::new(TanNode::new())),
+            "transform.sqrt" => Some(Box::new(SqrtNode::new())),
+            "transform.floor" => Some(Box::new(FloorNode::new())),
+            "transform.ceil" => Some(Box::new(CeilNode::new())),
+            "transform.round" => Some(Box::new(RoundNode::new())),
+            "transform.log2" => Some(Box::new(Log2Node::new())),
+            "transform.ln" => Some(Box::new(LnNode::new())),
             "transform.greater_than" => Some(Box::new(GreaterThanNode::new())),
             "transform.equal" => Some(Box::new(EqualNode::new())),
             "transform.select" => Some(Box::new(SelectNode::new())),
@@ -83,7 +104,7 @@ mod tests {
     fn catalog_has_all_nodes() {
         let plugin = TransformPlugin;
         let catalog = plugin.node_catalog();
-        assert_eq!(catalog.len(), 17);
+        assert_eq!(catalog.len(), 27);
     }
 
     #[test]

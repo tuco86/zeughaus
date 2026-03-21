@@ -1,4 +1,6 @@
 pub mod abs_node;
+pub mod lerp;
+pub mod trig;
 pub mod add;
 pub mod clamp_node;
 pub mod compare;
@@ -15,6 +17,8 @@ pub mod subtract;
 pub mod to_string;
 
 pub use abs_node::AbsNode;
+pub use lerp::LerpNode;
+pub use trig::{CeilNode, CosNode, FloorNode, LnNode, Log2Node, RoundNode, SinNode, SqrtNode, TanNode};
 pub use add::AddNode;
 pub use clamp_node::ClampNode;
 pub use compare::{EqualNode, GreaterThanNode};
