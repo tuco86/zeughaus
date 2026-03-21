@@ -22,6 +22,10 @@ impl DomainPlugin for TransformPlugin {
             catalog_entry("transform.negate", "Negate", "Math", &NegateNode::new()),
             catalog_entry("transform.abs", "Abs", "Math", &AbsNode::new()),
             catalog_entry("transform.clamp", "Clamp", "Math", &ClampNode::new()),
+            catalog_entry("transform.modulo", "Modulo", "Math", &ModuloNode::new()),
+            catalog_entry("transform.power", "Power", "Math", &PowerNode::new()),
+            catalog_entry("transform.min", "Min", "Math", &MinNode::new()),
+            catalog_entry("transform.max", "Max", "Math", &MaxNode::new()),
             // Logic
             catalog_entry("transform.greater_than", "Greater Than", "Logic", &GreaterThanNode::new()),
             catalog_entry("transform.equal", "Equal", "Logic", &EqualNode::new()),
@@ -43,6 +47,10 @@ impl DomainPlugin for TransformPlugin {
             "transform.negate" => Some(Box::new(NegateNode::new())),
             "transform.abs" => Some(Box::new(AbsNode::new())),
             "transform.clamp" => Some(Box::new(ClampNode::new())),
+            "transform.modulo" => Some(Box::new(ModuloNode::new())),
+            "transform.power" => Some(Box::new(PowerNode::new())),
+            "transform.min" => Some(Box::new(MinNode::new())),
+            "transform.max" => Some(Box::new(MaxNode::new())),
             "transform.greater_than" => Some(Box::new(GreaterThanNode::new())),
             "transform.equal" => Some(Box::new(EqualNode::new())),
             "transform.select" => Some(Box::new(SelectNode::new())),
@@ -75,7 +83,7 @@ mod tests {
     fn catalog_has_all_nodes() {
         let plugin = TransformPlugin;
         let catalog = plugin.node_catalog();
-        assert_eq!(catalog.len(), 13);
+        assert_eq!(catalog.len(), 17);
     }
 
     #[test]
