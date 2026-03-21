@@ -49,6 +49,8 @@ impl DomainPlugin for TransformPlugin {
             catalog_entry("transform.or", "Or", "Logic", &OrNode::new()),
             // Utility
             catalog_entry("transform.map_range", "Map Range", "Utility", &MapRangeNode::new()),
+            catalog_entry("transform.accumulator", "Accumulator", "Utility", &AccumulatorNode::new()),
+            catalog_entry("transform.threshold", "Threshold", "Utility", &ThresholdNode::new()),
             // String
             catalog_entry("transform.to_string", "To String", "String", &ToStringNode::new()),
             catalog_entry("transform.concat", "Concat", "String", &ConcatNode::new()),
@@ -91,6 +93,8 @@ impl DomainPlugin for TransformPlugin {
             "transform.and" => Some(Box::new(AndNode::new())),
             "transform.or" => Some(Box::new(OrNode::new())),
             "transform.map_range" => Some(Box::new(MapRangeNode::new())),
+            "transform.accumulator" => Some(Box::new(AccumulatorNode::new())),
+            "transform.threshold" => Some(Box::new(ThresholdNode::new())),
             "transform.to_string" => Some(Box::new(ToStringNode::new())),
             "transform.concat" => Some(Box::new(ConcatNode::new())),
             "transform.string_len" => Some(Box::new(StringLenNode::new())),
@@ -122,7 +126,7 @@ mod tests {
     fn catalog_has_all_nodes() {
         let plugin = TransformPlugin;
         let catalog = plugin.node_catalog();
-        assert_eq!(catalog.len(), 35);
+        assert_eq!(catalog.len(), 37);
     }
 
     #[test]
