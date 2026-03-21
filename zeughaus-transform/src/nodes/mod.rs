@@ -1,11 +1,25 @@
+pub mod abs_node;
 pub mod add;
+pub mod clamp_node;
+pub mod compare;
 pub mod const_node;
 pub mod display;
+pub mod divide;
 pub mod multiply;
+pub mod negate;
+pub mod select_node;
+pub mod subtract;
 pub mod to_string;
 
+pub use abs_node::AbsNode;
 pub use add::AddNode;
+pub use clamp_node::ClampNode;
+pub use compare::{EqualNode, GreaterThanNode};
 pub use const_node::ConstF64Node;
 pub use display::DisplayNode;
+pub use divide::DivideNode;
 pub use multiply::MultiplyNode;
+pub use negate::NegateNode;
+pub use select_node::SelectNode;
+pub use subtract::SubtractNode;
 pub use to_string::ToStringNode;
