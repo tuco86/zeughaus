@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/*"]
+members = [
+    "zeughaus",
+    "zeughaus-core",
+    "zeughaus-runtime",
+    "zeughaus-transform",
+]
 resolver = "2"
 
 [workspace.package]
@@ -7,9 +12,9 @@ edition = "2024"
 version = "0.1.0"
 
 [workspace.dependencies]
-zeughaus-core = { path = "crates/zeughaus-core" }
-zeughaus-runtime = { path = "crates/zeughaus-runtime" }
-zeughaus-transform = { path = "crates/zeughaus-transform" }
+zeughaus-core = { path = "zeughaus-core" }
+zeughaus-runtime = { path = "zeughaus-runtime" }
+zeughaus-transform = { path = "zeughaus-transform" }
 
 iced = { version = "0.14", features = ["advanced", "wgpu", "tokio"] }
 iced_nodegraph = { path = "../iced_nodegraph/iced_nodegraph" }
