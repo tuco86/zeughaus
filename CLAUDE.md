@@ -17,7 +17,9 @@ connected, and data flows live through the graph.
 zeughaus/              # binary (zeughaus.exe) - iced UI + iced_nodegraph
 zeughaus-core/         # types, traits (Value, ExecutableNode, DomainPlugin)
 zeughaus-runtime/      # graph execution engine (topo sort, dirty propagation, edge cache)
-zeughaus-transform/    # first domain plugin (17 math/logic/convert nodes)
+zeughaus-transform/    # transform plugin (37 math/logic/string/trig nodes)
+zeughaus-process/      # process plugin (Find Process, DLL Inject, Read Memory, Find Module)
+zeughaus-capture/      # capture plugin (Screen Capture via scrap/DXGI)
 ```
 
 ## Related Projects
