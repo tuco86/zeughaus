@@ -4,6 +4,7 @@ members = [
     "zeughaus-core",
     "zeughaus-runtime",
     "zeughaus-transform",
+    "zeughaus-process",
 ]
 resolver = "2"
 
@@ -15,6 +16,7 @@ version = "0.1.0"
 zeughaus-core = { path = "zeughaus-core" }
 zeughaus-runtime = { path = "zeughaus-runtime" }
 zeughaus-transform = { path = "zeughaus-transform" }
+zeughaus-process = { path = "zeughaus-process" }
 
 iced = { version = "0.14", features = ["advanced", "wgpu", "tokio"] }
 iced_nodegraph = { path = "../iced_nodegraph/iced_nodegraph" }

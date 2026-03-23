@@ -13,6 +13,7 @@ use zeughaus_core::{
     NodeDefinition, NodeId, PinDefinition, PinDirection, Value,
 };
 use zeughaus_runtime::{Graph, GraphEdge, GraphExecutor, GraphNode};
+use zeughaus_process::ProcessPlugin;
 use zeughaus_transform::TransformPlugin;
 
 use crate::message::{Message, PinLabel};
@@ -65,7 +66,10 @@ pub struct App {
 
 impl App {
     pub fn new() -> (Self, Task<Message>) {
-        let plugins: Vec<Box<dyn DomainPlugin>> = vec![Box::new(TransformPlugin)];
+        let plugins: Vec<Box<dyn DomainPlugin>> = vec![
+            Box::new(TransformPlugin),
+            Box::new(ProcessPlugin),
+        ];
         let catalog: Vec<NodeDefinition> = plugins.iter().flat_map(|p| p.node_catalog()).collect();
         let executor = GraphExecutor::new(Graph::new());
 

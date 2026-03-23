@@ -7,6 +7,7 @@ edition.workspace = true
 zeughaus-core.workspace = true
 zeughaus-runtime.workspace = true
 zeughaus-transform.workspace = true
+zeughaus-process.workspace = true
 iced.workspace = true
 iced_nodegraph.workspace = true
 iced_palette.workspace = true
