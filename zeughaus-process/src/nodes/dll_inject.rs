@@ -6,8 +6,13 @@ use zeughaus_core::*;
 /// Input: pid (f64), dll_path (String)
 /// Output: success (bool), error (String)
 ///
-/// Uses CreateRemoteThread + LoadLibraryW injection from tamagotchi-injector.
+/// Guard: Only injects once per unique (pid, dll_path) combination.
+/// Changing either input resets and allows a new injection.
 pub struct DllInjectNode {
+    last_pid: u32,
+    last_path: String,
+    last_success: bool,
+    last_error: String,
     pins: Vec<PinDefinition>,
 }
 
@@ -20,6 +25,10 @@ impl Default for DllInjectNode {
 impl DllInjectNode {
     pub fn new() -> Self {
         Self {
+            last_pid: 0,
+            last_path: String::new(),
+            last_success: false,
+            last_error: String::new(),
             pins: vec![
                 PinDefinition {
                     name: "pid",
@@ -67,19 +76,32 @@ impl ExecutableNode for DllInjectNode {
         }
 
         let pid = pid_f64 as u32;
-        let path = PathBuf::from(&dll_path);
 
+        // Only inject if inputs changed since last execution
+        if pid == self.last_pid && dll_path == self.last_path {
+            ctx.emit_typed("success", self.last_success);
+            ctx.emit_typed("error", self.last_error.clone());
+            ctx.flush();
+            return Ok(());
+        }
+
+        self.last_pid = pid;
+        self.last_path = dll_path.clone();
+
+        let path = PathBuf::from(&dll_path);
         match tamagotchi_injector::inject::dll_inject(&path, pid) {
             Ok(()) => {
-                ctx.emit_typed("success", true);
-                ctx.emit_typed("error", String::new());
+                self.last_success = true;
+                self.last_error = String::new();
             }
             Err(e) => {
-                ctx.emit_typed("success", false);
-                ctx.emit_typed("error", e.to_string());
+                self.last_success = false;
+                self.last_error = e.to_string();
             }
         }
 
+        ctx.emit_typed("success", self.last_success);
+        ctx.emit_typed("error", self.last_error.clone());
         ctx.flush();
         Ok(())
     }
