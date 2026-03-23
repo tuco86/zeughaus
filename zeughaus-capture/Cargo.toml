@@ -1,0 +1,8 @@
+[package]
+name = "zeughaus-capture"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zeughaus-core.workspace = true
+scrap = "0.5"

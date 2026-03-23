@@ -13,6 +13,7 @@ use zeughaus_core::{
     NodeDefinition, NodeId, PinDefinition, PinDirection, Value,
 };
 use zeughaus_runtime::{Graph, GraphEdge, GraphExecutor, GraphNode};
+use zeughaus_capture::CapturePlugin;
 use zeughaus_process::ProcessPlugin;
 use zeughaus_transform::TransformPlugin;
 
@@ -69,6 +70,7 @@ impl App {
         let plugins: Vec<Box<dyn DomainPlugin>> = vec![
             Box::new(TransformPlugin),
             Box::new(ProcessPlugin),
+            Box::new(CapturePlugin),
         ];
         let catalog: Vec<NodeDefinition> = plugins.iter().flat_map(|p| p.node_catalog()).collect();
         let executor = GraphExecutor::new(Graph::new());
