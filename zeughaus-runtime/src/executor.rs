@@ -129,10 +129,6 @@ impl GraphExecutor {
         self.cache.get(edge_id)
     }
 
-    pub fn node_mut(&mut self, id: NodeId) -> Option<&mut Box<dyn ExecutableNode>> {
-        self.nodes.get_mut(&id)
-    }
-
     pub fn set_parameter(&mut self, id: NodeId, name: &str, value: Value) -> Result<()> {
         if let Some(node) = self.nodes.get_mut(&id) {
             node.set_parameter(name, value)?;

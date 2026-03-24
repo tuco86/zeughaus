@@ -1,8 +1,11 @@
+/// How an edge delivers data. Only `LastValue` is currently implemented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EdgeSemantic {
     #[default]
     LastValue,
+    /// Reserved: ring buffer, drops oldest on overflow (see DESIGN.md)
     BoundedQueue(usize),
+    /// Reserved: unbounded backpressure queue (see DESIGN.md)
     Queue,
 }
 

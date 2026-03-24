@@ -1,5 +1,7 @@
 use crate::pin::PinDefinition;
 
+/// Per-node configuration. `capture` is reserved for opt-in result
+/// persistence to database (see DESIGN.md). Not yet implemented.
 #[derive(Debug, Clone, Default)]
 pub struct NodeConfig {
     pub capture: bool,

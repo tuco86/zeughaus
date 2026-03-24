@@ -38,7 +38,7 @@ their incoming edge caches must be readable. Verify with a test.
 Look at every file. Remove unused imports, dead code, unnecessary abstractions.
 Run `cargo clippy -- -D warnings`. Check if any node types are redundant or
 could be combined. Apply "nothing left to remove" principle.
-- [ ] DO THIS TASK
+- [x] DONE - Removed unused Event/EventMeta module, removed dead node_mut API, removed unused macro param. Added doc comments to reserved-but-unimplemented design-doc types (DataMode::Stream, EdgeSemantic::Queue, PinKind, NodeConfig::capture).
 
 ### 05 - Stable topological sort
 Topo sort must be deterministic. Add NodeId-based tiebreaking to Kahn's algorithm.

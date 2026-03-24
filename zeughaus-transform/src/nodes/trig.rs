@@ -1,7 +1,7 @@
 use zeughaus_core::*;
 
 macro_rules! unary_f64_node {
-    ($name:ident, $op:expr, $op_name:expr) => {
+    ($name:ident, $op:expr) => {
         pub struct $name {
             pins: Vec<PinDefinition>,
         }
@@ -51,15 +51,15 @@ macro_rules! unary_f64_node {
     };
 }
 
-unary_f64_node!(SinNode, f64::sin, "sin");
-unary_f64_node!(CosNode, f64::cos, "cos");
-unary_f64_node!(TanNode, f64::tan, "tan");
-unary_f64_node!(SqrtNode, f64::sqrt, "sqrt");
-unary_f64_node!(FloorNode, f64::floor, "floor");
-unary_f64_node!(CeilNode, f64::ceil, "ceil");
-unary_f64_node!(RoundNode, f64::round, "round");
-unary_f64_node!(Log2Node, f64::log2, "log2");
-unary_f64_node!(LnNode, f64::ln, "ln");
+unary_f64_node!(SinNode, f64::sin);
+unary_f64_node!(CosNode, f64::cos);
+unary_f64_node!(TanNode, f64::tan);
+unary_f64_node!(SqrtNode, f64::sqrt);
+unary_f64_node!(FloorNode, f64::floor);
+unary_f64_node!(CeilNode, f64::ceil);
+unary_f64_node!(RoundNode, f64::round);
+unary_f64_node!(Log2Node, f64::log2);
+unary_f64_node!(LnNode, f64::ln);
 
 #[cfg(test)]
 mod tests {
