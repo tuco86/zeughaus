@@ -187,8 +187,7 @@ impl App {
                 && e.to_pin == to_pin
         }) {
             let edge = self.edges.remove(pos);
-            self.executor.graph.remove_edge(edge.id);
-            self.executor.mark_dirty_downstream(to_node);
+            self.executor.disconnect_edge(edge.id);
             self.execute_graph();
         }
     }
@@ -443,17 +442,8 @@ impl App {
                     let id = NodeId(*raw_id);
                     self.nodes.remove(&id);
                     self.node_order.retain(|n| *n != id);
-                    let edge_ids: Vec<EdgeId> = self
-                        .edges
-                        .iter()
-                        .filter(|e| e.from_node == id || e.to_node == id)
-                        .map(|e| e.id)
-                        .collect();
-                    for eid in &edge_ids {
-                        self.executor.graph.remove_edge(*eid);
-                    }
                     self.edges.retain(|e| e.from_node != id && e.to_node != id);
-                    self.executor.graph.remove_node(id);
+                    self.executor.remove_node(id);
                     self.const_inputs.remove(&id);
                 }
             }

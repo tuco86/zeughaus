@@ -27,7 +27,7 @@ Write tests in `zeughaus-runtime/tests/integration.rs` that cover:
 When an edge is removed, the downstream node still sees the old cached value.
 The executor must clear the edge cache entry on disconnect and re-execute
 downstream with missing inputs defaulting to their pin defaults.
-- [ ] DO THIS TASK
+- [x] DONE - Added disconnect_edge() and remove_node() to GraphExecutor that clear cache. Updated editor and tests to use them.
 
 ### 03 - Fix execution for sink nodes
 Nodes with no outgoing edges (Display, Accumulator) must still execute and

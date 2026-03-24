@@ -321,9 +321,8 @@ fn workflow_disconnect_and_reexecute() {
 
     assert_eq!(exec.edge_value(out).unwrap().downcast_ref::<f64>(), Some(&7.0));
 
-    // Disconnect c2 from add's "b" pin
-    exec.graph.remove_edge(edge_b);
-    exec.mark_dirty_downstream(add);
+    // Disconnect c2 from add's "b" pin (properly clears cache)
+    exec.disconnect_edge(edge_b);
     exec.execute_dirty().unwrap();
 
     // Add should now compute a=3 + b=0(default) = 3
@@ -353,7 +352,7 @@ fn workflow_reconnect_with_new_value() {
     assert_eq!(exec.edge_value(out).unwrap().downcast_ref::<f64>(), Some(&30.0));
 
     // Disconnect c2, connect c3 instead
-    exec.graph.remove_edge(edge_b);
+    exec.disconnect_edge(edge_b);
     use zeughaus_core::{EdgeId, EdgeSemantic};
     use zeughaus_runtime::GraphEdge;
     let new_edge = EdgeId::next();
@@ -387,8 +386,8 @@ fn workflow_delete_node_mid_chain() {
     exec.set_parameter(c1, "value", Value::new(5.0f64)).unwrap();
     exec.execute_all().unwrap();
 
-    // Delete negate node (middle of chain)
-    exec.graph.remove_node(neg);
+    // Delete negate node (middle of chain) -- properly cleans up edges + cache
+    exec.remove_node(neg);
 
     // Executing should not panic -- negate is gone, display has no input
     exec.mark_dirty(disp);

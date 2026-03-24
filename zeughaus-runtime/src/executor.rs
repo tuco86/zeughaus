@@ -94,6 +94,37 @@ impl GraphExecutor {
         }
     }
 
+    /// Remove an edge and clear its cached value.
+    /// Marks the downstream node dirty so it re-executes without the stale input.
+    pub fn disconnect_edge(&mut self, edge_id: EdgeId) {
+        if let Some(edge) = self.graph.edge(edge_id) {
+            let to_node = edge.to_node;
+            self.cache.remove(edge_id);
+            self.graph.remove_edge(edge_id);
+            self.mark_dirty_downstream(to_node);
+        }
+    }
+
+    /// Remove a node, all its edges, and clean up all associated cache entries.
+    pub fn remove_node(&mut self, id: NodeId) {
+        // Collect edge IDs to remove (incoming + outgoing)
+        let edge_ids: Vec<EdgeId> = self
+            .graph
+            .incoming_edges(id)
+            .iter()
+            .chain(self.graph.outgoing_edges(id).iter())
+            .copied()
+            .collect();
+
+        for eid in edge_ids {
+            self.cache.remove(eid);
+        }
+
+        self.graph.remove_node(id);
+        self.nodes.remove(&id);
+        self.dirty.remove(&id);
+    }
+
     pub fn edge_value(&self, edge_id: EdgeId) -> Option<&Value> {
         self.cache.get(edge_id)
     }
@@ -234,5 +265,60 @@ mod tests {
         exec.mark_dirty_downstream(a);
         exec.execute_dirty().unwrap();
         // Should not panic -- b is also re-executed because it's downstream
+    }
+
+    #[test]
+    fn disconnect_edge_clears_cache() {
+        let mut graph = Graph::new();
+        let a = NodeId::next();
+        let b = NodeId::next();
+        graph.add_node(make_node(a));
+        graph.add_node(make_node(b));
+        let edge = make_edge(a, "value", b, "in");
+        let edge_id = edge.id;
+        graph.add_edge(edge);
+
+        let mut exec = GraphExecutor::new(graph);
+        exec.register_node(a, Box::new(ConstNode(5.0)));
+        exec.register_node(b, Box::new(DoubleNode));
+        exec.execute_all().unwrap();
+
+        // Edge cache should have the value
+        assert!(exec.edge_value(edge_id).is_some());
+
+        // Disconnect the edge properly
+        exec.disconnect_edge(edge_id);
+
+        // Cache entry must be gone
+        assert!(exec.edge_value(edge_id).is_none());
+
+        // Re-execute: b should get default input (0.0) -> output 0.0
+        exec.execute_dirty().unwrap();
+    }
+
+    #[test]
+    fn remove_node_cleans_up_cache() {
+        let mut graph = Graph::new();
+        let a = NodeId::next();
+        let b = NodeId::next();
+        graph.add_node(make_node(a));
+        graph.add_node(make_node(b));
+        let edge = make_edge(a, "value", b, "in");
+        let edge_id = edge.id;
+        graph.add_edge(edge);
+
+        let mut exec = GraphExecutor::new(graph);
+        exec.register_node(a, Box::new(ConstNode(5.0)));
+        exec.register_node(b, Box::new(DoubleNode));
+        exec.execute_all().unwrap();
+
+        assert!(exec.edge_value(edge_id).is_some());
+
+        exec.remove_node(a);
+
+        // Cache for the removed edge must be gone
+        assert!(exec.edge_value(edge_id).is_none());
+        // Graph should only have node b
+        assert_eq!(exec.graph.node_count(), 1);
     }
 }
