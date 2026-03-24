@@ -43,7 +43,7 @@ could be combined. Apply "nothing left to remove" principle.
 ### 05 - Stable topological sort
 Topo sort must be deterministic. Add NodeId-based tiebreaking to Kahn's algorithm.
 Add test: two independent nodes, verify order is always sorted by ID.
-- [ ] DO THIS TASK
+- [x] DONE - Replaced VecDeque with BinaryHeap<Reverse<NodeId>> for deterministic tiebreaking. Added tests: independent nodes always sorted by ID, diamond tiebreak consistent over 20 runs.
 
 ### 06 - Display trait for Value
 Implement `fmt::Display` for Value. f64 formats as number, String as-is, bool

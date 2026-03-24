@@ -1,11 +1,13 @@
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 
 use zeughaus_core::{NodeId, Result, ZeughausError};
 
 use crate::graph::Graph;
 
-/// Topological sort via Kahn's algorithm.
-/// Returns nodes in execution order (sources first).
+/// Topological sort via Kahn's algorithm with NodeId tiebreaking.
+/// When multiple nodes have in-degree 0, the smallest NodeId is processed first.
+/// This guarantees deterministic execution order across runs.
 pub fn topological_sort(graph: &Graph) -> Result<Vec<NodeId>> {
     let mut in_degree: HashMap<NodeId, usize> = HashMap::new();
 
@@ -18,20 +20,16 @@ pub fn topological_sort(graph: &Graph) -> Result<Vec<NodeId>> {
         }
     }
 
-    let mut queue: VecDeque<NodeId> = in_degree
+    // Min-heap by NodeId for deterministic ordering
+    let mut heap: BinaryHeap<Reverse<NodeId>> = in_degree
         .iter()
         .filter(|(_, deg)| **deg == 0)
-        .map(|(id, _)| *id)
+        .map(|(id, _)| Reverse(*id))
         .collect();
-
-    // Sort the initial queue for deterministic output
-    let mut sorted_queue: Vec<NodeId> = queue.drain(..).collect();
-    sorted_queue.sort();
-    queue.extend(sorted_queue);
 
     let mut result = Vec::new();
 
-    while let Some(node) = queue.pop_front() {
+    while let Some(Reverse(node)) = heap.pop() {
         result.push(node);
         for &edge_id in graph.outgoing_edges(node) {
             if let Some(edge) = graph.edge(edge_id)
@@ -39,7 +37,7 @@ pub fn topological_sort(graph: &Graph) -> Result<Vec<NodeId>> {
             {
                 *deg -= 1;
                 if *deg == 0 {
-                    queue.push_back(edge.to_node);
+                    heap.push(Reverse(edge.to_node));
                 }
             }
         }
@@ -147,5 +145,61 @@ mod tests {
             topological_sort(&g),
             Err(ZeughausError::CycleDetected)
         ));
+    }
+
+    /// Two independent nodes (no edges) must always be sorted by NodeId.
+    /// Run multiple times to verify determinism.
+    #[test]
+    fn independent_nodes_sorted_by_id() {
+        for _ in 0..20 {
+            let mut g = Graph::new();
+            // Create nodes in arbitrary order -- result must always be sorted by ID
+            let b = NodeId::next();
+            let a = NodeId::next();
+            let c = NodeId::next();
+            g.add_node(make_node(c));
+            g.add_node(make_node(a));
+            g.add_node(make_node(b));
+
+            let order = topological_sort(&g).unwrap();
+            assert_eq!(order.len(), 3);
+            // Must be sorted by NodeId (which wraps u64, smallest first)
+            assert!(order[0] < order[1]);
+            assert!(order[1] < order[2]);
+        }
+    }
+
+    /// In a diamond, when b and c both become ready after a, the one
+    /// with the smaller NodeId must come first.
+    #[test]
+    fn diamond_tiebreak_deterministic() {
+        for _ in 0..20 {
+            let mut g = Graph::new();
+            let a = NodeId::next();
+            let b = NodeId::next();
+            let c = NodeId::next();
+            let d = NodeId::next();
+            g.add_node(make_node(a));
+            g.add_node(make_node(b));
+            g.add_node(make_node(c));
+            g.add_node(make_node(d));
+            g.add_edge(make_edge(a, b));
+            g.add_edge(make_edge(a, c));
+            g.add_edge(make_edge(b, d));
+            g.add_edge(make_edge(c, d));
+
+            let order = topological_sort(&g).unwrap();
+            // a must be first, d must be last
+            assert_eq!(order[0], a);
+            assert_eq!(order[3], d);
+            // b and c: smaller ID must come first
+            if b < c {
+                assert_eq!(order[1], b);
+                assert_eq!(order[2], c);
+            } else {
+                assert_eq!(order[1], c);
+                assert_eq!(order[2], b);
+            }
+        }
     }
 }
