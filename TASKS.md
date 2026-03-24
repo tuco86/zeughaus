@@ -54,7 +54,7 @@ as true/false. Remove all `format_value()` helper functions and use Display.
 Create macros `binary_f64_node!` and `unary_f64_node!` (trig.rs already has one).
 Refactor Add, Sub, Mul, Div, Min, Max, Mod, Pow to use the binary macro.
 Refactor Negate, Abs to use the unary macro. Delete the old verbose files.
-- [ ] DO THIS TASK
+- [x] DONE - Created binary_f64_node! and unary_f64_node! macros in macros.rs. Consolidated Add, Sub, Mul, Div, Mod, Min, Max into math.rs (binary macro). Moved Negate, Abs into math.rs (unary macro). Updated trig.rs to use shared macro. Deleted 8 files, net -591 lines.
 
 ### 08 - REVIEW: test coverage audit
 Run `cargo test` and check which modules have zero tests. Write at least one
