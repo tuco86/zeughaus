@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use iced::keyboard;
 use iced::widget::{column, container, row, stack, text, text_input};
@@ -75,7 +76,7 @@ impl App {
         let catalog: Vec<NodeDefinition> = plugins.iter().flat_map(|p| p.node_catalog()).collect();
         let executor = GraphExecutor::new(Graph::new());
 
-        let app = Self {
+        let mut app = Self {
             nodes: HashMap::new(),
             node_order: Vec::new(),
             edges: Vec::new(),
@@ -92,6 +93,9 @@ impl App {
             palette_input: String::new(),
             palette_selected: 0,
         };
+
+        // Restore last session
+        app.load_autosave();
 
         (app, Task::none())
     }
@@ -144,6 +148,7 @@ impl App {
         }
 
         self.execute_graph();
+        self.autosave();
     }
 
     /// Normalize edge direction: ensure from=Output pin, to=Input pin.
@@ -197,6 +202,7 @@ impl App {
         });
         self.executor.mark_dirty_downstream(from_node);
         self.execute_graph();
+        self.autosave();
     }
 
     fn disconnect_edge(
@@ -215,6 +221,7 @@ impl App {
             let edge = self.edges.remove(pos);
             self.executor.disconnect_edge(edge.id);
             self.execute_graph();
+            self.autosave();
         }
     }
 
@@ -224,6 +231,30 @@ impl App {
             return;
         }
         self.update_display_values();
+    }
+
+    fn autosave(&self) {
+        let doc = self.to_document();
+        if let Ok(json) = serde_json::to_string_pretty(&doc) {
+            let _ = std::fs::write(Self::autosave_path(), json);
+        }
+    }
+
+    fn autosave_path() -> PathBuf {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."));
+        exe_dir.join("zeughaus_autosave.zgh")
+    }
+
+    fn load_autosave(&mut self) {
+        let path = Self::autosave_path();
+        if let Ok(json) = std::fs::read_to_string(&path)
+            && let Ok(doc) = serde_json::from_str::<GraphDocument>(&json)
+        {
+            self.load_document(doc);
+        }
     }
 
     fn update_display_values(&mut self) {
@@ -468,6 +499,7 @@ impl App {
                     self.executor.remove_node(id);
                     self.const_inputs.remove(&id);
                 }
+                self.autosave();
             }
             Message::CameraChanged { position, zoom } => {
                 self.camera_position = position;
@@ -529,6 +561,7 @@ impl App {
                     }
                     _ => {}
                 }
+                self.autosave();
             }
             Message::SaveGraph => {
                 let doc = self.to_document();
@@ -576,6 +609,7 @@ impl App {
             }
             Message::GraphLoaded(doc) => {
                 self.load_document(doc);
+                self.autosave();
             }
         }
         Task::none()
