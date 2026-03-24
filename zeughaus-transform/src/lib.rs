@@ -104,19 +104,7 @@ impl DomainPlugin for TransformPlugin {
     }
 }
 
-fn catalog_entry(
-    type_id: &'static str,
-    display_name: &'static str,
-    category: &'static str,
-    node: &dyn ExecutableNode,
-) -> NodeDefinition {
-    NodeDefinition {
-        type_id,
-        display_name,
-        category,
-        pins: node.pin_definitions().to_vec(),
-    }
-}
+use zeughaus_core::catalog_entry;
 
 #[cfg(test)]
 mod tests {

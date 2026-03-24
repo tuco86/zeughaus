@@ -82,7 +82,7 @@ widget structure (same number of children per node regardless of state).
 Review all plugin traits and node APIs. Are pin names consistent? Do all nodes
 follow the same execute/emit/flush pattern? Is there unnecessary duplication
 between plugins? Document any inconsistencies and fix them.
-- [ ] DO THIS TASK
+- [x] DONE - (1) Removed eprintln from ReadMemory/ScreenCapture, surface errors via "error" output pin. (2) Moved catalog_entry() to zeughaus-core, removed 2 duplicates. (3) Renamed inconsistent output pins: Accumulator "total"->"result", ToString "text"->"result", StringLen "length"->"result".
 
 ### 13 - Command palette categories
 Group nodes in the palette by category with visual headers.

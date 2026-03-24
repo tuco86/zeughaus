@@ -13,7 +13,7 @@ pub use document::{EdgeData, GraphDocument, NodeData};
 pub use edge::EdgeSemantic;
 pub use error::{Result, ZeughausError};
 pub use id::{EdgeId, NodeId, PinId};
-pub use node::{NodeConfig, NodeDefinition};
+pub use node::{NodeConfig, NodeDefinition, catalog_entry};
 pub use pin::{DataMode, PinDefinition, PinDirection, PinKind};
 pub use plugin::{DomainPlugin, ExecutableNode};
 pub use value::Value;

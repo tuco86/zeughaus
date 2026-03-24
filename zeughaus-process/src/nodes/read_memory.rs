@@ -61,6 +61,13 @@ impl ReadMemoryNode {
                     pin_kind: PinKind::Sample,
                     type_name: "bool",
                 },
+                PinDefinition {
+                    name: "error",
+                    direction: PinDirection::Output,
+                    data_mode: DataMode::Value,
+                    pin_kind: PinKind::Sample,
+                    type_name: "String",
+                },
             ],
         }
     }
@@ -76,6 +83,7 @@ impl ExecutableNode for ReadMemoryNode {
             ctx.emit_typed("hex", String::new());
             ctx.emit_typed("bytes_read", 0.0f64);
             ctx.emit_typed("success", false);
+            ctx.emit_typed("error", "Missing pid or address".to_string());
             ctx.flush();
             return Ok(());
         }
@@ -86,27 +94,30 @@ impl ExecutableNode for ReadMemoryNode {
 
         let process = Process::open(ProcessAccess::VM_READ | ProcessAccess::QUERY_INFORMATION, pid);
         match process {
-            Ok(proc) => {
-                match proc.read_memory_vec(address, size) {
-                    Ok(bytes) => {
-                        let hex: String = bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
-                        ctx.emit_typed("hex", hex);
-                        ctx.emit_typed("bytes_read", bytes.len() as f64);
-                        ctx.emit_typed("success", true);
-                    }
-                    Err(e) => {
-                        ctx.emit_typed("hex", String::new());
-                        ctx.emit_typed("bytes_read", 0.0f64);
-                        ctx.emit_typed("success", false);
-                        eprintln!("ReadMemory error: {e}");
-                    }
+            Ok(proc) => match proc.read_memory_vec(address, size) {
+                Ok(bytes) => {
+                    let hex: String = bytes
+                        .iter()
+                        .map(|b| format!("{b:02X}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    ctx.emit_typed("hex", hex);
+                    ctx.emit_typed("bytes_read", bytes.len() as f64);
+                    ctx.emit_typed("success", true);
+                    ctx.emit_typed("error", String::new());
                 }
-            }
+                Err(e) => {
+                    ctx.emit_typed("hex", String::new());
+                    ctx.emit_typed("bytes_read", 0.0f64);
+                    ctx.emit_typed("success", false);
+                    ctx.emit_typed("error", e.to_string());
+                }
+            },
             Err(e) => {
                 ctx.emit_typed("hex", String::new());
                 ctx.emit_typed("bytes_read", 0.0f64);
                 ctx.emit_typed("success", false);
-                eprintln!("OpenProcess error: {e}");
+                ctx.emit_typed("error", e.to_string());
             }
         }
 

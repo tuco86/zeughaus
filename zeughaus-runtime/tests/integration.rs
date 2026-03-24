@@ -489,7 +489,7 @@ fn accumulator_sink_node() {
     let disp = builder.add_node("transform.display", (400.0, 0.0)).unwrap();
 
     builder.connect(src, "value", acc, "input").unwrap();
-    let edge_to_disp = builder.connect(acc, "total", disp, "input").unwrap();
+    let edge_to_disp = builder.connect(acc, "result", disp, "input").unwrap();
 
     let mut exec = builder.build().unwrap();
     exec.set_parameter(src, "value", Value::new(5.0f64)).unwrap();
@@ -607,7 +607,7 @@ fn leak_pin(s: &str) -> &'static str {
         "input" => "input",
         "a" => "a",
         "b" => "b",
-        "total" => "total",
+        "total" => "result",
         other => Box::leak(other.to_string().into_boxed_str()),
     }
 }

@@ -22,7 +22,7 @@ impl StringLenNode {
                     type_name: "String",
                 },
                 PinDefinition {
-                    name: "length",
+                    name: "result",
                     direction: PinDirection::Output,
                     data_mode: DataMode::Value,
                     pin_kind: PinKind::Sample,
@@ -36,7 +36,7 @@ impl StringLenNode {
 impl ExecutableNode for StringLenNode {
     fn execute(&mut self, inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
         let s: String = inputs.get("input").unwrap_or_default();
-        ctx.emit_typed("length", s.len() as f64);
+        ctx.emit_typed("result", s.len() as f64);
         ctx.flush();
         Ok(())
     }
@@ -57,7 +57,7 @@ mod tests {
         inputs.insert("input", Value::new("hello".to_string()));
         let mut ctx = NodeContext::new(NodeId(1), 0);
         node.execute(&inputs, &mut ctx).unwrap();
-        assert_eq!(ctx.take_outputs()["length"].downcast_ref::<f64>(), Some(&5.0));
+        assert_eq!(ctx.take_outputs()["result"].downcast_ref::<f64>(), Some(&5.0));
     }
 
     #[test]
@@ -66,6 +66,6 @@ mod tests {
         let inputs = InputSet::new();
         let mut ctx = NodeContext::new(NodeId(1), 0);
         node.execute(&inputs, &mut ctx).unwrap();
-        assert_eq!(ctx.take_outputs()["length"].downcast_ref::<f64>(), Some(&0.0));
+        assert_eq!(ctx.take_outputs()["result"].downcast_ref::<f64>(), Some(&0.0));
     }
 }

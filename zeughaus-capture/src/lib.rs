@@ -12,12 +12,12 @@ impl DomainPlugin for CapturePlugin {
     }
 
     fn node_catalog(&self) -> Vec<NodeDefinition> {
-        vec![NodeDefinition {
-            type_id: "capture.screen",
-            display_name: "Screen Capture",
-            category: "Capture",
-            pins: ScreenCaptureNode::new().pin_definitions().to_vec(),
-        }]
+        vec![catalog_entry(
+            "capture.screen",
+            "Screen Capture",
+            "Capture",
+            &ScreenCaptureNode::new(),
+        )]
     }
 
     fn create_node(&self, type_id: &str) -> Option<Box<dyn ExecutableNode>> {

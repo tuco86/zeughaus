@@ -27,7 +27,7 @@ impl AccumulatorNode {
                     type_name: "f64",
                 },
                 PinDefinition {
-                    name: "total",
+                    name: "result",
                     direction: PinDirection::Output,
                     data_mode: DataMode::Value,
                     pin_kind: PinKind::Sample,
@@ -42,7 +42,7 @@ impl ExecutableNode for AccumulatorNode {
     fn execute(&mut self, inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
         let v: f64 = inputs.get("input").unwrap_or(0.0);
         self.total += v;
-        ctx.emit_typed("total", self.total);
+        ctx.emit_typed("result", self.total);
         ctx.flush();
         Ok(())
     }
@@ -71,13 +71,13 @@ mod tests {
         let mut inputs = InputSet::new();
         inputs.insert("input", Value::new(5.0f64));
         node.execute(&inputs, &mut ctx).unwrap();
-        assert_eq!(ctx.take_outputs()["total"].downcast_ref::<f64>(), Some(&5.0));
+        assert_eq!(ctx.take_outputs()["result"].downcast_ref::<f64>(), Some(&5.0));
 
         let mut ctx = NodeContext::new(NodeId(1), 1);
         let mut inputs = InputSet::new();
         inputs.insert("input", Value::new(3.0f64));
         node.execute(&inputs, &mut ctx).unwrap();
-        assert_eq!(ctx.take_outputs()["total"].downcast_ref::<f64>(), Some(&8.0));
+        assert_eq!(ctx.take_outputs()["result"].downcast_ref::<f64>(), Some(&8.0));
     }
 
     #[test]
@@ -94,6 +94,6 @@ mod tests {
         let mut inputs = InputSet::new();
         inputs.insert("input", Value::new(1.0f64));
         node.execute(&inputs, &mut ctx).unwrap();
-        assert_eq!(ctx.take_outputs()["total"].downcast_ref::<f64>(), Some(&1.0));
+        assert_eq!(ctx.take_outputs()["result"].downcast_ref::<f64>(), Some(&1.0));
     }
 }

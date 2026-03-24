@@ -22,7 +22,7 @@ impl ToStringNode {
                     type_name: "any",
                 },
                 PinDefinition {
-                    name: "text",
+                    name: "result",
                     direction: PinDirection::Output,
                     data_mode: DataMode::Value,
                     pin_kind: PinKind::Sample,
@@ -40,7 +40,7 @@ impl ExecutableNode for ToStringNode {
         } else {
             String::new()
         };
-        ctx.emit_typed("text", text);
+        ctx.emit_typed("result", text);
         ctx.flush();
         Ok(())
     }
@@ -63,7 +63,7 @@ mod tests {
         node.execute(&inputs, &mut ctx).unwrap();
         let outputs = ctx.take_outputs();
         assert_eq!(
-            outputs["text"].downcast_ref::<String>().unwrap(),
+            outputs["result"].downcast_ref::<String>().unwrap(),
             "3.14"
         );
     }
@@ -77,7 +77,7 @@ mod tests {
         node.execute(&inputs, &mut ctx).unwrap();
         let outputs = ctx.take_outputs();
         assert_eq!(
-            outputs["text"].downcast_ref::<String>().unwrap(),
+            outputs["result"].downcast_ref::<String>().unwrap(),
             "hello"
         );
     }
