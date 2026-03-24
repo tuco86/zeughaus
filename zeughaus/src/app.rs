@@ -60,6 +60,10 @@ pub struct App {
     // Spawn offset counter (staggers new nodes so they don't overlap)
     spawn_counter: u32,
 
+    // Status bar
+    last_exec_us: u64,
+    last_error: String,
+
     // Command palette state
     palette_open: bool,
     palette_input: String,
@@ -89,6 +93,8 @@ impl App {
             display_values: HashMap::new(),
             const_inputs: HashMap::new(),
             spawn_counter: 0,
+            last_exec_us: 0,
+            last_error: String::new(),
             palette_open: false,
             palette_input: String::new(),
             palette_selected: 0,
@@ -226,9 +232,16 @@ impl App {
     }
 
     fn execute_graph(&mut self) {
-        if let Err(e) = self.executor.execute_dirty() {
-            eprintln!("Execution error: {e}");
-            return;
+        let start = std::time::Instant::now();
+        match self.executor.execute_dirty() {
+            Ok(()) => {
+                self.last_exec_us = start.elapsed().as_micros() as u64;
+                self.last_error.clear();
+            }
+            Err(e) => {
+                self.last_exec_us = start.elapsed().as_micros() as u64;
+                self.last_error = e.to_string();
+            }
         }
         self.update_display_values();
     }
@@ -685,25 +698,56 @@ impl App {
             );
         }
 
-        let graph_view: Element<'_, Message> = container(ng)
+        let graph_area: Element<'_, Message> = container(ng)
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
 
-        if self.palette_open {
+        let graph_view = if self.palette_open {
             let commands = palette::build_commands(&self.catalog);
             let palette_view = palette::view(&self.palette_input, &commands, self.palette_selected);
-
-            // Empty spacer to keep palette not full screen
             let overlay = container(palette_view)
                 .width(Length::Fill)
                 .padding(80.0)
                 .align_x(iced::Alignment::Center);
-
-            stack![graph_view, overlay].into()
+            stack![graph_area, overlay].into()
         } else {
-            graph_view
-        }
+            graph_area
+        };
+
+        // Status bar
+        let status_text = if self.last_error.is_empty() {
+            format!(
+                "  {} nodes | {} edges | exec: {}us",
+                self.nodes.len(),
+                self.edges.len(),
+                self.last_exec_us,
+            )
+        } else {
+            format!(
+                "  {} nodes | {} edges | exec: {}us | ERROR: {}",
+                self.nodes.len(),
+                self.edges.len(),
+                self.last_exec_us,
+                self.last_error,
+            )
+        };
+
+        let error_color = if self.last_error.is_empty() {
+            Color::from_rgb(0.5, 0.5, 0.5)
+        } else {
+            Color::from_rgb(0.9, 0.3, 0.3)
+        };
+
+        let status_bar = container(text(status_text).size(12).color(error_color))
+            .width(Length::Fill)
+            .padding(4.0)
+            .style(|_theme: &Theme| container::Style {
+                background: Some(Color::from_rgb(0.1, 0.1, 0.12).into()),
+                ..Default::default()
+            });
+
+        column![graph_view, status_bar].into()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {

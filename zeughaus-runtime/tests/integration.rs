@@ -679,8 +679,8 @@ fn save_load_round_trip_chain() {
     let mut exec2 = document_to_executor(&loaded);
     exec2.execute_all().unwrap();
 
-    // Find the abs->display edge: it connects to the last node (display)
-    let disp_id = loaded.nodes.last().unwrap().id;
+    // Find the abs->display edge by locating the display node
+    let disp_id = loaded.nodes.iter().find(|n| n.type_id == "transform.display").unwrap().id;
     let abs_disp_edge = loaded.edges.iter().find(|e| e.to_node == disp_id).unwrap();
     let result = exec2.edge_value(zeughaus_core::EdgeId(abs_disp_edge.id)).unwrap();
     assert_eq!(result.downcast_ref::<f64>(), Some(&7.0));

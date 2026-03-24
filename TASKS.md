@@ -92,7 +92,7 @@ Math nodes together, Trig together, Logic together, etc.
 ### 14 - Status bar
 Add a bar at the bottom of the editor showing: node count, edge count,
 last execution duration, error message if any node failed.
-- [ ] DO THIS TASK
+- [x] DONE - Added status bar at bottom: node count, edge count, execution time (microseconds), error message in red if execution failed. Also fixed flaky save_load_round_trip_chain test (was assuming node order in HashMap iteration).
 
 ### 15 - Pin type validation at runtime
 Add type checking in the executor: when building InputSet, verify the cached
