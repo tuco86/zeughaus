@@ -74,10 +74,23 @@ impl GraphExecutor {
 
     fn build_input_set(&self, node_id: NodeId) -> InputSet {
         let mut inputs = InputSet::new();
+        let pin_defs = self.graph.node(node_id).map(|n| &n.pin_defs);
+
         for &edge_id in self.graph.incoming_edges(node_id) {
             if let Some(edge) = self.graph.edge(edge_id)
                 && let Some(value) = self.cache.get(edge_id)
             {
+                // Validate type compatibility
+                if let Some(defs) = pin_defs
+                    && let Some(pin_def) = defs.iter().find(|p| p.name == edge.to_pin)
+                    && pin_def.type_name != "any"
+                    && !value_matches_type(value, pin_def.type_name)
+                {
+                    eprintln!(
+                        "Type mismatch on {:?} pin '{}': expected {}, got {}",
+                        node_id, edge.to_pin, pin_def.type_name, value.type_name()
+                    );
+                }
                 inputs.insert(edge.to_pin, value.clone());
             }
         }
@@ -148,6 +161,20 @@ impl GraphExecutor {
             }
         }
         result
+    }
+}
+
+/// Check if a Value's runtime type matches the declared pin type_name.
+fn value_matches_type(value: &Value, type_name: &str) -> bool {
+    match type_name {
+        "f64" => value.is::<f64>(),
+        "String" => value.is::<String>(),
+        "bool" => value.is::<bool>(),
+        "i64" => value.is::<i64>(),
+        "i32" => value.is::<i32>(),
+        "u64" => value.is::<u64>(),
+        "any" => true,
+        _ => true, // unknown types pass through
     }
 }
 
@@ -316,5 +343,15 @@ mod tests {
         assert!(exec.edge_value(edge_id).is_none());
         // Graph should only have node b
         assert_eq!(exec.graph.node_count(), 1);
+    }
+
+    #[test]
+    fn value_type_check_helper() {
+        assert!(value_matches_type(&Value::new(1.0f64), "f64"));
+        assert!(value_matches_type(&Value::new("hi".to_string()), "String"));
+        assert!(value_matches_type(&Value::new(true), "bool"));
+        assert!(!value_matches_type(&Value::new(1.0f64), "String"));
+        assert!(!value_matches_type(&Value::new("hi".to_string()), "f64"));
+        assert!(value_matches_type(&Value::new(1.0f64), "any"));
     }
 }

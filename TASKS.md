@@ -97,7 +97,7 @@ last execution duration, error message if any node failed.
 ### 15 - Pin type validation at runtime
 Add type checking in the executor: when building InputSet, verify the cached
 Value's type matches the target pin's type_name. Log a warning on mismatch.
-- [ ] DO THIS TASK
+- [x] DONE - Added value_matches_type() check in build_input_set. Logs type mismatches to stderr (e.g. f64 value arriving at a String pin). Passes "any" pins through without check. Added unit test for the type checker.
 
 ### 16 - REVIEW: remove unnecessary complexity
 Look at the entire codebase with fresh eyes. What can be removed? What nodes
