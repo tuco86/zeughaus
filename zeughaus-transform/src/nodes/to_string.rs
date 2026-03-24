@@ -36,17 +36,7 @@ impl ToStringNode {
 impl ExecutableNode for ToStringNode {
     fn execute(&mut self, inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
         let text = if let Some(val) = inputs.get_value("input") {
-            if let Some(f) = val.downcast_ref::<f64>() {
-                format!("{f}")
-            } else if let Some(s) = val.downcast_ref::<String>() {
-                s.clone()
-            } else if let Some(b) = val.downcast_ref::<bool>() {
-                format!("{b}")
-            } else if let Some(i) = val.downcast_ref::<i64>() {
-                format!("{i}")
-            } else {
-                format!("<{}>", val.type_name())
-            }
+            val.to_string()
         } else {
             String::new()
         };

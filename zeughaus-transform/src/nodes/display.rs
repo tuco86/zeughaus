@@ -33,18 +33,7 @@ impl DisplayNode {
 impl ExecutableNode for DisplayNode {
     fn execute(&mut self, inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
         if let Some(val) = inputs.get_value("input") {
-            let text = if let Some(f) = val.downcast_ref::<f64>() {
-                format!("{f}")
-            } else if let Some(s) = val.downcast_ref::<String>() {
-                s.clone()
-            } else if let Some(b) = val.downcast_ref::<bool>() {
-                format!("{b}")
-            } else if let Some(i) = val.downcast_ref::<i64>() {
-                format!("{i}")
-            } else {
-                format!("<{}>", val.type_name())
-            };
-            self.last_value = Some(text);
+            self.last_value = Some(val.to_string());
         }
         ctx.flush();
         Ok(())

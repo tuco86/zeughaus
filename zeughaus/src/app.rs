@@ -210,7 +210,7 @@ impl App {
                 {
                     self.display_values
                         .entry(node_id)
-                        .or_insert_with(|| format_value(val));
+                        .or_insert_with(|| val.to_string());
                 }
             }
             // For sink nodes (no outgoing edges), show incoming values
@@ -221,7 +221,7 @@ impl App {
                     {
                         self.display_values
                             .entry(node_id)
-                            .or_insert_with(|| format_value(val));
+                            .or_insert_with(|| val.to_string());
                     }
                 }
             }
@@ -783,17 +783,6 @@ fn pin_color(type_name: &str) -> Color {
     }
 }
 
-fn format_value(val: &Value) -> String {
-    if let Some(f) = val.downcast_ref::<f64>() {
-        format!("{f}")
-    } else if let Some(s) = val.downcast_ref::<String>() {
-        s.clone()
-    } else if let Some(b) = val.downcast_ref::<bool>() {
-        format!("{b}")
-    } else {
-        format!("<{}>", val.type_name())
-    }
-}
 
 /// Leaks a string to get a &'static str. Used for pin labels loaded from JSON.
 /// Acceptable for graph loading since pin labels are a small, bounded set.

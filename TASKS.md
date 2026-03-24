@@ -48,7 +48,7 @@ Add test: two independent nodes, verify order is always sorted by ID.
 ### 06 - Display trait for Value
 Implement `fmt::Display` for Value. f64 formats as number, String as-is, bool
 as true/false. Remove all `format_value()` helper functions and use Display.
-- [ ] DO THIS TASK
+- [x] DONE - Implemented fmt::Display for Value (f64, String, bool, i64, i32, u64). Removed format_value() from app.rs, replaced inline formatting in display.rs and to_string.rs with val.to_string(). Added 4 Display tests.
 
 ### 07 - Macro for binary and unary f64 nodes
 Create macros `binary_f64_node!` and `unary_f64_node!` (trig.rs already has one).
