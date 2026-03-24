@@ -59,7 +59,7 @@ Refactor Negate, Abs to use the unary macro. Delete the old verbose files.
 ### 08 - REVIEW: test coverage audit
 Run `cargo test` and check which modules have zero tests. Write at least one
 meaningful test for every module that lacks coverage. Focus on edge cases.
-- [ ] DO THIS TASK
+- [x] DONE - Added 5 tests to cache.rs (get/set/overwrite/remove/noop) and 5 tests to builder.rs (unique IDs, unknown type error, empty build, cycle detection, build+execute). All previously untested runtime modules now covered.
 
 ### 09 - Serde for core types
 Add `#[derive(Serialize, Deserialize)]` to NodeId, EdgeId, PinId, PinDefinition,

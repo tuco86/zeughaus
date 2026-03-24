@@ -86,3 +86,87 @@ impl Default for GraphBuilder {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Minimal plugin for testing
+    struct TestPlugin;
+
+    struct TestNode;
+    impl ExecutableNode for TestNode {
+        fn execute(&mut self, _inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
+            ctx.emit_typed("out", 1.0f64);
+            ctx.flush();
+            Ok(())
+        }
+        fn pin_definitions(&self) -> &[PinDefinition] {
+            &[]
+        }
+    }
+
+    impl DomainPlugin for TestPlugin {
+        fn name(&self) -> &str {
+            "test"
+        }
+        fn node_catalog(&self) -> Vec<NodeDefinition> {
+            vec![NodeDefinition {
+                type_id: "test.node",
+                display_name: "Test",
+                category: "Test",
+                pins: vec![],
+            }]
+        }
+        fn create_node(&self, type_id: &str) -> Option<Box<dyn ExecutableNode>> {
+            if type_id == "test.node" {
+                Some(Box::new(TestNode))
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn add_node_returns_unique_ids() {
+        let mut b = GraphBuilder::new();
+        b.register_plugin(Box::new(TestPlugin));
+        let id1 = b.add_node("test.node", (0.0, 0.0)).unwrap();
+        let id2 = b.add_node("test.node", (1.0, 0.0)).unwrap();
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn add_unknown_type_errors() {
+        let mut b = GraphBuilder::new();
+        b.register_plugin(Box::new(TestPlugin));
+        assert!(b.add_node("nonexistent", (0.0, 0.0)).is_err());
+    }
+
+    #[test]
+    fn build_empty_graph() {
+        let b = GraphBuilder::new();
+        let exec = b.build().unwrap();
+        assert_eq!(exec.graph.node_count(), 0);
+    }
+
+    #[test]
+    fn build_with_cycle_errors() {
+        let mut b = GraphBuilder::new();
+        b.register_plugin(Box::new(TestPlugin));
+        let a = b.add_node("test.node", (0.0, 0.0)).unwrap();
+        let c = b.add_node("test.node", (1.0, 0.0)).unwrap();
+        b.connect(a, "out", c, "in").unwrap();
+        b.connect(c, "out", a, "in").unwrap();
+        assert!(matches!(b.build(), Err(ZeughausError::CycleDetected)));
+    }
+
+    #[test]
+    fn build_and_execute() {
+        let mut b = GraphBuilder::new();
+        b.register_plugin(Box::new(TestPlugin));
+        let _a = b.add_node("test.node", (0.0, 0.0)).unwrap();
+        let mut exec = b.build().unwrap();
+        exec.execute_all().unwrap(); // no panic
+    }
+}
