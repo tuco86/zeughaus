@@ -754,14 +754,18 @@ fn build_node_element<'a>(
         }
     }
 
-    // Show output/result value for non-const nodes
-    if !is_const
-        && let Some(val) = display_value
-    {
+    // Always render a value display row to keep widget tree structure stable.
+    // Empty text when no value -- prevents iced widget state downcast panics
+    // caused by children count changing between view() calls.
+    if !is_const {
+        let (prefix, value_text) = match display_value {
+            Some(val) => ("= ", val),
+            None => ("", ""),
+        };
         items.push(
             row![
-                text("= ").size(12).color(Color::from_rgb(0.6, 0.6, 0.6)),
-                text(val).size(13).color(Color::from_rgb(0.9, 0.9, 0.5))
+                text(prefix).size(12).color(Color::from_rgb(0.6, 0.6, 0.6)),
+                text(value_text).size(13).color(Color::from_rgb(0.9, 0.9, 0.5))
             ]
             .spacing(2)
             .into(),

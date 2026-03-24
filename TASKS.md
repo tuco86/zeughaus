@@ -76,7 +76,7 @@ This tests the entire save/load pipeline without the editor.
 The "Downcast widget state" crash in iced. Investigate root cause by reading
 iced_core source. Likely fix: ensure node_order is stable, use consistent
 widget structure (same number of children per node regardless of state).
-- [ ] DO THIS TASK
+- [x] DONE - Root cause: node children count changed between view() calls when display_value appeared/disappeared, causing iced tree reconciliation to misalign widget states. Fix: always render the value display row (empty text when no value), keeping widget structure stable.
 
 ### 12 - REVIEW: API consistency
 Review all plugin traits and node APIs. Are pin names consistent? Do all nodes
