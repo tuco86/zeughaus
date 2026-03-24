@@ -274,3 +274,139 @@ fn clamp_pipeline() {
     // 15 clamped to [0, 10] = 10
     assert_eq!(executor.edge_value(out_edge).unwrap().downcast_ref::<f64>(), Some(&10.0));
 }
+
+// ===========================================================================
+// Task 01: Real editor workflow simulation tests
+// ===========================================================================
+
+/// Full workflow: spawn nodes, connect, set values, verify result.
+#[test]
+fn workflow_const_add_display() {
+    let mut builder = setup();
+    let c1 = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
+    let c2 = builder.add_node("transform.const_f64", (100.0, 0.0)).unwrap();
+    let add = builder.add_node("transform.add", (200.0, 0.0)).unwrap();
+    let disp = builder.add_node("transform.display", (400.0, 0.0)).unwrap();
+
+    builder.connect(c1, "value", add, "a").unwrap();
+    builder.connect(c2, "value", add, "b").unwrap();
+    let out = builder.connect(add, "result", disp, "input").unwrap();
+
+    let mut exec = builder.build().unwrap();
+    exec.set_parameter(c1, "value", Value::new(3.0f64)).unwrap();
+    exec.set_parameter(c2, "value", Value::new(4.0f64)).unwrap();
+    exec.execute_all().unwrap();
+
+    assert_eq!(exec.edge_value(out).unwrap().downcast_ref::<f64>(), Some(&7.0));
+}
+
+/// Disconnect one input from Add, re-execute.
+/// Add should get default 0.0 for the missing input.
+#[test]
+fn workflow_disconnect_and_reexecute() {
+    let mut builder = setup();
+    let c1 = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
+    let c2 = builder.add_node("transform.const_f64", (100.0, 0.0)).unwrap();
+    let add = builder.add_node("transform.add", (200.0, 0.0)).unwrap();
+    let disp = builder.add_node("transform.display", (400.0, 0.0)).unwrap();
+
+    builder.connect(c1, "value", add, "a").unwrap();
+    let edge_b = builder.connect(c2, "value", add, "b").unwrap();
+    let out = builder.connect(add, "result", disp, "input").unwrap();
+
+    let mut exec = builder.build().unwrap();
+    exec.set_parameter(c1, "value", Value::new(3.0f64)).unwrap();
+    exec.set_parameter(c2, "value", Value::new(4.0f64)).unwrap();
+    exec.execute_all().unwrap();
+
+    assert_eq!(exec.edge_value(out).unwrap().downcast_ref::<f64>(), Some(&7.0));
+
+    // Disconnect c2 from add's "b" pin
+    exec.graph.remove_edge(edge_b);
+    exec.mark_dirty_downstream(add);
+    exec.execute_dirty().unwrap();
+
+    // Add should now compute a=3 + b=0(default) = 3
+    assert_eq!(exec.edge_value(out).unwrap().downcast_ref::<f64>(), Some(&3.0));
+}
+
+/// Reconnect a different value after disconnect.
+#[test]
+fn workflow_reconnect_with_new_value() {
+    let mut builder = setup();
+    let c1 = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
+    let c2 = builder.add_node("transform.const_f64", (100.0, 0.0)).unwrap();
+    let c3 = builder.add_node("transform.const_f64", (100.0, 100.0)).unwrap();
+    let add = builder.add_node("transform.add", (200.0, 0.0)).unwrap();
+    let disp = builder.add_node("transform.display", (400.0, 0.0)).unwrap();
+
+    builder.connect(c1, "value", add, "a").unwrap();
+    let edge_b = builder.connect(c2, "value", add, "b").unwrap();
+    let out = builder.connect(add, "result", disp, "input").unwrap();
+
+    let mut exec = builder.build().unwrap();
+    exec.set_parameter(c1, "value", Value::new(10.0f64)).unwrap();
+    exec.set_parameter(c2, "value", Value::new(20.0f64)).unwrap();
+    exec.set_parameter(c3, "value", Value::new(100.0f64)).unwrap();
+    exec.execute_all().unwrap();
+
+    assert_eq!(exec.edge_value(out).unwrap().downcast_ref::<f64>(), Some(&30.0));
+
+    // Disconnect c2, connect c3 instead
+    exec.graph.remove_edge(edge_b);
+    use zeughaus_core::{EdgeId, EdgeSemantic};
+    use zeughaus_runtime::GraphEdge;
+    let new_edge = EdgeId::next();
+    exec.graph.add_edge(GraphEdge {
+        id: new_edge,
+        from_node: c3,
+        from_pin: "value",
+        to_node: add,
+        to_pin: "b",
+        semantic: EdgeSemantic::default(),
+    });
+    exec.mark_dirty_downstream(c3);
+    exec.execute_dirty().unwrap();
+
+    // add = 10 + 100 = 110
+    assert_eq!(exec.edge_value(out).unwrap().downcast_ref::<f64>(), Some(&110.0));
+}
+
+/// Delete a node mid-chain. Remaining graph should not panic.
+#[test]
+fn workflow_delete_node_mid_chain() {
+    let mut builder = setup();
+    let c1 = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
+    let neg = builder.add_node("transform.negate", (100.0, 0.0)).unwrap();
+    let disp = builder.add_node("transform.display", (300.0, 0.0)).unwrap();
+
+    builder.connect(c1, "value", neg, "input").unwrap();
+    builder.connect(neg, "result", disp, "input").unwrap();
+
+    let mut exec = builder.build().unwrap();
+    exec.set_parameter(c1, "value", Value::new(5.0f64)).unwrap();
+    exec.execute_all().unwrap();
+
+    // Delete negate node (middle of chain)
+    exec.graph.remove_node(neg);
+
+    // Executing should not panic -- negate is gone, display has no input
+    exec.mark_dirty(disp);
+    exec.execute_dirty().unwrap();
+    // No assertion on value -- just verify no panic
+}
+
+/// Verify that a graph with only const nodes (no connections) executes without error.
+#[test]
+fn workflow_unconnected_nodes() {
+    let mut builder = setup();
+    let c1 = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
+    let c2 = builder.add_node("transform.const_f64", (100.0, 0.0)).unwrap();
+    let _disp = builder.add_node("transform.display", (200.0, 0.0)).unwrap();
+
+    let mut exec = builder.build().unwrap();
+    exec.set_parameter(c1, "value", Value::new(1.0f64)).unwrap();
+    exec.set_parameter(c2, "value", Value::new(2.0f64)).unwrap();
+    exec.execute_all().unwrap();
+    // No panic, no error
+}

@@ -21,7 +21,7 @@ Write tests in `zeughaus-runtime/tests/integration.rs` that cover:
 - Disconnect one const from Add, re-execute, verify Add outputs 3 (a=3, b=default 0)
 - Reconnect with different value, verify update propagates
 - Delete a node mid-chain, verify no panic and remaining graph still works
-- [ ] DO THIS TASK
+- [x] DONE - Added 5 workflow tests: spawn+connect+verify, disconnect+reexecute, reconnect, delete mid-chain, unconnected nodes
 
 ### 02 - Fix stale cache after edge disconnect
 When an edge is removed, the downstream node still sees the old cached value.
