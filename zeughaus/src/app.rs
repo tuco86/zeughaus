@@ -146,6 +146,32 @@ impl App {
         self.execute_graph();
     }
 
+    /// Normalize edge direction: ensure from=Output pin, to=Input pin.
+    /// iced_nodegraph fires on_connect with drag-start as "from" which may be an Input pin.
+    fn normalize_edge_direction(
+        &self,
+        a: PinRef<u64, PinLabel>,
+        b: PinRef<u64, PinLabel>,
+    ) -> (NodeId, PinLabel, NodeId, PinLabel) {
+        let a_node = NodeId(a.node_id);
+        let b_node = NodeId(b.node_id);
+
+        // Check if "a" pin is an Output pin
+        let a_is_output = self
+            .nodes
+            .get(&a_node)
+            .and_then(|n| n.pin_defs.iter().find(|p| p.name == a.pin_id))
+            .is_some_and(|p| p.direction == PinDirection::Output);
+
+        if a_is_output {
+            // a=Output, b=Input (correct order)
+            (a_node, a.pin_id, b_node, b.pin_id)
+        } else {
+            // a=Input, b=Output (swap)
+            (b_node, b.pin_id, a_node, a.pin_id)
+        }
+    }
+
     fn connect_edge(
         &mut self,
         from_node: NodeId,
@@ -390,20 +416,16 @@ impl App {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::EdgeConnected { from, to } => {
-                self.connect_edge(
-                    NodeId(from.node_id),
-                    from.pin_id,
-                    NodeId(to.node_id),
-                    to.pin_id,
-                );
+                // iced_nodegraph passes from=drag-start, to=snap-target.
+                // Normalize: from must be the Output pin, to must be the Input pin.
+                let (out_node, out_pin, in_node, in_pin) =
+                    self.normalize_edge_direction(from, to);
+                self.connect_edge(out_node, out_pin, in_node, in_pin);
             }
             Message::EdgeDisconnected { from, to } => {
-                self.disconnect_edge(
-                    NodeId(from.node_id),
-                    from.pin_id,
-                    NodeId(to.node_id),
-                    to.pin_id,
-                );
+                let (out_node, out_pin, in_node, in_pin) =
+                    self.normalize_edge_direction(from, to);
+                self.disconnect_edge(out_node, out_pin, in_node, in_pin);
             }
             Message::NodeMoved { node_id, position } => {
                 if let Some(node) = self.nodes.get_mut(&NodeId(node_id)) {
