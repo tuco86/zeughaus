@@ -409,3 +409,98 @@ fn workflow_unconnected_nodes() {
     exec.execute_all().unwrap();
     // No panic, no error
 }
+
+// ===========================================================================
+// Task 03: Sink node execution and incoming edge readability
+// ===========================================================================
+
+/// Display is a sink node (no outgoing edges). It must execute and its
+/// incoming edge cache must be readable for the editor to show values.
+#[test]
+fn sink_node_executes_and_incoming_edge_readable() {
+    let mut builder = setup();
+    let src = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
+    let disp = builder.add_node("transform.display", (200.0, 0.0)).unwrap();
+
+    let edge_to_display = builder.connect(src, "value", disp, "input").unwrap();
+
+    let mut exec = builder.build().unwrap();
+    exec.set_parameter(src, "value", Value::new(42.0f64)).unwrap();
+    exec.execute_all().unwrap();
+
+    // The incoming edge to display must have the cached value from src
+    let val = exec.edge_value(edge_to_display).unwrap();
+    assert_eq!(val.downcast_ref::<f64>(), Some(&42.0));
+}
+
+/// Multiple sink nodes fed by the same source via fan-out.
+#[test]
+fn multiple_sink_nodes_from_same_source() {
+    let mut builder = setup();
+    let src = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
+    let disp1 = builder.add_node("transform.display", (200.0, 0.0)).unwrap();
+    let disp2 = builder.add_node("transform.display", (200.0, 100.0)).unwrap();
+
+    let e1 = builder.connect(src, "value", disp1, "input").unwrap();
+    let e2 = builder.connect(src, "value", disp2, "input").unwrap();
+
+    let mut exec = builder.build().unwrap();
+    exec.set_parameter(src, "value", Value::new(99.0f64)).unwrap();
+    exec.execute_all().unwrap();
+
+    assert_eq!(exec.edge_value(e1).unwrap().downcast_ref::<f64>(), Some(&99.0));
+    assert_eq!(exec.edge_value(e2).unwrap().downcast_ref::<f64>(), Some(&99.0));
+}
+
+/// Sink node after a chain: Const -> Add -> Display.
+/// Display's incoming edge must carry the Add result.
+#[test]
+fn sink_node_after_chain() {
+    let mut builder = setup();
+    let c1 = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
+    let c2 = builder.add_node("transform.const_f64", (0.0, 100.0)).unwrap();
+    let add = builder.add_node("transform.add", (200.0, 0.0)).unwrap();
+    let disp = builder.add_node("transform.display", (400.0, 0.0)).unwrap();
+
+    builder.connect(c1, "value", add, "a").unwrap();
+    builder.connect(c2, "value", add, "b").unwrap();
+    let edge_to_disp = builder.connect(add, "result", disp, "input").unwrap();
+
+    let mut exec = builder.build().unwrap();
+    exec.set_parameter(c1, "value", Value::new(5.0f64)).unwrap();
+    exec.set_parameter(c2, "value", Value::new(3.0f64)).unwrap();
+    exec.execute_all().unwrap();
+
+    assert_eq!(exec.edge_value(edge_to_disp).unwrap().downcast_ref::<f64>(), Some(&8.0));
+
+    // Update a source and dirty-execute: display's incoming edge should update
+    exec.set_parameter(c1, "value", Value::new(10.0f64)).unwrap();
+    exec.execute_dirty().unwrap();
+
+    assert_eq!(exec.edge_value(edge_to_disp).unwrap().downcast_ref::<f64>(), Some(&13.0));
+}
+
+/// Accumulator is a stateful sink-like node. Verify it accumulates across executions.
+#[test]
+fn accumulator_sink_node() {
+    let mut builder = setup();
+    let src = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
+    let acc = builder.add_node("transform.accumulator", (200.0, 0.0)).unwrap();
+    let disp = builder.add_node("transform.display", (400.0, 0.0)).unwrap();
+
+    builder.connect(src, "value", acc, "input").unwrap();
+    let edge_to_disp = builder.connect(acc, "total", disp, "input").unwrap();
+
+    let mut exec = builder.build().unwrap();
+    exec.set_parameter(src, "value", Value::new(5.0f64)).unwrap();
+    exec.execute_all().unwrap();
+
+    // First execution: accumulator total = 0 + 5 = 5
+    assert_eq!(exec.edge_value(edge_to_disp).unwrap().downcast_ref::<f64>(), Some(&5.0));
+
+    // Execute again (re-mark dirty): total = 5 + 5 = 10
+    exec.mark_dirty_downstream(src);
+    exec.execute_dirty().unwrap();
+
+    assert_eq!(exec.edge_value(edge_to_disp).unwrap().downcast_ref::<f64>(), Some(&10.0));
+}

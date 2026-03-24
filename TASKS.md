@@ -32,7 +32,7 @@ downstream with missing inputs defaulting to their pin defaults.
 ### 03 - Fix execution for sink nodes
 Nodes with no outgoing edges (Display, Accumulator) must still execute and
 their incoming edge caches must be readable. Verify with a test.
-- [ ] DO THIS TASK
+- [x] DONE - Verified sink nodes execute correctly. Added 4 tests: single sink, multiple sinks from fan-out, sink after chain with dirty update, accumulator stateful sink.
 
 ### 04 - REVIEW: simplify and remove dead code
 Look at every file. Remove unused imports, dead code, unnecessary abstractions.
