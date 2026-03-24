@@ -1,5 +1,7 @@
+use serde::{Deserialize, Serialize};
+
 /// How an edge delivers data. Only `LastValue` is currently implemented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum EdgeSemantic {
     #[default]
     LastValue,

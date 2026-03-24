@@ -64,7 +64,7 @@ meaningful test for every module that lacks coverage. Focus on edge cases.
 ### 09 - Serde for core types
 Add `#[derive(Serialize, Deserialize)]` to NodeId, EdgeId, PinId, PinDefinition,
 EdgeSemantic, NodeConfig, NodeDefinition. These are prerequisites for SpacetimeDB.
-- [ ] DO THIS TASK
+- [x] DONE - Added Serialize/Deserialize to NodeId, EdgeId, PinId (transparent as u64), DataMode, PinKind, PinDirection, EdgeSemantic, NodeConfig. Added serde round-trip test. NodeDefinition/PinDefinition skipped (contain &'static str, handled by GraphDocument).
 
 ### 10 - Graph save/load round-trip test
 Create a graph in code, serialize to GraphDocument JSON, deserialize back,

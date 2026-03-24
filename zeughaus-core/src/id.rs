@@ -1,11 +1,14 @@
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde::{Deserialize, Serialize};
+
 macro_rules! define_id {
     ($name:ident, $counter:ident) => {
         static $counter: AtomicU64 = AtomicU64::new(1);
 
-        #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[serde(transparent)]
         pub struct $name(pub u64);
 
         impl $name {
@@ -56,5 +59,14 @@ mod tests {
     fn debug_format() {
         let id = NodeId(42);
         assert_eq!(format!("{id:?}"), "NodeId(42)");
+    }
+
+    #[test]
+    fn serde_round_trip() {
+        let id = NodeId(123);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "123"); // transparent serialization
+        let back: NodeId = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, id);
     }
 }
