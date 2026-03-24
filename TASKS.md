@@ -87,7 +87,7 @@ between plugins? Document any inconsistencies and fix them.
 ### 13 - Command palette categories
 Group nodes in the palette by category with visual headers.
 Math nodes together, Trig together, Logic together, etc.
-- [ ] DO THIS TASK
+- [x] DONE - Sorted palette entries by category then name. Display format: "Category / Node Name" with type_id as description. Groups visually in the fuzzy search.
 
 ### 14 - Status bar
 Add a bar at the bottom of the editor showing: node count, edge count,
