@@ -8,3 +8,4 @@ zeughaus-core.workspace = true
 
 [dev-dependencies]
 zeughaus-transform.workspace = true
+serde_json = "1.0"

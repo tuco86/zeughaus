@@ -70,7 +70,7 @@ EdgeSemantic, NodeConfig, NodeDefinition. These are prerequisites for SpacetimeD
 Create a graph in code, serialize to GraphDocument JSON, deserialize back,
 re-create the graph+executor from it, execute, verify identical results.
 This tests the entire save/load pipeline without the editor.
-- [ ] DO THIS TASK
+- [x] DONE - Added 2 round-trip tests: build graph -> GraphDocument -> JSON -> deserialize -> rebuild executor -> execute -> verify identical results. Covers add pipeline and negate->abs chain. Added helper functions executor_to_document() and document_to_executor().
 
 ### 11 - Fix widget tree panic
 The "Downcast widget state" crash in iced. Investigate root cause by reading
