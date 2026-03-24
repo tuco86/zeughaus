@@ -480,31 +480,6 @@ fn sink_node_after_chain() {
     assert_eq!(exec.edge_value(edge_to_disp).unwrap().downcast_ref::<f64>(), Some(&13.0));
 }
 
-/// Accumulator is a stateful sink-like node. Verify it accumulates across executions.
-#[test]
-fn accumulator_sink_node() {
-    let mut builder = setup();
-    let src = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
-    let acc = builder.add_node("transform.accumulator", (200.0, 0.0)).unwrap();
-    let disp = builder.add_node("transform.display", (400.0, 0.0)).unwrap();
-
-    builder.connect(src, "value", acc, "input").unwrap();
-    let edge_to_disp = builder.connect(acc, "result", disp, "input").unwrap();
-
-    let mut exec = builder.build().unwrap();
-    exec.set_parameter(src, "value", Value::new(5.0f64)).unwrap();
-    exec.execute_all().unwrap();
-
-    // First execution: accumulator total = 0 + 5 = 5
-    assert_eq!(exec.edge_value(edge_to_disp).unwrap().downcast_ref::<f64>(), Some(&5.0));
-
-    // Execute again (re-mark dirty): total = 5 + 5 = 10
-    exec.mark_dirty_downstream(src);
-    exec.execute_dirty().unwrap();
-
-    assert_eq!(exec.edge_value(edge_to_disp).unwrap().downcast_ref::<f64>(), Some(&10.0));
-}
-
 // ===========================================================================
 // Task 10: Graph save/load round-trip
 // ===========================================================================

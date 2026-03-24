@@ -103,4 +103,4 @@ Value's type matches the target pin's type_name. Log a warning on mismatch.
 Look at the entire codebase with fresh eyes. What can be removed? What nodes
 are never useful? What abstractions are premature? Simplify aggressively.
 Apply Steve Jobs principle: done when nothing left to remove.
-- [ ] DO THIS TASK
+- [x] DONE - Removed Accumulator (broken in sync executor) and Threshold (redundant with GreaterThan). Moved Floor/Ceil/Round/Sqrt/Log2/Ln from "Trig" to "Math" category (they're not trigonometry). 37->35 nodes, -202 lines.

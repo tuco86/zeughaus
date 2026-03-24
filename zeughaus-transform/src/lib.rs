@@ -30,16 +30,16 @@ impl DomainPlugin for TransformPlugin {
             catalog_entry("transform.min", "Min", "Math", &MinNode::new()),
             catalog_entry("transform.max", "Max", "Math", &MaxNode::new()),
             catalog_entry("transform.lerp", "Lerp", "Math", &LerpNode::new()),
+            catalog_entry("transform.sqrt", "Sqrt", "Math", &SqrtNode::new()),
+            catalog_entry("transform.floor", "Floor", "Math", &FloorNode::new()),
+            catalog_entry("transform.ceil", "Ceil", "Math", &CeilNode::new()),
+            catalog_entry("transform.round", "Round", "Math", &RoundNode::new()),
+            catalog_entry("transform.log2", "Log2", "Math", &Log2Node::new()),
+            catalog_entry("transform.ln", "Ln", "Math", &LnNode::new()),
             // Trig
             catalog_entry("transform.sin", "Sin", "Trig", &SinNode::new()),
             catalog_entry("transform.cos", "Cos", "Trig", &CosNode::new()),
             catalog_entry("transform.tan", "Tan", "Trig", &TanNode::new()),
-            catalog_entry("transform.sqrt", "Sqrt", "Trig", &SqrtNode::new()),
-            catalog_entry("transform.floor", "Floor", "Trig", &FloorNode::new()),
-            catalog_entry("transform.ceil", "Ceil", "Trig", &CeilNode::new()),
-            catalog_entry("transform.round", "Round", "Trig", &RoundNode::new()),
-            catalog_entry("transform.log2", "Log2", "Trig", &Log2Node::new()),
-            catalog_entry("transform.ln", "Ln", "Trig", &LnNode::new()),
             // Logic
             catalog_entry("transform.greater_than", "Greater Than", "Logic", &GreaterThanNode::new()),
             catalog_entry("transform.equal", "Equal", "Logic", &EqualNode::new()),
@@ -49,8 +49,6 @@ impl DomainPlugin for TransformPlugin {
             catalog_entry("transform.or", "Or", "Logic", &OrNode::new()),
             // Utility
             catalog_entry("transform.map_range", "Map Range", "Utility", &MapRangeNode::new()),
-            catalog_entry("transform.accumulator", "Accumulator", "Utility", &AccumulatorNode::new()),
-            catalog_entry("transform.threshold", "Threshold", "Utility", &ThresholdNode::new()),
             // String
             catalog_entry("transform.to_string", "To String", "String", &ToStringNode::new()),
             catalog_entry("transform.concat", "Concat", "String", &ConcatNode::new()),
@@ -77,15 +75,15 @@ impl DomainPlugin for TransformPlugin {
             "transform.min" => Some(Box::new(MinNode::new())),
             "transform.max" => Some(Box::new(MaxNode::new())),
             "transform.lerp" => Some(Box::new(LerpNode::new())),
-            "transform.sin" => Some(Box::new(SinNode::new())),
-            "transform.cos" => Some(Box::new(CosNode::new())),
-            "transform.tan" => Some(Box::new(TanNode::new())),
             "transform.sqrt" => Some(Box::new(SqrtNode::new())),
             "transform.floor" => Some(Box::new(FloorNode::new())),
             "transform.ceil" => Some(Box::new(CeilNode::new())),
             "transform.round" => Some(Box::new(RoundNode::new())),
             "transform.log2" => Some(Box::new(Log2Node::new())),
             "transform.ln" => Some(Box::new(LnNode::new())),
+            "transform.sin" => Some(Box::new(SinNode::new())),
+            "transform.cos" => Some(Box::new(CosNode::new())),
+            "transform.tan" => Some(Box::new(TanNode::new())),
             "transform.greater_than" => Some(Box::new(GreaterThanNode::new())),
             "transform.equal" => Some(Box::new(EqualNode::new())),
             "transform.select" => Some(Box::new(SelectNode::new())),
@@ -93,8 +91,6 @@ impl DomainPlugin for TransformPlugin {
             "transform.and" => Some(Box::new(AndNode::new())),
             "transform.or" => Some(Box::new(OrNode::new())),
             "transform.map_range" => Some(Box::new(MapRangeNode::new())),
-            "transform.accumulator" => Some(Box::new(AccumulatorNode::new())),
-            "transform.threshold" => Some(Box::new(ThresholdNode::new())),
             "transform.to_string" => Some(Box::new(ToStringNode::new())),
             "transform.concat" => Some(Box::new(ConcatNode::new())),
             "transform.string_len" => Some(Box::new(StringLenNode::new())),
@@ -114,7 +110,7 @@ mod tests {
     fn catalog_has_all_nodes() {
         let plugin = TransformPlugin;
         let catalog = plugin.node_catalog();
-        assert_eq!(catalog.len(), 37);
+        assert_eq!(catalog.len(), 35);
     }
 
     #[test]

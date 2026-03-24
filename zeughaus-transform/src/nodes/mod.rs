@@ -1,7 +1,6 @@
 #[macro_use]
 mod macros;
 
-pub mod accumulator;
 pub mod clamp_node;
 pub mod compare;
 pub mod concat;
@@ -16,11 +15,9 @@ pub mod math;
 pub mod power;
 pub mod select_node;
 pub mod string_len;
-pub mod threshold;
 pub mod to_string;
 pub mod trig;
 
-pub use accumulator::AccumulatorNode;
 pub use clamp_node::ClampNode;
 pub use compare::{EqualNode, GreaterThanNode};
 pub use concat::ConcatNode;
@@ -35,6 +32,5 @@ pub use math::{AbsNode, AddNode, DivideNode, MaxNode, MinNode, ModuloNode, Multi
 pub use power::PowerNode;
 pub use select_node::SelectNode;
 pub use string_len::StringLenNode;
-pub use threshold::ThresholdNode;
 pub use to_string::ToStringNode;
 pub use trig::{CeilNode, CosNode, FloorNode, LnNode, Log2Node, RoundNode, SinNode, SqrtNode, TanNode};
