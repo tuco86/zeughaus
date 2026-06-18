@@ -1,0 +1,11 @@
+[package]
+name = "zeughaus-module"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+spacetimedb = "2.6"

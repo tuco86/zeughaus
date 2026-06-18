@@ -7,6 +7,10 @@ members = [
     "zeughaus-process",
     "zeughaus-capture",
 ]
+# zeughaus-module is a SpacetimeDB server module: it only builds for the
+# wasm32 module target via `spacetime build`, so it is kept out of the native
+# workspace build.
+exclude = ["zeughaus-module"]
 resolver = "2"
 
 [workspace.package]
@@ -21,8 +25,12 @@ zeughaus-process = { path = "zeughaus-process" }
 zeughaus-capture = { path = "zeughaus-capture" }
 
 iced = { version = "0.14", features = ["advanced", "wgpu", "tokio"] }
-iced_nodegraph = { path = "../iced_nodegraph/iced_nodegraph" }
+iced_nodegraph = "0.1.0"
 iced_palette = { git = "https://github.com/tuco86/iced_palette.git", branch = "main" }
 
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
+
+# SpacetimeDB client SDK. Native uses default (tokio) features; wasm enables the
+# `browser` feature in the per-target deps of the zeughaus binary.
+spacetimedb-sdk = "2.6"

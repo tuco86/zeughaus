@@ -14,10 +14,6 @@ pub enum Message {
         from: PinRef<u64, PinLabel>,
         to: PinRef<u64, PinLabel>,
     },
-    NodeMoved {
-        node_id: u64,
-        position: Point,
-    },
     GroupMoved {
         node_ids: Vec<u64>,
         delta: Vector,
@@ -43,5 +39,8 @@ pub enum Message {
     // File operations
     SaveGraph,
     LoadGraph,
+    // Constructed by the native load dialog; on wasm, loading arrives via the
+    // SpacetimeDB store (later phase).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     GraphLoaded(zeughaus_core::GraphDocument),
 }

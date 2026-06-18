@@ -7,10 +7,24 @@ edition.workspace = true
 zeughaus-core.workspace = true
 zeughaus-runtime.workspace = true
 zeughaus-transform.workspace = true
-zeughaus-process.workspace = true
-zeughaus-capture.workspace = true
-iced.workspace = true
 iced_nodegraph.workspace = true
 iced_palette.workspace = true
 serde_json = "1.0"
+# web_time::Instant re-exports std on native, browser clock on wasm.
+web-time = "1.1"
+
+# Native-only: process/capture plugins (DLL injection, DXGI capture), the
+# native file dialog, and the tokio executor for iced.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+zeughaus-process.workspace = true
+zeughaus-capture.workspace = true
 rfd = "0.15"
+iced = { version = "0.14", features = ["advanced", "wgpu", "tokio"] }
+spacetimedb-sdk.workspace = true
+
+# wasm: iced without the tokio executor (iced uses the wasm-bindgen executor).
+# iced_nodegraph is WebGPU-only, so the browser editor needs a WebGPU context.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+iced = { version = "0.14", features = ["advanced", "wgpu"] }
+console_error_panic_hook = "0.1"
+spacetimedb-sdk = { workspace = true, features = ["browser"] }

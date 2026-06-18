@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Zeughaus Editor</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #1a1a1f;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- iced mounts a fullscreen canvas. Requires a WebGPU-capable browser:
+         iced_nodegraph is WebGPU-only with no WebGL fallback. -->
+    <link data-trunk rel="rust" data-bin="zeughaus" data-type="main" />
+  </body>
+</html>

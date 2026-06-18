@@ -1,2 +1,4 @@
-/target
+# Ignore Cargo build output at any level (workspace root and the
+# out-of-workspace zeughaus-module crate).
+target/
 .claude/settings.local.json

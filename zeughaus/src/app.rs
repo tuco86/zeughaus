@@ -1,12 +1,14 @@
 use std::collections::{HashMap, HashSet};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 
 use iced::keyboard;
 use iced::widget::{column, container, row, stack, text, text_input};
 use iced::{Color, Element, Event, Length, Point, Subscription, Task, Theme};
 use iced_nodegraph::{
-    EdgeConfig as NgEdgeConfig, NodeConfig as NgNodeConfig, NodeContentStyle, NodeGraph, NodeStatus,
-    PinDirection as NgPinDirection, PinRef, PinSide, node_pin, simple_node,
+    EdgeStyle, NodeGraph, NodeStatus, NodeStyle, Pattern, PinDirection as NgPinDirection, PinRef,
+    PinInfo, PinSide, PinStyle, default_edge_style, default_node_style, default_pin_style,
+    edge as ng_edge, node as ng_node, node_header, node_pin,
 };
 use iced_palette::{get_filtered_command_index, is_toggle_shortcut};
 use zeughaus_core::{
@@ -14,7 +16,9 @@ use zeughaus_core::{
     NodeDefinition, NodeId, PinDefinition, PinDirection, Value,
 };
 use zeughaus_runtime::{Graph, GraphEdge, GraphExecutor, GraphNode};
+#[cfg(not(target_arch = "wasm32"))]
 use zeughaus_capture::CapturePlugin;
+#[cfg(not(target_arch = "wasm32"))]
 use zeughaus_process::ProcessPlugin;
 use zeughaus_transform::TransformPlugin;
 
@@ -72,9 +76,13 @@ pub struct App {
 
 impl App {
     pub fn new() -> (Self, Task<Message>) {
+        // Process and capture plugins are native-only (DLL injection, DXGI
+        // capture). The wasm editor designs graphs; native runners execute them.
         let plugins: Vec<Box<dyn DomainPlugin>> = vec![
             Box::new(TransformPlugin),
+            #[cfg(not(target_arch = "wasm32"))]
             Box::new(ProcessPlugin),
+            #[cfg(not(target_arch = "wasm32"))]
             Box::new(CapturePlugin),
         ];
         let catalog: Vec<NodeDefinition> = plugins.iter().flat_map(|p| p.node_catalog()).collect();
@@ -232,7 +240,9 @@ impl App {
     }
 
     fn execute_graph(&mut self) {
-        let start = std::time::Instant::now();
+        // web_time::Instant re-exports std on native and uses the browser clock
+        // on wasm, so timing works on both targets.
+        let start = web_time::Instant::now();
         match self.executor.execute_dirty() {
             Ok(()) => {
                 self.last_exec_us = start.elapsed().as_micros() as u64;
@@ -246,6 +256,9 @@ impl App {
         self.update_display_values();
     }
 
+    // Local-file persistence is native-only. On wasm the graph lives in the
+    // SpacetimeDB central store (wired in a later phase), so these are no-ops.
+    #[cfg(not(target_arch = "wasm32"))]
     fn autosave(&self) {
         let doc = self.to_document();
         if let Ok(json) = serde_json::to_string_pretty(&doc) {
@@ -253,6 +266,10 @@ impl App {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn autosave(&self) {}
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn autosave_path() -> PathBuf {
         let exe_dir = std::env::current_exe()
             .ok()
@@ -261,6 +278,7 @@ impl App {
         exe_dir.join("zeughaus_autosave.zgh")
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn load_autosave(&mut self) {
         let path = Self::autosave_path();
         if let Ok(json) = std::fs::read_to_string(&path)
@@ -269,6 +287,9 @@ impl App {
             self.load_document(doc);
         }
     }
+
+    #[cfg(target_arch = "wasm32")]
+    fn load_autosave(&mut self) {}
 
     fn update_display_values(&mut self) {
         self.display_values.clear();
@@ -298,6 +319,9 @@ impl App {
         }
     }
 
+    // Used by native persistence (autosave / file dialogs); on wasm it will be
+    // used by the SpacetimeDB sync layer in a later phase.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     fn to_document(&self) -> GraphDocument {
         let nodes = self
             .node_order
@@ -471,11 +495,6 @@ impl App {
                     self.normalize_edge_direction(from, to);
                 self.disconnect_edge(out_node, out_pin, in_node, in_pin);
             }
-            Message::NodeMoved { node_id, position } => {
-                if let Some(node) = self.nodes.get_mut(&NodeId(node_id)) {
-                    node.position = position;
-                }
-            }
             Message::GroupMoved { node_ids, delta } => {
                 for raw_id in &node_ids {
                     let id = NodeId(*raw_id);
@@ -576,49 +595,57 @@ impl App {
                 }
                 self.autosave();
             }
+            // File dialogs are native-only (rfd). On wasm these are no-ops;
+            // persistence goes through the SpacetimeDB store instead.
             Message::SaveGraph => {
-                let doc = self.to_document();
-                return Task::perform(
-                    async move {
-                        let file = rfd::AsyncFileDialog::new()
-                            .set_title("Save Graph")
-                            .add_filter("Zeughaus Graph", &["zgh"])
-                            .add_filter("JSON", &["json"])
-                            .save_file()
-                            .await;
-                        if let Some(handle) = file {
-                            let json = serde_json::to_string_pretty(&doc).unwrap_or_default();
-                            let _ = handle.write(json.as_bytes()).await;
-                        }
-                    },
-                    |()| Message::PaletteCancel, // no-op after save
-                );
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let doc = self.to_document();
+                    return Task::perform(
+                        async move {
+                            let file = rfd::AsyncFileDialog::new()
+                                .set_title("Save Graph")
+                                .add_filter("Zeughaus Graph", &["zgh"])
+                                .add_filter("JSON", &["json"])
+                                .save_file()
+                                .await;
+                            if let Some(handle) = file {
+                                let json = serde_json::to_string_pretty(&doc).unwrap_or_default();
+                                let _ = handle.write(json.as_bytes()).await;
+                            }
+                        },
+                        |()| Message::PaletteCancel, // no-op after save
+                    );
+                }
             }
             Message::LoadGraph => {
-                return Task::perform(
-                    async {
-                        let file = rfd::AsyncFileDialog::new()
-                            .set_title("Load Graph")
-                            .add_filter("Zeughaus Graph", &["zgh"])
-                            .add_filter("JSON", &["json"])
-                            .pick_file()
-                            .await;
-                        if let Some(handle) = file {
-                            let bytes = handle.read().await;
-                            if let Ok(doc) = serde_json::from_slice::<GraphDocument>(&bytes) {
-                                return Some(doc);
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    return Task::perform(
+                        async {
+                            let file = rfd::AsyncFileDialog::new()
+                                .set_title("Load Graph")
+                                .add_filter("Zeughaus Graph", &["zgh"])
+                                .add_filter("JSON", &["json"])
+                                .pick_file()
+                                .await;
+                            if let Some(handle) = file {
+                                let bytes = handle.read().await;
+                                if let Ok(doc) = serde_json::from_slice::<GraphDocument>(&bytes) {
+                                    return Some(doc);
+                                }
                             }
-                        }
-                        None
-                    },
-                    |doc| {
-                        if let Some(d) = doc {
-                            Message::GraphLoaded(d)
-                        } else {
-                            Message::PaletteCancel // no-op on cancel
-                        }
-                    },
-                );
+                            None
+                        },
+                        |doc| {
+                            if let Some(d) = doc {
+                                Message::GraphLoaded(d)
+                            } else {
+                                Message::PaletteCancel // no-op on cancel
+                            }
+                        },
+                    );
+                }
             }
             Message::GraphLoaded(doc) => {
                 self.load_document(doc);
@@ -629,36 +656,29 @@ impl App {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        let mut ng: NodeGraph<'_, u64, PinLabel, u64, Message, Theme, _> = NodeGraph::default();
+        let mut ng: NodeGraph<'_, u64, PinLabel, Color, Message, Theme, _> = NodeGraph::default();
 
         ng = ng
             .on_connect(|from, to| Message::EdgeConnected { from, to })
             .on_disconnect(|from, to| Message::EdgeDisconnected { from, to })
-            .on_move(|node_id, position| Message::NodeMoved { node_id, position })
+            .on_move(|delta, node_ids| Message::GroupMoved { node_ids, delta })
             .on_select(Message::SelectionChanged)
             .on_clone(Message::CloneNodes)
             .on_delete(Message::DeleteNodes)
-            .on_group_move(|node_ids, delta| Message::GroupMoved { node_ids, delta })
-            .on_camera_change(|position, zoom| Message::CameraChanged { position, zoom })
-            .initial_camera(self.camera_position, self.camera_zoom)
-            .node_style(|_theme, status, base| match status {
-                NodeStatus::Selected => base
-                    .border_color(Color::from_rgb(0.3, 0.6, 1.0))
-                    .border_width(2.5),
-                NodeStatus::Idle => base,
-            })
+            .on_pan(|position, zoom| Message::CameraChanged { position, zoom })
+            .view(self.camera_position, self.camera_zoom)
             .can_connect({
                 let nodes = &self.nodes;
                 move |from, to| {
-                    let from_node = nodes.get(&NodeId(from.node_id));
-                    let to_node = nodes.get(&NodeId(to.node_id));
+                    let from_node = nodes.get(&NodeId(*from.node_id()));
+                    let to_node = nodes.get(&NodeId(*to.node_id()));
                     match (from_node, to_node) {
                         (Some(f), Some(t)) => {
                             let from_type = f.pin_defs.iter()
-                                .find(|p| p.name == from.pin_id)
+                                .find(|p| p.name == *from.pin_id())
                                 .map(|p| p.type_name);
                             let to_type = t.pin_defs.iter()
-                                .find(|p| p.name == to.pin_id)
+                                .find(|p| p.name == *to.pin_id())
                                 .map(|p| p.type_name);
                             match (from_type, to_type) {
                                 (Some("any"), _) | (_, Some("any")) => true,
@@ -671,14 +691,36 @@ impl App {
                 }
             });
 
-        let node_cfg = NgNodeConfig::new().corner_radius(8.0).opacity(0.88);
-
         for id in &self.node_order {
             if let Some(node) = self.nodes.get(id) {
                 let display_val = self.display_values.get(id).map(|s| s.as_str());
                 let const_input = self.const_inputs.get(id).map(|s| s.as_str());
                 let content = build_node_element(node, display_val, const_input);
-                ng.push_node_styled(node.id.0, node.position, content, node_cfg.clone());
+                let node_widget = ng_node(node.id.0, node.position, content)
+                    .style(|theme, status| {
+                        let base = default_node_style(theme, status);
+                        match status {
+                            NodeStatus::Selected => NodeStyle {
+                                corner_radius: 8.0,
+                                opacity: 0.88,
+                                border_color: Color::from_rgb(0.3, 0.6, 1.0).into(),
+                                border_pattern: Pattern::solid(2.5),
+                                ..base
+                            },
+                            NodeStatus::Idle => NodeStyle {
+                                corner_radius: 8.0,
+                                opacity: 0.88,
+                                ..base
+                            },
+                        }
+                    })
+                    .pin_style(
+                        |theme, pin: &PinInfo<'_, PinLabel, Color>, _other, status| PinStyle {
+                            color: (*pin.info()).into(),
+                            ..default_pin_style(theme, status)
+                        },
+                    );
+                ng.push_node(node_widget);
             }
         }
 
@@ -691,11 +733,16 @@ impl App {
                 .map(|p| pin_color(p.type_name))
                 .unwrap_or(Color::from_rgb(0.6, 0.6, 0.6));
 
-            ng.push_edge_styled(
+            let edge_widget = ng_edge(
                 PinRef::new(edge.from_node.0, edge.from_pin),
                 PinRef::new(edge.to_node.0, edge.to_pin),
-                NgEdgeConfig::new().solid_color(edge_color),
-            );
+                (),
+            )
+            .style(move |theme, status, _start, _end| EdgeStyle {
+                stroke_color: edge_color.into(),
+                ..default_edge_style(theme, status)
+            });
+            ng.push_edge(edge_widget);
         }
 
         let graph_area: Element<'_, Message> = container(ng)
@@ -791,18 +838,11 @@ impl App {
 }
 
 fn build_node_element<'a>(
-    node: &EditorNode,
+    node: &'a EditorNode,
     display_value: Option<&'a str>,
     const_input: Option<&'a str>,
 ) -> Element<'a, Message, Theme> {
-    let theme = Theme::Dark;
     let is_const = node.type_id.starts_with("transform.const_");
-
-    let style = match node.type_id.as_str() {
-        t if t.starts_with("transform.const_") => NodeContentStyle::input(&theme),
-        "transform.display" => NodeContentStyle::output(&theme),
-        _ => NodeContentStyle::process(&theme),
-    };
 
     let mut items: Vec<Element<'_, Message, Theme>> = Vec::new();
 
@@ -829,7 +869,7 @@ fn build_node_element<'a>(
         let pin: Element<'_, Message, Theme> =
             node_pin(PinSide::Right, "value", input_field)
                 .direction(NgPinDirection::Output)
-                .color(pin_color(pin_type))
+                .info(pin_color(pin_type))
                 .into();
         items.push(pin);
     } else {
@@ -848,7 +888,7 @@ fn build_node_element<'a>(
             let pin: Element<'_, Message, Theme> =
                 node_pin(side, pin_def.name, text(pin_def.name).size(12))
                     .direction(direction)
-                    .color(color)
+                    .info(color)
                     .into();
             items.push(pin);
         }
@@ -872,9 +912,27 @@ fn build_node_element<'a>(
         );
     }
 
-    let body: Element<'_, Message, Theme> = column(items).spacing(4).into();
-    let node_el = simple_node(&node.display_name, style, body);
-    container(node_el).width(180.0).into()
+    let body = column(items).spacing(4);
+    let header = node_header(
+        text(node.display_name.as_str())
+            .size(14)
+            .color(Color::from_rgb(0.92, 0.92, 0.95)),
+        header_color(&node.type_id),
+        8.0,
+    );
+    let inner = column![header, container(body).padding(6.0)];
+    container(inner).width(180.0).into()
+}
+
+/// Header background color per node category, mirroring the old content presets.
+fn header_color(type_id: &str) -> Color {
+    if type_id.starts_with("transform.const_") {
+        Color::from_rgb(0.16, 0.30, 0.20) // input: green
+    } else if type_id == "transform.display" {
+        Color::from_rgb(0.32, 0.26, 0.10) // output: gold
+    } else {
+        Color::from_rgb(0.18, 0.20, 0.26) // process: neutral
+    }
 }
 
 fn pin_color(type_name: &str) -> Color {

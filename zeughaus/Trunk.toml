@@ -1,0 +1,9 @@
+# Trunk build config for the wasm browser editor.
+# Run from this directory with `trunk serve` (needs: cargo install trunk wasm-bindgen-cli).
+# Requires a WebGPU-capable browser (iced_nodegraph has no WebGL fallback).
+[build]
+target = "index.html"
+
+[serve]
+address = "127.0.0.1"
+port = 8080
