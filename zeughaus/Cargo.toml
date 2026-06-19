@@ -18,8 +18,12 @@ web-time = "1.1"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 zeughaus-process.workspace = true
 zeughaus-capture.workspace = true
+zeughaus-llm.workspace = true
 rfd = "0.15"
 iced = { version = "0.14", features = ["advanced", "wgpu", "tokio"] }
+# Background thread pool for blocking node work (LLM HTTP requests) so the UI
+# thread is never blocked. iced already runs on a tokio runtime natively.
+tokio = { version = "1", features = ["rt"] }
 spacetimedb-sdk.workspace = true
 
 # wasm: iced without the tokio executor (iced uses the wasm-bindgen executor).
