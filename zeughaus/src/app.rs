@@ -572,6 +572,12 @@ impl App {
     }
 
     fn palette_confirm(&mut self) -> Option<Message> {
+        // The global key subscription emits PaletteConfirm on every Enter, even
+        // when the palette is closed (the closure can't see our state). Guard
+        // here so a stray Enter never spawns the index-0 catalog node.
+        if !self.palette_open {
+            return None;
+        }
         let commands = palette::build_commands(&self.catalog);
         let original_idx = get_filtered_command_index(
             &self.palette_input,
