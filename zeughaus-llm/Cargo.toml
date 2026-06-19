@@ -1,0 +1,13 @@
+[package]
+name = "zeughaus-llm"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zeughaus-core.workspace = true
+# Blocking HTTP client (pure Rust, no async runtime) for LM Studio's
+# OpenAI-compatible local endpoint. Keeps execute() synchronous like the
+# other native plugins.
+ureq = { version = "2.12", features = ["json"] }
+serde = { workspace = true }
+serde_json = "1.0"
