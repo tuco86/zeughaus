@@ -116,6 +116,7 @@ mod tests {
                 display_name: "Test",
                 category: "Test",
                 pins: vec![],
+                settings: vec![],
             }]
         }
         fn create_node(&self, type_id: &str) -> Option<Box<dyn ExecutableNode>> {

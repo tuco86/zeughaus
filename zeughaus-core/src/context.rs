@@ -1,7 +1,19 @@
 use std::collections::HashMap;
 
+use crate::error::Result;
 use crate::id::NodeId;
 use crate::value::Value;
+
+/// Off-thread work a node defers instead of producing outputs synchronously.
+/// A node calls `NodeContext::defer` during `execute()`; the executor hands the
+/// work to the host, which runs `run()` on a background thread and feeds the
+/// result back via `deliver_async_result`. This keeps blocking work (e.g. an
+/// LLM HTTP request) off the UI/executor thread.
+pub trait AsyncWork: Send + 'static {
+    /// Runs the blocking work and returns the node's output pin values
+    /// (pin name -> value), to be applied as if the node had emitted them.
+    fn run(self: Box<Self>) -> Result<HashMap<String, Value>>;
+}
 
 /// Read-only view of a node's inputs during execution.
 pub struct InputSet {
@@ -43,6 +55,7 @@ impl Default for InputSet {
 pub struct NodeContext {
     buffered: HashMap<String, Value>,
     flushed: HashMap<String, Value>,
+    deferred: Option<Box<dyn AsyncWork>>,
     pub source_node: NodeId,
     pub trace_id: u64,
 }
@@ -52,9 +65,22 @@ impl NodeContext {
         Self {
             buffered: HashMap::new(),
             flushed: HashMap::new(),
+            deferred: None,
             source_node,
             trace_id,
         }
+    }
+
+    /// Defer blocking work to a background thread instead of emitting outputs
+    /// now. The node should return Ok without flushing; its outputs arrive
+    /// later via the host's async result delivery.
+    pub fn defer(&mut self, work: Box<dyn AsyncWork>) {
+        self.deferred = Some(work);
+    }
+
+    /// Called by the executor after execute() to retrieve any deferred work.
+    pub fn take_deferred(&mut self) -> Option<Box<dyn AsyncWork>> {
+        self.deferred.take()
     }
 
     /// Buffer a value for the named output pin. Not visible to downstream until flush().

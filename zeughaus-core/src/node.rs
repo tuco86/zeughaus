@@ -9,12 +9,25 @@ pub struct NodeConfig {
     pub capture: bool,
 }
 
+/// An editable text setting rendered directly inside the node widget.
+/// Distinct from input pins: settings are node-local configuration the user
+/// types (e.g. an LLM base URL or model name), persisted as node parameters.
+#[derive(Debug, Clone)]
+pub struct SettingDef {
+    pub name: &'static str,
+    pub default: &'static str,
+    pub placeholder: &'static str,
+    /// Hint for the editor to render a taller, multi-line field.
+    pub multiline: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct NodeDefinition {
     pub type_id: &'static str,
     pub display_name: &'static str,
     pub category: &'static str,
     pub pins: Vec<PinDefinition>,
+    pub settings: Vec<SettingDef>,
 }
 
 /// Helper to build a NodeDefinition from a node instance.
@@ -29,5 +42,6 @@ pub fn catalog_entry(
         display_name,
         category,
         pins: node.pin_definitions().to_vec(),
+        settings: node.settings(),
     }
 }

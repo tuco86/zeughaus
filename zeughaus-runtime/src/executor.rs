@@ -1,6 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
-use zeughaus_core::{EdgeId, ExecutableNode, InputSet, NodeContext, NodeId, Result, Value};
+use zeughaus_core::{
+    AsyncWork, EdgeId, ExecutableNode, InputSet, NodeContext, NodeId, Result, Value,
+};
+
+/// Work a node deferred during execution, tagged with the node that owns it.
+/// The host runs each off-thread and returns the outputs via
+/// [`GraphExecutor::deliver_async_result`].
+pub type DeferredWork = Vec<(NodeId, Box<dyn AsyncWork>)>;
 
 use crate::cache::EdgeCache;
 use crate::graph::Graph;
@@ -11,6 +18,18 @@ pub struct GraphExecutor {
     nodes: HashMap<NodeId, Box<dyn ExecutableNode>>,
     cache: EdgeCache,
     dirty: HashSet<NodeId>,
+    /// Nodes awaiting an async result. They are skipped during execution so a
+    /// re-run does not spawn a duplicate request, and their downstream nodes
+    /// are held back until the result arrives.
+    pending: HashSet<NodeId>,
+    /// Last produced output values per node (pin name -> value), independent of
+    /// edges. Lets a newly connected edge be seeded from an already-computed
+    /// source without re-executing it -- critical for nodes with side effects
+    /// (e.g. an LLM chat node must not re-fire just because a wire was drawn).
+    last_outputs: HashMap<NodeId, HashMap<String, Value>>,
+    /// Nodes whose last execution failed (sync error or async failure). Cleared
+    /// when the node next runs cleanly. Drives error styling in the editor.
+    error_nodes: HashSet<NodeId>,
     trace_counter: u64,
 }
 
@@ -21,8 +40,32 @@ impl GraphExecutor {
             nodes: HashMap::new(),
             cache: EdgeCache::new(),
             dirty: HashSet::new(),
+            pending: HashSet::new(),
+            last_outputs: HashMap::new(),
+            error_nodes: HashSet::new(),
             trace_counter: 0,
         }
+    }
+
+    /// Number of nodes currently awaiting an async result.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Whether a node is awaiting an async result (working).
+    pub fn is_pending(&self, id: NodeId) -> bool {
+        self.pending.contains(&id)
+    }
+
+    /// Whether a node's last execution failed.
+    pub fn is_error(&self, id: NodeId) -> bool {
+        self.error_nodes.contains(&id)
+    }
+
+    /// Flags a node as failed (used by the host when async work errors).
+    pub fn mark_error(&mut self, id: NodeId) {
+        self.pending.remove(&id);
+        self.error_nodes.insert(id);
     }
 
     pub fn register_node(&mut self, id: NodeId, exec: Box<dyn ExecutableNode>) {
@@ -41,19 +84,42 @@ impl GraphExecutor {
         }
     }
 
-    pub fn execute_all(&mut self) -> Result<()> {
+    pub fn execute_all(&mut self) -> Result<DeferredWork> {
         for id in self.graph.node_ids().collect::<Vec<_>>() {
             self.dirty.insert(id);
         }
         self.execute_dirty()
     }
 
-    pub fn execute_dirty(&mut self) -> Result<()> {
+    /// Executes all dirty nodes in topological order. Nodes that defer async
+    /// work (or are already awaiting a result) are skipped, and their
+    /// downstream nodes are held back until the result is delivered. Returns
+    /// the deferred work for the host to run off-thread.
+    pub fn execute_dirty(&mut self) -> Result<DeferredWork> {
         let order = topological_sort(&self.graph)?;
         let dirty = std::mem::take(&mut self.dirty);
+        let mut deferred: DeferredWork = Vec::new();
+        // Nodes whose outputs are not (yet) available this pass: deferred this
+        // pass, already pending, or transitively downstream of either.
+        let mut blocked: HashSet<NodeId> = HashSet::new();
 
         for node_id in order {
             if !dirty.contains(&node_id) {
+                continue;
+            }
+
+            // Hold back nodes that feed off a blocked upstream; keep them dirty
+            // so they run once the upstream async result arrives.
+            if self.has_blocked_input(node_id, &blocked) {
+                blocked.insert(node_id);
+                self.dirty.insert(node_id);
+                continue;
+            }
+
+            // Already awaiting a result from an earlier pass: don't re-run
+            // (would spawn a duplicate request), but block its downstream.
+            if self.pending.contains(&node_id) {
+                blocked.insert(node_id);
                 continue;
             }
 
@@ -61,15 +127,30 @@ impl GraphExecutor {
             self.trace_counter += 1;
             let mut ctx = NodeContext::new(node_id, self.trace_counter);
 
-            if let Some(node) = self.nodes.get_mut(&node_id) {
-                node.execute(&inputs, &mut ctx)?;
+            if let Some(node) = self.nodes.get_mut(&node_id)
+                && let Err(e) = node.execute(&inputs, &mut ctx)
+            {
+                // Tag the failing node so the host can flag it visually,
+                // then propagate the error.
+                self.error_nodes.insert(node_id);
+                return Err(e);
+            }
+
+            if let Some(work) = ctx.take_deferred() {
+                self.pending.insert(node_id);
+                self.error_nodes.remove(&node_id); // now retrying
+                blocked.insert(node_id);
+                deferred.push((node_id, work));
+                continue;
             }
 
             let outputs = ctx.take_outputs();
+            self.error_nodes.remove(&node_id); // executed cleanly
+            self.last_outputs.insert(node_id, outputs.clone());
             self.apply_outputs(node_id, outputs);
         }
 
-        Ok(())
+        Ok(deferred)
     }
 
     fn build_input_set(&self, node_id: NodeId) -> InputSet {
@@ -97,6 +178,40 @@ impl GraphExecutor {
         inputs
     }
 
+    /// True if any input edge of `node_id` originates from a blocked node.
+    fn has_blocked_input(&self, node_id: NodeId, blocked: &HashSet<NodeId>) -> bool {
+        self.graph.incoming_edges(node_id).iter().any(|&edge_id| {
+            self.graph
+                .edge(edge_id)
+                .is_some_and(|e| blocked.contains(&e.from_node))
+        })
+    }
+
+    /// Delivers the outputs of a previously deferred node, then resumes
+    /// execution of its (now unblocked) downstream nodes. Returns any further
+    /// deferred work produced downstream (e.g. a chain of chat nodes).
+    pub fn deliver_async_result(
+        &mut self,
+        node_id: NodeId,
+        outputs: HashMap<String, Value>,
+    ) -> Result<DeferredWork> {
+        self.pending.remove(&node_id);
+        self.error_nodes.remove(&node_id);
+        self.last_outputs.insert(node_id, outputs.clone());
+        self.apply_outputs(node_id, outputs);
+        // Re-run only the downstream; the node itself is already done.
+        for downstream in self.graph.downstream(node_id) {
+            self.dirty.insert(downstream);
+        }
+        self.execute_dirty()
+    }
+
+    /// Clears a node's pending state without delivering outputs (e.g. after the
+    /// async work failed). Downstream nodes stay unexecuted until re-triggered.
+    pub fn clear_pending(&mut self, node_id: NodeId) {
+        self.pending.remove(&node_id);
+    }
+
     fn apply_outputs(&mut self, node_id: NodeId, outputs: HashMap<String, Value>) {
         for &edge_id in self.graph.outgoing_edges(node_id) {
             if let Some(edge) = self.graph.edge(edge_id)
@@ -104,6 +219,33 @@ impl GraphExecutor {
             {
                 self.cache.set(edge_id, value.clone());
             }
+        }
+    }
+
+    /// Notifies the executor that an edge was just added. Seeds the edge from
+    /// the source node's last known output (so the target sees the value
+    /// immediately) and marks only the target's subtree dirty. The source is
+    /// NOT re-executed -- avoids re-firing nodes with side effects. Only when
+    /// the source has no cached output do we fall back to running it.
+    pub fn on_edge_added(&mut self, edge_id: EdgeId) {
+        let Some(edge) = self.graph.edge(edge_id) else {
+            return;
+        };
+        let from_node = edge.from_node;
+        let from_pin = edge.from_pin;
+        let to_node = edge.to_node;
+
+        if let Some(value) = self
+            .last_outputs
+            .get(&from_node)
+            .and_then(|outs| outs.get(from_pin))
+            .cloned()
+        {
+            self.cache.set(edge_id, value);
+            self.mark_dirty_downstream(to_node);
+        } else {
+            // Source never produced this output yet; run it to populate the edge.
+            self.mark_dirty_downstream(from_node);
         }
     }
 
@@ -136,6 +278,9 @@ impl GraphExecutor {
         self.graph.remove_node(id);
         self.nodes.remove(&id);
         self.dirty.remove(&id);
+        self.pending.remove(&id);
+        self.last_outputs.remove(&id);
+        self.error_nodes.remove(&id);
     }
 
     pub fn edge_value(&self, edge_id: EdgeId) -> Option<&Value> {
@@ -265,6 +410,141 @@ mod tests {
 
         let val = exec.edge_value(edge_id).unwrap();
         assert_eq!(val.downcast_ref::<f64>(), Some(&5.0));
+    }
+
+    /// A node that defers its output to async work instead of emitting now.
+    struct DeferNode(f64);
+    impl ExecutableNode for DeferNode {
+        fn execute(&mut self, _inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
+            ctx.defer(Box::new(DeferWork(self.0)));
+            Ok(())
+        }
+        fn pin_definitions(&self) -> &[PinDefinition] {
+            &[]
+        }
+    }
+    struct DeferWork(f64);
+    impl AsyncWork for DeferWork {
+        fn run(self: Box<Self>) -> Result<HashMap<String, Value>> {
+            let mut out = HashMap::new();
+            out.insert("value".to_string(), Value::new(self.0));
+            Ok(out)
+        }
+    }
+
+    #[test]
+    fn deferred_node_blocks_downstream_until_delivered() {
+        let mut graph = Graph::new();
+        let a = NodeId::next();
+        let b = NodeId::next();
+        graph.add_node(make_node(a));
+        graph.add_node(make_node(b));
+        let edge = make_edge(a, "value", b, "in");
+        let edge_id = edge.id;
+        graph.add_edge(edge);
+
+        let mut exec = GraphExecutor::new(graph);
+        exec.register_node(a, Box::new(DeferNode(7.0)));
+        exec.register_node(b, Box::new(DoubleNode));
+
+        // First pass: node a defers, b is held back, no output cached yet.
+        let deferred = exec.execute_all().unwrap();
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].0, a);
+        assert_eq!(exec.pending_count(), 1);
+        assert!(exec.edge_value(edge_id).is_none());
+
+        // Run the deferred work off-thread (here inline) and deliver it.
+        let outputs = deferred.into_iter().next().unwrap().1.run().unwrap();
+        let more = exec.deliver_async_result(a, outputs).unwrap();
+
+        // a is no longer pending; b ran with a's value (7 * 2 = 14).
+        assert!(more.is_empty());
+        assert_eq!(exec.pending_count(), 0);
+        let val = exec.edge_value(edge_id).unwrap();
+        assert_eq!(val.downcast_ref::<f64>(), Some(&7.0));
+    }
+
+    #[test]
+    fn on_edge_added_seeds_without_rerunning_source() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        struct Counting(f64, Arc<AtomicU32>);
+        impl ExecutableNode for Counting {
+            fn execute(&mut self, _inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                ctx.emit_typed("value", self.0);
+                ctx.flush();
+                Ok(())
+            }
+            fn pin_definitions(&self) -> &[PinDefinition] {
+                &[]
+            }
+        }
+
+        let mut graph = Graph::new();
+        let a = NodeId::next();
+        let b = NodeId::next();
+        graph.add_node(make_node(a));
+        graph.add_node(make_node(b));
+
+        let mut exec = GraphExecutor::new(graph);
+        let runs = Arc::new(AtomicU32::new(0));
+        exec.register_node(a, Box::new(Counting(9.0, runs.clone())));
+        exec.register_node(b, Box::new(DoubleNode));
+        exec.execute_all().unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        // Connect a -> b AFTER a already produced its output.
+        let edge = make_edge(a, "value", b, "in");
+        let edge_id = edge.id;
+        exec.graph.add_edge(edge);
+        exec.on_edge_added(edge_id);
+        exec.execute_dirty().unwrap();
+
+        // Source not re-executed; the new edge is seeded from its cached output.
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        let val = exec.edge_value(edge_id).unwrap();
+        assert_eq!(val.downcast_ref::<f64>(), Some(&9.0));
+    }
+
+    #[test]
+    fn error_state_set_then_cleared() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // Fails while `fail` is true, succeeds otherwise.
+        struct Flaky(Arc<AtomicBool>);
+        impl ExecutableNode for Flaky {
+            fn execute(&mut self, _inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
+                if self.0.load(Ordering::SeqCst) {
+                    return Err(ZeughausError::ExecutionFailed("boom".into()));
+                }
+                ctx.emit_typed("value", 1.0f64);
+                ctx.flush();
+                Ok(())
+            }
+            fn pin_definitions(&self) -> &[PinDefinition] {
+                &[]
+            }
+        }
+
+        let mut graph = Graph::new();
+        let a = NodeId::next();
+        graph.add_node(make_node(a));
+        let mut exec = GraphExecutor::new(graph);
+        let fail = Arc::new(AtomicBool::new(true));
+        exec.register_node(a, Box::new(Flaky(fail.clone())));
+
+        assert!(exec.execute_all().is_err());
+        assert!(exec.is_error(a));
+
+        // Recover: node now succeeds, error flag clears.
+        fail.store(false, Ordering::SeqCst);
+        exec.mark_dirty_downstream(a);
+        exec.execute_dirty().unwrap();
+        assert!(!exec.is_error(a));
     }
 
     #[test]

@@ -15,6 +15,24 @@ macro_rules! define_id {
             pub fn next() -> Self {
                 Self($counter.fetch_add(1, Ordering::Relaxed))
             }
+
+            /// Ensures every subsequent `next()` returns a value greater than
+            /// `value`. Call after loading persisted ids so freshly generated
+            /// ids never collide with restored ones.
+            pub fn bump_above(value: u64) {
+                let mut cur = $counter.load(Ordering::Relaxed);
+                while cur <= value {
+                    match $counter.compare_exchange_weak(
+                        cur,
+                        value + 1,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(actual) => cur = actual,
+                    }
+                }
+            }
         }
 
         impl fmt::Debug for $name {
@@ -59,6 +77,17 @@ mod tests {
     fn debug_format() {
         let id = NodeId(42);
         assert_eq!(format!("{id:?}"), "NodeId(42)");
+    }
+
+    #[test]
+    fn bump_above_prevents_collision() {
+        // Use a high sentinel unlikely to be reached by other tests sharing
+        // this process-global counter.
+        EdgeId::bump_above(1_000_000);
+        assert!(EdgeId::next().0 > 1_000_000);
+        // Bumping below the current value is a no-op.
+        EdgeId::bump_above(5);
+        assert!(EdgeId::next().0 > 1_000_000);
     }
 
     #[test]
