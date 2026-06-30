@@ -1928,9 +1928,9 @@ dependencies = [
 
 [[package]]
 name = "iced_nodegraph"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adcfadc896483b2f1036e52ed2a25f7efa5363c5f4b0f0958e9a2d3d7f3a65b7"
+checksum = "8e56c4bbb05aaebb84c04a5c64756a958a366f56678d12b77825c750b6ae75f3"
 dependencies = [
  "bitflags 2.11.0",
  "euclid",
@@ -1945,9 +1945,9 @@ dependencies = [
 
 [[package]]
 name = "iced_nodegraph_sdf"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42a4489c5d4860fbdc499fe06559f4b492160f015c33949765016e66f78ddfe2"
+checksum = "7c96f3f5d24907bb961940e51cc17fec1826624fc555ea04a1b54a41793c7aa6"
 dependencies = [
  "bytemuck",
  "encase",
@@ -6241,6 +6241,7 @@ dependencies = [
  "zeughaus-capture",
  "zeughaus-core",
  "zeughaus-llm",
+ "zeughaus-ml",
  "zeughaus-process",
  "zeughaus-runtime",
  "zeughaus-transform",
@@ -6270,6 +6271,14 @@ dependencies = [
  "serde",
  "serde_json",
  "ureq",
+ "zeughaus-core",
+]
+
+[[package]]
+name = "zeughaus-ml"
+version = "0.1.0"
+dependencies = [
+ "serde",
  "zeughaus-core",
 ]
 

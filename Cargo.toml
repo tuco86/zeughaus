@@ -7,6 +7,7 @@ members = [
     "zeughaus-process",
     "zeughaus-capture",
     "zeughaus-llm",
+    "zeughaus-ml",
 ]
 # zeughaus-module is a SpacetimeDB server module: it only builds for the
 # wasm32 module target via `spacetime build`, so it is kept out of the native
@@ -25,9 +26,10 @@ zeughaus-transform = { path = "zeughaus-transform" }
 zeughaus-process = { path = "zeughaus-process" }
 zeughaus-capture = { path = "zeughaus-capture" }
 zeughaus-llm = { path = "zeughaus-llm" }
+zeughaus-ml = { path = "zeughaus-ml" }
 
 iced = { version = "0.14", features = ["advanced", "wgpu", "tokio"] }
-iced_nodegraph = "0.1.0"
+iced_nodegraph = "0.2.0"
 iced_palette = { git = "https://github.com/tuco86/iced_palette.git", branch = "main" }
 
 serde = { version = "1.0", features = ["derive"] }
