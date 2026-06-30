@@ -90,6 +90,52 @@ Double-click navigates into the subgraph.
 | Workflow / Automation | HTTP, Transform, Filter, Schedule | Sequential, event-triggered |
 | Screen Capture / Video | Capture, Encode, Stream, Overlay | Real-time stream |
 
+### Machine Learning (Keras) -- implemented
+
+The `zeughaus-ml` plugin turns Keras (TensorFlow) layers into nodes so a neural
+network can be designed entirely in the graph and exported as a runnable
+`keras.Sequential` program. A `KerasModel` value (an ordered layer stack plus an
+optional compile config) flows through the chain: each layer node consumes a
+model and emits it extended by one layer, mirroring the LLM plugin's
+Conversation pattern.
+
+Layer nodes are data-driven: every supported layer is a row in a static `LAYERS`
+table (Input, Dense, Conv1D/2D, Max/Average/GlobalAveragePooling, Flatten,
+Reshape, Dropout, BatchNormalization, LayerNormalization, Activation, LSTM, GRU,
+Embedding). Each parameter is typed -- strings are quoted in codegen, raw
+literals (numbers, tuples, bools) are emitted verbatim, and a blank value omits
+the kwarg so Keras applies its own default. The Export node validates at the
+boundary (non-empty model, Input layer first) and renders the final Python.
+
+Example graph:
+
+```
+[Input (28,28,1)] -> [Conv2D 32 (3,3) relu] -> [MaxPooling2D (2,2)]
+  -> [Flatten] -> [Dropout 0.5] -> [Dense 10 softmax]
+  -> [Compile adam/categorical_crossentropy/accuracy] -> [Export Code]
+```
+
+The Export node emits:
+
+```python
+import keras
+from keras import layers
+
+model = keras.Sequential([
+    layers.Input(shape=(28, 28, 1)),
+    layers.Conv2D(filters=32, kernel_size=(3, 3), activation='relu'),
+    layers.MaxPooling2D(pool_size=(2, 2)),
+    layers.Flatten(),
+    layers.Dropout(rate=0.5),
+    layers.Dense(units=10, activation='softmax'),
+])
+model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+model.summary()
+```
+
+The plugin is pure codegen with no platform dependencies, so it is available in
+the wasm editor as well; native runners execute the exported code.
+
 ## Dataflow Model
 
 ### Push/Pull Reactive

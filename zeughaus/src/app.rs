@@ -24,6 +24,7 @@ use zeughaus_capture::CapturePlugin;
 use zeughaus_llm::LlmPlugin;
 #[cfg(not(target_arch = "wasm32"))]
 use zeughaus_process::ProcessPlugin;
+use zeughaus_ml::MlPlugin;
 use zeughaus_transform::TransformPlugin;
 
 use crate::message::{Message, PinLabel};
@@ -88,6 +89,7 @@ impl App {
         // capture). The wasm editor designs graphs; native runners execute them.
         let plugins: Vec<Box<dyn DomainPlugin>> = vec![
             Box::new(TransformPlugin),
+            Box::new(MlPlugin),
             #[cfg(not(target_arch = "wasm32"))]
             Box::new(ProcessPlugin),
             #[cfg(not(target_arch = "wasm32"))]

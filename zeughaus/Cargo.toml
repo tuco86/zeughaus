@@ -7,6 +7,9 @@ edition.workspace = true
 zeughaus-core.workspace = true
 zeughaus-runtime.workspace = true
 zeughaus-transform.workspace = true
+# Pure codegen plugin, no platform deps, so it is available in the wasm editor
+# too (it designs ML graphs; native runners execute the exported code).
+zeughaus-ml.workspace = true
 iced_nodegraph.workspace = true
 iced_palette.workspace = true
 serde_json = "1.0"

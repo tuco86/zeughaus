@@ -1,0 +1,8 @@
+[package]
+name = "zeughaus-ml"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zeughaus-core.workspace = true
+serde = { workspace = true }
