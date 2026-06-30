@@ -7,14 +7,14 @@ use iced::keyboard;
 use iced::widget::{column, container, row, stack, text, text_input};
 use iced::{Color, Element, Event, Length, Point, Subscription, Task, Theme};
 use iced_nodegraph::{
-    EdgeStyle, NodeGraph, NodeStatus, NodeStyle, Pattern, PinDirection as NgPinDirection, PinRef,
-    PinInfo, PinSide, PinStyle, default_edge_style, default_node_style, default_pin_style,
+    EdgeStyle, NodeGraph, NodeStatus, NodeStyle, Pattern, PinDirection as NgPinDirection, PinInfo,
+    PinRef, PinShape, PinSide, PinStyle, default_edge_style, default_node_style, default_pin_style,
     edge as ng_edge, node as ng_node, node_header, node_pin,
 };
 use iced_palette::{get_filtered_command_index, is_toggle_shortcut};
 use zeughaus_core::{
     DomainPlugin, EdgeData, EdgeId, EdgeSemantic, GraphDocument, NodeConfig, NodeData,
-    NodeDefinition, NodeId, PinDefinition, PinDirection, SettingDef, TypeConverters, Value,
+    NodeDefinition, NodeId, PinDefinition, PinDirection, PinKind, SettingDef, TypeConverters, Value,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use zeughaus_runtime::DeferredWork;
@@ -846,7 +846,7 @@ impl App {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        let mut ng: NodeGraph<'_, u64, PinLabel, Color, Message, Theme, _> = NodeGraph::default();
+        let mut ng: NodeGraph<'_, u64, PinLabel, PinVisual, Message, Theme, _> = NodeGraph::default();
 
         ng = ng
             .on_connect(|from, to| Message::EdgeConnected { from, to })
@@ -942,8 +942,9 @@ impl App {
                         }
                     })
                     .pin_style(
-                        |theme, pin: &PinInfo<'_, PinLabel, Color>, _other, status| PinStyle {
-                            color: (*pin.info()).into(),
+                        |theme, pin: &PinInfo<'_, PinLabel, PinVisual>, _other, status| PinStyle {
+                            color: pin.info().color.into(),
+                            shape: pin.info().shape,
                             ..default_pin_style(theme, status)
                         },
                     );
@@ -965,6 +966,16 @@ impl App {
             let src_error = self.executor.is_error(edge.from_node);
             let src_pending = self.executor.is_pending(edge.from_node);
 
+            // Transmission mode is decided by the target pin: a Trigger input
+            // carries Events (animated flowing dash), a Sample input carries
+            // State (calm solid line).
+            let is_event = self
+                .nodes
+                .get(&edge.to_node)
+                .and_then(|n| n.pin_defs.iter().find(|p| p.name == edge.to_pin))
+                .map(|p| p.pin_kind == PinKind::Trigger)
+                .unwrap_or(false);
+
             let edge_widget = ng_edge(
                 PinRef::new(edge.from_node.0, edge.from_pin),
                 PinRef::new(edge.to_node.0, edge.to_pin),
@@ -981,9 +992,16 @@ impl App {
                         ..default_edge_style(theme, status)
                     };
                 }
+                let base = default_edge_style(theme, status);
                 EdgeStyle {
                     stroke_color: edge_color.into(),
-                    ..default_edge_style(theme, status)
+                    // Event edges flow; state edges stay solid.
+                    pattern: if is_event {
+                        Pattern::dashed(2.0, 7.0, 5.0).flow(20.0)
+                    } else {
+                        base.pattern
+                    },
+                    ..base
                 }
             });
             ng.push_edge(edge_widget);
@@ -1121,7 +1139,9 @@ fn build_node_element<'a>(
             "transform.const_string" => "text",
             _ => "",
         };
-        let pin_type = node.pin_defs.first().map(|p| p.type_name).unwrap_or("any");
+        let first_pin = node.pin_defs.first();
+        let pin_type = first_pin.map(|p| p.type_name).unwrap_or("any");
+        let pin_kind = first_pin.map(|p| p.pin_kind).unwrap_or(PinKind::Sample);
 
         let input_field = text_input(placeholder, input_text)
             .on_input(move |v| Message::ConstValueChanged {
@@ -1134,7 +1154,7 @@ fn build_node_element<'a>(
         let pin: Element<'_, Message, Theme> =
             node_pin(PinSide::Right, "value", input_field)
                 .direction(NgPinDirection::Output)
-                .info(pin_color(pin_type))
+                .info(PinVisual { color: pin_color(pin_type), shape: pin_shape(pin_kind) })
                 .into();
         items.push(pin);
     } else {
@@ -1148,12 +1168,15 @@ fn build_node_element<'a>(
                 PinDirection::Output => NgPinDirection::Output,
             };
 
-            let color = pin_color(pin_def.type_name);
+            let visual = PinVisual {
+                color: pin_color(pin_def.type_name),
+                shape: pin_shape(pin_def.pin_kind),
+            };
 
             let pin: Element<'_, Message, Theme> =
                 node_pin(side, pin_def.name, text(pin_def.name).size(12))
                     .direction(direction)
-                    .info(color)
+                    .info(visual)
                     .into();
             items.push(pin);
         }
@@ -1227,6 +1250,24 @@ fn header_color(type_id: &str) -> Color {
         Color::from_rgb(0.32, 0.26, 0.10) // output: gold
     } else {
         Color::from_rgb(0.18, 0.20, 0.26) // process: neutral
+    }
+}
+
+/// Per-pin visual data carried as the node graph's pin info. Two orthogonal
+/// channels: `color` encodes the payload type, `shape` encodes the transmission
+/// mode (Event vs State).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct PinVisual {
+    color: Color,
+    shape: PinShape,
+}
+
+/// Pin shape encodes the transmission mode: Event (Trigger) pins are triangles
+/// (Unreal-Blueprint "exec" look), State (Sample) pins are circles.
+fn pin_shape(kind: PinKind) -> PinShape {
+    match kind {
+        PinKind::Trigger => PinShape::Triangle,
+        PinKind::Sample => PinShape::Circle,
     }
 }
 
