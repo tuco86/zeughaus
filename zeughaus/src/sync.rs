@@ -25,7 +25,8 @@ use crate::module_bindings::{
     DbConnection, Edge, EdgeTableAccess, Node, NodeTableAccess,
 };
 
-const DEFAULT_URI: &str = "http://127.0.0.1:3000";
+pub const DEFAULT_PORT: u16 = 3000;
+pub const DEFAULT_SESSION: &str = "zeughaus";
 
 /// A change observed in the shared store, to be applied to the editor.
 #[derive(Debug, Clone)]
@@ -104,22 +105,62 @@ fn send(tx: &Sender<SyncEvent>, ev: SyncEvent) {
     let _ = tx.send(ev);
 }
 
-/// Joins a collaboration session: connects to the SpacetimeDB database named by
-/// `session_id` and subscribes to it. The server URI defaults to a local
-/// instance and can be overridden with `ZEUGHAUS_STDB_URI`. Returns the live
-/// connection plus the event receiver, or `None` if the connection failed.
-pub fn connect_session(session_id: &str) -> Option<(DbConnection, Receiver<SyncEvent>)> {
-    let uri = std::env::var("ZEUGHAUS_STDB_URI").unwrap_or_else(|_| DEFAULT_URI.to_string());
-    match connect(&uri, session_id) {
+/// Connects to a session: SpacetimeDB at `uri`, database `db`, subscribing to
+/// node+edge. Returns the live connection plus the event receiver, or `None` if
+/// the connection could not be established.
+pub fn join(uri: &str, db: &str) -> Option<(DbConnection, Receiver<SyncEvent>)> {
+    match connect(uri, db) {
         Ok(pair) => {
-            eprintln!("[stdb] joined session '{session_id}' at {uri}");
+            eprintln!("[stdb] connected to {uri} / {db}");
             Some(pair)
         }
         Err(e) => {
-            eprintln!("[stdb] could not join '{session_id}': {e}");
+            eprintln!("[stdb] could not connect to {uri} / {db}: {e}");
             None
         }
     }
+}
+
+/// Best-effort outbound LAN ip, for building a session token a remote buddy can
+/// reach. Falls back to the loopback address.
+pub fn lan_ip() -> String {
+    use std::net::UdpSocket;
+    UdpSocket::bind("0.0.0.0:0")
+        .and_then(|sock| {
+            // No packets are sent; this just selects the outbound interface.
+            sock.connect("8.8.8.8:80")?;
+            sock.local_addr()
+        })
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|_| "127.0.0.1".to_string())
+}
+
+/// Parses a session token `host[:port]/db` (or a bare `db` on localhost) into a
+/// connection uri and database name.
+pub fn parse_token(token: &str) -> (String, String) {
+    match token.split_once('/') {
+        Some((host, db)) => {
+            let host = if host.contains(':') {
+                host.to_string()
+            } else {
+                format!("{host}:{DEFAULT_PORT}")
+            };
+            (format!("http://{host}"), db.to_string())
+        }
+        None => (format!("http://127.0.0.1:{DEFAULT_PORT}"), token.to_string()),
+    }
+}
+
+/// Quick reachability probe so a missing server falls back to local-only
+/// instead of leaving a dead connection. Short timeout to avoid blocking start.
+pub fn reachable(uri: &str) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+    let host = uri.trim_start_matches("http://").trim_start_matches("https://");
+    let Ok(addrs) = host.to_socket_addrs() else {
+        return false;
+    };
+    addrs.into_iter().any(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok())
 }
 
 fn params_json(params: &[(String, String)]) -> String {

@@ -135,16 +135,46 @@ impl App {
         let mut executor = GraphExecutor::new(Graph::new());
         executor.set_converters(converters.clone());
 
-        // Join a collaboration session when `join <id>` was passed, else run a
-        // local editor. Splits the live connection from its event receiver and
-        // records the session id for the palette "Copy Session ID" command.
+        // `session` is the join token, or None to host a local session. Resolve
+        // the connection uri + database, then connect if a server is reachable,
+        // else fall back to a local, unsynced editor. The session token is what
+        // the palette "Copy Session ID" shares so a buddy can join.
         #[cfg(not(target_arch = "wasm32"))]
-        let (stdb, sync_rx, session_id) = match session {
-            Some(id) => match crate::sync::connect_session(&id) {
-                Some((conn, rx)) => (Some(conn), Some(rx), Some(id)),
-                None => (None, None, None),
-            },
-            None => (None, None, None),
+        let (stdb, sync_rx, session_id) = {
+            let (uri, db, token) = match session {
+                Some(token) => {
+                    let (uri, db) = crate::sync::parse_token(&token);
+                    (uri, db, token)
+                }
+                None => {
+                    // Host: local server, default session, LAN-reachable token.
+                    let token = format!(
+                        "{}:{}/{}",
+                        crate::sync::lan_ip(),
+                        crate::sync::DEFAULT_PORT,
+                        crate::sync::DEFAULT_SESSION
+                    );
+                    (
+                        format!("http://127.0.0.1:{}", crate::sync::DEFAULT_PORT),
+                        crate::sync::DEFAULT_SESSION.to_string(),
+                        token,
+                    )
+                }
+            };
+            if crate::sync::reachable(&uri) {
+                match crate::sync::join(&uri, &db) {
+                    Some((conn, rx)) => {
+                        eprintln!("[stdb] session token: {token}");
+                        (Some(conn), Some(rx), Some(token))
+                    }
+                    None => (None, None, None),
+                }
+            } else {
+                eprintln!(
+                    "[stdb] no SpacetimeDB at {uri}; running local-only (start it with `spacetime start`)"
+                );
+                (None, None, None)
+            }
         };
 
         let mut app = Self {
@@ -861,11 +891,11 @@ impl App {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     if let Some(id) = &self.session_id {
-                        self.last_error = format!("session id copied: {id}");
+                        self.last_error = format!("session token copied: {id}");
                         return iced::clipboard::write(id.clone());
                     }
                     self.last_error =
-                        "no active session (start with: zeughaus join <id>)".to_string();
+                        "no session (start `spacetime start` to host one)".to_string();
                 }
             }
             Message::AsyncNodeDone { node_id, result } => {
