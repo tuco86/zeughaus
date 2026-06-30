@@ -79,17 +79,34 @@ impl KerasModel {
         self.layers.is_empty()
     }
 
-    /// Renders the full Keras Python program: imports, the Sequential stack,
-    /// an optional compile call, and `model.summary()`.
+    /// Renders the full Keras Python program using the functional API: imports,
+    /// one variable per layer wired to its predecessor via the call syntax
+    /// `xN = layers.Foo(...)(x{N-1})`, the `keras.Model(inputs, outputs)`
+    /// construction, an optional compile call, and `model.summary()`.
+    ///
+    /// The first layer (the graph root, an `Input`) has no incoming edge, so it
+    /// is emitted without a call suffix; every following layer is called on the
+    /// variable of the layer feeding it, mirroring the graph edges.
     pub fn to_python(&self) -> String {
         let mut out = String::from("import keras\nfrom keras import layers\n\n");
-        out.push_str("model = keras.Sequential([\n");
-        for layer in &self.layers {
-            out.push_str("    ");
-            out.push_str(&layer.render());
-            out.push_str(",\n");
+        if self.layers.is_empty() {
+            return out;
         }
-        out.push_str("])\n");
+
+        let var = |i: usize| format!("x{i}");
+        for (i, layer) in self.layers.iter().enumerate() {
+            if i == 0 {
+                // Root layer: no incoming edge, no functional call.
+                out.push_str(&format!("{} = {}\n", var(i), layer.render()));
+            } else {
+                // Edge from the previous layer becomes the (input) call.
+                out.push_str(&format!("{} = {}({})\n", var(i), layer.render(), var(i - 1)));
+            }
+        }
+
+        let inputs = var(0);
+        let outputs = var(self.layers.len() - 1);
+        out.push_str(&format!("\nmodel = keras.Model(inputs={inputs}, outputs={outputs})\n"));
 
         if let Some(c) = &self.compile {
             let mut args: Vec<String> = Vec::new();
@@ -162,14 +179,34 @@ mod tests {
         assert_eq!(layer.render(), "layers.Dense(units=64, activation='relu')");
     }
 
+    fn input(shape: &str) -> Layer {
+        Layer {
+            keras_class: "Input".to_string(),
+            kwargs: vec![("shape".to_string(), shape.to_string())],
+        }
+    }
+
     #[test]
     fn codegen_includes_imports_and_summary() {
-        let py = KerasModel::new().with_layer(dense("10")).to_python();
+        let py = KerasModel::new().with_layer(input("(4,)")).to_python();
         assert!(py.contains("import keras"));
-        assert!(py.contains("keras.Sequential(["));
-        assert!(py.contains("layers.Dense(units=10)"));
+        assert!(py.contains("model = keras.Model(inputs=x0, outputs=x0)"));
+        assert!(py.contains("x0 = layers.Input(shape=(4,))"));
         assert!(py.contains("model.summary()"));
         assert!(!py.contains("model.compile"));
+    }
+
+    #[test]
+    fn codegen_wires_layers_with_functional_calls() {
+        // Root layer has no call suffix; each edge becomes a (prev) call.
+        let py = KerasModel::new()
+            .with_layer(input("(4,)"))
+            .with_layer(dense("10"))
+            .to_python();
+        assert!(py.contains("x0 = layers.Input(shape=(4,))\n"));
+        assert!(py.contains("x1 = layers.Dense(units=10)(x0)\n"));
+        assert!(py.contains("model = keras.Model(inputs=x0, outputs=x1)"));
+        assert!(!py.contains("Sequential"));
     }
 
     #[test]

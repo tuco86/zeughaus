@@ -93,11 +93,17 @@ Double-click navigates into the subgraph.
 ### Machine Learning (Keras) -- implemented
 
 The `zeughaus-ml` plugin turns Keras (TensorFlow) layers into nodes so a neural
-network can be designed entirely in the graph and exported as a runnable
-`keras.Sequential` program. A `KerasModel` value (an ordered layer stack plus an
+network can be designed entirely in the graph and exported as a runnable Keras
+functional-API program. A `KerasModel` value (an ordered layer stack plus an
 optional compile config) flows through the chain: each layer node consumes a
 model and emits it extended by one layer, mirroring the LLM plugin's
 Conversation pattern.
+
+Codegen uses the functional API so the generated code mirrors the graph edges:
+every layer becomes a variable (`x0`, `x1`, ...), and an edge feeding one layer
+into the next renders as a call, `x1 = layers.Dense(...)(x0)`. The root layer
+(the `Input`, which has no incoming edge) is emitted without a call suffix, and
+the program closes with `keras.Model(inputs=x0, outputs=xN)`.
 
 Layer nodes are data-driven: every supported layer is a row in a static `LAYERS`
 table (Input, Dense, Conv1D/2D, Max/Average/GlobalAveragePooling, Flatten,
@@ -121,14 +127,14 @@ The Export node emits:
 import keras
 from keras import layers
 
-model = keras.Sequential([
-    layers.Input(shape=(28, 28, 1)),
-    layers.Conv2D(filters=32, kernel_size=(3, 3), activation='relu'),
-    layers.MaxPooling2D(pool_size=(2, 2)),
-    layers.Flatten(),
-    layers.Dropout(rate=0.5),
-    layers.Dense(units=10, activation='softmax'),
-])
+x0 = layers.Input(shape=(28, 28, 1))
+x1 = layers.Conv2D(filters=32, kernel_size=(3, 3), activation='relu')(x0)
+x2 = layers.MaxPooling2D(pool_size=(2, 2))(x1)
+x3 = layers.Flatten()(x2)
+x4 = layers.Dropout(rate=0.5)(x3)
+x5 = layers.Dense(units=10, activation='softmax')(x4)
+
+model = keras.Model(inputs=x0, outputs=x5)
 model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
 model.summary()
 ```

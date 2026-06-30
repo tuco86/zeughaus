@@ -1,15 +1,16 @@
 //! ML plugin for Zeughaus. Turns Keras (TensorFlow) layers into nodes so a
 //! neural network can be designed entirely in the node graph and exported as a
-//! runnable `keras.Sequential` Python program.
+//! runnable Keras functional-API Python program.
 //!
 //! Nodes operate on a `KerasModel` value: each layer node consumes a model and
 //! emits it extended by one layer, so a network architecture maps directly onto
 //! a node chain -- the same pattern the LLM plugin uses for Conversation.
 //!
 //! A typical graph: `Input -> Conv2D -> MaxPooling2D -> Flatten -> Dense ->
-//! Compile -> Export Code`. The Export node renders imports, the Sequential
-//! stack, `model.compile(...)` and `model.summary()` and shows the result live
-//! in the node.
+//! Compile -> Export Code`. Codegen mirrors the edges: each layer becomes a
+//! variable wired to its predecessor (`x1 = layers.Dense(...)(x0)`), then
+//! `keras.Model(inputs, outputs)`, `model.compile(...)` and `model.summary()`.
+//! The Export node shows the result live in the node.
 
 pub mod model;
 pub mod nodes;
@@ -119,14 +120,14 @@ mod tests {
             "import keras\n",
             "from keras import layers\n",
             "\n",
-            "model = keras.Sequential([\n",
-            "    layers.Input(shape=(28, 28, 1)),\n",
-            "    layers.Conv2D(filters=32, kernel_size=(3, 3), activation='relu'),\n",
-            "    layers.MaxPooling2D(pool_size=(2, 2)),\n",
-            "    layers.Flatten(),\n",
-            "    layers.Dropout(rate=0.5),\n",
-            "    layers.Dense(units=10, activation='softmax'),\n",
-            "])\n",
+            "x0 = layers.Input(shape=(28, 28, 1))\n",
+            "x1 = layers.Conv2D(filters=32, kernel_size=(3, 3), activation='relu')(x0)\n",
+            "x2 = layers.MaxPooling2D(pool_size=(2, 2))(x1)\n",
+            "x3 = layers.Flatten()(x2)\n",
+            "x4 = layers.Dropout(rate=0.5)(x3)\n",
+            "x5 = layers.Dense(units=10, activation='softmax')(x4)\n",
+            "\n",
+            "model = keras.Model(inputs=x0, outputs=x5)\n",
             "model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])\n",
             "model.summary()\n",
         );

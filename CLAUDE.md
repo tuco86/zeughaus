@@ -21,7 +21,7 @@ zeughaus-transform/    # transform plugin (37 math/logic/string/trig nodes)
 zeughaus-process/      # process plugin (Find Process, DLL Inject, Read Memory, Find Module)
 zeughaus-capture/      # capture plugin (Screen Capture via scrap/DXGI)
 zeughaus-llm/          # LLM plugin (Conversation nodes, LM Studio chat)
-zeughaus-ml/           # ML plugin (Keras layers as nodes -> exportable keras.Sequential code)
+zeughaus-ml/           # ML plugin (Keras layers as nodes -> exportable functional-API code)
 ```
 
 ## Related Projects

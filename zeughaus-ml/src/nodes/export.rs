@@ -51,9 +51,10 @@ impl ExecutableNode for ExportNode {
             ));
         }
 
-        // Boundary validation: a Sequential model must start with an Input
-        // layer (or a layer carrying input_shape, which we do not model), else
-        // the generated code fails at runtime with an unbuilt model.
+        // Boundary validation: the functional model is built from
+        // keras.Model(inputs=x0, ...), so the root layer x0 must be an Input
+        // (which yields a KerasTensor). Any other first layer produces a layer
+        // object, not a tensor, and keras.Model would reject it at runtime.
         if model.layers[0].keras_class != "Input" {
             return Err(ZeughausError::ExecutionFailed(format!(
                 "first layer must be Input, found {}",
@@ -125,7 +126,8 @@ mod tests {
         node.execute(&inputs, &mut ctx).unwrap();
         let out = ctx.take_outputs();
         let code = out["code"].downcast_ref::<String>().unwrap();
-        assert!(code.contains("keras.Sequential"));
-        assert!(code.contains("layers.Input(shape=(28, 28, 1))"));
+        assert!(code.contains("x0 = layers.Input(shape=(28, 28, 1))"));
+        assert!(code.contains("x1 = layers.Flatten()(x0)"));
+        assert!(code.contains("model = keras.Model(inputs=x0, outputs=x1)"));
     }
 }
