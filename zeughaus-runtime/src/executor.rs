@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use zeughaus_core::{
-    AsyncWork, EdgeId, ExecutableNode, InputSet, NodeContext, NodeId, Result, Value,
+    AsyncWork, EdgeId, ExecutableNode, InputSet, NodeContext, NodeId, Result, TypeConverters, Value,
 };
 
 /// Work a node deferred during execution, tagged with the node that owns it.
@@ -31,6 +32,10 @@ pub struct GraphExecutor {
     /// when the node next runs cleanly. Drives error styling in the editor.
     error_nodes: HashSet<NodeId>,
     trace_counter: u64,
+    /// Coerces values that cross an edge whose endpoints declare different
+    /// types (e.g. a u8 output into an f64 input). Shared with the editor's
+    /// connection validation so "what may connect" and "what is coerced" agree.
+    converters: Arc<TypeConverters>,
 }
 
 impl GraphExecutor {
@@ -44,7 +49,13 @@ impl GraphExecutor {
             last_outputs: HashMap::new(),
             error_nodes: HashSet::new(),
             trace_counter: 0,
+            converters: Arc::new(TypeConverters::new()),
         }
+    }
+
+    /// Installs the type-converter registry (built from the plugins at startup).
+    pub fn set_converters(&mut self, converters: Arc<TypeConverters>) {
+        self.converters = converters;
     }
 
     /// Number of nodes currently awaiting an async result.
@@ -155,27 +166,55 @@ impl GraphExecutor {
 
     fn build_input_set(&self, node_id: NodeId) -> InputSet {
         let mut inputs = InputSet::new();
-        let pin_defs = self.graph.node(node_id).map(|n| &n.pin_defs);
 
         for &edge_id in self.graph.incoming_edges(node_id) {
             if let Some(edge) = self.graph.edge(edge_id)
                 && let Some(value) = self.cache.get(edge_id)
             {
-                // Validate type compatibility
-                if let Some(defs) = pin_defs
-                    && let Some(pin_def) = defs.iter().find(|p| p.name == edge.to_pin)
-                    && pin_def.type_name != "any"
-                    && !value_matches_type(value, pin_def.type_name)
-                {
-                    eprintln!(
-                        "Type mismatch on {:?} pin '{}': expected {}, got {}",
-                        node_id, edge.to_pin, pin_def.type_name, value.type_name()
-                    );
-                }
-                inputs.insert(edge.to_pin, value.clone());
+                let to_type = self.pin_type(node_id, edge.to_pin);
+                let from_type = self.pin_type(edge.from_node, edge.from_pin);
+                let value = self.coerce(from_type, to_type, value, node_id, edge.to_pin);
+                inputs.insert(edge.to_pin, value);
             }
         }
         inputs
+    }
+
+    /// Declared type name of a node's pin, if the node and pin are known.
+    fn pin_type(&self, node: NodeId, pin: &str) -> Option<&'static str> {
+        self.graph
+            .node(node)?
+            .pin_defs
+            .iter()
+            .find(|p| p.name == pin)
+            .map(|p| p.type_name)
+    }
+
+    /// Coerces a value crossing an edge to the target pin's declared type. If
+    /// the types match (or either is unknown/`any`), the value passes through.
+    /// Otherwise a registered converter is applied; a missing converter for a
+    /// genuine mismatch is logged and the value passed through unchanged.
+    fn coerce(
+        &self,
+        from_type: Option<&str>,
+        to_type: Option<&str>,
+        value: &Value,
+        node_id: NodeId,
+        to_pin: &str,
+    ) -> Value {
+        let (Some(from), Some(to)) = (from_type, to_type) else {
+            return value.clone();
+        };
+        if from == to || to == "any" || from == "any" {
+            return value.clone();
+        }
+        if let Some(converted) = self.converters.convert(from, to, value) {
+            return converted;
+        }
+        eprintln!(
+            "Type mismatch on {node_id:?} pin '{to_pin}': expected {to}, got {from} (no converter)"
+        );
+        value.clone()
     }
 
     /// True if any input edge of `node_id` originates from a blocked node.
@@ -306,20 +345,6 @@ impl GraphExecutor {
             }
         }
         result
-    }
-}
-
-/// Check if a Value's runtime type matches the declared pin type_name.
-fn value_matches_type(value: &Value, type_name: &str) -> bool {
-    match type_name {
-        "f64" => value.is::<f64>(),
-        "String" => value.is::<String>(),
-        "bool" => value.is::<bool>(),
-        "i64" => value.is::<i64>(),
-        "i32" => value.is::<i32>(),
-        "u64" => value.is::<u64>(),
-        "any" => true,
-        _ => true, // unknown types pass through
     }
 }
 
@@ -625,13 +650,62 @@ mod tests {
         assert_eq!(exec.graph.node_count(), 1);
     }
 
+    /// A converter coerces a value as it crosses an edge whose endpoints
+    /// declare different types (u8 source -> f64 input).
     #[test]
-    fn value_type_check_helper() {
-        assert!(value_matches_type(&Value::new(1.0f64), "f64"));
-        assert!(value_matches_type(&Value::new("hi".to_string()), "String"));
-        assert!(value_matches_type(&Value::new(true), "bool"));
-        assert!(!value_matches_type(&Value::new(1.0f64), "String"));
-        assert!(!value_matches_type(&Value::new("hi".to_string()), "f64"));
-        assert!(value_matches_type(&Value::new(1.0f64), "any"));
+    fn converter_coerces_value_across_edge() {
+        struct ConstU8(u8);
+        impl ExecutableNode for ConstU8 {
+            fn execute(&mut self, _inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
+                ctx.emit_typed("value", self.0);
+                ctx.flush();
+                Ok(())
+            }
+            fn pin_definitions(&self) -> &[PinDefinition] {
+                &[]
+            }
+        }
+
+        fn typed_node(id: NodeId, pin: &'static str, dir: PinDirection, ty: &'static str) -> GraphNode {
+            GraphNode {
+                id,
+                type_id: "test".to_string(),
+                config: NodeConfig::default(),
+                pin_defs: vec![PinDefinition {
+                    name: pin,
+                    direction: dir,
+                    data_mode: DataMode::Value,
+                    pin_kind: PinKind::Sample,
+                    type_name: ty,
+                }],
+                position: (0.0, 0.0),
+            }
+        }
+
+        let mut graph = Graph::new();
+        let a = NodeId::next();
+        let b = NodeId::next();
+        let c = NodeId::next();
+        graph.add_node(typed_node(a, "value", PinDirection::Output, "u8"));
+        graph.add_node(typed_node(b, "in", PinDirection::Input, "f64"));
+        graph.add_node(make_node(c));
+        graph.add_edge(make_edge(a, "value", b, "in"));
+        let bc = make_edge(b, "out", c, "in");
+        let bc_id = bc.id;
+        graph.add_edge(bc);
+
+        let mut conv = TypeConverters::new();
+        conv.register_typed::<u8, f64, _>("u8", "f64", |x| x as f64);
+
+        let mut exec = GraphExecutor::new(graph);
+        exec.set_converters(Arc::new(conv));
+        exec.register_node(a, Box::new(ConstU8(7)));
+        exec.register_node(b, Box::new(DoubleNode)); // reads in:f64, emits out = in*2
+        exec.register_node(c, Box::new(DoubleNode));
+        exec.execute_all().unwrap();
+
+        // Coercion u8(7) -> f64(7.0); DoubleNode emits 14.0 onto b->c.
+        let val = exec.edge_value(bc_id).unwrap();
+        assert_eq!(val.downcast_ref::<f64>(), Some(&14.0));
     }
 }

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use iced::keyboard;
 use iced::widget::{column, container, row, stack, text, text_input};
@@ -13,7 +14,7 @@ use iced_nodegraph::{
 use iced_palette::{get_filtered_command_index, is_toggle_shortcut};
 use zeughaus_core::{
     DomainPlugin, EdgeData, EdgeId, EdgeSemantic, GraphDocument, NodeConfig, NodeData,
-    NodeDefinition, NodeId, PinDefinition, PinDirection, SettingDef, Value,
+    NodeDefinition, NodeId, PinDefinition, PinDirection, SettingDef, TypeConverters, Value,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use zeughaus_runtime::DeferredWork;
@@ -60,6 +61,10 @@ pub struct App {
     executor: GraphExecutor,
     plugins: Vec<Box<dyn DomainPlugin>>,
     catalog: Vec<NodeDefinition>,
+    /// Type converters built from the plugins. Shared with the executor; used
+    /// here for connection validation so the editor and runtime agree on which
+    /// type pairs may connect.
+    converters: Arc<TypeConverters>,
 
     // Display values (node_id -> display string)
     display_values: HashMap<NodeId, String>,
@@ -98,7 +103,18 @@ impl App {
             Box::new(LlmPlugin),
         ];
         let catalog: Vec<NodeDefinition> = plugins.iter().flat_map(|p| p.node_catalog()).collect();
-        let executor = GraphExecutor::new(Graph::new());
+
+        // Build the type-converter registry from builtins plus each plugin's
+        // own converters, then share it with the executor.
+        let converters = Arc::new({
+            let mut c = TypeConverters::with_builtins();
+            for p in &plugins {
+                p.register_converters(&mut c);
+            }
+            c
+        });
+        let mut executor = GraphExecutor::new(Graph::new());
+        executor.set_converters(converters.clone());
 
         let mut app = Self {
             nodes: HashMap::new(),
@@ -110,6 +126,7 @@ impl App {
             executor,
             plugins,
             catalog,
+            converters,
             display_values: HashMap::new(),
             const_inputs: HashMap::new(),
             node_settings: HashMap::new(),
@@ -843,6 +860,7 @@ impl App {
                 // direction itself, so we must validate it here: exactly one
                 // output and one input, distinct nodes, compatible types.
                 let nodes = &self.nodes;
+                let converters = &self.converters;
                 move |from, to| {
                     let from_id = NodeId(*from.node_id());
                     let to_id = NodeId(*to.node_id());
@@ -864,7 +882,14 @@ impl App {
                     if !opposite {
                         return false;
                     }
-                    fp.type_name == "any" || tp.type_name == "any" || fp.type_name == tp.type_name
+                    // Converters are directional (output type -> input type), so
+                    // resolve which side is the output before checking.
+                    let (out_pin, in_pin) = if fp.direction == PinDirection::Output {
+                        (fp, tp)
+                    } else {
+                        (tp, fp)
+                    };
+                    converters.compatible(out_pin.type_name, in_pin.type_name)
                 }
             });
 

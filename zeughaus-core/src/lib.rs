@@ -1,4 +1,5 @@
 pub mod context;
+pub mod convert;
 pub mod document;
 pub mod edge;
 pub mod error;
@@ -9,6 +10,7 @@ pub mod plugin;
 pub mod value;
 
 pub use context::{AsyncWork, InputSet, NodeContext};
+pub use convert::TypeConverters;
 pub use document::{EdgeData, GraphDocument, NodeData};
 pub use edge::EdgeSemantic;
 pub use error::{Result, ZeughausError};
