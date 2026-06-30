@@ -15,6 +15,14 @@ fn main() -> iced::Result {
     #[cfg(target_arch = "wasm32")]
     console_error_panic_hook::set_once();
 
+    // Give this process a unique id range so two collaborating editors sharing
+    // a SpacetimeDB store never assign colliding node/edge ids.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        zeughaus_core::NodeId::seed_unique();
+        zeughaus_core::EdgeId::seed_unique();
+    }
+
     iced::application(App::new, App::update, App::view)
         .subscription(App::subscription)
         .title("Zeughaus Editor")

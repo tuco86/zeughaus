@@ -44,6 +44,10 @@ pub enum Message {
     NodeSettingChanged { node_id: u64, key: String, value: String },
     // Periodic redraw tick while nodes are working, to animate node borders.
     Tick,
+    // Drain queued remote sync events from the SpacetimeDB subscription and
+    // apply them to the editor. Only active while connected.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    SyncPoll,
     // A node's deferred async work finished. Carries the output pin values, or
     // an error message. Delivered back into the executor to resume downstream.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]

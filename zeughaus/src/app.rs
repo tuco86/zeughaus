@@ -89,10 +89,15 @@ pub struct App {
     palette_selected: usize,
 
     // Live SpacetimeDB connection (opt-in via ZEUGHAUS_STDB_URI). Held to keep
-    // the background message loop alive; not yet driving editor state.
+    // the background message loop alive and to call reducers on local edits.
     #[cfg(not(target_arch = "wasm32"))]
-    #[allow(dead_code)]
     stdb: Option<crate::module_bindings::DbConnection>,
+    // Receiver for remote changes, drained on the SyncPoll timer.
+    #[cfg(not(target_arch = "wasm32"))]
+    sync_rx: Option<std::sync::mpsc::Receiver<crate::sync::SyncEvent>>,
+    // True while applying a remote change, so it does not echo back as a reducer.
+    #[cfg(not(target_arch = "wasm32"))]
+    applying_remote: bool,
 }
 
 impl App {
@@ -124,6 +129,14 @@ impl App {
         let mut executor = GraphExecutor::new(Graph::new());
         executor.set_converters(converters.clone());
 
+        // Establish the SpacetimeDB connection (opt-in) and split the live
+        // connection from its remote-event receiver.
+        #[cfg(not(target_arch = "wasm32"))]
+        let (stdb, sync_rx) = match crate::sync::maybe_connect() {
+            Some((conn, rx)) => (Some(conn), Some(rx)),
+            None => (None, None),
+        };
+
         let mut app = Self {
             nodes: HashMap::new(),
             node_order: Vec::new(),
@@ -145,7 +158,11 @@ impl App {
             palette_input: String::new(),
             palette_selected: 0,
             #[cfg(not(target_arch = "wasm32"))]
-            stdb: crate::sync::maybe_connect(),
+            stdb,
+            #[cfg(not(target_arch = "wasm32"))]
+            sync_rx,
+            #[cfg(not(target_arch = "wasm32"))]
+            applying_remote: false,
         };
 
         // Restore last session (may kick off async node work, e.g. chat nodes).
@@ -216,6 +233,8 @@ impl App {
             _ => {}
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        self.push_node(id);
         let task = self.execute_graph();
         self.autosave();
         task
@@ -264,6 +283,10 @@ impl App {
         self.executor.on_edge_added(edge_id);
         // Grow a variadic target (e.g. merge node) so the next empty input shows.
         self.resync_arity(to_node);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(e) = self.edges.last() {
+            self.push_edge(e);
+        }
         let task = self.execute_graph();
         self.autosave();
         task
@@ -317,6 +340,8 @@ impl App {
             let edge = self.edges.remove(pos);
             self.executor.disconnect_edge(edge.id);
             self.resync_arity(to_node);
+            #[cfg(not(target_arch = "wasm32"))]
+            self.push_edge_remove(edge.id);
             let task = self.execute_graph();
             self.autosave();
             task
@@ -405,6 +430,12 @@ impl App {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn load_autosave(&mut self) -> Task<Message> {
+        // When syncing, the SpacetimeDB store is the source of truth: start
+        // empty and adopt the shared graph from the subscription instead of the
+        // local autosave (which would conflict with remote ids).
+        if self.stdb.is_some() {
+            return Task::none();
+        }
         let path = Self::autosave_path();
         if let Ok(json) = std::fs::read_to_string(&path)
             && let Ok(doc) = serde_json::from_str::<GraphDocument>(&json)
@@ -491,6 +522,78 @@ impl App {
         GraphDocument { nodes, edges }
     }
 
+    /// Instantiates one node from its serialized data (explicit id, position,
+    /// params), registering it in the executor and editor state. Shared by
+    /// document loading and remote sync apply. No-op on a duplicate id or an
+    /// unknown node type.
+    fn insert_node_from_data(&mut self, node_data: &NodeData) {
+        let type_id = &node_data.type_id;
+        let Some(mut exec) = self.plugins.iter().find_map(|p| p.create_node(type_id)) else {
+            return;
+        };
+        let id = NodeId(node_data.id);
+        if self.nodes.contains_key(&id) {
+            return;
+        }
+        let pin_defs = exec.pin_definitions().to_vec();
+        let setting_defs = exec.settings();
+        let position = Point::new(node_data.x, node_data.y);
+
+        let is_const = type_id.starts_with("transform.const_");
+        let setting_names: HashSet<&str> = setting_defs.iter().map(|d| d.name).collect();
+
+        // Apply saved parameters. Const nodes parse their typed value;
+        // setting-bearing nodes restore each named string setting.
+        for (name, value_str) in &node_data.params {
+            match type_id.as_str() {
+                "transform.const_f64" => {
+                    if let Ok(f) = value_str.parse::<f64>() {
+                        let _ = exec.set_parameter(name, Value::new(f));
+                    }
+                }
+                "transform.const_bool" => {
+                    let b = value_str == "true" || value_str == "1";
+                    let _ = exec.set_parameter(name, Value::new(b));
+                }
+                "transform.const_string" => {
+                    let _ = exec.set_parameter(name, Value::new(value_str.clone()));
+                }
+                _ => {}
+            }
+            if is_const {
+                self.const_inputs.insert(id, value_str.clone());
+            } else if setting_names.contains(name.as_str()) {
+                let _ = exec.set_parameter(name, Value::new(value_str.clone()));
+                self.node_settings
+                    .entry(id)
+                    .or_default()
+                    .insert(name.clone(), value_str.clone());
+            }
+        }
+
+        self.executor.graph.add_node(GraphNode {
+            id,
+            type_id: type_id.clone(),
+            config: NodeConfig::default(),
+            pin_defs: pin_defs.clone(),
+            position: (position.x, position.y),
+        });
+        self.executor.register_node(id, exec);
+
+        self.nodes.insert(
+            id,
+            EditorNode {
+                id,
+                type_id: type_id.clone(),
+                display_name: node_data.display_name.clone(),
+                position,
+                pin_defs,
+                settings: setting_defs,
+            },
+        );
+        self.node_order.push(id);
+    }
+
     fn load_document(&mut self, doc: GraphDocument) -> Task<Message> {
         // Clear current state
         self.nodes.clear();
@@ -513,73 +616,7 @@ impl App {
 
         // Rebuild from document
         for node_data in &doc.nodes {
-            let type_id = &node_data.type_id;
-            let exec = self.plugins.iter().find_map(|p| p.create_node(type_id));
-            let Some(mut exec) = exec else { continue };
-
-            let id = NodeId(node_data.id);
-            // Skip duplicate ids (e.g. a file corrupted by the old id-collision
-            // bug); rendering the same id twice causes the doubled-drag glitch.
-            if self.nodes.contains_key(&id) {
-                continue;
-            }
-            let pin_defs = exec.pin_definitions().to_vec();
-            let setting_defs = exec.settings();
-            let position = Point::new(node_data.x, node_data.y);
-
-            let is_const = type_id.starts_with("transform.const_");
-            let setting_names: HashSet<&str> = setting_defs.iter().map(|d| d.name).collect();
-
-            // Apply saved parameters. Const nodes parse their typed value;
-            // setting-bearing nodes restore each named string setting.
-            for (name, value_str) in &node_data.params {
-                match type_id.as_str() {
-                    "transform.const_f64" => {
-                        if let Ok(f) = value_str.parse::<f64>() {
-                            let _ = exec.set_parameter(name, Value::new(f));
-                        }
-                    }
-                    "transform.const_bool" => {
-                        let b = value_str == "true" || value_str == "1";
-                        let _ = exec.set_parameter(name, Value::new(b));
-                    }
-                    "transform.const_string" => {
-                        let _ = exec.set_parameter(name, Value::new(value_str.clone()));
-                    }
-                    _ => {}
-                }
-                if is_const {
-                    self.const_inputs.insert(id, value_str.clone());
-                } else if setting_names.contains(name.as_str()) {
-                    let _ = exec.set_parameter(name, Value::new(value_str.clone()));
-                    self.node_settings
-                        .entry(id)
-                        .or_default()
-                        .insert(name.clone(), value_str.clone());
-                }
-            }
-
-            self.executor.graph.add_node(GraphNode {
-                id,
-                type_id: type_id.clone(),
-                config: NodeConfig::default(),
-                pin_defs: pin_defs.clone(),
-                position: (position.x, position.y),
-            });
-            self.executor.register_node(id, exec);
-
-            self.nodes.insert(
-                id,
-                EditorNode {
-                    id,
-                    type_id: type_id.clone(),
-                    display_name: node_data.display_name.clone(),
-                    position,
-                    pin_defs,
-                    settings: setting_defs,
-                },
-            );
-            self.node_order.push(id);
+            self.insert_node_from_data(node_data);
         }
 
         // Rebuild edges
@@ -680,6 +717,11 @@ impl App {
                             node.position.y + delta.y,
                         );
                     }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(node) = self.nodes.get(&id) {
+                        let (x, y) = (node.position.x, node.position.y);
+                        self.push_move(id, x, y);
+                    }
                 }
                 self.autosave();
             }
@@ -704,6 +746,8 @@ impl App {
             Message::DeleteNodes(ids) => {
                 for raw_id in &ids {
                     let id = NodeId(*raw_id);
+                    #[cfg(not(target_arch = "wasm32"))]
+                    self.push_delete(id);
                     self.nodes.remove(&id);
                     self.node_order.retain(|n| *n != id);
                     self.edges.retain(|e| e.from_node != id && e.to_node != id);
@@ -774,6 +818,8 @@ impl App {
                     }
                     _ => {}
                 }
+                #[cfg(not(target_arch = "wasm32"))]
+                self.push_params(id);
                 self.autosave();
                 return task;
             }
@@ -785,11 +831,19 @@ impl App {
                     .insert(key.clone(), value.clone());
                 let _ = self.executor.set_parameter(id, &key, Value::new(value));
                 let task = self.execute_graph();
+                #[cfg(not(target_arch = "wasm32"))]
+                self.push_params(id);
                 self.autosave();
                 return task;
             }
             Message::Tick => {
                 // No-op: re-rendering advances the widget's animation clock.
+            }
+            Message::SyncPoll => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    return self.drain_sync();
+                }
             }
             Message::AsyncNodeDone { node_id, result } => {
                 let id = NodeId(node_id);
@@ -1129,21 +1183,248 @@ impl App {
             None
         });
 
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let mut subs = vec![events];
+
         // The library only auto-redraws for animated edges, not node borders.
         // While any node is working, drive ~30fps redraws so the marching-ants
         // node border animates. Native only: iced::time::every needs the tokio
         // executor feature, and async work only runs natively anyway.
         #[cfg(not(target_arch = "wasm32"))]
         if self.executor.pending_count() > 0 {
-            let ticks = iced::time::every(std::time::Duration::from_millis(33))
-                .map(|_| Message::Tick);
-            return Subscription::batch([events, ticks]);
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(33)).map(|_| Message::Tick),
+            );
         }
-        events
+
+        // Drain remote sync events on a steady cadence while connected.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.stdb.is_some() {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(100))
+                    .map(|_| Message::SyncPoll),
+            );
+        }
+
+        Subscription::batch(subs)
     }
 
     pub fn theme(&self) -> Theme {
         Theme::Dark
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl App {
+    /// Serializes one node's current data (id, type, position, params) for a
+    /// reducer call.
+    fn node_data(&self, id: NodeId) -> Option<NodeData> {
+        let node = self.nodes.get(&id)?;
+        let mut params: Vec<(String, String)> = self
+            .const_inputs
+            .get(&id)
+            .map(|v| vec![("value".to_string(), v.clone())])
+            .unwrap_or_default();
+        if let Some(settings) = self.node_settings.get(&id) {
+            params.extend(settings.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        Some(NodeData {
+            id: id.0,
+            type_id: node.type_id.clone(),
+            display_name: node.display_name.clone(),
+            x: node.position.x,
+            y: node.position.y,
+            params,
+        })
+    }
+
+    // Send: local edits -> reducers. Guarded by `applying_remote` so a change
+    // applied from the store does not echo back as a new reducer call.
+
+    fn push_node(&self, id: NodeId) {
+        if self.applying_remote {
+            return;
+        }
+        if let (Some(conn), Some(nd)) = (&self.stdb, self.node_data(id)) {
+            crate::sync::send_create_node(conn, &nd);
+        }
+    }
+
+    fn push_params(&self, id: NodeId) {
+        if self.applying_remote {
+            return;
+        }
+        if let (Some(conn), Some(nd)) = (&self.stdb, self.node_data(id)) {
+            crate::sync::send_set_params(conn, id.0, &nd.params);
+        }
+    }
+
+    fn push_move(&self, id: NodeId, x: f32, y: f32) {
+        if self.applying_remote {
+            return;
+        }
+        if let Some(conn) = &self.stdb {
+            crate::sync::send_move_node(conn, id.0, x, y);
+        }
+    }
+
+    fn push_delete(&self, id: NodeId) {
+        if self.applying_remote {
+            return;
+        }
+        if let Some(conn) = &self.stdb {
+            crate::sync::send_delete_node(conn, id.0);
+        }
+    }
+
+    fn push_edge(&self, e: &EditorEdge) {
+        if self.applying_remote {
+            return;
+        }
+        if let Some(conn) = &self.stdb {
+            crate::sync::send_connect_edge(
+                conn,
+                &EdgeData {
+                    id: e.id.0,
+                    from_node: e.from_node.0,
+                    from_pin: e.from_pin.to_string(),
+                    to_node: e.to_node.0,
+                    to_pin: e.to_pin.to_string(),
+                },
+            );
+        }
+    }
+
+    fn push_edge_remove(&self, id: EdgeId) {
+        if self.applying_remote {
+            return;
+        }
+        if let Some(conn) = &self.stdb {
+            crate::sync::send_disconnect_edge(conn, id.0);
+        }
+    }
+
+    // Receive: drain queued remote events and apply them to the editor.
+
+    fn drain_sync(&mut self) -> Task<Message> {
+        let mut events = Vec::new();
+        if let Some(rx) = &self.sync_rx {
+            while let Ok(ev) = rx.try_recv() {
+                events.push(ev);
+            }
+        }
+        if events.is_empty() {
+            return Task::none();
+        }
+        self.applying_remote = true;
+        for ev in events {
+            self.apply_sync_event(ev);
+        }
+        self.applying_remote = false;
+        let task = self.execute_graph();
+        self.update_display_values();
+        task
+    }
+
+    fn apply_sync_event(&mut self, ev: crate::sync::SyncEvent) {
+        use crate::sync::SyncEvent;
+        match ev {
+            SyncEvent::NodeUpsert(nd) => self.apply_node_upsert(nd),
+            SyncEvent::NodeRemove(id) => self.apply_node_remove(NodeId(id)),
+            SyncEvent::EdgeInsert(ed) => self.apply_edge_insert(ed),
+            SyncEvent::EdgeRemove(id) => self.apply_edge_remove(EdgeId(id)),
+        }
+    }
+
+    fn apply_node_upsert(&mut self, nd: NodeData) {
+        let id = NodeId(nd.id);
+        if self.nodes.contains_key(&id) {
+            let pos = Point::new(nd.x, nd.y);
+            if let Some(en) = self.nodes.get_mut(&id) {
+                en.position = pos;
+            }
+            if let Some(gn) = self.executor.graph.node_mut(id) {
+                gn.position = (pos.x, pos.y);
+            }
+            self.apply_params(id, &nd.type_id, &nd.params);
+        } else {
+            self.insert_node_from_data(&nd);
+        }
+    }
+
+    fn apply_params(&mut self, id: NodeId, type_id: &str, params: &[(String, String)]) {
+        let is_const = type_id.starts_with("transform.const_");
+        for (name, value_str) in params {
+            match type_id {
+                "transform.const_f64" => {
+                    if let Ok(f) = value_str.parse::<f64>() {
+                        let _ = self.executor.set_parameter(id, name, Value::new(f));
+                    }
+                }
+                "transform.const_bool" => {
+                    let b = value_str == "true" || value_str == "1";
+                    let _ = self.executor.set_parameter(id, name, Value::new(b));
+                }
+                "transform.const_string" => {
+                    let _ = self.executor.set_parameter(id, name, Value::new(value_str.clone()));
+                }
+                _ => {
+                    let _ = self.executor.set_parameter(id, name, Value::new(value_str.clone()));
+                }
+            }
+            if is_const {
+                self.const_inputs.insert(id, value_str.clone());
+            } else {
+                self.node_settings
+                    .entry(id)
+                    .or_default()
+                    .insert(name.clone(), value_str.clone());
+            }
+        }
+    }
+
+    fn apply_node_remove(&mut self, id: NodeId) {
+        self.nodes.remove(&id);
+        self.node_order.retain(|n| *n != id);
+        self.edges.retain(|e| e.from_node != id && e.to_node != id);
+        self.executor.remove_node(id);
+        self.const_inputs.remove(&id);
+        self.node_settings.remove(&id);
+    }
+
+    fn apply_edge_insert(&mut self, ed: EdgeData) {
+        let edge_id = EdgeId(ed.id);
+        if self.edges.iter().any(|e| e.id == edge_id) {
+            return;
+        }
+        let from_node = NodeId(ed.from_node);
+        let to_node = NodeId(ed.to_node);
+        // Both endpoints must already exist locally (node inserts arrive first).
+        if !self.nodes.contains_key(&from_node) || !self.nodes.contains_key(&to_node) {
+            return;
+        }
+        let from_pin = leak_string(&ed.from_pin);
+        let to_pin = leak_string(&ed.to_pin);
+        self.remove_edges_into(to_node, to_pin);
+        self.executor.graph.add_edge(GraphEdge {
+            id: edge_id,
+            from_node,
+            from_pin,
+            to_node,
+            to_pin,
+            semantic: EdgeSemantic::default(),
+        });
+        self.edges.push(EditorEdge { id: edge_id, from_node, from_pin, to_node, to_pin });
+        self.executor.on_edge_added(edge_id);
+        self.resync_arity(to_node);
+    }
+
+    fn apply_edge_remove(&mut self, id: EdgeId) {
+        if let Some(pos) = self.edges.iter().position(|e| e.id == id) {
+            let edge = self.edges.remove(pos);
+            self.executor.disconnect_edge(edge.id);
+            self.resync_arity(edge.to_node);
+        }
     }
 }
 
