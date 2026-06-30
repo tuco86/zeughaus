@@ -1928,9 +1928,7 @@ dependencies = [
 
 [[package]]
 name = "iced_nodegraph"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e56c4bbb05aaebb84c04a5c64756a958a366f56678d12b77825c750b6ae75f3"
+version = "0.3.0-dev"
 dependencies = [
  "bitflags 2.11.0",
  "euclid",
@@ -1945,9 +1943,7 @@ dependencies = [
 
 [[package]]
 name = "iced_nodegraph_sdf"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c96f3f5d24907bb961940e51cc17fec1826624fc555ea04a1b54a41793c7aa6"
+version = "0.3.0-dev"
 dependencies = [
  "bytemuck",
  "encase",

@@ -31,7 +31,7 @@ zeughaus-ml = { path = "zeughaus-ml" }
 zeughaus-flow = { path = "zeughaus-flow" }
 
 iced = { version = "0.14", features = ["advanced", "wgpu", "tokio"] }
-iced_nodegraph = "0.2.0"
+iced_nodegraph = { path = "../iced_nodegraph/iced_nodegraph" }
 iced_palette = { git = "https://github.com/tuco86/iced_palette.git", branch = "main" }
 
 serde = { version = "1.0", features = ["derive"] }
