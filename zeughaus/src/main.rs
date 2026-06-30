@@ -1,6 +1,12 @@
 mod app;
 mod message;
 mod palette;
+// SpacetimeDB client: generated bindings + minimal connect/subscribe layer.
+// Native-only for now; the wasm editor sync path is a later step.
+#[cfg(not(target_arch = "wasm32"))]
+mod module_bindings;
+#[cfg(not(target_arch = "wasm32"))]
+mod sync;
 
 use app::App;
 

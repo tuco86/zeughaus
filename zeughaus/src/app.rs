@@ -87,6 +87,12 @@ pub struct App {
     palette_open: bool,
     palette_input: String,
     palette_selected: usize,
+
+    // Live SpacetimeDB connection (opt-in via ZEUGHAUS_STDB_URI). Held to keep
+    // the background message loop alive; not yet driving editor state.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(dead_code)]
+    stdb: Option<crate::module_bindings::DbConnection>,
 }
 
 impl App {
@@ -138,6 +144,8 @@ impl App {
             palette_open: false,
             palette_input: String::new(),
             palette_selected: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            stdb: crate::sync::maybe_connect(),
         };
 
         // Restore last session (may kick off async node work, e.g. chat nodes).
