@@ -6240,6 +6240,7 @@ dependencies = [
  "web-time",
  "zeughaus-capture",
  "zeughaus-core",
+ "zeughaus-flow",
  "zeughaus-llm",
  "zeughaus-ml",
  "zeughaus-process",
@@ -6262,6 +6263,13 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "zeughaus-flow"
+version = "0.1.0"
+dependencies = [
+ "zeughaus-core",
 ]
 
 [[package]]

@@ -25,6 +25,7 @@ use zeughaus_capture::CapturePlugin;
 use zeughaus_llm::LlmPlugin;
 #[cfg(not(target_arch = "wasm32"))]
 use zeughaus_process::ProcessPlugin;
+use zeughaus_flow::FlowPlugin;
 use zeughaus_ml::MlPlugin;
 use zeughaus_transform::TransformPlugin;
 
@@ -95,6 +96,7 @@ impl App {
         let plugins: Vec<Box<dyn DomainPlugin>> = vec![
             Box::new(TransformPlugin),
             Box::new(MlPlugin),
+            Box::new(FlowPlugin),
             #[cfg(not(target_arch = "wasm32"))]
             Box::new(ProcessPlugin),
             #[cfg(not(target_arch = "wasm32"))]
