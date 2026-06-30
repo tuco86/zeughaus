@@ -1,0 +1,190 @@
+//! Merge layer nodes (Concatenate, Add, ...). Unlike the single-input layer
+//! nodes, a merge node has two model inputs `a` and `b` and joins the two
+//! branches into one DAG before appending the merge layer. For more than two
+//! inputs, chain merge nodes.
+
+use zeughaus_core::*;
+
+use super::layer::{build_kwargs, ParamDef, ParamType};
+use crate::model::{KerasModel, Layer};
+
+/// Static description of a merge node type. Mirrors `LayerSpec` but for the
+/// two-input merge layers.
+#[derive(Debug, Clone, Copy)]
+pub struct MergeSpec {
+    pub type_id: &'static str,
+    pub display_name: &'static str,
+    pub keras_class: &'static str,
+    pub params: &'static [ParamDef],
+}
+
+const fn p(name: &'static str, default: &'static str, placeholder: &'static str, ty: ParamType) -> ParamDef {
+    ParamDef { name, default, placeholder, ty }
+}
+
+/// The catalog of supported Keras merge layers. Most take no parameters; the
+/// merge semantics come from the class itself.
+pub static MERGES: &[MergeSpec] = &[
+    MergeSpec {
+        type_id: "ml.concatenate",
+        display_name: "Concatenate",
+        keras_class: "Concatenate",
+        params: &[p("axis", "", "-1", ParamType::Raw)],
+    },
+    MergeSpec { type_id: "ml.add", display_name: "Add", keras_class: "Add", params: &[] },
+    MergeSpec { type_id: "ml.subtract", display_name: "Subtract", keras_class: "Subtract", params: &[] },
+    MergeSpec { type_id: "ml.multiply", display_name: "Multiply", keras_class: "Multiply", params: &[] },
+    MergeSpec { type_id: "ml.average", display_name: "Average", keras_class: "Average", params: &[] },
+    MergeSpec { type_id: "ml.maximum", display_name: "Maximum", keras_class: "Maximum", params: &[] },
+    MergeSpec { type_id: "ml.minimum", display_name: "Minimum", keras_class: "Minimum", params: &[] },
+    MergeSpec {
+        type_id: "ml.dot",
+        display_name: "Dot",
+        keras_class: "Dot",
+        params: &[p("axes", "-1", "-1 or (1, 2)", ParamType::Raw)],
+    },
+];
+
+pub fn merge_spec(type_id: &str) -> Option<&'static MergeSpec> {
+    MERGES.iter().find(|s| s.type_id == type_id)
+}
+
+fn merge_pins() -> Vec<PinDefinition> {
+    vec![
+        PinDefinition {
+            name: "a",
+            direction: PinDirection::Input,
+            data_mode: DataMode::Value,
+            pin_kind: PinKind::Sample,
+            type_name: "KerasModel",
+        },
+        PinDefinition {
+            name: "b",
+            direction: PinDirection::Input,
+            data_mode: DataMode::Value,
+            pin_kind: PinKind::Sample,
+            type_name: "KerasModel",
+        },
+        PinDefinition {
+            name: "out",
+            direction: PinDirection::Output,
+            data_mode: DataMode::Value,
+            pin_kind: PinKind::Sample,
+            type_name: "KerasModel",
+        },
+    ]
+}
+
+/// A merge layer joining two branches. Both inputs must carry a non-empty model
+/// (a dangling branch is a user error and is reported, not panicked on).
+pub struct MergeNode {
+    spec: &'static MergeSpec,
+    values: Vec<(&'static str, String)>,
+    pins: Vec<PinDefinition>,
+}
+
+impl MergeNode {
+    pub fn new(spec: &'static MergeSpec) -> Self {
+        let values = spec.params.iter().map(|d| (d.name, d.default.to_string())).collect();
+        Self { spec, values, pins: merge_pins() }
+    }
+}
+
+impl ExecutableNode for MergeNode {
+    fn execute(&mut self, inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
+        let a: KerasModel = inputs.get("a").unwrap_or_default();
+        let b: KerasModel = inputs.get("b").unwrap_or_default();
+        if a.is_empty() || b.is_empty() {
+            return Err(ZeughausError::ExecutionFailed(format!(
+                "{} needs two connected model inputs",
+                self.spec.display_name
+            )));
+        }
+        let layer = Layer {
+            keras_class: self.spec.keras_class.to_string(),
+            kwargs: build_kwargs(self.spec.params, &self.values),
+        };
+        let out = KerasModel::join(ctx.source_node.0, layer, &[&a, &b]);
+        ctx.emit_typed("out", out);
+        ctx.flush();
+        Ok(())
+    }
+
+    fn pin_definitions(&self) -> &[PinDefinition] {
+        &self.pins
+    }
+
+    fn settings(&self) -> Vec<SettingDef> {
+        self.spec
+            .params
+            .iter()
+            .map(|d| SettingDef {
+                name: d.name,
+                default: d.default,
+                placeholder: d.placeholder,
+                multiline: false,
+            })
+            .collect()
+    }
+
+    fn set_parameter(&mut self, name: &str, value: Value) -> Result<()> {
+        if let Some(s) = value.downcast_ref::<String>()
+            && let Some(entry) = self.values.iter_mut().find(|(n, _)| *n == name)
+        {
+            entry.1 = s.clone();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input_model(id: u64) -> KerasModel {
+        KerasModel::new().with_layer(
+            id,
+            Layer { keras_class: "Input".to_string(), kwargs: vec![("shape".to_string(), "(4,)".to_string())] },
+        )
+    }
+
+    #[test]
+    fn join_merges_two_branches() {
+        let mut node = MergeNode::new(merge_spec("ml.concatenate").unwrap());
+        let mut inputs = InputSet::new();
+        inputs.insert("a", Value::new(input_model(1)));
+        inputs.insert("b", Value::new(input_model(2)));
+        let mut ctx = NodeContext::new(NodeId(3), 0);
+        node.execute(&inputs, &mut ctx).unwrap();
+        let out = ctx.take_outputs();
+        let model = out["out"].downcast_ref::<KerasModel>().unwrap();
+        assert_eq!(model.output, Some(3));
+        let merge_step = model.steps.iter().find(|s| s.id == 3).unwrap();
+        assert_eq!(merge_step.inputs, vec![1, 2]);
+        assert_eq!(merge_step.layer.keras_class, "Concatenate");
+    }
+
+    #[test]
+    fn empty_branch_errors() {
+        let mut node = MergeNode::new(merge_spec("ml.add").unwrap());
+        let mut inputs = InputSet::new();
+        inputs.insert("a", Value::new(input_model(1)));
+        // b missing -> empty
+        let mut ctx = NodeContext::new(NodeId(3), 0);
+        assert!(node.execute(&inputs, &mut ctx).is_err());
+    }
+
+    #[test]
+    fn dot_carries_axes_param() {
+        let mut node = MergeNode::new(merge_spec("ml.dot").unwrap());
+        node.set_parameter("axes", Value::new("(1, 2)".to_string())).unwrap();
+        let mut inputs = InputSet::new();
+        inputs.insert("a", Value::new(input_model(1)));
+        inputs.insert("b", Value::new(input_model(2)));
+        let mut ctx = NodeContext::new(NodeId(3), 0);
+        node.execute(&inputs, &mut ctx).unwrap();
+        let model = ctx.take_outputs()["out"].downcast_ref::<KerasModel>().unwrap().clone();
+        let step = model.steps.iter().find(|s| s.id == 3).unwrap();
+        assert_eq!(step.layer.render(), "layers.Dot(axes=(1, 2))");
+    }
+}

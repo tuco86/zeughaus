@@ -52,13 +52,14 @@ impl ExecutableNode for ExportNode {
         }
 
         // Boundary validation: the functional model is built from
-        // keras.Model(inputs=x0, ...), so the root layer x0 must be an Input
-        // (which yields a KerasTensor). Any other first layer produces a layer
-        // object, not a tensor, and keras.Model would reject it at runtime.
-        if model.layers[0].keras_class != "Input" {
+        // keras.Model(inputs=[roots], ...), so every root (a step with no
+        // incoming edge) must be an Input layer -- only Input yields a
+        // KerasTensor. Any other root would produce a layer object, not a
+        // tensor, and keras.Model would reject it at runtime.
+        if let Some(bad) = model.roots().iter().find(|s| s.layer.keras_class != "Input") {
             return Err(ZeughausError::ExecutionFailed(format!(
-                "first layer must be Input, found {}",
-                model.layers[0].keras_class
+                "every input branch must start with an Input layer, found {}",
+                bad.layer.keras_class
             )));
         }
 
@@ -103,10 +104,13 @@ mod tests {
     #[test]
     fn non_input_first_layer_errors() {
         let mut node = ExportNode::new();
-        let model = KerasModel::new().with_layer(Layer {
-            keras_class: "Dense".to_string(),
-            kwargs: vec![("units".to_string(), "10".to_string())],
-        });
+        let model = KerasModel::new().with_layer(
+            1,
+            Layer {
+                keras_class: "Dense".to_string(),
+                kwargs: vec![("units".to_string(), "10".to_string())],
+            },
+        );
         let mut inputs = InputSet::new();
         inputs.insert("model", Value::new(model));
         let mut ctx = NodeContext::new(NodeId(1), 0);
@@ -116,10 +120,9 @@ mod tests {
     #[test]
     fn valid_model_emits_code() {
         let mut node = ExportNode::new();
-        let model = KerasModel::new().with_layer(input_layer()).with_layer(Layer {
-            keras_class: "Flatten".to_string(),
-            kwargs: vec![],
-        });
+        let model = KerasModel::new()
+            .with_layer(1, input_layer())
+            .with_layer(2, Layer { keras_class: "Flatten".to_string(), kwargs: vec![] });
         let mut inputs = InputSet::new();
         inputs.insert("model", Value::new(model));
         let mut ctx = NodeContext::new(NodeId(1), 0);

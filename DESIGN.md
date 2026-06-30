@@ -94,24 +94,35 @@ Double-click navigates into the subgraph.
 
 The `zeughaus-ml` plugin turns Keras (TensorFlow) layers into nodes so a neural
 network can be designed entirely in the graph and exported as a runnable Keras
-functional-API program. A `KerasModel` value (an ordered layer stack plus an
-optional compile config) flows through the chain: each layer node consumes a
-model and emits it extended by one layer, mirroring the LLM plugin's
-Conversation pattern.
+functional-API program. A `KerasModel` value -- a directed acyclic graph of
+layer steps plus an optional compile config -- flows through the chain: each
+layer node consumes a model and emits it extended by one step, mirroring the LLM
+plugin's Conversation pattern. A plain feed-forward network is just a DAG where
+every step has one input; branches and merges add steps with zero or several.
 
 Codegen uses the functional API so the generated code mirrors the graph edges:
-every layer becomes a variable (`x0`, `x1`, ...), and an edge feeding one layer
-into the next renders as a call, `x1 = layers.Dense(...)(x0)`. The root layer
-(the `Input`, which has no incoming edge) is emitted without a call suffix, and
-the program closes with `keras.Model(inputs=x0, outputs=xN)`.
+every step becomes a variable (`x0`, `x1`, ...), and the call syntax reflects its
+inputs -- none for a root (`x0 = layers.Input(...)`), one for a normal layer
+(`x1 = layers.Dense(...)(x0)`), and a list for a merge
+(`x3 = layers.Concatenate()([x1, x2])`). The program closes with
+`keras.Model(inputs, outputs)` (a list of inputs for multi-input models).
+
+Each step carries a stable identity: the editor node that produced it. So when
+one layer fans out into two branches that later merge, the shared step is
+emitted once -- the merge dedups branch step sets by id. This is exactly why the
+identity must come from the producing node (`ctx.source_node`) rather than a
+per-value counter, which would collide across branches.
 
 Layer nodes are data-driven: every supported layer is a row in a static `LAYERS`
 table (Input, Dense, Conv1D/2D, Max/Average/GlobalAveragePooling, Flatten,
 Reshape, Dropout, BatchNormalization, LayerNormalization, Activation, LSTM, GRU,
-Embedding). Each parameter is typed -- strings are quoted in codegen, raw
-literals (numbers, tuples, bools) are emitted verbatim, and a blank value omits
-the kwarg so Keras applies its own default. The Export node validates at the
-boundary (non-empty model, Input layer first) and renders the final Python.
+Embedding). Merge nodes are a parallel `MERGES` table (Concatenate, Add,
+Subtract, Multiply, Average, Maximum, Minimum, Dot) and have two model inputs
+`a` and `b`; chain them for more. Each parameter is typed -- strings are quoted
+in codegen, raw literals (numbers, tuples, bools) are emitted verbatim, and a
+blank value omits the kwarg so Keras applies its own default. The Export node
+validates at the boundary (non-empty model, every input branch rooted in an
+Input layer) and renders the final Python.
 
 Example graph:
 
@@ -136,6 +147,20 @@ x5 = layers.Dense(units=10, activation='softmax')(x4)
 
 model = keras.Model(inputs=x0, outputs=x5)
 model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+model.summary()
+```
+
+Branches and merges work the same way. One `Input` fanning out to two `Conv2D`
+nodes joined by a `Concatenate` merge node renders as:
+
+```python
+x0 = layers.Input(shape=(32, 32, 3))
+x1 = layers.Conv2D(filters=16, kernel_size=(3, 3), activation='relu')(x0)
+x2 = layers.Conv2D(filters=16, kernel_size=(5, 5), activation='relu')(x0)
+x3 = layers.Concatenate()([x1, x2])
+x4 = layers.Dense(units=10, activation='softmax')(x3)
+
+model = keras.Model(inputs=x0, outputs=x4)
 model.summary()
 ```
 

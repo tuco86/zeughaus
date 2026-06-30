@@ -167,6 +167,32 @@ pub fn spec(type_id: &str) -> Option<&'static LayerSpec> {
     LAYERS.iter().find(|s| s.type_id == type_id)
 }
 
+/// Renders a layer's keyword arguments from its param defs and current values:
+/// string params are quoted, raw params emitted verbatim, blank params omitted
+/// (so Keras applies its own default). Shared by layer and merge nodes.
+pub(crate) fn build_kwargs(
+    params: &[ParamDef],
+    values: &[(&'static str, String)],
+) -> Vec<(String, String)> {
+    let mut kwargs = Vec::new();
+    for def in params {
+        let raw = values
+            .iter()
+            .find(|(n, _)| *n == def.name)
+            .map(|(_, v)| v.trim())
+            .unwrap_or("");
+        if raw.is_empty() {
+            continue;
+        }
+        let rendered = match def.ty {
+            ParamType::Str => format!("'{raw}'"),
+            ParamType::Raw => raw.to_string(),
+        };
+        kwargs.push((def.name.to_string(), rendered));
+    }
+    kwargs
+}
+
 /// Two pins shared by every layer node: model in (Sample), model out.
 fn layer_pins() -> Vec<PinDefinition> {
     vec![
@@ -203,34 +229,21 @@ impl LayerNode {
         Self { spec, values, pins: layer_pins() }
     }
 
-    /// Builds the rendered `Layer`, quoting string params and omitting any
-    /// param left blank (so Keras uses its own default).
+    /// Builds the rendered `Layer` from this node's params and current values.
     fn build_layer(&self) -> Layer {
-        let mut kwargs = Vec::new();
-        for def in self.spec.params {
-            let raw = self
-                .values
-                .iter()
-                .find(|(n, _)| *n == def.name)
-                .map(|(_, v)| v.trim())
-                .unwrap_or("");
-            if raw.is_empty() {
-                continue;
-            }
-            let rendered = match def.ty {
-                ParamType::Str => format!("'{raw}'"),
-                ParamType::Raw => raw.to_string(),
-            };
-            kwargs.push((def.name.to_string(), rendered));
+        Layer {
+            keras_class: self.spec.keras_class.to_string(),
+            kwargs: build_kwargs(self.spec.params, &self.values),
         }
-        Layer { keras_class: self.spec.keras_class.to_string(), kwargs }
     }
 }
 
 impl ExecutableNode for LayerNode {
     fn execute(&mut self, inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
         let model: KerasModel = inputs.get("model").unwrap_or_default();
-        let out = model.with_layer(self.build_layer());
+        // The producing node's id is the step's stable identity, so a layer
+        // feeding two branches stays a single step when they later merge.
+        let out = model.with_layer(ctx.source_node.0, self.build_layer());
         ctx.emit_typed("out", out);
         ctx.flush();
         Ok(())
@@ -296,18 +309,25 @@ mod tests {
     #[test]
     fn execute_appends_layer_to_model() {
         let mut node = LayerNode::new(spec("ml.flatten").unwrap());
-        let prior = KerasModel::new().with_layer(Layer {
-            keras_class: "Input".to_string(),
-            kwargs: vec![("shape".to_string(), "(28, 28)".to_string())],
-        });
+        let prior = KerasModel::new().with_layer(
+            1,
+            Layer {
+                keras_class: "Input".to_string(),
+                kwargs: vec![("shape".to_string(), "(28, 28)".to_string())],
+            },
+        );
         let mut inputs = InputSet::new();
         inputs.insert("model", Value::new(prior));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(7), 0);
         node.execute(&inputs, &mut ctx).unwrap();
         let out = ctx.take_outputs();
         let model = out["out"].downcast_ref::<KerasModel>().unwrap();
-        assert_eq!(model.layers.len(), 2);
-        assert_eq!(model.layers[1].keras_class, "Flatten");
+        assert_eq!(model.steps.len(), 2);
+        assert_eq!(model.steps[1].layer.keras_class, "Flatten");
+        // Step id comes from the executing node; wired to the prior tip.
+        assert_eq!(model.steps[1].id, 7);
+        assert_eq!(model.steps[1].inputs, vec![1]);
+        assert_eq!(model.output, Some(7));
     }
 
     #[test]
