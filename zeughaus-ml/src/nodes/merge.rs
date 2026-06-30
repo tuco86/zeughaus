@@ -49,30 +49,34 @@ pub fn merge_spec(type_id: &str) -> Option<&'static MergeSpec> {
     MERGES.iter().find(|s| s.type_id == type_id)
 }
 
-fn merge_pins() -> Vec<PinDefinition> {
-    vec![
-        PinDefinition {
-            name: "a",
-            direction: PinDirection::Input,
-            data_mode: DataMode::Value,
-            pin_kind: PinKind::Sample,
-            type_name: "KerasModel",
-        },
-        PinDefinition {
-            name: "b",
-            direction: PinDirection::Input,
-            data_mode: DataMode::Value,
-            pin_kind: PinKind::Sample,
-            type_name: "KerasModel",
-        },
-        PinDefinition {
-            name: "out",
-            direction: PinDirection::Output,
-            data_mode: DataMode::Value,
-            pin_kind: PinKind::Sample,
-            type_name: "KerasModel",
-        },
-    ]
+/// Stable static names for the variadic inputs, in order. A merge can join up
+/// to 26 branches; inputs grow as you fill them.
+const LETTERS: [&str; 26] = [
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s",
+    "t", "u", "v", "w", "x", "y", "z",
+];
+
+fn input_pin(name: &'static str) -> PinDefinition {
+    PinDefinition {
+        name,
+        direction: PinDirection::Input,
+        data_mode: DataMode::Value,
+        pin_kind: PinKind::Sample,
+        type_name: "KerasModel",
+    }
+}
+
+/// Builds `input_count` ordered input pins (a, b, c, ...) plus the `out` pin.
+fn merge_pins(input_count: usize) -> Vec<PinDefinition> {
+    let mut pins: Vec<PinDefinition> = LETTERS[..input_count].iter().map(|n| input_pin(n)).collect();
+    pins.push(PinDefinition {
+        name: "out",
+        direction: PinDirection::Output,
+        data_mode: DataMode::Value,
+        pin_kind: PinKind::Sample,
+        type_name: "KerasModel",
+    });
+    pins
 }
 
 /// A merge layer joining two branches. Both inputs must carry a non-empty model
@@ -86,17 +90,28 @@ pub struct MergeNode {
 impl MergeNode {
     pub fn new(spec: &'static MergeSpec) -> Self {
         let values = spec.params.iter().map(|d| (d.name, d.default.to_string())).collect();
-        Self { spec, values, pins: merge_pins() }
+        // Start with two inputs (a, b); more appear as they are filled.
+        Self { spec, values, pins: merge_pins(2) }
+    }
+
+    /// Number of input pins currently exposed (all pins minus the `out` pin).
+    fn input_count(&self) -> usize {
+        self.pins.len() - 1
     }
 }
 
 impl ExecutableNode for MergeNode {
     fn execute(&mut self, inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
-        let a: KerasModel = inputs.get("a").unwrap_or_default();
-        let b: KerasModel = inputs.get("b").unwrap_or_default();
-        if a.is_empty() || b.is_empty() {
+        // Collect every connected, non-empty branch in pin order (a, b, c, ...).
+        let branches: Vec<KerasModel> = LETTERS
+            .iter()
+            .copied()
+            .filter_map(|n| inputs.get::<KerasModel>(n))
+            .filter(|m| !m.is_empty())
+            .collect();
+        if branches.len() < 2 {
             return Err(ZeughausError::ExecutionFailed(format!(
-                "{} needs two connected model inputs",
+                "{} needs at least two connected model inputs",
                 self.spec.display_name
             )));
         }
@@ -104,7 +119,8 @@ impl ExecutableNode for MergeNode {
             keras_class: self.spec.keras_class.to_string(),
             kwargs: build_kwargs(self.spec.params, &self.values),
         };
-        let out = KerasModel::join(ctx.source_node.0, layer, &[&a, &b]);
+        let refs: Vec<&KerasModel> = branches.iter().collect();
+        let out = KerasModel::join(ctx.source_node.0, layer, &refs);
         ctx.emit_typed("out", out);
         ctx.flush();
         Ok(())
@@ -112,6 +128,28 @@ impl ExecutableNode for MergeNode {
 
     fn pin_definitions(&self) -> &[PinDefinition] {
         &self.pins
+    }
+
+    fn sync_arity(&mut self, connected: &[&str]) -> bool {
+        // Highest connected input index, then keep exactly one spare empty input
+        // after it (at least 2 inputs, at most 26 -- the a..z cap).
+        let last = LETTERS
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, n)| connected.contains(n))
+            .map(|(i, _)| i)
+            .max();
+        let desired = match last {
+            Some(i) => (i + 2).clamp(2, 26),
+            None => 2,
+        };
+        if desired != self.input_count() {
+            self.pins = merge_pins(desired);
+            true
+        } else {
+            false
+        }
     }
 
     fn settings(&self) -> Vec<SettingDef> {
@@ -186,5 +224,44 @@ mod tests {
         let model = ctx.take_outputs()["out"].downcast_ref::<KerasModel>().unwrap().clone();
         let step = model.steps.iter().find(|s| s.id == 3).unwrap();
         assert_eq!(step.layer.render(), "layers.Dot(axes=(1, 2))");
+    }
+
+    #[test]
+    fn arity_grows_when_last_input_filled() {
+        let mut node = MergeNode::new(merge_spec("ml.concatenate").unwrap());
+        let names = |n: &MergeNode| n.pin_definitions().iter().map(|p| p.name).collect::<Vec<_>>();
+        assert_eq!(names(&node), vec!["a", "b", "out"]);
+        // "a" filled but "b" is still the spare -> no growth.
+        assert!(!node.sync_arity(&["a"]));
+        assert_eq!(names(&node), vec!["a", "b", "out"]);
+        // Filling the last input "b" reveals "c".
+        assert!(node.sync_arity(&["a", "b"]));
+        assert_eq!(names(&node), vec!["a", "b", "c", "out"]);
+    }
+
+    #[test]
+    fn arity_shrinks_on_disconnect() {
+        let mut node = MergeNode::new(merge_spec("ml.add").unwrap());
+        node.sync_arity(&["a", "b", "c"]); // grows to a, b, c, d
+        assert_eq!(node.pin_definitions().len(), 5);
+        // Disconnecting "c": last connected is "b" -> back to a, b, c (one spare).
+        assert!(node.sync_arity(&["a", "b"]));
+        let names: Vec<_> = node.pin_definitions().iter().map(|p| p.name).collect();
+        assert_eq!(names, vec!["a", "b", "c", "out"]);
+    }
+
+    #[test]
+    fn execute_joins_three_branches_in_order() {
+        let mut node = MergeNode::new(merge_spec("ml.concatenate").unwrap());
+        node.sync_arity(&["a", "b", "c"]);
+        let mut inputs = InputSet::new();
+        inputs.insert("a", Value::new(input_model(1)));
+        inputs.insert("b", Value::new(input_model(2)));
+        inputs.insert("c", Value::new(input_model(3)));
+        let mut ctx = NodeContext::new(NodeId(9), 0);
+        node.execute(&inputs, &mut ctx).unwrap();
+        let model = ctx.take_outputs()["out"].downcast_ref::<KerasModel>().unwrap().clone();
+        let step = model.steps.iter().find(|s| s.id == 9).unwrap();
+        assert_eq!(step.inputs, vec![1, 2, 3]);
     }
 }

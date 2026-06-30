@@ -27,4 +27,11 @@ pub trait ExecutableNode: Send + Sync {
     fn set_parameter(&mut self, _name: &str, _value: Value) -> Result<()> {
         Ok(())
     }
+
+    /// Recomputes a variadic node's input pins from the names of its currently
+    /// connected input pins. Returns true if the pin set changed, so the host
+    /// re-syncs pin definitions and redraws. Default: pins are static.
+    fn sync_arity(&mut self, _connected_inputs: &[&str]) -> bool {
+        false
+    }
 }

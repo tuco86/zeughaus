@@ -262,6 +262,8 @@ impl App {
         // Seed the edge from the source's cached output and recompute only the
         // target subtree. The source is not re-run (no spurious LLM calls).
         self.executor.on_edge_added(edge_id);
+        // Grow a variadic target (e.g. merge node) so the next empty input shows.
+        self.resync_arity(to_node);
         let task = self.execute_graph();
         self.autosave();
         task
@@ -282,6 +284,23 @@ impl App {
         }
     }
 
+    /// After a node's connections change, recompute its pins if it is variadic
+    /// (e.g. a merge node grows an input as the last one fills) and sync the
+    /// editor's pin snapshot so the new/removed pin is drawn immediately.
+    fn resync_arity(&mut self, node: NodeId) {
+        let connected: Vec<&str> = self
+            .edges
+            .iter()
+            .filter(|e| e.to_node == node)
+            .map(|e| e.to_pin)
+            .collect();
+        if let Some(pins) = self.executor.sync_node_arity(node, &connected)
+            && let Some(en) = self.nodes.get_mut(&node)
+        {
+            en.pin_defs = pins;
+        }
+    }
+
     fn disconnect_edge(
         &mut self,
         from_node: NodeId,
@@ -297,6 +316,7 @@ impl App {
         }) {
             let edge = self.edges.remove(pos);
             self.executor.disconnect_edge(edge.id);
+            self.resync_arity(to_node);
             let task = self.execute_graph();
             self.autosave();
             task

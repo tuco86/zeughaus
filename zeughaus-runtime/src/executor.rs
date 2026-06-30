@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use zeughaus_core::{
-    AsyncWork, EdgeId, ExecutableNode, InputSet, NodeContext, NodeId, Result, TypeConverters, Value,
+    AsyncWork, EdgeId, ExecutableNode, InputSet, NodeContext, NodeId, PinDefinition, Result,
+    TypeConverters, Value,
 };
 
 /// Work a node deferred during execution, tagged with the node that owns it.
@@ -324,6 +325,21 @@ impl GraphExecutor {
 
     pub fn edge_value(&self, edge_id: EdgeId) -> Option<&Value> {
         self.cache.get(edge_id)
+    }
+
+    /// Recomputes a variadic node's pins from its connected input pin names.
+    /// On a change, updates the graph node's pin_defs and returns the new pin
+    /// set so the editor can re-sync its own snapshot. Returns None if unchanged.
+    pub fn sync_node_arity(&mut self, id: NodeId, connected: &[&str]) -> Option<Vec<PinDefinition>> {
+        let changed = self.nodes.get_mut(&id)?.sync_arity(connected);
+        if !changed {
+            return None;
+        }
+        let pins = self.nodes.get(&id)?.pin_definitions().to_vec();
+        if let Some(n) = self.graph.node_mut(id) {
+            n.pin_defs = pins.clone();
+        }
+        Some(pins)
     }
 
     pub fn set_parameter(&mut self, id: NodeId, name: &str, value: Value) -> Result<()> {
