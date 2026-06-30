@@ -48,6 +48,8 @@ pub enum Message {
     // apply them to the editor. Only active while connected.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     SyncPoll,
+    // Copy the current collaboration session id to the clipboard (palette).
+    CopySessionId,
     // A node's deferred async work finished. Carries the output pin values, or
     // an error message. Delivered back into the executor to resume downstream.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]

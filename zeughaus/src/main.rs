@@ -23,7 +23,14 @@ fn main() -> iced::Result {
         zeughaus_core::EdgeId::seed_unique();
     }
 
-    iced::application(App::new, App::update, App::view)
+    // `zeughaus`            -> local editor (no sync)
+    // `zeughaus join <id>`  -> join collaboration session <id>
+    #[cfg(not(target_arch = "wasm32"))]
+    let session = parse_join_arg();
+    #[cfg(target_arch = "wasm32")]
+    let session: Option<String> = None;
+
+    iced::application(move || App::new(session.clone()), App::update, App::view)
         .subscription(App::subscription)
         .title("Zeughaus Editor")
         .theme(|app: &App| app.theme())
@@ -33,4 +40,17 @@ fn main() -> iced::Result {
             ..Default::default()
         })
         .run()
+}
+
+/// Parses `join <sessionid>` from the CLI args. Returns the session id to join,
+/// or `None` for a local (unsynced) editor.
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_join_arg() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "join" {
+            return args.next();
+        }
+    }
+    None
 }

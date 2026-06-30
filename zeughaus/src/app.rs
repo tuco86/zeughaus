@@ -98,10 +98,16 @@ pub struct App {
     // True while applying a remote change, so it does not echo back as a reducer.
     #[cfg(not(target_arch = "wasm32"))]
     applying_remote: bool,
+    // The joined collaboration session id (database name), if any. Shown via the
+    // palette "Copy Session ID" command so others can `join` the same session.
+    #[cfg(not(target_arch = "wasm32"))]
+    session_id: Option<String>,
 }
 
 impl App {
-    pub fn new() -> (Self, Task<Message>) {
+    pub fn new(session: Option<String>) -> (Self, Task<Message>) {
+        #[cfg(target_arch = "wasm32")]
+        let _ = session;
         // Process and capture plugins are native-only (DLL injection, DXGI
         // capture). The wasm editor designs graphs; native runners execute them.
         let plugins: Vec<Box<dyn DomainPlugin>> = vec![
@@ -129,12 +135,16 @@ impl App {
         let mut executor = GraphExecutor::new(Graph::new());
         executor.set_converters(converters.clone());
 
-        // Establish the SpacetimeDB connection (opt-in) and split the live
-        // connection from its remote-event receiver.
+        // Join a collaboration session when `join <id>` was passed, else run a
+        // local editor. Splits the live connection from its event receiver and
+        // records the session id for the palette "Copy Session ID" command.
         #[cfg(not(target_arch = "wasm32"))]
-        let (stdb, sync_rx) = match crate::sync::maybe_connect() {
-            Some((conn, rx)) => (Some(conn), Some(rx)),
-            None => (None, None),
+        let (stdb, sync_rx, session_id) = match session {
+            Some(id) => match crate::sync::connect_session(&id) {
+                Some((conn, rx)) => (Some(conn), Some(rx), Some(id)),
+                None => (None, None, None),
+            },
+            None => (None, None, None),
         };
 
         let mut app = Self {
@@ -163,6 +173,8 @@ impl App {
             sync_rx,
             #[cfg(not(target_arch = "wasm32"))]
             applying_remote: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            session_id,
         };
 
         // Restore last session (may kick off async node work, e.g. chat nodes).
@@ -843,6 +855,17 @@ impl App {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     return self.drain_sync();
+                }
+            }
+            Message::CopySessionId => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if let Some(id) = &self.session_id {
+                        self.last_error = format!("session id copied: {id}");
+                        return iced::clipboard::write(id.clone());
+                    }
+                    self.last_error =
+                        "no active session (start with: zeughaus join <id>)".to_string();
                 }
             }
             Message::AsyncNodeDone { node_id, result } => {

@@ -25,7 +25,7 @@ use crate::module_bindings::{
     DbConnection, Edge, EdgeTableAccess, Node, NodeTableAccess,
 };
 
-const DEFAULT_MODULE: &str = "zeughaus";
+const DEFAULT_URI: &str = "http://127.0.0.1:3000";
 
 /// A change observed in the shared store, to be applied to the editor.
 #[derive(Debug, Clone)]
@@ -104,20 +104,19 @@ fn send(tx: &Sender<SyncEvent>, ev: SyncEvent) {
     let _ = tx.send(ev);
 }
 
-/// Opt-in entry point: connects only when `ZEUGHAUS_STDB_URI` is set. Returns
-/// the live connection plus the event receiver, or `None` when sync is disabled
-/// or the connection could not be established.
-pub fn maybe_connect() -> Option<(DbConnection, Receiver<SyncEvent>)> {
-    let uri = std::env::var("ZEUGHAUS_STDB_URI").ok()?;
-    let module =
-        std::env::var("ZEUGHAUS_STDB_MODULE").unwrap_or_else(|_| DEFAULT_MODULE.to_string());
-    match connect(&uri, &module) {
+/// Joins a collaboration session: connects to the SpacetimeDB database named by
+/// `session_id` and subscribes to it. The server URI defaults to a local
+/// instance and can be overridden with `ZEUGHAUS_STDB_URI`. Returns the live
+/// connection plus the event receiver, or `None` if the connection failed.
+pub fn connect_session(session_id: &str) -> Option<(DbConnection, Receiver<SyncEvent>)> {
+    let uri = std::env::var("ZEUGHAUS_STDB_URI").unwrap_or_else(|_| DEFAULT_URI.to_string());
+    match connect(&uri, session_id) {
         Ok(pair) => {
-            eprintln!("[stdb] sync enabled: {uri} / {module}");
+            eprintln!("[stdb] joined session '{session_id}' at {uri}");
             Some(pair)
         }
         Err(e) => {
-            eprintln!("[stdb] sync disabled: {e}");
+            eprintln!("[stdb] could not join '{session_id}': {e}");
             None
         }
     }
