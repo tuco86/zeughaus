@@ -4,7 +4,6 @@ members = [
     "zeughaus-core",
     "zeughaus-runtime",
     "zeughaus-transform",
-    "zeughaus-process",
     "zeughaus-capture",
     "zeughaus-llm",
     "zeughaus-ml",
@@ -24,7 +23,6 @@ version = "0.1.0"
 zeughaus-core = { path = "zeughaus-core" }
 zeughaus-runtime = { path = "zeughaus-runtime" }
 zeughaus-transform = { path = "zeughaus-transform" }
-zeughaus-process = { path = "zeughaus-process" }
 zeughaus-capture = { path = "zeughaus-capture" }
 zeughaus-llm = { path = "zeughaus-llm" }
 zeughaus-ml = { path = "zeughaus-ml" }

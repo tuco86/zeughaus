@@ -6203,7 +6203,6 @@ dependencies = [
  "zeughaus-flow",
  "zeughaus-llm",
  "zeughaus-ml",
- "zeughaus-process",
  "zeughaus-runtime",
  "zeughaus-transform",
 ]
@@ -6247,13 +6246,6 @@ name = "zeughaus-ml"
 version = "0.1.0"
 dependencies = [
  "serde",
- "zeughaus-core",
-]
-
-[[package]]
-name = "zeughaus-process"
-version = "0.1.0"
-dependencies = [
  "zeughaus-core",
 ]
 

@@ -23,8 +23,6 @@ use zeughaus_runtime::{Graph, GraphEdge, GraphExecutor, GraphNode};
 use zeughaus_capture::CapturePlugin;
 #[cfg(not(target_arch = "wasm32"))]
 use zeughaus_llm::LlmPlugin;
-#[cfg(not(target_arch = "wasm32"))]
-use zeughaus_process::ProcessPlugin;
 use zeughaus_flow::FlowPlugin;
 use zeughaus_ml::MlPlugin;
 use zeughaus_transform::TransformPlugin;
@@ -108,14 +106,12 @@ impl App {
     pub fn new(session: Option<String>) -> (Self, Task<Message>) {
         #[cfg(target_arch = "wasm32")]
         let _ = session;
-        // Process and capture plugins are native-only (DLL injection, DXGI
-        // capture). The wasm editor designs graphs; native runners execute them.
+        // Capture and LLM plugins are native-only (DXGI capture, local model
+        // host). The wasm editor designs graphs; native runners execute them.
         let plugins: Vec<Box<dyn DomainPlugin>> = vec![
             Box::new(TransformPlugin),
             Box::new(MlPlugin),
             Box::new(FlowPlugin),
-            #[cfg(not(target_arch = "wasm32"))]
-            Box::new(ProcessPlugin),
             #[cfg(not(target_arch = "wasm32"))]
             Box::new(CapturePlugin),
             #[cfg(not(target_arch = "wasm32"))]

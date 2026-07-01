@@ -21,7 +21,6 @@ web-time = "1.1"
 # Native-only: process/capture plugins (DLL injection, DXGI capture), the
 # native file dialog, and the tokio executor for iced.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-zeughaus-process.workspace = true
 zeughaus-capture.workspace = true
 zeughaus-llm.workspace = true
 rfd = "0.15"
