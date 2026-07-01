@@ -1,7 +1,5 @@
 use zeughaus_core::*;
 
-use tamagotchi_win32_util::process::{Process, ProcessAccess};
-
 /// Reads memory from a remote process.
 /// Input: pid (f64), address (f64), size (f64)
 /// Output: hex (String representation), bytes_read (f64), success (bool)
@@ -77,7 +75,6 @@ impl ExecutableNode for ReadMemoryNode {
     fn execute(&mut self, inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
         let pid_f64: f64 = inputs.get("pid").unwrap_or(0.0);
         let addr_f64: f64 = inputs.get("address").unwrap_or(0.0);
-        let size_f64: f64 = inputs.get("size").unwrap_or(16.0);
 
         if pid_f64 <= 0.0 || addr_f64 <= 0.0 {
             ctx.emit_typed("hex", String::new());
@@ -88,38 +85,11 @@ impl ExecutableNode for ReadMemoryNode {
             return Ok(());
         }
 
-        let pid = pid_f64 as u32;
-        let address = addr_f64 as usize;
-        let size = (size_f64 as usize).min(4096); // cap at 4KB per read
-
-        let process = Process::open(ProcessAccess::VM_READ | ProcessAccess::QUERY_INFORMATION, pid);
-        match process {
-            Ok(proc) => match proc.read_memory_vec(address, size) {
-                Ok(bytes) => {
-                    let hex: String = bytes
-                        .iter()
-                        .map(|b| format!("{b:02X}"))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    ctx.emit_typed("hex", hex);
-                    ctx.emit_typed("bytes_read", bytes.len() as f64);
-                    ctx.emit_typed("success", true);
-                    ctx.emit_typed("error", String::new());
-                }
-                Err(e) => {
-                    ctx.emit_typed("hex", String::new());
-                    ctx.emit_typed("bytes_read", 0.0f64);
-                    ctx.emit_typed("success", false);
-                    ctx.emit_typed("error", e.to_string());
-                }
-            },
-            Err(e) => {
-                ctx.emit_typed("hex", String::new());
-                ctx.emit_typed("bytes_read", 0.0f64);
-                ctx.emit_typed("success", false);
-                ctx.emit_typed("error", e.to_string());
-            }
-        }
+        // Native process memory reading is not available in this build.
+        ctx.emit_typed("hex", String::new());
+        ctx.emit_typed("bytes_read", 0.0f64);
+        ctx.emit_typed("success", false);
+        ctx.emit_typed("error", "Memory reading is not available in this build".to_string());
 
         ctx.flush();
         Ok(())

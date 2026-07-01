@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use zeughaus_core::*;
 
 /// Injects a DLL into a target process.
@@ -88,17 +86,9 @@ impl ExecutableNode for DllInjectNode {
         self.last_pid = pid;
         self.last_path = dll_path.clone();
 
-        let path = PathBuf::from(&dll_path);
-        match tamagotchi_injector::inject::dll_inject(&path, pid) {
-            Ok(()) => {
-                self.last_success = true;
-                self.last_error = String::new();
-            }
-            Err(e) => {
-                self.last_success = false;
-                self.last_error = e.to_string();
-            }
-        }
+        // Native DLL injection is not available in this build.
+        self.last_success = false;
+        self.last_error = "DLL injection is not available in this build".to_string();
 
         ctx.emit_typed("success", self.last_success);
         ctx.emit_typed("error", self.last_error.clone());

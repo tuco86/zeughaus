@@ -5,5 +5,3 @@ edition.workspace = true
 
 [dependencies]
 zeughaus-core.workspace = true
-tamagotchi-injector = { path = "../../tamagotchi/tamagotchi-injector" }
-tamagotchi-win32-util = { path = "../../tamagotchi/tamagotchi-win32-util" }

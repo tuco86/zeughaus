@@ -54,16 +54,9 @@ impl ExecutableNode for FindProcessNode {
             return Ok(());
         }
 
-        match tamagotchi_injector::process::find_process_by_name(&name) {
-            Some(pid) => {
-                ctx.emit_typed("pid", pid as f64);
-                ctx.emit_typed("found", true);
-            }
-            None => {
-                ctx.emit_typed("pid", 0.0f64);
-                ctx.emit_typed("found", false);
-            }
-        }
+        // Native process lookup is not available in this build.
+        ctx.emit_typed("pid", 0.0f64);
+        ctx.emit_typed("found", false);
 
         ctx.flush();
         Ok(())

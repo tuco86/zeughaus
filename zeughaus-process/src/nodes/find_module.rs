@@ -78,21 +78,11 @@ impl ExecutableNode for FindModuleNode {
             return Ok(());
         }
 
-        let pid = pid_f64 as u32;
-        match tamagotchi_injector::process::find_module_info(pid, &module_name) {
-            Some((base, size, path)) => {
-                ctx.emit_typed("base", base as f64);
-                ctx.emit_typed("size", size as f64);
-                ctx.emit_typed("path", path);
-                ctx.emit_typed("found", true);
-            }
-            None => {
-                ctx.emit_typed("base", 0.0f64);
-                ctx.emit_typed("size", 0.0f64);
-                ctx.emit_typed("path", String::new());
-                ctx.emit_typed("found", false);
-            }
-        }
+        // Native module lookup is not available in this build.
+        ctx.emit_typed("base", 0.0f64);
+        ctx.emit_typed("size", 0.0f64);
+        ctx.emit_typed("path", String::new());
+        ctx.emit_typed("found", false);
 
         ctx.flush();
         Ok(())
