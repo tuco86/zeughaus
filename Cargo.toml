@@ -40,3 +40,14 @@ thiserror = "2.0"
 # SpacetimeDB client SDK. Native uses default (tokio) features; wasm enables the
 # `browser` feature in the per-target deps of the zeughaus binary.
 spacetimedb-sdk = "2.6"
+
+# Profiles apply from the top-level workspace being built, so iced_nodegraph's
+# own `profile.dev` is ignored when it is a path dependency here. Without this,
+# `cargo run` builds iced/wgpu/lyon/nodegraph at opt-level 0 and large graphs
+# (500+ nodes) stutter. Optimize dependencies while keeping our own crates cheap
+# to recompile.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
