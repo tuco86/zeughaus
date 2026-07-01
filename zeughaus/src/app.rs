@@ -9,7 +9,7 @@ use iced::{Color, Element, Event, Length, Point, Subscription, Task, Theme};
 use iced_nodegraph::{
     EdgeStyle, NodeGraph, NodeStatus, NodeStyle, Pattern, PinDirection as NgPinDirection, PinInfo,
     PinRef, PinShape, PinSide, PinStyle, default_edge_style, default_node_style, default_pin_style,
-    edge as ng_edge, node as ng_node, node_header, node_pin,
+    edge as ng_edge, input_not_occupied, node as ng_node, node_header, node_pin,
 };
 use iced_palette::{get_filtered_command_index, is_toggle_shortcut};
 use zeughaus_core::{
@@ -300,9 +300,10 @@ impl App {
             return Task::none();
         }
 
-        // An input pin holds at most one edge: drop any existing wire into the
-        // same target before connecting the new source.
-        self.remove_edges_into(to_node, to_pin);
+        // An input pin holds at most one edge. can_connect already rejects a
+        // drop onto an occupied input, so there is no existing wire to remove
+        // here - the new connection only reaches this point when the input is
+        // free (or the same edge is being re-routed onto itself).
 
         let edge_id = EdgeId::next();
         self.executor.graph.add_edge(GraphEdge {
@@ -1017,6 +1018,13 @@ impl App {
                         || (fp.direction == PinDirection::Input
                             && tp.direction == PinDirection::Output);
                     if !opposite {
+                        return false;
+                    }
+                    // Single-slot inputs: reject a second edge here instead of
+                    // silently dropping the existing one on connect. The widget
+                    // excludes the edge being dragged from occupancy, so
+                    // re-routing a wire back onto its own input still passes.
+                    if !input_not_occupied(from) || !input_not_occupied(to) {
                         return false;
                     }
                     // Converters are directional (output type -> input type), so
