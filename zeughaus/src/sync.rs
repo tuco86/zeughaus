@@ -12,8 +12,8 @@
 //! editors never assign colliding ids. Applying a remote change is guarded so it
 //! does not echo back as a reducer call.
 //!
-//! Opt-in: only runs when `ZEUGHAUS_STDB_URI` is set, so the default editor is
-//! unchanged and never blocks on an absent server.
+//! Always-on: the editor connects to SpacetimeDB on startup with no local-only
+//! fallback. A missing server is a fatal startup error, not a degraded mode.
 
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -61,8 +61,9 @@ fn to_edge_data(e: &Edge) -> EdgeData {
 
 /// Connects, wires row-change callbacks into a channel, subscribes to node+edge,
 /// and spawns the background message loop. Returns the live connection (kept
-/// alive by the caller) and the receiving end of the event channel.
-fn connect(uri: &str, module: &str) -> Result<(DbConnection, Receiver<SyncEvent>), String> {
+/// alive by the caller) and the receiving end of the event channel. SpacetimeDB
+/// is required; the error is fatal to the caller (no local-only fallback).
+pub fn connect(uri: &str, module: &str) -> Result<(DbConnection, Receiver<SyncEvent>), String> {
     let (tx, rx) = std::sync::mpsc::channel();
 
     let conn = DbConnection::builder()
@@ -105,22 +106,6 @@ fn send(tx: &Sender<SyncEvent>, ev: SyncEvent) {
     let _ = tx.send(ev);
 }
 
-/// Connects to a session: SpacetimeDB at `uri`, database `db`, subscribing to
-/// node+edge. Returns the live connection plus the event receiver, or `None` if
-/// the connection could not be established.
-pub fn join(uri: &str, db: &str) -> Option<(DbConnection, Receiver<SyncEvent>)> {
-    match connect(uri, db) {
-        Ok(pair) => {
-            eprintln!("[stdb] connected to {uri} / {db}");
-            Some(pair)
-        }
-        Err(e) => {
-            eprintln!("[stdb] could not connect to {uri} / {db}: {e}");
-            None
-        }
-    }
-}
-
 /// Best-effort outbound LAN ip, for building a session token a remote buddy can
 /// reach. Falls back to the loopback address.
 pub fn lan_ip() -> String {
@@ -149,18 +134,6 @@ pub fn parse_token(token: &str) -> (String, String) {
         }
         None => (format!("http://127.0.0.1:{DEFAULT_PORT}"), token.to_string()),
     }
-}
-
-/// Quick reachability probe so a missing server falls back to local-only
-/// instead of leaving a dead connection. Short timeout to avoid blocking start.
-pub fn reachable(uri: &str) -> bool {
-    use std::net::{TcpStream, ToSocketAddrs};
-    use std::time::Duration;
-    let host = uri.trim_start_matches("http://").trim_start_matches("https://");
-    let Ok(addrs) = host.to_socket_addrs() else {
-        return false;
-    };
-    addrs.into_iter().any(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok())
 }
 
 fn params_json(params: &[(String, String)]) -> String {

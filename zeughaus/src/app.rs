@@ -86,8 +86,8 @@ pub struct App {
     palette_input: String,
     palette_selected: usize,
 
-    // Live SpacetimeDB connection (opt-in via ZEUGHAUS_STDB_URI). Held to keep
-    // the background message loop alive and to call reducers on local edits.
+    // Live SpacetimeDB connection, always established on native startup. Held to
+    // keep the background message loop alive and to call reducers on local edits.
     #[cfg(not(target_arch = "wasm32"))]
     stdb: Option<crate::module_bindings::DbConnection>,
     // Receiver for remote changes, drained on the SyncPoll timer.
@@ -131,10 +131,11 @@ impl App {
         let mut executor = GraphExecutor::new(Graph::new());
         executor.set_converters(converters.clone());
 
-        // `session` is the join token, or None to host a local session. Resolve
-        // the connection uri + database, then connect if a server is reachable,
-        // else fall back to a local, unsynced editor. The session token is what
-        // the palette "Copy Session ID" shares so a buddy can join.
+        // `session` is the join token, or None to host the default local
+        // session. SpacetimeDB is required: connect on startup with no
+        // local-only fallback, failing loudly if the server is absent. The
+        // session token is what the palette "Copy Session ID" shares so a buddy
+        // can join.
         #[cfg(not(target_arch = "wasm32"))]
         let (stdb, sync_rx, session_id) = {
             let (uri, db, token) = match session {
@@ -157,20 +158,11 @@ impl App {
                     )
                 }
             };
-            if crate::sync::reachable(&uri) {
-                match crate::sync::join(&uri, &db) {
-                    Some((conn, rx)) => {
-                        eprintln!("[stdb] session token: {token}");
-                        (Some(conn), Some(rx), Some(token))
-                    }
-                    None => (None, None, None),
-                }
-            } else {
-                eprintln!(
-                    "[stdb] no SpacetimeDB at {uri}; running local-only (start it with `spacetime start`)"
-                );
-                (None, None, None)
-            }
+            let (conn, rx) = crate::sync::connect(&uri, &db).unwrap_or_else(|e| {
+                panic!("[stdb] cannot connect to {uri} / {db}: {e} (start it with `spacetime start`)")
+            });
+            eprintln!("[stdb] session token: {token}");
+            (Some(conn), Some(rx), Some(token))
         };
 
         let mut app = Self {
