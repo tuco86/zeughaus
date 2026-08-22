@@ -267,6 +267,27 @@ impl GraphExecutor {
         self.execute_dirty()
     }
 
+    /// Adopts output values produced by another window's runtime.
+    ///
+    /// Exactly one window owns the graph and executes it; every other window is
+    /// a viewer and reaches this method instead of running the node. That is the
+    /// point: executing locally is precisely what this replaces, so a node with
+    /// side effects (a screen capture, an LLM request) fires once for the whole
+    /// session rather than once per open window. Hence nothing is marked dirty,
+    /// no pending state is touched and no node runs here -- the outputs are
+    /// simply recorded and pushed into the outgoing edge caches, so downstream
+    /// nodes and [`Self::output_value`] see them exactly as if they had been
+    /// computed here.
+    ///
+    /// A partial output set is normal, not an error: only scalars are
+    /// replicated, so pins carrying frames or plugin-owned types are absent
+    /// from `outputs`. Such a pin then has no value and the editor dims it,
+    /// which is the honest rendering of "the owner did not publish this".
+    pub fn set_remote_outputs(&mut self, node: NodeId, outputs: HashMap<String, Value>) {
+        self.last_outputs.insert(node, outputs.clone());
+        self.apply_outputs(node, outputs);
+    }
+
     /// Clears a node's pending state without delivering outputs (e.g. after the
     /// async work failed). Downstream nodes stay unexecuted until re-triggered.
     pub fn clear_pending(&mut self, node_id: NodeId) {
@@ -971,5 +992,67 @@ mod tests {
                 .and_then(Value::downcast_ref::<f64>),
             Some(&2.0)
         );
+    }
+
+    /// A viewer window adopts the owner's outputs instead of running the graph.
+    #[test]
+    fn remote_outputs_are_adopted_without_executing() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct Counting(f64, Arc<AtomicU32>);
+        impl ExecutableNode for Counting {
+            fn execute(&mut self, _inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                ctx.emit_typed("value", self.0);
+                ctx.flush();
+                Ok(())
+            }
+            fn pin_definitions(&self) -> &[PinDefinition] {
+                &[]
+            }
+        }
+
+        let mut graph = Graph::new();
+        let owner = NodeId::next();
+        let sink = NodeId::next();
+        graph.add_node(make_node(owner));
+        graph.add_node(make_node(sink));
+        let edge = make_edge(owner, "value", sink, "in");
+        let edge_id = edge.id;
+        graph.add_edge(edge);
+
+        let mut exec = GraphExecutor::new(graph);
+        let runs = Arc::new(AtomicU32::new(0));
+        exec.register_node(owner, Box::new(Counting(5.0, runs.clone())));
+        exec.register_node(sink, Box::new(DoubleNode));
+        exec.execute_all().unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        let mut outputs = HashMap::new();
+        outputs.insert("value".to_string(), Value::new(9.0_f64));
+        exec.set_remote_outputs(owner, outputs);
+
+        // Visible to the editor's pin rendering...
+        assert_eq!(
+            exec.output_value(owner, "value")
+                .and_then(Value::downcast_ref::<f64>),
+            Some(&9.0)
+        );
+        // ... and a pin the owner did not publish reads as "no value" (dimmed).
+        assert!(exec.output_value(owner, "frame").is_none());
+        // ... and available to downstream nodes on the wire's own edge.
+        assert_eq!(
+            exec.edge_value(edge_id)
+                .and_then(Value::downcast_ref::<f64>),
+            Some(&9.0)
+        );
+
+        // Nothing ran, and nothing was left dirty for the next pass to run:
+        // re-executing locally is exactly what adopting the outputs replaces.
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        exec.execute_dirty().unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(exec.pending_count(), 0);
     }
 }
