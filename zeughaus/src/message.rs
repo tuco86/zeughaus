@@ -1,11 +1,9 @@
-use std::collections::HashMap;
 use std::fmt;
 use std::ops::Deref;
 use std::sync::Arc;
 
 use iced::{Point, Vector};
 use iced_nodegraph::{PinId, PinRef};
-use zeughaus_core::Value;
 
 /// A pin name as it travels through the node graph widget.
 ///
@@ -101,8 +99,9 @@ pub enum Message {
         key: String,
         value: String,
     },
-    // A manual trigger node was pressed. Arms the node (`fire` parameter) so its
-    // next execution emits one event -- the hand-driven counterpart to a timer.
+    // A manual trigger node was pressed. Recorded in the shared store so the
+    // one process that executes the graph fires the node once -- the
+    // hand-driven counterpart to a timer, and it works from any window.
     NodeTriggered {
         node_id: u64,
     },
@@ -112,7 +111,9 @@ pub enum Message {
         node_id: u64,
         size: iced::Size,
     },
-    // Periodic redraw tick while nodes are working, to animate node borders.
+    // Periodic redraw tick while a node is in error, to animate its border. The
+    // wasm editor has no timer subscription, so nothing emits it there.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     Tick,
     // Drain queued remote sync events from the SpacetimeDB subscription and
     // apply them to the editor. Only active while connected.
@@ -120,13 +121,6 @@ pub enum Message {
     SyncPoll,
     // Copy the current collaboration session id to the clipboard (palette).
     CopySessionId,
-    // A node's deferred async work finished. Carries the output pin values, or
-    // an error message. Delivered back into the executor to resume downstream.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    AsyncNodeDone {
-        node_id: u64,
-        result: Result<HashMap<String, Value>, String>,
-    },
     // File operations
     SaveGraph,
     LoadGraph,

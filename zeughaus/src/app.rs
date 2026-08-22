@@ -23,8 +23,6 @@ use zeughaus_flow::FlowPlugin;
 #[cfg(not(target_arch = "wasm32"))]
 use zeughaus_llm::LlmPlugin;
 use zeughaus_ml::MlPlugin;
-#[cfg(not(target_arch = "wasm32"))]
-use zeughaus_runtime::DeferredWork;
 use zeughaus_runtime::{Graph, GraphEdge, GraphExecutor, GraphNode};
 use zeughaus_transform::TransformPlugin;
 
@@ -73,7 +71,10 @@ pub struct App {
     camera_position: Point,
     camera_zoom: f32,
 
-    // Runtime
+    // The editor's model of the graph, NOT a runtime. It owns the topology, the
+    // pin definitions a variadic node grows (`sync_node_pins`) and the pin types
+    // connection validation compares, so deleting it would take that metadata
+    // with it. Executing the graph is the runner process's job alone.
     executor: GraphExecutor,
     plugins: Vec<Box<dyn DomainPlugin>>,
     catalog: Vec<NodeDefinition>,
@@ -90,6 +91,13 @@ pub struct App {
     // not part of the shared graph document.
     node_sizes: HashMap<NodeId, iced::Size>,
 
+    // Edges from the store whose endpoint nodes have not arrived yet. A
+    // subscription applies as one burst with no ordering between tables, so an
+    // edge routinely precedes its nodes; dropping those is what left a fresh
+    // window showing a fraction of the wires.
+    #[cfg(not(target_arch = "wasm32"))]
+    pending_edges: Vec<EdgeData>,
+
     // Const node text inputs (node_id -> current text)
     const_inputs: HashMap<NodeId, String>,
 
@@ -100,7 +108,6 @@ pub struct App {
     spawn_counter: u32,
 
     // Status bar
-    last_exec_us: u64,
     last_error: String,
 
     // Command palette state
@@ -122,22 +129,15 @@ pub struct App {
     // palette "Copy Session ID" command so others can `join` the same session.
     #[cfg(not(target_arch = "wasm32"))]
     session_id: Option<String>,
-    // Whether this window owns execution. Exactly one runtime in a session runs
-    // the graph; the rest display its published outputs, so a capture node fires
-    // once per session instead of once per window. Recomputed from the store.
+    // How many runtime processes the store knows about. This process registers
+    // as `Role::Viewer`, so it is never one of them: the count only answers
+    // "is anything computing the values on screen".
     #[cfg(not(target_arch = "wasm32"))]
-    is_owner: bool,
-    // This window's place in the runtime order, for the status bar. 0 is owner.
-    #[cfg(not(target_arch = "wasm32"))]
-    runtime_index: Option<usize>,
-    // What this runtime last published per node and pin, so an unchanged value
-    // does not turn every execution pass into a burst of reducer calls.
-    #[cfg(not(target_arch = "wasm32"))]
-    published: HashMap<NodeId, HashMap<String, (String, String)>>,
+    runtimes: usize,
 }
 
 impl App {
-    pub fn new(session: Option<String>) -> (Self, Task<Message>) {
+    pub fn new(session: Option<String>) -> Self {
         #[cfg(target_arch = "wasm32")]
         let _ = session;
         // Capture and LLM plugins are native-only (DXGI capture, local model
@@ -192,11 +192,14 @@ impl App {
                     )
                 }
             };
-            let (conn, rx) = crate::sync::connect(&uri, &db).unwrap_or_else(|e| {
-                panic!(
-                    "[stdb] cannot connect to {uri} / {db}: {e} (start it with `spacetime start`)"
-                )
-            });
+            // Role::Viewer: this process edits and displays, it never executes,
+            // so it must not register in the runtime table and be elected owner.
+            let (conn, rx) =
+                crate::sync::connect(&uri, &db, crate::sync::Role::Viewer).unwrap_or_else(|e| {
+                    panic!(
+                        "[stdb] cannot connect to {uri} / {db}: {e} (start it with `spacetime start`)"
+                    )
+                });
             eprintln!("[stdb] session token: {token}");
             (Some(conn), Some(rx), Some(token))
         };
@@ -214,10 +217,11 @@ impl App {
             converters,
             display_values: HashMap::new(),
             node_sizes: HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            pending_edges: Vec::new(),
             const_inputs: HashMap::new(),
             node_settings: HashMap::new(),
             spawn_counter: 0,
-            last_exec_us: 0,
             last_error: String::new(),
             palette_open: false,
             palette_input: String::new(),
@@ -230,27 +234,23 @@ impl App {
             applying_remote: false,
             #[cfg(not(target_arch = "wasm32"))]
             session_id,
-            // Nothing executes until the store says who owns it: a window that
-            // assumed ownership at startup would double-run the graph for the
-            // moment before the runtime table arrives.
+            // No runtime is known until the subscription delivers that table,
+            // and this process never adds itself to it.
             #[cfg(not(target_arch = "wasm32"))]
-            is_owner: false,
-            #[cfg(not(target_arch = "wasm32"))]
-            runtime_index: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            published: HashMap::new(),
+            runtimes: 0,
         };
 
-        // Restore last session (may kick off async node work, e.g. chat nodes).
-        let task = app.load_autosave();
+        // Restore the last local session. A no-op while syncing: the shared
+        // graph arrives from the subscription instead.
+        app.load_autosave();
 
-        (app, task)
+        app
     }
 
-    fn spawn_node(&mut self, type_id: &str, position: Point) -> Task<Message> {
+    fn spawn_node(&mut self, type_id: &str, position: Point) {
         let exec = self.plugins.iter().find_map(|p| p.create_node(type_id));
         let Some(exec) = exec else {
-            return Task::none();
+            return;
         };
 
         // Stagger each new node so they don't pile up
@@ -319,9 +319,7 @@ impl App {
 
         #[cfg(not(target_arch = "wasm32"))]
         self.push_node(id);
-        let task = self.execute_graph();
         self.autosave();
-        task
     }
 
     fn connect_edge(
@@ -330,7 +328,7 @@ impl App {
         from_pin: PinLabel,
         to_node: NodeId,
         to_pin: PinLabel,
-    ) -> Task<Message> {
+    ) {
         // Ignore exact duplicates (snap can re-fire on_connect for the same pair).
         if self.edges.iter().any(|e| {
             e.from_node == from_node
@@ -338,7 +336,7 @@ impl App {
                 && e.to_node == to_node
                 && e.to_pin == to_pin
         }) {
-            return Task::none();
+            return;
         }
 
         // An input pin holds at most one edge. can_connect already rejects a
@@ -362,8 +360,9 @@ impl App {
             to_node,
             to_pin,
         });
-        // Seed the edge from the source's cached output and recompute only the
-        // target subtree. The source is not re-run (no spurious LLM calls).
+        // Seed the new wire from the source's last published output so it shows
+        // a value immediately instead of staying blank until the runtime's next
+        // publish. Nothing is executed here: this process does not run nodes.
         self.executor.on_edge_added(edge_id);
         // Grow a variadic target (e.g. merge node) so the next empty input shows.
         self.resync_pins(to_node);
@@ -371,24 +370,8 @@ impl App {
         if let Some(e) = self.edges.last() {
             self.push_edge(e);
         }
-        let task = self.execute_graph();
+        self.update_display_values();
         self.autosave();
-        task
-    }
-
-    /// Removes every edge feeding the given input pin, from both the editor
-    /// state and the executor graph/cache.
-    fn remove_edges_into(&mut self, to_node: NodeId, to_pin: &PinLabel) {
-        let stale: Vec<EdgeId> = self
-            .edges
-            .iter()
-            .filter(|e| e.to_node == to_node && e.to_pin == *to_pin)
-            .map(|e| e.id)
-            .collect();
-        for edge_id in stale {
-            self.edges.retain(|e| e.id != edge_id);
-            self.executor.disconnect_edge(edge_id);
-        }
     }
 
     /// After a node's connections change, recompute its pins if it is variadic
@@ -408,7 +391,7 @@ impl App {
         from_pin: PinLabel,
         to_node: NodeId,
         to_pin: PinLabel,
-    ) -> Task<Message> {
+    ) {
         if let Some(pos) = self.edges.iter().position(|e| {
             e.from_node == from_node
                 && e.from_pin == from_pin
@@ -420,121 +403,27 @@ impl App {
             self.resync_pins(to_node);
             #[cfg(not(target_arch = "wasm32"))]
             self.push_edge_remove(edge.id);
-            let task = self.execute_graph();
-            self.autosave();
-            task
-        } else {
-            Task::none()
-        }
-    }
-
-    fn execute_graph(&mut self) -> Task<Message> {
-        // A viewer runs nothing at all: the owning runtime's results arrive as
-        // published outputs. Executing "just the harmless nodes" locally would
-        // reintroduce the split brain this exists to remove.
-        if !self.executes_locally() {
-            self.last_exec_us = 0;
             self.update_display_values();
-            return Task::none();
+            self.autosave();
         }
-        // web_time::Instant re-exports std on native and uses the browser clock
-        // on wasm, so timing works on both targets.
-        let start = web_time::Instant::now();
-        let task = match self.executor.execute_dirty() {
-            Ok(deferred) => {
-                self.last_exec_us = start.elapsed().as_micros() as u64;
-                self.spawn_async(deferred)
-            }
-            // Only a graph that cannot be ordered (a cycle) fails the pass
-            // itself; a node's own failure is reported per node below.
-            Err(e) => {
-                self.last_exec_us = start.elapsed().as_micros() as u64;
-                self.last_error = e.to_string();
-                return Task::none();
-            }
-        };
-        self.last_error = self.node_error_summary();
-        self.publish_outputs();
-        self.update_display_values();
-        task
     }
 
-    /// Whether this window is the one that runs the graph.
+    /// Adopts the runtime's published outputs, replacing whatever this window
+    /// had. Nodes with no published rows are cleared, so their pins dim rather
+    /// than showing a value nothing produces any more.
     ///
-    /// On wasm there is no session to share yet, so the editor runs its own
-    /// graph; natively it is whichever runtime the store put first.
-    fn executes_locally(&self) -> bool {
-        #[cfg(target_arch = "wasm32")]
-        {
-            true
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.is_owner
-        }
-    }
-
-    /// Publishes this pass's scalar outputs so viewer windows can display them.
-    ///
-    /// Only what changed is sent. A pin that lost its value forces a clear of
-    /// that node's rows before the remaining pins are re-published, because
-    /// absence is a state a viewer has to be able to reach -- otherwise a stale
-    /// number would outlive the run that produced it.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn publish_outputs(&mut self) {
-        if !self.is_owner {
-            return;
-        }
-        let Some(conn) = &self.stdb else { return };
-        for (id, node) in &self.nodes {
-            let current: HashMap<String, (String, String)> = node
-                .pin_defs
-                .iter()
-                .filter(|p| p.direction == PinDirection::Output)
-                .filter_map(|p| {
-                    let value = self.executor.output_value(*id, &p.name)?;
-                    let (ty, text) = zeughaus_core::encode_scalar(value)?;
-                    Some((p.name.to_string(), (ty, text)))
-                })
-                .collect();
-            let previous = self.published.get(id);
-            if previous == Some(&current) {
-                continue;
-            }
-            let dropped = previous.is_some_and(|prev| {
-                prev.keys().any(|pin| !current.contains_key(pin))
-            });
-            if dropped {
-                crate::sync::send_clear_node_outputs(conn, id.0);
-            }
-            for (pin, (ty, text)) in &current {
-                let unchanged = !dropped
-                    && previous.and_then(|prev| prev.get(pin)) == Some(&(ty.clone(), text.clone()));
-                if unchanged {
-                    continue;
-                }
-                crate::sync::send_publish_output(conn, id.0, pin, ty, text);
-            }
-            self.published.insert(*id, current);
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn publish_outputs(&mut self) {}
-
-    /// Adopts the owning runtime's published outputs, replacing whatever this
-    /// viewer had. Nodes with no published rows are cleared, so their pins dim
-    /// rather than showing a value the owner no longer produces.
+    /// This is the only way a value ever reaches the editor: it computes
+    /// nothing itself.
     #[cfg(not(target_arch = "wasm32"))]
     fn adopt_published_outputs(&mut self) {
-        if self.is_owner {
-            return;
-        }
         let Some(conn) = &self.stdb else { return };
         let mut per_node: HashMap<NodeId, HashMap<String, Value>> = HashMap::new();
         for (node_id, pin, ty, text) in crate::sync::published_outputs(conn) {
             if let Some(value) = zeughaus_core::decode_scalar(&ty, &text) {
-                per_node.entry(NodeId(node_id)).or_default().insert(pin, value);
+                per_node
+                    .entry(NodeId(node_id))
+                    .or_default()
+                    .insert(pin, value);
             }
         }
         for id in self.nodes.keys().copied().collect::<Vec<_>>() {
@@ -544,22 +433,24 @@ impl App {
         self.update_display_values();
     }
 
-    /// Which runtime this window is, for the status bar.
+    /// Whether anything is executing the graph, for the status bar.
     ///
-    /// Worth permanent screen space: it is the difference between "this window
-    /// runs the graph" and "this window shows what runtime #0 computed", and
-    /// every otherwise surprising value follows from it.
+    /// Worth permanent screen space: with no runtime connected every value on
+    /// screen is a leftover nobody will refresh, and that explains away every
+    /// otherwise surprising number.
     #[cfg(not(target_arch = "wasm32"))]
-    fn role_text(&self) -> String {
-        match (self.runtime_index, self.is_owner) {
-            (Some(i), true) => format!(" | runtime #{i} (executing)"),
-            (Some(i), false) => format!(" | runtime #{i} (viewing #0)"),
-            (None, _) => " | connecting".to_string(),
+    fn runtime_text(&self) -> String {
+        match self.runtimes {
+            0 => " | no runtime".to_string(),
+            1 => " | runtime connected".to_string(),
+            // The store elects the lowest `seq`; the spares are standby.
+            n => format!(" | runtime connected (1 of {n} executing)"),
         }
     }
 
+    // The wasm editor has no sync layer, so it has no runtime to report on.
     #[cfg(target_arch = "wasm32")]
-    fn role_text(&self) -> String {
+    fn runtime_text(&self) -> String {
         String::new()
     }
 
@@ -578,42 +469,6 @@ impl App {
             0 => format!("{name}: {message}"),
             more => format!("{name}: {message} (+{more} more)"),
         }
-    }
-
-    /// Turns deferred node work into background tasks. Each runs its blocking
-    /// work on a tokio blocking thread, then reports back via AsyncNodeDone so
-    /// the executor can resume the dependent downstream nodes.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn spawn_async(&self, deferred: DeferredWork) -> Task<Message> {
-        if deferred.is_empty() {
-            return Task::none();
-        }
-        let tasks = deferred.into_iter().map(|(node_id, work)| {
-            let raw_id = node_id.0;
-            Task::perform(
-                async move {
-                    tokio::task::spawn_blocking(move || work.run())
-                        .await
-                        .unwrap_or_else(|e| {
-                            Err(zeughaus_core::ZeughausError::ExecutionFailed(format!(
-                                "background task failed: {e}"
-                            )))
-                        })
-                        .map_err(|e| e.to_string())
-                },
-                move |result| Message::AsyncNodeDone {
-                    node_id: raw_id,
-                    result,
-                },
-            )
-        });
-        Task::batch(tasks)
-    }
-
-    // On wasm there is no LLM plugin, so no node ever defers work.
-    #[cfg(target_arch = "wasm32")]
-    fn spawn_async(&self, _deferred: zeughaus_runtime::DeferredWork) -> Task<Message> {
-        Task::none()
     }
 
     // Local-file persistence is native-only. On wasm the graph lives in the
@@ -639,27 +494,23 @@ impl App {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn load_autosave(&mut self) -> Task<Message> {
+    fn load_autosave(&mut self) {
         // When syncing, the SpacetimeDB store is the source of truth: start
         // empty and adopt the shared graph from the subscription instead of the
         // local autosave (which would conflict with remote ids).
         if self.stdb.is_some() {
-            return Task::none();
+            return;
         }
         let path = Self::autosave_path();
         if let Ok(json) = std::fs::read_to_string(&path)
             && let Ok(doc) = serde_json::from_str::<GraphDocument>(&json)
         {
-            self.load_document(doc)
-        } else {
-            Task::none()
+            self.load_document(doc);
         }
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn load_autosave(&mut self) -> Task<Message> {
-        Task::none()
-    }
+    fn load_autosave(&mut self) {}
 
     /// Recomputes what each node shows inline from the values on its edges.
     ///
@@ -842,7 +693,7 @@ impl App {
         self.node_order.push(id);
     }
 
-    fn load_document(&mut self, doc: GraphDocument) -> Task<Message> {
+    fn load_document(&mut self, doc: GraphDocument) {
         // Clear current state
         self.nodes.clear();
         self.node_order.clear();
@@ -850,7 +701,10 @@ impl App {
         self.const_inputs.clear();
         self.node_settings.clear();
         self.display_values.clear();
+        // A fresh executor loses the converter registry, which `sync_node_pins`
+        // and the pin-type bookkeeping still need; hand it back immediately.
         self.executor = GraphExecutor::new(Graph::new());
+        self.executor.set_converters(self.converters.clone());
 
         // Advance the id counters past every restored id so newly spawned
         // nodes/edges cannot collide with loaded ones. A collision would push
@@ -891,10 +745,9 @@ impl App {
             });
         }
 
-        // Execute full graph; run any deferred (async) node work that results.
-        let deferred = self.executor.execute_all().unwrap_or_default();
+        // Nothing is executed: a loaded graph shows values only once the
+        // runtime publishes them.
         self.update_display_values();
-        self.spawn_async(deferred)
     }
 
     fn viewport_center(&self) -> Point {
@@ -937,7 +790,7 @@ impl App {
             Message::EdgeConnected { from, to } => {
                 // iced_nodegraph normalizes on_connect to (output, input), so
                 // `from` is always the output pin and `to` the input pin.
-                return self.connect_edge(
+                self.connect_edge(
                     NodeId(from.node_id),
                     from.pin_id,
                     NodeId(to.node_id),
@@ -945,7 +798,7 @@ impl App {
                 );
             }
             Message::EdgeDisconnected { from, to } => {
-                return self.disconnect_edge(
+                self.disconnect_edge(
                     NodeId(from.node_id),
                     from.pin_id,
                     NodeId(to.node_id),
@@ -979,12 +832,9 @@ impl App {
                         Some((node.type_id.clone(), node.position))
                     })
                     .collect();
-                let mut tasks = Vec::new();
                 for (type_id, pos) in positions {
-                    let offset_pos = Point::new(pos.x + 30.0, pos.y + 30.0);
-                    tasks.push(self.spawn_node(&type_id, offset_pos));
+                    self.spawn_node(&type_id, Point::new(pos.x + 30.0, pos.y + 30.0));
                 }
-                return Task::batch(tasks);
             }
             Message::DeleteNodes(ids) => {
                 for raw_id in &ids {
@@ -1036,35 +886,32 @@ impl App {
             }
             Message::SpawnNode { type_id } => {
                 let pos = self.viewport_center();
-                return self.spawn_node(&type_id, pos);
+                self.spawn_node(&type_id, pos);
             }
             Message::ConstValueChanged { node_id, value } => {
                 let id = NodeId(node_id);
                 self.const_inputs.insert(id, value.clone());
+                // The parameter still goes into the editor's model so pin types
+                // and the widget agree; the runtime learns it from the store.
                 let node_type = self.nodes.get(&id).map(|n| n.type_id.as_str());
-                let mut task = Task::none();
                 match node_type {
                     Some("transform.const_f64") => {
                         if let Ok(f) = value.parse::<f64>() {
                             let _ = self.executor.set_parameter(id, "value", Value::new(f));
-                            task = self.execute_graph();
                         }
                     }
                     Some("transform.const_bool") => {
                         let b = value == "true" || value == "1";
                         let _ = self.executor.set_parameter(id, "value", Value::new(b));
-                        task = self.execute_graph();
                     }
                     Some("transform.const_string") => {
                         let _ = self.executor.set_parameter(id, "value", Value::new(value));
-                        task = self.execute_graph();
                     }
                     _ => {}
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 self.push_params(id);
                 self.autosave();
-                return task;
             }
             Message::NodeSettingChanged {
                 node_id,
@@ -1077,25 +924,22 @@ impl App {
                     .or_default()
                     .insert(key.clone(), value.clone());
                 let _ = self.executor.set_parameter(id, &key, Value::new(value));
-                let task = self.execute_graph();
                 #[cfg(not(target_arch = "wasm32"))]
                 self.push_params(id);
                 self.autosave();
-                return task;
             }
             Message::NodeTriggered { node_id } => {
-                // A viewer must not fire the node: it does not run the graph, so
-                // the event would arm a node nobody executes. Forwarding the
-                // press to the owner needs a reducer of its own; until then this
-                // says so instead of pretending to work.
-                if !self.executes_locally() {
-                    self.last_error = "only the executing runtime can trigger".to_string();
-                    return Task::none();
+                // The press is recorded in the store rather than in the local
+                // executor: it has to reach the one process that executes, which
+                // is never this one. That is what makes a trigger work from any
+                // window, local or remote.
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(conn) = &self.stdb {
+                    crate::sync::send_trigger_node(conn, node_id);
                 }
-                // The press itself is the event; the value only arms the node.
-                let id = NodeId(node_id);
-                let _ = self.executor.set_parameter(id, "fire", Value::new(true));
-                return self.execute_graph();
+                // The wasm editor has no sync layer, so it has nobody to ask.
+                #[cfg(target_arch = "wasm32")]
+                let _ = node_id;
             }
             Message::NodeResized { node_id, size } => {
                 // View-local, so no reducer and no autosave: a size is what THIS
@@ -1107,9 +951,7 @@ impl App {
             }
             Message::SyncPoll => {
                 #[cfg(not(target_arch = "wasm32"))]
-                {
-                    return self.drain_sync();
-                }
+                self.drain_sync();
             }
             Message::CopySessionId => {
                 #[cfg(not(target_arch = "wasm32"))]
@@ -1120,27 +962,6 @@ impl App {
                     }
                     self.last_error =
                         "no session (start `spacetime start` to host one)".to_string();
-                }
-            }
-            Message::AsyncNodeDone { node_id, result } => {
-                let id = NodeId(node_id);
-                match result {
-                    Ok(outputs) => match self.executor.deliver_async_result(id, outputs) {
-                        Ok(deferred) => {
-                            self.last_error = self.node_error_summary();
-                            self.update_display_values();
-                            return self.spawn_async(deferred);
-                        }
-                        Err(e) => {
-                            self.last_error = e.to_string();
-                            self.update_display_values();
-                        }
-                    },
-                    Err(e) => {
-                        self.executor.mark_error(id, e);
-                        self.last_error = self.node_error_summary();
-                        self.update_display_values();
-                    }
                 }
             }
             // File dialogs are native-only (rfd). On wasm these are no-ops;
@@ -1196,9 +1017,8 @@ impl App {
                 }
             }
             Message::GraphLoaded(doc) => {
-                let task = self.load_document(doc);
+                self.load_document(doc);
                 self.autosave();
-                return task;
             }
         }
         Task::none()
@@ -1280,9 +1100,9 @@ impl App {
                     self.dim_mask(*id, node),
                     self.node_sizes.get(id).copied(),
                 );
-                // Per-node activity feedback: red marching-ants on error, accent
-                // marching-ants while the node is working (async pending).
-                let pending = self.executor.is_pending(*id);
+                // Per-node activity feedback: red marching-ants on error. There
+                // is no "working" state to draw -- this process does not
+                // execute, so a node is never mid-run here.
                 let errored = self.executor.is_error(*id);
                 let node_widget = ng_node(node.id.0, node.position, content)
                     .resizable(is_resizable(&node.type_id))
@@ -1294,15 +1114,6 @@ impl App {
                                 opacity: 0.88,
                                 border_color: Color::from_rgb(0.9, 0.25, 0.25).into(),
                                 border_pattern: Pattern::dashed(2.0, 6.0, 4.0).flow(25.0),
-                                ..base
-                            };
-                        }
-                        if pending {
-                            return NodeStyle {
-                                corner_radius: 8.0,
-                                opacity: 0.88,
-                                border_color: Color::from_rgb(0.3, 0.75, 0.95).into(),
-                                border_pattern: Pattern::dashed(2.0, 6.0, 4.0).flow(45.0),
                                 ..base
                             };
                         }
@@ -1356,9 +1167,8 @@ impl App {
             };
 
             // An edge reflects its source node's state: red marching-ants when
-            // the source errored (broken data), accent flow while it works.
+            // the source errored (broken data).
             let src_error = self.executor.is_error(edge.from_node);
-            let src_pending = self.executor.is_pending(edge.from_node);
 
             // Transmission mode is decided by the target pin: a Trigger input
             // carries Events (animated flowing dash), a Sample input carries
@@ -1378,13 +1188,6 @@ impl App {
             .style(move |theme, status, _start, _end| {
                 if src_error {
                     return EdgeStyle::error();
-                }
-                if src_pending {
-                    return EdgeStyle {
-                        stroke_color: edge_color.into(),
-                        pattern: Pattern::dashed(2.0, 6.0, 4.0).flow(45.0),
-                        ..default_edge_style(theme, status)
-                    };
                 }
                 let base = default_edge_style(theme, status);
                 EdgeStyle {
@@ -1418,35 +1221,34 @@ impl App {
             graph_area
         };
 
-        // Status bar
-        let running = self.executor.pending_count();
-        let running_text = if running > 0 {
-            format!(" | running: {running}")
-        } else {
-            String::new()
+        // Status bar. A failing node outranks the last UI notice: broken data is
+        // the more urgent thing to say. Node errors are not computed here -- they
+        // arrive with the runtime's published state, like every other value.
+        let error = {
+            let node_error = self.node_error_summary();
+            if node_error.is_empty() {
+                self.last_error.clone()
+            } else {
+                node_error
+            }
         };
-        let status_text = if self.last_error.is_empty() {
+        let status_text = if error.is_empty() {
             format!(
-                "  {} nodes | {} edges | exec: {}us{}{}",
+                "  {} nodes | {} edges{}",
                 self.nodes.len(),
                 self.edges.len(),
-                self.last_exec_us,
-                running_text,
-                self.role_text(),
+                self.runtime_text(),
             )
         } else {
             format!(
-                "  {} nodes | {} edges | exec: {}us{}{} | ERROR: {}",
+                "  {} nodes | {} edges{} | ERROR: {error}",
                 self.nodes.len(),
                 self.edges.len(),
-                self.last_exec_us,
-                running_text,
-                self.role_text(),
-                self.last_error,
+                self.runtime_text(),
             )
         };
 
-        let error_color = if self.last_error.is_empty() {
+        let error_color = if error.is_empty() {
             Color::from_rgb(0.5, 0.5, 0.5)
         } else {
             Color::from_rgb(0.9, 0.3, 0.3)
@@ -1498,11 +1300,11 @@ impl App {
         let mut subs = vec![events];
 
         // The library only auto-redraws for animated edges, not node borders.
-        // While any node is working, drive ~30fps redraws so the marching-ants
-        // node border animates. Native only: iced::time::every needs the tokio
-        // executor feature, and async work only runs natively anyway.
+        // While any node is in error, drive ~30fps redraws so its marching-ants
+        // border animates. Native only: iced::time::every needs the tokio
+        // executor feature.
         #[cfg(not(target_arch = "wasm32"))]
-        if self.executor.pending_count() > 0 {
+        if self.executor.errors().next().is_some() {
             subs.push(
                 iced::time::every(std::time::Duration::from_millis(33)).map(|_| Message::Tick),
             );
@@ -1616,7 +1418,24 @@ impl App {
 
     // Receive: drain queued remote events and apply them to the editor.
 
-    fn drain_sync(&mut self) -> Task<Message> {
+    /// Removes every edge feeding the given input pin, from both the editor
+    /// state and the executor graph/cache. Only the remote-apply path needs it:
+    /// a local connect cannot land on an occupied input (`can_connect` rejects
+    /// it), but a remote one can race one in.
+    fn remove_edges_into(&mut self, to_node: NodeId, to_pin: &PinLabel) {
+        let stale: Vec<EdgeId> = self
+            .edges
+            .iter()
+            .filter(|e| e.to_node == to_node && e.to_pin == *to_pin)
+            .map(|e| e.id)
+            .collect();
+        for edge_id in stale {
+            self.edges.retain(|e| e.id != edge_id);
+            self.executor.disconnect_edge(edge_id);
+        }
+    }
+
+    fn drain_sync(&mut self) {
         let mut events = Vec::new();
         if let Some(rx) = &self.sync_rx {
             while let Ok(ev) = rx.try_recv() {
@@ -1624,16 +1443,20 @@ impl App {
             }
         }
         if events.is_empty() {
-            return Task::none();
+            return;
         }
         self.applying_remote = true;
         for ev in events {
             self.apply_sync_event(ev);
         }
+        // The node an edge was waiting for may have been in this very batch.
+        self.resolve_pending_edges();
         self.applying_remote = false;
-        let task = self.execute_graph();
-        self.update_display_values();
-        task
+        // Adopt once after the whole batch, not per event: the first
+        // subscription delivers the node rows and the output rows together with
+        // no ordering guarantee between the two tables, so an output arriving
+        // before its node would be dropped and a fresh window would open blank.
+        self.adopt_published_outputs();
     }
 
     fn apply_sync_event(&mut self, ev: crate::sync::SyncEvent) {
@@ -1644,28 +1467,27 @@ impl App {
             SyncEvent::EdgeInsert(ed) => self.apply_edge_insert(ed),
             SyncEvent::EdgeRemove(id) => self.apply_edge_remove(EdgeId(id)),
             SyncEvent::RuntimesChanged => self.apply_runtimes_changed(),
-            SyncEvent::OutputsChanged => self.adopt_published_outputs(),
+            // Answered once per batch in `drain_sync`: a per-pin event cannot
+            // say which pins are now absent, so the whole cache is re-read.
+            SyncEvent::OutputsChanged => {}
+            // A press is for the process that executes. An editor only sends
+            // these; seeing its own request come back is not news.
+            SyncEvent::TriggerRequested { .. } => {}
+            // The batch that carries it already ends in an adopt, so the
+            // snapshot needs nothing extra here.
+            SyncEvent::SubscriptionApplied => {}
         }
     }
 
-    /// Re-reads who owns execution. Inheriting ownership (the previous owner
-    /// closed its window) means this runtime has never run the graph, so
-    /// everything is marked dirty; the pass itself happens in `drain_sync`.
+    /// Re-reads whether anything is executing the graph.
+    ///
+    /// The editor is not a candidate -- it registers as `Role::Viewer` and never
+    /// appears in the runtime table -- so this is purely informational. It is
+    /// still the difference between a live number and a stale one, which is the
+    /// one thing a user must not have to guess about.
     fn apply_runtimes_changed(&mut self) {
-        let Some(conn) = &self.stdb else { return };
-        let owner = crate::sync::is_owner(conn);
-        self.runtime_index = crate::sync::runtime_index(conn);
-        if owner == self.is_owner {
-            return;
-        }
-        self.is_owner = owner;
-        if owner {
-            // Republish from scratch: what the old owner left in the store says
-            // nothing about what this process has computed.
-            self.published.clear();
-            for id in self.nodes.keys().copied().collect::<Vec<_>>() {
-                self.executor.mark_dirty(id);
-            }
+        if let Some(conn) = &self.stdb {
+            self.runtimes = crate::sync::runtime_count(conn);
         }
     }
 
@@ -1736,8 +1558,12 @@ impl App {
         }
         let from_node = NodeId(ed.from_node);
         let to_node = NodeId(ed.to_node);
-        // Both endpoints must already exist locally (node inserts arrive first).
+        // An edge naming a node this window does not have yet is kept, not
+        // dropped: a subscription applies as one burst with no ordering between
+        // tables, so edges routinely arrive before their nodes. Dropping them
+        // is why a freshly opened editor showed 2 of 6 wires.
         if !self.nodes.contains_key(&from_node) || !self.nodes.contains_key(&to_node) {
+            self.pending_edges.push(ed);
             return;
         }
         let from_pin: Arc<str> = Arc::from(ed.from_pin.as_str());
@@ -1763,10 +1589,23 @@ impl App {
     }
 
     fn apply_edge_remove(&mut self, id: EdgeId) {
+        self.pending_edges.retain(|ed| ed.id != id.0);
         if let Some(pos) = self.edges.iter().position(|e| e.id == id) {
             let edge = self.edges.remove(pos);
             self.executor.disconnect_edge(edge.id);
             self.resync_pins(edge.to_node);
+        }
+    }
+
+    /// Retries edges that named a node this window did not have yet. Called once
+    /// per drained batch, because the node they were waiting for may have been
+    /// in the same batch.
+    fn resolve_pending_edges(&mut self) {
+        if self.pending_edges.is_empty() {
+            return;
+        }
+        for ed in std::mem::take(&mut self.pending_edges) {
+            self.apply_edge_insert(ed);
         }
     }
 }
