@@ -86,12 +86,32 @@ pub enum Message {
     PaletteCancel,
     PaletteNavigate(usize),
     // Spawning
-    SpawnNode { type_id: String },
+    SpawnNode {
+        type_id: String,
+    },
     // Node parameter editing
-    ConstValueChanged { node_id: u64, value: String },
+    ConstValueChanged {
+        node_id: u64,
+        value: String,
+    },
     // In-node text settings (e.g. LLM base_url/model/prompt). `key` names the
     // setting, matching the node's SettingDef and set_parameter key.
-    NodeSettingChanged { node_id: u64, key: String, value: String },
+    NodeSettingChanged {
+        node_id: u64,
+        key: String,
+        value: String,
+    },
+    // A manual trigger node was pressed. Arms the node (`fire` parameter) so its
+    // next execution emits one event -- the hand-driven counterpart to a timer.
+    NodeTriggered {
+        node_id: u64,
+    },
+    // A node was resized by dragging its corner grip. The widget reports the
+    // size the host should give the node's content; it does not own node size.
+    NodeResized {
+        node_id: u64,
+        size: iced::Size,
+    },
     // Periodic redraw tick while nodes are working, to animate node borders.
     Tick,
     // Drain queued remote sync events from the SpacetimeDB subscription and

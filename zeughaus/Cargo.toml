@@ -24,7 +24,8 @@ web-time = "1.1"
 zeughaus-capture.workspace = true
 zeughaus-llm.workspace = true
 rfd = "0.15"
-iced = { version = "0.14", features = ["advanced", "wgpu", "tokio"] }
+# `image` decodes/uploads raw RGBA frames (screen capture -> Display node).
+iced = { version = "0.14", features = ["advanced", "wgpu", "tokio", "image"] }
 # Background thread pool for blocking node work (LLM HTTP requests) so the UI
 # thread is never blocked. iced already runs on a tokio runtime natively.
 tokio = { version = "1", features = ["rt"] }
@@ -33,6 +34,6 @@ spacetimedb-sdk.workspace = true
 # wasm: iced without the tokio executor (iced uses the wasm-bindgen executor).
 # iced_nodegraph is WebGPU-only, so the browser editor needs a WebGPU context.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-iced = { version = "0.14", features = ["advanced", "wgpu"] }
+iced = { version = "0.14", features = ["advanced", "wgpu", "image"] }
 console_error_panic_hook = "0.1"
 spacetimedb-sdk = { workspace = true, features = ["browser"] }

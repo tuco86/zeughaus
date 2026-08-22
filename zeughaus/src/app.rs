@@ -4,28 +4,28 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use iced::keyboard;
-use iced::widget::{column, container, row, stack, text, text_input};
-use iced::{Color, Element, Event, Length, Point, Subscription, Task, Theme};
+use iced::widget::{button, column, container, image, row, stack, text, text_input};
+use iced::{Color, ContentFit, Element, Event, Length, Point, Subscription, Task, Theme};
 use iced_nodegraph::{
     EdgeStyle, NodeGraph, NodeStatus, NodeStyle, Pattern, PinDirection as NgPinDirection, PinInfo,
     PinRef, PinShape, PinSide, PinStyle, default_edge_style, default_node_style, default_pin_style,
     edge as ng_edge, input_not_occupied, node as ng_node, node_header, node_pin,
 };
 use iced_palette::{get_filtered_command_index, is_toggle_shortcut};
+#[cfg(not(target_arch = "wasm32"))]
+use zeughaus_capture::CapturePlugin;
 use zeughaus_core::{
-    DomainPlugin, EdgeData, EdgeId, EdgeSemantic, GraphDocument, NodeConfig, NodeData,
+    DomainPlugin, EdgeData, EdgeId, EdgeSemantic, GraphDocument, Image, NodeConfig, NodeData,
     NodeDefinition, NodeId, PinDefinition, PinDirection, PinKind, SettingDef, Ty, TypeConverters,
     Value,
 };
+use zeughaus_flow::FlowPlugin;
+#[cfg(not(target_arch = "wasm32"))]
+use zeughaus_llm::LlmPlugin;
+use zeughaus_ml::MlPlugin;
 #[cfg(not(target_arch = "wasm32"))]
 use zeughaus_runtime::DeferredWork;
 use zeughaus_runtime::{Graph, GraphEdge, GraphExecutor, GraphNode};
-#[cfg(not(target_arch = "wasm32"))]
-use zeughaus_capture::CapturePlugin;
-#[cfg(not(target_arch = "wasm32"))]
-use zeughaus_llm::LlmPlugin;
-use zeughaus_flow::FlowPlugin;
-use zeughaus_ml::MlPlugin;
 use zeughaus_transform::TransformPlugin;
 
 use crate::message::{Message, PinLabel};
@@ -48,6 +48,22 @@ pub struct EditorEdge {
     pub to_pin: PinLabel,
 }
 
+/// What a node shows inline: either the value rendered as text, or a decoded
+/// image frame.
+///
+/// The image variant caches the `image::Handle` next to the pixels it was built
+/// from. `Handle::from_rgba` mints a fresh id on every call, and a new id means
+/// a new GPU upload -- for a 4K capture that is 33 MB per frame. Rebuilding the
+/// handle only when the pixel buffer actually changed (pointer equality on the
+/// shared frame) keeps a still frame at zero upload cost across redraws.
+enum DisplayValue {
+    Text(String),
+    Frame {
+        pixels: Arc<[u8]>,
+        handle: image::Handle,
+    },
+}
+
 pub struct App {
     // Editor state
     nodes: HashMap<NodeId, EditorNode>,
@@ -66,8 +82,13 @@ pub struct App {
     /// type pairs may connect.
     converters: Arc<TypeConverters>,
 
-    // Display values (node_id -> display string)
-    display_values: HashMap<NodeId, String>,
+    // What each node shows inline (node_id -> text or decoded frame)
+    display_values: HashMap<NodeId, DisplayValue>,
+
+    // Content size of nodes the user resized by dragging their corner grip.
+    // Editor-local: a size is a per-user view preference, so it is deliberately
+    // not part of the shared graph document.
+    node_sizes: HashMap<NodeId, iced::Size>,
 
     // Const node text inputs (node_id -> current text)
     const_inputs: HashMap<NodeId, String>,
@@ -160,7 +181,9 @@ impl App {
                 }
             };
             let (conn, rx) = crate::sync::connect(&uri, &db).unwrap_or_else(|e| {
-                panic!("[stdb] cannot connect to {uri} / {db}: {e} (start it with `spacetime start`)")
+                panic!(
+                    "[stdb] cannot connect to {uri} / {db}: {e} (start it with `spacetime start`)"
+                )
             });
             eprintln!("[stdb] session token: {token}");
             (Some(conn), Some(rx), Some(token))
@@ -178,6 +201,7 @@ impl App {
             catalog,
             converters,
             display_values: HashMap::new(),
+            node_sizes: HashMap::new(),
             const_inputs: HashMap::new(),
             node_settings: HashMap::new(),
             spawn_counter: 0,
@@ -204,7 +228,9 @@ impl App {
 
     fn spawn_node(&mut self, type_id: &str, position: Point) -> Task<Message> {
         let exec = self.plugins.iter().find_map(|p| p.create_node(type_id));
-        let Some(exec) = exec else { return Task::none() };
+        let Some(exec) = exec else {
+            return Task::none();
+        };
 
         // Stagger each new node so they don't pile up
         let offset = (self.spawn_counter % 10) as f32 * 30.0;
@@ -236,9 +262,9 @@ impl App {
         if !setting_defs.is_empty() {
             let mut values = HashMap::new();
             for def in &setting_defs {
-                let _ = self
-                    .executor
-                    .set_parameter(id, &def.name, Value::new(def.default.to_string()));
+                let _ =
+                    self.executor
+                        .set_parameter(id, &def.name, Value::new(def.default.to_string()));
                 values.insert(def.name.to_string(), def.default.to_string());
             }
             self.node_settings.insert(id, values);
@@ -258,9 +284,15 @@ impl App {
         self.node_order.push(id);
 
         match type_id {
-            "transform.const_f64" => { self.const_inputs.insert(id, "0".to_string()); }
-            "transform.const_bool" => { self.const_inputs.insert(id, "false".to_string()); }
-            "transform.const_string" => { self.const_inputs.insert(id, String::new()); }
+            "transform.const_f64" => {
+                self.const_inputs.insert(id, "0".to_string());
+            }
+            "transform.const_bool" => {
+                self.const_inputs.insert(id, "false".to_string());
+            }
+            "transform.const_string" => {
+                self.const_inputs.insert(id, String::new());
+            }
             _ => {}
         }
 
@@ -270,7 +302,6 @@ impl App {
         self.autosave();
         task
     }
-
 
     fn connect_edge(
         &mut self,
@@ -477,32 +508,70 @@ impl App {
         Task::none()
     }
 
+    /// Recomputes what each node shows inline from the values on its edges.
+    ///
+    /// A node shows what it produced; a sink (no outgoing edges) shows what it
+    /// received, which is what makes the Display node work. Image frames reuse
+    /// the previous `image::Handle` when the pixels are literally the same
+    /// buffer, so an unchanged frame is not re-uploaded to the GPU.
     fn update_display_values(&mut self) {
-        self.display_values.clear();
+        let mut next: HashMap<NodeId, DisplayValue> = HashMap::new();
         for &node_id in self.nodes.keys() {
-            // Show values from outgoing edges (what this node produced)
-            for edge in &self.edges {
-                if edge.from_node == node_id
-                    && let Some(val) = self.executor.edge_value(edge.id)
-                {
-                    self.display_values
-                        .entry(node_id)
-                        .or_insert_with(|| val.to_string());
-                }
-            }
-            // For sink nodes (no outgoing edges), show incoming values
-            if !self.display_values.contains_key(&node_id) {
-                for edge in &self.edges {
-                    if edge.to_node == node_id
-                        && let Some(val) = self.executor.edge_value(edge.id)
-                    {
-                        self.display_values
-                            .entry(node_id)
-                            .or_insert_with(|| val.to_string());
-                    }
-                }
-            }
+            let value = self
+                .edges
+                .iter()
+                .filter(|e| e.from_node == node_id)
+                .find_map(|e| self.executor.edge_value(e.id))
+                .or_else(|| {
+                    self.edges
+                        .iter()
+                        .filter(|e| e.to_node == node_id)
+                        .find_map(|e| self.executor.edge_value(e.id))
+                });
+            let Some(value) = value else { continue };
+            let display = match value.downcast_ref::<Image>() {
+                Some(frame) => self.frame_display(node_id, frame),
+                None => DisplayValue::Text(value.to_string()),
+            };
+            next.insert(node_id, display);
         }
+        self.display_values = next;
+    }
+
+    /// A frame's inline display, reusing the cached handle while the pixel
+    /// buffer is unchanged (see [`DisplayValue`] for why the id matters).
+    fn frame_display(&self, node_id: NodeId, frame: &Image) -> DisplayValue {
+        let pixels = Arc::clone(frame.rgba());
+        if let Some(DisplayValue::Frame {
+            pixels: old,
+            handle,
+        }) = self.display_values.get(&node_id)
+            && Arc::ptr_eq(old, &pixels)
+        {
+            return DisplayValue::Frame {
+                pixels,
+                handle: handle.clone(),
+            };
+        }
+        let handle = image::Handle::from_rgba(frame.width(), frame.height(), pixels.to_vec());
+        DisplayValue::Frame { pixels, handle }
+    }
+
+    /// One bit per pin (in `node.pin_defs` order), set when that pin is an
+    /// output whose last run produced no value.
+    ///
+    /// Reads `output_value`, not the edge cache: the cache keeps whatever last
+    /// crossed the wire, while `output_value` answers "did this run produce it",
+    /// which is the distinction the user needs to see -- an `error` pin that
+    /// stays dim means nothing failed.
+    fn dim_mask(&self, id: NodeId, node: &EditorNode) -> u64 {
+        node.pin_defs
+            .iter()
+            .take(64)
+            .enumerate()
+            .filter(|(_, p)| p.direction == PinDirection::Output)
+            .filter(|(_, p)| self.executor.output_value(id, &p.name).is_none())
+            .fold(0u64, |mask, (i, _)| mask | 1 << i)
     }
 
     // Used by native persistence (autosave / file dialogs); on wasm it will be
@@ -691,11 +760,8 @@ impl App {
             return None;
         }
         let commands = palette::build_commands(&self.catalog);
-        let original_idx = get_filtered_command_index(
-            &self.palette_input,
-            &commands,
-            self.palette_selected,
-        )?;
+        let original_idx =
+            get_filtered_command_index(&self.palette_input, &commands, self.palette_selected)?;
 
         let cmd = commands.get(original_idx)?;
         if let iced_palette::CommandAction::Message(msg) = &cmd.action {
@@ -738,10 +804,8 @@ impl App {
                 for raw_id in &node_ids {
                     let id = NodeId(*raw_id);
                     if let Some(node) = self.nodes.get_mut(&id) {
-                        node.position = Point::new(
-                            node.position.x + delta.x,
-                            node.position.y + delta.y,
-                        );
+                        node.position =
+                            Point::new(node.position.x + delta.x, node.position.y + delta.y);
                     }
                     #[cfg(not(target_arch = "wasm32"))]
                     if let Some(node) = self.nodes.get(&id) {
@@ -849,7 +913,11 @@ impl App {
                 self.autosave();
                 return task;
             }
-            Message::NodeSettingChanged { node_id, key, value } => {
+            Message::NodeSettingChanged {
+                node_id,
+                key,
+                value,
+            } => {
                 let id = NodeId(node_id);
                 self.node_settings
                     .entry(id)
@@ -861,6 +929,17 @@ impl App {
                 self.push_params(id);
                 self.autosave();
                 return task;
+            }
+            Message::NodeTriggered { node_id } => {
+                // The press itself is the event; the value only arms the node.
+                let id = NodeId(node_id);
+                let _ = self.executor.set_parameter(id, "fire", Value::new(true));
+                return self.execute_graph();
+            }
+            Message::NodeResized { node_id, size } => {
+                // View-local, so no reducer and no autosave: a size is what THIS
+                // user wants to see, not part of the shared graph.
+                self.node_sizes.insert(NodeId(node_id), size);
             }
             Message::Tick => {
                 // No-op: re-rendering advances the widget's animation clock.
@@ -977,6 +1056,7 @@ impl App {
             .on_clone(Message::CloneNodes)
             .on_delete(Message::DeleteNodes)
             .on_pan(|position, zoom| Message::CameraChanged { position, zoom })
+            .on_resize(|node_id, size| Message::NodeResized { node_id, size })
             .view(self.camera_position, self.camera_zoom)
             .can_connect({
                 // With a custom can_connect, iced_nodegraph stops enforcing pin
@@ -1028,15 +1108,23 @@ impl App {
 
         for id in &self.node_order {
             if let Some(node) = self.nodes.get(id) {
-                let display_val = self.display_values.get(id).map(|s| s.as_str());
+                let display = self.display_values.get(id);
                 let const_input = self.const_inputs.get(id).map(|s| s.as_str());
                 let settings = self.node_settings.get(id);
-                let content = build_node_element(node, display_val, const_input, settings);
+                let content = build_node_element(
+                    node,
+                    display,
+                    const_input,
+                    settings,
+                    self.dim_mask(*id, node),
+                    self.node_sizes.get(id).copied(),
+                );
                 // Per-node activity feedback: red marching-ants on error, accent
                 // marching-ants while the node is working (async pending).
                 let pending = self.executor.is_pending(*id);
                 let errored = self.executor.is_error(*id);
                 let node_widget = ng_node(node.id.0, node.position, content)
+                    .resizable(is_resizable(&node.type_id))
                     .style(move |theme, status| {
                         let base = default_node_style(theme, status);
                         if errored {
@@ -1084,7 +1172,8 @@ impl App {
         }
 
         for edge in &self.edges {
-            // Color edge based on source pin type
+            // Edge color follows the source pin's type, dimmed while that output
+            // carries nothing: an edge is only as live as the value on it.
             let edge_color = self
                 .nodes
                 .get(&edge.from_node)
@@ -1095,6 +1184,15 @@ impl App {
                 })
                 .map(|p| pin_color(&p.ty))
                 .unwrap_or(Color::from_rgb(0.6, 0.6, 0.6));
+            let edge_color = if self
+                .executor
+                .output_value(edge.from_node, edge.from_pin.as_str())
+                .is_some()
+            {
+                edge_color
+            } else {
+                dim(edge_color)
+            };
 
             // An edge reflects its source node's state: red marching-ants when
             // the source errored (broken data), accent flow while it works.
@@ -1204,10 +1302,7 @@ impl App {
 
     pub fn subscription(&self) -> Subscription<Message> {
         let events = iced::event::listen_with(|event, _status, _id| {
-            if let Event::Keyboard(keyboard::Event::KeyPressed {
-                key, modifiers, ..
-            }) = event
-            {
+            if let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event {
                 if is_toggle_shortcut(&key, modifiers) {
                     return Some(Message::TogglePalette);
                 }
@@ -1254,8 +1349,7 @@ impl App {
         #[cfg(not(target_arch = "wasm32"))]
         if self.stdb.is_some() {
             subs.push(
-                iced::time::every(std::time::Duration::from_millis(100))
-                    .map(|_| Message::SyncPoll),
+                iced::time::every(std::time::Duration::from_millis(100)).map(|_| Message::SyncPoll),
             );
         }
 
@@ -1419,10 +1513,14 @@ impl App {
                     let _ = self.executor.set_parameter(id, name, Value::new(b));
                 }
                 "transform.const_string" => {
-                    let _ = self.executor.set_parameter(id, name, Value::new(value_str.clone()));
+                    let _ = self
+                        .executor
+                        .set_parameter(id, name, Value::new(value_str.clone()));
                 }
                 _ => {
-                    let _ = self.executor.set_parameter(id, name, Value::new(value_str.clone()));
+                    let _ = self
+                        .executor
+                        .set_parameter(id, name, Value::new(value_str.clone()));
                 }
             }
             if is_const {
@@ -1487,13 +1585,50 @@ impl App {
     }
 }
 
+/// Default content size of a Display node before the user resizes it. Wide
+/// enough that a downscaled 16:9 frame is recognizable.
+const DISPLAY_SIZE: iced::Size = iced::Size::new(240.0, 150.0);
+
+/// Width of every other node. Their content is text and pin rows, which do not
+/// benefit from being resizable.
+const NODE_WIDTH: f32 = 180.0;
+
+/// Node types whose content is worth resizing: only the Display node, which
+/// shows data rather than pin rows.
+fn is_resizable(type_id: &str) -> bool {
+    type_id == "transform.display"
+}
+
+/// Halves a color's brightness, marking a pin or edge that currently carries no
+/// value. Scaling the channels (rather than the alpha) keeps the hue readable
+/// against both the canvas and a node body.
+fn dim(c: Color) -> Color {
+    Color {
+        r: c.r * 0.5,
+        g: c.g * 0.5,
+        b: c.b * 0.5,
+        a: c.a,
+    }
+}
+
+/// Whether pin `index` is marked dim in a [`App::dim_mask`]. Pins beyond the
+/// mask's 64 slots are treated as live -- a node with that many outputs has no
+/// meaningful "empty pin" story anyway.
+fn is_dim(mask: u64, index: usize) -> bool {
+    index < 64 && mask & (1 << index) != 0
+}
+
 fn build_node_element<'a>(
     node: &'a EditorNode,
-    display_value: Option<&'a str>,
+    display: Option<&'a DisplayValue>,
     const_input: Option<&'a str>,
     settings: Option<&'a HashMap<String, String>>,
+    dim_mask: u64,
+    size: Option<iced::Size>,
 ) -> Element<'a, Message, Theme> {
     let is_const = node.type_id.starts_with("transform.const_");
+    let is_button = node.type_id == "flow.button";
+    let is_display = is_resizable(&node.type_id);
 
     let mut items: Vec<Element<'_, Message, Theme>> = Vec::new();
 
@@ -1522,11 +1657,70 @@ fn build_node_element<'a>(
         let pin: Element<'_, Message, Theme> =
             node_pin(PinSide::Right, PinLabel::from("value"), input_field)
                 .direction(NgPinDirection::Output)
-                .info(PinVisual { color: pin_tint, shape: pin_shape(pin_kind) })
+                .info(PinVisual {
+                    color: pin_tint,
+                    shape: pin_shape(pin_kind),
+                })
                 .into();
         items.push(pin);
+    } else if is_button {
+        // The button IS the pin content: pressing it is the event this node
+        // exists to produce, so there is nothing else worth showing.
+        let node_raw_id = node.id.0;
+        let first_pin = node.pin_defs.first();
+        let tint = first_pin.map_or_else(|| pin_color(&Ty::Bool), |p| pin_color(&p.ty));
+        let color = if is_dim(dim_mask, 0) { dim(tint) } else { tint };
+        let press = button(text("Trigger").size(13).center())
+            .on_press(Message::NodeTriggered {
+                node_id: node_raw_id,
+            })
+            .width(Length::Fill);
+        let pin: Element<'_, Message, Theme> =
+            node_pin(PinSide::Right, PinLabel::from("out"), press)
+                .direction(NgPinDirection::Output)
+                .info(PinVisual {
+                    color,
+                    shape: pin_shape(PinKind::Trigger),
+                })
+                .into();
+        items.push(pin);
+    } else if is_display {
+        // The Display node's whole body is its readout: the input pin wraps the
+        // content instead of a label, which also anchors the pin at the left
+        // edge's midpoint.
+        let body: Element<'_, Message, Theme> = match display {
+            Some(DisplayValue::Frame { handle, .. }) => image(handle.clone())
+                .content_fit(ContentFit::Contain)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+            Some(DisplayValue::Text(val)) => text(val.as_str())
+                .size(14)
+                .color(Color::from_rgb(0.9, 0.9, 0.5))
+                .into(),
+            None => text("").size(14).into(),
+        };
+        let pin_def = node.pin_defs.first();
+        let name = pin_def.map_or_else(|| Arc::from("input"), |p| p.name.clone());
+        let visual = PinVisual {
+            color: pin_def.map_or_else(|| pin_color(&Ty::Any), |p| pin_color(&p.ty)),
+            shape: pin_shape(pin_def.map(|p| p.pin_kind).unwrap_or(PinKind::Trigger)),
+        };
+        let pin: Element<'_, Message, Theme> = node_pin(
+            PinSide::Left,
+            PinLabel(name),
+            container(body)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        )
+        .direction(NgPinDirection::Input)
+        .info(visual)
+        .into();
+        items.push(pin);
     } else {
-        for pin_def in &node.pin_defs {
+        for (index, pin_def) in node.pin_defs.iter().enumerate() {
             let side = match pin_def.direction {
                 PinDirection::Input => PinSide::Left,
                 PinDirection::Output => PinSide::Right,
@@ -1536,16 +1730,24 @@ fn build_node_element<'a>(
                 PinDirection::Output => NgPinDirection::Output,
             };
 
+            let tint = pin_color(&pin_def.ty);
             let visual = PinVisual {
-                color: pin_color(&pin_def.ty),
+                color: if is_dim(dim_mask, index) {
+                    dim(tint)
+                } else {
+                    tint
+                },
                 shape: pin_shape(pin_def.pin_kind),
             };
 
-            let pin: Element<'_, Message, Theme> =
-                node_pin(side, PinLabel(pin_def.name.clone()), text(&*pin_def.name).size(12))
-                    .direction(direction)
-                    .info(visual)
-                    .into();
+            let pin: Element<'_, Message, Theme> = node_pin(
+                side,
+                PinLabel(pin_def.name.clone()),
+                text(&*pin_def.name).size(12),
+            )
+            .direction(direction)
+            .info(visual)
+            .into();
             items.push(pin);
         }
     }
@@ -1572,7 +1774,9 @@ fn build_node_element<'a>(
 
         items.push(
             column![
-                text(&*def.name).size(11).color(Color::from_rgb(0.6, 0.6, 0.6)),
+                text(&*def.name)
+                    .size(11)
+                    .color(Color::from_rgb(0.6, 0.6, 0.6)),
                 field
             ]
             .spacing(1)
@@ -1582,16 +1786,22 @@ fn build_node_element<'a>(
 
     // Always render a value display row to keep widget tree structure stable.
     // Empty text when no value -- prevents iced widget state downcast panics
-    // caused by children count changing between view() calls.
-    if !is_const {
-        let (prefix, value_text) = match display_value {
-            Some(val) => ("= ", val),
-            None => ("", ""),
+    // caused by children count changing between view() calls. The Display and
+    // Button nodes are exempt: their body already IS the value or the control.
+    if !is_const && !is_display && !is_button {
+        let value_text = match display {
+            Some(DisplayValue::Text(val)) => val.as_str(),
+            // A frame has no text form; the Display node is where it is shown.
+            Some(DisplayValue::Frame { .. }) => "frame",
+            None => "",
         };
+        let prefix = if value_text.is_empty() { "" } else { "= " };
         items.push(
             row![
                 text(prefix).size(12).color(Color::from_rgb(0.6, 0.6, 0.6)),
-                text(value_text).size(13).color(Color::from_rgb(0.9, 0.9, 0.5))
+                text(value_text)
+                    .size(13)
+                    .color(Color::from_rgb(0.9, 0.9, 0.5))
             ]
             .spacing(2)
             .into(),
@@ -1607,7 +1817,15 @@ fn build_node_element<'a>(
         8.0,
     );
     let inner = column![header, container(body).padding(6.0)];
-    container(inner).width(180.0).into()
+    if is_display {
+        let size = size.unwrap_or(DISPLAY_SIZE);
+        container(inner)
+            .width(size.width)
+            .height(size.height)
+            .into()
+    } else {
+        container(inner).width(NODE_WIDTH).into()
+    }
 }
 
 /// Header background color per node category, mirroring the old content presets.

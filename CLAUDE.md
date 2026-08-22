@@ -15,13 +15,13 @@ connected, and data flows live through the graph.
 
 ```
 zeughaus/              # binary (zeughaus) - iced UI + iced_nodegraph
-zeughaus-core/         # types, traits (Ty, Typed, Value, ExecutableNode, DomainPlugin)
+zeughaus-core/         # types, traits (Ty, Typed, Value, Image, ExecutableNode, DomainPlugin)
 zeughaus-runtime/      # graph execution engine (topo sort, dirty propagation, edge cache)
 zeughaus-transform/    # transform plugin (35 math/logic/string/trig nodes)
-zeughaus-capture/      # capture plugin (Screen Capture via scrap/DXGI)
+zeughaus-capture/      # capture plugin (Screen Capture -> frame/dimensions; scrap is X11/DXGI only, so a Wayland session yields black frames)
 zeughaus-llm/          # LLM plugin (Conversation nodes, LM Studio chat)
 zeughaus-ml/           # ML plugin (Keras layers as nodes -> exportable functional-API code)
-zeughaus-flow/         # flow plugin (Hold: Event -> State adapter)
+zeughaus-flow/         # flow plugin (Hold: Event -> State; Button: manual Event source)
 zeughaus-module/       # SpacetimeDB server module (excluded from the native workspace)
 ```
 
