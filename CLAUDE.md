@@ -18,7 +18,7 @@ zeughaus/              # binary (zeughaus) - iced UI + iced_nodegraph
 zeughaus-core/         # types, traits (Ty, Typed, Value, Image, ExecutableNode, DomainPlugin)
 zeughaus-runtime/      # graph execution engine (topo sort, dirty propagation, edge cache)
 zeughaus-transform/    # transform plugin (35 math/logic/string/trig nodes)
-zeughaus-capture/      # capture plugin (Screen Capture -> frame/dimensions; scrap is X11/DXGI only, so a Wayland session yields black frames)
+zeughaus-capture/      # capture plugin (Screen Capture -> frame/dimensions; xdg-desktop-portal on Wayland, scrap/X11/DXGI otherwise)
 zeughaus-llm/          # LLM plugin (Conversation nodes, LM Studio chat)
 zeughaus-ml/           # ML plugin (Keras layers as nodes -> exportable functional-API code)
 zeughaus-flow/         # flow plugin (Hold: Event -> State; Button: manual Event source)
