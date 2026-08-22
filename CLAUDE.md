@@ -99,7 +99,7 @@ regex patterns, or when the LSP server is unavailable.
 
 ### Technology Stack
 - UI: iced 0.14 + iced_nodegraph
-- Collaboration: SpacetimeDB (WASM support incoming via PR #4183)
+- Collaboration: SpacetimeDB 2.8 (`spacetimedb-sdk`, `browser` feature on wasm32)
 - Async: Tokio
 - Local Storage: SQLite
 - Production DB: PostgreSQL
@@ -107,4 +107,21 @@ regex patterns, or when the LSP server is unavailable.
 - Serialization: serde
 
 ### WASM
-Deferred until SpacetimeDB WASM support lands. No wasm32 target for now.
+`cargo check --target wasm32-unknown-unknown -p zeughaus` is green. Native-only
+plugins (capture) and `rfd` dialogs are behind `cfg(not(target_arch = "wasm32"))`;
+`trunk serve` in `zeughaus/` serves the browser editor (WebGPU only, no WebGL
+fallback).
+
+### SpacetimeDB
+The editor requires a running host: `spacetime start` (listens on 127.0.0.1:3000,
+data in `~/.local/share/spacetime/data`), then publish the module once per schema
+change:
+
+```
+spacetime publish --server local zeughaus --module-path zeughaus-module
+spacetime generate --lang rust --out-dir zeughaus/src/module_bindings --module-path zeughaus-module
+```
+
+`spacetime generate` output is checked in. The CLI renamed `--project-path` to
+`--module-path` in 2.7. Host and `spacetimedb-sdk` must share a major/minor
+version or the wire format mismatches on connect.

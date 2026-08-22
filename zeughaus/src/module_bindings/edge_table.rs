@@ -18,6 +18,18 @@ pub struct EdgeTableHandle<'ctx> {
     ctx: std::marker::PhantomData<&'ctx super::RemoteTables>,
 }
 
+/// Lifetime-aware accessor marker for the table `edge`.
+pub struct EdgeTableAccessor;
+
+impl __sdk::TableAccessor<super::RemoteTables> for EdgeTableAccessor {
+    type Row = Edge;
+    type Handle<'db> = EdgeTableHandle<'db>;
+
+    fn get<'db>(db: &'db super::RemoteTables) -> Self::Handle<'db> {
+        db.edge()
+    }
+}
+
 #[allow(non_camel_case_types)]
 /// Extension trait for access to the table `edge`.
 ///
@@ -39,6 +51,18 @@ impl EdgeTableAccess for super::RemoteTables {
 
 pub struct EdgeInsertCallbackId(__sdk::CallbackId);
 pub struct EdgeDeleteCallbackId(__sdk::CallbackId);
+
+impl<'ctx> __sdk::TableLike for EdgeTableHandle<'ctx> {
+    type Row = Edge;
+    type EventContext = super::EventContext;
+
+    fn count(&self) -> u64 {
+        self.imp.count()
+    }
+    fn iter(&self) -> impl Iterator<Item = Edge> + '_ {
+        self.imp.iter()
+    }
+}
 
 impl<'ctx> __sdk::Table for EdgeTableHandle<'ctx> {
     type Row = Edge;
@@ -78,9 +102,54 @@ impl<'ctx> __sdk::Table for EdgeTableHandle<'ctx> {
     }
 }
 
+impl<'ctx> __sdk::WithInsert for EdgeTableHandle<'ctx> {
+    type InsertCallbackId = EdgeInsertCallbackId;
+
+    fn on_insert(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row) + Send + 'static,
+    ) -> EdgeInsertCallbackId {
+        EdgeInsertCallbackId(self.imp.on_insert(Box::new(callback)))
+    }
+
+    fn remove_on_insert(&self, callback: EdgeInsertCallbackId) {
+        self.imp.remove_on_insert(callback.0)
+    }
+}
+
+impl<'ctx> __sdk::WithDelete for EdgeTableHandle<'ctx> {
+    type DeleteCallbackId = EdgeDeleteCallbackId;
+
+    fn on_delete(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row) + Send + 'static,
+    ) -> EdgeDeleteCallbackId {
+        EdgeDeleteCallbackId(self.imp.on_delete(Box::new(callback)))
+    }
+
+    fn remove_on_delete(&self, callback: EdgeDeleteCallbackId) {
+        self.imp.remove_on_delete(callback.0)
+    }
+}
+
 pub struct EdgeUpdateCallbackId(__sdk::CallbackId);
 
 impl<'ctx> __sdk::TableWithPrimaryKey for EdgeTableHandle<'ctx> {
+    type UpdateCallbackId = EdgeUpdateCallbackId;
+
+    fn on_update(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row, &Self::Row) + Send + 'static,
+    ) -> EdgeUpdateCallbackId {
+        EdgeUpdateCallbackId(self.imp.on_update(Box::new(callback)))
+    }
+
+    fn remove_on_update(&self, callback: EdgeUpdateCallbackId) {
+        self.imp.remove_on_update(callback.0)
+    }
+}
+
+impl<'ctx> __sdk::WithUpdate for EdgeTableHandle<'ctx> {
     type UpdateCallbackId = EdgeUpdateCallbackId;
 
     fn on_update(
