@@ -330,6 +330,20 @@ impl GraphExecutor {
         self.cache.get(edge_id)
     }
 
+    /// The value a node produced on one of its output pins during its last
+    /// execution, independent of any edge.
+    ///
+    /// `last_outputs` is replaced wholesale for a node every time it runs
+    /// (`execute_dirty` / `deliver_async_result` both `insert` the full output
+    /// map), so `None` means "the last run of this node produced no value on
+    /// that pin" -- not "never produced one". That is precisely the state the
+    /// editor dims. Contrast [`Self::edge_value`], which is a cache holding the
+    /// last value that ever crossed an edge and therefore keeps showing a stale
+    /// value after a run that emitted nothing.
+    pub fn output_value(&self, node: NodeId, pin: &str) -> Option<&Value> {
+        self.last_outputs.get(&node)?.get(pin)
+    }
+
     /// Recomputes a node's pins from what is currently connected to its inputs.
     /// On a change, updates the graph node's pin_defs and returns the new pin
     /// set so the editor can re-sync its own snapshot. Returns None if unchanged.
@@ -523,8 +537,8 @@ mod tests {
 
     #[test]
     fn on_edge_added_seeds_without_rerunning_source() {
-        use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
 
         struct Counting(f64, Arc<AtomicU32>);
         impl ExecutableNode for Counting {
@@ -567,8 +581,8 @@ mod tests {
 
     #[test]
     fn error_state_set_then_cleared() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         // Fails while `fail` is true, succeeds otherwise.
         struct Flaky(Arc<AtomicBool>);
@@ -842,5 +856,66 @@ mod tests {
         assert_eq!(exec.graph.node(split).unwrap().pin_defs.len(), 3);
         // Idempotent: nothing changed on a second sync.
         assert!(exec.sync_node_pins(split).is_none());
+    }
+
+    /// The editor dims a pin whose node produced nothing on it in the last run,
+    /// so `output_value` must reflect only the most recent execution.
+    #[test]
+    fn output_value_reports_only_the_last_run() {
+        /// Declares two outputs but emits just one per run, alternating.
+        struct Alternating {
+            pins: Vec<PinDefinition>,
+            runs: u32,
+        }
+        impl ExecutableNode for Alternating {
+            fn execute(&mut self, _inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
+                if self.runs.is_multiple_of(2) {
+                    ctx.emit_typed("a", 1.0_f64);
+                } else {
+                    ctx.emit_typed("b", 2.0_f64);
+                }
+                self.runs += 1;
+                ctx.flush();
+                Ok(())
+            }
+            fn pin_definitions(&self) -> &[PinDefinition] {
+                &self.pins
+            }
+        }
+
+        let mut graph = Graph::new();
+        let node = NodeId::next();
+        graph.add_node(make_node(node));
+
+        let mut exec = GraphExecutor::new(graph);
+        exec.register_node(
+            node,
+            Box::new(Alternating {
+                pins: vec![
+                    PinDefinition::output("a", Ty::Float),
+                    PinDefinition::output("b", Ty::Float),
+                ],
+                runs: 0,
+            }),
+        );
+
+        exec.execute_all().unwrap();
+        assert_eq!(
+            exec.output_value(node, "a")
+                .and_then(Value::downcast_ref::<f64>),
+            Some(&1.0)
+        );
+        // Declared but not emitted this run.
+        assert!(exec.output_value(node, "b").is_none());
+        assert!(exec.output_value(NodeId::next(), "a").is_none());
+
+        // Second run emits the other pin: the map is replaced, not merged.
+        exec.execute_all().unwrap();
+        assert!(exec.output_value(node, "a").is_none());
+        assert_eq!(
+            exec.output_value(node, "b")
+                .and_then(Value::downcast_ref::<f64>),
+            Some(&2.0)
+        );
     }
 }
