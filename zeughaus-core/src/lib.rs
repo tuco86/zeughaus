@@ -10,6 +10,7 @@ pub mod pin;
 pub mod plugin;
 pub mod ty;
 pub mod value;
+pub mod wire;
 
 pub use context::{AsyncWork, InputSet, NodeContext};
 pub use convert::TypeConverters;
@@ -23,3 +24,4 @@ pub use pin::{DataMode, PinBinding, PinDefinition, PinDirection, PinKind};
 pub use plugin::{DomainPlugin, ExecutableNode};
 pub use ty::{Field, Record, Repr, Ty, Typed};
 pub use value::Value;
+pub use wire::{decode_scalar, encode_scalar};
