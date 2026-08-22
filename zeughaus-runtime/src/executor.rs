@@ -29,9 +29,10 @@ pub struct GraphExecutor {
     /// source without re-executing it -- critical for nodes with side effects
     /// (e.g. an LLM chat node must not re-fire just because a wire was drawn).
     last_outputs: HashMap<NodeId, HashMap<String, Value>>,
-    /// Nodes whose last execution failed (sync error or async failure). Cleared
-    /// when the node next runs cleanly. Drives error styling in the editor.
-    error_nodes: HashSet<NodeId>,
+    /// Why a node's last execution failed (sync error or async failure), keyed
+    /// by node. Cleared when the node next runs cleanly. Drives error styling in
+    /// the editor and the message it shows.
+    node_errors: HashMap<NodeId, String>,
     trace_counter: u64,
     /// Coerces values that cross an edge whose endpoints declare different
     /// types (e.g. a u8 output into an f64 input). Shared with the editor's
@@ -48,7 +49,7 @@ impl GraphExecutor {
             dirty: HashSet::new(),
             pending: HashSet::new(),
             last_outputs: HashMap::new(),
-            error_nodes: HashSet::new(),
+            node_errors: HashMap::new(),
             trace_counter: 0,
             converters: Arc::new(TypeConverters::new()),
         }
@@ -71,13 +72,23 @@ impl GraphExecutor {
 
     /// Whether a node's last execution failed.
     pub fn is_error(&self, id: NodeId) -> bool {
-        self.error_nodes.contains(&id)
+        self.node_errors.contains_key(&id)
+    }
+
+    /// Why a node's last execution failed, if it did.
+    pub fn node_error(&self, id: NodeId) -> Option<&str> {
+        self.node_errors.get(&id).map(String::as_str)
+    }
+
+    /// Every node that failed in the last pass, in no particular order.
+    pub fn errors(&self) -> impl Iterator<Item = (NodeId, &str)> {
+        self.node_errors.iter().map(|(id, msg)| (*id, msg.as_str()))
     }
 
     /// Flags a node as failed (used by the host when async work errors).
-    pub fn mark_error(&mut self, id: NodeId) {
+    pub fn mark_error(&mut self, id: NodeId, message: String) {
         self.pending.remove(&id);
-        self.error_nodes.insert(id);
+        self.node_errors.insert(id, message);
     }
 
     pub fn register_node(&mut self, id: NodeId, exec: Box<dyn ExecutableNode>) {
@@ -107,12 +118,20 @@ impl GraphExecutor {
     /// work (or are already awaiting a result) are skipped, and their
     /// downstream nodes are held back until the result is delivered. Returns
     /// the deferred work for the host to run off-thread.
+    ///
+    /// A node that fails does not cancel the pass: its error is recorded (see
+    /// [`Self::node_error`]), its downstream is held back because its outputs
+    /// are unavailable, and every unrelated node still runs. Bailing out
+    /// instead used to throw away the deferred work already collected in this
+    /// pass while those nodes stayed marked pending -- one broken node left
+    /// every async node in the graph hanging forever. `Err` is reserved for a
+    /// failure of the pass itself, i.e. a graph that cannot be ordered.
     pub fn execute_dirty(&mut self) -> Result<DeferredWork> {
         let order = topological_sort(&self.graph)?;
         let dirty = std::mem::take(&mut self.dirty);
         let mut deferred: DeferredWork = Vec::new();
         // Nodes whose outputs are not (yet) available this pass: deferred this
-        // pass, already pending, or transitively downstream of either.
+        // pass, already pending, failed, or transitively downstream of any.
         let mut blocked: HashSet<NodeId> = HashSet::new();
 
         for node_id in order {
@@ -142,22 +161,21 @@ impl GraphExecutor {
             if let Some(node) = self.nodes.get_mut(&node_id)
                 && let Err(e) = node.execute(&inputs, &mut ctx)
             {
-                // Tag the failing node so the host can flag it visually,
-                // then propagate the error.
-                self.error_nodes.insert(node_id);
-                return Err(e);
+                self.node_errors.insert(node_id, e.to_string());
+                blocked.insert(node_id);
+                continue;
             }
 
             if let Some(work) = ctx.take_deferred() {
                 self.pending.insert(node_id);
-                self.error_nodes.remove(&node_id); // now retrying
+                self.node_errors.remove(&node_id); // now retrying
                 blocked.insert(node_id);
                 deferred.push((node_id, work));
                 continue;
             }
 
             let outputs = ctx.take_outputs();
-            self.error_nodes.remove(&node_id); // executed cleanly
+            self.node_errors.remove(&node_id); // executed cleanly
             self.last_outputs.insert(node_id, outputs.clone());
             self.apply_outputs(node_id, outputs);
         }
@@ -239,7 +257,7 @@ impl GraphExecutor {
         outputs: HashMap<String, Value>,
     ) -> Result<DeferredWork> {
         self.pending.remove(&node_id);
-        self.error_nodes.remove(&node_id);
+        self.node_errors.remove(&node_id);
         self.last_outputs.insert(node_id, outputs.clone());
         self.apply_outputs(node_id, outputs);
         // Re-run only the downstream; the node itself is already done.
@@ -323,7 +341,7 @@ impl GraphExecutor {
         self.dirty.remove(&id);
         self.pending.remove(&id);
         self.last_outputs.remove(&id);
-        self.error_nodes.remove(&id);
+        self.node_errors.remove(&id);
     }
 
     pub fn edge_value(&self, edge_id: EdgeId) -> Option<&Value> {
@@ -607,14 +625,50 @@ mod tests {
         let fail = Arc::new(AtomicBool::new(true));
         exec.register_node(a, Box::new(Flaky(fail.clone())));
 
-        assert!(exec.execute_all().is_err());
+        // The pass itself succeeds; the failure is recorded on the node.
+        assert!(exec.execute_all().is_ok());
         assert!(exec.is_error(a));
+        assert_eq!(exec.node_error(a), Some("node execution failed: boom"));
 
         // Recover: node now succeeds, error flag clears.
         fail.store(false, Ordering::SeqCst);
         exec.mark_dirty_downstream(a);
         exec.execute_dirty().unwrap();
         assert!(!exec.is_error(a));
+    }
+
+    /// A failing node used to abort the whole pass, which threw away deferred
+    /// work already collected from unrelated nodes -- those nodes stayed marked
+    /// pending with nothing running, so their downstream never resumed.
+    #[test]
+    fn a_failing_node_does_not_discard_another_nodes_deferred_work() {
+        struct Failing;
+        impl ExecutableNode for Failing {
+            fn execute(&mut self, _inputs: &InputSet, _ctx: &mut NodeContext) -> Result<()> {
+                Err(ZeughausError::ExecutionFailed("boom".into()))
+            }
+            fn pin_definitions(&self) -> &[PinDefinition] {
+                &[]
+            }
+        }
+
+        let mut graph = Graph::new();
+        // The failing node is ordered first (topological sort breaks ties by id),
+        // so it is the one that used to abort before the deferring node ran.
+        let failing = NodeId::next();
+        let deferring = NodeId::next();
+        graph.add_node(make_node(failing));
+        graph.add_node(make_node(deferring));
+        let mut exec = GraphExecutor::new(graph);
+        exec.register_node(failing, Box::new(Failing));
+        exec.register_node(deferring, Box::new(DeferNode(1.0)));
+
+        let deferred = exec.execute_all().unwrap();
+
+        assert_eq!(deferred.len(), 1, "the async work must survive");
+        assert_eq!(deferred[0].0, deferring);
+        assert!(exec.is_pending(deferring));
+        assert!(exec.is_error(failing));
     }
 
     #[test]

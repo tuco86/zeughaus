@@ -414,17 +414,36 @@ impl App {
         let task = match self.executor.execute_dirty() {
             Ok(deferred) => {
                 self.last_exec_us = start.elapsed().as_micros() as u64;
-                self.last_error.clear();
                 self.spawn_async(deferred)
             }
+            // Only a graph that cannot be ordered (a cycle) fails the pass
+            // itself; a node's own failure is reported per node below.
             Err(e) => {
                 self.last_exec_us = start.elapsed().as_micros() as u64;
                 self.last_error = e.to_string();
-                Task::none()
+                return Task::none();
             }
         };
+        self.last_error = self.node_error_summary();
         self.update_display_values();
         task
+    }
+
+    /// The status bar's error text: one failing node's message, plus a count
+    /// when several failed. Empty while every node is fine.
+    fn node_error_summary(&self) -> String {
+        let mut errors = self.executor.errors();
+        let Some((id, message)) = errors.next() else {
+            return String::new();
+        };
+        let name = self
+            .nodes
+            .get(&id)
+            .map_or("node", |n| n.display_name.as_str());
+        match errors.count() {
+            0 => format!("{name}: {message}"),
+            more => format!("{name}: {message} (+{more} more)"),
+        }
     }
 
     /// Turns deferred node work into background tasks. Each runs its blocking
@@ -966,7 +985,7 @@ impl App {
                 match result {
                     Ok(outputs) => match self.executor.deliver_async_result(id, outputs) {
                         Ok(deferred) => {
-                            self.last_error.clear();
+                            self.last_error = self.node_error_summary();
                             self.update_display_values();
                             return self.spawn_async(deferred);
                         }
@@ -976,8 +995,8 @@ impl App {
                         }
                     },
                     Err(e) => {
-                        self.executor.mark_error(id);
-                        self.last_error = e;
+                        self.executor.mark_error(id, e);
+                        self.last_error = self.node_error_summary();
                         self.update_display_values();
                     }
                 }
