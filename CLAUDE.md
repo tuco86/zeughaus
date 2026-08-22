@@ -14,7 +14,9 @@ connected, and data flows live through the graph.
 ## Workspace Structure
 
 ```
-zeughaus/              # binary (zeughaus) - iced UI + iced_nodegraph
+zeughaus/              # binary (zeughaus) - iced editor UI; edits the graph and views results, never executes
+zeughaus-runner/       # binary (zeughaus-runner) - headless process that executes the graph and publishes results
+zeughaus-sync/         # SpacetimeDB client shared by both binaries (generated bindings + connect/subscribe/publish)
 zeughaus-core/         # types, traits (Ty, Typed, Value, Image, ExecutableNode, DomainPlugin)
 zeughaus-runtime/      # graph execution engine (topo sort, dirty propagation, edge cache)
 zeughaus-transform/    # transform plugin (35 math/logic/string/trig nodes)
@@ -90,13 +92,13 @@ regex patterns, or when the LSP server is unavailable.
 
 ### Core Concepts
 - **Runtime Type System**: Pins declare a `Ty` built at runtime (scalars, `List`, `Option`, `Record`, `Opaque`), not a compile-time string. `Typed::ty()` is the single source of truth for both a pin's declaration and a value's tag, so they cannot disagree. Nodes may derive their pins from what is connected (`sync_pins`).
-- **One Executing Runtime**: Every editor window registers in the store's `runtime` table; the one with the lowest `seq` executes the graph, the rest display its published scalar outputs (`node_output`). Without this, each window ran the graph for itself -- two windows meant two screenshots from one capture node. Frames and other opaque values do not travel; only `bool`/`int`/`float`/`str` (see `zeughaus-core/src/wire.rs`).
+- **Editor and Runtime are Separate Processes**: `zeughaus` edits and views, `zeughaus-runner` executes. They meet in the store, so a local editor and a remote one are the same thing. Runners register in `runtime` and the lowest `seq` owns execution (a second runner is a hot standby); results reach editors as scalars in `node_output`. Frames do not travel -- only `bool`/`int`/`float`/`str` (`zeughaus-core/src/wire.rs`). A trigger press travels the other way, through `node_trigger`.
 - **Push/Pull Reactive Dataflow**: Every edge has a last-value cache. Push notifies downstream, pull triggers lazy computation.
 - **Trigger vs Sample Pins**: Input pins are either trigger (causes execution) or sample (read passively).
 - **Atomic Flush**: Multi-output nodes buffer with emit/flush to ensure synchronized delivery.
 - **Capture**: Opt-in per-node persistence of results to database. No event sourcing.
 - **Domain Subgraphs**: Each domain (DLL inject, DB, AI, etc.) is a subgraph type with its own semantics.
-- **Editor/Executor Separation**: Editor designs graphs, runners execute them. Enables WASM browser editor with native execution.
+- **Editor/Executor Separation**: Implemented as two processes (see above). Also what enables a WASM browser editor against native execution.
 
 ### Technology Stack
 - UI: iced 0.14 + iced_nodegraph
@@ -113,14 +115,21 @@ plugins (capture) and `rfd` dialogs are behind `cfg(not(target_arch = "wasm32"))
 `trunk serve` in `zeughaus/` serves the browser editor (WebGPU only, no WebGL
 fallback).
 
-### SpacetimeDB
-The editor requires a running host: `spacetime start` (listens on 127.0.0.1:3000,
-data in `~/.local/share/spacetime/data`), then publish the module once per schema
-change:
+### Running it
+Three processes, in this order:
+
+```
+spacetime start                 # store, 127.0.0.1:3000, data in ~/.local/share/spacetime/data
+cargo run -p zeughaus-runner    # executes the graph; nothing runs without it
+cargo run -p zeughaus           # editor; start as many as you like
+```
+
+An editor with no runner still edits the graph -- it just shows no values, and
+says so in the status bar. Publish the module once per schema change:
 
 ```
 spacetime publish --server local zeughaus --module-path zeughaus-module
-spacetime generate --lang rust --out-dir zeughaus/src/module_bindings --module-path zeughaus-module
+spacetime generate --lang rust --out-dir zeughaus-sync/src/module_bindings --module-path zeughaus-module
 ```
 
 `spacetime generate` output is checked in. The CLI renamed `--project-path` to

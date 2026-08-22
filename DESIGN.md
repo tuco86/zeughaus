@@ -31,12 +31,26 @@ The node graph is the universal interface. The execution happens elsewhere.
 +----------------------------------+
 ```
 
-### Separation of Editor and Executor
+### Separation of Editor and Executor -- implemented
 
-The editor designs the graph and visualizes results. Execution is delegated to runners.
-This separation resolves the tension between WASM browser support and native-only capabilities (DLL injection, GPU access).
+Two processes, and the split is not optional: `zeughaus` is an editor that never
+executes, `zeughaus-runner` is a headless process that does nothing else.
 
-A browser-based editor can submit graphs to a native local runner or a remote VM agent.
+They meet in the SpacetimeDB store: the editor writes the graph, the runner
+reads it, executes it, and publishes results back. Every editor -- the one on
+the same machine and one on another continent -- is therefore the same thing, a
+remote view. That is what makes a browser editor a plain consequence of the
+architecture rather than a special case, and it is what stops a side effect from
+happening twice: two editor windows used to mean two runtimes, so a screen
+capture node fired once per window, each seeing its own screen.
+
+Which runner executes is decided by the store, not negotiated: every runner
+registers in `runtime` and the lowest `seq` owns it, so a second runner is a hot
+standby that takes over when the first disconnects.
+
+Results travel as scalars through the store (`node_output`). Frames and other
+bulk payloads deliberately do not: a state store is the wrong pipe for 33 MB per
+frame, and they wait for a dedicated sample channel.
 
 ## Collaboration (SpacetimeDB)
 
