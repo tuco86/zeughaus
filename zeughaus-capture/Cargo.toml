@@ -17,7 +17,12 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 ashpd = { version = "0.13", default-features = false, features = [
     "tokio",
     "screenshot",
+    "screencast",
 ] }
+# ScreenCast hands back a PipeWire remote FD instead of a file, so the fast path
+# needs a PipeWire client. This links against the system libpipewire-0.3 and
+# libspa-0.2 through bindgen, so a build host needs their headers and libclang.
+pipewire = "0.10"
 # The portal returns a percent-encoded `file://` URI and `ashpd::Uri` is a
 # validated string, not a parsed URL, so the decoding is ours to do.
 percent-encoding = "2.3"

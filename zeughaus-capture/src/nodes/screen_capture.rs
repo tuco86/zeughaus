@@ -9,6 +9,21 @@ use zeughaus_core::*;
 /// this node used to emit on the failure paths were actively misleading -- a
 /// `width` of 0 reads as a measurement, an absent `width` reads as "no
 /// capture".
+///
+/// Which backend runs depends on the session, and their costs are orders of
+/// magnitude apart:
+///
+/// - Wayland, stream already running: sample the newest PipeWire frame from
+///   [`crate::screencast`]. No D-Bus, no decode, no deferral -- an `Arc` clone,
+///   well under a millisecond, so this path emits synchronously.
+/// - Wayland, first execution: the `ScreenCast` portal handshake (a consent
+///   dialog on the very first run, then a restore token makes it silent) plus
+///   the PipeWire connection and the first frame. Roughly a few hundred
+///   milliseconds, so it is deferred.
+/// - Wayland without a usable `ScreenCast` interface: the `Screenshot` portal
+///   via [`crate::portal`], about 2 s per capture (~0.35 s round trip, the rest
+///   PNG decoding). Correct but slow, and it repeats that cost every execution.
+/// - X11, Windows, macOS: `scrap`, synchronous.
 pub struct ScreenCaptureNode {
     pins: Vec<PinDefinition>,
 }
@@ -42,10 +57,21 @@ impl ExecutableNode for ScreenCaptureNode {
         // path would report a perfectly sized all-zero frame as a success.
         #[cfg(target_os = "linux")]
         if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-            // The portal is a D-Bus round trip with a compositor on the other
-            // end, so it goes through the async path instead of blocking the
-            // editor's UI thread for the duration.
-            ctx.defer(Box::new(PortalCapture));
+            // The fast path once the stream exists: the compositor has already
+            // pushed a frame into `screencast`'s slot, so there is nothing to
+            // wait for and deferring would only add a thread hop. Note that a
+            // static screen produces no new buffers at all -- the frame kept
+            // from the last change is still what the screen looks like.
+            if crate::screencast::is_running()
+                && let Some(frame) = crate::screencast::latest()
+            {
+                emit_frame(ctx, frame);
+                return Ok(());
+            }
+            // Otherwise a portal round trip with a compositor on the other end,
+            // possibly including a consent dialog, so it goes through the async
+            // path instead of blocking the editor's UI thread for the duration.
+            ctx.defer(Box::new(WaylandCapture));
             return Ok(());
         }
 
@@ -120,20 +146,60 @@ fn fail(ctx: &mut NodeContext, message: String) -> Result<()> {
     Ok(())
 }
 
-/// The deferred Wayland capture: one portal round trip, then the same output
-/// shape the synchronous path emits.
+/// The success shape for the paths that already hold a decoded [`Image`]: the
+/// three numbers are derived from it rather than from whatever buffer produced
+/// it, so `frame_size` always describes the pixels actually emitted.
+#[cfg(target_os = "linux")]
+fn emit_frame(ctx: &mut NodeContext, frame: Image) {
+    let width = frame.width() as f64;
+    let height = frame.height() as f64;
+    let frame_size = frame.rgba().len() as f64;
+    ctx.emit_typed("frame", frame);
+    ctx.emit_typed("width", width);
+    ctx.emit_typed("height", height);
+    ctx.emit_typed("frame_size", frame_size);
+    ctx.emit_typed("captured", true);
+    ctx.flush();
+}
+
+/// How long to wait for the first frame once the ScreenCast stream is
+/// connected. The compositor pushes one as soon as it has a client, so this only
+/// has to cover a frame interval and the repack; it is a bound against a stream
+/// that negotiated a format this code cannot repack and will therefore never
+/// deliver anything.
+#[cfg(target_os = "linux")]
+const FIRST_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The deferred Wayland capture: whatever it takes to obtain the first frame,
+/// then the same output shape the synchronous paths emit.
+///
+/// This runs only on the first execution in a session. Once the ScreenCast
+/// stream exists, `execute` samples it synchronously and never gets here.
 ///
 /// Failures come back as `captured = false` plus `error` rather than as an
 /// `Err`, so a denied portal permission reads on the node's pins exactly like a
 /// failed X11 grab instead of flagging the node as broken.
 #[cfg(target_os = "linux")]
-struct PortalCapture;
+struct WaylandCapture;
 
 #[cfg(target_os = "linux")]
-impl AsyncWork for PortalCapture {
+impl AsyncWork for WaylandCapture {
     fn run(self: Box<Self>) -> Result<std::collections::HashMap<String, Value>> {
+        // ScreenCast first, because it is the only path whose cost is paid once.
+        // The Screenshot fallback stays because a session may simply not have
+        // the ScreenCast interface -- an older xdg-desktop-portal, or a backend
+        // that implements Screenshot only -- and 2 s per capture beats none.
+        // A denied grant or a missing interface arrives here as the `Err` text,
+        // never as a hang: both backends are timeout-bounded internally.
+        let frame = match crate::screencast::wait_for_frame(FIRST_FRAME_TIMEOUT) {
+            Ok(frame) => Ok(frame),
+            Err(screencast) => {
+                crate::portal::capture().map_err(|portal| both_failed(&screencast, &portal))
+            }
+        };
+
         let mut outputs = std::collections::HashMap::new();
-        match crate::portal::capture() {
+        match frame {
             Ok(frame) => {
                 outputs.insert("width".to_string(), Value::new(frame.width() as f64));
                 outputs.insert("height".to_string(), Value::new(frame.height() as f64));
@@ -151,6 +217,18 @@ impl AsyncWork for PortalCapture {
         }
         Ok(outputs)
     }
+}
+
+/// The `error` pin text when neither Wayland backend produced a frame.
+///
+/// Both reasons are kept, ScreenCast first. Reporting only the fallback's would
+/// hide why the fast path was unavailable, which is the one thing a user needs
+/// to know: "denied or cancelled" is fixed by granting the permission, while
+/// "no ScreenCast portal" is fixed by installing a newer portal backend, and the
+/// Screenshot error alone distinguishes neither.
+#[cfg(target_os = "linux")]
+fn both_failed(screencast: &str, portal: &str) -> String {
+    format!("{screencast}; screenshot fallback: {portal}")
 }
 
 /// Repacks a `scrap` frame into the tight RGBA8 buffer [`Image`] requires.
@@ -181,6 +259,25 @@ fn bgra_to_rgba(width: u32, height: u32, stride: usize, src: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn both_failed_names_screencast_first_then_the_fallback() {
+        // The shape a denied grant produces on the `error` pin when Screenshot
+        // cannot save the capture either. The ScreenCast reason must survive:
+        // "denied or cancelled" tells the user to grant the permission, and the
+        // Screenshot message alone would not.
+        let message = both_failed(
+            "screencast: denied or cancelled: Cancelled",
+            "portal: denied or cancelled: Cancelled",
+        );
+        assert_eq!(
+            message,
+            "screencast: denied or cancelled: Cancelled; \
+             screenshot fallback: portal: denied or cancelled: Cancelled"
+        );
+        assert!(message.starts_with("screencast: "));
+    }
 
     #[test]
     fn frame_is_the_first_output_pin() {

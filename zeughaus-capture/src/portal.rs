@@ -34,7 +34,8 @@ use zeughaus_core::Image;
 /// its whole downstream blocked and no error anywhere.
 const PORTAL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The one runtime every capture shares, for the lifetime of the process.
+/// The one runtime every portal request in this crate shares, for the lifetime
+/// of the process.
 ///
 /// This must NOT be a runtime per capture. `ashpd` caches its D-Bus connection
 /// process-wide, so the connection belongs to whichever runtime created it:
@@ -47,6 +48,11 @@ const PORTAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// concurrent `block_on` calls on a current-thread runtime fight over who
 /// drives the scheduler. A worker thread drives the connection regardless of
 /// who is waiting.
+///
+/// [`crate::screencast`] drives its handshake on this same runtime rather than
+/// building its own, for the reason above: whichever backend talks to the portal
+/// first creates the cached connection, and a second runtime would leave the
+/// other backend's requests unanswerable.
 static RUNTIME: LazyLock<std::io::Result<tokio::runtime::Runtime>> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -59,7 +65,7 @@ static RUNTIME: LazyLock<std::io::Result<tokio::runtime::Runtime>> = LazyLock::n
 /// is also what keeps the portal's own dialog and permission handling sane.
 static SERIAL: Mutex<()> = Mutex::new(());
 
-fn runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+pub(crate) fn runtime() -> Result<&'static tokio::runtime::Runtime, String> {
     RUNTIME
         .as_ref()
         .map_err(|e| format!("portal: no runtime: {e}"))
