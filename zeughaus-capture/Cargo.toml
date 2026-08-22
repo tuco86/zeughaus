@@ -6,3 +6,22 @@ edition.workspace = true
 [dependencies]
 zeughaus-core.workspace = true
 scrap = "0.5"
+# The portal hands back a PNG file, so the Wayland path needs a decoder. PNG
+# only: the portal never returns anything else, and the default feature set
+# would pull every codec in the crate.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Wayland capture goes through xdg-desktop-portal, which only exists on
+# freedesktop systems; `scrap` remains the backend everywhere else.
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13", default-features = false, features = [
+    "tokio",
+    "screenshot",
+] }
+# The portal returns a percent-encoded `file://` URI and `ashpd::Uri` is a
+# validated string, not a parsed URL, so the decoding is ours to do.
+percent-encoding = "2.3"
+# The portal client is async while `AsyncWork::run` is blocking, so the backend
+# drives a private current-thread runtime. `net` and `time` are what zbus needs
+# underneath.
+tokio = { version = "1", features = ["rt", "net", "time"] }

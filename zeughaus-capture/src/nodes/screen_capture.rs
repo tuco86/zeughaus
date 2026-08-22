@@ -37,6 +37,18 @@ impl ScreenCaptureNode {
 
 impl ExecutableNode for ScreenCaptureNode {
     fn execute(&mut self, _inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
+        // A Wayland session has to go through the portal: `scrap` reads the X11
+        // root window, which under Wayland exists but stays black, so the X11
+        // path would report a perfectly sized all-zero frame as a success.
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            // The portal is a D-Bus round trip with a compositor on the other
+            // end, so it goes through the async path instead of blocking the
+            // editor's UI thread for the duration.
+            ctx.defer(Box::new(PortalCapture));
+            return Ok(());
+        }
+
         let display = match Display::primary() {
             Ok(d) => d,
             Err(e) => return fail(ctx, format!("display: {e}")),
@@ -106,6 +118,39 @@ fn fail(ctx: &mut NodeContext, message: String) -> Result<()> {
     ctx.emit_typed("error", message);
     ctx.flush();
     Ok(())
+}
+
+/// The deferred Wayland capture: one portal round trip, then the same output
+/// shape the synchronous path emits.
+///
+/// Failures come back as `captured = false` plus `error` rather than as an
+/// `Err`, so a denied portal permission reads on the node's pins exactly like a
+/// failed X11 grab instead of flagging the node as broken.
+#[cfg(target_os = "linux")]
+struct PortalCapture;
+
+#[cfg(target_os = "linux")]
+impl AsyncWork for PortalCapture {
+    fn run(self: Box<Self>) -> Result<std::collections::HashMap<String, Value>> {
+        let mut outputs = std::collections::HashMap::new();
+        match crate::portal::capture() {
+            Ok(frame) => {
+                outputs.insert("width".to_string(), Value::new(frame.width() as f64));
+                outputs.insert("height".to_string(), Value::new(frame.height() as f64));
+                outputs.insert(
+                    "frame_size".to_string(),
+                    Value::new(frame.rgba().len() as f64),
+                );
+                outputs.insert("captured".to_string(), Value::new(true));
+                outputs.insert("frame".to_string(), Value::new(frame));
+            }
+            Err(message) => {
+                outputs.insert("captured".to_string(), Value::new(false));
+                outputs.insert("error".to_string(), Value::new(message));
+            }
+        }
+        Ok(outputs)
+    }
 }
 
 /// Repacks a `scrap` frame into the tight RGBA8 buffer [`Image`] requires.

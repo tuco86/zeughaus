@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+mod portal;
 pub mod nodes;
 
 use zeughaus_core::*;
