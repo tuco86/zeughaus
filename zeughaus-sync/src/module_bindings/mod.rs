@@ -18,12 +18,15 @@ pub mod move_node_reducer;
 pub mod node_output_table;
 pub mod node_output_type;
 pub mod node_table;
+pub mod node_trigger_table;
+pub mod node_trigger_type;
 pub mod node_type;
 pub mod publish_output_reducer;
 pub mod replace_graph_reducer;
 pub mod runtime_table;
 pub mod runtime_type;
 pub mod set_node_params_reducer;
+pub mod trigger_node_reducer;
 
 pub use clear_node_outputs_reducer::clear_node_outputs;
 pub use connect_edge_reducer::connect_edge;
@@ -37,12 +40,15 @@ pub use move_node_reducer::move_node;
 pub use node_output_table::*;
 pub use node_output_type::NodeOutput;
 pub use node_table::*;
+pub use node_trigger_table::*;
+pub use node_trigger_type::NodeTrigger;
 pub use node_type::Node;
 pub use publish_output_reducer::publish_output;
 pub use replace_graph_reducer::replace_graph;
 pub use runtime_table::*;
 pub use runtime_type::Runtime;
 pub use set_node_params_reducer::set_node_params;
+pub use trigger_node_reducer::trigger_node;
 
 #[derive(Clone, PartialEq, Debug)]
 
@@ -96,6 +102,9 @@ pub enum Reducer {
         id: u64,
         params: String,
     },
+    TriggerNode {
+        node_id: u64,
+    },
 }
 
 impl __sdk::InModule for Reducer {
@@ -115,6 +124,7 @@ impl __sdk::Reducer for Reducer {
             Reducer::PublishOutput { .. } => "publish_output",
             Reducer::ReplaceGraph { .. } => "replace_graph",
             Reducer::SetNodeParams { .. } => "set_node_params",
+            Reducer::TriggerNode { .. } => "trigger_node",
             _ => unreachable!(),
         }
     }
@@ -195,6 +205,11 @@ impl __sdk::Reducer for Reducer {
                     params: params.clone(),
                 })
             }
+            Reducer::TriggerNode { node_id } => {
+                __sats::bsatn::to_vec(&trigger_node_reducer::TriggerNodeArgs {
+                    node_id: node_id.clone(),
+                })
+            }
             _ => unreachable!(),
         }
     }
@@ -207,6 +222,7 @@ pub struct DbUpdate {
     edge: __sdk::TableUpdate<Edge>,
     node: __sdk::TableUpdate<Node>,
     node_output: __sdk::TableUpdate<NodeOutput>,
+    node_trigger: __sdk::TableUpdate<NodeTrigger>,
     runtime: __sdk::TableUpdate<Runtime>,
 }
 
@@ -225,6 +241,9 @@ impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
                 "node_output" => db_update
                     .node_output
                     .append(node_output_table::parse_table_update(table_update)?),
+                "node_trigger" => db_update
+                    .node_trigger
+                    .append(node_trigger_table::parse_table_update(table_update)?),
                 "runtime" => db_update
                     .runtime
                     .append(runtime_table::parse_table_update(table_update)?),
@@ -263,6 +282,9 @@ impl __sdk::DbUpdate for DbUpdate {
         diff.node_output = cache
             .apply_diff_to_table::<NodeOutput>("node_output", &self.node_output)
             .with_updates_by_pk(|row| &row.key);
+        diff.node_trigger = cache
+            .apply_diff_to_table::<NodeTrigger>("node_trigger", &self.node_trigger)
+            .with_updates_by_pk(|row| &row.node_id);
         diff.runtime = cache
             .apply_diff_to_table::<Runtime>("runtime", &self.runtime)
             .with_updates_by_pk(|row| &row.identity);
@@ -281,6 +303,9 @@ impl __sdk::DbUpdate for DbUpdate {
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "node_output" => db_update
                     .node_output
+                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
+                "node_trigger" => db_update
+                    .node_trigger
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "runtime" => db_update
                     .runtime
@@ -307,6 +332,9 @@ impl __sdk::DbUpdate for DbUpdate {
                 "node_output" => db_update
                     .node_output
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
+                "node_trigger" => db_update
+                    .node_trigger
+                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 "runtime" => db_update
                     .runtime
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
@@ -328,6 +356,7 @@ pub struct AppliedDiff<'r> {
     edge: __sdk::TableAppliedDiff<'r, Edge>,
     node: __sdk::TableAppliedDiff<'r, Node>,
     node_output: __sdk::TableAppliedDiff<'r, NodeOutput>,
+    node_trigger: __sdk::TableAppliedDiff<'r, NodeTrigger>,
     runtime: __sdk::TableAppliedDiff<'r, Runtime>,
     __unused: std::marker::PhantomData<&'r ()>,
 }
@@ -345,6 +374,11 @@ impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
         callbacks.invoke_table_row_callbacks::<Edge>("edge", &self.edge, event);
         callbacks.invoke_table_row_callbacks::<Node>("node", &self.node, event);
         callbacks.invoke_table_row_callbacks::<NodeOutput>("node_output", &self.node_output, event);
+        callbacks.invoke_table_row_callbacks::<NodeTrigger>(
+            "node_trigger",
+            &self.node_trigger,
+            event,
+        );
         callbacks.invoke_table_row_callbacks::<Runtime>("runtime", &self.runtime, event);
     }
 }
@@ -1009,7 +1043,9 @@ impl __sdk::SpacetimeModule for RemoteModule {
         edge_table::register_table(client_cache);
         node_table::register_table(client_cache);
         node_output_table::register_table(client_cache);
+        node_trigger_table::register_table(client_cache);
         runtime_table::register_table(client_cache);
     }
-    const ALL_TABLE_NAMES: &'static [&'static str] = &["edge", "node", "node_output", "runtime"];
+    const ALL_TABLE_NAMES: &'static [&'static str] =
+        &["edge", "node", "node_output", "node_trigger", "runtime"];
 }

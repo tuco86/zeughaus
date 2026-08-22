@@ -1,19 +1,26 @@
-//! SpacetimeDB sync layer: bidirectional graph synchronization.
+//! SpacetimeDB client for the shared graph: generated bindings plus the
+//! connect/subscribe/publish layer both processes use.
 //!
-//! - Receive: subscribes to the `node` and `edge` tables; row changes are
-//!   converted to [`SyncEvent`]s and pushed onto a channel the editor drains on
-//!   a timer (the SDK callbacks run on a background thread, so we hand events to
-//!   the iced main loop rather than touch editor state directly).
-//! - Send: helper functions call the module's reducers when the user edits the
-//!   graph locally.
+//! - Receive: subscribes to `node`, `edge`, `runtime` and `node_output`; row
+//!   changes become [`SyncEvent`]s on a channel the caller drains on its own
+//!   schedule (the SDK callbacks run on a background thread, so state is never
+//!   touched from there).
+//! - Send: helper functions call the module's reducers for local edits and for
+//!   publishing computed outputs.
+//!
+//! This is a library because the editor and the headless runtime are separate
+//! processes that both speak to the same store: the GUI edits the graph and
+//! displays results, the runtime executes it and publishes them.
 //!
 //! Conflict model: fine-grained reducers, last-writer-wins per row. Node/edge
 //! ids are made process-unique at startup (see `NodeId::seed_unique`) so two
-//! editors never assign colliding ids. Applying a remote change is guarded so it
-//! does not echo back as a reducer call.
+//! clients never assign colliding ids. Applying a remote change is guarded by
+//! the caller so it does not echo back as a reducer call.
 //!
-//! Always-on: the editor connects to SpacetimeDB on startup with no local-only
-//! fallback. A missing server is a fatal startup error, not a degraded mode.
+//! Always-on: connecting is required, with no local-only fallback. A missing
+//! server is a fatal startup error, not a degraded mode.
+
+pub mod module_bindings;
 
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -22,8 +29,9 @@ use zeughaus_core::{EdgeData, NodeData};
 
 use crate::module_bindings::{
     DbConnection, Edge, EdgeTableAccess, Node, NodeOutputTableAccess, NodeTableAccess,
-    RuntimeTableAccess, clear_node_outputs, connect_edge, create_node, delete_node,
-    disconnect_edge, join_runtime, move_node, publish_output, set_node_params,
+    NodeTriggerTableAccess, RuntimeTableAccess, clear_node_outputs, connect_edge, create_node,
+    delete_node, disconnect_edge, join_runtime, move_node, publish_output, set_node_params,
+    trigger_node,
 };
 
 pub const DEFAULT_PORT: u16 = 3000;
@@ -44,6 +52,14 @@ pub enum SyncEvent {
     /// the same reason -- a viewer rebuilds a node's whole output set from the
     /// cache, because a per-pin event cannot say which pins are still absent.
     OutputsChanged,
+    /// An editor asked for a node to be fired once. Only the executing runtime
+    /// acts on it; the count identifies the press so a re-subscription does not
+    /// replay one that was already handled.
+    TriggerRequested { node_id: u64, count: u64 },
+    /// The first subscription snapshot has been delivered. Everything before it
+    /// is existing state, not something that just happened -- which is the
+    /// difference between adopting a pending trigger and firing it.
+    SubscriptionApplied,
 }
 
 fn to_node_data(n: &Node) -> NodeData {
@@ -68,22 +84,43 @@ fn to_edge_data(e: &Edge) -> EdgeData {
     }
 }
 
-/// Connects, wires row-change callbacks into a channel, subscribes to node+edge,
-/// and spawns the background message loop. Returns the live connection (kept
-/// alive by the caller) and the receiving end of the event channel. SpacetimeDB
-/// is required; the error is fatal to the caller (no local-only fallback).
-pub fn connect(uri: &str, module: &str) -> Result<(DbConnection, Receiver<SyncEvent>), String> {
+/// What a client is here for.
+///
+/// Only a [`Role::Runtime`] registers in the `runtime` table, because that table
+/// answers "who executes the graph". An editor that registered would be elected
+/// to run a graph it has no executor for, and a `spacetime sql` connection --
+/// also a client -- would do the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Executes the graph and publishes results.
+    Runtime,
+    /// Edits the graph and displays published results.
+    Viewer,
+}
+
+/// Connects, wires row-change callbacks into a channel, subscribes to the shared
+/// tables, and spawns the background message loop. Returns the live connection
+/// (kept alive by the caller) and the receiving end of the event channel.
+/// SpacetimeDB is required; the error is fatal to the caller (no local-only
+/// fallback).
+pub fn connect(
+    uri: &str,
+    module: &str,
+    role: Role,
+) -> Result<(DbConnection, Receiver<SyncEvent>), String> {
     let (tx, rx) = std::sync::mpsc::channel();
 
     let conn = DbConnection::builder()
         .with_uri(uri)
         .with_database_name(module)
-        .on_connect(|ctx, identity, _token| {
-            eprintln!("[stdb] connected as {identity:?}");
-            // Registering is opt-in, so only editors compete for ownership --
-            // a `spacetime sql` connection is a client too, and must not become
-            // the runtime everyone else waits for.
-            if let Err(e) = ctx.reducers.join_runtime() {
+        .on_connect(move |ctx, identity, _token| {
+            eprintln!("[stdb] connected as {identity:?} ({role:?})");
+            // Registering happens here rather than after `connect` returns:
+            // a reducer call needs the connection to be established, and this
+            // callback is the first point where it is.
+            if role == Role::Runtime
+                && let Err(e) = ctx.reducers.join_runtime()
+            {
                 eprintln!("[stdb] join_runtime failed: {e}");
             }
         })
@@ -119,15 +156,40 @@ pub fn connect(uri: &str, module: &str) -> Result<(DbConnection, Receiver<SyncEv
         .on_update(move |_ctx, _old, _new| send(&t, SyncEvent::OutputsChanged));
     let t = tx.clone();
     conn.db.node_output().on_delete(move |_ctx, _o| send(&t, SyncEvent::OutputsChanged));
+    let t = tx.clone();
+    conn.db.node_trigger().on_insert(move |_ctx, r| {
+        send(
+            &t,
+            SyncEvent::TriggerRequested {
+                node_id: r.node_id,
+                count: r.count,
+            },
+        )
+    });
+    let t = tx.clone();
+    conn.db.node_trigger().on_update(move |_ctx, _old, r| {
+        send(
+            &t,
+            SyncEvent::TriggerRequested {
+                node_id: r.node_id,
+                count: r.count,
+            },
+        )
+    });
 
+    let t = tx.clone();
     conn.subscription_builder()
-        .on_applied(|_ctx| eprintln!("[stdb] subscription applied"))
+        .on_applied(move |_ctx| {
+            eprintln!("[stdb] subscription applied");
+            send(&t, SyncEvent::SubscriptionApplied);
+        })
         .on_error(|_ctx, err| eprintln!("[stdb] subscription error: {err}"))
         .subscribe([
             "SELECT * FROM node",
             "SELECT * FROM edge",
             "SELECT * FROM runtime",
             "SELECT * FROM node_output",
+            "SELECT * FROM node_trigger",
         ]);
 
     conn.run_threaded();
@@ -175,12 +237,13 @@ fn params_json(params: &[(String, String)]) -> String {
 }
 
 /// Whether this client owns execution: the runtime with the lowest `seq` runs
-/// the graph, everyone else displays what it publishes.
+/// the graph, a second one is a standby. Only meaningful for a
+/// [`Role::Runtime`] client.
 ///
 /// Read from the client cache rather than remembered, so a runtime leaving
 /// hands ownership over without any handshake. While the cache is still empty
 /// (before the first subscription applies) nobody owns anything, which keeps a
-/// starting editor from executing a graph it has not seen yet.
+/// starting runner from executing a graph it has not seen yet.
 pub fn is_owner(conn: &DbConnection) -> bool {
     conn.db
         .runtime()
@@ -189,17 +252,26 @@ pub fn is_owner(conn: &DbConnection) -> bool {
         .is_some_and(|r| r.identity == conn.identity())
 }
 
-/// This client's position in the runtime order, for showing the user which
-/// window they are looking at. `0` is the owner.
-pub fn runtime_index(conn: &DbConnection) -> Option<usize> {
-    let mut seqs: Vec<(u64, bool)> = conn
-        .db
-        .runtime()
+/// How many runtimes are connected. An editor uses this to say whether anything
+/// is executing at all: with no runtime, a graph is drawn but nothing runs, and
+/// silence is the one thing a user must not have to guess about.
+pub fn runtime_count(conn: &DbConnection) -> usize {
+    conn.db.runtime().count() as usize
+}
+
+/// Every pending press as `(node_id, count)`.
+///
+/// A runtime reads this once the snapshot is applied instead of trusting the
+/// order of row callbacks: the SDK delivers `on_applied` and the per-row
+/// callbacks in an order that is not specified, so "was this row here before I
+/// arrived" has to be answered from state, not from event sequence. Getting it
+/// wrong means every runtime restart re-presses every button in the graph.
+pub fn pending_triggers(conn: &DbConnection) -> Vec<(u64, u64)> {
+    conn.db
+        .node_trigger()
         .iter()
-        .map(|r| (r.seq, r.identity == conn.identity()))
-        .collect();
-    seqs.sort_by_key(|(seq, _)| *seq);
-    seqs.iter().position(|(_, is_me)| *is_me)
+        .map(|t| (t.node_id, t.count))
+        .collect()
 }
 
 /// Every published output as `(node_id, pin, type tag, text)`.
@@ -280,5 +352,16 @@ pub fn send_connect_edge(conn: &DbConnection, e: &EdgeData) {
 pub fn send_disconnect_edge(conn: &DbConnection, id: u64) {
     if let Err(e) = conn.reducers.disconnect_edge(id) {
         eprintln!("[stdb] disconnect_edge failed: {e}");
+    }
+}
+
+/// Asks the executing runtime to fire a node once (the manual trigger button).
+///
+/// The editor does not execute, so a press has to travel: this bumps a counter
+/// the runtime watches, which is why a press survives a reconnect instead of
+/// vanishing with the window that made it.
+pub fn send_trigger_node(conn: &DbConnection, node_id: u64) {
+    if let Err(e) = conn.reducers.trigger_node(node_id) {
+        eprintln!("[stdb] trigger_node failed: {e}");
     }
 }

@@ -1,12 +1,14 @@
 mod app;
 mod message;
 mod palette;
-// SpacetimeDB client: generated bindings + minimal connect/subscribe layer.
-// Native-only for now; the wasm editor sync path is a later step.
+// The SpacetimeDB client lives in its own crate, shared with the headless
+// runtime process. Re-exported under the old paths so `crate::sync::` and
+// `crate::module_bindings::` keep working. Native-only for now; the wasm editor
+// sync path is a later step.
 #[cfg(not(target_arch = "wasm32"))]
-mod module_bindings;
+pub use zeughaus_sync as sync;
 #[cfg(not(target_arch = "wasm32"))]
-mod sync;
+pub use zeughaus_sync::module_bindings;
 
 use app::App;
 

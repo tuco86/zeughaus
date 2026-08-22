@@ -59,6 +59,20 @@ pub struct Node {
     pub params: String,
 }
 
+/// A pending "fire this node once" request, raised by an editor and consumed by
+/// the executing runtime.
+///
+/// A counter rather than a queue: the editor bumps it, the runtime notices the
+/// change and fires once. A press cannot be lost by a reconnect (the row
+/// survives) and cannot be double-fired by a re-subscription (the count the
+/// runtime already handled is the count it compares against).
+#[table(accessor = node_trigger, name = "node_trigger", public)]
+pub struct NodeTrigger {
+    #[primary_key]
+    pub node_id: u64,
+    pub count: u64,
+}
+
 /// A directed edge between two node pins.
 #[table(accessor = edge, name = "edge", public)]
 pub struct Edge {
@@ -134,6 +148,9 @@ pub fn delete_node(ctx: &ReducerContext, id: u64) {
     for key in orphaned {
         ctx.db.node_output().key().delete(&key);
     }
+    // The press counter goes with it. Node ids are never reused, so a surviving
+    // row could only be read as a press for a node that no longer exists.
+    ctx.db.node_trigger().node_id().delete(id);
 }
 
 #[reducer]
@@ -196,6 +213,24 @@ pub fn join_runtime(ctx: &ReducerContext) {
         identity: ctx.sender(),
         seq: 0, // auto_inc
     });
+}
+
+/// Asks the executing runtime to fire a node once. Callable by any editor: it
+/// is a request, not a result, and the runtime decides what to do with it.
+#[reducer]
+pub fn trigger_node(ctx: &ReducerContext, node_id: u64) {
+    let count = ctx
+        .db
+        .node_trigger()
+        .node_id()
+        .find(node_id)
+        .map_or(1, |t| t.count + 1);
+    let row = NodeTrigger { node_id, count };
+    if count == 1 {
+        ctx.db.node_trigger().insert(row);
+    } else {
+        ctx.db.node_trigger().node_id().update(row);
+    }
 }
 
 /// Drops a runtime when its editor disconnects, which is what hands ownership

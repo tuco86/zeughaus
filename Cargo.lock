@@ -6968,14 +6968,13 @@ dependencies = [
  "rfd",
  "serde_json",
  "spacetimedb-sdk",
- "tokio",
- "web-time",
  "zeughaus-capture",
  "zeughaus-core",
  "zeughaus-flow",
  "zeughaus-llm",
  "zeughaus-ml",
  "zeughaus-runtime",
+ "zeughaus-sync",
  "zeughaus-transform",
 ]
 
@@ -7027,12 +7026,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeughaus-runner"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "zeughaus-capture",
+ "zeughaus-core",
+ "zeughaus-flow",
+ "zeughaus-llm",
+ "zeughaus-ml",
+ "zeughaus-runtime",
+ "zeughaus-sync",
+ "zeughaus-transform",
+]
+
+[[package]]
 name = "zeughaus-runtime"
 version = "0.1.0"
 dependencies = [
  "serde_json",
  "zeughaus-core",
  "zeughaus-transform",
+]
+
+[[package]]
+name = "zeughaus-sync"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "spacetimedb-sdk",
+ "zeughaus-core",
 ]
 
 [[package]]

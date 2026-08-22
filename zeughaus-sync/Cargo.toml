@@ -1,0 +1,9 @@
+[package]
+name = "zeughaus-sync"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zeughaus-core.workspace = true
+serde_json = "1.0"
+spacetimedb-sdk.workspace = true
