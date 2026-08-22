@@ -17,48 +17,12 @@ impl ScreenCaptureNode {
     pub fn new() -> Self {
         Self {
             pins: vec![
-                PinDefinition {
-                    name: "trigger",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Trigger,
-                    type_name: "any",
-                },
-                PinDefinition {
-                    name: "width",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "f64",
-                },
-                PinDefinition {
-                    name: "height",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "f64",
-                },
-                PinDefinition {
-                    name: "frame_size",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "f64",
-                },
-                PinDefinition {
-                    name: "captured",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "bool",
-                },
-                PinDefinition {
-                    name: "error",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "String",
-                },
+                PinDefinition::input("trigger", Ty::Any, PinKind::Trigger),
+                PinDefinition::output("width", Ty::Float),
+                PinDefinition::output("height", Ty::Float),
+                PinDefinition::output("frame_size", Ty::Float),
+                PinDefinition::output("captured", Ty::Bool),
+                PinDefinition::output("error", Ty::Str),
             ],
         }
     }

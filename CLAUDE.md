@@ -14,14 +14,15 @@ connected, and data flows live through the graph.
 ## Workspace Structure
 
 ```
-zeughaus/              # binary (zeughaus.exe) - iced UI + iced_nodegraph
-zeughaus-core/         # types, traits (Value, ExecutableNode, DomainPlugin)
+zeughaus/              # binary (zeughaus) - iced UI + iced_nodegraph
+zeughaus-core/         # types, traits (Ty, Typed, Value, ExecutableNode, DomainPlugin)
 zeughaus-runtime/      # graph execution engine (topo sort, dirty propagation, edge cache)
-zeughaus-transform/    # transform plugin (37 math/logic/string/trig nodes)
-zeughaus-process/      # process plugin (Find Process, DLL Inject, Read Memory, Find Module)
+zeughaus-transform/    # transform plugin (35 math/logic/string/trig nodes)
 zeughaus-capture/      # capture plugin (Screen Capture via scrap/DXGI)
 zeughaus-llm/          # LLM plugin (Conversation nodes, LM Studio chat)
 zeughaus-ml/           # ML plugin (Keras layers as nodes -> exportable functional-API code)
+zeughaus-flow/         # flow plugin (Hold: Event -> State adapter)
+zeughaus-module/       # SpacetimeDB server module (excluded from the native workspace)
 ```
 
 ## Related Projects
@@ -88,6 +89,7 @@ regex patterns, or when the LSP server is unavailable.
 ## Architecture Notes
 
 ### Core Concepts
+- **Runtime Type System**: Pins declare a `Ty` built at runtime (scalars, `List`, `Option`, `Record`, `Opaque`), not a compile-time string. `Typed::ty()` is the single source of truth for both a pin's declaration and a value's tag, so they cannot disagree. Nodes may derive their pins from what is connected (`sync_pins`).
 - **Push/Pull Reactive Dataflow**: Every edge has a last-value cache. Push notifies downstream, pull triggers lazy computation.
 - **Trigger vs Sample Pins**: Input pins are either trigger (causes execution) or sample (read passively).
 - **Atomic Flush**: Multi-output nodes buffer with emit/flush to ensure synchronized delivery.

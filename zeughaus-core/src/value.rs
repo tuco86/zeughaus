@@ -1,15 +1,18 @@
 use std::any::Any;
 use std::fmt;
 
-trait CloneableAny: Any + Send + Sync {
-    fn clone_box(&self) -> Box<dyn CloneableAny>;
+use crate::ty::{Repr, Ty, Typed};
+
+/// Object-safe view of a [`Typed`] payload: clone it, downcast it, describe it.
+trait TypedAny: Any + Send + Sync {
+    fn clone_box(&self) -> Box<dyn TypedAny>;
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
-    fn type_name(&self) -> &'static str;
+    fn repr(&self) -> Repr<'_>;
 }
 
-impl<T: Clone + Send + Sync + 'static> CloneableAny for T {
-    fn clone_box(&self) -> Box<dyn CloneableAny> {
+impl<T: Typed> TypedAny for T {
+    fn clone_box(&self) -> Box<dyn TypedAny> {
         Box::new(self.clone())
     }
 
@@ -21,20 +24,40 @@ impl<T: Clone + Send + Sync + 'static> CloneableAny for T {
         self
     }
 
-    fn type_name(&self) -> &'static str {
-        std::any::type_name::<T>()
+    fn repr(&self) -> Repr<'_> {
+        Typed::repr(self)
     }
 }
 
+/// A value travelling through the graph: a type-erased payload plus the domain
+/// type it was created with.
+///
+/// The tag comes from `T::ty()`, never from a caller-supplied string, so a
+/// value's declared type and its actual Rust type cannot disagree. That is what
+/// lets the executor coerce on the value's own type instead of trusting the
+/// source pin's declaration.
 pub struct Value {
-    inner: Box<dyn CloneableAny>,
+    ty: Ty,
+    inner: Box<dyn TypedAny>,
 }
 
 impl Value {
-    pub fn new<T: Clone + Send + Sync + 'static>(val: T) -> Self {
+    pub fn new<T: Typed>(val: T) -> Self {
         Self {
+            ty: T::ty(),
             inner: Box::new(val),
         }
+    }
+
+    /// The value's domain type.
+    pub fn ty(&self) -> &Ty {
+        &self.ty
+    }
+
+    /// Structural view for generic display and inspection. Nominal plugin types
+    /// report [`Repr::Opaque`].
+    pub fn repr(&self) -> Repr<'_> {
+        self.inner.repr()
     }
 
     pub fn downcast_ref<T: 'static>(&self) -> Option<&T> {
@@ -45,10 +68,6 @@ impl Value {
         self.inner.as_any_mut().downcast_mut()
     }
 
-    pub fn type_name(&self) -> &'static str {
-        self.inner.type_name()
-    }
-
     pub fn is<T: 'static>(&self) -> bool {
         self.inner.as_any().is::<T>()
     }
@@ -57,6 +76,7 @@ impl Value {
 impl Clone for Value {
     fn clone(&self) -> Self {
         Self {
+            ty: self.ty.clone(),
             inner: self.inner.clone_box(),
         }
     }
@@ -64,27 +84,16 @@ impl Clone for Value {
 
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Value({})", self.type_name())
+        write!(f, "Value({}: {})", self.ty, self.repr())
     }
 }
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let any = self.inner.as_any();
-        if let Some(v) = any.downcast_ref::<f64>() {
-            write!(f, "{v}")
-        } else if let Some(v) = any.downcast_ref::<String>() {
-            write!(f, "{v}")
-        } else if let Some(v) = any.downcast_ref::<bool>() {
-            write!(f, "{v}")
-        } else if let Some(v) = any.downcast_ref::<i64>() {
-            write!(f, "{v}")
-        } else if let Some(v) = any.downcast_ref::<i32>() {
-            write!(f, "{v}")
-        } else if let Some(v) = any.downcast_ref::<u64>() {
-            write!(f, "{v}")
-        } else {
-            write!(f, "<{}>", self.type_name())
+        match self.repr() {
+            // A nominal type has nothing to show but its name.
+            Repr::Opaque => write!(f, "<{}>", self.ty),
+            repr => write!(f, "{repr}"),
         }
     }
 }
@@ -100,58 +109,53 @@ mod tests {
     }
 
     #[test]
-    fn wrong_type_returns_none() {
+    fn wrong_type_downcast_fails() {
         let val = Value::new(42.0f64);
-        assert_eq!(val.downcast_ref::<i32>(), None);
+        assert_eq!(val.downcast_ref::<String>(), None);
     }
 
     #[test]
-    fn clone_preserves_value() {
-        let val = Value::new(String::from("hello"));
-        let cloned = val.clone();
-        assert_eq!(cloned.downcast_ref::<String>().unwrap(), "hello");
+    fn tag_comes_from_the_rust_type() {
+        assert_eq!(Value::new(1.0f64).ty(), &Ty::Float);
+        assert_eq!(Value::new(1i64).ty(), &Ty::Int);
+        assert_eq!(Value::new(true).ty(), &Ty::Bool);
+        assert_eq!(Value::new("x".to_string()).ty(), &Ty::Str);
+        assert_eq!(Value::new(vec![1.0f64]).ty(), &Ty::list(Ty::Float));
     }
 
     #[test]
-    fn type_name_works() {
-        let val = Value::new(42.0f64);
-        assert!(val.type_name().contains("f64"));
+    fn clone_preserves_payload_and_type() {
+        let val = Value::new("hello".to_string());
+        let copy = val.clone();
+        assert_eq!(copy.downcast_ref::<String>().unwrap(), "hello");
+        assert_eq!(copy.ty(), &Ty::Str);
     }
 
     #[test]
-    fn is_checks_type() {
-        let val = Value::new(42.0f64);
-        assert!(val.is::<f64>());
-        assert!(!val.is::<String>());
+    fn downcast_mut_edits_in_place() {
+        let mut val = Value::new(1.0f64);
+        *val.downcast_mut::<f64>().unwrap() = 2.0;
+        assert_eq!(val.downcast_ref::<f64>(), Some(&2.0));
     }
 
     #[test]
-    fn downcast_mut_works() {
-        let mut val = Value::new(42.0f64);
-        *val.downcast_mut::<f64>().unwrap() = 99.0;
-        assert_eq!(val.downcast_ref::<f64>(), Some(&99.0));
+    fn display_uses_the_structural_view() {
+        assert_eq!(Value::new(42.0f64).to_string(), "42");
+        assert_eq!(Value::new("text".to_string()).to_string(), "text");
+        assert_eq!(Value::new(true).to_string(), "true");
+        assert_eq!(Value::new(7i64).to_string(), "7");
+        assert_eq!(Value::new(vec![1i64, 2]).to_string(), "[1, 2]");
     }
 
     #[test]
-    fn display_f64() {
-        assert_eq!(format!("{}", Value::new(3.14f64)), "3.14");
-    }
-
-    #[test]
-    fn display_string() {
-        assert_eq!(format!("{}", Value::new("hello".to_string())), "hello");
-    }
-
-    #[test]
-    fn display_bool() {
-        assert_eq!(format!("{}", Value::new(true)), "true");
-        assert_eq!(format!("{}", Value::new(false)), "false");
-    }
-
-    #[test]
-    fn display_unknown_type() {
-        let val = Value::new(vec![1u8, 2, 3]);
-        let s = format!("{val}");
-        assert!(s.starts_with('<'));
+    fn opaque_values_display_as_their_type_name() {
+        #[derive(Clone)]
+        struct Model;
+        impl Typed for Model {
+            fn ty() -> Ty {
+                Ty::opaque("Model")
+            }
+        }
+        assert_eq!(Value::new(Model).to_string(), "<Model>");
     }
 }

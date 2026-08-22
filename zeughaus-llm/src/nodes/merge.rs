@@ -18,27 +18,9 @@ impl MergeNode {
     pub fn new() -> Self {
         Self {
             pins: vec![
-                PinDefinition {
-                    name: "a",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "Conversation",
-                },
-                PinDefinition {
-                    name: "b",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "Conversation",
-                },
-                PinDefinition {
-                    name: "out",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "Conversation",
-                },
+                PinDefinition::input("a", Ty::of::<Conversation>(), PinKind::Sample),
+                PinDefinition::input("b", Ty::of::<Conversation>(), PinKind::Sample),
+                PinDefinition::output("out", Ty::of::<Conversation>()),
             ],
         }
     }

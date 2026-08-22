@@ -118,7 +118,7 @@ mod tests {
         let plugin = TransformPlugin;
         for def in plugin.node_catalog() {
             assert!(
-                plugin.create_node(def.type_id).is_some(),
+                plugin.create_node(&def.type_id).is_some(),
                 "Failed to create node: {}",
                 def.type_id
             );

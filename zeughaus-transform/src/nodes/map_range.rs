@@ -16,48 +16,12 @@ impl MapRangeNode {
     pub fn new() -> Self {
         Self {
             pins: vec![
-                PinDefinition {
-                    name: "value",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Trigger,
-                    type_name: "f64",
-                },
-                PinDefinition {
-                    name: "in_min",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "f64",
-                },
-                PinDefinition {
-                    name: "in_max",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "f64",
-                },
-                PinDefinition {
-                    name: "out_min",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "f64",
-                },
-                PinDefinition {
-                    name: "out_max",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "f64",
-                },
-                PinDefinition {
-                    name: "result",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "f64",
-                },
+                PinDefinition::input("value", Ty::Float, PinKind::Trigger),
+                PinDefinition::input("in_min", Ty::Float, PinKind::Sample),
+                PinDefinition::input("in_max", Ty::Float, PinKind::Sample),
+                PinDefinition::input("out_min", Ty::Float, PinKind::Sample),
+                PinDefinition::input("out_max", Ty::Float, PinKind::Sample),
+                PinDefinition::output("result", Ty::Float),
             ],
         }
     }

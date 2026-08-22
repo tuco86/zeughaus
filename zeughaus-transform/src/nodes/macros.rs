@@ -16,27 +16,17 @@ macro_rules! binary_f64_node {
             pub fn new() -> Self {
                 Self {
                     pins: vec![
-                        zeughaus_core::PinDefinition {
-                            name: "a",
-                            direction: zeughaus_core::PinDirection::Input,
-                            data_mode: zeughaus_core::DataMode::Value,
-                            pin_kind: zeughaus_core::PinKind::Trigger,
-                            type_name: "f64",
-                        },
-                        zeughaus_core::PinDefinition {
-                            name: "b",
-                            direction: zeughaus_core::PinDirection::Input,
-                            data_mode: zeughaus_core::DataMode::Value,
-                            pin_kind: zeughaus_core::PinKind::Trigger,
-                            type_name: "f64",
-                        },
-                        zeughaus_core::PinDefinition {
-                            name: "result",
-                            direction: zeughaus_core::PinDirection::Output,
-                            data_mode: zeughaus_core::DataMode::Value,
-                            pin_kind: zeughaus_core::PinKind::Sample,
-                            type_name: "f64",
-                        },
+                        zeughaus_core::PinDefinition::input(
+                            "a",
+                            zeughaus_core::Ty::Float,
+                            zeughaus_core::PinKind::Trigger,
+                        ),
+                        zeughaus_core::PinDefinition::input(
+                            "b",
+                            zeughaus_core::Ty::Float,
+                            zeughaus_core::PinKind::Trigger,
+                        ),
+                        zeughaus_core::PinDefinition::output("result", zeughaus_core::Ty::Float),
                     ],
                 }
             }
@@ -81,20 +71,12 @@ macro_rules! unary_f64_node {
             pub fn new() -> Self {
                 Self {
                     pins: vec![
-                        zeughaus_core::PinDefinition {
-                            name: "input",
-                            direction: zeughaus_core::PinDirection::Input,
-                            data_mode: zeughaus_core::DataMode::Value,
-                            pin_kind: zeughaus_core::PinKind::Trigger,
-                            type_name: "f64",
-                        },
-                        zeughaus_core::PinDefinition {
-                            name: "result",
-                            direction: zeughaus_core::PinDirection::Output,
-                            data_mode: zeughaus_core::DataMode::Value,
-                            pin_kind: zeughaus_core::PinKind::Sample,
-                            type_name: "f64",
-                        },
+                        zeughaus_core::PinDefinition::input(
+                            "input",
+                            zeughaus_core::Ty::Float,
+                            zeughaus_core::PinKind::Trigger,
+                        ),
+                        zeughaus_core::PinDefinition::output("result", zeughaus_core::Ty::Float),
                     ],
                 }
             }

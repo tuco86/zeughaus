@@ -14,20 +14,8 @@ impl StringLenNode {
     pub fn new() -> Self {
         Self {
             pins: vec![
-                PinDefinition {
-                    name: "input",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Trigger,
-                    type_name: "String",
-                },
-                PinDefinition {
-                    name: "result",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "f64",
-                },
+                PinDefinition::input("input", Ty::Str, PinKind::Trigger),
+                PinDefinition::output("result", Ty::Float),
             ],
         }
     }

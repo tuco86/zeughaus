@@ -21,20 +21,8 @@ impl SystemMessageNode {
         Self {
             text: String::new(),
             pins: vec![
-                PinDefinition {
-                    name: "conv",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "Conversation",
-                },
-                PinDefinition {
-                    name: "out",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "Conversation",
-                },
+                PinDefinition::input("conv", Ty::of::<Conversation>(), PinKind::Sample),
+                PinDefinition::output("out", Ty::of::<Conversation>()),
             ],
         }
     }
@@ -54,12 +42,11 @@ impl ExecutableNode for SystemMessageNode {
     }
 
     fn settings(&self) -> Vec<SettingDef> {
-        vec![SettingDef {
-            name: "text",
-            default: "You are a helpful assistant.",
-            placeholder: "system prompt",
-            multiline: true,
-        }]
+        vec![
+            SettingDef::new("text", "You are a helpful assistant.")
+                .placeholder("system prompt")
+                .multiline(),
+        ]
     }
 
     fn set_parameter(&mut self, name: &str, value: Value) -> Result<()> {

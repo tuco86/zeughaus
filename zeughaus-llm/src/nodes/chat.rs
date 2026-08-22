@@ -58,34 +58,10 @@ impl ChatNode {
             base_url: DEFAULT_BASE_URL.to_string(),
             model: String::new(),
             pins: vec![
-                PinDefinition {
-                    name: "conv",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Trigger,
-                    type_name: "Conversation",
-                },
-                PinDefinition {
-                    name: "out",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "Conversation",
-                },
-                PinDefinition {
-                    name: "reply",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "String",
-                },
-                PinDefinition {
-                    name: "tok_per_s",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "f64",
-                },
+                PinDefinition::input("conv", Ty::of::<Conversation>(), PinKind::Trigger),
+                PinDefinition::output("out", Ty::of::<Conversation>()),
+                PinDefinition::output("reply", Ty::Str),
+                PinDefinition::output("tok_per_s", Ty::Float),
             ],
         }
     }
@@ -122,18 +98,8 @@ impl ExecutableNode for ChatNode {
 
     fn settings(&self) -> Vec<SettingDef> {
         vec![
-            SettingDef {
-                name: "base_url",
-                default: DEFAULT_BASE_URL,
-                placeholder: DEFAULT_BASE_URL,
-                multiline: false,
-            },
-            SettingDef {
-                name: "model",
-                default: "",
-                placeholder: "(first loaded model)",
-                multiline: false,
-            },
+            SettingDef::new("base_url", DEFAULT_BASE_URL),
+            SettingDef::new("model", "").placeholder("(first loaded model)"),
         ]
     }
 
@@ -164,7 +130,7 @@ mod tests {
     #[test]
     fn settings_have_base_url_and_model() {
         let node = ChatNode::new();
-        let names: Vec<_> = node.settings().iter().map(|s| s.name).collect();
+        let names: Vec<_> = node.settings().iter().map(|s| s.name.to_string()).collect();
         assert_eq!(names, vec!["base_url", "model"]);
     }
 }

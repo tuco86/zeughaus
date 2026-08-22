@@ -5,10 +5,21 @@ use zeughaus_core::NodeDefinition;
 
 use crate::message::Message;
 
+/// `iced_palette::CommandId` is a `&'static str`, but a node's `type_id` is
+/// runtime data (`Arc<str>`) since the type-system rewrite. The palette used
+/// here filters on name plus description and reports the selection by index,
+/// and the spawn target travels in the message, so every catalog entry shares
+/// this id and carries its type id in the description.
+const SPAWN_COMMAND_ID: &str = "node.spawn";
+
 /// Build the list of palette commands from the node catalog, sorted by category.
 pub fn build_commands(catalog: &[NodeDefinition]) -> Vec<Command<Message>> {
     let mut sorted: Vec<&NodeDefinition> = catalog.iter().collect();
-    sorted.sort_by(|a, b| a.category.cmp(b.category).then(a.display_name.cmp(b.display_name)));
+    sorted.sort_by(|a, b| {
+        a.category
+            .cmp(&b.category)
+            .then(a.display_name.cmp(&b.display_name))
+    });
 
     // Non-node commands first.
     let mut commands = vec![
@@ -18,11 +29,14 @@ pub fn build_commands(catalog: &[NodeDefinition]) -> Vec<Command<Message>> {
     ];
 
     commands.extend(sorted.iter().map(|def| {
-        command(def.type_id, format!("{} / {}", def.category, def.display_name))
-            .description(def.type_id)
-            .action(Message::SpawnNode {
-                type_id: def.type_id.to_string(),
-            })
+        command(
+            SPAWN_COMMAND_ID,
+            format!("{} / {}", def.category, def.display_name),
+        )
+        .description(def.type_id.to_string())
+        .action(Message::SpawnNode {
+            type_id: def.type_id.to_string(),
+        })
     }));
 
     commands

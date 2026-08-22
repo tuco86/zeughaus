@@ -16,34 +16,10 @@ impl SelectNode {
     pub fn new() -> Self {
         Self {
             pins: vec![
-                PinDefinition {
-                    name: "condition",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Trigger,
-                    type_name: "bool",
-                },
-                PinDefinition {
-                    name: "true_val",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "f64",
-                },
-                PinDefinition {
-                    name: "false_val",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "f64",
-                },
-                PinDefinition {
-                    name: "result",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "f64",
-                },
+                PinDefinition::input("condition", Ty::Bool, PinKind::Trigger),
+                PinDefinition::input("true_val", Ty::Float, PinKind::Sample),
+                PinDefinition::input("false_val", Ty::Float, PinKind::Sample),
+                PinDefinition::output("result", Ty::Float),
             ],
         }
     }

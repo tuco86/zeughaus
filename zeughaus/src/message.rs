@@ -1,10 +1,60 @@
 use std::collections::HashMap;
+use std::fmt;
+use std::ops::Deref;
+use std::sync::Arc;
 
 use iced::{Point, Vector};
-use iced_nodegraph::PinRef;
+use iced_nodegraph::{PinId, PinRef};
 use zeughaus_core::Value;
 
-pub type PinLabel = &'static str;
+/// A pin name as it travels through the node graph widget.
+///
+/// Pin names are runtime data: a variadic node grows them while the graph is
+/// edited and a loaded document brings them in as plain strings, so this wraps
+/// a shared `Arc<str>` instead of a compile-time `&'static str`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PinLabel(pub Arc<str>);
+
+impl PinLabel {
+    /// The pin name as a plain string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PinId for PinLabel {}
+
+impl Deref for PinLabel {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for PinLabel {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for PinLabel {
+    fn from(name: &str) -> Self {
+        Self(Arc::from(name))
+    }
+}
+
+impl From<Arc<str>> for PinLabel {
+    fn from(name: Arc<str>) -> Self {
+        Self(name)
+    }
+}
+
+impl fmt::Display for PinLabel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -64,4 +114,40 @@ pub enum Message {
     // SpacetimeDB store (later phase).
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     GraphLoaded(zeughaus_core::GraphDocument),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Save/load and SpacetimeDB sync round-trip pin names through `String`:
+    /// the label must survive as the plain pin name in both directions. This is
+    /// what replaced the old `leak_string`, which fabricated `&'static str` by
+    /// leaking one allocation per loaded edge.
+    #[test]
+    fn label_round_trips_through_a_plain_string() {
+        let label = PinLabel::from("model");
+        let serialized = label.to_string();
+        assert_eq!(serialized, "model");
+        assert_eq!(PinLabel::from(serialized.as_str()), label);
+    }
+
+    /// A label built from a pin definition shares that allocation instead of
+    /// copying the name on every view pass.
+    #[test]
+    fn label_shares_the_pin_definition_allocation() {
+        let name: Arc<str> = Arc::from("out");
+        let label = PinLabel::from(Arc::clone(&name));
+        assert!(Arc::ptr_eq(&name, &label.0));
+        assert_eq!(label.as_str(), "out");
+    }
+
+    /// Pin lookups compare a label against a `PinDefinition::name`, so equality
+    /// must follow the name, not the allocation.
+    #[test]
+    fn equality_follows_the_name_not_the_allocation() {
+        assert_eq!(PinLabel::from("a"), PinLabel::from("a"));
+        assert_ne!(PinLabel::from("a"), PinLabel::from("b"));
+        assert_eq!(&*PinLabel::from("a"), "a");
+    }
 }

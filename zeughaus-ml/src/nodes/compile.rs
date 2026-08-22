@@ -1,6 +1,6 @@
 use zeughaus_core::*;
 
-use crate::model::{CompileConfig, KerasModel};
+use crate::model::{keras_model_ty, CompileConfig, KerasModel};
 
 /// Attaches a training configuration (optimizer, loss, metrics) to the model.
 /// Place it after the layer stack; the Export node renders the resulting
@@ -25,20 +25,8 @@ impl CompileNode {
             loss: "categorical_crossentropy".to_string(),
             metrics: "accuracy".to_string(),
             pins: vec![
-                PinDefinition {
-                    name: "model",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "KerasModel",
-                },
-                PinDefinition {
-                    name: "out",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "KerasModel",
-                },
+                PinDefinition::input("model", keras_model_ty(), PinKind::Sample),
+                PinDefinition::output("out", keras_model_ty()),
             ],
         }
     }
@@ -63,24 +51,9 @@ impl ExecutableNode for CompileNode {
 
     fn settings(&self) -> Vec<SettingDef> {
         vec![
-            SettingDef {
-                name: "optimizer",
-                default: "adam",
-                placeholder: "adam / sgd / rmsprop",
-                multiline: false,
-            },
-            SettingDef {
-                name: "loss",
-                default: "categorical_crossentropy",
-                placeholder: "loss function",
-                multiline: false,
-            },
-            SettingDef {
-                name: "metrics",
-                default: "accuracy",
-                placeholder: "accuracy, mae",
-                multiline: false,
-            },
+            SettingDef::new("optimizer", "adam").placeholder("adam / sgd / rmsprop"),
+            SettingDef::new("loss", "categorical_crossentropy").placeholder("loss function"),
+            SettingDef::new("metrics", "accuracy").placeholder("accuracy, mae"),
         ]
     }
 

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use zeughaus_core::*;
 
@@ -53,17 +54,17 @@ impl GraphBuilder {
     pub fn connect(
         &mut self,
         from: NodeId,
-        from_pin: &'static str,
+        from_pin: impl Into<Arc<str>>,
         to: NodeId,
-        to_pin: &'static str,
+        to_pin: impl Into<Arc<str>>,
     ) -> Result<EdgeId> {
         let edge_id = EdgeId::next();
         self.graph.add_edge(GraphEdge {
             id: edge_id,
             from_node: from,
-            from_pin,
+            from_pin: from_pin.into(),
             to_node: to,
-            to_pin,
+            to_pin: to_pin.into(),
             semantic: EdgeSemantic::default(),
         });
         Ok(edge_id)
@@ -112,9 +113,9 @@ mod tests {
         }
         fn node_catalog(&self) -> Vec<NodeDefinition> {
             vec![NodeDefinition {
-                type_id: "test.node",
-                display_name: "Test",
-                category: "Test",
+                type_id: "test.node".into(),
+                display_name: "Test".into(),
+                category: "Test".into(),
                 pins: vec![],
                 settings: vec![],
             }]

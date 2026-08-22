@@ -5,6 +5,7 @@
 //! (the assistant reply). This makes prompt chains expressible as node chains.
 
 use serde::{Deserialize, Serialize};
+use zeughaus_core::{Ty, Typed};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
@@ -71,6 +72,14 @@ impl Conversation {
 
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty()
+    }
+}
+
+/// `Conversation` is a nominal plugin type: its meaning is the chat protocol it
+/// implements, not its field layout, so it travels as an opaque `Ty`.
+impl Typed for Conversation {
+    fn ty() -> Ty {
+        Ty::opaque("Conversation")
     }
 }
 

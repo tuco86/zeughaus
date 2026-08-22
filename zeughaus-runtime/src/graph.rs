@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use zeughaus_core::{EdgeId, EdgeSemantic, NodeConfig, NodeId, PinDefinition};
 
@@ -13,9 +14,11 @@ pub struct GraphNode {
 pub struct GraphEdge {
     pub id: EdgeId,
     pub from_node: NodeId,
-    pub from_pin: &'static str,
+    /// Source pin name. Owned because pin names are not compile-time literals:
+    /// a variadic node grows them and a loaded document brings them as strings.
+    pub from_pin: Arc<str>,
     pub to_node: NodeId,
-    pub to_pin: &'static str,
+    pub to_pin: Arc<str>,
     pub semantic: EdgeSemantic,
 }
 
@@ -165,9 +168,9 @@ mod tests {
         GraphEdge {
             id: EdgeId::next(),
             from_node: from,
-            from_pin: "out",
+            from_pin: "out".into(),
             to_node: to,
-            to_pin: "in",
+            to_pin: "in".into(),
             semantic: EdgeSemantic::default(),
         }
     }

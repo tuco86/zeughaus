@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use zeughaus_core::{
-    AsyncWork, EdgeId, ExecutableNode, InputSet, NodeContext, NodeId, PinDefinition, Result,
-    TypeConverters, Value,
+    AsyncWork, EdgeId, ExecutableNode, InputSet, NodeContext, NodeId, PinBinding, PinDefinition,
+    Result, Ty, TypeConverters, Value,
 };
 
 /// Work a node deferred during execution, tagged with the node that owns it.
@@ -172,41 +172,44 @@ impl GraphExecutor {
             if let Some(edge) = self.graph.edge(edge_id)
                 && let Some(value) = self.cache.get(edge_id)
             {
-                let to_type = self.pin_type(node_id, edge.to_pin);
-                let from_type = self.pin_type(edge.from_node, edge.from_pin);
-                let value = self.coerce(from_type, to_type, value, node_id, edge.to_pin);
-                inputs.insert(edge.to_pin, value);
+                let to_type = self.pin_type(node_id, &edge.to_pin);
+                let value = self.coerce(to_type, value, node_id, &edge.to_pin);
+                inputs.insert(Arc::clone(&edge.to_pin), value);
             }
         }
         inputs
     }
 
-    /// Declared type name of a node's pin, if the node and pin are known.
-    fn pin_type(&self, node: NodeId, pin: &str) -> Option<&'static str> {
+    /// Declared type of a node's pin, if the node and pin are known.
+    fn pin_type(&self, node: NodeId, pin: &str) -> Option<&Ty> {
         self.graph
             .node(node)?
             .pin_defs
             .iter()
-            .find(|p| p.name == pin)
-            .map(|p| p.type_name)
+            .find(|p| &*p.name == pin)
+            .map(|p| &p.ty)
     }
 
-    /// Coerces a value crossing an edge to the target pin's declared type. If
-    /// the types match (or either is unknown/`any`), the value passes through.
-    /// Otherwise a registered converter is applied; a missing converter for a
-    /// genuine mismatch is logged and the value passed through unchanged.
+    /// Coerces a value crossing an edge to the target pin's declared type.
+    ///
+    /// The source type is the value's own tag rather than the source pin's
+    /// declaration: a value knows what it is, and a pin declared `any` (e.g.
+    /// `flow.hold`) carries whatever was latched. If the types match, or the
+    /// target accepts anything, the value passes through. Otherwise a registered
+    /// converter is applied; a missing converter for a genuine mismatch is
+    /// logged and the value passed through unchanged.
     fn coerce(
         &self,
-        from_type: Option<&str>,
-        to_type: Option<&str>,
+        to_type: Option<&Ty>,
         value: &Value,
         node_id: NodeId,
         to_pin: &str,
     ) -> Value {
-        let (Some(from), Some(to)) = (from_type, to_type) else {
+        let Some(to) = to_type else {
             return value.clone();
         };
-        if from == to || to == "any" || from == "any" {
+        let from = value.ty();
+        if from == to || to.is_any() || from.is_any() {
             return value.clone();
         }
         if let Some(converted) = self.converters.convert(from, to, value) {
@@ -255,7 +258,7 @@ impl GraphExecutor {
     fn apply_outputs(&mut self, node_id: NodeId, outputs: HashMap<String, Value>) {
         for &edge_id in self.graph.outgoing_edges(node_id) {
             if let Some(edge) = self.graph.edge(edge_id)
-                && let Some(value) = outputs.get(edge.from_pin)
+                && let Some(value) = outputs.get(&*edge.from_pin)
             {
                 self.cache.set(edge_id, value.clone());
             }
@@ -272,13 +275,13 @@ impl GraphExecutor {
             return;
         };
         let from_node = edge.from_node;
-        let from_pin = edge.from_pin;
+        let from_pin = Arc::clone(&edge.from_pin);
         let to_node = edge.to_node;
 
         if let Some(value) = self
             .last_outputs
             .get(&from_node)
-            .and_then(|outs| outs.get(from_pin))
+            .and_then(|outs| outs.get(&*from_pin))
             .cloned()
         {
             self.cache.set(edge_id, value);
@@ -327,11 +330,20 @@ impl GraphExecutor {
         self.cache.get(edge_id)
     }
 
-    /// Recomputes a variadic node's pins from its connected input pin names.
+    /// Recomputes a node's pins from what is currently connected to its inputs.
     /// On a change, updates the graph node's pin_defs and returns the new pin
     /// set so the editor can re-sync its own snapshot. Returns None if unchanged.
-    pub fn sync_node_arity(&mut self, id: NodeId, connected: &[&str]) -> Option<Vec<PinDefinition>> {
-        let changed = self.nodes.get_mut(&id)?.sync_arity(connected);
+    ///
+    /// The bindings are derived here rather than passed in: the executor already
+    /// holds the edges, the pin declarations and the cached values, so it is the
+    /// only place where a pin's incoming type is known without guessing.
+    pub fn sync_node_pins(&mut self, id: NodeId) -> Option<Vec<PinDefinition>> {
+        let bindings = self.input_bindings(id);
+        let borrowed: Vec<PinBinding<'_>> = bindings
+            .iter()
+            .map(|(name, ty)| PinBinding { name, ty })
+            .collect();
+        let changed = self.nodes.get_mut(&id)?.sync_pins(&borrowed);
         if !changed {
             return None;
         }
@@ -342,25 +354,33 @@ impl GraphExecutor {
         Some(pins)
     }
 
+    /// What is connected to each of a node's input pins: the pin name plus the
+    /// type actually arriving there (the cached value's own type when there is
+    /// one, otherwise the source pin's declaration).
+    fn input_bindings(&self, id: NodeId) -> Vec<(Arc<str>, Ty)> {
+        self.graph
+            .incoming_edges(id)
+            .iter()
+            .filter_map(|&edge_id| {
+                let edge = self.graph.edge(edge_id)?;
+                let ty = match self.cache.get(edge_id) {
+                    Some(value) => value.ty().clone(),
+                    None => self
+                        .pin_type(edge.from_node, &edge.from_pin)
+                        .cloned()
+                        .unwrap_or(Ty::Any),
+                };
+                Some((Arc::clone(&edge.to_pin), ty))
+            })
+            .collect()
+    }
+
     pub fn set_parameter(&mut self, id: NodeId, name: &str, value: Value) -> Result<()> {
         if let Some(node) = self.nodes.get_mut(&id) {
             node.set_parameter(name, value)?;
             self.mark_dirty_downstream(id);
         }
         Ok(())
-    }
-
-    /// Read cached output values for a node (from outgoing edge caches).
-    pub fn node_output_values(&self, node_id: NodeId) -> HashMap<&'static str, &Value> {
-        let mut result = HashMap::new();
-        for &edge_id in self.graph.outgoing_edges(node_id) {
-            if let Some(edge) = self.graph.edge(edge_id)
-                && let Some(value) = self.cache.get(edge_id)
-            {
-                result.insert(edge.from_pin, value);
-            }
-        }
-        result
     }
 }
 
@@ -405,18 +425,13 @@ mod tests {
         }
     }
 
-    fn make_edge(
-        from: NodeId,
-        from_pin: &'static str,
-        to: NodeId,
-        to_pin: &'static str,
-    ) -> GraphEdge {
+    fn make_edge(from: NodeId, from_pin: &str, to: NodeId, to_pin: &str) -> GraphEdge {
         GraphEdge {
             id: EdgeId::next(),
             from_node: from,
-            from_pin,
+            from_pin: from_pin.into(),
             to_node: to,
-            to_pin,
+            to_pin: to_pin.into(),
             semantic: EdgeSemantic::default(),
         }
     }
@@ -666,12 +681,26 @@ mod tests {
         assert_eq!(exec.graph.node_count(), 1);
     }
 
+    fn typed_node(id: NodeId, pin: &str, dir: PinDirection, ty: Ty) -> GraphNode {
+        let pin_def = match dir {
+            PinDirection::Input => PinDefinition::input(pin, ty, PinKind::Sample),
+            PinDirection::Output => PinDefinition::output(pin, ty),
+        };
+        GraphNode {
+            id,
+            type_id: "test".to_string(),
+            config: NodeConfig::default(),
+            pin_defs: vec![pin_def],
+            position: (0.0, 0.0),
+        }
+    }
+
     /// A converter coerces a value as it crosses an edge whose endpoints
-    /// declare different types (u8 source -> f64 input).
+    /// declare different types (int source -> float input).
     #[test]
     fn converter_coerces_value_across_edge() {
-        struct ConstU8(u8);
-        impl ExecutableNode for ConstU8 {
+        struct ConstInt(i64);
+        impl ExecutableNode for ConstInt {
             fn execute(&mut self, _inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
                 ctx.emit_typed("value", self.0);
                 ctx.flush();
@@ -682,28 +711,12 @@ mod tests {
             }
         }
 
-        fn typed_node(id: NodeId, pin: &'static str, dir: PinDirection, ty: &'static str) -> GraphNode {
-            GraphNode {
-                id,
-                type_id: "test".to_string(),
-                config: NodeConfig::default(),
-                pin_defs: vec![PinDefinition {
-                    name: pin,
-                    direction: dir,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: ty,
-                }],
-                position: (0.0, 0.0),
-            }
-        }
-
         let mut graph = Graph::new();
         let a = NodeId::next();
         let b = NodeId::next();
         let c = NodeId::next();
-        graph.add_node(typed_node(a, "value", PinDirection::Output, "u8"));
-        graph.add_node(typed_node(b, "in", PinDirection::Input, "f64"));
+        graph.add_node(typed_node(a, "value", PinDirection::Output, Ty::Int));
+        graph.add_node(typed_node(b, "in", PinDirection::Input, Ty::Float));
         graph.add_node(make_node(c));
         graph.add_edge(make_edge(a, "value", b, "in"));
         let bc = make_edge(b, "out", c, "in");
@@ -711,17 +724,123 @@ mod tests {
         graph.add_edge(bc);
 
         let mut conv = TypeConverters::new();
-        conv.register_typed::<u8, f64, _>("u8", "f64", |x| x as f64);
+        conv.register_typed::<i64, f64, _>(|x| x as f64);
 
         let mut exec = GraphExecutor::new(graph);
         exec.set_converters(Arc::new(conv));
-        exec.register_node(a, Box::new(ConstU8(7)));
+        exec.register_node(a, Box::new(ConstInt(7)));
         exec.register_node(b, Box::new(DoubleNode)); // reads in:f64, emits out = in*2
         exec.register_node(c, Box::new(DoubleNode));
         exec.execute_all().unwrap();
 
-        // Coercion u8(7) -> f64(7.0); DoubleNode emits 14.0 onto b->c.
+        // Coercion int(7) -> float(7.0); DoubleNode emits 14.0 onto b->c.
         let val = exec.edge_value(bc_id).unwrap();
         assert_eq!(val.downcast_ref::<f64>(), Some(&14.0));
+    }
+
+    /// Coercion keys on the value's own type, not on the source pin's
+    /// declaration: a pin declared `any` (e.g. `flow.hold`) still lands
+    /// correctly on a typed input.
+    #[test]
+    fn coercion_uses_the_value_type_not_the_declared_source() {
+        struct ConstInt;
+        impl ExecutableNode for ConstInt {
+            fn execute(&mut self, _inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
+                ctx.emit_typed("value", 21i64);
+                ctx.flush();
+                Ok(())
+            }
+            fn pin_definitions(&self) -> &[PinDefinition] {
+                &[]
+            }
+        }
+
+        let mut graph = Graph::new();
+        let a = NodeId::next();
+        let b = NodeId::next();
+        let c = NodeId::next();
+        // Source declares `any` while actually emitting an int.
+        graph.add_node(typed_node(a, "value", PinDirection::Output, Ty::Any));
+        graph.add_node(typed_node(b, "in", PinDirection::Input, Ty::Float));
+        graph.add_node(make_node(c));
+        graph.add_edge(make_edge(a, "value", b, "in"));
+        let bc = make_edge(b, "out", c, "in");
+        let bc_id = bc.id;
+        graph.add_edge(bc);
+
+        let mut exec = GraphExecutor::new(graph);
+        exec.set_converters(Arc::new(TypeConverters::with_builtins()));
+        exec.register_node(a, Box::new(ConstInt));
+        exec.register_node(b, Box::new(DoubleNode));
+        exec.register_node(c, Box::new(DoubleNode));
+        exec.execute_all().unwrap();
+
+        assert_eq!(
+            exec.edge_value(bc_id).unwrap().downcast_ref::<f64>(),
+            Some(&42.0)
+        );
+    }
+
+    /// The point of the runtime type system: a node whose interface is derived
+    /// from a type nobody wrote in Rust. `SplitRecord` grows one output pin per
+    /// field of whatever record arrives on its input.
+    #[test]
+    fn node_derives_its_pins_from_an_incoming_record_type() {
+        struct SplitRecord {
+            pins: Vec<PinDefinition>,
+        }
+        impl ExecutableNode for SplitRecord {
+            fn execute(&mut self, _inputs: &InputSet, _ctx: &mut NodeContext) -> Result<()> {
+                Ok(())
+            }
+            fn pin_definitions(&self) -> &[PinDefinition] {
+                &self.pins
+            }
+            fn sync_pins(&mut self, connected: &[PinBinding<'_>]) -> bool {
+                let mut pins = vec![PinDefinition::input("row", Ty::Any, PinKind::Trigger)];
+                if let Some(Ty::Record(rec)) =
+                    connected.iter().find(|b| b.name == "row").map(|b| b.ty)
+                {
+                    pins.extend(
+                        rec.fields
+                            .iter()
+                            .map(|f| PinDefinition::output(Arc::clone(&f.name), f.ty.clone())),
+                    );
+                }
+                let changed = pins != self.pins;
+                self.pins = pins;
+                changed
+            }
+        }
+
+        let customer = Ty::record(
+            "Customer",
+            vec![Field::new("id", Ty::Int), Field::new("name", Ty::Str)],
+        );
+
+        let mut graph = Graph::new();
+        let source = NodeId::next();
+        let split = NodeId::next();
+        graph.add_node(typed_node(source, "row", PinDirection::Output, customer));
+        graph.add_node(make_node(split));
+        graph.add_edge(make_edge(source, "row", split, "row"));
+
+        let mut exec = GraphExecutor::new(graph);
+        exec.register_node(
+            split,
+            Box::new(SplitRecord {
+                pins: vec![PinDefinition::input("row", Ty::Any, PinKind::Trigger)],
+            }),
+        );
+
+        let pins = exec.sync_node_pins(split).expect("pins changed");
+        let names: Vec<&str> = pins.iter().map(|p| &*p.name).collect();
+        assert_eq!(names, vec!["row", "id", "name"]);
+        assert_eq!(pins[1].ty, Ty::Int);
+        assert_eq!(pins[2].ty, Ty::Str);
+        // The graph's own snapshot is updated too, so the editor redraws them.
+        assert_eq!(exec.graph.node(split).unwrap().pin_defs.len(), 3);
+        // Idempotent: nothing changed on a second sync.
+        assert!(exec.sync_node_pins(split).is_none());
     }
 }

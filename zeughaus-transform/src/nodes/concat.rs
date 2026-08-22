@@ -15,34 +15,10 @@ impl ConcatNode {
     pub fn new() -> Self {
         Self {
             pins: vec![
-                PinDefinition {
-                    name: "a",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Trigger,
-                    type_name: "String",
-                },
-                PinDefinition {
-                    name: "b",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Trigger,
-                    type_name: "String",
-                },
-                PinDefinition {
-                    name: "sep",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "String",
-                },
-                PinDefinition {
-                    name: "result",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "String",
-                },
+                PinDefinition::input("a", Ty::Str, PinKind::Trigger),
+                PinDefinition::input("b", Ty::Str, PinKind::Trigger),
+                PinDefinition::input("sep", Ty::Str, PinKind::Sample),
+                PinDefinition::output("result", Ty::Str),
             ],
         }
     }

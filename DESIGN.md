@@ -167,6 +167,63 @@ model.summary()
 The plugin is pure codegen with no platform dependencies, so it is available in
 the wasm editor as well; native runners execute the exported code.
 
+## Type System -- implemented
+
+Pin types are runtime values, not compile-time labels. A pin declares a `Ty`:
+
+```rust
+enum Ty {
+    Any,                       // wildcard: connects to anything, never coerced
+    Bool, Int, Float, Str,     // scalars, bijective with bool/i64/f64/String
+    List(Arc<Ty>),
+    Option(Arc<Ty>),
+    Record(Arc<Record>),       // named, ordered fields -- built at runtime
+    Opaque(Arc<str>),          // a plugin's own Rust type, matched by name
+}
+```
+
+This is what lets a domain describe types nobody wrote in Rust: a user-designed
+database schema, a subgraph's exposed interface, an inferred tensor shape. A node
+derives its pins from what is connected to it via `sync_pins`, so its interface
+can follow its data rather than its source code.
+
+### Types and Values Agree by Construction
+
+A Rust type declares its own `Ty` once, and both the pin declaration and the
+runtime tag on values come from that single definition:
+
+```rust
+trait Typed: Clone + Send + Sync + 'static {
+    fn ty() -> Ty;
+    fn repr(&self) -> Repr<'_> { Repr::Opaque }   // structural view for display
+}
+```
+
+`Value::new::<T>` tags the value with `T::ty()`, so a value's declared type and
+its actual payload cannot drift apart -- the failure mode of the previous string
+labels, where a pin could claim `f64` while carrying something else. The executor
+therefore coerces on the value's own type rather than trusting the source pin's
+declaration, which is also what makes an `Any` output (e.g. `flow.hold`) land
+correctly on a typed input.
+
+The built-in scalars are deliberately a 1:1 mapping onto Rust types. Narrower
+numerics (`u8`, `f32`) are not pin types: a node converts at the emit site, so
+there is no ladder of widening converters papering over mismatches. The one
+remaining built-in coercion is `Int -> Float`.
+
+### Structural Inspection
+
+`Typed::repr` exposes a borrowed structural view (`Repr`) of scalars, lists and
+records. Generic consumers walk it instead of downcasting to every concrete type:
+today the editor's in-node value display, later the edge preview widgets and
+capture. Nominal plugin types (`KerasModel`, `Conversation`) stay opaque -- their
+meaning is their Rust implementation, not a field layout.
+
+Deserializing a value back from its `Repr` is not implemented: `Ty` and
+`PinDefinition` are serializable (a subgraph's derived pins must survive
+save/load), but reconstructing an arbitrary payload needs a per-type decoder,
+which waits for the first consumer (capture or a remote runner).
+
 ## Dataflow Model
 
 ### Push/Pull Reactive
@@ -384,6 +441,9 @@ trait DomainPlugin {
 trait ExecutableNode {
     fn execute(&mut self, inputs: &InputSet, ctx: &mut NodeContext) -> Result<()>;
     fn pin_definitions(&self) -> &[PinDefinition];
+    // Derive pins from what is connected: variadic arity, or a shape that
+    // follows an incoming type (a schema, a subgraph interface).
+    fn sync_pins(&mut self, connected: &[PinBinding<'_>]) -> bool { false }
 }
 ```
 

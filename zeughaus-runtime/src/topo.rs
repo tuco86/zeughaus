@@ -70,9 +70,9 @@ mod tests {
         GraphEdge {
             id: EdgeId::next(),
             from_node: from,
-            from_pin: "out",
+            from_pin: "out".into(),
             to_node: to,
-            to_pin: "in",
+            to_pin: "in".into(),
             semantic: EdgeSemantic::default(),
         }
     }

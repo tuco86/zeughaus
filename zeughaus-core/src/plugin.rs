@@ -2,7 +2,7 @@ use crate::context::{InputSet, NodeContext};
 use crate::convert::TypeConverters;
 use crate::error::Result;
 use crate::node::{NodeDefinition, SettingDef};
-use crate::pin::PinDefinition;
+use crate::pin::{PinBinding, PinDefinition};
 use crate::value::Value;
 
 pub trait DomainPlugin: Send + Sync {
@@ -28,10 +28,15 @@ pub trait ExecutableNode: Send + Sync {
         Ok(())
     }
 
-    /// Recomputes a variadic node's input pins from the names of its currently
-    /// connected input pins. Returns true if the pin set changed, so the host
-    /// re-syncs pin definitions and redraws. Default: pins are static.
-    fn sync_arity(&mut self, _connected_inputs: &[&str]) -> bool {
+    /// Recomputes this node's pins from what is currently connected to its
+    /// inputs. Returns true if the pin set changed, so the host re-syncs pin
+    /// definitions and redraws. Default: pins are static.
+    ///
+    /// A variadic node reads only the binding names (a merge node grows an input
+    /// once the last one fills). A node whose shape follows its data -- a table
+    /// writer taking a schema, a subgraph exposing its interior -- reads the
+    /// incoming types.
+    fn sync_pins(&mut self, _connected: &[PinBinding<'_>]) -> bool {
         false
     }
 }

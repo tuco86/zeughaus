@@ -14,27 +14,9 @@ impl GreaterThanNode {
     pub fn new() -> Self {
         Self {
             pins: vec![
-                PinDefinition {
-                    name: "a",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Trigger,
-                    type_name: "f64",
-                },
-                PinDefinition {
-                    name: "b",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Trigger,
-                    type_name: "f64",
-                },
-                PinDefinition {
-                    name: "result",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "bool",
-                },
+                PinDefinition::input("a", Ty::Float, PinKind::Trigger),
+                PinDefinition::input("b", Ty::Float, PinKind::Trigger),
+                PinDefinition::output("result", Ty::Bool),
             ],
         }
     }
@@ -68,34 +50,10 @@ impl EqualNode {
     pub fn new() -> Self {
         Self {
             pins: vec![
-                PinDefinition {
-                    name: "a",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Trigger,
-                    type_name: "f64",
-                },
-                PinDefinition {
-                    name: "b",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Trigger,
-                    type_name: "f64",
-                },
-                PinDefinition {
-                    name: "epsilon",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "f64",
-                },
-                PinDefinition {
-                    name: "result",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "bool",
-                },
+                PinDefinition::input("a", Ty::Float, PinKind::Trigger),
+                PinDefinition::input("b", Ty::Float, PinKind::Trigger),
+                PinDefinition::input("epsilon", Ty::Float, PinKind::Sample),
+                PinDefinition::output("result", Ty::Bool),
             ],
         }
     }

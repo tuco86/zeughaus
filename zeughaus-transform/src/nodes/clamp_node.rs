@@ -14,34 +14,10 @@ impl ClampNode {
     pub fn new() -> Self {
         Self {
             pins: vec![
-                PinDefinition {
-                    name: "input",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Trigger,
-                    type_name: "f64",
-                },
-                PinDefinition {
-                    name: "min",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "f64",
-                },
-                PinDefinition {
-                    name: "max",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "f64",
-                },
-                PinDefinition {
-                    name: "result",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "f64",
-                },
+                PinDefinition::input("input", Ty::Float, PinKind::Trigger),
+                PinDefinition::input("min", Ty::Float, PinKind::Sample),
+                PinDefinition::input("max", Ty::Float, PinKind::Sample),
+                PinDefinition::output("result", Ty::Float),
             ],
         }
     }

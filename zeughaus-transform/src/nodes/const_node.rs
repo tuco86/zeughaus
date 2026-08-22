@@ -9,13 +9,7 @@ impl ConstF64Node {
     pub fn new(value: f64) -> Self {
         Self {
             value,
-            pins: vec![PinDefinition {
-                name: "value",
-                direction: PinDirection::Output,
-                data_mode: DataMode::Value,
-                pin_kind: PinKind::Sample,
-                type_name: "f64",
-            }],
+            pins: vec![PinDefinition::output("value", Ty::Float)],
         }
     }
 }

@@ -1,6 +1,6 @@
 use zeughaus_core::*;
 
-use crate::model::KerasModel;
+use crate::model::{keras_model_ty, KerasModel};
 
 /// Terminal node of an ML graph: renders the incoming model to a runnable
 /// Keras (TensorFlow) Python program and emits it as a String on the `code`
@@ -20,20 +20,8 @@ impl ExportNode {
     pub fn new() -> Self {
         Self {
             pins: vec![
-                PinDefinition {
-                    name: "model",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Trigger,
-                    type_name: "KerasModel",
-                },
-                PinDefinition {
-                    name: "code",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "String",
-                },
+                PinDefinition::input("model", keras_model_ty(), PinKind::Trigger),
+                PinDefinition::output("code", Ty::Str),
             ],
         }
     }

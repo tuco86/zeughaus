@@ -14,7 +14,8 @@ use iced_nodegraph::{
 use iced_palette::{get_filtered_command_index, is_toggle_shortcut};
 use zeughaus_core::{
     DomainPlugin, EdgeData, EdgeId, EdgeSemantic, GraphDocument, NodeConfig, NodeData,
-    NodeDefinition, NodeId, PinDefinition, PinDirection, PinKind, SettingDef, TypeConverters, Value,
+    NodeDefinition, NodeId, PinDefinition, PinDirection, PinKind, SettingDef, Ty, TypeConverters,
+    Value,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use zeughaus_runtime::DeferredWork;
@@ -217,7 +218,7 @@ impl App {
         let display_name = self
             .catalog
             .iter()
-            .find(|d| d.type_id == type_id)
+            .find(|d| &*d.type_id == type_id)
             .map(|d| d.display_name.to_string())
             .unwrap_or_else(|| type_id.to_string());
 
@@ -237,7 +238,7 @@ impl App {
             for def in &setting_defs {
                 let _ = self
                     .executor
-                    .set_parameter(id, def.name, Value::new(def.default.to_string()));
+                    .set_parameter(id, &def.name, Value::new(def.default.to_string()));
                 values.insert(def.name.to_string(), def.default.to_string());
             }
             self.node_settings.insert(id, values);
@@ -297,9 +298,9 @@ impl App {
         self.executor.graph.add_edge(GraphEdge {
             id: edge_id,
             from_node,
-            from_pin,
+            from_pin: from_pin.0.clone(),
             to_node,
-            to_pin,
+            to_pin: to_pin.0.clone(),
             semantic: EdgeSemantic::default(),
         });
         self.edges.push(EditorEdge {
@@ -313,7 +314,7 @@ impl App {
         // target subtree. The source is not re-run (no spurious LLM calls).
         self.executor.on_edge_added(edge_id);
         // Grow a variadic target (e.g. merge node) so the next empty input shows.
-        self.resync_arity(to_node);
+        self.resync_pins(to_node);
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(e) = self.edges.last() {
             self.push_edge(e);
@@ -325,11 +326,11 @@ impl App {
 
     /// Removes every edge feeding the given input pin, from both the editor
     /// state and the executor graph/cache.
-    fn remove_edges_into(&mut self, to_node: NodeId, to_pin: PinLabel) {
+    fn remove_edges_into(&mut self, to_node: NodeId, to_pin: &PinLabel) {
         let stale: Vec<EdgeId> = self
             .edges
             .iter()
-            .filter(|e| e.to_node == to_node && e.to_pin == to_pin)
+            .filter(|e| e.to_node == to_node && e.to_pin == *to_pin)
             .map(|e| e.id)
             .collect();
         for edge_id in stale {
@@ -341,14 +342,8 @@ impl App {
     /// After a node's connections change, recompute its pins if it is variadic
     /// (e.g. a merge node grows an input as the last one fills) and sync the
     /// editor's pin snapshot so the new/removed pin is drawn immediately.
-    fn resync_arity(&mut self, node: NodeId) {
-        let connected: Vec<&str> = self
-            .edges
-            .iter()
-            .filter(|e| e.to_node == node)
-            .map(|e| e.to_pin)
-            .collect();
-        if let Some(pins) = self.executor.sync_node_arity(node, &connected)
+    fn resync_pins(&mut self, node: NodeId) {
+        if let Some(pins) = self.executor.sync_node_pins(node)
             && let Some(en) = self.nodes.get_mut(&node)
         {
             en.pin_defs = pins;
@@ -370,7 +365,7 @@ impl App {
         }) {
             let edge = self.edges.remove(pos);
             self.executor.disconnect_edge(edge.id);
-            self.resync_arity(to_node);
+            self.resync_pins(to_node);
             #[cfg(not(target_arch = "wasm32"))]
             self.push_edge_remove(edge.id);
             let task = self.execute_graph();
@@ -571,7 +566,7 @@ impl App {
         let position = Point::new(node_data.x, node_data.y);
 
         let is_const = type_id.starts_with("transform.const_");
-        let setting_names: HashSet<&str> = setting_defs.iter().map(|d| d.name).collect();
+        let setting_names: HashSet<&str> = setting_defs.iter().map(|d| &*d.name).collect();
 
         // Apply saved parameters. Const nodes parse their typed value;
         // setting-bearing nodes restore each named string setting.
@@ -653,24 +648,24 @@ impl App {
         // Rebuild edges
         for edge_data in &doc.edges {
             let edge_id = EdgeId(edge_data.id);
-            let from_pin: &'static str = leak_string(&edge_data.from_pin);
-            let to_pin: &'static str = leak_string(&edge_data.to_pin);
+            let from_pin: Arc<str> = Arc::from(edge_data.from_pin.as_str());
+            let to_pin: Arc<str> = Arc::from(edge_data.to_pin.as_str());
 
             self.executor.graph.add_edge(GraphEdge {
                 id: edge_id,
                 from_node: NodeId(edge_data.from_node),
-                from_pin,
+                from_pin: from_pin.clone(),
                 to_node: NodeId(edge_data.to_node),
-                to_pin,
+                to_pin: to_pin.clone(),
                 semantic: EdgeSemantic::default(),
             });
 
             self.edges.push(EditorEdge {
                 id: edge_id,
                 from_node: NodeId(edge_data.from_node),
-                from_pin,
+                from_pin: PinLabel(from_pin),
                 to_node: NodeId(edge_data.to_node),
-                to_pin,
+                to_pin: PinLabel(to_pin),
             });
         }
 
@@ -970,7 +965,9 @@ impl App {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        let mut ng: NodeGraph<'_, u64, PinLabel, PinVisual, Message, Theme, _> = NodeGraph::default();
+        // NodeGraph is generic over node id, pin id, per-pin payload and message;
+        // renderer and edge id stay at their defaults.
+        let mut ng: NodeGraph<'_, u64, PinLabel, PinVisual, Message> = NodeGraph::default();
 
         ng = ng
             .on_connect(|from, to| Message::EdgeConnected { from, to })
@@ -996,8 +993,11 @@ impl App {
                     let (Some(f), Some(t)) = (nodes.get(&from_id), nodes.get(&to_id)) else {
                         return false;
                     };
-                    let from_pin = f.pin_defs.iter().find(|p| p.name == *from.pin_id());
-                    let to_pin = t.pin_defs.iter().find(|p| p.name == *to.pin_id());
+                    let from_pin = f
+                        .pin_defs
+                        .iter()
+                        .find(|p| &*p.name == from.pin_id().as_str());
+                    let to_pin = t.pin_defs.iter().find(|p| &*p.name == to.pin_id().as_str());
                     let (Some(fp), Some(tp)) = (from_pin, to_pin) else {
                         return false;
                     };
@@ -1022,7 +1022,7 @@ impl App {
                     } else {
                         (tp, fp)
                     };
-                    converters.compatible(out_pin.type_name, in_pin.type_name)
+                    converters.compatible(&out_pin.ty, &in_pin.ty)
                 }
             });
 
@@ -1088,8 +1088,12 @@ impl App {
             let edge_color = self
                 .nodes
                 .get(&edge.from_node)
-                .and_then(|n| n.pin_defs.iter().find(|p| p.name == edge.from_pin))
-                .map(|p| pin_color(p.type_name))
+                .and_then(|n| {
+                    n.pin_defs
+                        .iter()
+                        .find(|p| &*p.name == edge.from_pin.as_str())
+                })
+                .map(|p| pin_color(&p.ty))
                 .unwrap_or(Color::from_rgb(0.6, 0.6, 0.6));
 
             // An edge reflects its source node's state: red marching-ants when
@@ -1103,13 +1107,13 @@ impl App {
             let is_event = self
                 .nodes
                 .get(&edge.to_node)
-                .and_then(|n| n.pin_defs.iter().find(|p| p.name == edge.to_pin))
+                .and_then(|n| n.pin_defs.iter().find(|p| &*p.name == edge.to_pin.as_str()))
                 .map(|p| p.pin_kind == PinKind::Trigger)
                 .unwrap_or(false);
 
             let edge_widget = ng_edge(
-                PinRef::new(edge.from_node.0, edge.from_pin),
-                PinRef::new(edge.to_node.0, edge.to_pin),
+                PinRef::new(edge.from_node.0, edge.from_pin.clone()),
+                PinRef::new(edge.to_node.0, edge.to_pin.clone()),
                 (),
             )
             .style(move |theme, status, _start, _end| {
@@ -1452,27 +1456,33 @@ impl App {
         if !self.nodes.contains_key(&from_node) || !self.nodes.contains_key(&to_node) {
             return;
         }
-        let from_pin = leak_string(&ed.from_pin);
-        let to_pin = leak_string(&ed.to_pin);
-        self.remove_edges_into(to_node, to_pin);
+        let from_pin: Arc<str> = Arc::from(ed.from_pin.as_str());
+        let to_pin: Arc<str> = Arc::from(ed.to_pin.as_str());
+        self.remove_edges_into(to_node, &PinLabel(to_pin.clone()));
         self.executor.graph.add_edge(GraphEdge {
             id: edge_id,
             from_node,
-            from_pin,
+            from_pin: from_pin.clone(),
             to_node,
-            to_pin,
+            to_pin: to_pin.clone(),
             semantic: EdgeSemantic::default(),
         });
-        self.edges.push(EditorEdge { id: edge_id, from_node, from_pin, to_node, to_pin });
+        self.edges.push(EditorEdge {
+            id: edge_id,
+            from_node,
+            from_pin: PinLabel(from_pin),
+            to_node,
+            to_pin: PinLabel(to_pin),
+        });
         self.executor.on_edge_added(edge_id);
-        self.resync_arity(to_node);
+        self.resync_pins(to_node);
     }
 
     fn apply_edge_remove(&mut self, id: EdgeId) {
         if let Some(pos) = self.edges.iter().position(|e| e.id == id) {
             let edge = self.edges.remove(pos);
             self.executor.disconnect_edge(edge.id);
-            self.resync_arity(edge.to_node);
+            self.resync_pins(edge.to_node);
         }
     }
 }
@@ -1498,7 +1508,7 @@ fn build_node_element<'a>(
             _ => "",
         };
         let first_pin = node.pin_defs.first();
-        let pin_type = first_pin.map(|p| p.type_name).unwrap_or("any");
+        let pin_tint = first_pin.map_or_else(|| pin_color(&Ty::Any), |p| pin_color(&p.ty));
         let pin_kind = first_pin.map(|p| p.pin_kind).unwrap_or(PinKind::Sample);
 
         let input_field = text_input(placeholder, input_text)
@@ -1510,9 +1520,9 @@ fn build_node_element<'a>(
             .width(Length::Fill);
 
         let pin: Element<'_, Message, Theme> =
-            node_pin(PinSide::Right, "value", input_field)
+            node_pin(PinSide::Right, PinLabel::from("value"), input_field)
                 .direction(NgPinDirection::Output)
-                .info(PinVisual { color: pin_color(pin_type), shape: pin_shape(pin_kind) })
+                .info(PinVisual { color: pin_tint, shape: pin_shape(pin_kind) })
                 .into();
         items.push(pin);
     } else {
@@ -1527,12 +1537,12 @@ fn build_node_element<'a>(
             };
 
             let visual = PinVisual {
-                color: pin_color(pin_def.type_name),
+                color: pin_color(&pin_def.ty),
                 shape: pin_shape(pin_def.pin_kind),
             };
 
             let pin: Element<'_, Message, Theme> =
-                node_pin(side, pin_def.name, text(pin_def.name).size(12))
+                node_pin(side, PinLabel(pin_def.name.clone()), text(&*pin_def.name).size(12))
                     .direction(direction)
                     .info(visual)
                     .into();
@@ -1545,13 +1555,13 @@ fn build_node_element<'a>(
     // settings is fixed per node type, so the widget tree stays stable.
     for def in &node.settings {
         let node_raw_id = node.id.0;
-        let key = def.name;
+        let key = def.name.clone();
         let current = settings
-            .and_then(|m| m.get(def.name))
+            .and_then(|m| m.get(&*def.name))
             .map(|s| s.as_str())
-            .unwrap_or(def.default);
+            .unwrap_or(&def.default);
 
-        let field = text_input(def.placeholder, current)
+        let field = text_input(&def.placeholder, current)
             .on_input(move |v| Message::NodeSettingChanged {
                 node_id: node_raw_id,
                 key: key.to_string(),
@@ -1562,7 +1572,7 @@ fn build_node_element<'a>(
 
         items.push(
             column![
-                text(def.name).size(11).color(Color::from_rgb(0.6, 0.6, 0.6)),
+                text(&*def.name).size(11).color(Color::from_rgb(0.6, 0.6, 0.6)),
                 field
             ]
             .spacing(1)
@@ -1620,57 +1630,25 @@ struct PinVisual {
     shape: PinShape,
 }
 
-/// Pin shape encodes the transmission mode: Event (Trigger) pins are triangles
-/// (Unreal-Blueprint "exec" look), State (Sample) pins are circles.
+/// Pin shape encodes the transmission mode: Event (Trigger) pins are squares,
+/// State (Sample) pins are circles. `PinShape` offers exactly these two.
 fn pin_shape(kind: PinKind) -> PinShape {
     match kind {
-        PinKind::Trigger => PinShape::Triangle,
+        PinKind::Trigger => PinShape::Square,
         PinKind::Sample => PinShape::Circle,
     }
 }
 
-fn pin_color(type_name: &str) -> Color {
-    match type_name {
-        "f64" => Color::from_rgb(0.3, 0.8, 0.4),
-        "String" => Color::from_rgb(0.9, 0.7, 0.2),
-        "bool" => Color::from_rgb(0.3, 0.5, 0.9),
-        "Conversation" => Color::from_rgb(0.8, 0.4, 0.85),
-        "any" => Color::from_rgb(0.7, 0.7, 0.7),
-        _ => Color::from_rgb(0.6, 0.6, 0.6),
-    }
-}
-
-
-/// Leaks a string to get a &'static str. Used for pin labels loaded from JSON.
-/// Acceptable for graph loading since pin labels are a small, bounded set.
-fn leak_string(s: &str) -> &'static str {
-    // Check common pin names first to avoid leaking
-    match s {
-        "value" => "value",
-        "result" => "result",
-        "input" => "input",
-        "a" => "a",
-        "b" => "b",
-        "t" => "t",
-        "condition" => "condition",
-        "true_val" => "true_val",
-        "false_val" => "false_val",
-        "min" => "min",
-        "max" => "max",
-        "base" => "base",
-        "exp" => "exp",
-        "in_min" => "in_min",
-        "in_max" => "in_max",
-        "out_min" => "out_min",
-        "out_max" => "out_max",
-        "sep" => "sep",
-        "text" => "text",
-        "length" => "length",
-        "epsilon" => "epsilon",
-        "conv" => "conv",
-        "out" => "out",
-        "reply" => "reply",
-        "tok_per_s" => "tok_per_s",
-        other => Box::leak(other.to_string().into_boxed_str()),
+/// Pin color per payload type. Scalars get a distinct hue; opaque and composite
+/// types share the neutral fallback rather than a generated palette.
+fn pin_color(ty: &Ty) -> Color {
+    match ty {
+        Ty::Float => Color::from_rgb(0.3, 0.8, 0.4),
+        Ty::Str => Color::from_rgb(0.9, 0.7, 0.2),
+        Ty::Bool => Color::from_rgb(0.3, 0.5, 0.9),
+        Ty::Any => Color::from_rgb(0.7, 0.7, 0.7),
+        Ty::Int | Ty::List(_) | Ty::Option(_) | Ty::Record(_) | Ty::Opaque(_) => {
+            Color::from_rgb(0.6, 0.6, 0.6)
+        }
     }
 }

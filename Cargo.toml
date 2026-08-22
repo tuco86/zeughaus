@@ -32,7 +32,9 @@ iced = { version = "0.14", features = ["advanced", "wgpu", "tokio"] }
 iced_nodegraph = { path = "../iced_nodegraph/iced_nodegraph" }
 iced_palette = { git = "https://github.com/tuco86/iced_palette.git", branch = "main" }
 
-serde = { version = "1.0", features = ["derive"] }
+# `rc` provides Serialize/Deserialize for Arc<str> / Arc<T>, which pin names,
+# node ids and the runtime type system (Ty) use to stay cheap to clone.
+serde = { version = "1.0", features = ["derive", "rc"] }
 thiserror = "2.0"
 
 # SpacetimeDB client SDK. Native uses default (tokio) features; wasm enables the

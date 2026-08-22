@@ -51,7 +51,7 @@ mod tests {
         let plugin = LlmPlugin;
         for def in plugin.node_catalog() {
             assert!(
-                plugin.create_node(def.type_id).is_some(),
+                plugin.create_node(&def.type_id).is_some(),
                 "failed to create: {}",
                 def.type_id
             );
@@ -64,7 +64,7 @@ mod tests {
         let chat = plugin
             .node_catalog()
             .into_iter()
-            .find(|d| d.type_id == "llm.chat")
+            .find(|d| &*d.type_id == "llm.chat")
             .unwrap();
         assert_eq!(chat.settings.len(), 2);
     }

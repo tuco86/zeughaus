@@ -5,7 +5,7 @@
 
 use zeughaus_core::*;
 
-use crate::model::{KerasModel, Layer};
+use crate::model::{keras_model_ty, KerasModel, Layer};
 
 /// Whether a parameter is a Python string (quoted in codegen) or a raw literal
 /// (number, tuple, bool, identifier -- emitted verbatim).
@@ -196,20 +196,8 @@ pub(crate) fn build_kwargs(
 /// Two pins shared by every layer node: model in (Sample), model out.
 fn layer_pins() -> Vec<PinDefinition> {
     vec![
-        PinDefinition {
-            name: "model",
-            direction: PinDirection::Input,
-            data_mode: DataMode::Value,
-            pin_kind: PinKind::Sample,
-            type_name: "KerasModel",
-        },
-        PinDefinition {
-            name: "out",
-            direction: PinDirection::Output,
-            data_mode: DataMode::Value,
-            pin_kind: PinKind::Sample,
-            type_name: "KerasModel",
-        },
+        PinDefinition::input("model", keras_model_ty(), PinKind::Sample),
+        PinDefinition::output("out", keras_model_ty()),
     ]
 }
 
@@ -257,12 +245,7 @@ impl ExecutableNode for LayerNode {
         self.spec
             .params
             .iter()
-            .map(|d| SettingDef {
-                name: d.name,
-                default: d.default,
-                placeholder: d.placeholder,
-                multiline: false,
-            })
+            .map(|d| SettingDef::new(d.name, d.default).placeholder(d.placeholder))
             .collect()
     }
 

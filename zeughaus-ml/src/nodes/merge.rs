@@ -6,7 +6,7 @@
 use zeughaus_core::*;
 
 use super::layer::{build_kwargs, ParamDef, ParamType};
-use crate::model::{KerasModel, Layer};
+use crate::model::{keras_model_ty, KerasModel, Layer};
 
 /// Static description of a merge node type. Mirrors `LayerSpec` but for the
 /// two-input merge layers.
@@ -57,25 +57,13 @@ const LETTERS: [&str; 26] = [
 ];
 
 fn input_pin(name: &'static str) -> PinDefinition {
-    PinDefinition {
-        name,
-        direction: PinDirection::Input,
-        data_mode: DataMode::Value,
-        pin_kind: PinKind::Sample,
-        type_name: "KerasModel",
-    }
+    PinDefinition::input(name, keras_model_ty(), PinKind::Sample)
 }
 
 /// Builds `input_count` ordered input pins (a, b, c, ...) plus the `out` pin.
 fn merge_pins(input_count: usize) -> Vec<PinDefinition> {
     let mut pins: Vec<PinDefinition> = LETTERS[..input_count].iter().map(|n| input_pin(n)).collect();
-    pins.push(PinDefinition {
-        name: "out",
-        direction: PinDirection::Output,
-        data_mode: DataMode::Value,
-        pin_kind: PinKind::Sample,
-        type_name: "KerasModel",
-    });
+    pins.push(PinDefinition::output("out", keras_model_ty()));
     pins
 }
 
@@ -130,14 +118,14 @@ impl ExecutableNode for MergeNode {
         &self.pins
     }
 
-    fn sync_arity(&mut self, connected: &[&str]) -> bool {
+    fn sync_pins(&mut self, connected: &[PinBinding<'_>]) -> bool {
         // Highest connected input index, then keep exactly one spare empty input
         // after it (at least 2 inputs, at most 26 -- the a..z cap).
         let last = LETTERS
             .iter()
             .copied()
             .enumerate()
-            .filter(|(_, n)| connected.contains(n))
+            .filter(|(_, n)| connected.iter().any(|b| b.name == *n))
             .map(|(i, _)| i)
             .max();
         let desired = match last {
@@ -156,12 +144,7 @@ impl ExecutableNode for MergeNode {
         self.spec
             .params
             .iter()
-            .map(|d| SettingDef {
-                name: d.name,
-                default: d.default,
-                placeholder: d.placeholder,
-                multiline: false,
-            })
+            .map(|d| SettingDef::new(d.name, d.default).placeholder(d.placeholder))
             .collect()
     }
 
@@ -178,12 +161,24 @@ impl ExecutableNode for MergeNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::LazyLock;
 
     fn input_model(id: u64) -> KerasModel {
         KerasModel::new().with_layer(
             id,
             Layer { keras_class: "Input".to_string(), kwargs: vec![("shape".to_string(), "(4,)".to_string())] },
         )
+    }
+
+    /// The bindings the editor hands to `sync_pins`: one per connected input
+    /// pin, all carrying a model.
+    fn connected(names: &[&'static str]) -> Vec<PinBinding<'static>> {
+        static MODEL_TY: LazyLock<Ty> = LazyLock::new(keras_model_ty);
+        names.iter().map(|n| PinBinding { name: n, ty: &MODEL_TY }).collect()
+    }
+
+    fn names(node: &MergeNode) -> Vec<&str> {
+        node.pin_definitions().iter().map(|p| &*p.name).collect()
     }
 
     #[test]
@@ -229,31 +224,40 @@ mod tests {
     #[test]
     fn arity_grows_when_last_input_filled() {
         let mut node = MergeNode::new(merge_spec("ml.concatenate").unwrap());
-        let names = |n: &MergeNode| n.pin_definitions().iter().map(|p| p.name).collect::<Vec<_>>();
         assert_eq!(names(&node), vec!["a", "b", "out"]);
         // "a" filled but "b" is still the spare -> no growth.
-        assert!(!node.sync_arity(&["a"]));
+        assert!(!node.sync_pins(&connected(&["a"])));
         assert_eq!(names(&node), vec!["a", "b", "out"]);
         // Filling the last input "b" reveals "c".
-        assert!(node.sync_arity(&["a", "b"]));
+        assert!(node.sync_pins(&connected(&["a", "b"])));
         assert_eq!(names(&node), vec!["a", "b", "c", "out"]);
     }
 
     #[test]
     fn arity_shrinks_on_disconnect() {
         let mut node = MergeNode::new(merge_spec("ml.add").unwrap());
-        node.sync_arity(&["a", "b", "c"]); // grows to a, b, c, d
+        node.sync_pins(&connected(&["a", "b", "c"])); // grows to a, b, c, d
         assert_eq!(node.pin_definitions().len(), 5);
         // Disconnecting "c": last connected is "b" -> back to a, b, c (one spare).
-        assert!(node.sync_arity(&["a", "b"]));
-        let names: Vec<_> = node.pin_definitions().iter().map(|p| p.name).collect();
-        assert_eq!(names, vec!["a", "b", "c", "out"]);
+        assert!(node.sync_pins(&connected(&["a", "b"])));
+        assert_eq!(names(&node), vec!["a", "b", "c", "out"]);
+    }
+
+    #[test]
+    fn arity_caps_at_26_inputs() {
+        let mut node = MergeNode::new(merge_spec("ml.concatenate").unwrap());
+        // The last letter is connected, so there is no room for a spare input.
+        assert!(node.sync_pins(&connected(&LETTERS)));
+        assert_eq!(node.pin_definitions().len(), 27);
+        assert_eq!(names(&node).last().copied(), Some("out"));
+        // Already at the cap -> nothing changes.
+        assert!(!node.sync_pins(&connected(&LETTERS)));
     }
 
     #[test]
     fn execute_joins_three_branches_in_order() {
         let mut node = MergeNode::new(merge_spec("ml.concatenate").unwrap());
-        node.sync_arity(&["a", "b", "c"]);
+        node.sync_pins(&connected(&["a", "b", "c"]));
         let mut inputs = InputSet::new();
         inputs.insert("a", Value::new(input_model(1)));
         inputs.insert("b", Value::new(input_model(2)));

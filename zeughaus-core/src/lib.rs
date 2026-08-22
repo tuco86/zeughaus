@@ -7,6 +7,7 @@ pub mod id;
 pub mod node;
 pub mod pin;
 pub mod plugin;
+pub mod ty;
 pub mod value;
 
 pub use context::{AsyncWork, InputSet, NodeContext};
@@ -16,6 +17,7 @@ pub use edge::EdgeSemantic;
 pub use error::{Result, ZeughausError};
 pub use id::{EdgeId, NodeId, PinId};
 pub use node::{NodeConfig, NodeDefinition, SettingDef, catalog_entry};
-pub use pin::{DataMode, PinDefinition, PinDirection, PinKind};
+pub use pin::{DataMode, PinBinding, PinDefinition, PinDirection, PinKind};
 pub use plugin::{DomainPlugin, ExecutableNode};
+pub use ty::{Field, Record, Repr, Ty, Typed};
 pub use value::Value;

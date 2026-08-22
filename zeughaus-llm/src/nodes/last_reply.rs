@@ -18,20 +18,8 @@ impl LastReplyNode {
     pub fn new() -> Self {
         Self {
             pins: vec![
-                PinDefinition {
-                    name: "conv",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "Conversation",
-                },
-                PinDefinition {
-                    name: "text",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "String",
-                },
+                PinDefinition::input("conv", Ty::of::<Conversation>(), PinKind::Sample),
+                PinDefinition::output("text", Ty::Str),
             ],
         }
     }

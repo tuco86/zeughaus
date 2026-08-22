@@ -36,7 +36,7 @@ mod tests {
     fn catalog_has_screen_capture() {
         let plugin = CapturePlugin;
         assert_eq!(plugin.node_catalog().len(), 1);
-        assert_eq!(plugin.node_catalog()[0].type_id, "capture.screen");
+        assert_eq!(&*plugin.node_catalog()[0].type_id, "capture.screen");
     }
 
     #[test]

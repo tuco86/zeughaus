@@ -7,6 +7,7 @@
 //! a node chain -- exactly like the LLM Conversation pattern.
 
 use serde::{Deserialize, Serialize};
+use zeughaus_core::{Ty, Typed};
 
 /// One rendered Keras layer: the `keras.layers` class name plus its already
 /// formatted keyword arguments (e.g. `("units", "64")`, `("activation", "'relu'")`).
@@ -223,6 +224,20 @@ impl KerasModel {
     pub fn roots(&self) -> Vec<&Step> {
         self.steps.iter().filter(|s| s.inputs.is_empty()).collect()
     }
+}
+
+/// `KerasModel` is opaque to the runtime type system: only ML nodes interpret
+/// its contents, so an edge only has to agree on the name.
+impl Typed for KerasModel {
+    fn ty() -> Ty {
+        Ty::opaque("KerasModel")
+    }
+}
+
+/// The pin type carried by every model edge of this crate. Written once so the
+/// opaque name lives in exactly one place.
+pub(crate) fn keras_model_ty() -> Ty {
+    Ty::of::<KerasModel>()
 }
 
 /// Turns a comma-separated metrics setting (`accuracy, mae`) into a quoted

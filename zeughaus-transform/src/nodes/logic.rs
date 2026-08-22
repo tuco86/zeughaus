@@ -14,20 +14,8 @@ impl NotNode {
     pub fn new() -> Self {
         Self {
             pins: vec![
-                PinDefinition {
-                    name: "input",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Trigger,
-                    type_name: "bool",
-                },
-                PinDefinition {
-                    name: "result",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "bool",
-                },
+                PinDefinition::input("input", Ty::Bool, PinKind::Trigger),
+                PinDefinition::output("result", Ty::Bool),
             ],
         }
     }
@@ -60,27 +48,9 @@ impl AndNode {
     pub fn new() -> Self {
         Self {
             pins: vec![
-                PinDefinition {
-                    name: "a",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Trigger,
-                    type_name: "bool",
-                },
-                PinDefinition {
-                    name: "b",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Trigger,
-                    type_name: "bool",
-                },
-                PinDefinition {
-                    name: "result",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "bool",
-                },
+                PinDefinition::input("a", Ty::Bool, PinKind::Trigger),
+                PinDefinition::input("b", Ty::Bool, PinKind::Trigger),
+                PinDefinition::output("result", Ty::Bool),
             ],
         }
     }
@@ -114,27 +84,9 @@ impl OrNode {
     pub fn new() -> Self {
         Self {
             pins: vec![
-                PinDefinition {
-                    name: "a",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Trigger,
-                    type_name: "bool",
-                },
-                PinDefinition {
-                    name: "b",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Trigger,
-                    type_name: "bool",
-                },
-                PinDefinition {
-                    name: "result",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "bool",
-                },
+                PinDefinition::input("a", Ty::Bool, PinKind::Trigger),
+                PinDefinition::input("b", Ty::Bool, PinKind::Trigger),
+                PinDefinition::output("result", Ty::Bool),
             ],
         }
     }

@@ -1561,6 +1561,12 @@ name = "glam"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "151665d9be52f9bb40fc7966565d39666f2d1e69233571b71b87791c7e0528b3"
+
+[[package]]
+name = "glam"
+version = "0.33.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7360bd2cd76e0cd9032d42cf2922155cecea2685b0cfa4630c3246df030bcfd6"
 dependencies = [
  "bytemuck",
 ]
@@ -1871,7 +1877,7 @@ checksum = "91ab1937d699403e7e69252ae743a902bcee9f4ab2052cc4c9a46fcf34729d85"
 dependencies = [
  "bitflags 2.11.0",
  "bytes",
- "glam",
+ "glam 0.25.0",
  "lilt",
  "log",
  "num-traits",
@@ -1928,28 +1934,23 @@ dependencies = [
 
 [[package]]
 name = "iced_nodegraph"
-version = "0.3.0-dev"
+version = "0.5.0-dev"
 dependencies = [
- "bitflags 2.11.0",
  "euclid",
- "iced",
  "iced_nodegraph_sdf",
  "iced_wgpu",
  "iced_widget",
- "rustc-hash 2.1.1",
- "thiserror 2.0.18",
  "web-time",
 ]
 
 [[package]]
 name = "iced_nodegraph_sdf"
-version = "0.3.0-dev"
+version = "0.5.0-dev"
 dependencies = [
- "bytemuck",
  "encase",
- "glam",
- "iced",
+ "glam 0.33.3",
  "iced_wgpu",
+ "parking_lot",
  "web-time",
 ]
 
@@ -2025,7 +2026,7 @@ dependencies = [
  "bytemuck",
  "cryoglyph",
  "futures",
- "glam",
+ "glam 0.25.0",
  "guillotiere",
  "iced_debug",
  "iced_graphics",
@@ -5317,7 +5318,6 @@ dependencies = [
  "thiserror 2.0.18",
  "wgpu-core-deps-apple",
  "wgpu-core-deps-emscripten",
- "wgpu-core-deps-wasm",
  "wgpu-core-deps-windows-linux-android",
  "wgpu-hal",
  "wgpu-types",
@@ -5337,15 +5337,6 @@ name = "wgpu-core-deps-emscripten"
 version = "27.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b06ac3444a95b0813ecfd81ddb2774b66220b264b3e2031152a4a29fda4da6b5"
-dependencies = [
- "wgpu-hal",
-]
-
-[[package]]
-name = "wgpu-core-deps-wasm"
-version = "27.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b1027dcf3b027a877e44819df7ceb0e2e98578830f8cd34cd6c3c7c2a7a50b7"
 dependencies = [
  "wgpu-hal",
 ]

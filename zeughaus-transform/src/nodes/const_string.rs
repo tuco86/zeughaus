@@ -9,13 +9,7 @@ impl ConstStringNode {
     pub fn new(value: impl Into<String>) -> Self {
         Self {
             value: value.into(),
-            pins: vec![PinDefinition {
-                name: "value",
-                direction: PinDirection::Output,
-                data_mode: DataMode::Value,
-                pin_kind: PinKind::Sample,
-                type_name: "String",
-            }],
+            pins: vec![PinDefinition::output("value", Ty::Str)],
         }
     }
 }

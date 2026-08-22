@@ -22,27 +22,9 @@ impl UserMessageNode {
         Self {
             text: String::new(),
             pins: vec![
-                PinDefinition {
-                    name: "conv",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "Conversation",
-                },
-                PinDefinition {
-                    name: "text",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "String",
-                },
-                PinDefinition {
-                    name: "out",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "Conversation",
-                },
+                PinDefinition::input("conv", Ty::of::<Conversation>(), PinKind::Sample),
+                PinDefinition::input("text", Ty::Str, PinKind::Sample),
+                PinDefinition::output("out", Ty::of::<Conversation>()),
             ],
         }
     }
@@ -63,12 +45,11 @@ impl ExecutableNode for UserMessageNode {
     }
 
     fn settings(&self) -> Vec<SettingDef> {
-        vec![SettingDef {
-            name: "text",
-            default: "",
-            placeholder: "user message",
-            multiline: true,
-        }]
+        vec![
+            SettingDef::new("text", "")
+                .placeholder("user message")
+                .multiline(),
+        ]
     }
 
     fn set_parameter(&mut self, name: &str, value: Value) -> Result<()> {

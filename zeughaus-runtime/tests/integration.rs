@@ -359,9 +359,9 @@ fn workflow_reconnect_with_new_value() {
     exec.graph.add_edge(GraphEdge {
         id: new_edge,
         from_node: c3,
-        from_pin: "value",
+        from_pin: "value".into(),
         to_node: add,
-        to_pin: "b",
+        to_pin: "b".into(),
         semantic: EdgeSemantic::default(),
     });
     exec.mark_dirty_downstream(c3);
@@ -539,10 +539,10 @@ fn document_to_executor(
 
         // Apply saved parameters
         for (name, val_str) in &nd.params {
-            if nd.type_id == "transform.const_f64" {
-                if let Ok(f) = val_str.parse::<f64>() {
-                    exec.set_parameter(name, Value::new(f)).unwrap();
-                }
+            if nd.type_id == "transform.const_f64"
+                && let Ok(f) = val_str.parse::<f64>()
+            {
+                exec.set_parameter(name, Value::new(f)).unwrap();
             }
         }
 
@@ -560,9 +560,9 @@ fn document_to_executor(
         graph.add_edge(GraphEdge {
             id: EdgeId(ed.id),
             from_node: NodeId(ed.from_node),
-            from_pin: leak_pin(&ed.from_pin),
+            from_pin: ed.from_pin.as_str().into(),
             to_node: NodeId(ed.to_node),
-            to_pin: leak_pin(&ed.to_pin),
+            to_pin: ed.to_pin.as_str().into(),
             semantic: EdgeSemantic::default(),
         });
     }
@@ -572,19 +572,6 @@ fn document_to_executor(
         executor.register_node(id, exec);
     }
     executor
-}
-
-/// Map common pin name strings to &'static str without leaking.
-fn leak_pin(s: &str) -> &'static str {
-    match s {
-        "value" => "value",
-        "result" => "result",
-        "input" => "input",
-        "a" => "a",
-        "b" => "b",
-        "total" => "result",
-        other => Box::leak(other.to_string().into_boxed_str()),
-    }
 }
 
 /// Build graph: Const(3) + Const(4) -> Add -> Display

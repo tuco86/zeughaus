@@ -14,27 +14,9 @@ impl PowerNode {
     pub fn new() -> Self {
         Self {
             pins: vec![
-                PinDefinition {
-                    name: "base",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Trigger,
-                    type_name: "f64",
-                },
-                PinDefinition {
-                    name: "exp",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Trigger,
-                    type_name: "f64",
-                },
-                PinDefinition {
-                    name: "result",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "f64",
-                },
+                PinDefinition::input("base", Ty::Float, PinKind::Trigger),
+                PinDefinition::input("exp", Ty::Float, PinKind::Trigger),
+                PinDefinition::output("result", Ty::Float),
             ],
         }
     }

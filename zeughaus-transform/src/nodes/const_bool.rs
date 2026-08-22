@@ -9,13 +9,7 @@ impl ConstBoolNode {
     pub fn new(value: bool) -> Self {
         Self {
             value,
-            pins: vec![PinDefinition {
-                name: "value",
-                direction: PinDirection::Output,
-                data_mode: DataMode::Value,
-                pin_kind: PinKind::Sample,
-                type_name: "bool",
-            }],
+            pins: vec![PinDefinition::output("value", Ty::Bool)],
         }
     }
 }

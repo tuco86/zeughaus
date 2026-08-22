@@ -48,20 +48,8 @@ impl HoldNode {
         Self {
             last: None,
             pins: vec![
-                PinDefinition {
-                    name: "in",
-                    direction: PinDirection::Input,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Trigger,
-                    type_name: "any",
-                },
-                PinDefinition {
-                    name: "out",
-                    direction: PinDirection::Output,
-                    data_mode: DataMode::Value,
-                    pin_kind: PinKind::Sample,
-                    type_name: "any",
-                },
+                PinDefinition::input("in", Ty::Any, PinKind::Trigger),
+                PinDefinition::output("out", Ty::Any),
             ],
         }
     }
@@ -94,7 +82,7 @@ mod tests {
     fn create_all_catalog_nodes() {
         let plugin = FlowPlugin;
         for def in plugin.node_catalog() {
-            assert!(plugin.create_node(def.type_id).is_some(), "failed: {}", def.type_id);
+            assert!(plugin.create_node(&def.type_id).is_some(), "failed: {}", def.type_id);
         }
     }
 

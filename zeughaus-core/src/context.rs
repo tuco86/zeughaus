@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::error::Result;
 use crate::id::NodeId;
+use crate::ty::Typed;
 use crate::value::Value;
 
 /// Off-thread work a node defers instead of producing outputs synchronously.
@@ -17,7 +19,7 @@ pub trait AsyncWork: Send + 'static {
 
 /// Read-only view of a node's inputs during execution.
 pub struct InputSet {
-    values: HashMap<&'static str, Value>,
+    values: HashMap<Arc<str>, Value>,
 }
 
 impl InputSet {
@@ -27,8 +29,8 @@ impl InputSet {
         }
     }
 
-    pub fn insert(&mut self, pin_name: &'static str, value: Value) {
-        self.values.insert(pin_name, value);
+    pub fn insert(&mut self, pin_name: impl Into<Arc<str>>, value: Value) {
+        self.values.insert(pin_name.into(), value);
     }
 
     pub fn get<T: Clone + 'static>(&self, pin_name: &str) -> Option<T> {
@@ -89,7 +91,7 @@ impl NodeContext {
     }
 
     /// Convenience: emit a typed value.
-    pub fn emit_typed<T: Clone + Send + Sync + 'static>(&mut self, pin_name: &str, val: T) {
+    pub fn emit_typed<T: Typed>(&mut self, pin_name: &str, val: T) {
         self.emit(pin_name, Value::new(val));
     }
 
@@ -109,48 +111,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn input_set_get_typed() {
-        let mut set = InputSet::new();
-        set.insert("a", Value::new(3.0f64));
-        assert_eq!(set.get::<f64>("a"), Some(3.0));
-        assert_eq!(set.get::<String>("a"), None);
+    fn input_set_round_trip() {
+        let mut inputs = InputSet::new();
+        inputs.insert("a", Value::new(1.0f64));
+        assert_eq!(inputs.get::<f64>("a"), Some(1.0));
+        assert!(inputs.has("a"));
+        assert!(!inputs.has("b"));
+        assert_eq!(inputs.get::<String>("a"), None);
     }
 
     #[test]
-    fn input_set_has() {
-        let mut set = InputSet::new();
-        set.insert("x", Value::new(1i32));
-        assert!(set.has("x"));
-        assert!(!set.has("y"));
+    fn input_set_takes_runtime_pin_names() {
+        // Pin names are not always literals: a variadic node or a schema-derived
+        // node builds them.
+        let mut inputs = InputSet::new();
+        let name: Arc<str> = format!("in{}", 3).into();
+        inputs.insert(name.clone(), Value::new(2.0f64));
+        assert_eq!(inputs.get::<f64>("in3"), Some(2.0));
+        assert!(inputs.get_value(&name).is_some());
     }
 
     #[test]
-    fn context_emit_flush() {
+    fn emit_is_invisible_until_flush() {
         let mut ctx = NodeContext::new(NodeId(1), 0);
-        ctx.emit_typed("out_a", 10.0f64);
-        ctx.emit_typed("out_b", 20.0f64);
-
-        // Before flush, take_outputs returns nothing
-        let pre = ctx.take_outputs();
-        assert!(pre.is_empty());
-
-        // Re-emit since take cleared flushed
-        ctx.emit_typed("out_a", 10.0f64);
-        ctx.emit_typed("out_b", 20.0f64);
+        ctx.emit_typed("out", 1.0f64);
+        assert!(ctx.take_outputs().is_empty());
+        ctx.emit_typed("out", 2.0f64);
         ctx.flush();
+        let outputs = ctx.take_outputs();
+        assert_eq!(outputs["out"].downcast_ref::<f64>(), Some(&2.0));
+    }
 
+    #[test]
+    fn flush_releases_all_pins_together() {
+        let mut ctx = NodeContext::new(NodeId(1), 7);
+        ctx.emit_typed("a", 1.0f64);
+        ctx.emit_typed("b", "x".to_string());
+        ctx.flush();
         let outputs = ctx.take_outputs();
         assert_eq!(outputs.len(), 2);
-        assert_eq!(outputs["out_a"].downcast_ref::<f64>(), Some(&10.0));
-        assert_eq!(outputs["out_b"].downcast_ref::<f64>(), Some(&20.0));
+        assert_eq!(ctx.trace_id, 7);
     }
 
     #[test]
-    fn context_emit_without_flush_discards() {
+    fn deferred_work_is_taken_once() {
+        struct Noop;
+        impl AsyncWork for Noop {
+            fn run(self: Box<Self>) -> Result<HashMap<String, Value>> {
+                Ok(HashMap::new())
+            }
+        }
         let mut ctx = NodeContext::new(NodeId(1), 0);
-        ctx.emit_typed("out", 42.0f64);
-        // No flush -- outputs stay buffered, not flushed
-        let outputs = ctx.take_outputs();
-        assert!(outputs.is_empty());
+        ctx.defer(Box::new(Noop));
+        assert!(ctx.take_deferred().is_some());
+        assert!(ctx.take_deferred().is_none());
     }
 }

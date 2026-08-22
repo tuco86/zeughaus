@@ -15,13 +15,7 @@ impl DisplayNode {
     pub fn new() -> Self {
         Self {
             last_value: None,
-            pins: vec![PinDefinition {
-                name: "input",
-                direction: PinDirection::Input,
-                data_mode: DataMode::Value,
-                pin_kind: PinKind::Trigger,
-                type_name: "any",
-            }],
+            pins: vec![PinDefinition::input("input", Ty::Any, PinKind::Trigger)],
         }
     }
 
