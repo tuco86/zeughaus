@@ -122,6 +122,18 @@ pub struct App {
     // palette "Copy Session ID" command so others can `join` the same session.
     #[cfg(not(target_arch = "wasm32"))]
     session_id: Option<String>,
+    // Whether this window owns execution. Exactly one runtime in a session runs
+    // the graph; the rest display its published outputs, so a capture node fires
+    // once per session instead of once per window. Recomputed from the store.
+    #[cfg(not(target_arch = "wasm32"))]
+    is_owner: bool,
+    // This window's place in the runtime order, for the status bar. 0 is owner.
+    #[cfg(not(target_arch = "wasm32"))]
+    runtime_index: Option<usize>,
+    // What this runtime last published per node and pin, so an unchanged value
+    // does not turn every execution pass into a burst of reducer calls.
+    #[cfg(not(target_arch = "wasm32"))]
+    published: HashMap<NodeId, HashMap<String, (String, String)>>,
 }
 
 impl App {
@@ -218,6 +230,15 @@ impl App {
             applying_remote: false,
             #[cfg(not(target_arch = "wasm32"))]
             session_id,
+            // Nothing executes until the store says who owns it: a window that
+            // assumed ownership at startup would double-run the graph for the
+            // moment before the runtime table arrives.
+            #[cfg(not(target_arch = "wasm32"))]
+            is_owner: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            runtime_index: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            published: HashMap::new(),
         };
 
         // Restore last session (may kick off async node work, e.g. chat nodes).
@@ -408,6 +429,14 @@ impl App {
     }
 
     fn execute_graph(&mut self) -> Task<Message> {
+        // A viewer runs nothing at all: the owning runtime's results arrive as
+        // published outputs. Executing "just the harmless nodes" locally would
+        // reintroduce the split brain this exists to remove.
+        if !self.executes_locally() {
+            self.last_exec_us = 0;
+            self.update_display_values();
+            return Task::none();
+        }
         // web_time::Instant re-exports std on native and uses the browser clock
         // on wasm, so timing works on both targets.
         let start = web_time::Instant::now();
@@ -425,8 +454,113 @@ impl App {
             }
         };
         self.last_error = self.node_error_summary();
+        self.publish_outputs();
         self.update_display_values();
         task
+    }
+
+    /// Whether this window is the one that runs the graph.
+    ///
+    /// On wasm there is no session to share yet, so the editor runs its own
+    /// graph; natively it is whichever runtime the store put first.
+    fn executes_locally(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        {
+            true
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.is_owner
+        }
+    }
+
+    /// Publishes this pass's scalar outputs so viewer windows can display them.
+    ///
+    /// Only what changed is sent. A pin that lost its value forces a clear of
+    /// that node's rows before the remaining pins are re-published, because
+    /// absence is a state a viewer has to be able to reach -- otherwise a stale
+    /// number would outlive the run that produced it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn publish_outputs(&mut self) {
+        if !self.is_owner {
+            return;
+        }
+        let Some(conn) = &self.stdb else { return };
+        for (id, node) in &self.nodes {
+            let current: HashMap<String, (String, String)> = node
+                .pin_defs
+                .iter()
+                .filter(|p| p.direction == PinDirection::Output)
+                .filter_map(|p| {
+                    let value = self.executor.output_value(*id, &p.name)?;
+                    let (ty, text) = zeughaus_core::encode_scalar(value)?;
+                    Some((p.name.to_string(), (ty, text)))
+                })
+                .collect();
+            let previous = self.published.get(id);
+            if previous == Some(&current) {
+                continue;
+            }
+            let dropped = previous.is_some_and(|prev| {
+                prev.keys().any(|pin| !current.contains_key(pin))
+            });
+            if dropped {
+                crate::sync::send_clear_node_outputs(conn, id.0);
+            }
+            for (pin, (ty, text)) in &current {
+                let unchanged = !dropped
+                    && previous.and_then(|prev| prev.get(pin)) == Some(&(ty.clone(), text.clone()));
+                if unchanged {
+                    continue;
+                }
+                crate::sync::send_publish_output(conn, id.0, pin, ty, text);
+            }
+            self.published.insert(*id, current);
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn publish_outputs(&mut self) {}
+
+    /// Adopts the owning runtime's published outputs, replacing whatever this
+    /// viewer had. Nodes with no published rows are cleared, so their pins dim
+    /// rather than showing a value the owner no longer produces.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn adopt_published_outputs(&mut self) {
+        if self.is_owner {
+            return;
+        }
+        let Some(conn) = &self.stdb else { return };
+        let mut per_node: HashMap<NodeId, HashMap<String, Value>> = HashMap::new();
+        for (node_id, pin, ty, text) in crate::sync::published_outputs(conn) {
+            if let Some(value) = zeughaus_core::decode_scalar(&ty, &text) {
+                per_node.entry(NodeId(node_id)).or_default().insert(pin, value);
+            }
+        }
+        for id in self.nodes.keys().copied().collect::<Vec<_>>() {
+            let outputs = per_node.remove(&id).unwrap_or_default();
+            self.executor.set_remote_outputs(id, outputs);
+        }
+        self.update_display_values();
+    }
+
+    /// Which runtime this window is, for the status bar.
+    ///
+    /// Worth permanent screen space: it is the difference between "this window
+    /// runs the graph" and "this window shows what runtime #0 computed", and
+    /// every otherwise surprising value follows from it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn role_text(&self) -> String {
+        match (self.runtime_index, self.is_owner) {
+            (Some(i), true) => format!(" | runtime #{i} (executing)"),
+            (Some(i), false) => format!(" | runtime #{i} (viewing #0)"),
+            (None, _) => " | connecting".to_string(),
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn role_text(&self) -> String {
+        String::new()
     }
 
     /// The status bar's error text: one failing node's message, plus a count
@@ -950,6 +1084,14 @@ impl App {
                 return task;
             }
             Message::NodeTriggered { node_id } => {
+                // A viewer must not fire the node: it does not run the graph, so
+                // the event would arm a node nobody executes. Forwarding the
+                // press to the owner needs a reducer of its own; until then this
+                // says so instead of pretending to work.
+                if !self.executes_locally() {
+                    self.last_error = "only the executing runtime can trigger".to_string();
+                    return Task::none();
+                }
                 // The press itself is the event; the value only arms the node.
                 let id = NodeId(node_id);
                 let _ = self.executor.set_parameter(id, "fire", Value::new(true));
@@ -1285,19 +1427,21 @@ impl App {
         };
         let status_text = if self.last_error.is_empty() {
             format!(
-                "  {} nodes | {} edges | exec: {}us{}",
+                "  {} nodes | {} edges | exec: {}us{}{}",
                 self.nodes.len(),
                 self.edges.len(),
                 self.last_exec_us,
                 running_text,
+                self.role_text(),
             )
         } else {
             format!(
-                "  {} nodes | {} edges | exec: {}us{} | ERROR: {}",
+                "  {} nodes | {} edges | exec: {}us{}{} | ERROR: {}",
                 self.nodes.len(),
                 self.edges.len(),
                 self.last_exec_us,
                 running_text,
+                self.role_text(),
                 self.last_error,
             )
         };
@@ -1499,6 +1643,29 @@ impl App {
             SyncEvent::NodeRemove(id) => self.apply_node_remove(NodeId(id)),
             SyncEvent::EdgeInsert(ed) => self.apply_edge_insert(ed),
             SyncEvent::EdgeRemove(id) => self.apply_edge_remove(EdgeId(id)),
+            SyncEvent::RuntimesChanged => self.apply_runtimes_changed(),
+            SyncEvent::OutputsChanged => self.adopt_published_outputs(),
+        }
+    }
+
+    /// Re-reads who owns execution. Inheriting ownership (the previous owner
+    /// closed its window) means this runtime has never run the graph, so
+    /// everything is marked dirty; the pass itself happens in `drain_sync`.
+    fn apply_runtimes_changed(&mut self) {
+        let Some(conn) = &self.stdb else { return };
+        let owner = crate::sync::is_owner(conn);
+        self.runtime_index = crate::sync::runtime_index(conn);
+        if owner == self.is_owner {
+            return;
+        }
+        self.is_owner = owner;
+        if owner {
+            // Republish from scratch: what the old owner left in the store says
+            // nothing about what this process has computed.
+            self.published.clear();
+            for id in self.nodes.keys().copied().collect::<Vec<_>>() {
+                self.executor.mark_dirty(id);
+            }
         }
     }
 

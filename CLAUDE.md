@@ -90,6 +90,7 @@ regex patterns, or when the LSP server is unavailable.
 
 ### Core Concepts
 - **Runtime Type System**: Pins declare a `Ty` built at runtime (scalars, `List`, `Option`, `Record`, `Opaque`), not a compile-time string. `Typed::ty()` is the single source of truth for both a pin's declaration and a value's tag, so they cannot disagree. Nodes may derive their pins from what is connected (`sync_pins`).
+- **One Executing Runtime**: Every editor window registers in the store's `runtime` table; the one with the lowest `seq` executes the graph, the rest display its published scalar outputs (`node_output`). Without this, each window ran the graph for itself -- two windows meant two screenshots from one capture node. Frames and other opaque values do not travel; only `bool`/`int`/`float`/`str` (see `zeughaus-core/src/wire.rs`).
 - **Push/Pull Reactive Dataflow**: Every edge has a last-value cache. Push notifies downstream, pull triggers lazy computation.
 - **Trigger vs Sample Pins**: Input pins are either trigger (causes execution) or sample (read passively).
 - **Atomic Flush**: Multi-output nodes buffer with emit/flush to ensure synchronized delivery.

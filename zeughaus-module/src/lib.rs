@@ -5,10 +5,46 @@
 //! changes via subscriptions. Node parameters are stored as a JSON string to
 //! avoid nested tables in this first iteration.
 //!
+//! Beyond the graph itself, the store decides WHO runs it. Every connected
+//! editor registers in `runtime`; the one with the lowest `seq` owns execution
+//! and publishes its scalar results into `node_output`, which the others
+//! display. Without that, each window ran the graph for itself -- two windows
+//! meant two screenshots from one capture node, each seeing its own.
+//!
 //! Built for the wasm32 module target with `spacetime build` (this crate is
 //! excluded from the native workspace build).
 
-use spacetimedb::{ReducerContext, Table, reducer, table};
+use spacetimedb::{Identity, ReducerContext, Table, reducer, table};
+
+/// A connected editor. `seq` is monotonic, so "lowest seq" is a stable,
+/// server-decided answer to "who executes" that needs no election protocol:
+/// whoever has been here longest owns it, and when they leave the next one
+/// inherits it.
+#[table(accessor = runtime, name = "runtime", public)]
+pub struct Runtime {
+    #[primary_key]
+    pub identity: Identity,
+    #[unique]
+    #[auto_inc]
+    pub seq: u64,
+}
+
+/// One output pin's last published value, owned by the executing runtime.
+///
+/// Only scalars travel: the key is `"<node_id>:<pin>"` because a table takes a
+/// single primary key, and the value is text tagged with its type so a viewer
+/// can rebuild the value without guessing. Frames and other opaque payloads are
+/// deliberately absent -- a 4K frame is 33 MB and a state store is the wrong
+/// pipe for it.
+#[table(accessor = node_output, name = "node_output", public)]
+pub struct NodeOutput {
+    #[primary_key]
+    pub key: String,
+    pub node_id: u64,
+    pub pin: String,
+    pub ty: String,
+    pub value: String,
+}
 
 /// A graph node: position, type, display name, and serialized parameters.
 #[table(accessor = node, name = "node", public)]
@@ -85,6 +121,19 @@ pub fn delete_node(ctx: &ReducerContext, id: u64) {
     for eid in dangling {
         ctx.db.edge().id().delete(eid);
     }
+    // Published outputs die with their node, exactly like its edges: a value
+    // whose producer is gone would otherwise sit in the store forever and be
+    // adopted by every viewer that joins later.
+    let orphaned: Vec<String> = ctx
+        .db
+        .node_output()
+        .iter()
+        .filter(|o| o.node_id == id)
+        .map(|o| o.key)
+        .collect();
+    for key in orphaned {
+        ctx.db.node_output().key().delete(&key);
+    }
 }
 
 #[reducer]
@@ -128,4 +177,91 @@ pub fn replace_graph(ctx: &ReducerContext, nodes: Vec<Node>, edges: Vec<Edge>) {
     for e in edges {
         ctx.db.edge().insert(e);
     }
+}
+
+/// Registers the caller as a runtime that wants to run the graph. `seq` is
+/// assigned by the store, so ownership never depends on client clocks or on who
+/// shouts first.
+///
+/// Explicitly called by editors rather than hooked to `client_connected`: every
+/// `spacetime sql` or `spacetime call` is a client too, and one of those holding
+/// the lowest seq would make a CLI invocation the owner of execution -- leaving
+/// every editor waiting for a runtime that is not there.
+#[reducer]
+pub fn join_runtime(ctx: &ReducerContext) {
+    if ctx.db.runtime().identity().find(ctx.sender()).is_some() {
+        return;
+    }
+    ctx.db.runtime().insert(Runtime {
+        identity: ctx.sender(),
+        seq: 0, // auto_inc
+    });
+}
+
+/// Drops a runtime when its editor disconnects, which is what hands ownership
+/// to the next one. Published outputs stay: they are the last known values of
+/// the graph, and the new owner overwrites them as it runs.
+#[reducer(client_disconnected)]
+pub fn on_client_disconnected(ctx: &ReducerContext) {
+    ctx.db.runtime().identity().delete(ctx.sender());
+}
+
+/// Publishes one output pin's value. Ignored unless the caller is the owning
+/// runtime, so a viewer cannot overwrite what it is only supposed to display.
+#[reducer]
+pub fn publish_output(
+    ctx: &ReducerContext,
+    node_id: u64,
+    pin: String,
+    ty: String,
+    value: String,
+) {
+    if !is_owner(ctx, ctx.sender()) {
+        return;
+    }
+    let key = output_key(node_id, &pin);
+    let row = NodeOutput {
+        key: key.clone(),
+        node_id,
+        pin,
+        ty,
+        value,
+    };
+    if ctx.db.node_output().key().find(&key).is_some() {
+        ctx.db.node_output().key().update(row);
+    } else {
+        ctx.db.node_output().insert(row);
+    }
+}
+
+/// Drops every published output of a node. The owner calls this when a node
+/// stops producing a value, so a stale number cannot outlive its source.
+#[reducer]
+pub fn clear_node_outputs(ctx: &ReducerContext, node_id: u64) {
+    if !is_owner(ctx, ctx.sender()) {
+        return;
+    }
+    let keys: Vec<String> = ctx
+        .db
+        .node_output()
+        .iter()
+        .filter(|o| o.node_id == node_id)
+        .map(|o| o.key)
+        .collect();
+    for key in keys {
+        ctx.db.node_output().key().delete(&key);
+    }
+}
+
+/// The owning runtime is the one with the lowest `seq`.
+fn is_owner(ctx: &ReducerContext, who: Identity) -> bool {
+    ctx.db
+        .runtime()
+        .iter()
+        .min_by_key(|r| r.seq)
+        .is_some_and(|r| r.identity == who)
+}
+
+fn output_key(node_id: u64, pin: &str) -> String {
+    format!("{node_id}:{pin}")
 }

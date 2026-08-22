@@ -21,8 +21,9 @@ use spacetimedb_sdk::{DbContext, Table, TableWithPrimaryKey};
 use zeughaus_core::{EdgeData, NodeData};
 
 use crate::module_bindings::{
-    connect_edge, create_node, delete_node, disconnect_edge, move_node, set_node_params,
-    DbConnection, Edge, EdgeTableAccess, Node, NodeTableAccess,
+    DbConnection, Edge, EdgeTableAccess, Node, NodeOutputTableAccess, NodeTableAccess,
+    RuntimeTableAccess, clear_node_outputs, connect_edge, create_node, delete_node,
+    disconnect_edge, join_runtime, move_node, publish_output, set_node_params,
 };
 
 pub const DEFAULT_PORT: u16 = 3000;
@@ -35,6 +36,14 @@ pub enum SyncEvent {
     NodeRemove(u64),
     EdgeInsert(EdgeData),
     EdgeRemove(u64),
+    /// The set of connected runtimes changed, so who owns execution may have
+    /// changed with it. Carries no payload: the editor recomputes ownership from
+    /// the client cache, which is the authority.
+    RuntimesChanged,
+    /// A published output value changed or disappeared. Also payload-free for
+    /// the same reason -- a viewer rebuilds a node's whole output set from the
+    /// cache, because a per-pin event cannot say which pins are still absent.
+    OutputsChanged,
 }
 
 fn to_node_data(n: &Node) -> NodeData {
@@ -69,7 +78,15 @@ pub fn connect(uri: &str, module: &str) -> Result<(DbConnection, Receiver<SyncEv
     let conn = DbConnection::builder()
         .with_uri(uri)
         .with_database_name(module)
-        .on_connect(|_ctx, identity, _token| eprintln!("[stdb] connected as {identity:?}"))
+        .on_connect(|ctx, identity, _token| {
+            eprintln!("[stdb] connected as {identity:?}");
+            // Registering is opt-in, so only editors compete for ownership --
+            // a `spacetime sql` connection is a client too, and must not become
+            // the runtime everyone else waits for.
+            if let Err(e) = ctx.reducers.join_runtime() {
+                eprintln!("[stdb] join_runtime failed: {e}");
+            }
+        })
         .on_connect_error(|_ctx, err| eprintln!("[stdb] connect error: {err}"))
         .on_disconnect(|_ctx, err| match err {
             Some(e) => eprintln!("[stdb] disconnected: {e}"),
@@ -90,11 +107,28 @@ pub fn connect(uri: &str, module: &str) -> Result<(DbConnection, Receiver<SyncEv
     conn.db.edge().on_insert(move |_ctx, e| send(&t, SyncEvent::EdgeInsert(to_edge_data(e))));
     let t = tx.clone();
     conn.db.edge().on_delete(move |_ctx, e| send(&t, SyncEvent::EdgeRemove(e.id)));
+    let t = tx.clone();
+    conn.db.runtime().on_insert(move |_ctx, _r| send(&t, SyncEvent::RuntimesChanged));
+    let t = tx.clone();
+    conn.db.runtime().on_delete(move |_ctx, _r| send(&t, SyncEvent::RuntimesChanged));
+    let t = tx.clone();
+    conn.db.node_output().on_insert(move |_ctx, _o| send(&t, SyncEvent::OutputsChanged));
+    let t = tx.clone();
+    conn.db
+        .node_output()
+        .on_update(move |_ctx, _old, _new| send(&t, SyncEvent::OutputsChanged));
+    let t = tx.clone();
+    conn.db.node_output().on_delete(move |_ctx, _o| send(&t, SyncEvent::OutputsChanged));
 
     conn.subscription_builder()
         .on_applied(|_ctx| eprintln!("[stdb] subscription applied"))
         .on_error(|_ctx, err| eprintln!("[stdb] subscription error: {err}"))
-        .subscribe(["SELECT * FROM node", "SELECT * FROM edge"]);
+        .subscribe([
+            "SELECT * FROM node",
+            "SELECT * FROM edge",
+            "SELECT * FROM runtime",
+            "SELECT * FROM node_output",
+        ]);
 
     conn.run_threaded();
     Ok((conn, rx))
@@ -140,6 +174,47 @@ fn params_json(params: &[(String, String)]) -> String {
     serde_json::to_string(params).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// Whether this client owns execution: the runtime with the lowest `seq` runs
+/// the graph, everyone else displays what it publishes.
+///
+/// Read from the client cache rather than remembered, so a runtime leaving
+/// hands ownership over without any handshake. While the cache is still empty
+/// (before the first subscription applies) nobody owns anything, which keeps a
+/// starting editor from executing a graph it has not seen yet.
+pub fn is_owner(conn: &DbConnection) -> bool {
+    conn.db
+        .runtime()
+        .iter()
+        .min_by_key(|r| r.seq)
+        .is_some_and(|r| r.identity == conn.identity())
+}
+
+/// This client's position in the runtime order, for showing the user which
+/// window they are looking at. `0` is the owner.
+pub fn runtime_index(conn: &DbConnection) -> Option<usize> {
+    let mut seqs: Vec<(u64, bool)> = conn
+        .db
+        .runtime()
+        .iter()
+        .map(|r| (r.seq, r.identity == conn.identity()))
+        .collect();
+    seqs.sort_by_key(|(seq, _)| *seq);
+    seqs.iter().position(|(_, is_me)| *is_me)
+}
+
+/// Every published output as `(node_id, pin, type tag, text)`.
+///
+/// A viewer rebuilds a node's whole output set from this, because absence is
+/// meaningful: a pin with no row produced no value, which is what the editor
+/// draws dimmed.
+pub fn published_outputs(conn: &DbConnection) -> Vec<(u64, String, String, String)> {
+    conn.db
+        .node_output()
+        .iter()
+        .map(|o| (o.node_id, o.pin, o.ty, o.value))
+        .collect()
+}
+
 // --- Send side: local edits -> reducers. Errors are logged, not fatal. -------
 
 pub fn send_create_node(conn: &DbConnection, n: &NodeData) {
@@ -170,6 +245,23 @@ pub fn send_set_params(conn: &DbConnection, id: u64, params: &[(String, String)]
 pub fn send_delete_node(conn: &DbConnection, id: u64) {
     if let Err(e) = conn.reducers.delete_node(id) {
         eprintln!("[stdb] delete_node failed: {e}");
+    }
+}
+
+/// Publishes one scalar output. The module drops it unless this client owns
+/// execution, so a viewer calling this is harmless.
+pub fn send_publish_output(conn: &DbConnection, node_id: u64, pin: &str, ty: &str, value: &str) {
+    if let Err(e) = conn
+        .reducers
+        .publish_output(node_id, pin.to_string(), ty.to_string(), value.to_string())
+    {
+        eprintln!("[stdb] publish_output failed: {e}");
+    }
+}
+
+pub fn send_clear_node_outputs(conn: &DbConnection, node_id: u64) {
+    if let Err(e) = conn.reducers.clear_node_outputs(node_id) {
+        eprintln!("[stdb] clear_node_outputs failed: {e}");
     }
 }
 

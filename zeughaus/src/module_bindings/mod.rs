@@ -6,28 +6,42 @@
 #![allow(unused, clippy::all)]
 use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
+pub mod clear_node_outputs_reducer;
 pub mod connect_edge_reducer;
 pub mod create_node_reducer;
 pub mod delete_node_reducer;
 pub mod disconnect_edge_reducer;
 pub mod edge_table;
 pub mod edge_type;
+pub mod join_runtime_reducer;
 pub mod move_node_reducer;
+pub mod node_output_table;
+pub mod node_output_type;
 pub mod node_table;
 pub mod node_type;
+pub mod publish_output_reducer;
 pub mod replace_graph_reducer;
+pub mod runtime_table;
+pub mod runtime_type;
 pub mod set_node_params_reducer;
 
+pub use clear_node_outputs_reducer::clear_node_outputs;
 pub use connect_edge_reducer::connect_edge;
 pub use create_node_reducer::create_node;
 pub use delete_node_reducer::delete_node;
 pub use disconnect_edge_reducer::disconnect_edge;
 pub use edge_table::*;
 pub use edge_type::Edge;
+pub use join_runtime_reducer::join_runtime;
 pub use move_node_reducer::move_node;
+pub use node_output_table::*;
+pub use node_output_type::NodeOutput;
 pub use node_table::*;
 pub use node_type::Node;
+pub use publish_output_reducer::publish_output;
 pub use replace_graph_reducer::replace_graph;
+pub use runtime_table::*;
+pub use runtime_type::Runtime;
 pub use set_node_params_reducer::set_node_params;
 
 #[derive(Clone, PartialEq, Debug)]
@@ -38,6 +52,9 @@ pub use set_node_params_reducer::set_node_params;
 /// to indicate which reducer caused the event.
 
 pub enum Reducer {
+    ClearNodeOutputs {
+        node_id: u64,
+    },
     ConnectEdge {
         id: u64,
         from_node: u64,
@@ -59,10 +76,17 @@ pub enum Reducer {
     DisconnectEdge {
         id: u64,
     },
+    JoinRuntime,
     MoveNode {
         id: u64,
         x: f32,
         y: f32,
+    },
+    PublishOutput {
+        node_id: u64,
+        pin: String,
+        ty: String,
+        value: String,
     },
     ReplaceGraph {
         nodes: Vec<Node>,
@@ -81,11 +105,14 @@ impl __sdk::InModule for Reducer {
 impl __sdk::Reducer for Reducer {
     fn reducer_name(&self) -> &'static str {
         match self {
+            Reducer::ClearNodeOutputs { .. } => "clear_node_outputs",
             Reducer::ConnectEdge { .. } => "connect_edge",
             Reducer::CreateNode { .. } => "create_node",
             Reducer::DeleteNode { .. } => "delete_node",
             Reducer::DisconnectEdge { .. } => "disconnect_edge",
+            Reducer::JoinRuntime => "join_runtime",
             Reducer::MoveNode { .. } => "move_node",
+            Reducer::PublishOutput { .. } => "publish_output",
             Reducer::ReplaceGraph { .. } => "replace_graph",
             Reducer::SetNodeParams { .. } => "set_node_params",
             _ => unreachable!(),
@@ -94,6 +121,11 @@ impl __sdk::Reducer for Reducer {
     #[allow(clippy::clone_on_copy)]
     fn args_bsatn(&self) -> Result<Vec<u8>, __sats::bsatn::EncodeError> {
         match self {
+            Reducer::ClearNodeOutputs { node_id } => {
+                __sats::bsatn::to_vec(&clear_node_outputs_reducer::ClearNodeOutputsArgs {
+                    node_id: node_id.clone(),
+                })
+            }
             Reducer::ConnectEdge {
                 id,
                 from_node,
@@ -130,6 +162,9 @@ impl __sdk::Reducer for Reducer {
                     id: id.clone(),
                 })
             }
+            Reducer::JoinRuntime => {
+                __sats::bsatn::to_vec(&join_runtime_reducer::JoinRuntimeArgs {})
+            }
             Reducer::MoveNode { id, x, y } => {
                 __sats::bsatn::to_vec(&move_node_reducer::MoveNodeArgs {
                     id: id.clone(),
@@ -137,6 +172,17 @@ impl __sdk::Reducer for Reducer {
                     y: y.clone(),
                 })
             }
+            Reducer::PublishOutput {
+                node_id,
+                pin,
+                ty,
+                value,
+            } => __sats::bsatn::to_vec(&publish_output_reducer::PublishOutputArgs {
+                node_id: node_id.clone(),
+                pin: pin.clone(),
+                ty: ty.clone(),
+                value: value.clone(),
+            }),
             Reducer::ReplaceGraph { nodes, edges } => {
                 __sats::bsatn::to_vec(&replace_graph_reducer::ReplaceGraphArgs {
                     nodes: nodes.clone(),
@@ -160,6 +206,8 @@ impl __sdk::Reducer for Reducer {
 pub struct DbUpdate {
     edge: __sdk::TableUpdate<Edge>,
     node: __sdk::TableUpdate<Node>,
+    node_output: __sdk::TableUpdate<NodeOutput>,
+    runtime: __sdk::TableUpdate<Runtime>,
 }
 
 impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
@@ -174,6 +222,12 @@ impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
                 "node" => db_update
                     .node
                     .append(node_table::parse_table_update(table_update)?),
+                "node_output" => db_update
+                    .node_output
+                    .append(node_output_table::parse_table_update(table_update)?),
+                "runtime" => db_update
+                    .runtime
+                    .append(runtime_table::parse_table_update(table_update)?),
 
                 unknown => {
                     return Err(__sdk::InternalError::unknown_name(
@@ -206,6 +260,12 @@ impl __sdk::DbUpdate for DbUpdate {
         diff.node = cache
             .apply_diff_to_table::<Node>("node", &self.node)
             .with_updates_by_pk(|row| &row.id);
+        diff.node_output = cache
+            .apply_diff_to_table::<NodeOutput>("node_output", &self.node_output)
+            .with_updates_by_pk(|row| &row.key);
+        diff.runtime = cache
+            .apply_diff_to_table::<Runtime>("runtime", &self.runtime)
+            .with_updates_by_pk(|row| &row.identity);
 
         diff
     }
@@ -218,6 +278,12 @@ impl __sdk::DbUpdate for DbUpdate {
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "node" => db_update
                     .node
+                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
+                "node_output" => db_update
+                    .node_output
+                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
+                "runtime" => db_update
+                    .runtime
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 unknown => {
                     return Err(
@@ -238,6 +304,12 @@ impl __sdk::DbUpdate for DbUpdate {
                 "node" => db_update
                     .node
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
+                "node_output" => db_update
+                    .node_output
+                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
+                "runtime" => db_update
+                    .runtime
+                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 unknown => {
                     return Err(
                         __sdk::InternalError::unknown_name("table", unknown, "QueryRows").into(),
@@ -255,6 +327,8 @@ impl __sdk::DbUpdate for DbUpdate {
 pub struct AppliedDiff<'r> {
     edge: __sdk::TableAppliedDiff<'r, Edge>,
     node: __sdk::TableAppliedDiff<'r, Node>,
+    node_output: __sdk::TableAppliedDiff<'r, NodeOutput>,
+    runtime: __sdk::TableAppliedDiff<'r, Runtime>,
     __unused: std::marker::PhantomData<&'r ()>,
 }
 
@@ -270,6 +344,8 @@ impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
     ) {
         callbacks.invoke_table_row_callbacks::<Edge>("edge", &self.edge, event);
         callbacks.invoke_table_row_callbacks::<Node>("node", &self.node, event);
+        callbacks.invoke_table_row_callbacks::<NodeOutput>("node_output", &self.node_output, event);
+        callbacks.invoke_table_row_callbacks::<Runtime>("runtime", &self.runtime, event);
     }
 }
 
@@ -932,6 +1008,8 @@ impl __sdk::SpacetimeModule for RemoteModule {
     fn register_tables(client_cache: &mut __sdk::ClientCache<Self>) {
         edge_table::register_table(client_cache);
         node_table::register_table(client_cache);
+        node_output_table::register_table(client_cache);
+        runtime_table::register_table(client_cache);
     }
-    const ALL_TABLE_NAMES: &'static [&'static str] = &["edge", "node"];
+    const ALL_TABLE_NAMES: &'static [&'static str] = &["edge", "node", "node_output", "runtime"];
 }
