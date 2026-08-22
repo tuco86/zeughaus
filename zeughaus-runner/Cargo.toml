@@ -1,0 +1,22 @@
+[package]
+name = "zeughaus-runner"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zeughaus-core.workspace = true
+zeughaus-runtime.workspace = true
+zeughaus-sync.workspace = true
+# Every plugin the editor offers natively must be instantiable here: the editor
+# only draws a node, this process is the one that runs it. A node type missing
+# from the runner is a node that silently never executes.
+zeughaus-transform.workspace = true
+zeughaus-capture.workspace = true
+zeughaus-llm.workspace = true
+zeughaus-ml.workspace = true
+zeughaus-flow.workspace = true
+# Blocking node work (LLM requests, screen capture) runs on tokio's blocking
+# pool so the event loop keeps draining the store. Multi-threaded because a
+# worker has to poll those join handles while the main thread blocks on the
+# event channel.
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
