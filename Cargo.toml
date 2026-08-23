@@ -9,6 +9,7 @@ members = [
     "zeughaus-ml",
     "zeughaus-flow",
     "zeughaus-sync",
+    "zeughaus-samples",
     "zeughaus-runner",
 ]
 # zeughaus-module is a SpacetimeDB server module: it only builds for the
@@ -30,6 +31,10 @@ zeughaus-llm = { path = "zeughaus-llm" }
 zeughaus-ml = { path = "zeughaus-ml" }
 zeughaus-flow = { path = "zeughaus-flow" }
 zeughaus-sync = { path = "zeughaus-sync" }
+zeughaus-samples = { path = "zeughaus-samples" }
+# The QUIC sample transport lives in a sibling checkout: frames are streams, and
+# a state store is the wrong pipe for 33 MB per frame.
+weida = { path = "../weida/crates/weida" }
 zeughaus-runner = { path = "zeughaus-runner" }
 
 iced = { version = "0.14", features = ["advanced", "wgpu", "tokio"] }

@@ -7050,6 +7050,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeughaus-samples"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "zeughaus-core",
+]
+
+[[package]]
 name = "zeughaus-sync"
 version = "0.1.0"
 dependencies = [
