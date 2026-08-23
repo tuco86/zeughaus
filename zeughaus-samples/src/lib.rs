@@ -334,7 +334,7 @@ mod tests {
         let frame = Image::from_rgba(4, 4, pixels);
         let scaled = scale_to_fit(&frame, 2, 2);
         assert_eq!((scaled.width(), scaled.height()), (2, 2));
-        for px in scaled.rgba().chunks_exact(4) {
+        for px in scaled.rgba().as_chunks::<4>().0 {
             assert_eq!(px[0], 127, "each output pixel averages two black and two white");
             assert_eq!(px[3], 255);
         }

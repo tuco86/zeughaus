@@ -383,6 +383,18 @@ impl GraphExecutor {
         self.last_outputs.get(&node)?.get(pin)
     }
 
+    /// Nodes that asked to be run on a clock, with the interval each wants.
+    ///
+    /// The host does the scheduling, because a node that slept would block the
+    /// pass it runs in. Without this a source node -- a screen capture, a sensor
+    /// poll -- produces one value and then never again: nothing upstream ever
+    /// marks it dirty.
+    pub fn clocked_nodes(&self) -> impl Iterator<Item = (NodeId, std::time::Duration)> + '_ {
+        self.nodes
+            .iter()
+            .filter_map(|(id, node)| node.tick_interval().map(|interval| (*id, interval)))
+    }
+
     /// Recomputes a node's pins from what is currently connected to its inputs.
     /// On a change, updates the graph node's pin_defs and returns the new pin
     /// set so the editor can re-sync its own snapshot. Returns None if unchanged.

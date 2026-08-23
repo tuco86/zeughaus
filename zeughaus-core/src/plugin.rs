@@ -39,4 +39,17 @@ pub trait ExecutableNode: Send + Sync {
     fn sync_pins(&mut self, _connected: &[PinBinding<'_>]) -> bool {
         false
     }
+
+    /// How often this node wants to be executed on its own, with no input to
+    /// wake it. `None` -- the default -- means it only runs when something
+    /// upstream changes.
+    ///
+    /// This is what makes a *source* possible. A screen capture is not driven by
+    /// data arriving; it is driven by time, and without a clock the graph
+    /// produces exactly one frame and then sits still, because nothing ever
+    /// marks the node dirty again. The host owns the scheduling: a node states an
+    /// interval, it does not sleep.
+    fn tick_interval(&self) -> Option<std::time::Duration> {
+        None
+    }
 }

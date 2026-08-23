@@ -25,6 +25,7 @@ impl DomainPlugin for FlowPlugin {
         vec![
             catalog_entry("flow.hold", "Hold", "Flow", &HoldNode::new()),
             catalog_entry("flow.button", "Button", "Flow", &ButtonNode::new()),
+            catalog_entry("flow.timer", "Timer", "Flow", &TimerNode::new()),
         ]
     }
 
@@ -32,6 +33,7 @@ impl DomainPlugin for FlowPlugin {
         match type_id {
             "flow.hold" => Some(Box::new(HoldNode::new())),
             "flow.button" => Some(Box::new(ButtonNode::new())),
+            "flow.timer" => Some(Box::new(TimerNode::new())),
             _ => None,
         }
     }
@@ -132,6 +134,89 @@ impl ExecutableNode for ButtonNode {
             self.armed = true;
         }
         Ok(())
+    }
+}
+
+/// A clock: fires `tick` every `hz`-th of a second, driven by nothing but time.
+///
+/// This is what makes a source node a *source*. A screen capture is not woken by
+/// data arriving upstream, so without a clock the graph produces one frame and
+/// then sits still -- nothing ever marks the node dirty again. The timer states
+/// its interval through [`ExecutableNode::tick_interval`] and the host does the
+/// scheduling; a node that slept would block the pass it runs in.
+pub struct TimerNode {
+    hz: f64,
+    pins: Vec<PinDefinition>,
+}
+
+impl Default for TimerNode {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TimerNode {
+    /// 30 Hz by default: enough for a live preview, and half the work of 60.
+    pub const DEFAULT_HZ: f64 = 30.0;
+    /// Ceilings on the configured rate. Zero would mean "never" more clearly
+    /// expressed by deleting the node, and a runaway value would spin the host.
+    pub const MIN_HZ: f64 = 0.01;
+    pub const MAX_HZ: f64 = 240.0;
+
+    pub fn new() -> Self {
+        Self {
+            hz: Self::DEFAULT_HZ,
+            pins: vec![PinDefinition::output("tick", Ty::Bool)],
+        }
+    }
+
+    pub fn hz(&self) -> f64 {
+        self.hz
+    }
+}
+
+impl ExecutableNode for TimerNode {
+    fn execute(&mut self, _inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
+        // Every execution IS the tick: the host only runs this node when its
+        // interval elapsed, so there is no schedule to re-check here.
+        ctx.emit("tick", Value::new(true));
+        ctx.flush();
+        Ok(())
+    }
+
+    fn pin_definitions(&self) -> &[PinDefinition] {
+        &self.pins
+    }
+
+    fn settings(&self) -> Vec<SettingDef> {
+        vec![SettingDef {
+            name: "hz".into(),
+            default: Self::DEFAULT_HZ.to_string().into(),
+            placeholder: "30".into(),
+            multiline: false,
+        }]
+    }
+
+    /// An unparsable or out-of-range rate keeps the previous one: a half-typed
+    /// number in the editor must not stop the clock.
+    fn set_parameter(&mut self, name: &str, value: Value) -> Result<()> {
+        if name != "hz" {
+            return Ok(());
+        }
+        let parsed = match value.repr() {
+            Repr::Float(f) => Some(f),
+            Repr::Int(i) => Some(i as f64),
+            Repr::Str(s) => s.trim().parse::<f64>().ok(),
+            _ => None,
+        };
+        if let Some(hz) = parsed.filter(|hz| hz.is_finite()) {
+            self.hz = hz.clamp(Self::MIN_HZ, Self::MAX_HZ);
+        }
+        Ok(())
+    }
+
+    fn tick_interval(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_secs_f64(1.0 / self.hz))
     }
 }
 
@@ -245,5 +330,57 @@ mod tests {
         assert_eq!(&*pins[0].name, "out");
         assert_eq!(pins[0].direction, PinDirection::Output);
         assert_eq!(pins[0].ty, Ty::Bool);
+    }
+
+    #[test]
+    fn a_timer_ticks_every_execution() {
+        let mut node = TimerNode::new();
+        let mut ctx = NodeContext::new(NodeId(1), 0);
+        node.execute(&InputSet::new(), &mut ctx).unwrap();
+        assert_eq!(
+            ctx.take_outputs()["tick"].downcast_ref::<bool>(),
+            Some(&true)
+        );
+    }
+
+    #[test]
+    fn the_default_rate_is_a_preview_rate() {
+        let node = TimerNode::new();
+        assert_eq!(node.hz(), 30.0);
+        assert_eq!(
+            node.tick_interval(),
+            Some(std::time::Duration::from_secs_f64(1.0 / 30.0))
+        );
+    }
+
+    #[test]
+    fn the_rate_comes_from_the_hz_setting() {
+        let mut node = TimerNode::new();
+        node.set_parameter("hz", Value::new("5".to_string())).unwrap();
+        assert_eq!(node.hz(), 5.0);
+        node.set_parameter("hz", Value::new(12.0f64)).unwrap();
+        assert_eq!(node.hz(), 12.0);
+    }
+
+    /// A half-typed number in the editor must not stop the clock, and a runaway
+    /// value must not spin the host.
+    #[test]
+    fn a_nonsense_rate_is_refused_or_clamped() {
+        let mut node = TimerNode::new();
+        node.set_parameter("hz", Value::new("".to_string())).unwrap();
+        assert_eq!(node.hz(), TimerNode::DEFAULT_HZ);
+        node.set_parameter("hz", Value::new("-3".to_string())).unwrap();
+        assert_eq!(node.hz(), TimerNode::MIN_HZ);
+        node.set_parameter("hz", Value::new(100_000.0f64)).unwrap();
+        assert_eq!(node.hz(), TimerNode::MAX_HZ);
+    }
+
+    /// Only the timer asks to be run on a clock; every other flow node waits for
+    /// data.
+    #[test]
+    fn only_the_timer_wants_a_clock() {
+        assert!(HoldNode::new().tick_interval().is_none());
+        assert!(ButtonNode::new().tick_interval().is_none());
+        assert!(TimerNode::new().tick_interval().is_some());
     }
 }
