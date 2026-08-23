@@ -27,6 +27,20 @@ pub struct Runtime {
     #[unique]
     #[auto_inc]
     pub seq: u64,
+    /// Where viewers reach this runtime's sample feed
+    /// (`weida://host:port/path`), or empty while it serves none. Frames do not
+    /// travel through this store -- 33 MB per frame is not what a state store is
+    /// for -- so the store's job is to say where they DO travel.
+    ///
+    /// Defaulted so adding the feed is an automatic migration: an existing
+    /// session must not have to be deleted to gain one.
+    #[default("")]
+    pub sample_addr: String,
+    /// PEM a viewer must trust to dial `sample_addr`. Self-signed per runtime
+    /// start, which is honest for a LAN and matches the trust this store itself
+    /// is used with.
+    #[default("")]
+    pub sample_cert: String,
 }
 
 /// One output pin's last published value, owned by the executing runtime.
@@ -35,7 +49,7 @@ pub struct Runtime {
 /// single primary key, and the value is text tagged with its type so a viewer
 /// can rebuild the value without guessing. Frames and other opaque payloads are
 /// deliberately absent -- a 4K frame is 33 MB and a state store is the wrong
-/// pipe for it.
+/// pipe for it; they travel over the sample feed instead.
 #[table(accessor = node_output, name = "node_output", public)]
 pub struct NodeOutput {
     #[primary_key]
@@ -212,7 +226,24 @@ pub fn join_runtime(ctx: &ReducerContext) {
     ctx.db.runtime().insert(Runtime {
         identity: ctx.sender(),
         seq: 0, // auto_inc
+        sample_addr: String::new(),
+        sample_cert: String::new(),
     });
+}
+
+/// Announces where this runtime serves its sample feed, and what to trust.
+///
+/// Separate from joining because the feed's address is only known once its
+/// listener is bound, and a runtime is useful (scalars still flow) before that
+/// happens. Only the caller's own row is touched, so no runtime can redirect a
+/// viewer to somewhere else.
+#[reducer]
+pub fn announce_feed(ctx: &ReducerContext, addr: String, cert: String) {
+    if let Some(mut row) = ctx.db.runtime().identity().find(ctx.sender()) {
+        row.sample_addr = addr;
+        row.sample_cert = cert;
+        ctx.db.runtime().identity().update(row);
+    }
 }
 
 /// Asks the executing runtime to fire a node once. Callable by any editor: it

@@ -6,6 +6,7 @@
 #![allow(unused, clippy::all)]
 use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
+pub mod announce_feed_reducer;
 pub mod clear_node_outputs_reducer;
 pub mod connect_edge_reducer;
 pub mod create_node_reducer;
@@ -28,6 +29,7 @@ pub mod runtime_type;
 pub mod set_node_params_reducer;
 pub mod trigger_node_reducer;
 
+pub use announce_feed_reducer::announce_feed;
 pub use clear_node_outputs_reducer::clear_node_outputs;
 pub use connect_edge_reducer::connect_edge;
 pub use create_node_reducer::create_node;
@@ -58,6 +60,10 @@ pub use trigger_node_reducer::trigger_node;
 /// to indicate which reducer caused the event.
 
 pub enum Reducer {
+    AnnounceFeed {
+        addr: String,
+        cert: String,
+    },
     ClearNodeOutputs {
         node_id: u64,
     },
@@ -114,6 +120,7 @@ impl __sdk::InModule for Reducer {
 impl __sdk::Reducer for Reducer {
     fn reducer_name(&self) -> &'static str {
         match self {
+            Reducer::AnnounceFeed { .. } => "announce_feed",
             Reducer::ClearNodeOutputs { .. } => "clear_node_outputs",
             Reducer::ConnectEdge { .. } => "connect_edge",
             Reducer::CreateNode { .. } => "create_node",
@@ -131,6 +138,12 @@ impl __sdk::Reducer for Reducer {
     #[allow(clippy::clone_on_copy)]
     fn args_bsatn(&self) -> Result<Vec<u8>, __sats::bsatn::EncodeError> {
         match self {
+            Reducer::AnnounceFeed { addr, cert } => {
+                __sats::bsatn::to_vec(&announce_feed_reducer::AnnounceFeedArgs {
+                    addr: addr.clone(),
+                    cert: cert.clone(),
+                })
+            }
             Reducer::ClearNodeOutputs { node_id } => {
                 __sats::bsatn::to_vec(&clear_node_outputs_reducer::ClearNodeOutputsArgs {
                     node_id: node_id.clone(),

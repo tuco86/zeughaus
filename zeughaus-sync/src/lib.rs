@@ -30,7 +30,7 @@ use zeughaus_core::{EdgeData, NodeData};
 use crate::module_bindings::{
     DbConnection, Edge, EdgeTableAccess, Node, NodeOutputTableAccess, NodeTableAccess,
     NodeTriggerTableAccess, RuntimeTableAccess, clear_node_outputs, connect_edge, create_node,
-    delete_node, disconnect_edge, join_runtime, move_node, publish_output, set_node_params,
+    delete_node, announce_feed, disconnect_edge, join_runtime, move_node, publish_output, set_node_params,
     trigger_node,
 };
 
@@ -272,6 +272,29 @@ pub fn pending_triggers(conn: &DbConnection) -> Vec<(u64, u64)> {
         .iter()
         .map(|t| (t.node_id, t.count))
         .collect()
+}
+
+/// Where the executing runtime serves its sample feed, as
+/// `(address, trust anchor PEM)`. `None` while no runtime is connected or the
+/// owning one serves no feed.
+///
+/// Reads the OWNING runtime specifically: an editor watching a video signal has
+/// to watch the process that is producing it, and a standby produces nothing.
+pub fn feed_endpoint(conn: &DbConnection) -> Option<(String, String)> {
+    let owner = conn.db.runtime().iter().min_by_key(|r| r.seq)?;
+    (!owner.sample_addr.is_empty() && !owner.sample_cert.is_empty())
+        .then_some((owner.sample_addr, owner.sample_cert))
+}
+
+/// Announces this runtime's sample feed. The store rejects nothing here -- a
+/// runtime may only ever describe its own row.
+pub fn send_announce_feed(conn: &DbConnection, addr: &str, cert: &str) {
+    if let Err(e) = conn
+        .reducers
+        .announce_feed(addr.to_string(), cert.to_string())
+    {
+        eprintln!("[stdb] announce_feed failed: {e}");
+    }
 }
 
 /// Every published output as `(node_id, pin, type tag, text)`.
