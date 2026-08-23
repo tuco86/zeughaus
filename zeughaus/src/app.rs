@@ -26,6 +26,8 @@ use zeughaus_ml::MlPlugin;
 use zeughaus_runtime::{Graph, GraphEdge, GraphExecutor, GraphNode};
 use zeughaus_transform::TransformPlugin;
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::feed::{self, FeedEndpoint, FeedKey, FeedSpec, FrameOrder};
 use crate::message::{Message, PinLabel};
 use crate::palette;
 
@@ -60,6 +62,26 @@ enum DisplayValue {
         pixels: Arc<[u8]>,
         handle: image::Handle,
     },
+}
+
+/// One live feed: the task reading it, what it was asked for, and the newest
+/// frame it produced.
+///
+/// The handle aborts on drop, which makes the map entry the feed's whole
+/// lifetime: removing it here stops the task, and a feed can therefore not
+/// outlive the node that wanted it. One that did would keep receiving 33 MB
+/// frames for a node nobody can see.
+#[cfg(not(target_arch = "wasm32"))]
+struct LiveFeed {
+    /// The tier this feed was opened with. A resize that snaps to the same
+    /// ladder tier leaves it unchanged, which is what keeps a drag from
+    /// restarting a video stream.
+    tier: u32,
+    /// Which generation of this feed the task belongs to.
+    epoch: u64,
+    /// Newest frame accepted, with the order it arrived in.
+    latest: Option<(FrameOrder, Image)>,
+    _task: iced::task::Handle,
 }
 
 pub struct App {
@@ -134,6 +156,25 @@ pub struct App {
     // "is anything computing the values on screen".
     #[cfg(not(target_arch = "wasm32"))]
     runtimes: usize,
+    // Where the executing runtime last said it serves frames. Kept so a runner
+    // that restarted on another port, or vanished, is detectable: every live
+    // feed dialled the old address and has to be redialled.
+    #[cfg(not(target_arch = "wasm32"))]
+    feed_endpoint: Option<FeedEndpoint>,
+    // Live video feeds, keyed by the source pin they carry rather than by the
+    // Display node drawing it: two nodes watching one pin need the same frame,
+    // so they share one feed.
+    #[cfg(not(target_arch = "wasm32"))]
+    feeds: HashMap<FeedKey, LiveFeed>,
+    // Hands out feed generations. A replaced feed numbers its frames from
+    // scratch, so the epoch -- not the sequence -- is what keeps a frame still
+    // in flight from the old one out of the new one.
+    #[cfg(not(target_arch = "wasm32"))]
+    feed_epoch: u64,
+    // Frames accepted since startup, for the status bar. A feed count alone
+    // cannot be told from a stall; a number that climbs can.
+    #[cfg(not(target_arch = "wasm32"))]
+    frames_received: u64,
 }
 
 impl App {
@@ -238,6 +279,16 @@ impl App {
             // and this process never adds itself to it.
             #[cfg(not(target_arch = "wasm32"))]
             runtimes: 0,
+            // No feed until a runtime announces one and a Display node is wired
+            // to a frame; both are discovered from the store, never assumed.
+            #[cfg(not(target_arch = "wasm32"))]
+            feed_endpoint: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            feeds: HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            feed_epoch: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            frames_received: 0,
         };
 
         // Restore the last local session. A no-op while syncing: the shared
@@ -433,19 +484,220 @@ impl App {
         self.update_display_values();
     }
 
-    /// Whether anything is executing the graph, for the status bar.
+    /// Brings the live feeds in line with what the graph and the store now say.
+    ///
+    /// The one place feeds start and stop, called after anything that can change
+    /// the answer: a Display node's wire, its size, its existence, a graph
+    /// reload, or where the runtime serves. A feed that is still wanted with the
+    /// same request is left running -- restarting a video stream because the
+    /// editor redrew would be a stutter the user can see.
+    ///
+    /// Stopping is by removal: [`LiveFeed`]'s handle aborts on drop.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn reconcile_feeds(&mut self) -> Task<Message> {
+        let announced = self.stdb.as_ref().and_then(|conn| {
+            crate::sync::feed_endpoint(conn).map(|(url, cert)| FeedEndpoint { url, cert })
+        });
+        // A runtime that moved, restarted or reissued its certificate
+        // invalidates every address already dialled, so no feed survives it.
+        let moved = announced != self.feed_endpoint;
+        if moved {
+            self.feed_endpoint = announced;
+        }
+        // With nothing serving frames, a live feed would be reading a dead
+        // stream and the frame it left behind is not what the graph shows.
+        let wanted = match self.feed_endpoint {
+            None => HashMap::new(),
+            Some(_) => self.wanted_feeds(),
+        };
+        // A feed's request is fixed for its lifetime, so a new tier is a new
+        // feed rather than a renegotiation.
+        let lost = self.retain_feeds(|key, live| !moved && wanted.get(key) == Some(&live.tier));
+        if lost {
+            self.update_display_values();
+        }
+        let Some(endpoint) = self.feed_endpoint.clone() else {
+            return Task::none();
+        };
+
+        let mut tasks = Vec::new();
+        for (key, tier) in wanted {
+            if self.feeds.contains_key(&key) {
+                continue;
+            }
+            self.feed_epoch += 1;
+            let epoch = self.feed_epoch;
+            let spec = FeedSpec {
+                endpoint: endpoint.clone(),
+                key: key.clone(),
+                epoch,
+                tier,
+            };
+            let (task, handle) = Task::run(feed::frames(spec), Message::FeedFrame).abortable();
+            self.feeds.insert(
+                key,
+                LiveFeed {
+                    tier,
+                    epoch,
+                    latest: None,
+                    _task: handle.abort_on_drop(),
+                },
+            );
+            tasks.push(task);
+        }
+        Task::batch(tasks)
+    }
+
+    /// Which feeds the graph asks for, and at what ladder tier.
+    ///
+    /// Only image-typed source pins: a scalar already arrives through
+    /// `node_output`, and streaming it over QUIC as well would be a second,
+    /// slower path to the same number.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wanted_feeds(&self) -> HashMap<FeedKey, u32> {
+        let frame_ty = Ty::of::<Image>();
+        let mut wanted: HashMap<FeedKey, u32> = HashMap::new();
+        for (id, node) in &self.nodes {
+            if !is_display(&node.type_id) {
+                continue;
+            }
+            // A Display node has exactly one input, so its single incoming edge
+            // names the pin it draws.
+            let Some(edge) = self.edges.iter().find(|e| e.to_node == *id) else {
+                continue;
+            };
+            let carries_frame = self
+                .nodes
+                .get(&edge.from_node)
+                .and_then(|src| src.pin_defs.iter().find(|p| p.name == edge.from_pin.0))
+                .is_some_and(|p| p.ty == frame_ty);
+            if !carries_frame {
+                continue;
+            }
+            // Sized by what the node body draws, not by the frame's native size:
+            // the runtime holds the frame, so it is the side that can cheaply
+            // produce the half megabyte a preview needs instead of shipping
+            // 33 MB for it.
+            let tier =
+                feed::requested_tier(self.node_sizes.get(id).copied().unwrap_or(DISPLAY_SIZE));
+            let key = FeedKey {
+                node_id: edge.from_node.0,
+                pin: Arc::clone(&edge.from_pin.0),
+            };
+            wanted
+                .entry(key)
+                .and_modify(|shared| *shared = feed::widen(*shared, tier))
+                .or_insert(tier);
+        }
+        wanted
+    }
+
+    /// Drops every feed `keep` rejects, returning whether any of them was
+    /// showing a frame -- that frame just left the screen, so the caller has to
+    /// rebuild the display values.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn retain_feeds(&mut self, mut keep: impl FnMut(&FeedKey, &LiveFeed) -> bool) -> bool {
+        let mut lost = false;
+        self.feeds.retain(|key, live| {
+            let stay = keep(key, live);
+            lost |= !stay && live.latest.is_some();
+            stay
+        });
+        lost
+    }
+
+    /// The frame a Display node currently shows, if a feed is delivering one.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn feed_frame(&self, node_id: NodeId) -> Option<&Image> {
+        if self.feeds.is_empty() {
+            return None;
+        }
+        if !self
+            .nodes
+            .get(&node_id)
+            .is_some_and(|n| is_display(&n.type_id))
+        {
+            return None;
+        }
+        let edge = self.edges.iter().find(|e| e.to_node == node_id)?;
+        let key = FeedKey {
+            node_id: edge.from_node.0,
+            pin: Arc::clone(&edge.from_pin.0),
+        };
+        self.feeds
+            .get(&key)?
+            .latest
+            .as_ref()
+            .map(|(_, image)| image)
+    }
+
+    /// Adopts a frame from a feed, if it is still the frame to show.
+    ///
+    /// Two are refused: one from a superseded generation (a resize or a
+    /// reconnect opened a new feed, whose numbering restarts, so the epoch is
+    /// what separates them), and one whose sequence is not newer than what is
+    /// already on screen.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn apply_feed_frame(&mut self, frame: crate::feed::Frame) {
+        let Some(live) = self.feeds.get_mut(&frame.key) else {
+            return;
+        };
+        if live.epoch != frame.epoch {
+            return;
+        }
+        if live
+            .latest
+            .as_ref()
+            .is_some_and(|(order, _)| frame.order <= *order)
+        {
+            return;
+        }
+        let image = frame.image.clone();
+        live.latest = Some((frame.order, frame.image));
+        self.frames_received += 1;
+
+        // Only the nodes drawing this feed change, so the whole display map is
+        // not rebuilt: at 30 frames a second that would re-render every other
+        // node's value text 30 times a second for nothing.
+        let drawing: Vec<NodeId> = self
+            .edges
+            .iter()
+            .filter(|e| e.from_node.0 == frame.key.node_id && e.from_pin.0 == frame.key.pin)
+            .map(|e| e.to_node)
+            .filter(|id| self.nodes.get(id).is_some_and(|n| is_display(&n.type_id)))
+            .collect();
+        for id in drawing {
+            let display = self.frame_display(id, &image);
+            self.display_values.insert(id, display);
+        }
+    }
+
+    /// Whether anything is executing the graph and whether video is arriving,
+    /// for the status bar.
     ///
     /// Worth permanent screen space: with no runtime connected every value on
     /// screen is a leftover nobody will refresh, and that explains away every
-    /// otherwise surprising number.
+    /// otherwise surprising number. The frame total is there for the same
+    /// reason one step further in -- a feed count alone looks identical whether
+    /// frames are flowing or the stream has stalled, and a number that climbs
+    /// is the difference.
     #[cfg(not(target_arch = "wasm32"))]
     fn runtime_text(&self) -> String {
-        match self.runtimes {
+        let mut text = match self.runtimes {
             0 => " | no runtime".to_string(),
             1 => " | runtime connected".to_string(),
             // The store elects the lowest `seq`; the spares are standby.
             n => format!(" | runtime connected (1 of {n} executing)"),
+        };
+        if !self.feeds.is_empty() {
+            let feeds = self.feeds.len();
+            let plural = if feeds == 1 { "" } else { "s" };
+            text.push_str(&format!(
+                " | {feeds} feed{plural}, {} frames",
+                self.frames_received
+            ));
         }
+        text
     }
 
     // The wasm editor has no sync layer, so it has no runtime to report on.
@@ -512,7 +764,8 @@ impl App {
     #[cfg(target_arch = "wasm32")]
     fn load_autosave(&mut self) {}
 
-    /// Recomputes what each node shows inline from the values on its edges.
+    /// Recomputes what each node shows inline from the values on its edges, and
+    /// from the video feeds for the nodes that have one.
     ///
     /// A node shows what it produced; a sink (no outgoing edges) shows what it
     /// received, which is what makes the Display node work. Image frames reuse
@@ -521,6 +774,14 @@ impl App {
     fn update_display_values(&mut self) {
         let mut next: HashMap<NodeId, DisplayValue> = HashMap::new();
         for &node_id in self.nodes.keys() {
+            // A frame from a feed outranks the edge cache, because for an image
+            // pin the edge cache is empty by design: pixels never travel through
+            // the store, so the feed is the only thing that has the frame.
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(frame) = self.feed_frame(node_id) {
+                next.insert(node_id, self.frame_display(node_id, frame));
+                continue;
+            }
             let value = self
                 .edges
                 .iter()
@@ -701,6 +962,11 @@ impl App {
         self.const_inputs.clear();
         self.node_settings.clear();
         self.display_values.clear();
+        // Every feed was opened for the outgoing document's node ids; nothing
+        // here is known to still be wanted, so they all stop. The reconcile that
+        // follows the load reopens whatever the new document asks for.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.feeds.clear();
         // A fresh executor loses the converter registry, which `sync_node_pins`
         // and the pin-type bookkeeping still need; hand it back immediately.
         self.executor = GraphExecutor::new(Graph::new());
@@ -796,6 +1062,10 @@ impl App {
                     NodeId(to.node_id),
                     to.pin_id,
                 );
+                // The Display node's source changed, so what it should be
+                // watching changed with it.
+                #[cfg(not(target_arch = "wasm32"))]
+                return self.reconcile_feeds();
             }
             Message::EdgeDisconnected { from, to } => {
                 self.disconnect_edge(
@@ -804,6 +1074,8 @@ impl App {
                     NodeId(to.node_id),
                     to.pin_id,
                 );
+                #[cfg(not(target_arch = "wasm32"))]
+                return self.reconcile_feeds();
             }
             Message::GroupMoved { node_ids, delta } => {
                 // Fires once on drag release; persist the new positions.
@@ -849,6 +1121,9 @@ impl App {
                     self.node_settings.remove(&id);
                 }
                 self.autosave();
+                // A deleted Display node's feed has nobody left to draw it.
+                #[cfg(not(target_arch = "wasm32"))]
+                return self.reconcile_feeds();
             }
             Message::CameraChanged { position, zoom } => {
                 self.camera_position = position;
@@ -945,13 +1220,25 @@ impl App {
                 // View-local, so no reducer and no autosave: a size is what THIS
                 // user wants to see, not part of the shared graph.
                 self.node_sizes.insert(NodeId(node_id), size);
+                // A drag only re-requests when it crosses a ladder tier; see
+                // `feed::requested_box`.
+                #[cfg(not(target_arch = "wasm32"))]
+                return self.reconcile_feeds();
             }
             Message::Tick => {
                 // No-op: re-rendering advances the widget's animation clock.
             }
             Message::SyncPoll => {
                 #[cfg(not(target_arch = "wasm32"))]
-                self.drain_sync();
+                {
+                    self.drain_sync();
+                    // Also where the feed endpoint is noticed. A runtime
+                    // announces its address by updating its own `runtime` row,
+                    // and the sync layer reports inserts and deletes of that
+                    // table but not updates -- so there is no event to wait for,
+                    // and the client cache is read instead.
+                    return self.reconcile_feeds();
+                }
             }
             Message::CopySessionId => {
                 #[cfg(not(target_arch = "wasm32"))]
@@ -1019,6 +1306,14 @@ impl App {
             Message::GraphLoaded(doc) => {
                 self.load_document(doc);
                 self.autosave();
+                // `load_document` stopped every feed; this reopens what the new
+                // document asks for.
+                #[cfg(not(target_arch = "wasm32"))]
+                return self.reconcile_feeds();
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::FeedFrame(frame) => {
+                self.apply_feed_frame(frame);
             }
         }
         Task::none()
@@ -1105,7 +1400,7 @@ impl App {
                 // execute, so a node is never mid-run here.
                 let errored = self.executor.is_error(*id);
                 let node_widget = ng_node(node.id.0, node.position, content)
-                    .resizable(is_resizable(&node.type_id))
+                    .resizable(is_display(&node.type_id))
                     .style(move |theme, status| {
                         let base = default_node_style(theme, status);
                         if errored {
@@ -1618,9 +1913,10 @@ const DISPLAY_SIZE: iced::Size = iced::Size::new(240.0, 150.0);
 /// benefit from being resizable.
 const NODE_WIDTH: f32 = 180.0;
 
-/// Node types whose content is worth resizing: only the Display node, which
-/// shows data rather than pin rows.
-fn is_resizable(type_id: &str) -> bool {
+/// The Display node: the one node type whose body shows data rather than pin
+/// rows. That makes it the only one worth resizing, and the only one that asks
+/// the runtime for a video feed.
+fn is_display(type_id: &str) -> bool {
     type_id == "transform.display"
 }
 
@@ -1653,7 +1949,7 @@ fn build_node_element<'a>(
 ) -> Element<'a, Message, Theme> {
     let is_const = node.type_id.starts_with("transform.const_");
     let is_button = node.type_id == "flow.button";
-    let is_display = is_resizable(&node.type_id);
+    let is_display = is_display(&node.type_id);
 
     let mut items: Vec<Element<'_, Message, Theme>> = Vec::new();
 

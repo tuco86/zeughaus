@@ -1,4 +1,8 @@
 mod app;
+// The video path: dialling the runtime's frame feed. Native-only, because it
+// needs the sync layer to learn where a runtime serves.
+#[cfg(not(target_arch = "wasm32"))]
+mod feed;
 mod message;
 mod palette;
 // The SpacetimeDB client lives in its own crate, shared with the headless

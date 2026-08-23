@@ -128,6 +128,11 @@ pub enum Message {
     // SpacetimeDB store (later phase).
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     GraphLoaded(zeughaus_core::GraphDocument),
+    // A frame arrived on a Display node's feed. Native-only: the wasm editor
+    // has no sync layer, so it never learns where frames come from and nothing
+    // can emit this.
+    #[cfg(not(target_arch = "wasm32"))]
+    FeedFrame(crate::feed::Frame),
 }
 
 #[cfg(test)]
