@@ -57,15 +57,14 @@ Verified, v0, layers L0 (raw QUIC streams) and L1 (Req/Rep, Push/Pull, Pub/Sub).
 - **Nothing conflates.** Backpressure is `Block`, `Reject` or (fan-out only)
   `Drop`; "keep the newest, discard the rest" is not implemented and is planned
   as broker-level `Coalescing(key)` (`docs/GUARANTEES.md:181-190`, master plan
-  1150-1188).
-- **Ordering across streams is `None`** (`docs/GUARANTEES.md:245`). Frames need a
-  sequence number in the payload if a receiver must reject a stale one.
+  1150-1188). The design below does not need it: a private stream per viewer
+  conflates by construction, because the runtime holds only the newest frame.
+- **Ordering across streams is `None`** (`docs/GUARANTEES.md:245`), but within one
+  stream QUIC orders bytes, so a feed's frames arrive in the order written.
 - **A receipt means the peer's transport holds the bytes**, nothing more
   (`docs/GUARANTEES.md:92-114`). Fine here: a dropped frame needs no ceremony.
 - **Addresses are `weida://host:port/path`**, path opaque and matched exactly
-  (`crates/core/src/addr.rs:15-28`, `crates/weida/src/listener.rs:48-57`). Topic
-  prefix filtering exists only inside Pub/Sub
-  (`crates/weida/src/pubsub.rs:29-35`).
+  (`crates/core/src/addr.rs:15-28`, `crates/weida/src/listener.rs:48-57`).
 - **TLS is mandatory and trust is explicit**: `ClientTls` carries trust anchors,
   `ServerTls` a chain and key, either from memory or file
   (`crates/weida/src/config.rs:36-119`). There is no authorization concept beyond
@@ -73,43 +72,53 @@ Verified, v0, layers L0 (raw QUIC streams) and L1 (Req/Rep, Push/Pull, Pub/Sub).
 - **Integration**: workspace version 0.1.0, edition 2024, MSRV 1.88, needs an
   ambient Tokio reactor (`Cargo.toml:1-25`, `crates/weida/src/runtime.rs:42-64`).
   zeughaus is on rustc 1.97 with Tokio already present, so nothing conflicts.
-  Whether the crates resolve from crates.io is unknown; a path or git dependency
-  works either way.
-
 ## Proposal
 
-### Frames are pulled, not pushed
+### A video signal is one standing request, not a request per frame
 
-The editor repaints at most a few dozen times per second and only ever wants the
-newest frame. If it *asks* per repaint, "newest wins" is a property of the
-protocol rather than a queue policy: there is no buffer to conflate, no drop
-rule to tune, and a slow editor throttles itself by asking less often. That
-sidesteps the two things weida does not have today (streaming fan-out and
-conflation) and needs no new weida feature at all.
+A viewer states its terms once -- node, pin, the size it will draw, a frame-rate
+ceiling -- and the runtime then writes frames on that one stream until the viewer
+stops reading. One exchange per (viewer, node), private to that viewer.
 
-So: one weida **Req/Rep** endpoint on the runner, one exchange per sample.
+This keeps what matters about pulling while paying for it once. The viewer still
+decides the size and the rate and still cancels; what it no longer does is spend
+a round trip per frame, which is bearable on a LAN and ruinous across the
+internet. And because each viewer has its own stream, there is no fan-out and
+therefore no 8 MiB publish cap and no missing conflation to work around:
+
+- **Backpressure is QUIC's.** A slow viewer's stream fills, `write_all` blocks,
+  and when it unblocks the runtime sends *what is current then* -- not the frame
+  that was current when it started waiting. Conflation falls out of holding only
+  the newest frame, which the capture path already does
+  (`zeughaus-capture/src/screencast.rs` keeps a single-slot latest frame).
+- **A dropped viewer costs nothing.** Reset the stream and the feed ends
+  (`crates/weida/src/transfer.rs:538-608`).
+- **Remote is not a special case.** The same request from the same code; only the
+  address differs.
 
 ```
-Editor                                   Runner (zeughaus-runner)
-  |  request  {node, pin, max_w, max_h, since_seq}   |
+Viewer                                   Runtime (zeughaus-runner)
+  |  FeedRequest {node, pin, w, h, fps}  (once, then FIN)
   |------------------------------------------------->|
-  |  reply    {seq, w, h, format} + pixel bytes      |
+  |  FrameHeader{seq,w,h} + RGBA, repeatedly         |
   |<-------------------------------------------------|
+  |  reset when the node scrolls away / closes       |
 ```
 
-- `max_w`/`max_h`: what the editor will actually draw. The runner downscales
-  before sending, because it is the side that already holds the frame. A node
-  body asks for its body size; a full-resolution inspection asks for 0 (meaning
-  "no limit") and pays the 33 MB.
-- `since_seq`: the sequence number the editor already has. Unchanged frame means
-  an empty reply, so a static screen costs one small exchange per repaint rather
-  than a frame.
-- Reply body is streamed (`AsyncWrite`/`AsyncRead`), so nothing materializes on
-  either side beyond the scaled frame itself.
-- Failure is free: a lost or cancelled exchange means the editor draws the frame
-  it already had and asks again next repaint. Dropping a `ReplyStream` resets the
-  reply half (`crates/weida/src/transfer.rs:538-608`), which is exactly the
-  behaviour wanted when a node scrolls out of view mid-transfer.
+### The runtime scales, and sizes snap to a ladder
+
+The runtime holds the frame, so it is the side that can produce the ~0.5 MB a
+node body draws instead of shipping 33 MB for it. Sizes snap to a tier ladder
+(240/360/480/720/1080 lines, or source resolution above that), so two viewers
+drawing the same node at 190 and 210 pixels tall both get the 240-line version:
+the runtime scales once and sends the same bytes twice. Exact per-viewer sizes
+would mean a separate scaling pass for a difference nobody can see at preview
+size.
+
+Scaling is box-averaged with a cap of 4x4 source samples per output pixel
+(`zeughaus-samples`): point sampling turns text into noise at an 8:1 reduction,
+and an uncapped box filter would read all 33 MB to produce a 480x270 preview --
+the work this design exists to avoid.
 
 Scalars stay in `node_output`. They are already there, they are the graph's
 visible state rather than a sample, and moving them would buy latency nobody has
@@ -148,24 +157,21 @@ below, not with the transport.
 
 ### Staging
 
-**Stage 1 -- pull, direct, no weida changes.** Runner binds a weida listener,
-serves a `/samples` replier, publishes its address. Editor dials it, requests one
-sample per visible frame node per repaint. Full-resolution inspection is the same
-request with no size limit. This is implementable against weida as it stands
-today.
+**Stage 1 -- standing feeds, direct, no weida changes. Being built.** The runner
+binds a weida listener, serves `/samples`, announces address and certificate in
+the `runtime` row. An editor dials it and holds one feed per visible frame node
+at the tier its body draws; full-resolution inspection is the same request with
+no size limit. Implementable against weida exactly as it stands.
 
-**Stage 2 -- notification, still no weida changes.** Polling per repaint wastes
-exchanges when nothing changes. A Pub/Sub topic per node carrying only
-`{node_id, pin, seq}` -- tens of bytes, far below the 8 MiB cap -- lets an editor
-request only after something moved. Pub/Sub is the right pattern here precisely
-because these messages are tiny and losing one is harmless: the next repaint
-catches up.
+**Stage 2 -- shared scaling and rate discipline.** Same protocol, better
+behaviour: one scaling pass shared by every viewer on a tier, a source that only
+scales tiers somebody is watching, and per-feed rate ceilings so a 60 Hz source
+does not force 60 Hz on a preview. Mostly runtime-side work.
 
-**Stage 3 -- push, when weida can stream fan-out.** With a streaming publisher, a
-frame stream becomes a real subscription: the runner publishes, N editors consume,
-and no one polls. This is the first stage that needs something weida does not
-have, and it only pays off for the high-rate case (a video preview at display
-rate), not for the editor's node bodies.
+**Stage 3 -- fan-out, when weida can stream it.** Today N viewers of one node
+cost N streams and N identical writes. A streaming publisher would make it one
+publish and N reads. Worth it when several viewers watch the same signal, which
+is the collaboration case, not the single-user case.
 
 **Stage 4 -- broker.** Two things move: a hop for editors that cannot reach the
 runner, and a durable path for recorded sample series. Both are the broker's
@@ -194,10 +200,11 @@ resume at the current frame, never replay a backlog.
    equivalent). Without it, push-based frames are impossible at any size above
    `subscriber_buffer_bytes`, and raising that limit trades the problem for a
    per-subscriber 33 MB copy. Already a recorded Phase 3 deferral.
-2. **A conflating queue** -- the planned `Coalescing(key)`. Only the newest sample
-   per node-pin matters for monitoring, and a consumer that cannot keep up must
-   fall behind in *time*, not in a growing backlog. Until it exists, pulling is
-   the workaround, and pulling is good enough for the editor.
+2. **A conflating queue** -- the planned `Coalescing(key)`. Not needed for a
+   private stream per viewer (the runtime holds only the newest frame, so the
+   conflation is free), but the moment fan-out exists it does: one publisher and
+   N consumers at different speeds is exactly where "keep the newest, discard the
+   rest" has to live in the transport rather than in the producer.
 3. **Peer authorization beyond certificate trust.** Stage 1 is a LAN with a
    self-signed certificate; a user who reaches a SpacetimeDB over the internet and
    wants monitoring needs something that says *which* client may attach. If weida
@@ -236,7 +243,10 @@ workaround into the natural shape.
 2. **Does an editor ever need the unscaled frame more than occasionally?** If
    full-resolution monitoring at rate becomes a real workflow, compression stops
    being optional and stage 3 arrives earlier.
-3. **Should the runner keep a short history per node?** Pull with `since_seq`
-   assumes the newest frame is the only interesting one. Recording (stage 4) says
-   otherwise, and where that history lives -- runner, broker, or capture store --
-   is unresolved.
+3. **Should the runtime keep a short history per node?** A live feed assumes the
+   newest frame is the only interesting one. Recording says otherwise, and where
+   that history lives -- runtime, broker, or capture store -- is unresolved.
+4. **Is one tier per node right, or one per viewer?** Sharing a scaling pass
+   argues for tiers; a viewer that wants an exact size argues against. The ladder
+   is the current answer and it is cheap to revisit -- `FeedRequest` already
+   carries the exact size the viewer asked for.
