@@ -12,14 +12,17 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use zeughaus_core::{
-    DomainPlugin, EdgeData, EdgeId, EdgeSemantic, NodeConfig, NodeData, NodeId, PinDirection,
-    TypeConverters, Value, encode_scalar,
+    DomainPlugin, EdgeData, EdgeId, EdgeSemantic, Image, NodeConfig, NodeData, NodeId,
+    PinDirection, Ty, TypeConverters, Value, encode_scalar,
 };
 use zeughaus_runtime::{DeferredWork, Graph, GraphEdge, GraphExecutor, GraphNode};
 use zeughaus_sync::SyncEvent;
 use zeughaus_sync::module_bindings::DbConnection;
+
+use crate::feed::FrameRegistry;
 
 /// Outcome of one node's deferred work, as reported back by the host loop.
 pub type AsyncResult = Result<HashMap<String, Value>, String>;
@@ -46,6 +49,8 @@ pub struct Runner {
     /// Edges that named a node this process did not have yet. See
     /// [`Runner::apply_edge_insert`] for why they cannot be dropped.
     pending_edges: Vec<EdgeData>,
+    /// When each clocked node is next due. Held by the owner only.
+    due: HashMap<NodeId, Instant>,
     /// Node errors already written to the log, so a failing node reports once
     /// instead of on every pass it stays broken.
     logged_errors: HashMap<NodeId, String>,
@@ -56,10 +61,18 @@ pub struct Runner {
     /// Graph size at the last log line, so the counts are reported when they
     /// change instead of once per batch.
     logged_size: (usize, usize),
+    /// The newest frame per frame-producing output pin, read by the feed
+    /// server's tasks. Rebuilt after every pass: see
+    /// [`Runner::refresh_frames`].
+    frames: Arc<FrameRegistry>,
+    /// Where this process serves its sample feed, as `(url, certificate PEM)`.
+    /// `None` until the listener is bound -- a viewer must never be pointed at
+    /// a runtime that is not serving yet.
+    feed: Option<(String, String)>,
 }
 
 impl Runner {
-    pub fn new(conn: DbConnection) -> Self {
+    pub fn new(conn: DbConnection, frames: Arc<FrameRegistry>) -> Self {
         // The same plugin set the native editor registers. Both sides must agree
         // on what exists and what may connect: the editor validates a drag
         // against these converters, this process coerces the value that then
@@ -96,9 +109,12 @@ impl Runner {
             published: HashMap::new(),
             triggers: TriggerLog::default(),
             pending_edges: Vec::new(),
+            due: HashMap::new(),
             logged_errors: HashMap::new(),
             unknown_types: HashSet::new(),
             logged_size: (0, 0),
+            frames,
+            feed: None,
         }
     }
 
@@ -128,7 +144,15 @@ impl Runner {
             return;
         }
         self.is_owner = owner;
+        // Ownership decides where viewers are pointed: `feed_endpoint` resolves
+        // the *owning* runtime's row, so a standby inheriting execution becomes
+        // the row every editor reads and has to be sure its address is in it.
+        self.announce_feed();
         if !owner {
+            // The frames this process holds are the last ones it produced.
+            // Another runtime is producing the real ones now, so its viewers
+            // have to be sent away rather than shown a still picture.
+            self.frames.clear();
             return;
         }
         // Ownership was just inherited, so this process has never run this
@@ -172,6 +196,11 @@ impl Runner {
                 for (node_id, count) in zeughaus_sync::pending_triggers(&self.conn) {
                     self.triggers.adopt(node_id, count);
                 }
+                // The snapshot is also the first look this process gets at its
+                // own `runtime` row, and a reconnect recreates that row without
+                // the feed address. Re-announcing here is what keeps a viewer
+                // from resolving an owning runtime with an empty address.
+                self.announce_feed();
             }
         }
     }
@@ -204,6 +233,52 @@ impl Runner {
         deferred
     }
 
+    /// Marks every clocked node whose interval has elapsed, returning whether
+    /// any did. This is what turns a screen capture into a video source: nothing
+    /// upstream wakes it, so the clock does.
+    ///
+    /// A standby holds no schedule at all. It must not run the graph, and a
+    /// deadline it kept while idle would fire a burst the moment it took over.
+    pub fn mark_due_ticks(&mut self) -> bool {
+        if !self.is_owner {
+            self.due.clear();
+            return false;
+        }
+        let now = Instant::now();
+        let clocked: Vec<(NodeId, Duration)> = self.executor.clocked_nodes().collect();
+        self.due.retain(|id, _| clocked.iter().any(|(c, _)| c == id));
+        let mut fired = false;
+        for (id, interval) in clocked {
+            // A node seen for the first time is due immediately: a source should
+            // produce its first value without waiting out a period.
+            let deadline = *self.due.entry(id).or_insert(now);
+            if deadline > now {
+                continue;
+            }
+            // Downstream too: the tick is only useful because it reaches what it
+            // drives.
+            self.executor.mark_dirty_downstream(id);
+            // Count from the deadline that was served, so a steady rate does not
+            // drift -- but never from the past, or a slow pass would queue up
+            // ticks it can never catch up with.
+            self.due.insert(id, (deadline + interval).max(now));
+            fired = true;
+        }
+        fired
+    }
+
+    /// How long the event loop may block: the soonest clock deadline, capped by
+    /// `cap`. Without the cap an idle graph would still wake on nothing; without
+    /// the deadline a 30 Hz timer would be served at the polling interval.
+    pub fn next_wait(&self, cap: Duration) -> Duration {
+        let now = Instant::now();
+        self.due
+            .values()
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .min()
+            .map_or(cap, |wait| wait.min(cap))
+    }
+
     /// Applies the result of one node's deferred work, resuming the downstream
     /// nodes it was holding back.
     pub fn deliver(&mut self, node_id: NodeId, result: AsyncResult) -> DeferredWork {
@@ -230,6 +305,7 @@ impl Runner {
     fn after_pass(&mut self) {
         self.log_errors();
         self.publish();
+        self.refresh_frames();
     }
 
     /// Fires every press that has not been handled yet.
@@ -431,6 +507,61 @@ impl Runner {
             }
             self.published.insert(id, current);
         }
+    }
+
+    /// Records where this process serves its sample feed and announces it.
+    ///
+    /// Called once the listener is bound and never before: a viewer that
+    /// reached a runtime which is not serving yet would fail its first request
+    /// and have no reason to try again.
+    pub fn set_feed_endpoint(&mut self, url: String, cert_pem: String) {
+        self.feed = Some((url, cert_pem));
+        self.announce_feed();
+    }
+
+    /// Writes the feed endpoint into this runtime's row. Idempotent, which is
+    /// what lets it be repeated whenever ownership or the subscription changes.
+    fn announce_feed(&self) {
+        let Some((url, cert_pem)) = &self.feed else {
+            return;
+        };
+        zeughaus_sync::send_announce_feed(&self.conn, url, cert_pem);
+    }
+
+    /// Hands this pass's frames to the feed server.
+    ///
+    /// Frames only: a scalar already reaches every editor as a `node_output`
+    /// row, and 33 MB of pixels must not go the same way. What counts as a
+    /// frame pin is the graph's own statement -- an output pin declaring
+    /// [`Image`] -- rather than a guess from the value, so a pin that has not
+    /// produced anything yet is still served (a viewer attaching before the
+    /// first capture waits instead of being told the feed is over).
+    ///
+    /// The whole set is restated every pass because the registry is
+    /// authoritative: a pin missing from it is a pin whose node is gone, which
+    /// is both how its frame is released and how its viewers learn to stop.
+    fn refresh_frames(&self) {
+        if !self.is_owner {
+            return;
+        }
+        let frame_ty = Ty::of::<Image>();
+        let mut pins: Vec<(NodeId, &str, Option<&Image>)> = Vec::new();
+        for id in self.executor.graph.node_ids() {
+            let Some(node) = self.executor.graph.node(id) else {
+                continue;
+            };
+            for pin in &node.pin_defs {
+                if pin.direction != PinDirection::Output || pin.ty != frame_ty {
+                    continue;
+                }
+                let image = self
+                    .executor
+                    .output_value(id, &pin.name)
+                    .and_then(Value::downcast_ref::<Image>);
+                pins.push((id, &pin.name, image));
+            }
+        }
+        self.frames.publish(pins);
     }
 
     /// Reports node failures and recoveries once each. A headless process has
