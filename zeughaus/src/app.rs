@@ -18,13 +18,13 @@ use iced_nodegraph::{ParticleStyle, default_particle_style, particle};
 use iced_palette::{get_filtered_command_index, is_toggle_shortcut};
 #[cfg(not(target_arch = "wasm32"))]
 use zeughaus_capture::CapturePlugin;
+#[cfg(not(target_arch = "wasm32"))]
+use zeughaus_core::occupancy_winner;
 use zeughaus_core::{
     DomainPlugin, EdgeData, EdgeId, EdgeSemantic, GraphDocument, Image, NodeConfig, NodeData,
     NodeDefinition, NodeId, PinDefinition, PinDirection, PinKind, SettingDef, SettingKind, Ty,
     TypeConverters, Value,
 };
-#[cfg(not(target_arch = "wasm32"))]
-use zeughaus_core::occupancy_winner;
 use zeughaus_flow::FlowPlugin;
 use zeughaus_graph::GraphPlugin;
 #[cfg(not(target_arch = "wasm32"))]
@@ -743,6 +743,32 @@ impl App {
         }
     }
 
+    /// A node's setting value, or the default its type declares.
+    fn setting_or_default(&self, node: NodeId, key: &str) -> String {
+        let default = || {
+            self.nodes
+                .get(&node)
+                .and_then(|n| n.settings.iter().find(|s| &*s.name == key))
+                .map(|s| s.default.to_string())
+                .unwrap_or_default()
+        };
+        self.node_settings
+            .get(&node)
+            .and_then(|s| s.get(key))
+            .cloned()
+            .unwrap_or_else(default)
+    }
+
+    /// Whether a node's setting is a field list, i.e. whether its rows name
+    /// pins. Only then can an edit of it rename one.
+    fn is_field_setting(&self, node: NodeId, key: &str) -> bool {
+        self.nodes.get(&node).is_some_and(|n| {
+            n.settings
+                .iter()
+                .any(|s| &*s.name == key && matches!(s.kind, SettingKind::Fields { .. }))
+        })
+    }
+
     /// Drops an edge from this window: the view, the executor graph and cache,
     /// and the particle queue that was riding it.
     fn forget_edge(&mut self, id: EdgeId) {
@@ -750,6 +776,75 @@ impl App {
         self.executor.disconnect_edge(id);
         #[cfg(not(target_arch = "wasm32"))]
         self.particles.remove(&id);
+    }
+
+    /// Moves every wire on `node`'s pin `old` over to pin `new`.
+    ///
+    /// A renamed field keeps its relations. The pin is the same field under
+    /// another name, and dropping a foreign key because the user fixed a typo
+    /// would be the harshest possible reading of an edit.
+    ///
+    /// A wire is replaced rather than renamed: the store addresses an edge by
+    /// id and has no way to change the pin it names, so the row is deleted and
+    /// a new one inserted under a fresh [`EdgeId`]. An edge id is not identity
+    /// here -- nothing outside the graph refers to one -- so this needs no
+    /// reducer of its own and leaves the module schema alone.
+    fn rename_pin_edges(&mut self, node: NodeId, old: &str, new: &str) {
+        let affected: Vec<(EdgeId, NodeId, PinLabel, NodeId, PinLabel)> = self
+            .edges
+            .iter()
+            .filter(|e| {
+                (e.from_node == node && e.from_pin.as_str() == old)
+                    || (e.to_node == node && e.to_pin.as_str() == old)
+            })
+            .map(|e| {
+                (
+                    e.id,
+                    e.from_node,
+                    e.from_pin.clone(),
+                    e.to_node,
+                    e.to_pin.clone(),
+                )
+            })
+            .collect();
+        let renamed = PinLabel(Arc::from(new));
+        for (id, from_node, from_pin, to_node, to_pin) in affected {
+            self.forget_edge(id);
+            #[cfg(not(target_arch = "wasm32"))]
+            self.push_edge_remove(id);
+
+            let from_pin = if from_node == node && from_pin.as_str() == old {
+                renamed.clone()
+            } else {
+                from_pin
+            };
+            let to_pin = if to_node == node && to_pin.as_str() == old {
+                renamed.clone()
+            } else {
+                to_pin
+            };
+            let fresh = EdgeId::next();
+            self.executor.graph.add_edge(GraphEdge {
+                id: fresh,
+                from_node,
+                from_pin: Arc::clone(&from_pin.0),
+                to_node,
+                to_pin: Arc::clone(&to_pin.0),
+                semantic: EdgeSemantic::default(),
+            });
+            self.edges.push(EditorEdge {
+                id: fresh,
+                from_node,
+                from_pin,
+                to_node,
+                to_pin,
+            });
+            self.executor.on_edge_added(fresh);
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(e) = self.edges.last() {
+                self.push_edge(e);
+            }
+        }
     }
 
     /// What a node declares for this pin, if it declares it at all.
@@ -1809,6 +1904,13 @@ impl App {
                 value,
             } => {
                 let id = NodeId(node_id);
+                // A field-list edit is compared against what it replaced: one
+                // name changed in place is a rename, and a rename keeps its
+                // wires (`rename_pin_edges`) instead of orphaning them.
+                let renamed = self
+                    .is_field_setting(id, &key)
+                    .then(|| renamed_field(&self.setting_or_default(id, &key), &value))
+                    .flatten();
                 self.node_settings
                     .entry(id)
                     .or_default()
@@ -1817,10 +1919,13 @@ impl App {
                 // A setting can decide the node's pins (a table's columns are
                 // one), so the widget re-reads what it now declares.
                 self.refresh_node_pins(id);
-                // A field that is gone takes its relations with it: a foreign
-                // key lives on a field, and a wire to a pin the node no longer
-                // declares is one nobody can see or delete.
-                self.drop_orphaned_relations(id);
+                match &renamed {
+                    Some((old, new)) => self.rename_pin_edges(id, old, new),
+                    // A field that is gone takes its relations with it: a
+                    // foreign key lives on a field, and a wire to a pin the
+                    // node no longer declares is one nobody can see or delete.
+                    None => self.drop_orphaned_relations(id),
+                }
                 // Renaming a boundary renames its container's pin.
                 if key == "name" {
                     self.refresh_boundary_owner(id);
@@ -2573,22 +2678,6 @@ impl App {
         // being applied.
     }
 
-    /// A node's setting value, or the default its type declares.
-    fn setting_or_default(&self, node: NodeId, key: &str) -> String {
-        let default = || {
-            self.nodes
-                .get(&node)
-                .and_then(|n| n.settings.iter().find(|s| &*s.name == key))
-                .map(|s| s.default.to_string())
-                .unwrap_or_default()
-        };
-        self.node_settings
-            .get(&node)
-            .and_then(|s| s.get(key))
-            .cloned()
-            .unwrap_or_else(default)
-    }
-
     /// The relations a table's fields declare, one `field -> table.field` per
     /// line, as the `relations` parameter carries them.
     ///
@@ -3256,6 +3345,32 @@ fn relation_references_to(from_pin: &str, to_pin: &str) -> bool {
     to_pin == KEY_FIELD || from_pin != KEY_FIELD
 }
 
+/// The single field a field-list edit renamed, as `(old, new)`.
+///
+/// Recognised deliberately narrowly: the same number of rows, exactly one
+/// position whose name changed, and neither name empty. A row added, removed
+/// or reordered, or two names changed at once, is not a rename.
+///
+/// The asymmetry is on purpose. Guessing "rename" where the user removed one
+/// field and added another would move a foreign key onto a field nobody
+/// pointed it at, silently and in the shared store. Guessing "not a rename"
+/// costs a wire that is redrawn in a second.
+fn renamed_field(before: &str, after: &str) -> Option<(String, String)> {
+    let (before, after) = (field_rows(before), field_rows(after));
+    if before.len() != after.len() {
+        return None;
+    }
+    let mut changed = before
+        .iter()
+        .zip(&after)
+        .filter(|((old, _), (new, _))| old != new);
+    let ((old, _), (new, _)) = changed.next()?;
+    if changed.next().is_some() || old.is_empty() || new.is_empty() {
+        return None;
+    }
+    Some((old.to_string(), new.to_string()))
+}
+
 /// A [`SettingKind::Title`] setting: the node's name, editable in place.
 fn title_setting<'a>(
     node: &'a EditorNode,
@@ -3796,5 +3911,40 @@ mod tests {
         // vanished for a moment while a setting was half-typed must survive.
         assert!(!is_lost_relation(None, Some(&output)));
         assert!(!is_lost_relation(None, None));
+    }
+
+    /// A rename has to be recognised so the field's relations survive it, and
+    /// only recognised when it really is one: mistaking a remove-plus-add for
+    /// a rename moves a foreign key onto a field nobody pointed it at.
+    #[test]
+    fn one_name_changed_in_place_is_a_rename_and_nothing_else_is() {
+        let before = "id:int\ncustomer_id:int\ntotal:float";
+        assert_eq!(
+            renamed_field(before, "id:int\ncust_id:int\ntotal:float"),
+            Some(("customer_id".to_string(), "cust_id".to_string()))
+        );
+
+        // A type change on its own leaves every name where it was.
+        assert_eq!(
+            renamed_field(before, "id:int\ncustomer_id:str\ntotal:float"),
+            None
+        );
+        // Nothing changed.
+        assert_eq!(renamed_field(before, before), None);
+        // A row added or removed: the rows no longer line up.
+        assert_eq!(renamed_field(before, "id:int\ncustomer_id:int"), None);
+        assert_eq!(
+            renamed_field(before, "id:int\ncustomer_id:int\ntotal:float\nnote:str"),
+            None
+        );
+        // Two names at once, and a reorder, are not one rename.
+        assert_eq!(renamed_field(before, "id:int\ncust:int\nsum:float"), None);
+        assert_eq!(
+            renamed_field(before, "customer_id:int\nid:int\ntotal:float"),
+            None
+        );
+        // A name cleared to nothing is a row being retyped, not a rename to
+        // the empty pin.
+        assert_eq!(renamed_field(before, "id:int\n:int\ntotal:float"), None);
     }
 }

@@ -7,8 +7,8 @@
 use zeughaus_core::*;
 
 use crate::{
-    ColTy, DB_PATH, RELATIONS, TableRef, failed, is_query, open, parse_columns,
-    parse_relations, quote, rows_to_json, table_ty, to_sql,
+    ColTy, DB_PATH, RELATIONS, TableRef, failed, is_query, open, parse_columns, parse_relations,
+    quote, rows_to_json, table_ty, to_sql,
 };
 
 /// Reads a parameter's text, whatever scalar form it arrives in.
