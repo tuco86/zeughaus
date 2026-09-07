@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::error::Result;
@@ -20,17 +20,36 @@ pub trait AsyncWork: Send + 'static {
 /// Read-only view of a node's inputs during execution.
 pub struct InputSet {
     values: HashMap<Arc<str>, Value>,
+    /// Pins a value was delivered on since this node last ran.
+    ///
+    /// Dirty propagation is uniform -- every downstream node reruns, which is
+    /// what an LLM or ML chain depends on -- so the values alone cannot say
+    /// what just happened. A node that must act only when its own trigger
+    /// fired (an insert, a query) asks this instead of comparing values, which
+    /// would fire again on an unchanged one and never on a repeated one.
+    changed: HashSet<Arc<str>>,
 }
 
 impl InputSet {
     pub fn new() -> Self {
         Self {
             values: HashMap::new(),
+            changed: HashSet::new(),
         }
     }
 
     pub fn insert(&mut self, pin_name: impl Into<Arc<str>>, value: Value) {
         self.values.insert(pin_name.into(), value);
+    }
+
+    /// Records that the value on `pin` was delivered since the last execution.
+    pub fn mark_changed(&mut self, pin: impl Into<Arc<str>>) {
+        self.changed.insert(pin.into());
+    }
+
+    /// Whether a value was delivered on `pin` since this node last ran.
+    pub fn changed(&self, pin: &str) -> bool {
+        self.changed.contains(pin)
     }
 
     pub fn get<T: Clone + 'static>(&self, pin_name: &str) -> Option<T> {

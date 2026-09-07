@@ -43,6 +43,9 @@ pub struct GraphExecutor {
     /// what lets a viewer draw one particle per message instead of guessing
     /// from a value that may not have changed.
     delivered: Vec<EdgeId>,
+    /// The cache generation each incoming edge had when a node last ran, per
+    /// node. The difference is what [`InputSet::changed`] reports.
+    seen: HashMap<NodeId, HashMap<EdgeId, u64>>,
 }
 
 impl GraphExecutor {
@@ -58,6 +61,7 @@ impl GraphExecutor {
             trace_counter: 0,
             converters: Arc::new(TypeConverters::new()),
             delivered: Vec::new(),
+            seen: HashMap::new(),
         }
     }
 
@@ -189,17 +193,31 @@ impl GraphExecutor {
         Ok(deferred)
     }
 
-    fn build_input_set(&self, node_id: NodeId) -> InputSet {
+    /// The inputs one node sees, and which of them just arrived.
+    ///
+    /// `&mut self` because reading is also remembering: the generation each
+    /// incoming edge had when this node last ran is what makes "delivered
+    /// since" answerable at all.
+    fn build_input_set(&mut self, node_id: NodeId) -> InputSet {
         let mut inputs = InputSet::new();
 
-        for &edge_id in self.graph.incoming_edges(node_id) {
-            if let Some(edge) = self.graph.edge(edge_id)
-                && let Some(value) = self.cache.get(edge_id)
-            {
-                let to_type = self.pin_type(node_id, &edge.to_pin);
-                let value = self.coerce(to_type, value, node_id, &edge.to_pin);
-                inputs.insert(Arc::clone(&edge.to_pin), value);
+        let incoming: Vec<EdgeId> = self.graph.incoming_edges(node_id).to_vec();
+        for edge_id in incoming {
+            let Some(edge) = self.graph.edge(edge_id) else {
+                continue;
+            };
+            let to_pin = Arc::clone(&edge.to_pin);
+            let Some(value) = self.cache.get(edge_id) else {
+                continue;
+            };
+            let to_type = self.pin_type(node_id, &to_pin);
+            let value = self.coerce(to_type, value, node_id, &to_pin);
+            let generation = self.cache.generation(edge_id);
+            let seen = self.seen.entry(node_id).or_default();
+            if seen.insert(edge_id, generation) != Some(generation) {
+                inputs.mark_changed(Arc::clone(&to_pin));
             }
+            inputs.insert(to_pin, value);
         }
         inputs
     }
@@ -376,6 +394,11 @@ impl GraphExecutor {
             let to_node = edge.to_node;
             self.cache.remove(edge_id);
             self.graph.remove_edge(edge_id);
+            // A wire that comes back is a new wire: its next value is a
+            // delivery, not something the target has already seen.
+            if let Some(seen) = self.seen.get_mut(&to_node) {
+                seen.remove(&edge_id);
+            }
             self.mark_dirty_downstream(to_node);
         }
     }
@@ -401,6 +424,12 @@ impl GraphExecutor {
         self.pending.remove(&id);
         self.last_outputs.remove(&id);
         self.node_errors.remove(&id);
+        // Node ids are never reused, so nothing can inherit what this one had
+        // seen; the entries of the nodes it fed lose their edges below.
+        self.seen.remove(&id);
+        for seen in self.seen.values_mut() {
+            seen.retain(|eid, _| self.graph.edge(*eid).is_some());
+        }
     }
 
     pub fn edge_value(&self, edge_id: EdgeId) -> Option<&Value> {
@@ -454,6 +483,26 @@ impl GraphExecutor {
         if let Some(n) = self.graph.node_mut(id) {
             n.pin_defs = pins.clone();
         }
+        Some(pins)
+    }
+
+    /// Re-reads a node's own pin declaration after its parameters changed.
+    ///
+    /// Distinct from [`Self::sync_node_pins`]: that one asks the node to grow
+    /// pins from what is wired to it, this one only picks up what the node
+    /// already decided for itself -- a table node whose column list is a
+    /// setting has a different pin set the moment that text changes, and
+    /// nothing is connected yet at that point.
+    ///
+    /// `None` when the declaration is unchanged, so a caller can skip the
+    /// bookkeeping that follows a real change.
+    pub fn refresh_pins(&mut self, id: NodeId) -> Option<Vec<PinDefinition>> {
+        let pins = self.nodes.get(&id)?.pin_definitions().to_vec();
+        let node = self.graph.node_mut(id)?;
+        if node.pin_defs == pins {
+            return None;
+        }
+        node.pin_defs = pins.clone();
         Some(pins)
     }
 
@@ -1160,5 +1209,68 @@ mod tests {
         exec.set_remote_outputs(a, HashMap::new());
         assert!(exec.edge_value(edge_id).is_none());
         assert!(exec.output_value(a, "value").is_none());
+    }
+
+    /// A node that must act only when its own trigger fired asks `changed`,
+    /// because dirty propagation reruns it for reasons of its own. Recording
+    /// what it saw is what makes "delivered since I last ran" answerable: an
+    /// unchanged value must not read as delivered, and a repeated one must.
+    #[test]
+    fn a_node_is_told_which_of_its_inputs_were_delivered() {
+        use std::sync::Mutex;
+
+        struct Watcher(Arc<Mutex<Vec<(bool, bool)>>>);
+        impl ExecutableNode for Watcher {
+            fn execute(&mut self, inputs: &InputSet, _ctx: &mut NodeContext) -> Result<()> {
+                self.0
+                    .lock()
+                    .expect("log")
+                    .push((inputs.changed("a"), inputs.changed("b")));
+                Ok(())
+            }
+            fn pin_definitions(&self) -> &[PinDefinition] {
+                &[]
+            }
+        }
+
+        let mut graph = Graph::new();
+        let source_a = NodeId::next();
+        let source_b = NodeId::next();
+        let sink = NodeId::next();
+        graph.add_node(make_node(source_a));
+        graph.add_node(make_node(source_b));
+        graph.add_node(make_node(sink));
+        let wire_a = make_edge(source_a, "value", sink, "a");
+        let wire_b = make_edge(source_b, "value", sink, "b");
+        let (edge_a, edge_b) = (wire_a.id, wire_b.id);
+        graph.add_edge(wire_a);
+        graph.add_edge(wire_b);
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut exec = GraphExecutor::new(graph);
+        // The sources have no executable: this test delivers on their wires by
+        // hand, so that the only node that runs is the one being asked.
+        exec.register_node(sink, Box::new(Watcher(Arc::clone(&seen))));
+
+        // Only `a` has a value on it.
+        exec.cache.set(edge_a, Value::new(1.0_f64));
+        exec.mark_dirty(sink);
+        exec.execute_dirty().expect("pass");
+        assert_eq!(seen.lock().expect("log").last().copied(), Some((true, false)));
+
+        // Nothing delivered since: a rerun for another reason reports neither.
+        exec.mark_dirty(sink);
+        exec.execute_dirty().expect("pass");
+        assert_eq!(
+            seen.lock().expect("log").last().copied(),
+            Some((false, false))
+        );
+
+        // The same value again is still a delivery.
+        exec.cache.set(edge_a, Value::new(1.0_f64));
+        exec.cache.set(edge_b, Value::new(2.0_f64));
+        exec.mark_dirty(sink);
+        exec.execute_dirty().expect("pass");
+        assert_eq!(seen.lock().expect("log").last().copied(), Some((true, true)));
     }
 }

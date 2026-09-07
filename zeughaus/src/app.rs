@@ -680,6 +680,20 @@ impl App {
         }
     }
 
+    /// Re-reads a node's own pin declaration after its parameters changed, and
+    /// mirrors it into the editor's node.
+    ///
+    /// Distinct from [`App::resync_pins`], which grows a variadic node from
+    /// what is wired to it: this one picks up a pin set the node derived from a
+    /// setting, where nothing is connected yet.
+    fn refresh_node_pins(&mut self, node: NodeId) {
+        if let Some(pins) = self.executor.refresh_pins(node)
+            && let Some(en) = self.nodes.get_mut(&node)
+        {
+            en.pin_defs = pins;
+        }
+    }
+
     fn disconnect_edge(
         &mut self,
         from_node: NodeId,
@@ -1665,6 +1679,9 @@ impl App {
                     .or_default()
                     .insert(key.clone(), value.clone());
                 let _ = self.executor.set_parameter(id, &key, Value::new(value));
+                // A setting can decide the node's pins (a table's columns are
+                // one), so the widget re-reads what it now declares.
+                self.refresh_node_pins(id);
                 // Renaming a boundary renames its container's pin.
                 if key == "name" {
                     self.refresh_boundary_owner(id);
@@ -2393,6 +2410,9 @@ impl App {
                     .insert(name.clone(), value_str.clone());
             }
         }
+        // A setting can decide a node's pins; the widget has to draw the set
+        // the node now declares, not the one it was created with.
+        self.refresh_node_pins(id);
     }
 
     fn apply_node_remove(&mut self, id: NodeId) {

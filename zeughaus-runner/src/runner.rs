@@ -422,6 +422,11 @@ impl Runner {
                 let _ = self.executor.set_parameter(id, name, value);
             }
         }
+        // A setting can decide a node's pins (a table's column list is one), so
+        // the graph's declaration is re-read once the parameters are in. Without
+        // it the edges into a node the editor already drew with new pins would
+        // find nothing to attach to here.
+        self.executor.refresh_pins(id);
     }
 
     fn apply_node_remove(&mut self, id: NodeId) {
