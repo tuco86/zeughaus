@@ -78,6 +78,9 @@ pub enum Message {
     // Show the contents of a container node, or the root graph for id 0. The
     // one navigation the editor has: a subgraph is drawn nowhere else.
     EnterGraph(u64),
+    // Arrange the current graph's nodes in columns by depth. A layout is a
+    // shared edit like any other move: it changes node positions.
+    AutoLayout,
     GroupMoved {
         node_ids: Vec<u64>,
         delta: Vector,

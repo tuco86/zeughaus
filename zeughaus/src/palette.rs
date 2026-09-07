@@ -26,6 +26,9 @@ pub fn build_commands(catalog: &[NodeDefinition]) -> Vec<Command<Message>> {
         command("session.copy", "Session / Copy Session ID".to_string())
             .description("Copy the current collaboration session id to the clipboard")
             .action(Message::CopySessionId),
+        command("graph.autolayout", "Graph / Auto Layout".to_string())
+            .description("Arrange the nodes of the current graph in columns by depth")
+            .action(Message::AutoLayout),
     ];
 
     commands.extend(sorted.iter().map(|def| {
