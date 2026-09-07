@@ -151,6 +151,14 @@ impl TableNode {
     /// than emitted: the wire may still be there while the field it started on
     /// is being renamed, and a `FOREIGN KEY` on a column that is not in the
     /// statement is a syntax error, not a warning.
+    ///
+    /// This is the schema as designed, which is not always the schema in the
+    /// file. `CREATE TABLE IF NOT EXISTS` does nothing to a table that is
+    /// already there, and SQLite has no `ADD CONSTRAINT`: a foreign key can
+    /// only be declared when the table is created, or on a column that
+    /// `ALTER TABLE ... ADD COLUMN` adds. So a relation drawn onto a field
+    /// the file already has shows up in this text and never in the file --
+    /// dropping the table (or renaming this one) is the only way to apply it.
     pub fn ddl(&self) -> String {
         let columns = parse_columns(&self.columns);
         let relations = parse_relations(&self.relations);
@@ -201,28 +209,74 @@ impl ExecutableNode for TableNode {
         conn.execute_batch(&ddl)
             .map_err(|e| failed(format!("{ddl}: {e}")))?;
 
-        // What is in the file decides, not what this node declared: a table
-        // that already exists with other columns is the one case where
-        // continuing would write rows into a shape nobody asked for.
-        let existing: Vec<String> = {
+        // What is in the file decides, not what this node declared. A field
+        // the file does not have yet is added; a column the file has and the
+        // node does not, or one whose type changed, is refused -- SQLite
+        // cannot drop or retype a column in place, and guessing which of the
+        // two the user meant is how data gets lost.
+        let existing: Vec<(String, String)> = {
             let sql = format!("PRAGMA table_info({})", quote(&self.name));
             let mut statement = conn
                 .prepare(&sql)
                 .map_err(|e| failed(format!("{sql}: {e}")))?;
-            let names = statement
-                .query_map([], |row| row.get::<_, String>(1))
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })
                 .map_err(|e| failed(format!("{sql}: {e}")))?;
-            names
-                .collect::<rusqlite::Result<Vec<String>>>()
+            rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(|e| failed(format!("{sql}: {e}")))?
         };
-        let declared: Vec<String> = columns.iter().map(|(name, _)| name.clone()).collect();
-        if existing != declared {
+
+        let mut refused: Vec<String> = Vec::new();
+        for (name, _) in &existing {
+            if !columns.iter().any(|(declared, _)| declared == name) {
+                refused.push(format!("{name} would have to be dropped"));
+            }
+        }
+        for (name, ty) in &columns {
+            let Some((_, have)) = existing.iter().find(|(e, _)| e == name) else {
+                continue;
+            };
+            if !have.eq_ignore_ascii_case(ty.affinity()) {
+                refused.push(format!(
+                    "{name} is {have} in the file, not {}",
+                    ty.affinity()
+                ));
+            }
+        }
+        if !refused.is_empty() {
             return Err(failed(format!(
-                "table {} exists with different columns ({}); drop it or rename",
+                "table {} cannot be migrated: {}; drop the table or rename this one",
                 self.name,
-                existing.join(", ")
+                refused.join(", ")
             )));
+        }
+
+        // A new column may carry its foreign key, but only because SQLite
+        // allows a `REFERENCES` clause on `ADD COLUMN` when the default is
+        // NULL. A relation drawn onto a column that is already in the file
+        // cannot be added at all -- see [`Self::ddl`].
+        let relations = parse_relations(&self.relations);
+        for (name, ty) in &columns {
+            if existing.iter().any(|(e, _)| e == name) {
+                continue;
+            }
+            let mut sql = format!(
+                "ALTER TABLE {} ADD COLUMN {} {}",
+                quote(&self.name),
+                quote(name),
+                ty.affinity()
+            );
+            if let Some(relation) = relations.iter().find(|r| &r.field == name) {
+                sql.push_str(&format!(
+                    " REFERENCES {}({})",
+                    quote(&relation.table),
+                    quote(&relation.target)
+                ));
+            }
+            conn.execute_batch(&sql)
+                .map_err(|e| failed(format!("{sql}: {e}")))?;
         }
 
         ctx.emit("table", Value::new(self.table_ref()));
@@ -777,25 +831,84 @@ mod tests {
         assert_eq!(parsed[0]["id"], serde_json::json!(2));
     }
 
-    /// A table that exists with other columns is the one case where writing on
-    /// would put rows into a shape nobody asked for.
+    /// A field added to a table whose file already exists reaches the file:
+    /// designing a schema is iterative, and starting over for one more column
+    /// is not a workbench.
     #[test]
-    fn a_table_that_exists_with_other_columns_is_refused() {
-        let path = temp_db("mismatch");
-        let mut first = TableNode::new();
-        set(&mut first, DB_PATH, &path);
-        set(&mut first, "name", "samples");
-        set(&mut first, "columns", "id:int\nx:float");
-        first.execute(&InputSet::new(), &mut ctx()).expect("create");
+    fn a_new_field_is_added_to_a_table_that_already_exists() {
+        let path = temp_db("addcolumn");
+        let mut node = TableNode::new();
+        set(&mut node, DB_PATH, &path);
+        set(&mut node, "name", "samples");
+        set(&mut node, "columns", "id:int\nx:float");
+        node.execute(&InputSet::new(), &mut ctx()).expect("create");
 
-        let mut second = TableNode::new();
-        set(&mut second, DB_PATH, &path);
-        set(&mut second, "name", "samples");
-        set(&mut second, "columns", "id:int\ny:str");
-        let error = second
+        set(&mut node, "columns", "id:int\nx:float\ntag:str");
+        node.execute(&InputSet::new(), &mut ctx()).expect("migrate");
+        // Running again with nothing new to do must stay a no-op rather than
+        // trying to add the column twice.
+        node.execute(&InputSet::new(), &mut ctx())
+            .expect("idempotent");
+
+        // The pooled connection is shared with the node, so the guard has to
+        // be dropped before anything executes again.
+        let columns: Vec<(String, String)> = {
+            let conn = open(&path).expect("open");
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            let mut statement = conn
+                .prepare("PRAGMA table_info(\"samples\")")
+                .expect("pragma");
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })
+                .expect("rows")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("columns")
+        };
+        assert_eq!(
+            columns,
+            vec![
+                ("id".to_string(), "INTEGER".to_string()),
+                ("x".to_string(), "REAL".to_string()),
+                ("tag".to_string(), "TEXT".to_string()),
+            ]
+        );
+    }
+
+    /// A column the node no longer declares, and one whose type changed, are
+    /// the two cases SQLite cannot do in place -- and the message has to name
+    /// which one it is.
+    #[test]
+    fn dropping_or_retyping_a_column_is_refused() {
+        let path = temp_db("mismatch");
+        let mut node = TableNode::new();
+        set(&mut node, DB_PATH, &path);
+        set(&mut node, "name", "samples");
+        set(&mut node, "columns", "id:int\nx:float");
+        node.execute(&InputSet::new(), &mut ctx()).expect("create");
+
+        let mut dropped = TableNode::new();
+        set(&mut dropped, DB_PATH, &path);
+        set(&mut dropped, "name", "samples");
+        set(&mut dropped, "columns", "id:int");
+        let error = dropped
             .execute(&InputSet::new(), &mut ctx())
-            .expect_err("mismatch");
-        assert!(error.to_string().contains("different columns"));
+            .expect_err("dropped column");
+        assert!(error.to_string().contains("x would have to be dropped"));
+
+        let mut retyped = TableNode::new();
+        set(&mut retyped, DB_PATH, &path);
+        set(&mut retyped, "name", "samples");
+        set(&mut retyped, "columns", "id:int\nx:str");
+        let error = retyped
+            .execute(&InputSet::new(), &mut ctx())
+            .expect_err("retyped column");
+        assert!(
+            error
+                .to_string()
+                .contains("x is REAL in the file, not TEXT")
+        );
     }
 
     /// A node outside a database has no file, and the message has to say what
