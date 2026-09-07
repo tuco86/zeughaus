@@ -140,9 +140,10 @@ impl ExecutableNode for DatabaseNode {
 /// a wire is the referenced one.
 ///
 /// Creating is the execution, and so is following the schema afterwards: a
-/// field the file does not have yet is added, and a field renamed in the graph
-/// is renamed in the file. What stays refused is what SQLite cannot do in
-/// place -- dropping a column or changing its type.
+/// field the file does not have yet is added, a field renamed in the graph is
+/// renamed in the file, and a field removed from the node is dropped from the
+/// file. What stays refused is a retype -- the one edit SQLite cannot do in
+/// place -- and whatever SQLite itself refuses to drop.
 pub struct TableNode {
     db_path: String,
     name: String,
@@ -291,17 +292,11 @@ impl ExecutableNode for TableNode {
         };
 
         // What is in the file decides, not what this node declared. A field
-        // the file does not have yet is added; a column the file has and the
-        // node does not, or one whose type changed, is refused -- SQLite
-        // cannot drop or retype a column in place, and guessing which of the
-        // two the user meant is how data gets lost.
-
+        // the file does not have yet is added, a column the node no longer
+        // declares is dropped, and only a column whose type changed is
+        // refused -- that is the one edit SQLite cannot do in place, and
+        // guessing between a cast and a rename is how data gets lost.
         let mut refused: Vec<String> = Vec::new();
-        for (name, _) in &existing {
-            if !columns.iter().any(|(declared, _)| declared == name) {
-                refused.push(format!("{name} would have to be dropped"));
-            }
-        }
         for (name, ty) in &columns {
             let Some((_, have)) = existing.iter().find(|(e, _)| e == name) else {
                 continue;
@@ -319,6 +314,35 @@ impl ExecutableNode for TableNode {
                 self.name,
                 refused.join(", ")
             )));
+        }
+
+        // A field removed in the graph is dropped from the file. `ALTER TABLE
+        // ... DROP COLUMN` has existed since SQLite 3.35 and the bundled
+        // library is newer, so removing a field is an edit like any other
+        // rather than a dead end.
+        //
+        // SQLite refuses a column that carries the primary key, that an index
+        // or a foreign key names, or that a view or generated column reads.
+        // Its own message is the one that reaches the user, because it is the
+        // one that says which of those it is; nothing here can improve on it.
+        //
+        // A rename is settled above, so a field renamed in the graph never
+        // reaches this loop as one column dropped and another added.
+        for (name, _) in &existing {
+            if columns.iter().any(|(declared, _)| declared == name) {
+                continue;
+            }
+            let sql = format!(
+                "ALTER TABLE {} DROP COLUMN {}",
+                quote(&self.name),
+                quote(name)
+            );
+            conn.execute_batch(&sql).map_err(|e| {
+                failed(format!(
+                    "cannot drop column {name} from table {}: {e}",
+                    self.name
+                ))
+            })?;
         }
 
         // A new column may carry its foreign key, but only because SQLite
@@ -1098,26 +1122,48 @@ mod tests {
         );
     }
 
-    /// A column the node no longer declares, and one whose type changed, are
-    /// the two cases SQLite cannot do in place -- and the message has to name
-    /// which one it is.
+    /// A field removed from the node is dropped from the file, with the data
+    /// of the columns beside it untouched. A retype is the one edit left that
+    /// SQLite cannot do in place, and it has to say so.
     #[test]
-    fn dropping_or_retyping_a_column_is_refused() {
+    fn retyping_is_refused_and_dropping_drops() {
         let path = temp_db("mismatch");
         let mut node = TableNode::new();
         set(&mut node, DB_PATH, &path);
         set(&mut node, "name", "samples");
-        set(&mut node, "columns", "id:int\nx:float");
+        set(&mut node, "columns", "id:int\nx:float\nnote:str");
         node.execute(&InputSet::new(), &mut ctx()).expect("create");
+        {
+            let conn = open(&path).expect("open");
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute_batch("INSERT INTO \"samples\" (\"x\", \"note\") VALUES (1.5, 'hi')")
+                .expect("row");
+        }
 
-        let mut dropped = TableNode::new();
-        set(&mut dropped, DB_PATH, &path);
-        set(&mut dropped, "name", "samples");
-        set(&mut dropped, "columns", "id:int");
-        let error = dropped
-            .execute(&InputSet::new(), &mut ctx())
-            .expect_err("dropped column");
-        assert!(error.to_string().contains("x would have to be dropped"));
+        // The field is removed in the graph, so the column goes.
+        set(&mut node, "columns", "id:int\nx:float");
+        node.execute(&InputSet::new(), &mut ctx()).expect("drop");
+        // And the next pass has nothing left to do.
+        node.execute(&InputSet::new(), &mut ctx())
+            .expect("idempotent");
+
+        let (columns, value) = {
+            let conn = open(&path).expect("open");
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            let columns = table_columns(&conn, "samples").expect("columns");
+            let value: f64 = conn
+                .query_row("SELECT \"x\" FROM \"samples\"", [], |row| row.get(0))
+                .expect("value");
+            (columns, value)
+        };
+        assert_eq!(
+            columns,
+            vec![
+                ("id".to_string(), "INTEGER".to_string()),
+                ("x".to_string(), "REAL".to_string()),
+            ]
+        );
+        assert_eq!(value, 1.5);
 
         let mut retyped = TableNode::new();
         set(&mut retyped, DB_PATH, &path);
@@ -1131,6 +1177,30 @@ mod tests {
                 .to_string()
                 .contains("x is REAL in the file, not TEXT")
         );
+    }
+
+    /// What SQLite will not drop, the user has to read from SQLite: the
+    /// primary key is the column every table of these nodes has, and its
+    /// refusal names the reason.
+    #[test]
+    fn a_column_sqlite_refuses_to_drop_reports_its_reason() {
+        let path = temp_db("undroppable");
+        let mut node = TableNode::new();
+        set(&mut node, DB_PATH, &path);
+        set(&mut node, "name", "samples");
+        set(&mut node, "columns", "id:int\nx:float");
+        node.execute(&InputSet::new(), &mut ctx()).expect("create");
+
+        set(&mut node, "columns", "x:float");
+        let error = node
+            .execute(&InputSet::new(), &mut ctx())
+            .expect_err("primary key");
+        let text = error.to_string();
+        assert!(
+            text.contains("cannot drop column id from table samples"),
+            "{text}"
+        );
+        assert!(text.to_lowercase().contains("primary key"), "{text}");
     }
 
     /// A node outside a database has no file, and the message has to say what
