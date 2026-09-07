@@ -41,8 +41,8 @@ use serde::{Deserialize, Serialize};
 use zeughaus_core::Image;
 
 pub use events::{
-    MAX_EVENT_BYTES, MAX_SNAPSHOT_BYTES, MAX_TRIGGER_BYTES, OutputRow, RuntimeEvent, Snapshot,
-    TOPIC_EDGE, TOPIC_OUTPUT, TriggerRequest,
+    ErrorRow, MAX_EVENT_BYTES, MAX_SNAPSHOT_BYTES, MAX_TRIGGER_BYTES, OutputRow, RuntimeEvent,
+    Snapshot, TOPIC_EDGE, TOPIC_ERROR, TOPIC_OUTPUT, TriggerRequest,
 };
 
 /// The endpoint a viewer dials for frames. Opaque to weida and matched

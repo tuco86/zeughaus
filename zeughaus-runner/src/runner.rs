@@ -20,7 +20,9 @@ use zeughaus_core::{
 };
 use weida::Publisher;
 use zeughaus_runtime::{DeferredWork, Graph, GraphEdge, GraphExecutor, GraphNode};
-use zeughaus_samples::{OutputRow, RuntimeEvent, Snapshot, TOPIC_EDGE, TOPIC_OUTPUT};
+use zeughaus_samples::{
+    ErrorRow, OutputRow, RuntimeEvent, Snapshot, TOPIC_EDGE, TOPIC_ERROR, TOPIC_OUTPUT,
+};
 use zeughaus_sync::SyncEvent;
 use zeughaus_sync::module_bindings::DbConnection;
 
@@ -354,6 +356,9 @@ impl Runner {
     fn after_pass(&mut self) {
         self.log_errors();
         self.publish();
+        // Failures are state like a value is, and they travel the same way: the
+        // process that ran the node is not the process drawing it.
+        self.publish_errors();
         // Traffic, after the values it carried: an editor that draws a particle
         // has to have the value the particle stands for.
         let delivered = self.executor.take_delivered();
@@ -393,9 +398,12 @@ impl Runner {
         eprintln!("[runner] firing {id}");
         // The press itself is the signal; the value only has to arrive. A node
         // that refuses it did not fire, so asking for a pass would report a
-        // press that never happened.
+        // press that never happened -- and the editor that pressed has to be
+        // told, which is what the node error is for.
         if let Err(e) = self.executor.set_parameter(id, "fire", Value::new(true)) {
-            eprintln!("[runner] {id} refused the trigger: {e}");
+            let message = format!("the trigger was refused: {e}");
+            eprintln!("[runner] {id}: {message}");
+            self.executor.report_error(id, message);
             return false;
         }
         true
@@ -476,19 +484,23 @@ impl Runner {
             return;
         }
         for (name, text) in changed {
-            // Two ways a value does not arrive, and a silent one is
-            // indistinguishable from a setting that never reached this process:
-            // the text is not a value of the node's parameter type at all, or
-            // the node refuses it. Either way the node keeps what it had, and
-            // naming the node, the key and the text is what a user needs to
-            // find the field to fix. There is no node-error channel to editors
-            // yet, so this log is the only place it surfaces.
+            // Two ways a value does not arrive: the text is not a value of the
+            // node's parameter type at all, or the node refuses it. Either way
+            // the node keeps what it had, which is a node whose setting on
+            // screen is not the setting it runs on -- so it is reported as a
+            // node error and reaches the editor that typed it. The next value
+            // the node does accept marks it dirty, and the clean run that
+            // follows clears the error.
             let Some(value) = param_value(type_id, &text) else {
-                eprintln!("[runner] {id} ({type_id}): {name} = {text:?} is not a value it takes");
+                let message = format!("{name}: {text:?} is not a value this node takes");
+                eprintln!("[runner] {id} ({type_id}): {message}");
+                self.executor.report_error(id, message);
                 continue;
             };
             if let Err(e) = self.executor.set_parameter(id, &name, value) {
-                eprintln!("[runner] {id} ({type_id}) refused {name} = {text:?}: {e}");
+                let message = format!("{name}: {e}");
+                eprintln!("[runner] {id} ({type_id}) refused {text:?}: {message}");
+                self.executor.report_error(id, message);
             }
         }
         // A setting can decide a node's pins (a table's column list is one), so
@@ -677,6 +689,46 @@ impl Runner {
         self.published.flush(self.seq, &self.snapshot);
     }
 
+    /// Publishes which nodes are failing, and why.
+    ///
+    /// The only path a node error has to an editor. A viewer does not execute,
+    /// so it cannot discover a failure itself: without this the report lived
+    /// in this process's log and the editor's error surface -- the status bar
+    /// line, the red node border -- was drawn from a set that was always
+    /// empty.
+    ///
+    /// Diffed against the same baseline the outputs use, so a node that keeps
+    /// failing for the same reason costs nothing per pass, and the snapshot a
+    /// late editor is served says exactly what the live events said.
+    fn publish_errors(&mut self) {
+        if !self.is_owner {
+            return;
+        }
+        let current: HashMap<NodeId, String> = self
+            .executor
+            .errors()
+            .map(|(id, message)| (id, message.to_string()))
+            .collect();
+        let changes = error_changes(self.published.errors(), &current);
+        if changes.is_empty() {
+            return;
+        }
+        for (id, message) in changes {
+            let seq = self.next_seq();
+            let event = match message {
+                Some(message) => RuntimeEvent::NodeError {
+                    seq,
+                    node_id: id.0,
+                    message,
+                },
+                None => RuntimeEvent::NodeErrorCleared { seq, node_id: id.0 },
+            };
+            self.emit(TOPIC_ERROR, event);
+        }
+        self.published.set_errors(current);
+        self.published.flush(self.seq, &self.snapshot);
+    }
+
     /// Records the pinned URL this process serves on and announces it.
     ///
     /// Called once the listener is bound and never before: an editor that
@@ -849,7 +901,35 @@ impl AppliedParams {
     }
 }
 
-/// What editors have been told, in the two forms it is needed in: the per-pin
+/// What an editor has to be told to get from `published` to `current`.
+///
+/// `Some(message)` is a failure it does not know about yet, or one whose
+/// message changed; `None` is a recovery. A node that keeps failing for the
+/// same reason yields nothing, which is what makes reporting per pass free at
+/// frame rate.
+///
+/// Sorted by node id: two runners and two passes then describe the same change
+/// in the same order, and a log or a test reads the same way twice.
+fn error_changes(
+    published: &HashMap<NodeId, String>,
+    current: &HashMap<NodeId, String>,
+) -> Vec<(NodeId, Option<String>)> {
+    let mut changes: Vec<(NodeId, Option<String>)> = Vec::new();
+    for (id, message) in current {
+        if published.get(id) != Some(message) {
+            changes.push((*id, Some(message.clone())));
+        }
+    }
+    for id in published.keys() {
+        if !current.contains_key(id) {
+            changes.push((*id, None));
+        }
+    }
+    changes.sort_by_key(|(id, _)| *id);
+    changes
+}
+
+/// What editors have been told, in the two forms it is needed in: the
 /// baseline the next pass is diffed against, and the snapshot a late joiner is
 /// served.
 ///
@@ -857,9 +937,16 @@ impl AppliedParams {
 /// removed node was dropped from the baseline, the next pass had nothing to
 /// say about a node the graph no longer holds, and the snapshot kept serving
 /// its outputs to every editor that joined afterwards.
+///
+/// Failures are held beside the values for exactly that reason: an editor
+/// joining late has to be told which nodes are broken by the same snapshot
+/// that tells it the numbers, or it would draw a graph that looks healthy
+/// until the next failure happens.
 #[derive(Default)]
 pub struct Published {
     baseline: HashMap<NodeId, HashMap<String, (String, String)>>,
+    /// Why each failing node is failing, as editors were last told.
+    errors: HashMap<NodeId, String>,
     /// Whether the snapshot still matches the baseline. Rebuilding is deferred
     /// because one pass touches many nodes and the snapshot only has to be
     /// current when it is read.
@@ -878,19 +965,33 @@ impl Published {
         self.stale = true;
     }
 
-    /// Forgets a node: its outputs are gone with it.
+    /// Forgets a node: its outputs and its failure are gone with it.
     pub fn forget(&mut self, node: NodeId) {
-        if self.baseline.remove(&node).is_some() {
+        if self.baseline.remove(&node).is_some() | self.errors.remove(&node).is_some() {
             self.stale = true;
         }
     }
 
+    /// Which nodes editors were last told are failing, for the diff.
+    pub fn errors(&self) -> &HashMap<NodeId, String> {
+        &self.errors
+    }
+
+    /// Records the current set of failing nodes.
+    pub fn set_errors(&mut self, errors: HashMap<NodeId, String>) {
+        if self.errors != errors {
+            self.stale = true;
+        }
+        self.errors = errors;
+    }
+
     /// Forgets everything, as when this process stops owning execution.
     pub fn clear(&mut self) {
-        if !self.baseline.is_empty() {
+        if !self.baseline.is_empty() || !self.errors.is_empty() {
             self.stale = true;
         }
         self.baseline.clear();
+        self.errors.clear();
     }
 
     /// Writes the snapshot if the baseline moved since the last call.
@@ -914,7 +1015,19 @@ impl Published {
                 })
             })
             .collect();
-        *into.lock().unwrap_or_else(|e| e.into_inner()) = Snapshot { seq, outputs };
+        let errors: Vec<ErrorRow> = self
+            .errors
+            .iter()
+            .map(|(id, message)| ErrorRow {
+                node_id: id.0,
+                message: message.clone(),
+            })
+            .collect();
+        *into.lock().unwrap_or_else(|e| e.into_inner()) = Snapshot {
+            seq,
+            outputs,
+            errors,
+        };
         self.stale = false;
     }
 }
@@ -1142,5 +1255,78 @@ mod tests {
         // A result stamped with an epoch this process has not reached cannot be
         // its own either.
         assert!(!accepts_async_result(true, 3, 4));
+    }
+
+    fn errors(pairs: &[(u64, &str)]) -> HashMap<NodeId, String> {
+        pairs
+            .iter()
+            .map(|(id, message)| (NodeId(*id), message.to_string()))
+            .collect()
+    }
+
+    /// The whole point of the diff: a node that keeps failing for the same
+    /// reason is not news, so a graph with one broken node costs nothing per
+    /// pass at frame rate. A changed message is news, and so is a recovery.
+    #[test]
+    fn only_a_new_changed_or_gone_error_is_reported() {
+        let published = errors(&[(1, "no table wired"), (2, "cannot open /x")]);
+
+        assert!(error_changes(&published, &published).is_empty());
+
+        let current = errors(&[
+            (1, "no table wired"),
+            (2, "cannot open /y"),
+            (3, "cycle detected"),
+        ]);
+        assert_eq!(
+            error_changes(&published, &current),
+            vec![
+                (NodeId(2), Some("cannot open /y".to_string())),
+                (NodeId(3), Some("cycle detected".to_string())),
+            ]
+        );
+
+        // A node that stopped failing has to be said out loud, or a fixed node
+        // keeps its red border for the session.
+        assert_eq!(
+            error_changes(&published, &errors(&[(1, "no table wired")])),
+            vec![(NodeId(2), None)]
+        );
+    }
+
+    /// A late editor learns which nodes are broken from the snapshot, or it
+    /// draws a graph that looks healthy until the next failure happens.
+    #[test]
+    fn the_snapshot_carries_the_failing_nodes() {
+        let snapshot = Mutex::new(Snapshot::default());
+        let mut published = Published::default();
+        published.set(NodeId(1), pins("out", "1"));
+        published.set_errors(errors(&[(2, "no frame wired")]));
+        published.flush(4, &snapshot);
+        let served = snapshot.lock().expect("snapshot");
+        assert_eq!(served.errors.len(), 1);
+        assert_eq!(served.errors[0].node_id, 2);
+        assert_eq!(served.errors[0].message, "no frame wired");
+        drop(served);
+
+        // Losing ownership answers for nothing any more, failures included.
+        published.clear();
+        published.flush(5, &snapshot);
+        let served = snapshot.lock().expect("snapshot");
+        assert!(served.errors.is_empty());
+        assert!(served.outputs.is_empty());
+    }
+
+    /// A deleted node's failure goes with it: nothing would ever clear an
+    /// error on a node no editor can see.
+    #[test]
+    fn forgetting_a_node_takes_its_error_too() {
+        let snapshot = Mutex::new(Snapshot::default());
+        let mut published = Published::default();
+        published.set_errors(errors(&[(7, "no table wired")]));
+        published.flush(1, &snapshot);
+        published.forget(NodeId(7));
+        published.flush(2, &snapshot);
+        assert!(snapshot.lock().expect("snapshot").errors.is_empty());
     }
 }

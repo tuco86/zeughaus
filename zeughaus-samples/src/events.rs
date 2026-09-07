@@ -35,6 +35,19 @@ pub enum RuntimeEvent {
     /// traffic rather than of state, which is what makes one message one
     /// particle even when the value did not change.
     Edge { seq: u64, edge_id: u64 },
+    /// A node's last run failed, with the message the user has to act on.
+    ///
+    /// The only path a failure has to an editor: the process that ran the node
+    /// is not the process drawing it, so without this the report existed
+    /// nowhere but the runtime's own log.
+    NodeError {
+        seq: u64,
+        node_id: u64,
+        message: String,
+    },
+    /// A node stopped failing. Recovery is a state an editor has to be able to
+    /// reach, or a fixed node would keep its red border for the session.
+    NodeErrorCleared { seq: u64, node_id: u64 },
 }
 
 impl RuntimeEvent {
@@ -60,6 +73,13 @@ pub struct OutputRow {
     pub value: String,
 }
 
+/// One failing node in a [`Snapshot`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorRow {
+    pub node_id: u64,
+    pub message: String,
+}
+
 /// Everything the runtime currently holds, for an editor that joined after the
 /// values were produced.
 ///
@@ -69,6 +89,10 @@ pub struct OutputRow {
 pub struct Snapshot {
     pub seq: u64,
     pub outputs: Vec<OutputRow>,
+    /// The nodes currently failing. Absence means "not failing", exactly as an
+    /// absent output means "produced nothing".
+    #[serde(default)]
+    pub errors: Vec<ErrorRow>,
 }
 
 impl Snapshot {
@@ -102,6 +126,9 @@ pub const TOPIC_OUTPUT: &str = "output";
 
 /// Topic of [`RuntimeEvent::Edge`].
 pub const TOPIC_EDGE: &str = "edge";
+
+/// Topic of [`RuntimeEvent::NodeError`] and [`RuntimeEvent::NodeErrorCleared`].
+pub const TOPIC_ERROR: &str = "error";
 
 /// Largest event payload a subscriber reads. An event is a few identifiers and
 /// a scalar rendered as text; the cap is what stops a peer from making a viewer
@@ -137,6 +164,15 @@ mod tests {
                 pin: "result".to_owned(),
             },
             RuntimeEvent::Edge { seq: 9, edge_id: 4 },
+            RuntimeEvent::NodeError {
+                seq: 10,
+                node_id: 5,
+                message: "no table wired".to_owned(),
+            },
+            RuntimeEvent::NodeErrorCleared {
+                seq: 11,
+                node_id: 5,
+            },
         ];
         for event in events {
             assert_eq!(RuntimeEvent::decode(&event.encode()), Some(event));
@@ -161,8 +197,22 @@ mod tests {
                 ty: "int".to_owned(),
                 value: "42".to_owned(),
             }],
+            errors: vec![ErrorRow {
+                node_id: 2,
+                message: "cannot open /srv/x.sqlite".to_owned(),
+            }],
         };
         assert_eq!(Snapshot::decode(&snapshot.encode()), Some(snapshot));
+    }
+
+    /// A runtime older than the error channel sends a snapshot without the
+    /// field. Reading it as "nothing is failing" is what keeps a viewer from
+    /// refusing the whole snapshot -- and the values in it -- over an addition.
+    #[test]
+    fn a_snapshot_without_errors_still_decodes() {
+        let decoded = Snapshot::decode(br#"{"seq":3,"outputs":[]}"#).expect("snapshot");
+        assert_eq!(decoded.seq, 3);
+        assert!(decoded.errors.is_empty());
     }
 
     #[test]

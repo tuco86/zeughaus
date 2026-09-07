@@ -1276,6 +1276,11 @@ impl App {
                     particles.pop_front();
                 }
             }
+            // The runtime now reports node failures, and drawing them is the
+            // editor's half of that change: not wired up yet, so they are
+            // dropped rather than half-applied.
+            Traffic::Event(RuntimeEvent::NodeError { .. })
+            | Traffic::Event(RuntimeEvent::NodeErrorCleared { .. }) => {}
             Traffic::Lost => self.traffic_live = false,
         }
     }

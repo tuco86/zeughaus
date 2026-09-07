@@ -116,6 +116,20 @@ impl GraphExecutor {
         self.node_errors.get(&id).map(String::as_str)
     }
 
+    /// Records a failure that is not the end of an execution.
+    ///
+    /// A rejected parameter and a node caught in a cycle are both failures the
+    /// user has to see, but neither is a run that finished: `pending` is left
+    /// alone, so a node awaiting an async result keeps awaiting it instead of
+    /// being dispatched a second time. Cleared like every other node error, by
+    /// the node's next clean run.
+    pub fn report_error(&mut self, id: NodeId, message: String) {
+        if self.graph.node(id).is_none() {
+            return;
+        }
+        self.node_errors.insert(id, message);
+    }
+
     /// Every node that failed in the last pass, in no particular order.
     pub fn errors(&self) -> impl Iterator<Item = (NodeId, &str)> {
         self.node_errors.iter().map(|(id, msg)| (*id, msg.as_str()))
@@ -206,11 +220,11 @@ impl GraphExecutor {
     pub fn execute_dirty(&mut self) -> Result<DeferredWork> {
         let (order, stuck) = self.topology();
         for id in stuck.iter().copied() {
-            // Not `mark_error`: a node in a cycle that is awaiting an async
-            // result is still awaiting it, and forgetting that would let the
-            // node be dispatched twice.
+            // `report_error`, not `mark_error`: a node in a cycle that is
+            // awaiting an async result is still awaiting it, and forgetting
+            // that would let the node be dispatched twice.
             self.dirty.remove(&id);
-            self.node_errors.insert(id, CYCLE_ERROR.to_string());
+            self.report_error(id, CYCLE_ERROR.to_string());
         }
         let dirty = std::mem::take(&mut self.dirty);
         let mut deferred: DeferredWork = Vec::new();
