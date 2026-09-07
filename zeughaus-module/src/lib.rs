@@ -15,7 +15,7 @@
 //! Built for the wasm32 module target with `spacetime build` (this crate is
 //! excluded from the native workspace build).
 
-use spacetimedb::{Identity, ReducerContext, Table, reducer, table};
+use spacetimedb::{Identity, ReducerContext, Table, log, reducer, table};
 
 /// A connected editor. `seq` is monotonic, so "lowest seq" is a stable,
 /// server-decided answer to "who executes" that needs no election protocol:
@@ -117,8 +117,14 @@ pub fn set_node_params(ctx: &ReducerContext, id: u64, params: String) {
 /// Recursive because a container node IS its contents: deleting the container
 /// row alone would leave its children in the store, parented to a node that no
 /// longer exists and reachable from no graph.
+///
+/// Every call is logged with its caller. These three are the only reducers
+/// that destroy graph state, and a row that vanished with nobody able to say
+/// which client asked for it is a bug nobody can chase -- `spacetime logs`
+/// otherwise records only the calls that FAILED.
 #[reducer]
 pub fn delete_node(ctx: &ReducerContext, id: u64) {
+    log::info!("delete_node {id} by {}", ctx.sender());
     let mut stack = vec![id];
     while let Some(current) = stack.pop() {
         ctx.db.node().id().delete(current);
@@ -159,6 +165,7 @@ pub fn connect_edge(
 
 #[reducer]
 pub fn disconnect_edge(ctx: &ReducerContext, id: u64) {
+    log::info!("disconnect_edge {id} by {}", ctx.sender());
     ctx.db.edge().id().delete(id);
 }
 
@@ -167,10 +174,18 @@ pub fn disconnect_edge(ctx: &ReducerContext, id: u64) {
 #[reducer]
 pub fn replace_graph(ctx: &ReducerContext, nodes: Vec<Node>, edges: Vec<Edge>) {
     let node_ids: Vec<u64> = ctx.db.node().iter().map(|n| n.id).collect();
+    let edge_ids: Vec<u64> = ctx.db.edge().iter().map(|e| e.id).collect();
+    log::info!(
+        "replace_graph by {}: {} nodes and {} edges replace {} nodes and {} edges",
+        ctx.sender(),
+        nodes.len(),
+        edges.len(),
+        node_ids.len(),
+        edge_ids.len()
+    );
     for id in node_ids {
         ctx.db.node().id().delete(id);
     }
-    let edge_ids: Vec<u64> = ctx.db.edge().iter().map(|e| e.id).collect();
     for id in edge_ids {
         ctx.db.edge().id().delete(id);
     }
