@@ -106,7 +106,14 @@ impl GraphExecutor {
     }
 
     /// Flags a node as failed (used by the host when async work errors).
+    ///
+    /// A node the graph no longer has is ignored: the work outlived the node,
+    /// and recording an error for an id nothing can clear again would leave a
+    /// permanent failure on a node nobody can see or delete.
     pub fn mark_error(&mut self, id: NodeId, message: String) {
+        if self.graph.node(id).is_none() {
+            return;
+        }
         self.pending.remove(&id);
         self.node_errors.insert(id, message);
     }
@@ -299,12 +306,22 @@ impl GraphExecutor {
     /// Delivers the outputs of a previously deferred node, then resumes
     /// execution of its (now unblocked) downstream nodes. Returns any further
     /// deferred work produced downstream (e.g. a chain of chat nodes).
+    ///
+    /// A result for a node the graph no longer has is thrown away: work can
+    /// outlive the node that asked for it (a request in flight when the node
+    /// is deleted), and the state it would leave behind -- an output map and
+    /// an edge cache for an id no node carries -- belongs to nothing and is
+    /// never cleaned up again. There is also nothing downstream left to
+    /// resume, so the whole delivery is a no-op.
     pub fn deliver_async_result(
         &mut self,
         node_id: NodeId,
         outputs: HashMap<String, Value>,
     ) -> Result<DeferredWork> {
         self.pending.remove(&node_id);
+        if self.graph.node(node_id).is_none() {
+            return Ok(DeferredWork::new());
+        }
         self.node_errors.remove(&node_id);
         self.last_outputs.insert(node_id, outputs.clone());
         self.apply_outputs(node_id, outputs);
@@ -1459,5 +1476,41 @@ mod tests {
 
         exec.disconnect_edge(back_id);
         assert_eq!(exec.node_error(broken), Some(OWN));
+    }
+
+    /// Work outlives the node that asked for it when the node is deleted
+    /// mid-request. Applying the result then wrote an output map and an edge
+    /// cache for an id no node carries, which nothing ever cleaned up again.
+    #[test]
+    fn a_result_for_a_removed_node_is_ignored() {
+        let mut graph = Graph::new();
+        let a = NodeId::next();
+        let b = NodeId::next();
+        graph.add_node(make_node(a));
+        graph.add_node(make_node(b));
+        graph.add_edge(make_edge(a, "value", b, "in"));
+
+        let mut exec = GraphExecutor::new(graph);
+        exec.register_node(a, Box::new(DeferNode(7.0)));
+        exec.register_node(b, Box::new(DoubleNode));
+        let deferred = exec.execute_dirty().expect("pass");
+        assert_eq!(exec.pending_count(), 1);
+
+        // The node is deleted while its work is running.
+        exec.remove_node(a);
+        let work = deferred.into_iter().next().expect("work").1;
+        let outputs = work.run().expect("work");
+        let more = exec.deliver_async_result(a, outputs).expect("delivery");
+
+        assert!(more.is_empty());
+        assert_eq!(exec.pending_count(), 0);
+        assert!(exec.output_value(a, "value").is_none());
+        assert!(exec.node_error(a).is_none());
+
+        // A failure for the same node is equally not worth recording: nothing
+        // could ever clear an error on a node that no longer exists.
+        exec.mark_error(a, "too late".to_string());
+        assert!(exec.node_error(a).is_none());
+        assert_eq!(exec.errors().count(), 0);
     }
 }
