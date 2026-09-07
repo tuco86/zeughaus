@@ -137,6 +137,10 @@ pub enum Message {
     SyncPoll,
     // Copy the current collaboration session id to the clipboard (palette).
     CopySessionId,
+    // The window was asked to close. Handled rather than obeyed, because a
+    // settings edit held back for the debounce would otherwise be lost from
+    // the store: the editor flushes and then closes the window itself.
+    CloseRequested(iced::window::Id),
     // File operations
     SaveGraph,
     LoadGraph,

@@ -2541,6 +2541,15 @@ impl App {
                     return self.reconcile_runtime();
                 }
             }
+            Message::CloseRequested(window) => {
+                // The last thing this window does. A settings edit is held
+                // back for the debounce, so closing right after typing used to
+                // drop it from the store silently -- and the autosave that
+                // does hold it is not read while a store exists.
+                self.flush_pending();
+                self.autosave();
+                return iced::window::close(window);
+            }
             Message::CopySessionId => {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
@@ -3007,6 +3016,7 @@ impl App {
 
         #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let mut subs = vec![events];
+        subs.push(iced::window::close_requests().map(Message::CloseRequested));
 
         // The library only auto-redraws for animated edges, not node borders.
         // While any node is in error, drive ~30fps redraws so its marching-ants
