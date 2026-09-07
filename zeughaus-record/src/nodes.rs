@@ -1,9 +1,11 @@
 //! The two nodes: one writes a dataset, one plays it back.
 
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use ::image::ImageEncoder;
 
 use zeughaus_core::*;
 
@@ -139,6 +141,13 @@ impl RecorderNode {
         self.seq
     }
 
+    /// Forgets which recording is being written, so the next frame decides the
+    /// directory again and numbering starts at one.
+    fn restart(&mut self) {
+        self.active = None;
+        self.seq = 0;
+    }
+
     fn emit_state(&self, ctx: &mut NodeContext) {
         ctx.emit_typed("count", self.seq as i64);
         ctx.emit_typed("session", self.active.clone().unwrap_or_default());
@@ -177,13 +186,22 @@ impl RecorderNode {
 
         let seq = self.seq + 1;
         let file = frame_file(seq);
-        // `::image`: `zeughaus_core::*` brings in a module of the same name.
-        let buffer =
-            ::image::RgbaImage::from_raw(frame.width(), frame.height(), frame.rgba().to_vec())
-                .ok_or_else(|| failed("frame geometry does not match its pixels"))?;
-        buffer
-            .save(dir.join(&file))
-            .map_err(|e| failed(format!("cannot write {file}: {e}")))?;
+        // Encoded straight out of the frame's shared buffer: an `RgbaImage`
+        // would need its own copy of it, which for a 4K frame is 33 MB per
+        // written frame for nothing. `::image` because `zeughaus_core::*`
+        // brings in a module of the same name.
+        let target = dir.join(&file);
+        let sink = io::BufWriter::new(
+            fs::File::create(&target).map_err(|e| failed(format!("cannot write {file}: {e}")))?,
+        );
+        ::image::codecs::png::PngEncoder::new(sink)
+            .write_image(
+                frame.rgba(),
+                frame.width(),
+                frame.height(),
+                ::image::ExtendedColorType::Rgba8,
+            )
+            .map_err(|e| failed(format!("cannot encode {file}: {e}")))?;
 
         let line = serde_json::json!({
             "seq": seq,
@@ -252,15 +270,22 @@ impl ExecutableNode for RecorderNode {
             return Ok(());
         };
         match name {
-            "dir" => self.dir = text.trim().to_string(),
+            // Either setting decides where the frames go, so either one is a
+            // new recording: leaving `seq` alone would continue numbering into
+            // a fresh index under the new root, splitting one nominal session
+            // across two directories.
+            "dir" => {
+                let dir = text.trim().to_string();
+                if dir != self.dir {
+                    self.dir = dir;
+                    self.restart();
+                }
+            }
             "session" => {
                 let session = text.trim().to_string();
                 if session != self.session {
                     self.session = session;
-                    // A new session is a new recording: numbering restarts and
-                    // the directory is decided again on the next frame.
-                    self.active = None;
-                    self.seq = 0;
+                    self.restart();
                 }
             }
             _ => {}
@@ -624,6 +649,44 @@ mod tests {
                     .get("seq")
                     .and_then(Value::downcast_ref::<i64>),
                 Some(&1)
+            );
+        }
+    }
+
+    /// Both settings decide where the frames go, so both start a new
+    /// recording. Numbering that continued into the new directory would leave
+    /// one nominal session split across two roots, with an index in each that
+    /// names only part of it.
+    #[test]
+    fn changing_the_directory_starts_a_new_recording() {
+        let first = temp_dir("dir-a");
+        let second = temp_dir("dir-b");
+        let mut writer = RecorderNode::new();
+        set(&mut writer, "session", "run1");
+
+        let mut inputs = InputSet::new();
+        inputs.insert("frame", Value::new(frame(0x40)));
+        inputs.mark_changed("frame");
+
+        for dir in [&first, &second] {
+            set(&mut writer, "dir", &dir.to_string_lossy());
+            let mut writing = ctx();
+            writer.execute(&inputs, &mut writing).expect("write");
+            assert_eq!(
+                writing
+                    .take_outputs()
+                    .get("count")
+                    .and_then(Value::downcast_ref::<i64>),
+                Some(&1),
+                "each directory is its own recording"
+            );
+            assert!(dir.join("run1").join(frame_file(1)).exists());
+            assert_eq!(
+                fs::read_to_string(dir.join("run1").join(INDEX_FILE))
+                    .expect("index")
+                    .lines()
+                    .count(),
+                1
             );
         }
     }
