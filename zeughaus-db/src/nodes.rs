@@ -45,6 +45,40 @@ fn table_columns(conn: &rusqlite::Connection, table: &str) -> Result<Vec<(String
         .map_err(|e| failed(format!("{sql}: {e}")))
 }
 
+/// The one column a rename turned into another, read off the difference
+/// between the file and what the node declares, as `(old, new)`.
+///
+/// Recognised as narrowly as the editor's own detection: exactly one declared
+/// field missing from the file, exactly one file column no longer declared,
+/// and the same SQLite affinity. Anything else -- a field added, a field
+/// removed, two of each -- is not a rename, and `ALTER TABLE RENAME COLUMN`
+/// on a guess moves someone's data under a name they did not choose.
+///
+/// Stateless on purpose. Deriving it here means a standby runner that never
+/// saw the edits, a pass that failed before this point, and a chain of renames
+/// typed in one go all reach the same answer: whatever the file and the node
+/// currently disagree about.
+fn renamed_column(
+    existing: &[(String, String)],
+    declared: &[(String, ColTy)],
+) -> Option<(String, String)> {
+    let mut added = declared
+        .iter()
+        .filter(|(name, _)| !existing.iter().any(|(have, _)| have == name));
+    let mut dropped = existing
+        .iter()
+        .filter(|(name, _)| !declared.iter().any(|(want, _)| want == name));
+    let (new, ty) = added.next()?;
+    let (old, have) = dropped.next()?;
+    if added.next().is_some() || dropped.next().is_some() {
+        return None;
+    }
+    if !have.eq_ignore_ascii_case(ty.affinity()) {
+        return None;
+    }
+    Some((old.clone(), new.clone()))
+}
+
 /// The database itself: a container whose `path` names the file.
 ///
 /// It executes nothing. What it contributes is the path its children inherit
@@ -116,13 +150,6 @@ pub struct TableNode {
     /// The relations this table's fields declare, as the editor derived them
     /// from the wires: one `field -> table.field` per line.
     relations: String,
-    /// A field renamed since the last pass, as `(old, new)`, waiting to be
-    /// applied to the file.
-    ///
-    /// Held rather than applied at once because `set_parameter` has no
-    /// database: the file is only opened during `execute`, where the path is
-    /// known to be resolved and an error has somewhere to go.
-    pending_rename: Option<(String, String)>,
     pins: Vec<PinDefinition>,
 }
 
@@ -142,7 +169,6 @@ impl TableNode {
             name: Self::DEFAULT_NAME.to_string(),
             columns: Self::DEFAULT_COLUMNS.to_string(),
             relations: String::new(),
-            pending_rename: None,
             pins: Vec::new(),
         };
         node.rebuild_pins();
@@ -238,34 +264,37 @@ impl ExecutableNode for TableNode {
             .map_err(|e| failed(format!("{ddl}: {e}")))?;
 
         // A field renamed in the graph is renamed in the file, before the
-        // schemas are compared -- otherwise the same edit would read as a
-        // column dropped and another added, and be refused. Guarded on what
-        // the file actually has: the rename is applied once, and a node that
-        // reruns (or a second runner that never saw the edit) finds nothing to
-        // do rather than an error.
-        if let Some((old, new)) = self.pending_rename.take() {
-            let has = |column: &str, columns: &[(String, String)]| {
-                columns.iter().any(|(name, _)| name == column)
-            };
-            let before = table_columns(&conn, &self.name)?;
-            if has(&old, &before) && !has(&new, &before) {
-                let sql = format!(
-                    "ALTER TABLE {} RENAME COLUMN {} TO {}",
-                    quote(&self.name),
-                    quote(&old),
-                    quote(&new)
-                );
-                conn.execute_batch(&sql)
-                    .map_err(|e| failed(format!("{sql}: {e}")))?;
-            }
-        }
+        // schemas are compared -- otherwise the same edit reads as one column
+        // dropped and another added, and is refused.
+        //
+        // Derived from the file, not remembered. A remembered chain (`x->y`
+        // then `y->z` collapsing to `x->z`) is per-process state, and there
+        // are two processes: a standby accumulates the same chain without
+        // executing it, so killing the owner mid-chain left the file at `y`
+        // and the new owner looking for `x`, which wedged the table forever.
+        // Reading the difference off the file is stateless, idempotent, and
+        // survives a pass that failed before it got here.
+        let existing = if let Some((old, new)) =
+            renamed_column(&table_columns(&conn, &self.name)?, &columns)
+        {
+            let sql = format!(
+                "ALTER TABLE {} RENAME COLUMN {} TO {}",
+                quote(&self.name),
+                quote(&old),
+                quote(&new)
+            );
+            conn.execute_batch(&sql)
+                .map_err(|e| failed(format!("{sql}: {e}")))?;
+            table_columns(&conn, &self.name)?
+        } else {
+            table_columns(&conn, &self.name)?
+        };
 
         // What is in the file decides, not what this node declared. A field
         // the file does not have yet is added; a column the file has and the
         // node does not, or one whose type changed, is refused -- SQLite
         // cannot drop or retype a column in place, and guessing which of the
         // two the user meant is how data gets lost.
-        let existing = table_columns(&conn, &self.name)?;
 
         let mut refused: Vec<String> = Vec::new();
         for (name, _) in &existing {
@@ -354,21 +383,14 @@ impl ExecutableNode for TableNode {
             // asked for them again after a setting changed
             // (`GraphExecutor::refresh_pins`).
             //
-            // One name changed in place is a rename, and the file is told so
-            // on the next pass. Renames chain: if the last one has not reached
-            // the file yet, the file still holds the first `old`, so the two
-            // collapse into one.
+            // A rename is not remembered here: `execute` reads it off the
+            // difference between the file and this list, which is what makes
+            // it survive a standby taking over mid-chain.
             "columns" => {
                 // Validated before anything is replaced: an unparsable line
                 // used to make every field pin (and every wire on it) vanish,
                 // with the only report a later generic "no fields".
                 parse_columns_checked(&text)?;
-                if let Some((old, new)) = renamed_field(&self.columns, &text) {
-                    self.pending_rename = match self.pending_rename.take() {
-                        Some((first, waiting)) if waiting == old => Some((first, new)),
-                        _ => Some((old, new)),
-                    };
-                }
                 self.columns = text;
                 self.rebuild_pins();
             }
@@ -989,6 +1011,91 @@ mod tests {
             ]
         );
         assert_eq!(value, 1.5);
+    }
+
+    /// A rename is read off the file, so a process that never saw the earlier
+    /// edits finishes the job. This is the standby taking over mid-chain: the
+    /// owner applied `x -> y` and died, and the new owner's node declares `z`
+    /// with no idea that `x` ever existed.
+    #[test]
+    fn a_process_that_never_saw_the_rename_still_applies_it() {
+        let path = temp_db("midchain");
+        let mut owner = TableNode::new();
+        set(&mut owner, DB_PATH, &path);
+        set(&mut owner, "name", "samples");
+        set(&mut owner, "columns", "id:int\nx:float");
+        owner.execute(&InputSet::new(), &mut ctx()).expect("create");
+        set(&mut owner, "columns", "id:int\ny:float");
+        owner.execute(&InputSet::new(), &mut ctx()).expect("x -> y");
+
+        // A fresh node, as a standby's would be: it has never held `x`.
+        let mut standby = TableNode::new();
+        set(&mut standby, DB_PATH, &path);
+        set(&mut standby, "name", "samples");
+        set(&mut standby, "columns", "id:int\nz:float");
+        standby
+            .execute(&InputSet::new(), &mut ctx())
+            .expect("y -> z");
+
+        let columns = {
+            let conn = open(&path).expect("open");
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            table_columns(&conn, "samples").expect("columns")
+        };
+        assert_eq!(
+            columns,
+            vec![
+                ("id".to_string(), "INTEGER".to_string()),
+                ("z".to_string(), "REAL".to_string()),
+            ]
+        );
+    }
+
+    /// What counts as a rename and what does not. Guessing wrong here moves
+    /// someone's data under a name they did not choose.
+    #[test]
+    fn a_rename_is_one_column_gone_and_one_arrived_of_the_same_type() {
+        let file = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(n, t)| (n.to_string(), t.to_string()))
+                .collect()
+        };
+        let declared = |pairs: &[(&str, ColTy)]| -> Vec<(String, ColTy)> {
+            pairs.iter().map(|(n, t)| (n.to_string(), *t)).collect()
+        };
+        let have = file(&[("id", "INTEGER"), ("x", "REAL")]);
+
+        assert_eq!(
+            renamed_column(&have, &declared(&[("id", ColTy::Int), ("y", ColTy::Float)])),
+            Some(("x".to_string(), "y".to_string()))
+        );
+        // Nothing changed, a field added, a field removed: not renames.
+        assert_eq!(
+            renamed_column(&have, &declared(&[("id", ColTy::Int), ("x", ColTy::Float)])),
+            None
+        );
+        assert_eq!(
+            renamed_column(
+                &have,
+                &declared(&[("id", ColTy::Int), ("x", ColTy::Float), ("y", ColTy::Str)])
+            ),
+            None
+        );
+        assert_eq!(
+            renamed_column(&have, &declared(&[("id", ColTy::Int)])),
+            None
+        );
+        // Two of each is ambiguous, and a different type is not the same
+        // column under another name.
+        assert_eq!(
+            renamed_column(&have, &declared(&[("a", ColTy::Int), ("b", ColTy::Float)])),
+            None
+        );
+        assert_eq!(
+            renamed_column(&have, &declared(&[("id", ColTy::Int), ("y", ColTy::Str)])),
+            None
+        );
     }
 
     /// A column the node no longer declares, and one whose type changed, are
