@@ -12,6 +12,9 @@ zeughaus-transform.workspace = true
 zeughaus-ml.workspace = true
 # Flow primitives (Hold, future Zip/Pulse). Pure, cross-platform like ml.
 zeughaus-flow.workspace = true
+# Subgraph containers and their boundary nodes. Pure, cross-platform: the
+# nesting is drawn here and executed nowhere.
+zeughaus-graph.workspace = true
 iced_nodegraph.workspace = true
 iced_palette.workspace = true
 serde_json = "1.0"

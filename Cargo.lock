@@ -7104,6 +7104,7 @@ dependencies = [
  "zeughaus-capture",
  "zeughaus-core",
  "zeughaus-flow",
+ "zeughaus-graph",
  "zeughaus-llm",
  "zeughaus-ml",
  "zeughaus-runtime",
@@ -7142,6 +7143,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeughaus-graph"
+version = "0.1.0"
+dependencies = [
+ "zeughaus-core",
+]
+
+[[package]]
 name = "zeughaus-llm"
 version = "0.1.0"
 dependencies = [
@@ -7168,6 +7176,7 @@ dependencies = [
  "zeughaus-capture",
  "zeughaus-core",
  "zeughaus-flow",
+ "zeughaus-graph",
  "zeughaus-llm",
  "zeughaus-ml",
  "zeughaus-runtime",

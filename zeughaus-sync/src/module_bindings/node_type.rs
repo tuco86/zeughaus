@@ -13,6 +13,7 @@ pub struct Node {
     pub x: f32,
     pub y: f32,
     pub params: String,
+    pub parent: u64,
 }
 
 impl __sdk::InModule for Node {
@@ -29,6 +30,7 @@ pub struct NodeCols {
     pub x: __sdk::__query_builder::Col<Node, f32>,
     pub y: __sdk::__query_builder::Col<Node, f32>,
     pub params: __sdk::__query_builder::Col<Node, String>,
+    pub parent: __sdk::__query_builder::Col<Node, u64>,
 }
 
 impl __sdk::__query_builder::HasCols for Node {
@@ -41,6 +43,7 @@ impl __sdk::__query_builder::HasCols for Node {
             x: __sdk::__query_builder::Col::new(table_name, "x"),
             y: __sdk::__query_builder::Col::new(table_name, "y"),
             params: __sdk::__query_builder::Col::new(table_name, "params"),
+            parent: __sdk::__query_builder::Col::new(table_name, "parent"),
         }
     }
 }
@@ -50,6 +53,7 @@ impl __sdk::__query_builder::HasCols for Node {
 /// Provides typed access to indexed columns for query building.
 pub struct NodeIxCols {
     pub id: __sdk::__query_builder::IxCol<Node, u64>,
+    pub parent: __sdk::__query_builder::IxCol<Node, u64>,
 }
 
 impl __sdk::__query_builder::HasIxCols for Node {
@@ -57,6 +61,7 @@ impl __sdk::__query_builder::HasIxCols for Node {
     fn ix_cols(table_name: &'static str) -> Self::IxCols {
         NodeIxCols {
             id: __sdk::__query_builder::IxCol::new(table_name, "id"),
+            parent: __sdk::__query_builder::IxCol::new(table_name, "parent"),
         }
     }
 }

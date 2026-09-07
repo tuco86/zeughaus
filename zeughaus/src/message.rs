@@ -75,6 +75,9 @@ pub enum Message {
         from: PinRef<GraphIds>,
         to: PinRef<GraphIds>,
     },
+    // Show the contents of a container node, or the root graph for id 0. The
+    // one navigation the editor has: a subgraph is drawn nowhere else.
+    EnterGraph(u64),
     GroupMoved {
         node_ids: Vec<u64>,
         delta: Vector,

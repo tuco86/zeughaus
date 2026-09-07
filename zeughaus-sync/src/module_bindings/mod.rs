@@ -63,6 +63,7 @@ pub enum Reducer {
         x: f32,
         y: f32,
         params: String,
+        parent: u64,
     },
     DeleteNode {
         id: u64,
@@ -133,6 +134,7 @@ impl __sdk::Reducer for Reducer {
                 x,
                 y,
                 params,
+                parent,
             } => __sats::bsatn::to_vec(&create_node_reducer::CreateNodeArgs {
                 id: id.clone(),
                 type_id: type_id.clone(),
@@ -140,6 +142,7 @@ impl __sdk::Reducer for Reducer {
                 x: x.clone(),
                 y: y.clone(),
                 params: params.clone(),
+                parent: parent.clone(),
             }),
             Reducer::DeleteNode { id } => {
                 __sats::bsatn::to_vec(&delete_node_reducer::DeleteNodeArgs { id: id.clone() })

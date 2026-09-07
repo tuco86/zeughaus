@@ -63,6 +63,7 @@ fn to_node_data(n: &Node) -> NodeData {
         y: n.y,
         // params are stored as a JSON array of [name, value] pairs.
         params: serde_json::from_str(&n.params).unwrap_or_default(),
+        parent: n.parent,
     }
 }
 
@@ -249,6 +250,7 @@ pub fn send_create_node(conn: &DbConnection, n: &NodeData) {
         n.x,
         n.y,
         params_json(&n.params),
+        n.parent,
     ) {
         eprintln!("[stdb] create_node failed: {e}");
     }

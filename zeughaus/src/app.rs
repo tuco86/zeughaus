@@ -24,6 +24,7 @@ use zeughaus_core::{
     Value,
 };
 use zeughaus_flow::FlowPlugin;
+use zeughaus_graph::GraphPlugin;
 #[cfg(not(target_arch = "wasm32"))]
 use zeughaus_llm::LlmPlugin;
 use zeughaus_ml::MlPlugin;
@@ -59,6 +60,9 @@ pub struct EditorNode {
     pub position: Point,
     pub pin_defs: Vec<PinDefinition>,
     pub settings: Vec<SettingDef>,
+    /// The container node this node lives inside, `NodeId(0)` for the root
+    /// graph. Only the editor knows about it: the executor stays flat.
+    pub parent: NodeId,
 }
 
 pub struct EditorEdge {
@@ -113,6 +117,12 @@ pub struct App {
     selected: HashSet<NodeId>,
     camera_position: Point,
     camera_zoom: f32,
+    /// Which container's contents are on screen; `NodeId(0)` is the root
+    /// graph. Editor-local: what one window looks at is not shared state.
+    current_graph: NodeId,
+    /// Camera per graph, so stepping out of a subgraph returns to the view it
+    /// was entered from instead of resetting.
+    cameras: HashMap<NodeId, (Point, f32)>,
 
     // The editor's model of the graph, NOT a runtime. It owns the topology, the
     // pin definitions a variadic node grows (`sync_node_pins`) and the pin types
@@ -228,6 +238,7 @@ impl App {
             Box::new(TransformPlugin),
             Box::new(MlPlugin),
             Box::new(FlowPlugin),
+            Box::new(GraphPlugin),
             #[cfg(not(target_arch = "wasm32"))]
             Box::new(CapturePlugin),
             #[cfg(not(target_arch = "wasm32"))]
@@ -293,6 +304,8 @@ impl App {
             selected: HashSet::new(),
             camera_position: Point::ORIGIN,
             camera_zoom: 1.0,
+            current_graph: NodeId(0),
+            cameras: HashMap::new(),
             executor,
             plugins,
             catalog,
@@ -349,6 +362,177 @@ impl App {
         app
     }
 
+    /// The nodes directly inside `parent`, in creation order.
+    ///
+    /// Order matters: it decides which boundary wins a duplicate pin name, and
+    /// `node_order` is the only stable order the editor has.
+    fn children(&self, parent: NodeId) -> impl Iterator<Item = &EditorNode> {
+        self.node_order
+            .iter()
+            .filter_map(move |id| self.nodes.get(id))
+            .filter(move |node| node.parent == parent)
+    }
+
+    /// Every node inside `parent`, at any depth.
+    ///
+    /// Deleting a container deletes its contents, so the local delete needs the
+    /// whole subtree -- otherwise this window would keep nodes the store has
+    /// already dropped.
+    fn descendants(&self, parent: NodeId) -> Vec<NodeId> {
+        let mut found = Vec::new();
+        let mut stack = vec![parent];
+        while let Some(current) = stack.pop() {
+            for child in self.children(current) {
+                found.push(child.id);
+                stack.push(child.id);
+            }
+        }
+        found
+    }
+
+    /// Whether this node type holds a subgraph, per the catalog.
+    fn is_container(&self, type_id: &str) -> bool {
+        self.catalog
+            .iter()
+            .find(|d| &*d.type_id == type_id)
+            .is_some_and(|d| d.container)
+    }
+
+    /// The pin name a boundary node contributes to its container.
+    ///
+    /// The node's `name` setting, or the type's default when it is empty: a
+    /// container's pin has to be called something even while the user is
+    /// clearing the field.
+    fn boundary_name(&self, child: NodeId) -> String {
+        let typed_default = || {
+            self.nodes
+                .get(&child)
+                .and_then(|node| node.settings.iter().find(|s| &*s.name == "name"))
+                .map(|s| s.default.to_string())
+                .unwrap_or_default()
+        };
+        self.node_settings
+            .get(&child)
+            .and_then(|s| s.get("name"))
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(typed_default)
+    }
+
+    /// Rebuilds a container's pins from the boundary nodes inside it.
+    ///
+    /// The container declares no pins of its own, so this is the only thing
+    /// that gives it any: one input per `graph.input` child, one output per
+    /// `graph.output` child, named by that child. A name already used on the
+    /// same side is skipped -- two pins with one name would be one pin the user
+    /// cannot tell apart, and the first child in creation order keeps it.
+    fn refresh_container_pins(&mut self, container: NodeId) {
+        let Some(node) = self.nodes.get(&container) else {
+            return;
+        };
+        if !self.is_container(&node.type_id) {
+            return;
+        }
+        let boundaries: Vec<(NodeId, bool)> = self
+            .children(container)
+            .filter_map(|child| match child.type_id.as_str() {
+                "graph.input" => Some((child.id, true)),
+                "graph.output" => Some((child.id, false)),
+                _ => None,
+            })
+            .collect();
+        let mut pins: Vec<PinDefinition> = Vec::with_capacity(boundaries.len());
+        for (child, is_input) in boundaries {
+            let name = self.boundary_name(child);
+            let taken = pins.iter().any(|p| {
+                &*p.name == name.as_str() && (p.direction == PinDirection::Input) == is_input
+            });
+            if name.is_empty() || taken {
+                continue;
+            }
+            pins.push(if is_input {
+                PinDefinition::input(name, Ty::Any, PinKind::Trigger)
+            } else {
+                PinDefinition::output(name, Ty::Any)
+            });
+        }
+        if let Some(node) = self.nodes.get_mut(&container) {
+            node.pin_defs = pins.clone();
+        }
+        if let Some(gn) = self.executor.graph.node_mut(container) {
+            gn.pin_defs = pins;
+        }
+    }
+
+    /// The real node an edge endpoint has to name in the store.
+    ///
+    /// A wire dropped on a container's pin belongs to the boundary node behind
+    /// that pin: edges always connect real nodes, so the executor never has to
+    /// know a container exists. `None` when the pin names no boundary, which is
+    /// a wire that cannot be stored and is therefore dropped.
+    fn resolve_boundary(
+        &self,
+        node: NodeId,
+        pin: &PinLabel,
+        is_source: bool,
+    ) -> Option<(NodeId, PinLabel)> {
+        let type_id = &self.nodes.get(&node)?.type_id;
+        if !self.is_container(type_id) {
+            return Some((node, pin.clone()));
+        }
+        let wanted = if is_source {
+            "graph.output"
+        } else {
+            "graph.input"
+        };
+        let child = self
+            .children(node)
+            .filter(|child| child.type_id == wanted)
+            .find(|child| self.boundary_name(child.id) == pin.as_str())?;
+        let inner_pin = if is_source { "out" } else { "in" };
+        Some((child.id, PinLabel::from(inner_pin)))
+    }
+
+    /// Where an edge endpoint is drawn in the current graph.
+    ///
+    /// Identity for a node of this graph; a boundary node one level down is
+    /// drawn on its container's pin instead, so a wire that crosses into a
+    /// subgraph is one visible wire rather than a stub on each side. `None`
+    /// means the endpoint is not visible here, and the edge is not drawn.
+    fn view_endpoint(
+        &self,
+        node: NodeId,
+        pin: &PinLabel,
+        is_source: bool,
+    ) -> Option<(NodeId, PinLabel)> {
+        let editor_node = self.nodes.get(&node)?;
+        if editor_node.parent == self.current_graph {
+            return Some((node, pin.clone()));
+        }
+        let crosses = match editor_node.type_id.as_str() {
+            "graph.output" => is_source && pin.as_str() == "out",
+            "graph.input" => !is_source && pin.as_str() == "in",
+            _ => false,
+        };
+        if !crosses {
+            return None;
+        }
+        let container = editor_node.parent;
+        if self.nodes.get(&container)?.parent != self.current_graph {
+            return None;
+        }
+        Some((container, PinLabel::from(self.boundary_name(node).as_str())))
+    }
+
+    /// Rebuilds the pins of the container a boundary node belongs to. Called
+    /// after anything that can change a boundary's name or existence.
+    fn refresh_boundary_owner(&mut self, node: NodeId) {
+        let Some(parent) = self.nodes.get(&node).map(|n| n.parent) else {
+            return;
+        };
+        self.refresh_container_pins(parent);
+    }
+
     fn spawn_node(&mut self, type_id: &str, position: Point) {
         let exec = self.plugins.iter().find_map(|p| p.create_node(type_id));
         let Some(exec) = exec else {
@@ -402,6 +586,7 @@ impl App {
                 position,
                 pin_defs,
                 settings: setting_defs,
+                parent: self.current_graph,
             },
         );
         self.node_order.push(id);
@@ -419,6 +604,8 @@ impl App {
             _ => {}
         }
 
+        // A boundary node spawned inside a container is a new pin on it.
+        self.refresh_container_pins(self.current_graph);
         #[cfg(not(target_arch = "wasm32"))]
         self.push_node(id);
         self.autosave();
@@ -1029,6 +1216,7 @@ impl App {
                     x: node.position.x,
                     y: node.position.y,
                     params,
+                    parent: node.parent.0,
                 })
             })
             .collect();
@@ -1115,6 +1303,7 @@ impl App {
                 position,
                 pin_defs,
                 settings: setting_defs,
+                parent: NodeId(node_data.parent),
             },
         );
         self.node_order.push(id);
@@ -1221,27 +1410,69 @@ impl App {
         match message {
             Message::EdgeConnected { from, to } => {
                 // iced_nodegraph normalizes on_connect to (output, input), so
-                // `from` is always the output pin and `to` the input pin.
-                self.connect_edge(
-                    NodeId(from.node_id),
-                    from.pin_id,
-                    NodeId(to.node_id),
-                    to.pin_id,
-                );
+                // `from` is always the output pin and `to` the input pin. A pin
+                // on a container belongs to a boundary node inside it: edges in
+                // the store always connect real nodes.
+                let Some((from_node, from_pin)) =
+                    self.resolve_boundary(NodeId(from.node_id), &from.pin_id, true)
+                else {
+                    return Task::none();
+                };
+                let Some((to_node, to_pin)) =
+                    self.resolve_boundary(NodeId(to.node_id), &to.pin_id, false)
+                else {
+                    return Task::none();
+                };
+                self.connect_edge(from_node, from_pin, to_node, to_pin);
                 // The Display node's source changed, so what it should be
                 // watching changed with it.
                 #[cfg(not(target_arch = "wasm32"))]
                 return self.reconcile_runtime();
             }
             Message::EdgeDisconnected { from, to } => {
-                self.disconnect_edge(
-                    NodeId(from.node_id),
-                    from.pin_id,
-                    NodeId(to.node_id),
-                    to.pin_id,
-                );
+                let Some((from_node, from_pin)) =
+                    self.resolve_boundary(NodeId(from.node_id), &from.pin_id, true)
+                else {
+                    return Task::none();
+                };
+                let Some((to_node, to_pin)) =
+                    self.resolve_boundary(NodeId(to.node_id), &to.pin_id, false)
+                else {
+                    return Task::none();
+                };
+                self.disconnect_edge(from_node, from_pin, to_node, to_pin);
                 #[cfg(not(target_arch = "wasm32"))]
                 return self.reconcile_runtime();
+            }
+            Message::EnterGraph(raw_id) => {
+                let target = NodeId(raw_id);
+                if target == self.current_graph {
+                    return Task::none();
+                }
+                // Only the root graph and a real container can be entered; a
+                // stale breadcrumb of a deleted container must not strand the
+                // view in a graph with nothing in it.
+                let enterable = target == NodeId(0)
+                    || self
+                        .nodes
+                        .get(&target)
+                        .is_some_and(|node| self.is_container(&node.type_id));
+                if !enterable {
+                    return Task::none();
+                }
+                self.cameras
+                    .insert(self.current_graph, (self.camera_position, self.camera_zoom));
+                self.current_graph = target;
+                let (position, zoom) = self
+                    .cameras
+                    .get(&target)
+                    .copied()
+                    .unwrap_or((Point::ORIGIN, 1.0));
+                self.camera_position = position;
+                self.camera_zoom = zoom;
+                // A selection from another graph is not visible here, and a
+                // delete would act on nodes the user can no longer see.
+                self.selected.clear();
             }
             Message::GroupMoved { node_ids, delta } => {
                 // Fires once on drag release; persist the new positions.
@@ -1277,14 +1508,33 @@ impl App {
             Message::DeleteNodes(ids) => {
                 for raw_id in &ids {
                     let id = NodeId(*raw_id);
+                    // The store deletes a container's contents with it, so this
+                    // window has to as well or it would keep nodes no graph
+                    // contains any more. One reducer call: the recursion lives
+                    // in the module.
                     #[cfg(not(target_arch = "wasm32"))]
                     self.push_delete(id);
-                    self.nodes.remove(&id);
-                    self.node_order.retain(|n| *n != id);
-                    self.edges.retain(|e| e.from_node != id && e.to_node != id);
-                    self.executor.remove_node(id);
-                    self.const_inputs.remove(&id);
-                    self.node_settings.remove(&id);
+                    let parent = self.nodes.get(&id).map(|node| node.parent);
+                    let mut doomed = self.descendants(id);
+                    doomed.push(id);
+                    for id in doomed {
+                        self.nodes.remove(&id);
+                        self.node_order.retain(|n| *n != id);
+                        self.edges.retain(|e| e.from_node != id && e.to_node != id);
+                        self.executor.remove_node(id);
+                        self.const_inputs.remove(&id);
+                        self.node_settings.remove(&id);
+                        // Looking into a graph that no longer exists shows
+                        // nothing and offers no way out.
+                        if self.current_graph == id {
+                            self.current_graph = NodeId(0);
+                        }
+                        self.cameras.remove(&id);
+                    }
+                    // A deleted boundary node is a pin its container loses.
+                    if let Some(parent) = parent {
+                        self.refresh_container_pins(parent);
+                    }
                 }
                 self.autosave();
                 // A deleted Display node's feed has nobody left to draw it.
@@ -1365,6 +1615,10 @@ impl App {
                     .or_default()
                     .insert(key.clone(), value.clone());
                 let _ = self.executor.set_parameter(id, &key, Value::new(value));
+                // Renaming a boundary renames its container's pin.
+                if key == "name" {
+                    self.refresh_boundary_owner(id);
+                }
                 #[cfg(not(target_arch = "wasm32"))]
                 self.push_params(id);
                 self.autosave();
@@ -1562,6 +1816,11 @@ impl App {
 
         for id in &self.node_order {
             if let Some(node) = self.nodes.get(id) {
+                // One graph at a time: a node of another one is not drawn here,
+                // and its wires are mapped onto the container that holds it.
+                if node.parent != self.current_graph {
+                    continue;
+                }
                 let display = self.display_values.get(id);
                 let const_input = self.const_inputs.get(id).map(|s| s.as_str());
                 let settings = self.node_settings.get(id);
@@ -1572,6 +1831,7 @@ impl App {
                     settings,
                     self.dim_mask(*id, node),
                     self.node_sizes.get(id).copied(),
+                    self.is_container(&node.type_id),
                 );
                 // Per-node activity feedback: red marching-ants on error. There
                 // is no "working" state to draw -- this process does not
@@ -1617,18 +1877,26 @@ impl App {
         }
 
         for edge in &self.edges {
+            // Both ends mapped into this graph first: an edge into a subgraph is
+            // drawn on the container's pin, and one that touches neither this
+            // graph nor its containers is not drawn at all.
+            let (Some((from_node, from_pin)), Some((to_node, to_pin))) = (
+                self.view_endpoint(edge.from_node, &edge.from_pin, true),
+                self.view_endpoint(edge.to_node, &edge.to_pin, false),
+            ) else {
+                continue;
+            };
+
             // Edge color follows the source pin's type, dimmed while that output
             // carries nothing: an edge is only as live as the value on it.
             let edge_color = self
                 .nodes
-                .get(&edge.from_node)
-                .and_then(|n| {
-                    n.pin_defs
-                        .iter()
-                        .find(|p| &*p.name == edge.from_pin.as_str())
-                })
+                .get(&from_node)
+                .and_then(|n| n.pin_defs.iter().find(|p| &*p.name == from_pin.as_str()))
                 .map(|p| pin_color(&p.ty))
                 .unwrap_or(Color::from_rgb(0.6, 0.6, 0.6));
+            // Read on the real source pin, not the mapped one: a container has
+            // no outputs of its own, so the value lives on the boundary node.
             let edge_color = if self
                 .executor
                 .output_value(edge.from_node, edge.from_pin.as_str())
@@ -1648,15 +1916,15 @@ impl App {
             // State (calm solid line).
             let is_event = self
                 .nodes
-                .get(&edge.to_node)
-                .and_then(|n| n.pin_defs.iter().find(|p| &*p.name == edge.to_pin.as_str()))
+                .get(&to_node)
+                .and_then(|n| n.pin_defs.iter().find(|p| &*p.name == to_pin.as_str()))
                 .map(|p| p.pin_kind == PinKind::Trigger)
                 .unwrap_or(false);
 
             let edge_widget = ng_edge(
                 edge.id,
-                PinRef::new(edge.from_node.0, edge.from_pin.clone()),
-                PinRef::new(edge.to_node.0, edge.to_pin.clone()),
+                PinRef::new(from_node.0, from_pin),
+                PinRef::new(to_node.0, to_pin),
             )
             .style(move |theme, status, _start, _end| {
                 if src_error {
@@ -1751,7 +2019,56 @@ impl App {
                 ..Default::default()
             });
 
-        column![graph_view, status_bar].into()
+        column![self.breadcrumb(), graph_view, status_bar].into()
+    }
+
+    /// The path from the root graph to what is on screen, each step a way back.
+    ///
+    /// The only way out of a subgraph: the canvas shows one graph at a time, so
+    /// without this a container entered by mistake would be a dead end.
+    fn breadcrumb(&self) -> Element<'_, Message> {
+        let mut trail = Vec::new();
+        let mut current = self.current_graph;
+        while current != NodeId(0) {
+            let Some(node) = self.nodes.get(&current) else {
+                break;
+            };
+            trail.push((current, node.display_name.clone()));
+            current = node.parent;
+        }
+        trail.reverse();
+
+        let mut row = row![].spacing(6.0).align_y(iced::Alignment::Center);
+        if self.current_graph == NodeId(0) {
+            row = row.push(text("root").size(12));
+        } else {
+            row = row.push(
+                button(text("root").size(12))
+                    .padding(2.0)
+                    .on_press(Message::EnterGraph(0)),
+            );
+        }
+        for (index, (id, name)) in trail.iter().enumerate() {
+            row = row.push(text("/").size(12));
+            let last = index + 1 == trail.len();
+            row = if last {
+                row.push(text(name.clone()).size(12))
+            } else {
+                row.push(
+                    button(text(name.clone()).size(12))
+                        .padding(2.0)
+                        .on_press(Message::EnterGraph(id.0)),
+                )
+            };
+        }
+        container(row)
+            .width(Length::Fill)
+            .padding(4.0)
+            .style(|_theme: &Theme| container::Style {
+                background: Some(Color::from_rgb(0.1, 0.1, 0.12).into()),
+                ..Default::default()
+            })
+            .into()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -1836,6 +2153,7 @@ impl App {
             x: node.position.x,
             y: node.position.y,
             params,
+            parent: node.parent.0,
         })
     }
 
@@ -1987,6 +2305,9 @@ impl App {
             #[cfg(not(target_arch = "wasm32"))]
             self.reapply_remote_outputs(id);
         }
+        // A boundary node arriving from another window is a pin its container
+        // gains here, and a renamed one is a pin that changed name.
+        self.refresh_container_pins(NodeId(nd.parent));
     }
 
     fn apply_params(&mut self, id: NodeId, type_id: &str, params: &[(String, String)]) {
@@ -2025,10 +2346,15 @@ impl App {
     }
 
     fn apply_node_remove(&mut self, id: NodeId) {
+        let parent = self.nodes.get(&id).map(|node| node.parent);
         self.nodes.remove(&id);
         self.node_order.retain(|n| *n != id);
         #[cfg(not(target_arch = "wasm32"))]
-        for edge in self.edges.iter().filter(|e| e.from_node == id || e.to_node == id) {
+        for edge in self
+            .edges
+            .iter()
+            .filter(|e| e.from_node == id || e.to_node == id)
+        {
             self.particles.remove(&edge.id);
         }
         self.edges.retain(|e| e.from_node != id && e.to_node != id);
@@ -2042,6 +2368,15 @@ impl App {
             self.remote_outputs.remove(&id);
             self.output_seq.retain(|(node, _), _| *node != id);
         }
+        // A removed boundary node is a pin its container loses; a removed
+        // container is a graph nobody can be looking at any more.
+        if let Some(parent) = parent {
+            self.refresh_container_pins(parent);
+        }
+        if self.current_graph == id {
+            self.current_graph = NodeId(0);
+        }
+        self.cameras.remove(&id);
     }
 
     fn apply_edge_insert(&mut self, ed: EdgeData) {
@@ -2147,12 +2482,24 @@ fn build_node_element<'a>(
     settings: Option<&'a HashMap<String, String>>,
     dim_mask: u64,
     size: Option<iced::Size>,
+    is_container: bool,
 ) -> Element<'a, Message, Theme> {
     let is_const = node.type_id.starts_with("transform.const_");
     let is_button = node.type_id == "flow.button";
     let is_display = is_display(&node.type_id);
 
     let mut items: Vec<Element<'_, Message, Theme>> = Vec::new();
+
+    // A container's body is a way in. Its pins come from the boundary nodes
+    // inside it, so without this the node would be a box with no purpose.
+    if is_container {
+        items.push(
+            button(text("open").size(11))
+                .padding(2.0)
+                .on_press(Message::EnterGraph(node.id.0))
+                .into(),
+        );
+    }
 
     if is_const {
         // Const nodes get an inline text input with output pin

@@ -17,6 +17,12 @@ pub struct NodeData {
     pub display_name: String,
     pub x: f32,
     pub y: f32,
+    /// The container node this node lives inside, `0` for the root graph.
+    ///
+    /// Defaulted so a document written before subgraphs existed still loads:
+    /// every node in it belongs to the root graph, which is what `0` says.
+    #[serde(default)]
+    pub parent: u64,
     /// Serialized parameter values (name -> JSON value string).
     #[serde(default)]
     pub params: Vec<(String, String)>,
@@ -61,6 +67,7 @@ mod tests {
                 x: 100.0,
                 y: 200.0,
                 params: vec![("value".to_string(), "42".to_string())],
+                parent: 0,
             }],
             edges: vec![EdgeData {
                 id: 10,

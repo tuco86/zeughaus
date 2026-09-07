@@ -118,6 +118,7 @@ mod tests {
                 category: "Test".into(),
                 pins: vec![],
                 settings: vec![],
+                container: false,
             }]
         }
         fn create_node(&self, type_id: &str) -> Option<Box<dyn ExecutableNode>> {

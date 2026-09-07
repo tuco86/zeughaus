@@ -51,6 +51,14 @@ pub struct Node {
     pub y: f32,
     /// JSON-encoded parameter list (name -> value), mirroring NodeData::params.
     pub params: String,
+    /// The container node this node lives inside, `0` for the root graph.
+    ///
+    /// Indexed because deleting a container walks its children, and defaulted
+    /// so gaining subgraphs is an automatic migration: every node in an
+    /// existing session belongs to the root graph.
+    #[default(0)]
+    #[index(btree)]
+    pub parent: u64,
 }
 
 /// A directed edge between two node pins.
@@ -73,6 +81,7 @@ pub fn create_node(
     x: f32,
     y: f32,
     params: String,
+    parent: u64,
 ) {
     ctx.db.node().insert(Node {
         id,
@@ -81,6 +90,7 @@ pub fn create_node(
         x,
         y,
         params,
+        parent,
     });
 }
 
@@ -101,19 +111,31 @@ pub fn set_node_params(ctx: &ReducerContext, id: u64, params: String) {
     }
 }
 
+/// Deletes a node, everything inside it, and every edge that touched any of
+/// them.
+///
+/// Recursive because a container node IS its contents: deleting the container
+/// row alone would leave its children in the store, parented to a node that no
+/// longer exists and reachable from no graph.
 #[reducer]
 pub fn delete_node(ctx: &ReducerContext, id: u64) {
-    ctx.db.node().id().delete(id);
-    // Remove dangling edges that referenced this node.
-    let dangling: Vec<u64> = ctx
-        .db
-        .edge()
-        .iter()
-        .filter(|e| e.from_node == id || e.to_node == id)
-        .map(|e| e.id)
-        .collect();
-    for eid in dangling {
-        ctx.db.edge().id().delete(eid);
+    let mut stack = vec![id];
+    while let Some(current) = stack.pop() {
+        ctx.db.node().id().delete(current);
+        for child in ctx.db.node().parent().filter(current) {
+            stack.push(child.id);
+        }
+        // Remove dangling edges that referenced this node.
+        let dangling: Vec<u64> = ctx
+            .db
+            .edge()
+            .iter()
+            .filter(|e| e.from_node == current || e.to_node == current)
+            .map(|e| e.id)
+            .collect();
+        for eid in dangling {
+            ctx.db.edge().id().delete(eid);
+        }
     }
 }
 

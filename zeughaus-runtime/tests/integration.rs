@@ -506,6 +506,7 @@ fn executor_to_document(
             x: gn.position.0,
             y: gn.position.1,
             params,
+            parent: 0,
         });
     }
     let mut edges = Vec::new();

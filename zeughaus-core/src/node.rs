@@ -57,6 +57,21 @@ pub struct NodeDefinition {
     pub category: Arc<str>,
     pub pins: Vec<PinDefinition>,
     pub settings: Vec<SettingDef>,
+    /// Whether this node type holds a subgraph.
+    ///
+    /// A container has no pins of its own: the editor synthesizes them from the
+    /// boundary nodes inside it, and offers a way in. Nothing else in the
+    /// system distinguishes it -- the executor stays flat, because a boundary
+    /// node is an ordinary passthrough.
+    pub container: bool,
+}
+
+impl NodeDefinition {
+    /// Marks this type as holding a subgraph.
+    pub fn container(mut self) -> Self {
+        self.container = true;
+        self
+    }
 }
 
 /// Helper to build a NodeDefinition from a node instance.
@@ -72,6 +87,7 @@ pub fn catalog_entry(
         category: category.into(),
         pins: node.pin_definitions().to_vec(),
         settings: node.settings(),
+        container: false,
     }
 }
 

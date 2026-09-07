@@ -1,0 +1,7 @@
+[package]
+name = "zeughaus-graph"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zeughaus-core.workspace = true

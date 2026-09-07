@@ -100,6 +100,7 @@ impl Runner {
             Box::new(zeughaus_transform::TransformPlugin),
             Box::new(zeughaus_ml::MlPlugin),
             Box::new(zeughaus_flow::FlowPlugin),
+            Box::new(zeughaus_graph::GraphPlugin),
             Box::new(zeughaus_capture::CapturePlugin),
             Box::new(zeughaus_llm::LlmPlugin),
         ];

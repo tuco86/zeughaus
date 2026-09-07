@@ -291,6 +291,24 @@ impl GraphExecutor {
     /// which is the honest rendering of "the owner did not publish this".
     pub fn set_remote_outputs(&mut self, node: NodeId, outputs: HashMap<String, Value>) {
         self.last_outputs.insert(node, outputs.clone());
+        // A replication states the node's WHOLE output set, so a pin that is
+        // absent has no value -- and the wire leaving it must not keep showing
+        // the last one. Without this a runtime that went away would leave its
+        // final numbers on screen forever.
+        let stale: Vec<EdgeId> = self
+            .graph
+            .outgoing_edges(node)
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.graph
+                    .edge(*id)
+                    .is_some_and(|edge| !outputs.contains_key(&*edge.from_pin))
+            })
+            .collect();
+        for id in stale {
+            self.cache.remove(id);
+        }
         // Replication is not traffic: the edge already carried this value where
         // it was computed, and counting it again would draw a second particle
         // for one message.
@@ -1114,5 +1132,33 @@ mod tests {
         outputs.insert("value".to_string(), Value::new(9.0_f64));
         exec.set_remote_outputs(a, outputs);
         assert!(exec.take_delivered().is_empty());
+    }
+
+    /// The editor clears a node's outputs when its runtime goes away, and the
+    /// wire must go with them: a last-known number left on screen is one nobody
+    /// will ever refresh.
+    #[test]
+    fn a_replication_without_a_pin_clears_the_wire_leaving_it() {
+        let mut graph = Graph::new();
+        let a = NodeId::next();
+        let b = NodeId::next();
+        graph.add_node(make_node(a));
+        graph.add_node(make_node(b));
+        let edge = make_edge(a, "value", b, "in");
+        let edge_id = edge.id;
+        graph.add_edge(edge);
+
+        let mut exec = GraphExecutor::new(graph);
+        exec.register_node(a, Box::new(ConstNode(2.0)));
+        exec.register_node(b, Box::new(DoubleNode));
+
+        let mut outputs = HashMap::new();
+        outputs.insert("value".to_string(), Value::new(9.0_f64));
+        exec.set_remote_outputs(a, outputs);
+        assert!(exec.edge_value(edge_id).is_some());
+
+        exec.set_remote_outputs(a, HashMap::new());
+        assert!(exec.edge_value(edge_id).is_none());
+        assert!(exec.output_value(a, "value").is_none());
     }
 }
