@@ -147,9 +147,11 @@ pub enum Message {
     #[cfg(not(target_arch = "wasm32"))]
     FeedFrame(crate::feed::Frame),
     // The runtime reported a value, a cleared pin or an edge it delivered
-    // across. Native-only for the same reason as `FeedFrame`.
+    // across, on the subscription of that epoch: a task that has been replaced
+    // may still have messages queued, and its state must not be applied.
+    // Native-only for the same reason as `FeedFrame`.
     #[cfg(not(target_arch = "wasm32"))]
-    Traffic(crate::feed::Traffic),
+    Traffic(u64, crate::feed::Traffic),
 }
 
 #[cfg(test)]

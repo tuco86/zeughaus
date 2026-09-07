@@ -200,20 +200,35 @@ pub fn events(endpoint: Endpoint) -> impl Stream<Item = Traffic> {
     // these are a few hundred bytes each, so buffering them is cheap and
     // dropping one loses a value nothing else will restate.
     iced::stream::channel(64, async move |mut out| {
-        for attempt in 0.. {
+        let mut attempt = 0u64;
+        loop {
             if attempt > 0 {
                 tokio::time::sleep(retry_delay(attempt)).await;
             }
-            match subscribe(&endpoint, &mut out).await {
+            // Whether this attempt got as far as delivering a snapshot. Only
+            // then is there state on screen that can go stale, and only then
+            // has the runtime answered at all.
+            let mut served = false;
+            match subscribe(&endpoint, &mut out, &mut served).await {
                 // The receiver is gone: this editor stopped watching.
                 Ok(Wanted::No) => return,
                 Ok(Wanted::Yes) => {}
                 Err(e) => eprintln!("[traffic] {e}"),
             }
-            // Values on screen are last-known, not wrong; saying so is the
-            // honest state until a snapshot replaces them.
-            if out.send(Traffic::Lost).await.is_err() {
-                return;
+            if served {
+                // Values on screen are last-known, not wrong; saying so is the
+                // honest state until a snapshot replaces them. A connection
+                // that worked once also earns a fresh backoff: this is a
+                // runtime that restarted, not one that is not there.
+                attempt = 0;
+                if out.send(Traffic::Lost).await.is_err() {
+                    return;
+                }
+            } else {
+                // Nothing was ever shown from this attempt, so there is nothing
+                // to declare lost -- and a peer that never answered is one to
+                // back off from.
+                attempt += 1;
             }
         }
     })
@@ -245,6 +260,7 @@ pub async fn trigger(endpoint: Endpoint, node_id: u64) -> Result<(), String> {
 async fn subscribe(
     endpoint: &Endpoint,
     out: &mut mpsc::Sender<Traffic>,
+    served: &mut bool,
 ) -> Result<Wanted, String> {
     let quic = QUIC.as_ref().ok_or("no QUIC runtime")?;
     let events_url = endpoint.path(EVENTS_PATH)?;
@@ -277,6 +293,7 @@ async fn subscribe(
     if out.send(Traffic::Snapshot(snapshot)).await.is_err() {
         return Ok(Wanted::No);
     }
+    *served = true;
 
     loop {
         let message = subscriber

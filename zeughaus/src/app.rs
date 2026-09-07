@@ -215,6 +215,10 @@ pub struct App {
     // to guess.
     #[cfg(not(target_arch = "wasm32"))]
     traffic_live: bool,
+    // Which subscription the traffic on screen came from. Bumped whenever the
+    // task is replaced, so a message queued by the old one is recognizable.
+    #[cfg(not(target_arch = "wasm32"))]
+    traffic_epoch: u64,
     // The runtime's values as last reported, per node and pin. Kept beside the
     // executor because a value can arrive before the node row it belongs to.
     #[cfg(not(target_arch = "wasm32"))]
@@ -347,6 +351,8 @@ impl App {
             traffic: None,
             #[cfg(not(target_arch = "wasm32"))]
             traffic_live: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            traffic_epoch: 0,
             #[cfg(not(target_arch = "wasm32"))]
             remote_outputs: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -690,6 +696,10 @@ impl App {
             let edge = self.edges.remove(pos);
             self.executor.disconnect_edge(edge.id);
             self.resync_pins(to_node);
+            // The wire the particles were riding is gone; without this every
+            // local rewiring leaks a queue nothing will ever draw again.
+            #[cfg(not(target_arch = "wasm32"))]
+            self.particles.remove(&edge.id);
             #[cfg(not(target_arch = "wasm32"))]
             self.push_edge_remove(edge.id);
             self.update_display_values();
@@ -703,10 +713,16 @@ impl App {
     /// This is the only way a value ever reaches the editor -- it computes
     /// nothing itself -- and the only place particles are born.
     #[cfg(not(target_arch = "wasm32"))]
-    fn apply_traffic(&mut self, traffic: crate::feed::Traffic) {
+    fn apply_traffic(&mut self, epoch: u64, traffic: crate::feed::Traffic) {
         use crate::feed::Traffic;
         use zeughaus_samples::RuntimeEvent;
 
+        // A task that has been replaced may still have messages queued: its
+        // snapshot would clear the values the current runtime just delivered.
+        // The epoch is which subscription asked for them.
+        if epoch != self.traffic_epoch {
+            return;
+        }
         match traffic {
             Traffic::Snapshot(snapshot) => {
                 // The whole set replaces the whole set: a pin the snapshot does
@@ -837,6 +853,9 @@ impl App {
         if moved || (self.traffic.is_none() && self.endpoint.is_some()) {
             self.traffic = None;
             self.traffic_live = false;
+            // Anything the aborted task still has queued belongs to the
+            // subscription that is being replaced.
+            self.traffic_epoch += 1;
             self.remote_outputs.clear();
             self.output_seq.clear();
             // A particle in flight belongs to the runtime that sent it; the new
@@ -849,8 +868,11 @@ impl App {
             }
             self.update_display_values();
             if let Some(endpoint) = self.endpoint.clone() {
-                let (task, handle) =
-                    Task::run(feed::events(endpoint), Message::Traffic).abortable();
+                let epoch = self.traffic_epoch;
+                let (task, handle) = Task::run(feed::events(endpoint), move |traffic| {
+                    Message::Traffic(epoch, traffic)
+                })
+                .abortable();
                 self.traffic = Some(handle.abort_on_drop());
                 tasks.push(task);
             }
@@ -1341,6 +1363,24 @@ impl App {
         for node_data in &doc.nodes {
             self.insert_node_from_data(node_data);
         }
+        // Only now: a container's pins come from its children, and a saved
+        // document lists them in whatever order it pleases. Refreshing during
+        // the loop would give a container that precedes its boundary nodes no
+        // pins at all -- and the edges below would then have nothing to attach
+        // to.
+        let containers: Vec<NodeId> = self
+            .node_order
+            .iter()
+            .filter(|id| {
+                self.nodes
+                    .get(id)
+                    .is_some_and(|node| self.is_container(&node.type_id))
+            })
+            .copied()
+            .collect();
+        for container in containers {
+            self.refresh_container_pins(container);
+        }
 
         // Rebuild edges
         for edge_data in &doc.edges {
@@ -1520,6 +1560,16 @@ impl App {
                     for id in doomed {
                         self.nodes.remove(&id);
                         self.node_order.retain(|n| *n != id);
+                        // Before the edges go: every wire that touched this
+                        // node carried particles nobody can draw any more.
+                        #[cfg(not(target_arch = "wasm32"))]
+                        for edge in self
+                            .edges
+                            .iter()
+                            .filter(|e| e.from_node == id || e.to_node == id)
+                        {
+                            self.particles.remove(&edge.id);
+                        }
                         self.edges.retain(|e| e.from_node != id && e.to_node != id);
                         self.executor.remove_node(id);
                         self.const_inputs.remove(&id);
@@ -1744,8 +1794,8 @@ impl App {
                 self.apply_feed_frame(frame);
             }
             #[cfg(not(target_arch = "wasm32"))]
-            Message::Traffic(traffic) => {
-                self.apply_traffic(traffic);
+            Message::Traffic(epoch, traffic) => {
+                self.apply_traffic(epoch, traffic);
             }
         }
         Task::none()

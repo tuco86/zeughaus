@@ -42,11 +42,10 @@ pub struct Runner {
     /// stated as soon as it is known and again whenever it or the number of
     /// connected runners changes.
     logged_role: Option<(bool, usize)>,
-    /// What this process last published, per node and output pin, as the
-    /// `(type tag, text)` pair that went over the wire. Diffed against the next
-    /// pass so an unchanged value costs no reducer call -- a capture graph runs
-    /// at frame rate and would otherwise flood the store.
-    published: HashMap<NodeId, HashMap<String, (String, String)>>,
+    /// What editors have been told: the diff baseline and the snapshot derived
+    /// from it. Only what changed is sent, because a capture graph runs at
+    /// frame rate and an unchanged value must cost nothing.
+    published: Published,
     /// Where runtime events go. `None` when the transport failed to start:
     /// publishing then does nothing, the same degradation as having no feed.
     publisher: Option<Publisher>,
@@ -126,7 +125,7 @@ impl Runner {
             executor,
             is_owner: false,
             logged_role: None,
-            published: HashMap::new(),
+            published: Published::default(),
             publisher,
             seq: 0,
             snapshot,
@@ -181,7 +180,7 @@ impl Runner {
             // snapshot it serves must not answer with values it no longer
             // produces.
             self.published.clear();
-            *self.snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Snapshot::default();
+            self.published.flush(self.seq, &self.snapshot);
             return;
         }
         // Ownership was just inherited, so this process has never run this
@@ -193,6 +192,7 @@ impl Runner {
         // everything. Values do not live in the store any more, so there is no
         // predecessor's row left behind to diff against and nothing to clear.
         self.published.clear();
+        self.published.flush(self.seq, &self.snapshot);
     }
 
     pub fn apply(&mut self, event: SyncEvent) {
@@ -426,7 +426,13 @@ impl Runner {
 
     fn apply_node_remove(&mut self, id: NodeId) {
         self.executor.remove_node(id);
-        self.published.remove(&id);
+        // The next `publish` only walks the nodes the graph still has, so it
+        // has no reason to say anything about this one. Flushing here is what
+        // keeps an editor that joins afterwards from being handed the outputs
+        // of a node that is gone; the live stream needs nothing, because a
+        // subscriber sees the node row disappear from the store.
+        self.published.forget(id);
+        self.published.flush(self.seq, &self.snapshot);
         self.logged_errors.remove(&id);
         self.unknown_types.remove(&id.0);
     }
@@ -515,13 +521,12 @@ impl Runner {
     /// cleared, because absence is a state a viewer has to be able to reach --
     /// otherwise a stale number would outlive the run that produced it.
     ///
-    /// The snapshot is rebuilt whenever anything was emitted, so an editor that
-    /// joins between two passes sees the same set the live events describe.
+    /// The snapshot follows the same baseline, so an editor that joins between
+    /// two passes sees the set the live events describe.
     fn publish(&mut self) {
         if !self.is_owner {
             return;
         }
-        let mut emitted = false;
         for id in self.executor.graph.node_ids().collect::<Vec<_>>() {
             let Some(node) = self.executor.graph.node(id) else {
                 continue;
@@ -536,12 +541,12 @@ impl Runner {
                     Some((p.name.to_string(), (ty, text)))
                 })
                 .collect();
-            let previous = self.published.get(&id);
+            let previous = self.published.get(id);
             if previous == Some(&current) {
                 continue;
             }
             // Collected while `previous` is borrowed, emitted after: the diff
-            // reads `published` and emitting takes the publisher mutably.
+            // reads the baseline and emitting takes the publisher mutably.
             let mut events: Vec<(String, Option<(String, String)>)> = Vec::new();
             if let Some(prev) = previous {
                 for pin in prev.keys() {
@@ -559,7 +564,7 @@ impl Runner {
                 }
                 events.push((pin.clone(), Some((ty.clone(), text.clone()))));
             }
-            self.published.insert(id, current);
+            self.published.set(id, current);
             for (pin, value) in events {
                 let seq = self.next_seq();
                 let event = match value {
@@ -577,36 +582,9 @@ impl Runner {
                     },
                 };
                 self.emit(TOPIC_OUTPUT, event);
-                emitted = true;
             }
         }
-        if emitted {
-            self.rebuild_snapshot();
-        }
-    }
-
-    /// Restates the whole output set for editors that join later.
-    ///
-    /// Rebuilt rather than patched: the snapshot has to be exactly what the
-    /// diff baseline says, or a late editor would inherit a value the live
-    /// events already cleared.
-    fn rebuild_snapshot(&mut self) {
-        let outputs: Vec<OutputRow> = self
-            .published
-            .iter()
-            .flat_map(|(id, pins)| {
-                pins.iter().map(move |(pin, (ty, value))| OutputRow {
-                    node_id: id.0,
-                    pin: pin.clone(),
-                    ty: ty.clone(),
-                    value: value.clone(),
-                })
-            })
-            .collect();
-        *self.snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Snapshot {
-            seq: self.seq,
-            outputs,
-        };
+        self.published.flush(self.seq, &self.snapshot);
     }
 
     /// Records the pinned URL this process serves on and announces it.
@@ -719,9 +697,156 @@ fn param_value(type_id: &str, text: &str) -> Option<Value> {
     }
 }
 
+/// What editors have been told, in the two forms it is needed in: the per-pin
+/// baseline the next pass is diffed against, and the snapshot a late joiner is
+/// served.
+///
+/// One type because the two must not disagree. As separate fields they did: a
+/// removed node was dropped from the baseline, the next pass had nothing to
+/// say about a node the graph no longer holds, and the snapshot kept serving
+/// its outputs to every editor that joined afterwards.
+#[derive(Default)]
+pub struct Published {
+    baseline: HashMap<NodeId, HashMap<String, (String, String)>>,
+    /// Whether the snapshot still matches the baseline. Rebuilding is deferred
+    /// because one pass touches many nodes and the snapshot only has to be
+    /// current when it is read.
+    stale: bool,
+}
+
+impl Published {
+    /// What this node last published, for the diff.
+    pub fn get(&self, node: NodeId) -> Option<&HashMap<String, (String, String)>> {
+        self.baseline.get(&node)
+    }
+
+    /// Records a node's current output set.
+    pub fn set(&mut self, node: NodeId, pins: HashMap<String, (String, String)>) {
+        self.baseline.insert(node, pins);
+        self.stale = true;
+    }
+
+    /// Forgets a node: its outputs are gone with it.
+    pub fn forget(&mut self, node: NodeId) {
+        if self.baseline.remove(&node).is_some() {
+            self.stale = true;
+        }
+    }
+
+    /// Forgets everything, as when this process stops owning execution.
+    pub fn clear(&mut self) {
+        if !self.baseline.is_empty() {
+            self.stale = true;
+        }
+        self.baseline.clear();
+    }
+
+    /// Writes the snapshot if the baseline moved since the last call.
+    ///
+    /// Rebuilt whole rather than patched: the snapshot has to be exactly what
+    /// the baseline says, or a late editor would inherit a value the live
+    /// events already cleared.
+    pub fn flush(&mut self, seq: u64, into: &Mutex<Snapshot>) {
+        if !self.stale {
+            return;
+        }
+        let outputs: Vec<OutputRow> = self
+            .baseline
+            .iter()
+            .flat_map(|(id, pins)| {
+                pins.iter().map(move |(pin, (ty, value))| OutputRow {
+                    node_id: id.0,
+                    pin: pin.clone(),
+                    ty: ty.clone(),
+                    value: value.clone(),
+                })
+            })
+            .collect();
+        *into.lock().unwrap_or_else(|e| e.into_inner()) = Snapshot { seq, outputs };
+        self.stale = false;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pins(pin: &str, value: &str) -> HashMap<String, (String, String)> {
+        HashMap::from([(pin.to_string(), ("float".to_string(), value.to_string()))])
+    }
+
+    fn served(snapshot: &Mutex<Snapshot>) -> Vec<(u64, String, String)> {
+        let mut rows: Vec<(u64, String, String)> = snapshot
+            .lock()
+            .expect("snapshot")
+            .outputs
+            .iter()
+            .map(|row| (row.node_id, row.pin.clone(), row.value.clone()))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// A late editor is served the snapshot, so it must say exactly what the
+    /// diff baseline says. A node that was removed is the case that broke: the
+    /// next pass has nothing to report about a node the graph no longer holds,
+    /// so if the snapshot kept its rows, every editor joining afterwards saw
+    /// the outputs of a node that does not exist.
+    #[test]
+    fn forgetting_a_node_takes_its_outputs_out_of_the_snapshot() {
+        let snapshot = Mutex::new(Snapshot::default());
+        let mut published = Published::default();
+        published.set(NodeId(1), pins("out", "1"));
+        published.set(NodeId(2), pins("result", "2"));
+        published.flush(7, &snapshot);
+        assert_eq!(
+            served(&snapshot),
+            vec![
+                (1, "out".to_string(), "1".to_string()),
+                (2, "result".to_string(), "2".to_string())
+            ]
+        );
+        assert_eq!(snapshot.lock().expect("snapshot").seq, 7);
+
+        published.forget(NodeId(1));
+        published.flush(8, &snapshot);
+        assert_eq!(published.get(NodeId(1)), None);
+        assert_eq!(
+            served(&snapshot),
+            vec![(2, "result".to_string(), "2".to_string())]
+        );
+        assert_eq!(snapshot.lock().expect("snapshot").seq, 8);
+    }
+
+    /// Losing ownership empties both: another runtime produces the real values
+    /// now, and this one must not answer for them.
+    #[test]
+    fn clearing_empties_the_snapshot_too() {
+        let snapshot = Mutex::new(Snapshot::default());
+        let mut published = Published::default();
+        published.set(NodeId(3), pins("out", "3"));
+        published.flush(1, &snapshot);
+        published.clear();
+        published.flush(2, &snapshot);
+        assert!(served(&snapshot).is_empty());
+    }
+
+    /// Flushing an unchanged baseline must not touch the snapshot: the seq it
+    /// carries is what an editor compares live events against, and bumping it
+    /// for nothing would make it drop events it needs.
+    #[test]
+    fn flushing_without_a_change_leaves_the_snapshot_alone() {
+        let snapshot = Mutex::new(Snapshot::default());
+        let mut published = Published::default();
+        published.set(NodeId(4), pins("out", "4"));
+        published.flush(5, &snapshot);
+        published.flush(9, &snapshot);
+        assert_eq!(snapshot.lock().expect("snapshot").seq, 5);
+        // A removal that removes nothing is not a change either.
+        published.forget(NodeId(99));
+        published.flush(9, &snapshot);
+        assert_eq!(snapshot.lock().expect("snapshot").seq, 5);
+    }
 
     #[test]
     fn const_f64_param_parses_to_float() {
