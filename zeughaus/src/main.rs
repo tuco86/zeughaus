@@ -44,14 +44,16 @@ fn main() -> iced::Result {
         .subscription(App::subscription)
         .title("Zeughaus Editor")
         .theme(|app: &App| app.theme())
-        // The close is handled rather than obeyed: a settings edit is held
-        // back for 400 ms after the last keystroke, and typing into a field
-        // and closing the window used to lose it from the store without a
-        // word. `App` flushes and then closes the window itself.
-        .exit_on_close_request(false)
         .window(iced::window::Settings {
             size: iced::Size::new(1280.0, 800.0),
             position: iced::window::Position::Centered,
+            // The close is handled rather than obeyed: a settings edit is held
+            // back for 400 ms after the last keystroke, and typing into a
+            // field and closing the window used to lose it from the store
+            // without a word. `App` flushes and then ends the runtime itself.
+            // Set here rather than through `exit_on_close_request`, which
+            // `window` would overwrite.
+            exit_on_close_request: false,
             ..Default::default()
         })
         .run()

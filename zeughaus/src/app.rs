@@ -1374,7 +1374,10 @@ impl App {
                 let Some(value) = zeughaus_core::decode_scalar(&ty, &value) else {
                     return;
                 };
-                self.remote_outputs.entry(node).or_default().insert(pin, value);
+                self.remote_outputs
+                    .entry(node)
+                    .or_default()
+                    .insert(pin, value);
                 self.reapply_remote_outputs(node);
             }
             Traffic::Event(RuntimeEvent::OutputCleared { seq, node_id, pin }) => {
@@ -2566,14 +2569,16 @@ impl App {
                     return self.reconcile_runtime();
                 }
             }
-            Message::CloseRequested(window) => {
+            Message::CloseRequested => {
                 // The last thing this window does. A settings edit is held
                 // back for the debounce, so closing right after typing used to
                 // drop it from the store silently -- and the autosave that
                 // does hold it is not read while a store exists.
                 self.flush_pending();
                 self.autosave();
-                return iced::window::close(window);
+                // Ends the runtime rather than closing the window: a closed
+                // window leaves the event loop spinning with nothing to draw.
+                return iced::exit();
             }
             Message::CopySessionId => {
                 #[cfg(not(target_arch = "wasm32"))]
@@ -2880,18 +2885,15 @@ impl App {
             // by edge id, so a wire that carries an unchanged value still shows
             // the traffic on it -- which the colour alone cannot.
             #[cfg(not(target_arch = "wasm32"))]
-            let edge_widget = edge_widget.particles(
-                self.particles
-                    .get(&edge.id)
-                    .into_iter()
-                    .flatten()
-                    .map(move |born| {
+            let edge_widget =
+                edge_widget.particles(self.particles.get(&edge.id).into_iter().flatten().map(
+                    move |born| {
                         particle(*born, PARTICLE_SPEED).style(move |theme| ParticleStyle {
                             color: edge_color,
                             ..default_particle_style(theme)
                         })
-                    }),
-            );
+                    },
+                ));
             ng = ng.push_edge(edge_widget);
         }
 
@@ -3041,7 +3043,7 @@ impl App {
 
         #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let mut subs = vec![events];
-        subs.push(iced::window::close_requests().map(Message::CloseRequested));
+        subs.push(iced::window::close_requests().map(|_| Message::CloseRequested));
 
         // The library only auto-redraws for animated edges, not node borders.
         // While any node is in error, drive ~30fps redraws so its marching-ants

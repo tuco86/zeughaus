@@ -323,7 +323,10 @@ async fn subscribe(
             .await
             .map_err(|e| format!("event: {e}"))?;
         let Some(event) = RuntimeEvent::decode(&payload) else {
-            eprintln!("[traffic] skipped a malformed event ({} bytes)", payload.len());
+            eprintln!(
+                "[traffic] skipped a malformed event ({} bytes)",
+                payload.len()
+            );
             continue;
         };
         if out.send(Traffic::Event(event)).await.is_err() {
