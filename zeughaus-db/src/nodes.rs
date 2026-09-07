@@ -7,7 +7,7 @@
 use zeughaus_core::*;
 
 use crate::{
-    ColTy, DB_PATH, RELATIONS, TableRef, failed, is_query, open, parse_columns,
+    ColTy, DB_PATH, RELATIONS, RENAMED_FROM, TableRef, failed, is_query, open, parse_columns,
     parse_columns_checked, parse_relations, quote, rejected, rows_to_json, table_ty, to_sql,
 };
 
@@ -153,6 +153,9 @@ pub struct TableNode {
     /// The relations this table's fields declare, as the editor derived them
     /// from the wires: one `field -> table.field` per line.
     relations: String,
+    /// The name this table had before the last rename, as the editor derived
+    /// it ([`crate::RENAMED_FROM`]). Empty when nothing was renamed.
+    renamed_from: String,
     pins: Vec<PinDefinition>,
 }
 
@@ -172,6 +175,7 @@ impl TableNode {
             name: Self::DEFAULT_NAME.to_string(),
             columns: Self::DEFAULT_COLUMNS.to_string(),
             relations: String::new(),
+            renamed_from: String::new(),
             pins: Vec::new(),
         };
         node.rebuild_pins();
@@ -263,6 +267,33 @@ impl ExecutableNode for TableNode {
 
         let conn = open(&self.db_path)?;
         let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+        // The table this node used to be called is renamed to what it is
+        // called now -- before the `CREATE TABLE`, which would otherwise
+        // create the new name as an empty second table and leave the data
+        // behind under the old one.
+        //
+        // Both conditions are the idempotence: the old table has to be there
+        // and the new one must not be. A rerun, a second runner and a standby
+        // that takes over therefore all find nothing to do, and the parameter
+        // may stay in the store saying nothing.
+        if !self.renamed_from.is_empty()
+            && self.renamed_from != self.name
+            && !table_columns(&conn, &self.renamed_from)?.is_empty()
+            && table_columns(&conn, &self.name)?.is_empty()
+        {
+            let sql = format!(
+                "ALTER TABLE {} RENAME TO {}",
+                quote(&self.renamed_from),
+                quote(&self.name)
+            );
+            conn.execute_batch(&sql).map_err(|e| {
+                failed(format!(
+                    "cannot rename table {} to {}: {e}",
+                    self.renamed_from, self.name
+                ))
+            })?;
+        }
+
         conn.execute_batch(&ddl)
             .map_err(|e| failed(format!("cannot create table {}: {e}", self.name)))?;
 
@@ -436,6 +467,9 @@ impl ExecutableNode for TableNode {
             // same way `db_path` is derived from the enclosing database: a
             // relation is a fact about the graph, and the runner reads facts.
             RELATIONS => self.relations = text,
+            // Also derived by the editor: which name this table had before,
+            // because only the process that saw the edit knows.
+            RENAMED_FROM => self.renamed_from = text.trim().to_string(),
             _ => {}
         }
         Ok(())
@@ -1003,6 +1037,81 @@ mod tests {
                 ("tag".to_string(), "TEXT".to_string()),
             ]
         );
+    }
+
+    /// A table renamed in the graph is renamed in the file, with its rows.
+    /// Creating the new name and leaving the old table behind is what this
+    /// replaces -- two tables, the data in the one nothing writes to.
+    #[test]
+    fn a_renamed_table_takes_its_rows_with_it() {
+        let path = temp_db("tablerename");
+        let mut node = TableNode::new();
+        set(&mut node, DB_PATH, &path);
+        set(&mut node, "name", "samples");
+        set(&mut node, "columns", "id:int\nx:float");
+        node.execute(&InputSet::new(), &mut ctx()).expect("create");
+        {
+            let conn = open(&path).expect("open");
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute_batch("INSERT INTO \"samples\" (\"x\") VALUES (1.5)")
+                .expect("row");
+        }
+
+        // What the editor derives from the edit it saw.
+        set(&mut node, "name", "readings");
+        set(&mut node, RENAMED_FROM, "samples");
+        node.execute(&InputSet::new(), &mut ctx()).expect("rename");
+        // The parameter stays in the store, so the next pass sees it again and
+        // must find nothing to do.
+        node.execute(&InputSet::new(), &mut ctx())
+            .expect("idempotent");
+
+        let (tables, value) = {
+            let conn = open(&path).expect("open");
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            let mut statement = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                .expect("master");
+            let tables: Vec<String> = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("rows")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("tables");
+            let value: f64 = conn
+                .query_row("SELECT \"x\" FROM \"readings\"", [], |row| row.get(0))
+                .expect("value");
+            (tables, value)
+        };
+        assert_eq!(tables, vec!["readings".to_string()]);
+        assert_eq!(value, 1.5);
+    }
+
+    /// The rename is skipped when the file has nothing to rename: a second
+    /// runner, a fresh file, and a node whose old table someone dropped all
+    /// have to be able to run the same parameter without failing.
+    #[test]
+    fn a_rename_with_nothing_to_rename_is_a_no_op() {
+        let path = temp_db("tablerename-noop");
+        let mut node = TableNode::new();
+        set(&mut node, DB_PATH, &path);
+        set(&mut node, "name", "readings");
+        set(&mut node, "columns", "id:int\nx:float");
+        set(&mut node, RENAMED_FROM, "samples");
+        node.execute(&InputSet::new(), &mut ctx()).expect("create");
+
+        let tables = {
+            let conn = open(&path).expect("open");
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            let mut statement = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .expect("master");
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("rows")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("tables")
+        };
+        assert_eq!(tables, vec!["readings".to_string()]);
     }
 
     /// A field renamed in the graph is renamed in the file, with its data.

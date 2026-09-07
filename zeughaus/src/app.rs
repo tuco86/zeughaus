@@ -1158,6 +1158,53 @@ impl App {
         }
     }
 
+    /// Records the name a table had before this commit, so the runner can
+    /// rename the table in the file instead of creating a second one.
+    ///
+    /// The editor is the only process that sees the edit: the store holds one
+    /// row per node, and a runner handed a row with a new name cannot tell a
+    /// rename from a table it has never heard of. `was` is the value the store
+    /// held, so however many keystrokes produced the new name, this is the one
+    /// name the file can still be under.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn settle_table_rename(&mut self, node: NodeId, key: &str, was: &str) {
+        if key != "name"
+            || self
+                .nodes
+                .get(&node)
+                .is_none_or(|n| n.type_id != "db.table")
+        {
+            return;
+        }
+        // A name the node refused renamed nothing: it kept the one it had, and
+        // recording a rename away from it would name a table that is still in
+        // use.
+        if self
+            .setting_errors
+            .get(&node)
+            .is_some_and(|errors| errors.contains_key(key))
+        {
+            return;
+        }
+        let now = self.setting_or_default(node, "name");
+        // Nothing to rename from: the name did not change, or there was none.
+        let from = if was.is_empty() || was == now {
+            String::new()
+        } else {
+            was.to_string()
+        };
+        if self.setting_or_default(node, zeughaus_db::RENAMED_FROM) == from {
+            return;
+        }
+        self.node_settings
+            .entry(node)
+            .or_default()
+            .insert(zeughaus_db::RENAMED_FROM.to_string(), from.clone());
+        let _ = self
+            .executor
+            .set_parameter(node, zeughaus_db::RENAMED_FROM, Value::new(from));
+    }
+
     /// Commits one node's held-back settings to the store: the wires they
     /// moved, the parameters they are derived into, and the row itself.
     #[cfg(not(target_arch = "wasm32"))]
@@ -1168,6 +1215,7 @@ impl App {
         keys.sort();
         for (key, was) in keys {
             self.settle_relations(node, &key, &was);
+            self.settle_table_rename(node, &key, &was);
         }
         // A database's path reaches its children, a table's columns reach
         // everything it feeds, and its name is what the tables referencing it

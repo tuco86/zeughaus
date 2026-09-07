@@ -101,6 +101,18 @@ pub fn table_ty() -> Ty {
 /// between field pins, so it is not in any node's `settings()`.
 pub const RELATIONS: &str = "relations";
 
+/// The hidden parameter a `db.table` takes when its name changes: the name it
+/// had before. Derived by the editor, which is the only process that sees the
+/// edit itself -- the runner is handed a row and cannot tell a rename from a
+/// table it has never heard of.
+///
+/// What a `db.table` does with it is rename the table in the file, once: the
+/// step is skipped as soon as the old table is gone or the new one is there,
+/// so a second runner, a rerun and a standby taking over all reach the same
+/// file. The value stays in the store afterwards, where it says nothing --
+/// the table it names no longer exists.
+pub const RENAMED_FROM: &str = "renamed_from";
+
 /// A column's declared type, as the user writes it in a `name:type` line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColTy {
