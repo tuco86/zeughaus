@@ -5,6 +5,10 @@ mod app;
 mod feed;
 mod message;
 mod palette;
+// Settings edits waiting to reach the store. Native-only: without a store
+// there is nothing to hold them back from.
+#[cfg(not(target_arch = "wasm32"))]
+mod pending;
 // The SpacetimeDB client lives in its own crate, shared with the headless
 // runtime process. Re-exported under the old paths so `crate::sync::` and
 // `crate::module_bindings::` keep working. Native-only for now; the wasm editor

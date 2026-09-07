@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 
 use iced::keyboard;
 use iced::widget::{button, column, container, image, pick_list, row, stack, text, text_input};
@@ -232,6 +234,9 @@ pub struct App {
     // which is why an unchanged value still animates: traffic, not state.
     #[cfg(not(target_arch = "wasm32"))]
     particles: HashMap<EdgeId, std::collections::VecDeque<iced::time::Instant>>,
+    /// Settings edits the store has not seen yet. See [`crate::pending`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pending: crate::pending::PendingEdits,
 }
 
 impl App {
@@ -365,6 +370,8 @@ impl App {
             output_seq: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             particles: HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            pending: crate::pending::PendingEdits::new(),
         };
 
         // Restore the last local session. A no-op while syncing: the shared
@@ -768,6 +775,101 @@ impl App {
                 .any(|s| &*s.name == key && matches!(s.kind, SettingKind::Fields { .. }))
         })
     }
+
+    /// Applies a setting to this window only: the recorded text, the local
+    /// executor's copy of the node, and the pin set the node now declares.
+    ///
+    /// Immediate on purpose. What the user typed has to be on screen at the
+    /// next frame; what the *store* learns is a separate question, answered by
+    /// [`Self::commit_node`] once the typing stops.
+    fn apply_setting_locally(&mut self, node: NodeId, key: &str, value: String) {
+        self.node_settings
+            .entry(node)
+            .or_default()
+            .insert(key.to_string(), value.clone());
+        let _ = self.executor.set_parameter(node, key, Value::new(value));
+        // A setting can decide the node's pins (a table's columns are one), so
+        // the widget re-reads what it now declares.
+        self.refresh_node_pins(node);
+    }
+
+    /// Settles the wires a settings change moved or orphaned.
+    ///
+    /// `was` is the value the store holds, so one name changed in place is one
+    /// rename however many keystrokes produced it.
+    fn settle_relations(&mut self, node: NodeId, key: &str, was: &str) -> bool {
+        let renamed = self
+            .is_field_setting(node, key)
+            .then(|| renamed_field(was, &self.setting_or_default(node, key)))
+            .flatten();
+        match renamed {
+            Some((old, new)) => {
+                self.rename_pin_edges(node, &old, &new);
+                true
+            }
+            // A field that is gone takes its relations with it: a foreign key
+            // lives on a field, and a wire to a pin the node no longer
+            // declares is one nobody can see or delete.
+            None => {
+                self.drop_orphaned_relations(node);
+                false
+            }
+        }
+    }
+
+    /// Commits one node's held-back settings to the store: the wires they
+    /// moved, the parameters they are derived into, and the row itself.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn commit_node(&mut self, node: NodeId, owed: crate::pending::Owed) {
+        // Sorted so a run of edits produces the same sequence of store calls
+        // in every window that replays it.
+        let mut keys: Vec<(String, String)> = owed.was.into_iter().collect();
+        keys.sort();
+        let mut renamed = false;
+        for (key, was) in keys {
+            renamed |= self.settle_relations(node, &key, &was);
+        }
+        // A rename already rewired everything; asking again would only look
+        // for orphans that a rename cannot leave.
+        let _ = renamed;
+        // A database's path reaches its children, a table's columns reach
+        // everything it feeds, and its name is what the tables referencing it
+        // name in their foreign keys.
+        self.derive_db_params(node);
+        self.derive_db_dependents(node);
+        self.push_params(node);
+    }
+
+    /// Commits every node whose settings have been quiet long enough. Called
+    /// from the sync poll, which is the editor's only clock while it is idle.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn commit_settled(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let due = self
+            .pending
+            .settled(Instant::now(), crate::pending::DEBOUNCE);
+        for (node, owed) in due {
+            self.commit_node(node, owed);
+        }
+    }
+
+    /// Commits everything now, because something is about to read or change
+    /// the shared graph and must not see a store the local view has outgrown.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn flush_pending(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        for (node, owed) in self.pending.drain() {
+            self.commit_node(node, owed);
+        }
+    }
+
+    /// No store, nothing to hold back.
+    #[cfg(target_arch = "wasm32")]
+    fn flush_pending(&mut self) {}
 
     /// Drops an edge from this window: the view, the executor graph and cache,
     /// and the particle queue that was riding it.
@@ -1655,6 +1757,14 @@ impl App {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        // Held-back settings edits reach the store before anything that reads
+        // or changes the shared graph. A wire drawn onto a pin the store does
+        // not know about yet, or a node deleted before its own text ever
+        // arrived, would leave a graph nobody can reconstruct. The typing
+        // messages are of course exempt -- holding them back is the point.
+        if observes_store(&message) {
+            self.flush_pending();
+        }
         match message {
             Message::EdgeConnected { from, to } => {
                 // iced_nodegraph normalizes on_connect to (output, input), so
@@ -1790,6 +1900,20 @@ impl App {
                 }
             }
             Message::DeleteNodes(ids) => {
+                // Edits still owed by a node that is about to go are dropped,
+                // not committed: pushing a parameter onto a row the very next
+                // reducer call deletes is work for nothing.
+                #[cfg(not(target_arch = "wasm32"))]
+                for raw_id in &ids {
+                    let mut doomed = self.descendants(NodeId(*raw_id));
+                    doomed.push(NodeId(*raw_id));
+                    for id in doomed {
+                        self.pending.take(id);
+                    }
+                }
+                // What every other node still owes does go, before the store
+                // changes shape underneath it.
+                self.flush_pending();
                 for raw_id in &ids {
                     let id = NodeId(*raw_id);
                     // The store deletes a container's contents with it, so this
@@ -1904,41 +2028,25 @@ impl App {
                 value,
             } => {
                 let id = NodeId(node_id);
-                // A field-list edit is compared against what it replaced: one
-                // name changed in place is a rename, and a rename keeps its
-                // wires (`rename_pin_edges`) instead of orphaning them.
-                let renamed = self
-                    .is_field_setting(id, &key)
-                    .then(|| renamed_field(&self.setting_or_default(id, &key), &value))
-                    .flatten();
-                self.node_settings
-                    .entry(id)
-                    .or_default()
-                    .insert(key.clone(), value.clone());
-                let _ = self.executor.set_parameter(id, &key, Value::new(value));
-                // A setting can decide the node's pins (a table's columns are
-                // one), so the widget re-reads what it now declares.
-                self.refresh_node_pins(id);
-                match &renamed {
-                    Some((old, new)) => self.rename_pin_edges(id, old, new),
-                    // A field that is gone takes its relations with it: a
-                    // foreign key lives on a field, and a wire to a pin the
-                    // node no longer declares is one nobody can see or delete.
-                    None => self.drop_orphaned_relations(id),
-                }
-                // Renaming a boundary renames its container's pin.
+                // What the store still holds. The commit compares against it
+                // rather than against the previous keystroke, which is what
+                // makes a run of characters one change.
+                let was = self.setting_or_default(id, &key);
+                #[cfg(not(target_arch = "wasm32"))]
+                self.pending.touch(id, &key, &was, Instant::now());
+                self.apply_setting_locally(id, &key, value);
+                // Renaming a boundary renames its container's pin. View-local,
+                // so it does not wait.
                 if key == "name" {
                     self.refresh_boundary_owner(id);
                 }
-                // A database's path reaches its children, a table's columns
-                // reach everything it feeds, and its name is what the tables
-                // referencing it name in their foreign keys.
-                #[cfg(not(target_arch = "wasm32"))]
-                self.derive_db_params(id);
-                #[cfg(not(target_arch = "wasm32"))]
-                self.derive_db_dependents(id);
-                #[cfg(not(target_arch = "wasm32"))]
-                self.push_params(id);
+                // Without a store there is nothing to hold back.
+                #[cfg(target_arch = "wasm32")]
+                self.settle_relations(id, &key, &was);
+                // No flush before this: `autosave` writes the local document,
+                // which `apply_setting_locally` has just brought up to date.
+                // Flushing here would defeat the whole point, since every
+                // keystroke autosaves.
                 self.autosave();
             }
             Message::NodeTriggered { node_id } => {
@@ -1977,6 +2085,10 @@ impl App {
             Message::SyncPoll => {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
+                    // The editor's only clock while it is idle, so this is
+                    // where a run of settings edits that has gone quiet
+                    // reaches the store.
+                    self.commit_settled();
                     self.drain_sync();
                     // Also where the runtime endpoint is noticed. A runtime
                     // announces its address by updating its own `runtime` row,
@@ -2996,6 +3108,31 @@ impl App {
             self.apply_edge_insert(ed);
         }
     }
+}
+
+/// Whether handling this message reads or changes the shared graph, and
+/// therefore has to see the store the local view already shows.
+///
+/// The settings-editing messages are absent by design: holding them back from
+/// the store until the typing stops is exactly what this list protects.
+/// `SyncPoll` is absent too -- it commits what has settled instead, and
+/// flushing there would make the delay meaningless.
+fn observes_store(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::EdgeConnected { .. }
+            | Message::EdgeDisconnected { .. }
+            | Message::EnterGraph(_)
+            | Message::AutoLayout
+            | Message::GroupMoved { .. }
+            | Message::CloneNodes(_)
+            // `DeleteNodes` is missing on purpose: it flushes itself, after
+            // dropping what the doomed nodes owed.
+            | Message::SpawnNode { .. }
+            | Message::NodeTriggered { .. }
+            | Message::SaveGraph
+            | Message::GraphLoaded(_)
+    )
 }
 
 /// Default content size of a Display node before the user resizes it. Wide
