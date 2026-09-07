@@ -3481,6 +3481,16 @@ impl App {
     fn apply_params(&mut self, id: NodeId, type_id: &str, params: &[(String, String)]) {
         let is_const = type_id.starts_with("transform.const_");
         for (name, value_str) in params {
+            // A key this window still owes the store is one the user is
+            // typing: the shared value for it is older than what is on screen
+            // (usually this window's own echo, one debounce behind), and
+            // adopting it snaps the field back mid-word and then pushes the
+            // snapped-back text. The remote value is taken for that key the
+            // next time the row arrives with nothing owed.
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.pending.owes(id, name) {
+                continue;
+            }
             match type_id {
                 "transform.const_f64" => {
                     if let Ok(f) = value_str.parse::<f64>() {

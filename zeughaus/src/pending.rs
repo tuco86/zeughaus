@@ -101,6 +101,20 @@ impl PendingEdits {
         self.nodes.remove(&node).map(|entry| entry.owed)
     }
 
+    /// Whether this window still owes the store a value for `key` on `node`.
+    ///
+    /// The one question a remote row has to ask before it overwrites a field.
+    /// A held-back edit is 400 ms of typing the store has not seen: adopting
+    /// the shared value for that key snaps the field back mid-word, and the
+    /// held edit then pushes whatever the overwrite left behind. The common
+    /// trigger is this window's own echo -- the debounce fires, the store
+    /// echoes the row a moment later, and by then the user has typed on.
+    pub fn owes(&self, node: NodeId, key: &str) -> bool {
+        self.nodes
+            .get(&node)
+            .is_some_and(|entry| entry.owed.was.contains_key(key))
+    }
+
     fn collect(&mut self, mut ids: Vec<NodeId>) -> Vec<(NodeId, Owed)> {
         ids.sort_unstable();
         ids.into_iter()
@@ -192,6 +206,30 @@ mod tests {
             Some(owed(&[("name", "orders"), ("columns", "id:int")]))
         );
         assert!(pending.take(node).is_none());
+    }
+
+    /// What a remote row asks before it overwrites a field. Owed is per key
+    /// and per node, and it ends the moment the edit reaches the store --
+    /// otherwise the shared value would never be adopted again.
+    #[test]
+    fn a_key_is_owed_until_it_reaches_the_store() {
+        let mut pending = PendingEdits::new();
+        let start = Instant::now();
+        let node = NodeId(1);
+        assert!(!pending.owes(node, "columns"));
+
+        pending.touch(node, "columns", "id:int", start);
+        assert!(pending.owes(node, "columns"));
+        // Only that key, and only that node.
+        assert!(!pending.owes(node, "name"));
+        assert!(!pending.owes(NodeId(2), "columns"));
+
+        // Still owed while the edits keep coming...
+        pending.touch(node, "columns", "id:int", start + ms(100));
+        assert!(pending.owes(node, "columns"));
+        // ...and no longer once they have settled and been taken.
+        assert_eq!(pending.settled(start + ms(600), DEBOUNCE).len(), 1);
+        assert!(!pending.owes(node, "columns"));
     }
 
     fn ms(n: u64) -> Duration {
