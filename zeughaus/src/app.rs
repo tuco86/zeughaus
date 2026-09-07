@@ -89,8 +89,16 @@ pub struct EditorEdge {
 /// a capture graph delivers.
 #[derive(Default)]
 struct NodeEdges {
-    outgoing: Vec<EdgeId>,
-    incoming: Vec<EdgeId>,
+    /// Edges leaving this node, each with the node at the other end -- so
+    /// resolving one no longer means scanning every edge.
+    outgoing: Vec<(EdgeId, NodeId)>,
+    incoming: Vec<(EdgeId, NodeId)>,
+    /// The nodes this one feeds through a *dataflow* edge.
+    ///
+    /// Relations are absent on purpose: two tables referencing each other is a
+    /// legal schema, and this list is what answers "would this wire close a
+    /// cycle".
+    flow_out: Vec<NodeId>,
 }
 
 /// What a node shows inline: either the value rendered as text, or a decoded
@@ -1227,7 +1235,6 @@ impl App {
     ///
     /// Read off the pin declaration, never off a node type: what makes an edge
     /// a relation is the same fact here, in the runtime and in the runner.
-    #[cfg(not(target_arch = "wasm32"))]
     fn is_field_pin(&self, node: NodeId, pin: &str) -> bool {
         self.pin_def(node, pin)
             .is_some_and(|p| p.direction == PinDirection::Both)
@@ -1825,16 +1832,18 @@ impl App {
     fn reindex_edges(&mut self) {
         let mut index: HashMap<NodeId, NodeEdges> = HashMap::new();
         for edge in &self.edges {
-            index
-                .entry(edge.from_node)
-                .or_default()
-                .outgoing
-                .push(edge.id);
-            index
-                .entry(edge.to_node)
-                .or_default()
-                .incoming
-                .push(edge.id);
+            let from = edge.from_node;
+            let to = edge.to_node;
+            index.entry(from).or_default().outgoing.push((edge.id, to));
+            index.entry(to).or_default().incoming.push((edge.id, from));
+            // The same rule the runtime applies (`Graph::is_dataflow`): a wire
+            // with a field pin at either end declares a relationship, carries
+            // nothing, and is no dependency.
+            let relation = self.is_field_pin(from, edge.from_pin.as_str())
+                || self.is_field_pin(to, edge.to_pin.as_str());
+            if !relation {
+                index.entry(from).or_default().flow_out.push(to);
+            }
         }
         self.edge_index = index;
     }
@@ -1858,12 +1867,12 @@ impl App {
         let value = edges
             .outgoing
             .iter()
-            .find_map(|id| self.executor.edge_value(*id))
+            .find_map(|(id, _)| self.executor.edge_value(*id))
             .or_else(|| {
                 edges
                     .incoming
                     .iter()
-                    .find_map(|id| self.executor.edge_value(*id))
+                    .find_map(|(id, _)| self.executor.edge_value(*id))
             })?;
         Some(match value.downcast_ref::<Image>() {
             Some(frame) => self.frame_display(node_id, frame),
@@ -1897,11 +1906,7 @@ impl App {
     fn update_displays_from(&mut self, node: NodeId) {
         let mut touched: Vec<NodeId> = vec![node];
         if let Some(edges) = self.edge_index.get(&node) {
-            for id in &edges.outgoing {
-                if let Some(edge) = self.edges.iter().find(|e| e.id == *id) {
-                    touched.push(edge.to_node);
-                }
-            }
+            touched.extend(edges.outgoing.iter().map(|(_, target)| *target));
         }
         for id in touched {
             match self.display_for(id) {
@@ -2640,6 +2645,7 @@ impl App {
                 // output and one input, distinct nodes, compatible types --
                 // or, between two field pins, a relation.
                 let nodes = &self.nodes;
+                let edge_index = &self.edge_index;
                 let converters = &self.converters;
                 move |from, to| {
                     let from_id = NodeId(*from.node_id());
@@ -2685,11 +2691,24 @@ impl App {
                     }
                     // Converters are directional (output type -> input type), so
                     // resolve which side is the output before checking.
-                    let (out_pin, in_pin) = if fp.direction == PinDirection::Output {
-                        (fp, tp)
+                    let (out_pin, in_pin, source, target) = if fp.direction == PinDirection::Output
+                    {
+                        (fp, tp, from_id, to_id)
                     } else {
-                        (tp, fp)
+                        (tp, fp, to_id, from_id)
                     };
+                    // A wire whose target already feeds its source closes a
+                    // cycle. The runtime survives one now -- it runs the
+                    // acyclic part -- but a component that quietly stops is
+                    // not what the user asked for, and the drop is the one
+                    // moment where saying no needs no explanation.
+                    //
+                    // Over the real edges, which are flat: a cycle that runs
+                    // through a subgraph boundary is a cycle the executor sees,
+                    // whatever the canvas draws it as.
+                    if flow_reaches(edge_index, target, source) {
+                        return false;
+                    }
                     converters.compatible(&out_pin.ty, &in_pin.ty)
                 }
             });
@@ -3673,6 +3692,35 @@ fn setting_refusal<'a>(
     text(message).size(10).color(Color::from_rgb(0.9, 0.4, 0.4))
 }
 
+/// Whether `start` can reach `goal` by following dataflow edges of `index`.
+///
+/// What makes a wire a cycle: a wire from `goal` to `start` closes one exactly
+/// when this is true. Only `flow_out` is followed, so a relation between two
+/// table fields is not a path -- two tables referencing each other is a legal
+/// schema, and the runtime already keeps such an edge out of execution.
+///
+/// The executor now runs the acyclic part of a graph that has a cycle, so this
+/// is not the last line of defence. It is the only place where refusing needs
+/// no explanation: at the drop, nothing has happened yet.
+fn flow_reaches(index: &HashMap<NodeId, NodeEdges>, start: NodeId, goal: NodeId) -> bool {
+    let mut seen: HashSet<NodeId> = HashSet::from([start]);
+    let mut stack = vec![start];
+    while let Some(node) = stack.pop() {
+        let Some(edges) = index.get(&node) else {
+            continue;
+        };
+        for next in &edges.flow_out {
+            if *next == goal {
+                return true;
+            }
+            if seen.insert(*next) {
+                stack.push(*next);
+            }
+        }
+    }
+    false
+}
+
 /// The containers between the root graph and `graph`, outermost first.
 ///
 /// `parent_of` answers what a node's parent is, or `None` for a node this
@@ -4593,5 +4641,55 @@ mod tests {
         // A parent this window does not have stops the walk rather than
         // dropping the part of the trail that is known.
         assert!(ancestry(NodeId(9), |_| None).is_empty());
+    }
+
+    /// A wire is refused exactly when its target already feeds its source. A
+    /// relation is not a path: two tables referencing each other is a legal
+    /// schema, and the runtime keeps such an edge out of execution anyway.
+    #[test]
+    fn a_wire_closes_a_cycle_only_along_dataflow_edges() {
+        let node = |flow_out: Vec<u64>| NodeEdges {
+            outgoing: Vec::new(),
+            incoming: Vec::new(),
+            flow_out: flow_out.into_iter().map(NodeId).collect(),
+        };
+        // 1 -> 2 -> 3, and 4 alone.
+        let index: HashMap<NodeId, NodeEdges> = HashMap::from([
+            (NodeId(1), node(vec![2])),
+            (NodeId(2), node(vec![3])),
+            (NodeId(3), node(vec![])),
+            (NodeId(4), node(vec![])),
+        ]);
+
+        // A wire from 3 back to 1 would close the chain: 1 reaches 3.
+        assert!(flow_reaches(&index, NodeId(1), NodeId(3)));
+        assert!(flow_reaches(&index, NodeId(1), NodeId(2)));
+        // The other direction is the wire the user is allowed to draw.
+        assert!(!flow_reaches(&index, NodeId(3), NodeId(1)));
+        // Unrelated components, and a node nothing in the index mentions.
+        assert!(!flow_reaches(&index, NodeId(4), NodeId(1)));
+        assert!(!flow_reaches(&index, NodeId(9), NodeId(1)));
+
+        // A graph that already has a cycle must not hang the walk -- one can
+        // arrive from the store, which the executor now tolerates.
+        let looped: HashMap<NodeId, NodeEdges> =
+            HashMap::from([(NodeId(1), node(vec![2])), (NodeId(2), node(vec![1]))]);
+        assert!(flow_reaches(&looped, NodeId(1), NodeId(2)));
+        assert!(!flow_reaches(&looped, NodeId(1), NodeId(7)));
+
+        // Relations are absent from `flow_out`, so a pair of tables wired to
+        // each other is not a path at all.
+        let relations: HashMap<NodeId, NodeEdges> = HashMap::from([
+            (
+                NodeId(1),
+                NodeEdges {
+                    outgoing: vec![(EdgeId(1), NodeId(2))],
+                    incoming: vec![(EdgeId(2), NodeId(2))],
+                    flow_out: Vec::new(),
+                },
+            ),
+            (NodeId(2), node(vec![])),
+        ]);
+        assert!(!flow_reaches(&relations, NodeId(1), NodeId(2)));
     }
 }
