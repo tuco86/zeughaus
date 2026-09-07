@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use iced::keyboard;
 use iced::widget::{button, column, container, image, pick_list, row, stack, text, text_input};
-use iced::{Color, ContentFit, Element, Event, Length, Point, Subscription, Task, Theme};
+use iced::{Color, ContentFit, Element, Event, Length, Point, Subscription, Task, Theme, Vector};
 use iced_nodegraph::{
     EdgeStyle, NodeGraph, NodeStatus, NodeStyle, Pattern, PinDirection as NgPinDirection, PinInfo,
     PinRef, PinShape, PinSide, PinStyle, default_edge_style, default_node_style, default_pin_style,
@@ -596,20 +596,31 @@ impl App {
     }
 
     fn spawn_node(&mut self, type_id: &str, position: Point) {
-        let exec = self.plugins.iter().find_map(|p| p.create_node(type_id));
-        let Some(exec) = exec else {
-            return;
-        };
-
         // Stagger each new node so they don't pile up
         let offset = (self.spawn_counter % 10) as f32 * 30.0;
         self.spawn_counter += 1;
         let position = Point::new(position.x + offset, position.y + offset);
+        self.spawn_node_into(type_id, position, self.current_graph);
+    }
+
+    /// Creates a node of `type_id` inside `parent`, seeded with the defaults
+    /// its type declares. `None` when no plugin in this build provides the
+    /// type.
+    ///
+    /// Separate from [`Self::spawn_node`] because a clone decides both the
+    /// parent and the exact position: a copied subtree's children belong to
+    /// the copied container, and staggering them would move them inside it.
+    fn spawn_node_into(
+        &mut self,
+        type_id: &str,
+        position: Point,
+        parent: NodeId,
+    ) -> Option<NodeId> {
+        let exec = self.plugins.iter().find_map(|p| p.create_node(type_id))?;
 
         let pin_defs = exec.pin_definitions().to_vec();
         let setting_defs = exec.settings();
         let id = NodeId::next();
-
         let display_name = self
             .catalog
             .iter()
@@ -651,7 +662,7 @@ impl App {
                 position,
                 pin_defs,
                 settings: setting_defs,
-                parent: self.current_graph,
+                parent,
                 is_container: self.is_container(type_id),
             },
         );
@@ -671,12 +682,91 @@ impl App {
         }
 
         // A boundary node spawned inside a container is a new pin on it.
-        self.refresh_container_pins(self.current_graph);
+        self.refresh_container_pins(parent);
         #[cfg(not(target_arch = "wasm32"))]
         self.derive_db_params(id);
         #[cfg(not(target_arch = "wasm32"))]
         self.push_node(id);
         self.autosave();
+        Some(id)
+    }
+
+    /// Copies a node, what has been typed into it, and -- for a container --
+    /// everything inside it. Returns the copy of `root`.
+    ///
+    /// Cloning used to be `spawn_node(type_id, position)`: same type, same
+    /// place, default everything. A copy that comes up with default settings,
+    /// and a copied container that comes up empty, look like the original and
+    /// behave differently -- which is worse than either copying properly or
+    /// refusing.
+    ///
+    /// Ids are remapped, so a wire between two copied nodes joins the copies.
+    /// Relations are ordinary edges here and are copied like the rest. An edge
+    /// with only one end inside the copied subtree is NOT copied: a second
+    /// wire onto a single-slot input would be refused anyway, and for a
+    /// relation, guessing which of the two schemas the user meant to reference
+    /// is worse than leaving the wire to be drawn.
+    fn clone_subtree(&mut self, root: NodeId, offset: Vector) -> Option<NodeId> {
+        // `descendants` yields a parent before its own children, so the copy a
+        // child is parented to always exists by the time it is created.
+        let mut originals = vec![root];
+        originals.extend(self.descendants(root));
+
+        let mut copy_of: HashMap<NodeId, NodeId> = HashMap::new();
+        for original in originals {
+            let Some(node) = self.nodes.get(&original) else {
+                continue;
+            };
+            let type_id = node.type_id.clone();
+            let position = if original == root {
+                Point::new(node.position.x + offset.x, node.position.y + offset.y)
+            } else {
+                node.position
+            };
+            // The root lands next to the original, in the graph on screen;
+            // everything below it keeps its place inside the copied container.
+            let into = if original == root {
+                self.current_graph
+            } else {
+                match copy_of.get(&node.parent) {
+                    Some(parent) => *parent,
+                    None => continue,
+                }
+            };
+            let Some(copy) = self.spawn_node_into(&type_id, position, into) else {
+                continue;
+            };
+            copy_of.insert(original, copy);
+
+            if let Some(value) = self.const_inputs.get(&original).cloned() {
+                self.const_inputs.insert(copy, value);
+            }
+            if let Some(settings) = self.node_settings.get(&original).cloned() {
+                for (key, value) in settings {
+                    self.apply_setting_locally(copy, &key, value);
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                self.push_params(copy);
+            }
+        }
+
+        let internal: Vec<(NodeId, PinLabel, NodeId, PinLabel)> = self
+            .edges
+            .iter()
+            .filter_map(|e| {
+                Some((
+                    *copy_of.get(&e.from_node)?,
+                    e.from_pin.clone(),
+                    *copy_of.get(&e.to_node)?,
+                    e.to_pin.clone(),
+                ))
+            })
+            .collect();
+        for (from_node, from_pin, to_node, to_pin) in internal {
+            self.connect_edge(from_node, from_pin, to_node, to_pin);
+        }
+
+        copy_of.get(&root).copied()
     }
 
     fn connect_edge(
@@ -2033,15 +2123,21 @@ impl App {
                 self.selected = sel.into_iter().map(NodeId).collect();
             }
             Message::CloneNodes(ids) => {
-                let positions: Vec<_> = ids
+                // Only the nodes the user selected: a container's contents come
+                // with it, and cloning a selected child of a selected container
+                // as well would duplicate it twice.
+                let roots: Vec<NodeId> = ids
                     .iter()
-                    .filter_map(|raw_id| {
-                        let node = self.nodes.get(&NodeId(*raw_id))?;
-                        Some((node.type_id.clone(), node.position))
-                    })
+                    .map(|raw_id| NodeId(*raw_id))
+                    .filter(|id| self.nodes.contains_key(id))
                     .collect();
-                for (type_id, pos) in positions {
-                    self.spawn_node(&type_id, Point::new(pos.x + 30.0, pos.y + 30.0));
+                let nested: HashSet<NodeId> =
+                    roots.iter().flat_map(|id| self.descendants(*id)).collect();
+                for root in roots {
+                    if nested.contains(&root) {
+                        continue;
+                    }
+                    self.clone_subtree(root, Vector::new(30.0, 30.0));
                 }
             }
             Message::DeleteNodes(ids) => {
