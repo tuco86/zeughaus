@@ -25,6 +25,9 @@ zeughaus-capture/      # capture plugin (Screen Capture -> frame/dimensions; xdg
 zeughaus-llm/          # LLM plugin (Conversation nodes, LM Studio chat)
 zeughaus-ml/           # ML plugin (Keras layers as nodes -> exportable functional-API code)
 zeughaus-flow/         # flow plugin (Hold: Event -> State; Button: manual Event; Timer: the clock a source node needs)
+zeughaus-graph/        # graph plugin (Subgraph: a container node; Input/Output: the pins it shows its parent)
+zeughaus-db/           # database plugin (Database container, Table, Insert, Query, SQL; SQLite, native only)
+zeughaus-record/       # record plugin (Recorder: frames + values to disk; Player: the same dataset as a source)
 zeughaus-module/       # SpacetimeDB server module (excluded from the native workspace)
 ```
 
@@ -100,7 +103,8 @@ regex patterns, or when the LSP server is unavailable.
 - **Trigger vs Sample Pins**: Input pins are either trigger (causes execution) or sample (read passively).
 - **Atomic Flush**: Multi-output nodes buffer with emit/flush to ensure synchronized delivery.
 - **Capture**: Opt-in per-node persistence of results to database. No event sourcing.
-- **Domain Subgraphs**: Each domain (DLL inject, DB, AI, etc.) is a subgraph type with its own semantics.
+- **Which Inputs Just Arrived**: Dirty propagation reruns every downstream node, so a node that must act only on its own trigger asks `InputSet::changed(pin)` -- a delivery since its last run, tracked per edge by cache generation -- and `GraphExecutor::refresh_pins` re-reads a node's pins after a setting changed them (a `db.table`'s column list).
+- **Domain Subgraphs**: Each domain (DLL inject, DB, AI, etc.) is a subgraph type with its own semantics. A container node holds children by `parent` id and shows their `graph.input`/`graph.output` boundaries as its own pins; only the editor knows about the nesting (DESIGN.md).
 - **Editor/Executor Separation**: Implemented as two processes (see above). Also what enables a WASM browser editor against native execution.
 
 ### Technology Stack

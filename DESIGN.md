@@ -92,17 +92,40 @@ Different domains live in separate subgraphs. Each subgraph is internally consis
 ```
 
 A subgraph appears as a single node in its parent graph with explicitly exposed input/output pins.
-Double-click navigates into the subgraph.
+
+### How containers work -- implemented
+
+Every node carries a `parent` node id; `0` is the root graph. A *container*
+node (`NodeDefinition::container`, currently `graph.sub` and `db.database`) has
+no pins of its own: its pins in the parent view are synthesized from its direct
+children of type `graph.input` (one input pin each) and `graph.output` (one
+output pin each), named by that child's `name` setting.
+
+Edges in the store always connect real nodes. A wire drawn onto a container's
+pin `x` is stored as an edge to the `graph.input` child named `x` (pin `in`),
+and a wire from pin `y` comes from the `graph.output` child named `y` (pin
+`out`). Both boundary types are ordinary passthrough nodes, so **the executor
+stays flat and knows nothing about nesting**: it sees one graph of real nodes
+and real edges, which is what keeps dirty propagation, the trigger/sample
+distinction and the type system unchanged by this feature.
+
+The editor is the only component that knows about parents. It filters the
+canvas to the graph currently being viewed, maps each edge's endpoints onto the
+container that holds them for display, resolves them back to the boundary child
+on connect, and offers a way in and out (an `open` button on the container plus
+a breadcrumb). Deleting a container deletes its contents -- recursively in the
+module reducer, and locally in every editor.
 
 ### Planned Domains
 
 | Domain | Node Types | Execution Model |
 |--------|-----------|-----------------|
 | Process / DLL Injection | Processes, Inject, Memory Read/Write, Hook | Imperative, event-driven |
-| Database (FileMaker-style) | Connect, Table, Query, Insert, Schema Viz | Declarative, generates SQL |
+| Database (FileMaker-style) | Database (container), Table, Insert, Query, SQL | Declarative, SQLite implemented (`zeughaus-db`) |
 | AI / GPU | ONNX Inference, Preprocessing, Postprocessing | Pipeline, batch or stream |
 | Workflow / Automation | HTTP, Transform, Filter, Schedule | Sequential, event-triggered |
 | Screen Capture / Video | Capture, Encode, Stream, Overlay | Real-time stream |
+| Recorder / Dataset | Recorder, Player | Frames plus values as files on disk, implemented (`zeughaus-record`) |
 
 ### Machine Learning (Keras) -- implemented
 
