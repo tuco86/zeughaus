@@ -209,29 +209,47 @@ pub fn events(endpoint: Endpoint) -> impl Stream<Item = Traffic> {
             // then is there state on screen that can go stale, and only then
             // has the runtime answered at all.
             let mut served = false;
+            let started = std::time::Instant::now();
             match subscribe(&endpoint, &mut out, &mut served).await {
                 // The receiver is gone: this editor stopped watching.
                 Ok(Wanted::No) => return,
                 Ok(Wanted::Yes) => {}
                 Err(e) => eprintln!("[traffic] {e}"),
             }
+            attempt = next_attempt(attempt, started.elapsed());
             if served {
                 // Values on screen are last-known, not wrong; saying so is the
-                // honest state until a snapshot replaces them. A connection
-                // that worked once also earns a fresh backoff: this is a
-                // runtime that restarted, not one that is not there.
-                attempt = 0;
+                // honest state until a snapshot replaces them.
                 if out.send(Traffic::Lost).await.is_err() {
                     return;
                 }
-            } else {
-                // Nothing was ever shown from this attempt, so there is nothing
-                // to declare lost -- and a peer that never answered is one to
-                // back off from.
-                attempt += 1;
             }
         }
     })
+}
+
+/// How long a subscription has to last to count as a working connection.
+///
+/// Below this it is a runtime that accepts and then drops -- restarting,
+/// half-broken, refusing after the handshake -- and asking it again
+/// immediately is a full-speed loop of QUIC handshakes and snapshot
+/// transfers. Above it, the runtime was serving and merely went away, which
+/// deserves the shortest wait there is.
+const STABLE_UPTIME: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The attempt number the next dial carries, given how long the one that just
+/// ended lasted.
+///
+/// Never zero: the loop sleeps for any attempt above zero, and a subscription
+/// that ended -- however well it had been going -- must not be redialled in
+/// the same instant. Resetting to the *first* delay rather than to none is the
+/// whole fix: a runtime that served a snapshot and then dropped the stream
+/// used to reset the backoff to nothing and be redialled at once, forever.
+fn next_attempt(attempt: u64, lasted: std::time::Duration) -> u64 {
+    if lasted >= STABLE_UPTIME {
+        return 1;
+    }
+    attempt.saturating_add(1)
 }
 
 /// Asks the runtime to fire a node once.
@@ -506,5 +524,29 @@ mod tests {
     #[test]
     fn a_bad_endpoint_reports_instead_of_panicking() {
         assert!(Endpoint("not a url".to_owned()).path(FEED_PATH).is_err());
+    }
+
+    /// The loop this schedule drives sleeps for any attempt above zero, so
+    /// what has to hold is: never zero, growing while the runtime keeps
+    /// dropping the stream, and back to the shortest wait once one connection
+    /// actually lasted. A runtime that serves a snapshot and drops the stream
+    /// used to reset the backoff to nothing, which redialled it at once and
+    /// paid a handshake plus a whole snapshot per turn.
+    #[test]
+    fn a_dropped_stream_always_costs_at_least_one_backoff_step() {
+        let brief = std::time::Duration::from_millis(20);
+        assert_eq!(next_attempt(0, brief), 1, "even the first end waits");
+        assert_eq!(next_attempt(1, brief), 2);
+        assert_eq!(next_attempt(2, brief), 3, "one that keeps dropping waits");
+        // Just short of stable is still not stable.
+        assert_eq!(next_attempt(3, STABLE_UPTIME - brief), 4);
+
+        // A connection that lasted is a runtime that went away, not one that
+        // refuses: the next dial is the shortest wait, not none.
+        assert_eq!(next_attempt(7, STABLE_UPTIME), 1);
+        assert_eq!(next_attempt(7, STABLE_UPTIME * 100), 1);
+
+        // And no attempt count wraps back to "redial immediately".
+        assert_eq!(next_attempt(u64::MAX, brief), u64::MAX);
     }
 }
