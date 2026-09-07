@@ -24,6 +24,13 @@
 //! makes two tables referencing each other a legal schema instead of a cycle
 //! that stops every pass.
 //!
+//! A field pin declares the column's own type ([`ColTy::ty`]), not one
+//! nominal field type. The editor lets a wire between two field pins land
+//! only when their types are equal, so an `int` field cannot be related to a
+//! `str` one -- a foreign key across types is a constraint SQLite keeps
+//! failing, and refusing the wire says so while it is being drawn. It also
+//! means a field pin is coloured by its type like every other pin.
+//!
 //! Which end is referenced follows from the fields, not from the direction
 //! the user dragged: **the end whose field is named `id` is the referenced
 //! side, and if neither is, the end the wire was dropped on is.** `id` is
@@ -93,13 +100,6 @@ pub fn table_ty() -> Ty {
 /// one `field -> table.field` per line. Derived by the editor from the wires
 /// between field pins, so it is not in any node's `settings()`.
 pub const RELATIONS: &str = "relations";
-
-/// The type a table's field pin declares. Opaque and uniform across field
-/// types: what such a pin connects is a relationship, not a value, so the
-/// column's own type has nothing to say about whether a wire may land.
-pub fn field_ty() -> Ty {
-    Ty::opaque("db.field")
-}
 
 /// A column's declared type, as the user writes it in a `name:type` line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -7,7 +7,7 @@
 use zeughaus_core::*;
 
 use crate::{
-    ColTy, DB_PATH, RELATIONS, TableRef, failed, field_ty, is_query, open, parse_columns,
+    ColTy, DB_PATH, RELATIONS, TableRef, failed, is_query, open, parse_columns,
     parse_relations, quote, rows_to_json, table_ty, to_sql,
 };
 
@@ -122,11 +122,18 @@ impl TableNode {
     }
 
     /// One bidirectional field pin per field, plus the handle and the DDL text.
+    ///
+    /// A field pin declares the column's own type rather than one nominal
+    /// field type, which is what makes a relation between an `int` and a `str`
+    /// field refuse to connect at all: the editor accepts a wire between two
+    /// field pins only when their types are equal. A foreign key onto a column
+    /// of another type is a constraint SQLite will keep failing, and refusing
+    /// the wire says so while it is being drawn.
     fn rebuild_pins(&mut self) {
         let columns = parse_columns(&self.columns);
         let mut pins = Vec::with_capacity(columns.len() + 2);
-        for (name, _) in &columns {
-            pins.push(PinDefinition::field(name.clone(), field_ty()));
+        for (name, ty) in &columns {
+            pins.push(PinDefinition::field(name.clone(), ty.ty()));
         }
         pins.push(PinDefinition::output("table", table_ty()));
         pins.push(PinDefinition::output("ddl", Ty::Str));
@@ -657,20 +664,19 @@ mod tests {
         );
     }
 
-    /// Every field is a pin, and a bidirectional one: that is what a relation
-    /// attaches to on either border.
+    /// Every field is a pin, and a bidirectional one carrying the column's own
+    /// type: that is what a relation attaches to on either border, and what
+    /// keeps a wire between two fields of different types from landing.
     #[test]
     fn a_tables_pins_follow_its_fields() {
         let mut node = TableNode::new();
-        set(&mut node, "columns", "id:int\nx:float");
+        set(&mut node, "columns", "id:int\nx:float\ntag:str\nok:bool");
         let pins = node.pin_definitions();
         let names: Vec<&str> = pins.iter().map(|p| &*p.name).collect();
-        assert_eq!(names, vec!["id", "x", "table", "ddl"]);
-        assert!(
-            pins[..2]
-                .iter()
-                .all(|p| p.direction == PinDirection::Both && p.ty == field_ty())
-        );
+        assert_eq!(names, vec!["id", "x", "tag", "ok", "table", "ddl"]);
+        assert!(pins[..4].iter().all(|p| p.direction == PinDirection::Both));
+        let types: Vec<&Ty> = pins[..4].iter().map(|p| &p.ty).collect();
+        assert_eq!(types, vec![&Ty::Int, &Ty::Float, &Ty::Str, &Ty::Bool]);
     }
 
     /// An insert takes one input per column except the rowid, which SQLite
