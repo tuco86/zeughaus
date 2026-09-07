@@ -1094,23 +1094,17 @@ impl App {
     ///
     /// `was` is the value the store holds, so one name changed in place is one
     /// rename however many keystrokes produced it.
-    fn settle_relations(&mut self, node: NodeId, key: &str, was: &str) -> bool {
+    fn settle_relations(&mut self, node: NodeId, key: &str, was: &str) {
         let renamed = self
             .is_field_setting(node, key)
             .then(|| renamed_field(was, &self.setting_or_default(node, key)))
             .flatten();
         match renamed {
-            Some((old, new)) => {
-                self.rename_pin_edges(node, &old, &new);
-                true
-            }
+            Some((old, new)) => self.rename_pin_edges(node, &old, &new),
             // A field that is gone takes its relations with it: a foreign key
             // lives on a field, and a wire to a pin the node no longer
             // declares is one nobody can see or delete.
-            None => {
-                self.drop_orphaned_relations(node);
-                false
-            }
+            None => self.drop_orphaned_relations(node),
         }
     }
 
@@ -1122,13 +1116,9 @@ impl App {
         // in every window that replays it.
         let mut keys: Vec<(String, String)> = owed.was.into_iter().collect();
         keys.sort();
-        let mut renamed = false;
         for (key, was) in keys {
-            renamed |= self.settle_relations(node, &key, &was);
+            self.settle_relations(node, &key, &was);
         }
-        // A rename already rewired everything; asking again would only look
-        // for orphans that a rename cannot leave.
-        let _ = renamed;
         // A database's path reaches its children, a table's columns reach
         // everything it feeds, and its name is what the tables referencing it
         // name in their foreign keys.
@@ -1239,13 +1229,15 @@ impl App {
                 to_node,
                 to_pin,
             });
-            self.reindex_edges();
             self.executor.on_edge_added(fresh);
             #[cfg(not(target_arch = "wasm32"))]
             if let Some(e) = self.edges.last().map(edge_data) {
                 self.push_edge(e);
             }
         }
+        // Once, after every wire has been replaced: nothing in the loop reads
+        // the index, and rebuilding it per wire made a rename O(wires x edges).
+        self.reindex_edges();
     }
 
     /// What a node declares for this pin, if it declares it at all.
@@ -2405,10 +2397,10 @@ impl App {
                             self.particles.remove(&edge.id);
                         }
                         self.edges.retain(|e| e.from_node != id && e.to_node != id);
-                        self.reindex_edges();
                         self.executor.remove_node(id);
                         self.const_inputs.remove(&id);
                         self.node_settings.remove(&id);
+                        self.setting_errors.remove(&id);
                         // Looking into a graph that no longer exists shows
                         // nothing and offers no way out.
                         if self.current_graph == id {
@@ -2421,6 +2413,10 @@ impl App {
                         self.refresh_container_pins(parent);
                     }
                 }
+                // Once, after every doomed node is gone: rebuilding the index
+                // inside the loop made deleting a large container O(nodes x
+                // edges).
+                self.reindex_edges();
                 self.autosave();
                 // A deleted Display node's feed has nobody left to draw it.
                 #[cfg(not(target_arch = "wasm32"))]
@@ -3572,12 +3568,17 @@ impl App {
         self.executor.remove_node(id);
         self.const_inputs.remove(&id);
         self.node_settings.remove(&id);
+        self.setting_errors.remove(&id);
         // A value whose producer is gone is not a value any more, and node ids
-        // are never reused, so nothing can inherit it.
+        // are never reused, so nothing can inherit it. Same for what this
+        // window still owed the store: the row it would have updated is gone.
         #[cfg(not(target_arch = "wasm32"))]
         {
+            self.pending.take(id);
             self.remote_outputs.remove(&id);
             self.output_seq.retain(|(node, _), _| *node != id);
+            self.remote_errors.remove(&id);
+            self.error_seq.remove(&id);
         }
         // A removed boundary node is a pin its container loses; a removed
         // container is a graph nobody can be looking at any more.
