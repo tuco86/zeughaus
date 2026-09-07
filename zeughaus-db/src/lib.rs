@@ -200,21 +200,23 @@ pub fn parse_columns_checked(text: &str) -> Result<Vec<(String, ColTy)>> {
         }
         let at = index + 1;
         let Some((name, ty)) = line.split_once(':') else {
-            return Err(failed(format!("line {at} '{line}': expected name:type")));
+            return Err(rejected(format!("line {at} '{line}': expected name:type")));
         };
         let name = name.trim();
         if name.is_empty() {
-            return Err(failed(format!("line {at} '{line}': the field has no name")));
+            return Err(rejected(format!(
+                "line {at} '{line}': the field has no name"
+            )));
         }
         let Some(ty) = ColTy::parse(ty) else {
-            return Err(failed(format!(
+            return Err(rejected(format!(
                 "line {at} '{line}': unknown type '{}', expected one of {}",
                 ty.trim(),
                 ColTy::NAMES.join(", ")
             )));
         };
         if columns.iter().any(|(taken, _)| taken == name) {
-            return Err(failed(format!(
+            return Err(rejected(format!(
                 "line {at} '{line}': {name} is declared twice"
             )));
         }
@@ -313,6 +315,13 @@ pub fn open(path: &str) -> Result<Arc<Mutex<Connection>>> {
 /// user sees the message on the node and the pass keeps going.
 pub fn failed(message: impl Into<String>) -> ZeughausError {
     ZeughausError::ExecutionFailed(message.into())
+}
+
+/// A refused setting. The value never took effect and the node kept the one it
+/// had, so the message belongs under the field it was typed into -- not on the
+/// node, where it would read as a run that failed.
+pub fn rejected(message: impl Into<String>) -> ZeughausError {
+    ZeughausError::InvalidParameter(message.into())
 }
 
 /// A graph value as a bound SQL parameter.

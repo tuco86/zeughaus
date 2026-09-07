@@ -8,7 +8,7 @@ use zeughaus_core::*;
 
 use crate::{
     ColTy, DB_PATH, RELATIONS, TableRef, failed, is_query, open, parse_columns,
-    parse_columns_checked, parse_relations, quote, rows_to_json, table_ty, to_sql,
+    parse_columns_checked, parse_relations, quote, rejected, rows_to_json, table_ty, to_sql,
 };
 
 /// Reads a parameter's text, whatever scalar form it arrives in.
@@ -633,13 +633,13 @@ impl ExecutableNode for QueryNode {
             "limit" => {
                 let trimmed = text.trim();
                 let Ok(limit) = trimmed.parse::<usize>() else {
-                    return Err(failed(format!(
+                    return Err(rejected(format!(
                         "limit '{trimmed}': expected a row count between 1 and {}",
                         Self::MAX_LIMIT
                     )));
                 };
                 if limit == 0 {
-                    return Err(failed("limit 0: a query that returns nothing is not one"));
+                    return Err(rejected("limit 0: a query that returns nothing is not one"));
                 }
                 self.limit = limit.min(Self::MAX_LIMIT).to_string();
             }
@@ -1067,7 +1067,13 @@ mod tests {
             let error = node
                 .set_parameter("limit", Value::new(bad.to_string()))
                 .expect_err("refused");
-            assert!(error.to_string().contains("expected a row count"));
+            // A refused setting is its own error kind, and its text is the
+            // reason alone: it is drawn under the field, where "node execution
+            // failed:" would say nothing the field does not already show.
+            assert!(matches!(error, ZeughausError::InvalidParameter(_)), "{bad}");
+            let text = error.to_string();
+            assert!(text.starts_with("limit "), "{text}");
+            assert!(text.contains("expected a row count"), "{text}");
         }
         let error = node
             .set_parameter("limit", Value::new("0".to_string()))

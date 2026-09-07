@@ -197,8 +197,13 @@ impl ExecutableNode for TimerNode {
         }]
     }
 
-    /// An unparsable or out-of-range rate keeps the previous one: a half-typed
-    /// number in the editor must not stop the clock.
+    /// An unparsable or non-finite rate keeps the previous one and says so:
+    /// the clock does not stop over a half-typed number, and the field the
+    /// number was typed into is where the refusal is shown. Silently ignoring
+    /// it left the field reading one rate while the timer ran at another.
+    ///
+    /// A finite rate out of range is clamped rather than refused: the intent
+    /// is clear, and the bounds are the host's, not the user's mistake.
     fn set_parameter(&mut self, name: &str, value: Value) -> Result<()> {
         if name != "hz" {
             return Ok(());
@@ -209,9 +214,14 @@ impl ExecutableNode for TimerNode {
             Repr::Str(s) => s.trim().parse::<f64>().ok(),
             _ => None,
         };
-        if let Some(hz) = parsed.filter(|hz| hz.is_finite()) {
-            self.hz = hz.clamp(Self::MIN_HZ, Self::MAX_HZ);
-        }
+        let Some(hz) = parsed.filter(|hz| hz.is_finite()) else {
+            return Err(ZeughausError::InvalidParameter(format!(
+                "hz: expected a rate between {} and {}",
+                Self::MIN_HZ,
+                Self::MAX_HZ
+            )));
+        };
+        self.hz = hz.clamp(Self::MIN_HZ, Self::MAX_HZ);
         Ok(())
     }
 
@@ -362,14 +372,23 @@ mod tests {
         assert_eq!(node.hz(), 12.0);
     }
 
-    /// A half-typed number in the editor must not stop the clock, and a runaway
-    /// value must not spin the host.
+    /// A half-typed number in the editor must not stop the clock -- and must
+    /// not be swallowed either, or the field shows one rate while the timer
+    /// runs at another. A runaway value is clamped, because the intent is
+    /// clear and the bounds are the host's.
     #[test]
-    fn a_nonsense_rate_is_refused_or_clamped() {
+    fn a_nonsense_rate_is_refused_and_a_runaway_one_clamped() {
         let mut node = TimerNode::new();
-        node.set_parameter("hz", Value::new("".to_string())).unwrap();
-        assert_eq!(node.hz(), TimerNode::DEFAULT_HZ);
-        node.set_parameter("hz", Value::new("-3".to_string())).unwrap();
+        for bad in ["", "fast", "nan"] {
+            let error = node
+                .set_parameter("hz", Value::new(bad.to_string()))
+                .expect_err(bad)
+                .to_string();
+            assert!(error.contains("expected a rate"), "{error}");
+            assert_eq!(node.hz(), TimerNode::DEFAULT_HZ, "{bad} kept the old rate");
+        }
+        node.set_parameter("hz", Value::new("-3".to_string()))
+            .unwrap();
         assert_eq!(node.hz(), TimerNode::MIN_HZ);
         node.set_parameter("hz", Value::new(100_000.0f64)).unwrap();
         assert_eq!(node.hz(), TimerNode::MAX_HZ);

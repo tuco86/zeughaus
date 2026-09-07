@@ -492,7 +492,7 @@ impl ExecutableNode for PlayerNode {
                     "true" | "1" => true,
                     "false" | "0" => false,
                     _ => {
-                        return Err(ZeughausError::ExecutionFailed(format!(
+                        return Err(ZeughausError::InvalidParameter(format!(
                             "loop '{trimmed}': expected true or false"
                         )));
                     }

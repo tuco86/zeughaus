@@ -20,6 +20,17 @@ pub enum ZeughausError {
     #[error("node execution failed: {0}")]
     ExecutionFailed(String),
 
+    /// A node refused a setting: the value never took effect and the node kept
+    /// the one it had.
+    ///
+    /// Distinct from [`Self::ExecutionFailed`] because it is answered at a
+    /// different place. A failed run is reported on the node; a refused value
+    /// belongs under the field it was typed into, where the reason alone is
+    /// the whole message -- "node execution failed: limit 'lots': ..." says
+    /// nothing the field does not already show.
+    #[error("{0}")]
+    InvalidParameter(String),
+
     #[error("unknown node type: {0}")]
     UnknownNodeType(String),
 }
