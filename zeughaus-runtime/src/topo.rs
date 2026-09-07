@@ -5,10 +5,20 @@ use zeughaus_core::{NodeId, Result, ZeughausError};
 
 use crate::graph::Graph;
 
-/// Topological sort via Kahn's algorithm with NodeId tiebreaking.
-/// When multiple nodes have in-degree 0, the smallest NodeId is processed first.
-/// This guarantees deterministic execution order across runs.
-pub fn topological_sort(graph: &Graph) -> Result<Vec<NodeId>> {
+/// The order the graph can be executed in, plus the nodes that have no place
+/// in any order.
+///
+/// Kahn's algorithm with NodeId tiebreaking: when several nodes have in-degree
+/// zero, the smallest id is taken first, so the order is the same on every run
+/// and in every process.
+///
+/// `stuck` is whatever is left when Kahn stalls: every node in a cycle, and
+/// everything downstream of one -- their in-degree never reaches zero either.
+/// Reported rather than turned into one failure for the whole graph, because a
+/// cycle is a property of the nodes in it: the rest of the document has
+/// nothing to do with it and has to keep running. Sorted by id like `order`,
+/// so what a caller reports about them is stable too.
+pub fn topological_order(graph: &Graph) -> (Vec<NodeId>, Vec<NodeId>) {
     let mut in_degree: HashMap<NodeId, usize> = HashMap::new();
 
     for node_id in graph.node_ids() {
@@ -43,11 +53,30 @@ pub fn topological_sort(graph: &Graph) -> Result<Vec<NodeId>> {
         }
     }
 
-    if result.len() != in_degree.len() {
-        return Err(ZeughausError::CycleDetected);
-    }
+    // Everything Kahn placed reached in-degree zero, so what still carries an
+    // incoming edge is exactly what it could not place.
+    let mut stuck: Vec<NodeId> = in_degree
+        .iter()
+        .filter(|(_, degree)| **degree > 0)
+        .map(|(id, _)| *id)
+        .collect();
+    stuck.sort();
+    (result, stuck)
+}
 
-    Ok(result)
+/// The whole graph's order, or [`ZeughausError::CycleDetected`] if it has no
+/// single order at all.
+///
+/// For a caller that refuses a cyclic graph outright rather than working
+/// around one: [`crate::GraphBuilder::build`] validates a graph it is about to
+/// hand over, and a cycle there is a graph that was assembled wrong. Execution
+/// takes [`topological_order`] instead -- by then the graph is the user's
+/// document, and one bad wire must not stop the rest of it.
+pub fn topological_sort(graph: &Graph) -> Result<Vec<NodeId>> {
+    match topological_order(graph) {
+        (order, stuck) if stuck.is_empty() => Ok(order),
+        _ => Err(ZeughausError::CycleDetected),
+    }
 }
 
 #[cfg(test)]
@@ -145,6 +174,32 @@ mod tests {
             topological_sort(&g),
             Err(ZeughausError::CycleDetected)
         ));
+    }
+
+    /// What the executor works from: the cycle's nodes and everything after
+    /// them are named as stuck, the rest is a usable order. A self-edge counts
+    /// as its own cycle.
+    #[test]
+    fn a_cycle_leaves_its_own_nodes_stuck_and_orders_the_rest() {
+        let mut g = Graph::new();
+        let (a, b, sink, loner, own) = (
+            NodeId::next(),
+            NodeId::next(),
+            NodeId::next(),
+            NodeId::next(),
+            NodeId::next(),
+        );
+        for id in [a, b, sink, loner, own] {
+            g.add_node(make_node(id));
+        }
+        g.add_edge(make_edge(a, b));
+        g.add_edge(make_edge(b, a));
+        g.add_edge(make_edge(b, sink));
+        g.add_edge(make_edge(own, own));
+
+        let (order, stuck) = topological_order(&g);
+        assert_eq!(order, vec![loner]);
+        assert_eq!(stuck, vec![a, b, sink, own]);
     }
 
     /// Two independent nodes (no edges) must always be sorted by NodeId.

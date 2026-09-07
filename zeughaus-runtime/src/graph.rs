@@ -330,6 +330,29 @@ mod tests {
         assert!(!ds.contains(&a));
     }
 
+    /// The walk every dirty mark uses has to terminate on a cycle: a user can
+    /// wire one, and this is called while the executor is deciding what to run.
+    #[test]
+    fn downstream_terminates_on_a_cycle() {
+        let mut g = Graph::new();
+        let a = NodeId::next();
+        let b = NodeId::next();
+        g.add_node(make_node(a));
+        g.add_node(make_node(b));
+        g.add_edge(make_edge(a, b));
+        g.add_edge(make_edge(b, a));
+        let ds = g.downstream(a);
+        assert!(ds.contains(&b));
+        assert!(ds.contains(&a), "a is reachable from itself through b");
+        assert_eq!(ds.len(), 2, "each node is reported once");
+
+        // A node wired to itself is the smallest cycle there is.
+        let own = NodeId::next();
+        g.add_node(make_node(own));
+        g.add_edge(make_edge(own, own));
+        assert_eq!(g.downstream(own), vec![own]);
+    }
+
     /// A relation between two field pins is held by the graph but is not a
     /// dependency: two tables referencing each other has to stay orderable.
     #[test]

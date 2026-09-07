@@ -13,7 +13,17 @@ pub type DeferredWork = Vec<(NodeId, Box<dyn AsyncWork>)>;
 
 use crate::cache::EdgeCache;
 use crate::graph::Graph;
-use crate::topo::topological_sort;
+use crate::topo::topological_order;
+
+/// What every node of a cycle -- and everything downstream of one -- is told,
+/// verbatim.
+///
+/// One text, because it is also the marker: a node carrying exactly this
+/// message is one whose only problem is the cycle, so when the cycle is gone
+/// the executor can clear it and run the node again without asking anything
+/// else. A node that failed for its own reasons keeps its own message and is
+/// left alone.
+const CYCLE_ERROR: &str = "cycle detected: this node is in a loop of wires, or downstream of one";
 
 pub struct GraphExecutor {
     pub graph: Graph,
@@ -134,10 +144,24 @@ impl GraphExecutor {
     /// are unavailable, and every unrelated node still runs. Bailing out
     /// instead used to throw away the deferred work already collected in this
     /// pass while those nodes stayed marked pending -- one broken node left
-    /// every async node in the graph hanging forever. `Err` is reserved for a
-    /// failure of the pass itself, i.e. a graph that cannot be ordered.
+    /// every async node in the graph hanging forever.
+    ///
+    /// A cycle is not a failure of the pass either. The nodes in it, and the
+    /// nodes downstream of it, have no place in any order and cannot run; they
+    /// are told so as a node error and dropped from the dirty set, so the
+    /// report reaches the user once instead of the host logging a failed pass
+    /// every 50 ms. Everything else runs. Failing the whole pass meant one
+    /// wire closed into a loop froze every unrelated part of the document,
+    /// with nothing on screen to say why.
     pub fn execute_dirty(&mut self) -> Result<DeferredWork> {
-        let order = topological_sort(&self.graph)?;
+        let (order, stuck) = topological_order(&self.graph);
+        for id in stuck {
+            // Not `mark_error`: a node in a cycle that is awaiting an async
+            // result is still awaiting it, and forgetting that would let the
+            // node be dispatched twice.
+            self.dirty.remove(&id);
+            self.node_errors.insert(id, CYCLE_ERROR.to_string());
+        }
         let dirty = std::mem::take(&mut self.dirty);
         let mut deferred: DeferredWork = Vec::new();
         // Nodes whose outputs are not (yet) available this pass: deferred this
@@ -406,6 +430,9 @@ impl GraphExecutor {
                 seen.remove(&edge_id);
             }
             self.mark_dirty_downstream(to_node);
+            // Removing a wire is how a cycle is broken, and the nodes that
+            // were in it are the ones nothing else would ever wake.
+            self.resume_freed_from_cycle();
         }
     }
 
@@ -429,6 +456,38 @@ impl GraphExecutor {
         self.seen.remove(&id);
         for seen in self.seen.values_mut() {
             seen.retain(|eid, _| self.graph.edge(*eid).is_some());
+        }
+        // Deleting a node breaks every cycle it was part of.
+        self.resume_freed_from_cycle();
+    }
+
+    /// Clears [`CYCLE_ERROR`] from every node that is no longer in a cycle and
+    /// marks it dirty, so it runs in the next pass.
+    ///
+    /// Called after the two things that can break a cycle: a wire removed and
+    /// a node deleted. Both are needed, and the dirty mark is the load-bearing
+    /// half -- a node that was refused an order for several passes has nothing
+    /// upstream that will notify it again, so without this the loop the user
+    /// just untied would stay dead until the graph was reloaded.
+    ///
+    /// Recomputed rather than remembered: which nodes a cycle held back is
+    /// exactly what the order says, and asking again is one Kahn pass on a
+    /// structural change that already costs more than that.
+    fn resume_freed_from_cycle(&mut self) {
+        if !self.node_errors.values().any(|msg| msg == CYCLE_ERROR) {
+            return;
+        }
+        let (_, stuck) = topological_order(&self.graph);
+        let freed: Vec<NodeId> = self
+            .node_errors
+            .iter()
+            .filter(|(_, message)| message.as_str() == CYCLE_ERROR)
+            .map(|(id, _)| *id)
+            .filter(|id| !stuck.contains(id) && self.graph.node(*id).is_some())
+            .collect();
+        for id in freed {
+            self.node_errors.remove(&id);
+            self.dirty.insert(id);
         }
     }
 
@@ -1272,5 +1331,133 @@ mod tests {
         exec.mark_dirty(sink);
         exec.execute_dirty().expect("pass");
         assert_eq!(seen.lock().expect("log").last().copied(), Some((true, true)));
+    }
+
+    /// A node that records every run, so a test can tell "ran once" from
+    /// "never ran".
+    struct Tally(Arc<std::sync::Mutex<Vec<NodeId>>>);
+    impl ExecutableNode for Tally {
+        fn execute(&mut self, _inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
+            self.0.lock().expect("log").push(ctx.source_node);
+            ctx.emit_typed("value", 1.0_f64);
+            ctx.flush();
+            Ok(())
+        }
+        fn pin_definitions(&self) -> &[PinDefinition] {
+            &[]
+        }
+    }
+
+    /// One loop of wires must cost exactly the nodes in it. The unrelated pair
+    /// keeps running, the two in the cycle say why they do not, and the pass
+    /// itself does not fail -- the host used to log a failed pass every 50 ms
+    /// and execute nothing at all, anywhere in the document.
+    #[test]
+    fn a_cycle_stops_only_its_own_nodes() {
+        let mut graph = Graph::new();
+        let (a, b, c, d) = (
+            NodeId::next(),
+            NodeId::next(),
+            NodeId::next(),
+            NodeId::next(),
+        );
+        for id in [a, b, c, d] {
+            graph.add_node(make_node(id));
+        }
+        graph.add_edge(make_edge(a, "value", b, "in"));
+        let back = make_edge(b, "value", a, "in");
+        let back_id = back.id;
+        graph.add_edge(back);
+        graph.add_edge(make_edge(c, "value", d, "in"));
+
+        let runs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut exec = GraphExecutor::new(graph);
+        for id in [a, b, c, d] {
+            exec.register_node(id, Box::new(Tally(runs.clone())));
+        }
+
+        exec.execute_dirty().expect("a cycle is not a failed pass");
+        let ran = runs.lock().expect("log").clone();
+        assert_eq!(ran, vec![c, d], "the acyclic part runs, in order");
+        assert_eq!(exec.node_error(a), Some(CYCLE_ERROR));
+        assert_eq!(exec.node_error(b), Some(CYCLE_ERROR));
+        assert!(exec.node_error(c).is_none());
+        assert!(exec.node_error(d).is_none());
+
+        // And it stays reported without being re-tried: the dirty set is not
+        // holding two nodes that can never run.
+        runs.lock().expect("log").clear();
+        exec.execute_dirty().expect("pass");
+        assert!(runs.lock().expect("log").is_empty());
+
+        // Untying the loop runs both of them again and takes the error away.
+        exec.disconnect_edge(back_id);
+        exec.execute_dirty().expect("pass");
+        let ran = runs.lock().expect("log").clone();
+        assert_eq!(ran, vec![a, b], "both former cycle nodes run, a before b");
+        assert!(exec.node_error(a).is_none());
+        assert!(exec.node_error(b).is_none());
+    }
+
+    /// Everything downstream of a cycle is stuck for the same reason and is
+    /// told the same thing: its input can never be computed.
+    #[test]
+    fn a_node_downstream_of_a_cycle_is_reported_too() {
+        let mut graph = Graph::new();
+        let (a, b, sink) = (NodeId::next(), NodeId::next(), NodeId::next());
+        for id in [a, b, sink] {
+            graph.add_node(make_node(id));
+        }
+        graph.add_edge(make_edge(a, "value", b, "in"));
+        graph.add_edge(make_edge(b, "value", a, "in"));
+        graph.add_edge(make_edge(b, "value", sink, "in"));
+
+        let runs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut exec = GraphExecutor::new(graph);
+        for id in [a, b, sink] {
+            exec.register_node(id, Box::new(Tally(runs.clone())));
+        }
+
+        exec.execute_dirty().expect("pass");
+        assert!(runs.lock().expect("log").is_empty());
+        assert_eq!(exec.node_error(sink), Some(CYCLE_ERROR));
+    }
+
+    /// A node that fails for its own reasons is not a cycle node: breaking a
+    /// cycle elsewhere must not clear its error, or a broken node would look
+    /// fine until its next run.
+    #[test]
+    fn breaking_a_cycle_leaves_an_unrelated_error_alone() {
+        const OWN: &str = "node execution failed: its own problem";
+
+        struct Failing;
+        impl ExecutableNode for Failing {
+            fn execute(&mut self, _inputs: &InputSet, _ctx: &mut NodeContext) -> Result<()> {
+                Err(ZeughausError::ExecutionFailed("its own problem".into()))
+            }
+            fn pin_definitions(&self) -> &[PinDefinition] {
+                &[]
+            }
+        }
+
+        let mut graph = Graph::new();
+        let (a, b, broken) = (NodeId::next(), NodeId::next(), NodeId::next());
+        for id in [a, b, broken] {
+            graph.add_node(make_node(id));
+        }
+        graph.add_edge(make_edge(a, "value", b, "in"));
+        let back = make_edge(b, "value", a, "in");
+        let back_id = back.id;
+        graph.add_edge(back);
+
+        let mut exec = GraphExecutor::new(graph);
+        exec.register_node(a, Box::new(ConstNode(1.0)));
+        exec.register_node(b, Box::new(DoubleNode));
+        exec.register_node(broken, Box::new(Failing));
+        exec.execute_dirty().expect("pass");
+        assert_eq!(exec.node_error(broken), Some(OWN));
+
+        exec.disconnect_edge(back_id);
+        assert_eq!(exec.node_error(broken), Some(OWN));
     }
 }
