@@ -48,7 +48,7 @@ thiserror = "2.0"
 
 # SpacetimeDB client SDK. Native uses default (tokio) features; wasm enables the
 # `browser` feature in the per-target deps of the zeughaus binary.
-spacetimedb-sdk = "2.8"
+spacetimedb-sdk = "2.10"
 
 # Profiles apply from the top-level workspace being built, so iced_nodegraph's
 # own `profile.dev` is ignored when it is a path dependency here. Without this,

@@ -21,9 +21,6 @@ zeughaus-flow.workspace = true
 # Frames leave this process over QUIC, not through the store: a 4K RGBA frame
 # is 33 MB and a state store is the wrong pipe for it.
 weida.workspace = true
-# The feed's certificate is generated in memory at startup and published
-# through the store, so there is no key file to create, protect and unlink.
-rcgen = "0.14"
 # Blocking node work (LLM requests, screen capture) runs on tokio's blocking
 # pool so the event loop keeps draining the store. Multi-threaded because the
 # feed server's tasks live here too: they park on QUIC flow control and scale

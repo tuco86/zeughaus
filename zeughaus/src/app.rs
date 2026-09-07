@@ -28,7 +28,7 @@ use zeughaus_transform::TransformPlugin;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::feed::{self, FeedEndpoint, FeedKey, FeedSpec, FrameOrder};
-use crate::message::{Message, PinLabel};
+use crate::message::{GraphIds, Message, PinLabel};
 use crate::palette;
 
 pub struct EditorNode {
@@ -1320,9 +1320,9 @@ impl App {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        // NodeGraph is generic over node id, pin id, per-pin payload and message;
-        // renderer and edge id stay at their defaults.
-        let mut ng: NodeGraph<'_, u64, PinLabel, PinVisual, Message> = NodeGraph::default();
+        // NodeGraph is generic over the id vocabulary declared by `GraphIds`;
+        // theme and renderer stay at their defaults.
+        let mut ng: NodeGraph<'_, GraphIds, Message> = NodeGraph::new();
 
         ng = ng
             .on_connect(|from, to| Message::EdgeConnected { from, to })
@@ -1331,9 +1331,9 @@ impl App {
             .on_select(Message::SelectionChanged)
             .on_clone(Message::CloneNodes)
             .on_delete(Message::DeleteNodes)
-            .on_pan(|position, zoom| Message::CameraChanged { position, zoom })
+            .on_camera(|position, zoom| Message::CameraChanged { position, zoom })
             .on_resize(|node_id, size| Message::NodeResized { node_id, size })
-            .view(self.camera_position, self.camera_zoom)
+            .camera(self.camera_position, self.camera_zoom)
             .can_connect({
                 // With a custom can_connect, iced_nodegraph stops enforcing pin
                 // direction itself, so we must validate it here: exactly one
@@ -1427,14 +1427,12 @@ impl App {
                             },
                         }
                     })
-                    .pin_style(
-                        |theme, pin: &PinInfo<'_, PinLabel, PinVisual>, _other, status| PinStyle {
-                            color: pin.info().color.into(),
-                            shape: pin.info().shape,
-                            ..default_pin_style(theme, status)
-                        },
-                    );
-                ng.push_node(node_widget);
+                    .pin_style(|theme, pin: &PinInfo<'_, GraphIds>, _other, status| PinStyle {
+                        color: pin.info().color.into(),
+                        shape: pin.info().shape,
+                        ..default_pin_style(theme, status)
+                    });
+                ng = ng.push_node(node_widget);
             }
         }
 
@@ -1476,13 +1474,13 @@ impl App {
                 .unwrap_or(false);
 
             let edge_widget = ng_edge(
+                edge.id,
                 PinRef::new(edge.from_node.0, edge.from_pin.clone()),
                 PinRef::new(edge.to_node.0, edge.to_pin.clone()),
-                (),
             )
             .style(move |theme, status, _start, _end| {
                 if src_error {
-                    return EdgeStyle::error();
+                    return EdgeStyle::error(theme, status);
                 }
                 let base = default_edge_style(theme, status);
                 EdgeStyle {
@@ -1496,7 +1494,7 @@ impl App {
                     ..base
                 }
             });
-            ng.push_edge(edge_widget);
+            ng = ng.push_edge(edge_widget);
         }
 
         let graph_area: Element<'_, Message> = container(ng)
@@ -2163,8 +2161,11 @@ fn header_color(type_id: &str) -> Color {
 /// Per-pin visual data carried as the node graph's pin info. Two orthogonal
 /// channels: `color` encodes the payload type, `shape` encodes the transmission
 /// mode (Event vs State).
+///
+/// Public because it is `GraphIds::Payload`, and that vocabulary is named in
+/// `Message`.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
-struct PinVisual {
+pub struct PinVisual {
     color: Color,
     shape: PinShape,
 }

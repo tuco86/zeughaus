@@ -3,7 +3,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use iced::{Point, Vector};
-use iced_nodegraph::{PinId, PinRef};
+use iced_nodegraph::{Ids, PinRef};
 
 /// A pin name as it travels through the node graph widget.
 ///
@@ -20,7 +20,17 @@ impl PinLabel {
     }
 }
 
-impl PinId for PinLabel {}
+/// The id vocabulary of the editor's graph widget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GraphIds;
+
+impl Ids for GraphIds {
+    type NodeId = u64;
+    type PinId = PinLabel;
+    type EdgeId = zeughaus_core::EdgeId;
+    type AnchorId = u64;
+    type Payload = crate::app::PinVisual;
+}
 
 impl Deref for PinLabel {
     type Target = str;
@@ -58,12 +68,12 @@ impl fmt::Display for PinLabel {
 pub enum Message {
     // Graph events (u64 IDs from iced_nodegraph)
     EdgeConnected {
-        from: PinRef<u64, PinLabel>,
-        to: PinRef<u64, PinLabel>,
+        from: PinRef<GraphIds>,
+        to: PinRef<GraphIds>,
     },
     EdgeDisconnected {
-        from: PinRef<u64, PinLabel>,
-        to: PinRef<u64, PinLabel>,
+        from: PinRef<GraphIds>,
+        to: PinRef<GraphIds>,
     },
     GroupMoved {
         node_ids: Vec<u64>,
