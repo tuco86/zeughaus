@@ -97,7 +97,7 @@ regex patterns, or when the LSP server is unavailable.
 ### Core Concepts
 - **Runtime Type System**: Pins declare a `Ty` built at runtime (scalars, `List`, `Option`, `Record`, `Opaque`), not a compile-time string. `Typed::ty()` is the single source of truth for both a pin's declaration and a value's tag, so they cannot disagree. Nodes may derive their pins from what is connected (`sync_pins`).
 - **Editor and Runtime are Separate Processes**: `zeughaus` edits and views, `zeughaus-runner` executes. They meet in the store, so a local editor and a remote one are the same thing. Runners register in `runtime` and the lowest `seq` owns execution (a second runner is a hot standby); results reach editors as scalars in `node_output`. Frames do not travel -- only `bool`/`int`/`float`/`str` (`zeughaus-core/src/wire.rs`). A trigger press travels the other way, through `node_trigger`.
-- **Sample Feed**: Frames never touch the store. The runtime binds a QUIC listener (`weida`), announces it in the `runtime` row, and a viewer holds one standing exchange per (node, pin): it names the size it draws, the runtime scales to a tier ladder and streams frames until the viewer stops. Backpressure is QUIC's, so a slow viewer gets fewer frames -- always the current one, never a backlog. See `plans/weida-sample-transport.md`.
+- **Sample Feed**: Frames never touch the store. The runtime binds a QUIC listener (`weida`), announces it in the `runtime` row, and a viewer holds one standing exchange per (node, pin): it names the size it draws, the runtime scales to a tier ladder and streams frames until the viewer stops. Backpressure is QUIC's, so a slow viewer gets fewer frames -- always the current one, never a backlog.
 - **A Source Needs a Clock**: Nothing upstream wakes a screen capture, so `ExecutableNode::tick_interval` lets a node ask to be run periodically and the host schedules it. `flow.timer` is that clock; without one in the graph a capture node produces exactly one frame and stops.
 - **Push/Pull Reactive Dataflow**: Every edge has a last-value cache. Push notifies downstream, pull triggers lazy computation.
 - **Trigger vs Sample Pins**: Input pins are either trigger (causes execution) or sample (read passively).
@@ -109,7 +109,7 @@ regex patterns, or when the LSP server is unavailable.
 
 ### Technology Stack
 - UI: iced 0.14 + iced_nodegraph
-- Collaboration: SpacetimeDB 2.8 (`spacetimedb-sdk`, `browser` feature on wasm32)
+- Collaboration: SpacetimeDB 2.10 (`spacetimedb-sdk`, `browser` feature on wasm32)
 - Async: Tokio
 - Local Storage: SQLite
 - Production DB: PostgreSQL
