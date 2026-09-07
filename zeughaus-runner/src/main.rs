@@ -46,6 +46,17 @@ const TICK: Duration = Duration::from_millis(50);
 const DEFAULT_FEED_ADDR: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
 
+/// How many unserved trigger presses are held. A press is a moment, so a deep
+/// queue of them is worth nothing: what a button needs is that the next press
+/// is taken, not that the hundredth one from a loop still is.
+const TRIGGER_BACKLOG: usize = 32;
+
+/// How many presses one iteration serves. The loop that takes them also
+/// applies graph changes and serves the clocks, so a flood must not be able to
+/// hold it in the press queue; the rest wait for the next iteration, which is
+/// at most `TICK` away.
+const MAX_PRESSES_PER_TURN: usize = 8;
+
 fn main() -> ExitCode {
     // A unique id range per process, so a runner that creates ids (none today,
     // but nodes may spawn nodes) can never collide with a live editor's.
@@ -119,7 +130,10 @@ fn main() -> ExitCode {
     let _enter = rt.enter();
 
     let snapshot = Arc::new(Mutex::new(Snapshot::default()));
-    let (trigger_tx, trigger_rx) = std::sync::mpsc::channel::<u64>();
+    // Bounded: a press is a moment, and a peer that presses in a loop must not
+    // be able to make this process grow. `accept_triggers` drops and says so
+    // when it is full.
+    let (trigger_tx, trigger_rx) = std::sync::mpsc::sync_channel::<u64>(TRIGGER_BACKLOG);
     let mut publisher = None;
     if let Some(transport) = &transport {
         let listener = transport.listener();
@@ -186,9 +200,13 @@ fn main() -> ExitCode {
 
         // A press is a request from an editor, so it is drained like any other
         // input to the pass. Latency is bounded by TICK, the same as an async
-        // result.
+        // result -- and so is a press left over from a burst, because the loop
+        // takes at most `MAX_PRESSES_PER_TURN` of them before it goes back to
+        // serving the store and the clocks.
         let mut fired = false;
-        let presses: Vec<u64> = std::iter::from_fn(|| trigger_rx.try_recv().ok()).collect();
+        let presses: Vec<u64> = std::iter::from_fn(|| trigger_rx.try_recv().ok())
+            .take(MAX_PRESSES_PER_TURN)
+            .collect();
 
         // Before anything is applied or published: a pass must not run on an
         // ownership this process no longer has.

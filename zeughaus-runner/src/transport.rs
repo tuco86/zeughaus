@@ -14,7 +14,7 @@
 //! store later on.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
 use weida::{
@@ -107,13 +107,39 @@ fn announced_host(bind: SocketAddr) -> String {
     }
 }
 
+/// What became of a press offered to the event loop.
+#[derive(Debug, PartialEq, Eq)]
+enum Intake {
+    Taken,
+    /// The loop has not caught up and the queue is full, so the press is gone.
+    Dropped,
+    /// The event loop is gone, which for this process means it is shutting
+    /// down.
+    Gone,
+}
+
+/// Hands one press to the event loop without ever waiting for it.
+///
+/// Never blocking is the whole point: this runs on a weida task that also has
+/// to keep reading the connection, and a press is a moment -- so a queue that
+/// is full is a reason to drop one, not to hold the transport still. A peer
+/// pressing in a loop therefore costs a bounded queue and a log line instead
+/// of the memory of every press it ever sent.
+fn offer(tx: &SyncSender<u64>, node_id: u64) -> Intake {
+    match tx.try_send(node_id) {
+        Ok(()) => Intake::Taken,
+        Err(TrySendError::Full(_)) => Intake::Dropped,
+        Err(TrySendError::Disconnected(_)) => Intake::Gone,
+    }
+}
+
 /// Takes trigger presses until the puller goes away, which for this process
 /// means never: it owns the puller for the life of the program.
 ///
 /// Push/Pull rather than Req/Rep because a press has no answer: the editor
 /// learns that it worked by seeing the value change, and waiting for a reply
 /// would only add a round trip to a button.
-pub async fn accept_triggers(puller: Puller, tx: Sender<u64>) {
+pub async fn accept_triggers(puller: Puller, tx: SyncSender<u64>) {
     loop {
         let transfer = match puller.recv().await {
             Ok(transfer) => transfer,
@@ -133,10 +159,15 @@ pub async fn accept_triggers(puller: Puller, tx: Sender<u64>) {
             eprintln!("[runner] refused a malformed trigger ({} bytes)", payload.len());
             continue;
         };
-        // The receiver is the event loop; it outlives this task, so a send
-        // error means the process is going down.
-        if tx.send(request.node_id).is_err() {
-            return;
+        match offer(&tx, request.node_id) {
+            Intake::Taken => {}
+            Intake::Dropped => {
+                eprintln!(
+                    "[runner] trigger backlog full, dropped a press for {}",
+                    request.node_id
+                );
+            }
+            Intake::Gone => return,
         }
     }
 }
@@ -191,5 +222,27 @@ mod tests {
             announced_host("10.0.0.8:7443".parse().expect("addr")),
             "10.0.0.8"
         );
+    }
+
+    /// A full queue must cost a dropped press, not a stalled transport: this
+    /// runs on the task that also reads the connection, and the event loop it
+    /// feeds serves the store and the clocks.
+    #[test]
+    fn a_full_trigger_queue_drops_the_press() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<u64>(1);
+        assert_eq!(offer(&tx, 1), Intake::Taken);
+        assert_eq!(offer(&tx, 2), Intake::Dropped);
+        // Room again once the loop took one.
+        assert_eq!(rx.recv().expect("press"), 1);
+        assert_eq!(offer(&tx, 3), Intake::Taken);
+    }
+
+    /// The event loop being gone is the process shutting down, which is a
+    /// different answer from a backlog and ends the intake task.
+    #[test]
+    fn a_gone_event_loop_is_not_a_full_queue() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<u64>(1);
+        drop(rx);
+        assert_eq!(offer(&tx, 1), Intake::Gone);
     }
 }
