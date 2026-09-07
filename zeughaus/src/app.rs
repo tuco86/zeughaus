@@ -2386,6 +2386,12 @@ impl App {
         // also the whole batch that decides the answer -- the table a node
         // reads its columns from may have arrived in it.
         self.derive_all_db_params();
+        // A batch that added an edge changed what every node it touches shows:
+        // the value was already known, the wire to carry it was not. Nothing
+        // else refreshes the display map on the remote path, so a graph built
+        // by another window used to sit there with the wires drawn and the
+        // bodies empty until the next value arrived.
+        self.update_display_values();
     }
 
     fn apply_sync_event(&mut self, ev: crate::sync::SyncEvent) {
