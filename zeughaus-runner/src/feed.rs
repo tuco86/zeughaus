@@ -24,7 +24,7 @@
 //! feed is over. Without that, a removed node's last frame and the task writing
 //! it would both outlive the node.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -328,18 +328,113 @@ impl Default for ScaleCache {
     }
 }
 
+/// Most feeds this process serves at the same time.
+///
+/// Every feed is a task, a watch receiver, a QUIC stream and -- while it is
+/// writing -- a scaled frame. A peer can open them as fast as it can dial, so
+/// without a ceiling "how much memory does the runtime use" is a number a
+/// viewer chooses. Sixty-four is far above any real editor: a Display node is
+/// one feed, and viewers sharing a pin share one.
+const MAX_FEEDS: usize = 64;
+
+/// Whether one more feed can be served, and whether refusing it is news.
+#[derive(Debug, PartialEq, Eq)]
+enum Admission {
+    Serve,
+    Refuse {
+        /// Only the first refusal of an episode is logged: a peer that keeps
+        /// dialling would otherwise write the log, which is precisely the
+        /// resource this limit exists to protect.
+        report: bool,
+    },
+}
+
+/// The capacity rule, and which peers it has already told.
+#[derive(Default)]
+struct Capacity {
+    told: HashSet<String>,
+}
+
+impl Capacity {
+    /// Answers one request, given how many feeds are being served.
+    ///
+    /// Serving resets the memory of who has been told, so "full again" is a
+    /// new episode worth one line per peer rather than silence forever.
+    fn offer(&mut self, serving: usize, peer: &str) -> Admission {
+        if serving < MAX_FEEDS {
+            self.told.clear();
+            return Admission::Serve;
+        }
+        Admission::Refuse {
+            report: self.told.insert(peer.to_string()),
+        }
+    }
+}
+
+/// One served feed's claim on [`MAX_FEEDS`], released when its task ends.
+///
+/// A count rather than a semaphore permit because nothing here ever waits for
+/// capacity -- it refuses -- and one shared counter keeps the decision in
+/// [`Capacity::offer`], where it can be read and tested.
+struct FeedSlot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for FeedSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// How a peer is named in the log: the identity it proved in the handshake, or
+/// that it proved none.
+///
+/// The fingerprint is the only trustworthy name a peer has -- it comes from
+/// the TLS handshake rather than from anything the peer wrote. Viewers dial
+/// anonymously today, so this is usually the same name for all of them; that
+/// is also why the limit is global and not per peer. A per-peer share needs an
+/// identity to divide by, and this is where it would come from.
+fn peer_name(meta: &weida::IncomingMeta) -> String {
+    match meta.peer {
+        Some(fingerprint) => fingerprint.to_string(),
+        None => "an anonymous viewer".to_string(),
+    }
+}
+
 /// Accepts feeds until the replier goes away, which for this process means
 /// never: it owns the replier for the life of the program.
+///
+/// A request beyond [`MAX_FEEDS`] is dropped without a reply, which is what
+/// tells the viewer no reply is coming (weida has no public typed refusal on a
+/// reply half). Its `frames` loop then backs off and redials, so a viewer that
+/// arrives during a burst gets its feed a moment later instead of being told
+/// nothing at all.
 pub async fn accept_feeds(replier: Replier, frames: Arc<FrameRegistry>) {
     let cache = Arc::new(ScaleCache::new());
+    let serving = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut capacity = Capacity::default();
     loop {
         match replier.accept().await {
             Ok(request) => {
-                tokio::spawn(serve_feed(
-                    request,
-                    Arc::clone(&frames),
-                    Arc::clone(&cache),
-                ));
+                let in_flight = serving.load(std::sync::atomic::Ordering::Relaxed);
+                match capacity.offer(in_flight, &peer_name(request.meta())) {
+                    Admission::Serve => {
+                        serving.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tokio::spawn(serve_feed(
+                            request,
+                            Arc::clone(&frames),
+                            Arc::clone(&cache),
+                            FeedSlot(Arc::clone(&serving)),
+                        ));
+                    }
+                    Admission::Refuse { report } => {
+                        if report {
+                            eprintln!(
+                                "[feed] serving {in_flight} feeds already, refusing {}",
+                                peer_name(request.meta())
+                            );
+                        }
+                        drop(request);
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("[feed] stopped accepting: {e}");
@@ -368,7 +463,16 @@ impl std::fmt::Display for FeedEnd {
 }
 
 /// Serves one viewer for as long as it wants frames.
-async fn serve_feed(mut request: IncomingRequest, frames: Arc<FrameRegistry>, cache: Arc<ScaleCache>) {
+///
+/// `_slot` is this feed's claim on [`MAX_FEEDS`]: it is released when this
+/// task ends, however it ends, which is why it is owned here rather than
+/// counted down by the accept loop.
+async fn serve_feed(
+    mut request: IncomingRequest,
+    frames: Arc<FrameRegistry>,
+    cache: Arc<ScaleCache>,
+    _slot: FeedSlot,
+) {
     let mut body = request.take_body();
     // Taken before `reply` consumes the request. This is the only prompt signal
     // that a viewer walked away, and it has to sit beside a `write_all` that
@@ -732,5 +836,58 @@ mod tests {
             cache.entries.lock().expect("cache").len(),
             SCALE_CACHE_ENTRIES
         );
+    }
+
+    /// Below the ceiling everything is served; at it, nothing is -- and the
+    /// refusal is said once per peer, because a peer that keeps dialling must
+    /// not be able to write the log either.
+    #[test]
+    fn a_full_server_refuses_and_says_so_once() {
+        let mut capacity = Capacity::default();
+        assert_eq!(capacity.offer(0, "viewer-a"), Admission::Serve);
+        assert_eq!(capacity.offer(MAX_FEEDS - 1, "viewer-a"), Admission::Serve);
+
+        assert_eq!(
+            capacity.offer(MAX_FEEDS, "viewer-a"),
+            Admission::Refuse { report: true }
+        );
+        assert_eq!(
+            capacity.offer(MAX_FEEDS, "viewer-a"),
+            Admission::Refuse { report: false },
+            "the same peer is told once"
+        );
+        assert_eq!(
+            capacity.offer(MAX_FEEDS + 5, "viewer-b"),
+            Admission::Refuse { report: true },
+            "another peer is a different report"
+        );
+    }
+
+    /// Capacity coming back ends the episode: the next time the server fills
+    /// up, that is worth saying again rather than staying silent forever.
+    #[test]
+    fn capacity_returning_starts_a_new_episode() {
+        let mut capacity = Capacity::default();
+        assert_eq!(
+            capacity.offer(MAX_FEEDS, "viewer-a"),
+            Admission::Refuse { report: true }
+        );
+        assert_eq!(capacity.offer(MAX_FEEDS - 1, "viewer-a"), Admission::Serve);
+        assert_eq!(
+            capacity.offer(MAX_FEEDS, "viewer-a"),
+            Admission::Refuse { report: true }
+        );
+    }
+
+    /// A feed's claim is released when its task ends, however it ends.
+    #[test]
+    fn a_slot_is_returned_when_it_is_dropped() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let serving = Arc::new(AtomicUsize::new(0));
+        serving.fetch_add(1, Ordering::Relaxed);
+        let slot = FeedSlot(Arc::clone(&serving));
+        assert_eq!(serving.load(Ordering::Relaxed), 1);
+        drop(slot);
+        assert_eq!(serving.load(Ordering::Relaxed), 0);
     }
 }
