@@ -26,7 +26,7 @@ zeughaus-llm/          # LLM plugin (Conversation nodes, LM Studio chat)
 zeughaus-ml/           # ML plugin (Keras layers as nodes -> exportable functional-API code)
 zeughaus-flow/         # flow plugin (Hold: Event -> State; Button: manual Event; Timer: the clock a source node needs)
 zeughaus-graph/        # graph plugin (Subgraph: a container node; Input/Output: the pins it shows its parent)
-zeughaus-db/           # database plugin (Database container, Table, Insert, Query, SQL; SQLite, native only)
+zeughaus-db/           # database plugin (Database container, Table, Insert, Query, SQL; tables designed in the graph -- field rows are bidirectional pins, a wire between two is a FOREIGN KEY; SQLite, native only)
 zeughaus-record/       # record plugin (Recorder: frames + values to disk; Player: the same dataset as a source)
 zeughaus-module/       # SpacetimeDB server module (excluded from the native workspace)
 ```

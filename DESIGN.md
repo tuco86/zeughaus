@@ -121,11 +121,45 @@ module reducer, and locally in every editor.
 | Domain | Node Types | Execution Model |
 |--------|-----------|-----------------|
 | Process / DLL Injection | Processes, Inject, Memory Read/Write, Hook | Imperative, event-driven |
-| Database (FileMaker-style) | Database (container), Table, Insert, Query, SQL | Declarative, SQLite implemented (`zeughaus-db`) |
+| Database (FileMaker-style) | Database (container), Table, Insert, Query, SQL | Declarative, SQLite implemented (`zeughaus-db`) -- schema designed in the graph, see below |
 | AI / GPU | ONNX Inference, Preprocessing, Postprocessing | Pipeline, batch or stream |
 | Workflow / Automation | HTTP, Transform, Filter, Schedule | Sequential, event-triggered |
 | Screen Capture / Video | Capture, Encode, Stream, Overlay | Real-time stream |
 | Recorder / Dataset | Recorder, Player | Frames plus values as files on disk, implemented (`zeughaus-record`) |
+
+### Database schemas are drawn -- implemented
+
+A `db.table` is not a node with a text field holding a column list; it *is*
+the table. Its name is an editable title and its fields are a row editor
+(`[name] [type] [remove]` plus `add field`), and every field is a
+bidirectional pin spanning the node (`PinDirection::Both` in the core,
+`PinSide::Row` in the widget). So a **relation** is a wire drawn between two
+field pins -- `orders.customer_id` to `customers.id` -- and it becomes a
+`FOREIGN KEY` in the emitted DDL.
+
+That wire carries nothing, and that is the point: **an edge with a
+bidirectional end is excluded from execution**, in one place
+(`Graph::is_dataflow` in `zeughaus-runtime`, read by `incoming_edges` /
+`outgoing_edges` and therefore by the topological order, the dirty walk and
+every input set). Two tables referencing each other is a legal schema and a
+legal cycle; as a dependency it would leave the whole graph unorderable and
+nothing at all would run. The rule is stated on pin declarations, never on
+node type ids, so the editor and the runner -- which both build their graph
+from the same store -- reach the same answer.
+
+The relations themselves reach the runner as a derived hidden parameter
+(`relations`, one `field -> table.field` line each), exactly as `db_path` is
+derived from the enclosing `db.database`. Which end of a wire is the
+referenced one follows from the fields rather than from the drag: the end
+whose field is named `id`, and if neither is, the end the wire was dropped
+on. A runner therefore never has to know what a wire between two fields
+meant.
+
+The field editor is generic, not database-specific: `SettingKind::Fields {
+types }` is a setting kind like `Text` and `Multiline`, its value stays the
+plain `name:type` text a multiline field would have held, and the type
+vocabulary travels in the setting. That is what lets the browser editor render
+the rows for a plugin it cannot even link.
 
 ### Machine Learning (Keras) -- implemented
 
