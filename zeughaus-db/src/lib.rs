@@ -182,6 +182,47 @@ pub fn parse_columns(text: &str) -> Vec<(String, ColTy)> {
         .collect()
 }
 
+/// Parses a column list and says what is wrong with it.
+///
+/// Blank lines are ignored; anything else that is not `name:type` with a known
+/// type is an error naming the line, so a bad value is refused where it
+/// arrives instead of quietly becoming a shorter schema.
+///
+/// [`parse_columns`] stays lenient and is what reads an already accepted
+/// value: a node re-reading its own stored text must not fail a pass over a
+/// line it cannot do anything about.
+pub fn parse_columns_checked(text: &str) -> Result<Vec<(String, ColTy)>> {
+    let mut columns: Vec<(String, ColTy)> = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let at = index + 1;
+        let Some((name, ty)) = line.split_once(':') else {
+            return Err(failed(format!("line {at} '{line}': expected name:type")));
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(failed(format!("line {at} '{line}': the field has no name")));
+        }
+        let Some(ty) = ColTy::parse(ty) else {
+            return Err(failed(format!(
+                "line {at} '{line}': unknown type '{}', expected one of {}",
+                ty.trim(),
+                ColTy::NAMES.join(", ")
+            )));
+        };
+        if columns.iter().any(|(taken, _)| taken == name) {
+            return Err(failed(format!(
+                "line {at} '{line}': {name} is declared twice"
+            )));
+        }
+        columns.push((name.to_string(), ty));
+    }
+    Ok(columns)
+}
+
 /// One relation a table's field declares: this table's `field` references
 /// `target` in `table`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,6 +429,35 @@ mod tests {
                 ("name".to_string(), ColTy::Str),
             ]
         );
+    }
+
+    /// A value arriving from outside the row editor is refused where it
+    /// arrives, naming the line: silently keeping the parseable part turned
+    /// one bad paste into a shorter schema with every wire on the dropped
+    /// fields gone.
+    #[test]
+    fn a_checked_column_list_names_the_line_it_refuses() {
+        assert_eq!(
+            parse_columns_checked("id:int\n\n  \nname:str\n").expect("clean"),
+            vec![
+                ("id".to_string(), ColTy::Int),
+                ("name".to_string(), ColTy::Str),
+            ]
+        );
+
+        let cases = [
+            ("id:int\nbroken\n", "line 2 'broken': expected name:type"),
+            ("id:int\n:str\n", "line 2 ':str': the field has no name"),
+            ("id:int\nx:nope\n", "unknown type 'nope'"),
+            ("id:int\nid:str\n", "id is declared twice"),
+        ];
+        for (text, expected) in cases {
+            let error = parse_columns_checked(text).expect_err(text).to_string();
+            assert!(
+                error.contains(expected),
+                "{error} should mention {expected}"
+            );
+        }
     }
 
     /// The relation text is derived while the graph is being edited, so a line

@@ -483,7 +483,21 @@ impl ExecutableNode for PlayerNode {
                     self.hz = hz.clamp(Self::MIN_HZ, Self::MAX_HZ);
                 }
             }
-            "loop" => self.looping = matches!(text.trim(), "true" | "1"),
+            // Only explicit spellings. Reading every other text as "false"
+            // meant a typo silently stopped playback after one run, with
+            // nothing anywhere saying why.
+            "loop" => {
+                let trimmed = text.trim();
+                self.looping = match trimmed.to_ascii_lowercase().as_str() {
+                    "true" | "1" => true,
+                    "false" | "0" => false,
+                    _ => {
+                        return Err(ZeughausError::ExecutionFailed(format!(
+                            "loop '{trimmed}': expected true or false"
+                        )));
+                    }
+                };
+            }
             _ => {}
         }
         Ok(())
@@ -522,6 +536,27 @@ mod tests {
             .flat_map(|i| [tint, tint.wrapping_add(i), 0x40, 0xff])
             .collect();
         Image::from_rgba(2, 2, pixels)
+    }
+
+    /// Only explicit spellings loop. Reading everything else as "false" made
+    /// a typo look like a player that simply stops.
+    #[test]
+    fn the_loop_setting_accepts_only_explicit_spellings() {
+        let mut node = PlayerNode::new();
+        for (text, expected) in [("true", true), ("1", true), ("false", false), ("0", false)] {
+            set(&mut node, "loop", text);
+            assert_eq!(node.looping, expected, "{text}");
+        }
+        set(&mut node, "loop", "true");
+        for bad in ["tru", "yes", "", "maybe"] {
+            let error = node
+                .set_parameter("loop", Value::new(bad.to_string()))
+                .expect_err(bad)
+                .to_string();
+            assert!(error.contains("expected true or false"), "{error}");
+            // The refusal left the accepted value in place.
+            assert!(node.looping);
+        }
     }
 
     /// The two nodes are counterparts: the pixels and the values a recording

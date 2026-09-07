@@ -234,6 +234,10 @@ pub struct App {
     // which is why an unchanged value still animates: traffic, not state.
     #[cfg(not(target_arch = "wasm32"))]
     particles: HashMap<EdgeId, std::collections::VecDeque<iced::time::Instant>>,
+    /// What a node said about a setting it refused, per setting key. Drawn
+    /// under the field, so a rejected value does not sit there looking
+    /// accepted.
+    setting_errors: HashMap<NodeId, HashMap<String, String>>,
     /// Settings edits the store has not seen yet. See [`crate::pending`].
     #[cfg(not(target_arch = "wasm32"))]
     pending: crate::pending::PendingEdits,
@@ -370,6 +374,7 @@ impl App {
             output_seq: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             particles: HashMap::new(),
+            setting_errors: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             pending: crate::pending::PendingEdits::new(),
         };
@@ -584,13 +589,16 @@ impl App {
         self.executor.register_node(id, exec);
 
         // Seed settings from their defaults and push them into the node so its
-        // execution state matches what the widget shows.
+        // execution state matches what the widget shows. A node that refuses
+        // its own default says so on the node rather than nowhere.
         if !setting_defs.is_empty() {
             let mut values = HashMap::new();
             for def in &setting_defs {
-                let _ =
-                    self.executor
-                        .set_parameter(id, &def.name, Value::new(def.default.to_string()));
+                let refusal = self
+                    .executor
+                    .set_parameter(id, &def.name, Value::new(def.default.to_string()))
+                    .err();
+                self.record_setting_error(id, &def.name, refusal);
                 values.insert(def.name.to_string(), def.default.to_string());
             }
             self.node_settings.insert(id, values);
@@ -782,15 +790,50 @@ impl App {
     /// Immediate on purpose. What the user typed has to be on screen at the
     /// next frame; what the *store* learns is a separate question, answered by
     /// [`Self::commit_node`] once the typing stops.
+    ///
+    /// The node's refusal is kept and drawn under the field
+    /// ([`Self::setting_error`]). This window applies every setting locally
+    /// before pushing it, so the node has already said what is wrong with the
+    /// text -- discarding that was why a rejected value sat in the field
+    /// looking accepted while the node kept the old one.
     fn apply_setting_locally(&mut self, node: NodeId, key: &str, value: String) {
         self.node_settings
             .entry(node)
             .or_default()
             .insert(key.to_string(), value.clone());
-        let _ = self.executor.set_parameter(node, key, Value::new(value));
+        let refusal = self
+            .executor
+            .set_parameter(node, key, Value::new(value))
+            .err();
+        self.record_setting_error(node, key, refusal);
         // A setting can decide the node's pins (a table's columns are one), so
         // the widget re-reads what it now declares.
         self.refresh_node_pins(node);
+    }
+
+    /// Remembers, or clears, what a node said about one of its settings.
+    fn record_setting_error(
+        &mut self,
+        node: NodeId,
+        key: &str,
+        refusal: Option<zeughaus_core::ZeughausError>,
+    ) {
+        match refusal {
+            Some(error) => {
+                self.setting_errors
+                    .entry(node)
+                    .or_default()
+                    .insert(key.to_string(), error.to_string());
+            }
+            None => {
+                if let Some(errors) = self.setting_errors.get_mut(&node) {
+                    errors.remove(key);
+                    if errors.is_empty() {
+                        self.setting_errors.remove(&node);
+                    }
+                }
+            }
+        }
     }
 
     /// Settles the wires a settings change moved or orphaned.
@@ -2263,17 +2306,17 @@ impl App {
                 if node.parent != self.current_graph {
                     continue;
                 }
-                let display = self.display_values.get(id);
-                let const_input = self.const_inputs.get(id).map(|s| s.as_str());
-                let settings = self.node_settings.get(id);
                 let content = build_node_element(
                     node,
-                    display,
-                    const_input,
-                    settings,
-                    self.dim_mask(*id, node),
-                    self.node_sizes.get(id).copied(),
-                    self.is_container(&node.type_id),
+                    NodeChrome {
+                        display: self.display_values.get(id),
+                        const_input: self.const_inputs.get(id).map(|s| s.as_str()),
+                        settings: self.node_settings.get(id),
+                        errors: self.setting_errors.get(id),
+                        dim_mask: self.dim_mask(*id, node),
+                        size: self.node_sizes.get(id).copied(),
+                        is_container: self.is_container(&node.type_id),
+                    },
                 );
                 // Per-node activity feedback: red marching-ants on error. There
                 // is no "working" state to draw -- this process does not
@@ -3173,15 +3216,48 @@ fn is_dim(mask: u64, index: usize) -> bool {
     index < 64 && mask & (1 << index) != 0
 }
 
-fn build_node_element<'a>(
-    node: &'a EditorNode,
+/// What the node said about this setting, drawn under the field.
+///
+/// Always a widget, empty when there is nothing to say: the node body's child
+/// count has to stay the same between redraws, or iced's widget state is
+/// matched against the wrong element.
+fn setting_refusal<'a>(
+    errors: Option<&'a HashMap<String, String>>,
+    def: &'a SettingDef,
+) -> iced::widget::Text<'a, Theme> {
+    let message = errors
+        .and_then(|e| e.get(&*def.name))
+        .map(String::as_str)
+        .unwrap_or("");
+    text(message).size(10).color(Color::from_rgb(0.9, 0.4, 0.4))
+}
+
+/// Everything the widget needs about one node besides the node itself: what it
+/// shows, what has been typed into it, and what the node said about that.
+struct NodeChrome<'a> {
     display: Option<&'a DisplayValue>,
     const_input: Option<&'a str>,
     settings: Option<&'a HashMap<String, String>>,
+    /// What the node refused, per setting key.
+    errors: Option<&'a HashMap<String, String>>,
     dim_mask: u64,
     size: Option<iced::Size>,
     is_container: bool,
+}
+
+fn build_node_element<'a>(
+    node: &'a EditorNode,
+    chrome: NodeChrome<'a>,
 ) -> Element<'a, Message, Theme> {
+    let NodeChrome {
+        display,
+        const_input,
+        settings,
+        errors,
+        dim_mask,
+        size,
+        is_container,
+    } = chrome;
     let is_const = node.type_id.starts_with("transform.const_");
     let is_button = node.type_id == "flow.button";
     let is_display = is_display(&node.type_id);
@@ -3293,6 +3369,7 @@ fn build_node_element<'a>(
                 continue;
             }
             items.push(title_setting(node, def, setting_value(settings, def)));
+            items.push(setting_refusal(errors, def).into());
         }
         // A field-list setting draws its own pins: each row IS a pin spanning
         // the node, so the plain pin loop below must not draw them a second
@@ -3305,6 +3382,7 @@ fn build_node_element<'a>(
             let current = setting_value(settings, def);
             fields.extend(field_rows(current).into_iter().map(|(name, _)| name));
             items.extend(field_setting(node, def, types, current, dim_mask));
+            items.push(setting_refusal(errors, def).into());
         }
 
         for (index, pin_def) in node.pin_defs.iter().enumerate() {
@@ -3361,7 +3439,8 @@ fn build_node_element<'a>(
                 text(&*def.name)
                     .size(11)
                     .color(Color::from_rgb(0.6, 0.6, 0.6)),
-                field
+                field,
+                setting_refusal(errors, def)
             ]
             .spacing(1)
             .into(),

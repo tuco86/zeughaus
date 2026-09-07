@@ -7,8 +7,8 @@
 use zeughaus_core::*;
 
 use crate::{
-    ColTy, DB_PATH, RELATIONS, TableRef, failed, is_query, open, parse_columns, parse_relations,
-    quote, rows_to_json, table_ty, to_sql,
+    ColTy, DB_PATH, RELATIONS, TableRef, failed, is_query, open, parse_columns,
+    parse_columns_checked, parse_relations, quote, rows_to_json, table_ty, to_sql,
 };
 
 /// Reads a parameter's text, whatever scalar form it arrives in.
@@ -359,6 +359,10 @@ impl ExecutableNode for TableNode {
             // the file yet, the file still holds the first `old`, so the two
             // collapse into one.
             "columns" => {
+                // Validated before anything is replaced: an unparsable line
+                // used to make every field pin (and every wire on it) vanish,
+                // with the only report a later generic "no fields".
+                parse_columns_checked(&text)?;
                 if let Some((old, new)) = renamed_field(&self.columns, &text) {
                     self.pending_rename = match self.pending_rename.take() {
                         Some((first, waiting)) if waiting == old => Some((first, new)),
@@ -623,7 +627,22 @@ impl ExecutableNode for QueryNode {
             DB_PATH => self.db_path = text.trim().to_string(),
             "where" => self.filter = text,
             "order" => self.order = text,
-            "limit" => self.limit = text,
+            // Canonicalized here, where the user typed it. Storing any text
+            // and silently falling back to the default at query time meant the
+            // field showed one bound while the query used another.
+            "limit" => {
+                let trimmed = text.trim();
+                let Ok(limit) = trimmed.parse::<usize>() else {
+                    return Err(failed(format!(
+                        "limit '{trimmed}': expected a row count between 1 and {}",
+                        Self::MAX_LIMIT
+                    )));
+                };
+                if limit == 0 {
+                    return Err(failed("limit 0: a query that returns nothing is not one"));
+                }
+                self.limit = limit.min(Self::MAX_LIMIT).to_string();
+            }
             _ => {}
         }
         Ok(())
@@ -1035,10 +1054,29 @@ mod tests {
             node.sql("samples"),
             "SELECT * FROM \"samples\" WHERE x > 1 ORDER BY id DESC LIMIT 3"
         );
-        // An unparsable limit falls back rather than dropping the clause, and
-        // an absurd one is capped.
-        set(&mut node, "limit", "lots");
-        assert!(node.sql("samples").ends_with("LIMIT 100"));
+    }
+
+    /// A limit is canonicalized where it is typed. The field showing one
+    /// bound while the query used another is what this replaces.
+    #[test]
+    fn a_limit_is_refused_or_clamped_when_it_is_set() {
+        let mut node = QueryNode::new();
+        set(&mut node, "limit", "3");
+
+        for bad in ["lots", "", "-2", "3.5"] {
+            let error = node
+                .set_parameter("limit", Value::new(bad.to_string()))
+                .expect_err("refused");
+            assert!(error.to_string().contains("expected a row count"));
+        }
+        let error = node
+            .set_parameter("limit", Value::new("0".to_string()))
+            .expect_err("refused");
+        assert!(error.to_string().contains("limit 0"));
+        // Every refusal left the accepted value in place.
+        assert!(node.sql("samples").ends_with("LIMIT 3"));
+
+        // An absurd one is capped rather than refused: the intent is clear.
         set(&mut node, "limit", "999999");
         assert!(node.sql("samples").ends_with("LIMIT 10000"));
     }
