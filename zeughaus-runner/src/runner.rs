@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use zeughaus_core::{
     DomainPlugin, EdgeData, EdgeId, EdgeSemantic, Image, NodeConfig, NodeData, NodeId,
-    PinDirection, Ty, TypeConverters, Value, encode_scalar,
+    PinDirection, Ty, TypeConverters, Value, encode_scalar, occupancy_winner,
 };
 use weida::Publisher;
 use zeughaus_runtime::{DeferredWork, Graph, GraphEdge, GraphExecutor, GraphNode};
@@ -478,10 +478,18 @@ impl Runner {
         let to_pin: Arc<str> = Arc::from(ed.to_pin.as_str());
 
         // A data input pin holds at most one edge; a re-route arrives as a new
-        // edge without a removal for the old one. `incoming_edges` yields only
-        // data edges, so a relation is untouched here -- a field referenced by
-        // several others is the normal case for a primary key.
-        let stale: Vec<EdgeId> = self
+        // edge without a removal for the old one, and two editors can each
+        // have drawn one. `incoming_edges` yields only data edges, so a
+        // relation is untouched here -- a field referenced by several others
+        // is the normal case for a primary key.
+        //
+        // The verdict is [`occupancy_winner`], the same rule every editor
+        // applies, so this process executes the wire the windows draw. By
+        // arrival order it could have kept the other one and then run the
+        // graph nobody was looking at. An editor deletes the losing row; until
+        // that arrives, dropping it locally is enough, and the removal event
+        // then finds nothing left to do.
+        let mut contenders: Vec<EdgeId> = self
             .executor
             .graph
             .incoming_edges(to_node)
@@ -492,8 +500,15 @@ impl Runner {
                     .is_some_and(|e| e.to_pin == to_pin)
             })
             .collect();
-        for eid in stale {
-            self.executor.disconnect_edge(eid);
+        if !contenders.is_empty() {
+            contenders.push(edge_id);
+            let winner = occupancy_winner(contenders.iter().copied()).expect("not empty");
+            for loser in contenders.into_iter().filter(|id| *id != winner) {
+                self.executor.disconnect_edge(loser);
+            }
+            if winner != edge_id {
+                return;
+            }
         }
 
         self.executor.graph.add_edge(GraphEdge {

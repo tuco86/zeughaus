@@ -15,7 +15,7 @@ pub mod wire;
 pub use context::{AsyncWork, InputSet, NodeContext};
 pub use convert::TypeConverters;
 pub use document::{EdgeData, GraphDocument, NodeData};
-pub use edge::EdgeSemantic;
+pub use edge::{EdgeSemantic, occupancy_winner};
 pub use error::{Result, ZeughausError};
 pub use id::{EdgeId, NodeId, PinId};
 pub use image::Image;

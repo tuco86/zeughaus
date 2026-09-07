@@ -23,6 +23,8 @@ use zeughaus_core::{
     NodeDefinition, NodeId, PinDefinition, PinDirection, PinKind, SettingDef, SettingKind, Ty,
     TypeConverters, Value,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use zeughaus_core::occupancy_winner;
 use zeughaus_flow::FlowPlugin;
 use zeughaus_graph::GraphPlugin;
 #[cfg(not(target_arch = "wasm32"))]
@@ -741,6 +743,15 @@ impl App {
         }
     }
 
+    /// Drops an edge from this window: the view, the executor graph and cache,
+    /// and the particle queue that was riding it.
+    fn forget_edge(&mut self, id: EdgeId) {
+        self.edges.retain(|e| e.id != id);
+        self.executor.disconnect_edge(id);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.particles.remove(&id);
+    }
+
     /// What a node declares for this pin, if it declares it at all.
     ///
     /// `None` and "declared, but not a field" are different answers, and the
@@ -803,10 +814,7 @@ impl App {
             .map(|e| e.id)
             .collect();
         for edge_id in orphaned {
-            self.edges.retain(|e| e.id != edge_id);
-            self.executor.disconnect_edge(edge_id);
-            #[cfg(not(target_arch = "wasm32"))]
-            self.particles.remove(&edge_id);
+            self.forget_edge(edge_id);
             #[cfg(not(target_arch = "wasm32"))]
             self.push_edge_remove(edge_id);
         }
@@ -2442,21 +2450,43 @@ impl App {
 
     // Receive: drain queued remote events and apply them to the editor.
 
-    /// Removes every edge feeding the given input pin, from both the editor
-    /// state and the executor graph/cache. Only the remote-apply path needs it:
-    /// a local connect cannot land on an occupied input (`can_connect` rejects
-    /// it), but a remote one can race one in.
-    fn remove_edges_into(&mut self, to_node: NodeId, to_pin: &PinLabel) {
-        let stale: Vec<EdgeId> = self
+    /// Settles which wire owns a single-slot input pin, deleting the losers
+    /// here, in the executor and in the store. Returns whether `arriving` won.
+    ///
+    /// Only the remote path needs it: a local connect cannot land on an
+    /// occupied input (`can_connect` rejects it), but two windows can each
+    /// draw one without seeing the other. The verdict comes from
+    /// [`occupancy_winner`] rather than from arrival order, so every window
+    /// and every runner keeps the same wire -- ordering by arrival used to
+    /// leave each window with whichever row reached it last, and a window
+    /// opened afterwards with a third answer.
+    ///
+    /// The deletion is pushed even while a remote change is being applied.
+    /// That guard is there to stop an echo, and this is not one: the row
+    /// deleted is a different edge than the one that arrived. Every window
+    /// that sees both rows issues the same delete and the reducer is
+    /// idempotent, so agreeing is cheap and leaving the row is not -- nothing
+    /// would ever remove it and it would outlive every view that dropped it.
+    fn resolve_input_occupancy(&mut self, arriving: EdgeId, to_node: NodeId, to_pin: &str) -> bool {
+        let mut contenders: Vec<EdgeId> = self
             .edges
             .iter()
-            .filter(|e| e.to_node == to_node && e.to_pin == *to_pin)
+            .filter(|e| e.to_node == to_node && e.to_pin.as_str() == to_pin)
             .map(|e| e.id)
             .collect();
-        for edge_id in stale {
-            self.edges.retain(|e| e.id != edge_id);
-            self.executor.disconnect_edge(edge_id);
+        if contenders.is_empty() {
+            return true;
         }
+        contenders.push(arriving);
+        let winner = occupancy_winner(contenders.iter().copied()).expect("contenders is not empty");
+        for loser in contenders.into_iter().filter(|id| *id != winner) {
+            self.forget_edge(loser);
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(conn) = &self.stdb {
+                crate::sync::send_disconnect_edge(conn, loser.0);
+            }
+        }
+        winner == arriving
     }
 
     fn drain_sync(&mut self) {
@@ -2828,8 +2858,12 @@ impl App {
         let to_pin: Arc<str> = Arc::from(ed.to_pin.as_str());
         // A field pin is not a single-slot input: a primary key is referenced
         // by many, so a relation landing on it displaces nothing.
-        if !self.is_field_pin(to_node, &to_pin) {
-            self.remove_edges_into(to_node, &PinLabel(to_pin.clone()));
+        if !self.is_field_pin(to_node, &to_pin)
+            && !self.resolve_input_occupancy(edge_id, to_node, &to_pin)
+        {
+            // This wire lost the pin to one already there. It is gone from the
+            // store by now, so there is nothing left to draw.
+            return;
         }
         self.executor.graph.add_edge(GraphEdge {
             id: edge_id,
