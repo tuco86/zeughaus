@@ -67,6 +67,10 @@ pub struct Runner {
     /// Node errors already written to the log, so a failing node reports once
     /// instead of on every pass it stays broken.
     logged_errors: HashMap<NodeId, String>,
+    /// The parameter text this process last handed each node, so a row rewrite
+    /// that changed nothing (a drag, a keystroke in another field) does not
+    /// re-run the node. See [`Runner::apply_params`].
+    applied_params: AppliedParams,
     /// Nodes whose type no plugin here knows, already reported. A remote editor
     /// can create a type this build lacks, and an upsert repeats on every
     /// parameter edit.
@@ -135,6 +139,7 @@ impl Runner {
             pending_edges: Vec::new(),
             due: HashMap::new(),
             logged_errors: HashMap::new(),
+            applied_params: AppliedParams::default(),
             unknown_types: HashSet::new(),
             logged_size: (0, 0),
             frames,
@@ -418,10 +423,23 @@ impl Runner {
         self.apply_params(id, &nd.type_id, &nd.params);
     }
 
+    /// Hands the node the parameters that actually changed.
+    ///
+    /// A node row is rewritten for reasons that have nothing to do with its
+    /// settings -- a drag writes `x`/`y`, and the editor restates the whole
+    /// parameter set on every keystroke -- and `set_parameter` marks the node
+    /// and its entire downstream subtree dirty. Applying a value that did not
+    /// change therefore re-ran the node: one LLM request per keystroke in a
+    /// chat node's `model` field, one screen capture per drag. Diffing against
+    /// what this process last applied is what makes a move cost nothing.
     fn apply_params(&mut self, id: NodeId, type_id: &str, params: &[(String, String)]) {
-        for (name, text) in params {
-            if let Some(value) = param_value(type_id, text) {
-                let _ = self.executor.set_parameter(id, name, value);
+        let changed = self.applied_params.changed(id, params);
+        if changed.is_empty() {
+            return;
+        }
+        for (name, text) in changed {
+            if let Some(value) = param_value(type_id, &text) {
+                let _ = self.executor.set_parameter(id, &name, value);
             }
         }
         // A setting can decide a node's pins (a table's column list is one), so
@@ -441,6 +459,7 @@ impl Runner {
         self.published.forget(id);
         self.published.flush(self.seq, &self.snapshot);
         self.logged_errors.remove(&id);
+        self.applied_params.forget(id);
         self.unknown_types.remove(&id.0);
     }
 
@@ -719,6 +738,53 @@ fn param_value(type_id: &str, text: &str) -> Option<Value> {
     }
 }
 
+/// The parameter text last handed to each node, and the answer to "what in this
+/// row is new".
+///
+/// A stored node row carries its position and its whole parameter set
+/// together, and it is rewritten for either reason: a drag writes coordinates,
+/// the editor restates every parameter on every keystroke. Since
+/// `set_parameter` marks the node and its downstream dirty, re-applying an
+/// unchanged value is a re-run -- and for a node with side effects that is a
+/// second LLM request or a second capture for no reason at all.
+///
+/// Text rather than `Value` because that is what the store holds and what the
+/// comparison has to be exact about; the conversion happens after the diff.
+#[derive(Default)]
+pub struct AppliedParams {
+    applied: HashMap<NodeId, HashMap<String, String>>,
+}
+
+impl AppliedParams {
+    /// The parameters of this row that differ from what was last applied,
+    /// recorded as applied on the way out.
+    ///
+    /// A key the row no longer carries is forgotten rather than reset: a node
+    /// can be told a value, never that it has none, so the honest bookkeeping
+    /// is to treat that same text arriving again as a change. Every current
+    /// derived parameter (`db_path`, `columns`, `relations`) is idempotent, so
+    /// re-applying one costs a comparison inside the node and nothing else.
+    pub fn changed(&mut self, node: NodeId, params: &[(String, String)]) -> Vec<(String, String)> {
+        let applied = self.applied.entry(node).or_default();
+        let mut changed = Vec::new();
+        for (name, text) in params {
+            if applied.get(name).is_some_and(|current| current == text) {
+                continue;
+            }
+            applied.insert(name.clone(), text.clone());
+            changed.push((name.clone(), text.clone()));
+        }
+        applied.retain(|name, _| params.iter().any(|(n, _)| n == name));
+        changed
+    }
+
+    /// Forgets a node, so an id that comes back is a node this process has
+    /// told nothing.
+    pub fn forget(&mut self, node: NodeId) {
+        self.applied.remove(&node);
+    }
+}
+
 /// What editors have been told, in the two forms it is needed in: the per-pin
 /// baseline the next pass is diffed against, and the snapshot a late joiner is
 /// served.
@@ -906,5 +972,95 @@ mod tests {
         // A setting is a string by contract, even when it reads like a number.
         let value = param_value("llm.chat", "0.7").expect("setting");
         assert_eq!(value.downcast_ref::<String>(), Some(&"0.7".to_string()));
+    }
+
+    fn params(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// The first sight of a node is all new: it has been told nothing yet.
+    #[test]
+    fn every_parameter_of_a_new_node_is_changed() {
+        let mut applied = AppliedParams::default();
+        let row = params(&[("model", "qwen"), ("base_url", "http://x")]);
+        let mut changed = applied.changed(NodeId(1), &row);
+        changed.sort();
+        assert_eq!(
+            changed,
+            vec![
+                ("base_url".to_string(), "http://x".to_string()),
+                ("model".to_string(), "qwen".to_string())
+            ]
+        );
+    }
+
+    /// The case this exists for: a drag rewrites the row with the same
+    /// parameters, and re-applying one would re-run the node and everything
+    /// downstream of it.
+    #[test]
+    fn an_unchanged_row_changes_nothing() {
+        let mut applied = AppliedParams::default();
+        let row = params(&[("model", "qwen"), ("base_url", "http://x")]);
+        applied.changed(NodeId(1), &row);
+        assert!(applied.changed(NodeId(1), &row).is_empty());
+    }
+
+    /// One edited field is one parameter to apply, not the whole set.
+    #[test]
+    fn only_the_edited_parameter_is_changed() {
+        let mut applied = AppliedParams::default();
+        let before = params(&[("model", "qwen"), ("base_url", "http://x")]);
+        let after = params(&[("model", "qwen3"), ("base_url", "http://x")]);
+        applied.changed(NodeId(1), &before);
+        assert_eq!(
+            applied.changed(NodeId(1), &after),
+            vec![("model".to_string(), "qwen3".to_string())]
+        );
+    }
+
+    /// Two nodes are two baselines: one node's setting must not silence
+    /// another's.
+    #[test]
+    fn nodes_are_tracked_apart() {
+        let mut applied = AppliedParams::default();
+        let row = params(&[("hz", "2")]);
+        applied.changed(NodeId(1), &row);
+        assert_eq!(
+            applied.changed(NodeId(2), &row),
+            vec![("hz".to_string(), "2".to_string())]
+        );
+    }
+
+    /// A key that left the row is forgotten, so the same text arriving later
+    /// is applied again -- the node was never told the parameter was dropped,
+    /// and treating it as still applied would leave the two disagreeing.
+    #[test]
+    fn a_dropped_key_is_applied_again_when_it_returns() {
+        let mut applied = AppliedParams::default();
+        let both = params(&[("where", "x > 1"), ("limit", "3")]);
+        let one = params(&[("limit", "3")]);
+        applied.changed(NodeId(1), &both);
+        assert!(applied.changed(NodeId(1), &one).is_empty());
+        assert_eq!(
+            applied.changed(NodeId(1), &both),
+            vec![("where".to_string(), "x > 1".to_string())]
+        );
+    }
+
+    /// A node id that comes back is a node this process has told nothing: its
+    /// instance is new and holds its own defaults.
+    #[test]
+    fn forgetting_a_node_restates_everything() {
+        let mut applied = AppliedParams::default();
+        let row = params(&[("path", "/tmp/db.sqlite")]);
+        applied.changed(NodeId(1), &row);
+        applied.forget(NodeId(1));
+        assert_eq!(
+            applied.changed(NodeId(1), &row),
+            vec![("path".to_string(), "/tmp/db.sqlite".to_string())]
+        );
     }
 }
