@@ -109,6 +109,52 @@ enum DisplayValue {
     },
 }
 
+/// One local edit on its way to the store.
+///
+/// The payload is owned and captured when the edit was made, not read again at
+/// send time. That matters only for a replay after a reconnect: the store's
+/// snapshot arrives on the same connection and may already have overwritten
+/// this window's state with the older shared value, and re-reading state then
+/// would send the store its own stale value back.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone)]
+enum Outbound {
+    Node(NodeData),
+    Params(NodeId, Vec<(String, String)>),
+    Move(NodeId, f32, f32),
+    Delete(NodeId),
+    Connect(EdgeData),
+    Disconnect(EdgeId),
+}
+
+/// Calls the reducer one queued edit means.
+#[cfg(not(target_arch = "wasm32"))]
+fn send_outbound(
+    conn: &crate::module_bindings::DbConnection,
+    edit: &Outbound,
+) -> Result<(), String> {
+    match edit {
+        Outbound::Node(nd) => crate::sync::send_create_node(conn, nd),
+        Outbound::Params(id, params) => crate::sync::send_set_params(conn, id.0, params),
+        Outbound::Move(id, x, y) => crate::sync::send_move_node(conn, id.0, *x, *y),
+        Outbound::Delete(id) => crate::sync::send_delete_node(conn, id.0),
+        Outbound::Connect(e) => crate::sync::send_connect_edge(conn, e),
+        Outbound::Disconnect(id) => crate::sync::send_disconnect_edge(conn, id.0),
+    }
+}
+
+/// An editor edge as the store's row.
+#[cfg(not(target_arch = "wasm32"))]
+fn edge_data(e: &EditorEdge) -> EdgeData {
+    EdgeData {
+        id: e.id.0,
+        from_node: e.from_node.0,
+        from_pin: e.from_pin.to_string(),
+        to_node: e.to_node.0,
+        to_pin: e.to_pin.to_string(),
+    }
+}
+
 /// One live feed: the task reading it, what it was asked for, and the newest
 /// frame it produced.
 ///
@@ -200,10 +246,22 @@ pub struct App {
     palette_input: String,
     palette_selected: usize,
 
-    // Live SpacetimeDB connection, always established on native startup. Held to
-    // keep the background message loop alive and to call reducers on local edits.
+    // The store connection, which rebuilds itself when the host goes away.
+    // Held rather than a bare `DbConnection` because there is no such thing as
+    // a connection a process can be handed once: a host restart or a dropped
+    // packet ends it, and the editor used to keep editing against the corpse.
     #[cfg(not(target_arch = "wasm32"))]
-    stdb: Option<crate::module_bindings::DbConnection>,
+    stdb: Option<crate::sync::Store>,
+    // Edits that have not reached the store, in the order they were made.
+    // Replayed when the connection comes back. Each entry carries the payload
+    // as it was at the time of the edit, not a reference to state that the
+    // reconnect's snapshot may have overwritten in the meantime.
+    #[cfg(not(target_arch = "wasm32"))]
+    outbox: Vec<Outbound>,
+    // Reducer failures already logged, so a store that refuses every call does
+    // not fill the terminal with one line per edit.
+    #[cfg(not(target_arch = "wasm32"))]
+    logged_sends: HashSet<String>,
     // Receiver for remote changes, drained on the SyncPoll timer.
     #[cfg(not(target_arch = "wasm32"))]
     sync_rx: Option<std::sync::mpsc::Receiver<crate::sync::SyncEvent>>,
@@ -316,10 +374,15 @@ impl App {
         executor.set_converters(converters.clone());
 
         // `session` is the join token, or None to host the default local
-        // session. SpacetimeDB is required: connect on startup with no
-        // local-only fallback, failing loudly if the server is absent. The
-        // session token is what the palette "Copy Session ID" shares so a buddy
-        // can join.
+        // session. The session token is what the palette "Copy Session ID"
+        // shares so a buddy can join.
+        //
+        // The first connection still has to succeed: a token naming a store
+        // that is not there is a startup mistake, and retrying it forever
+        // would only hide it. What is no longer fatal is LOSING it -- see
+        // [`crate::sync::Store`]. A start with no store at all therefore falls
+        // through to the local autosave, which is what makes an editor usable
+        // before `spacetime start`.
         #[cfg(not(target_arch = "wasm32"))]
         let (stdb, sync_rx, session_id) = {
             let (uri, db, token) = match session {
@@ -344,14 +407,19 @@ impl App {
             };
             // Role::Viewer: this process edits and displays, it never executes,
             // so it must not register in the runtime table and be elected owner.
-            let (conn, rx) =
-                crate::sync::connect(&uri, &db, crate::sync::Role::Viewer).unwrap_or_else(|e| {
-                    panic!(
-                        "[stdb] cannot connect to {uri} / {db}: {e} (start it with `spacetime start`)"
-                    )
-                });
-            eprintln!("[stdb] session token: {token}");
-            (Some(conn), Some(rx), Some(token))
+            match crate::sync::Store::open(&uri, &db, crate::sync::Role::Viewer) {
+                Ok((store, rx)) => {
+                    eprintln!("[stdb] session token: {token}");
+                    (Some(store), Some(rx), Some(token))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[stdb] cannot reach {uri} / {db}: {e} -- editing locally \
+                         (start it with `spacetime start` and restart to collaborate)"
+                    );
+                    (None, None, None)
+                }
+            }
         };
 
         let mut app = Self {
@@ -392,6 +460,10 @@ impl App {
             // and this process never adds itself to it.
             #[cfg(not(target_arch = "wasm32"))]
             runtimes: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            outbox: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            logged_sends: HashSet::new(),
             // No feed until a runtime announces one and a Display node is wired
             // to a frame; both are discovered from the store, never assumed.
             #[cfg(not(target_arch = "wasm32"))]
@@ -829,7 +901,7 @@ impl App {
         // Grow a variadic target (e.g. merge node) so the next empty input shows.
         self.resync_pins(to_node);
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(e) = self.edges.last() {
+        if let Some(e) = self.edges.last().map(edge_data) {
             self.push_edge(e);
         }
         // A table wired into a `table` pin is the column list the target works
@@ -1133,7 +1205,7 @@ impl App {
             self.reindex_edges();
             self.executor.on_edge_added(fresh);
             #[cfg(not(target_arch = "wasm32"))]
-            if let Some(e) = self.edges.last() {
+            if let Some(e) = self.edges.last().map(edge_data) {
                 self.push_edge(e);
             }
         }
@@ -1399,6 +1471,21 @@ impl App {
         self.update_displays_from(node);
     }
 
+    /// The live store connection, or `None` while there is none.
+    ///
+    /// `None` is a state, not a failure: the host may be restarting, and this
+    /// window keeps working on a graph it can no longer share.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn store_conn(&self) -> Option<&crate::module_bindings::DbConnection> {
+        self.stdb.as_ref().and_then(crate::sync::Store::conn)
+    }
+
+    /// Whether this window's edits are reaching the shared graph.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn store_live(&self) -> bool {
+        self.stdb.as_ref().is_some_and(crate::sync::Store::is_live)
+    }
+
     /// Brings the event subscription and the live feeds in line with what the
     /// graph and the store now say.
     ///
@@ -1412,8 +1499,7 @@ impl App {
     #[cfg(not(target_arch = "wasm32"))]
     fn reconcile_runtime(&mut self) -> Task<Message> {
         let announced = self
-            .stdb
-            .as_ref()
+            .store_conn()
             .and_then(crate::sync::owner_endpoint)
             .map(Endpoint);
         // A runtime that moved, restarted or regenerated its identity
@@ -1628,6 +1714,17 @@ impl App {
     /// is the difference.
     #[cfg(not(target_arch = "wasm32"))]
     fn runtime_text(&self) -> String {
+        // First, because it outranks everything after it: with no store this
+        // window is editing a graph nobody else will see, and the runtime
+        // counts behind it are whatever the last connection said.
+        if self.stdb.is_some() && !self.store_live() {
+            let owed = self.outbox.len();
+            return match owed {
+                0 => " | store offline (reconnecting)".to_string(),
+                1 => " | store offline (reconnecting, 1 edit waiting)".to_string(),
+                n => format!(" | store offline (reconnecting, {n} edits waiting)"),
+            };
+        }
         let mut text = match self.runtimes {
             0 => " | no runtime".to_string(),
             1 => " | runtime connected".to_string(),
@@ -2424,6 +2521,11 @@ impl App {
                     // The editor's only clock while it is idle, so this is
                     // where a run of settings edits that has gone quiet
                     // reaches the store.
+                    // The reconnect, on this window's own clock: nothing
+                    // rebuilds the connection behind the editor's back.
+                    if let Some(store) = &mut self.stdb {
+                        store.poll();
+                    }
                     self.commit_settled();
                     self.drain_sync();
                     // Also where the runtime endpoint is noticed. A runtime
@@ -2942,71 +3044,96 @@ impl App {
     // Send: local edits -> reducers. Guarded by `applying_remote` so a change
     // applied from the store does not echo back as a new reducer call.
     //
-    // The sync layer now answers whether the edit reached the store, and
-    // showing that -- an edit the shared graph does not have -- is the
-    // editor's half of the disconnect work, which comes later. Discarded here
-    // on purpose so this window behaves exactly as it did.
-    fn push_node(&self, id: NodeId) {
-        if self.applying_remote {
-            return;
-        }
-        if let (Some(conn), Some(nd)) = (&self.stdb, self.node_data(id)) {
-            let _ = crate::sync::send_create_node(conn, &nd);
+    // Every one of them goes through [`Self::dispatch`], which tries the store
+    // and keeps the edit when it cannot: a reducer call that failed used to be
+    // a log line nobody reads, so a session's worth of work vanished the
+    // moment the host went away.
+    fn push_node(&mut self, id: NodeId) {
+        if let Some(nd) = self.node_data(id) {
+            self.dispatch(Outbound::Node(nd));
         }
     }
 
-    fn push_params(&self, id: NodeId) {
-        if self.applying_remote {
-            return;
-        }
-        if let (Some(conn), Some(nd)) = (&self.stdb, self.node_data(id)) {
-            let _ = crate::sync::send_set_params(conn, id.0, &nd.params);
+    fn push_params(&mut self, id: NodeId) {
+        if let Some(nd) = self.node_data(id) {
+            self.dispatch(Outbound::Params(id, nd.params));
         }
     }
 
-    fn push_move(&self, id: NodeId, x: f32, y: f32) {
+    fn push_move(&mut self, id: NodeId, x: f32, y: f32) {
+        self.dispatch(Outbound::Move(id, x, y));
+    }
+
+    fn push_delete(&mut self, id: NodeId) {
+        self.dispatch(Outbound::Delete(id));
+    }
+
+    fn push_edge(&mut self, e: EdgeData) {
+        self.dispatch(Outbound::Connect(e));
+    }
+
+    fn push_edge_remove(&mut self, id: EdgeId) {
+        self.dispatch(Outbound::Disconnect(id));
+    }
+
+    /// Sends one edit to the store, or keeps it until the store is back.
+    ///
+    /// Silent while a remote change is being applied: that would echo the
+    /// change straight back as a new reducer call.
+    fn dispatch(&mut self, edit: Outbound) {
         if self.applying_remote {
             return;
         }
-        if let Some(conn) = &self.stdb {
-            let _ = crate::sync::send_move_node(conn, id.0, x, y);
+        let sent = self
+            .stdb
+            .as_ref()
+            .and_then(crate::sync::Store::conn)
+            .map(|conn| send_outbound(conn, &edit));
+        match sent {
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
+                // Once per distinct message: a store that refuses every call
+                // would otherwise print one line per keystroke.
+                if self.logged_sends.insert(e.clone()) {
+                    eprintln!("[stdb] {e}");
+                }
+                self.outbox.push(edit);
+            }
+            // No connection at all: nothing to say that the status bar is not
+            // already saying.
+            None => self.outbox.push(edit),
         }
     }
 
-    fn push_delete(&self, id: NodeId) {
-        if self.applying_remote {
+    /// Replays what the store never received, oldest first.
+    ///
+    /// Order is the whole point: a node has to exist before an edge names it,
+    /// and a delete has to come after the create it undoes. An edit that fails
+    /// again stays queued, and everything after it stays behind it.
+    fn flush_outbox(&mut self) {
+        if self.outbox.is_empty() {
             return;
         }
-        if let Some(conn) = &self.stdb {
-            let _ = crate::sync::send_delete_node(conn, id.0);
-        }
-    }
-
-    fn push_edge(&self, e: &EditorEdge) {
-        if self.applying_remote {
+        let Some(conn) = self.stdb.as_ref().and_then(crate::sync::Store::conn) else {
             return;
+        };
+        let queued = std::mem::take(&mut self.outbox);
+        let total = queued.len();
+        let mut kept: Vec<Outbound> = Vec::new();
+        for edit in queued {
+            if !kept.is_empty() {
+                kept.push(edit);
+                continue;
+            }
+            if let Err(e) = send_outbound(conn, &edit) {
+                eprintln!("[stdb] {e} (keeping {} edits)", total - kept.len());
+                kept.push(edit);
+            }
         }
-        if let Some(conn) = &self.stdb {
-            let _ = crate::sync::send_connect_edge(
-                conn,
-                &EdgeData {
-                    id: e.id.0,
-                    from_node: e.from_node.0,
-                    from_pin: e.from_pin.to_string(),
-                    to_node: e.to_node.0,
-                    to_pin: e.to_pin.to_string(),
-                },
-            );
+        if kept.is_empty() {
+            eprintln!("[stdb] {total} local edit(s) reached the store");
         }
-    }
-
-    fn push_edge_remove(&self, id: EdgeId) {
-        if self.applying_remote {
-            return;
-        }
-        if let Some(conn) = &self.stdb {
-            let _ = crate::sync::send_disconnect_edge(conn, id.0);
-        }
+        self.outbox = kept;
     }
 
     // Receive: drain queued remote events and apply them to the editor.
@@ -3042,8 +3169,12 @@ impl App {
         let winner = occupancy_winner(contenders.iter().copied()).expect("contenders is not empty");
         for loser in contenders.into_iter().filter(|id| *id != winner) {
             self.forget_edge(loser);
+            // Not through `dispatch`: that is silent while a remote change is
+            // being applied, which is right for an echo and wrong here -- the
+            // row deleted is a different edge than the one that arrived. If
+            // the store is gone the loser's row goes with it anyway.
             #[cfg(not(target_arch = "wasm32"))]
-            if let Some(conn) = &self.stdb {
+            if let Some(conn) = self.store_conn() {
                 let _ = crate::sync::send_disconnect_edge(conn, loser.0);
             }
         }
@@ -3092,10 +3223,12 @@ impl App {
             // The batch may have brought this editor's first look at the
             // runtime table, which is where the endpoint to dial comes from.
             SyncEvent::SubscriptionApplied => {}
-            // The sync layer now reports the connection going away and coming
-            // back, and saying so in the status bar (plus surviving it) is the
-            // editor's half of that change: not wired up yet.
-            SyncEvent::Connected | SyncEvent::Disconnected => {}
+            // The store is back: whatever this window edited while it was gone
+            // has not reached it, and now can.
+            SyncEvent::Connected => self.flush_outbox(),
+            // Said in the status bar rather than here: `Store::is_live` is the
+            // authority, and it answers without waiting for an event.
+            SyncEvent::Disconnected => {}
         }
     }
 
@@ -3106,7 +3239,7 @@ impl App {
     /// still the difference between a live number and a stale one, which is the
     /// one thing a user must not have to guess about.
     fn apply_runtimes_changed(&mut self) {
-        if let Some(conn) = &self.stdb {
+        if let Some(conn) = self.store_conn() {
             self.runtimes = crate::sync::runtime_count(conn);
         }
     }
