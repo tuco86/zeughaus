@@ -143,6 +143,10 @@ pub enum Message {
     // can emit this.
     #[cfg(not(target_arch = "wasm32"))]
     FeedFrame(crate::feed::Frame),
+    // The runtime reported a value, a cleared pin or an edge it delivered
+    // across. Native-only for the same reason as `FeedFrame`.
+    #[cfg(not(target_arch = "wasm32"))]
+    Traffic(crate::feed::Traffic),
 }
 
 #[cfg(test)]

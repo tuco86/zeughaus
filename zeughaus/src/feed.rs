@@ -19,7 +19,10 @@ use iced::futures::{SinkExt, Stream};
 use tokio::io::AsyncReadExt;
 use weida::{ClientTls, EndpointAddr, Runtime, RuntimeConfig, TransferMeta, Trust};
 use zeughaus_core::Image;
-use zeughaus_samples::{FEED_PATH, FeedRequest, FrameHeader, ladder};
+use zeughaus_samples::{
+    EVENTS_PATH, FEED_PATH, FeedRequest, FrameHeader, MAX_EVENT_BYTES, MAX_SNAPSHOT_BYTES,
+    RuntimeEvent, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, TriggerRequest, ladder,
+};
 
 /// The one QUIC client this process needs.
 ///
@@ -173,6 +176,125 @@ pub fn requested_tier(size: iced::Size) -> u32 {
 /// losing a plain `max`.
 pub fn widen(a: u32, b: u32) -> u32 {
     if a == 0 || b == 0 { 0 } else { a.max(b) }
+}
+
+/// What the runtime told this editor about the graph it is executing.
+#[derive(Debug, Clone)]
+pub enum Traffic {
+    /// The whole current output set, answering a late join.
+    Snapshot(Snapshot),
+    /// One thing that just happened.
+    Event(RuntimeEvent),
+    /// The subscription dropped; values are stale until the next `Snapshot`.
+    Lost,
+}
+
+/// Subscribes to a runtime's events and keeps them coming for as long as the
+/// editor wants them.
+///
+/// The stream never ends on its own, for the same reason [`frames`] does not: a
+/// runtime that restarted is a reason to redial, and the editor stops wanting
+/// this by dropping the task.
+pub fn events(endpoint: Endpoint) -> impl Stream<Item = Traffic> {
+    // Room for a burst of events while the UI is mid-redraw. Unlike frames
+    // these are a few hundred bytes each, so buffering them is cheap and
+    // dropping one loses a value nothing else will restate.
+    iced::stream::channel(64, async move |mut out| {
+        for attempt in 0.. {
+            if attempt > 0 {
+                tokio::time::sleep(retry_delay(attempt)).await;
+            }
+            match subscribe(&endpoint, &mut out).await {
+                // The receiver is gone: this editor stopped watching.
+                Ok(Wanted::No) => return,
+                Ok(Wanted::Yes) => {}
+                Err(e) => eprintln!("[traffic] {e}"),
+            }
+            // Values on screen are last-known, not wrong; saying so is the
+            // honest state until a snapshot replaces them.
+            if out.send(Traffic::Lost).await.is_err() {
+                return;
+            }
+        }
+    })
+}
+
+/// Asks the runtime to fire a node once.
+///
+/// Push, not request: a press has no answer worth waiting for -- the editor
+/// learns it worked by seeing the value change.
+pub async fn trigger(endpoint: Endpoint, node_id: u64) -> Result<(), String> {
+    let quic = QUIC.as_ref().ok_or("no QUIC runtime")?;
+    let url = endpoint.path(TRIGGERS_PATH)?;
+    let pusher = quic.pusher(client_tls());
+    pusher
+        .connect(&url)
+        .await
+        .map_err(|e| format!("connect {url}: {e}"))?;
+    pusher
+        .send(&TriggerRequest { node_id }.encode())
+        .await
+        .map_err(|e| format!("trigger {node_id}: {e}"))
+}
+
+/// One attempt: subscribe, fetch the snapshot, then relay events.
+///
+/// Subscribing before requesting the snapshot is deliberate. An event that
+/// happens between the two is then not lost, and `seq` resolves the overlap --
+/// the other order would leave a gap nothing restates.
+async fn subscribe(
+    endpoint: &Endpoint,
+    out: &mut mpsc::Sender<Traffic>,
+) -> Result<Wanted, String> {
+    let quic = QUIC.as_ref().ok_or("no QUIC runtime")?;
+    let events_url = endpoint.path(EVENTS_PATH)?;
+    let subscriber = quic.subscriber(client_tls());
+    subscriber
+        .connect(&events_url)
+        .await
+        .map_err(|e| format!("connect {events_url}: {e}"))?;
+    // The empty filter is every topic: outputs and edge traffic alike.
+    subscriber
+        .subscribe("")
+        .await
+        .map_err(|e| format!("subscribe: {e}"))?;
+
+    let snapshot_url = endpoint.path(SNAPSHOT_PATH)?;
+    let requester = quic.requester(client_tls());
+    requester
+        .connect(&snapshot_url)
+        .await
+        .map_err(|e| format!("connect {snapshot_url}: {e}"))?;
+    let reply = requester
+        .request(b"")
+        .await
+        .map_err(|e| format!("snapshot: {e}"))?;
+    let encoded = reply
+        .collect(MAX_SNAPSHOT_BYTES)
+        .await
+        .map_err(|e| format!("snapshot: {e}"))?;
+    let snapshot = Snapshot::decode(&encoded).ok_or("snapshot: malformed")?;
+    if out.send(Traffic::Snapshot(snapshot)).await.is_err() {
+        return Ok(Wanted::No);
+    }
+
+    loop {
+        let message = subscriber
+            .recv()
+            .await
+            .map_err(|e| format!("subscription: {e}"))?;
+        let payload = message
+            .collect(MAX_EVENT_BYTES)
+            .await
+            .map_err(|e| format!("event: {e}"))?;
+        let Some(event) = RuntimeEvent::decode(&payload) else {
+            eprintln!("[traffic] skipped a malformed event ({} bytes)", payload.len());
+            continue;
+        };
+        if out.send(Traffic::Event(event)).await.is_err() {
+            return Ok(Wanted::No);
+        }
+    }
 }
 
 /// Streams one feed's frames for as long as the editor wants them.

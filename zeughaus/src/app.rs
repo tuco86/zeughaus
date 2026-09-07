@@ -11,6 +11,10 @@ use iced_nodegraph::{
     PinRef, PinShape, PinSide, PinStyle, default_edge_style, default_node_style, default_pin_style,
     edge as ng_edge, input_not_occupied, node as ng_node, node_header, node_pin,
 };
+// Particles are drawn from what the runtime delivered, and the wasm editor has
+// no sync layer to hear it from.
+#[cfg(not(target_arch = "wasm32"))]
+use iced_nodegraph::{ParticleStyle, default_particle_style, particle};
 use iced_palette::{get_filtered_command_index, is_toggle_shortcut};
 #[cfg(not(target_arch = "wasm32"))]
 use zeughaus_capture::CapturePlugin;
@@ -30,6 +34,23 @@ use zeughaus_transform::TransformPlugin;
 use crate::feed::{self, Endpoint, FeedKey, FeedSpec, FrameOrder};
 use crate::message::{GraphIds, Message, PinLabel};
 use crate::palette;
+
+/// How fast a particle travels along its cable, in world units per second.
+/// Fast enough to read as a message in flight, slow enough to be seen on a
+/// short wire.
+#[cfg(not(target_arch = "wasm32"))]
+const PARTICLE_SPEED: f32 = 240.0;
+
+/// Shortest gap between two particles on one edge: at most ten per second. A
+/// 30 Hz source would otherwise smear into a solid line, which says less than
+/// countable dots do.
+#[cfg(not(target_arch = "wasm32"))]
+const PARTICLE_MIN_GAP: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Most particles kept per edge. A born time whose distance is past the cable
+/// simply is not drawn, so the cap only bounds the memory a fast edge holds.
+#[cfg(not(target_arch = "wasm32"))]
+const PARTICLES_PER_EDGE: usize = 32;
 
 pub struct EditorNode {
     pub id: NodeId,
@@ -175,6 +196,26 @@ pub struct App {
     // cannot be told from a stall; a number that climbs can.
     #[cfg(not(target_arch = "wasm32"))]
     frames_received: u64,
+    // The task subscribed to the runtime's events. Aborts on drop, so replacing
+    // it is how the editor stops listening to a runtime that moved.
+    #[cfg(not(target_arch = "wasm32"))]
+    traffic: Option<iced::task::Handle>,
+    // Whether the event subscription is live. Values on screen are last-known
+    // while it is not, which the status bar says rather than leaving the user
+    // to guess.
+    #[cfg(not(target_arch = "wasm32"))]
+    traffic_live: bool,
+    // The runtime's values as last reported, per node and pin. Kept beside the
+    // executor because a value can arrive before the node row it belongs to.
+    #[cfg(not(target_arch = "wasm32"))]
+    remote_outputs: HashMap<NodeId, HashMap<String, Value>>,
+    // The newest sequence applied per (node, pin). See `accept_output_seq`.
+    #[cfg(not(target_arch = "wasm32"))]
+    output_seq: HashMap<(NodeId, String), u64>,
+    // When each in-flight particle was born, per edge. One per delivered value,
+    // which is why an unchanged value still animates: traffic, not state.
+    #[cfg(not(target_arch = "wasm32"))]
+    particles: HashMap<EdgeId, std::collections::VecDeque<iced::time::Instant>>,
 }
 
 impl App {
@@ -289,6 +330,16 @@ impl App {
             feed_epoch: 0,
             #[cfg(not(target_arch = "wasm32"))]
             frames_received: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            traffic: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            traffic_live: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            remote_outputs: HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            output_seq: HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            particles: HashMap::new(),
         };
 
         // Restore the last local session. A no-op while syncing: the shared
@@ -459,52 +510,163 @@ impl App {
         }
     }
 
-    /// Adopts the runtime's published outputs, replacing whatever this window
-    /// had. Nodes with no published rows are cleared, so their pins dim rather
-    /// than showing a value nothing produces any more.
+    /// Applies what the runtime reported: values, their absence, and the edges
+    /// a value crossed.
     ///
-    /// This is the only way a value ever reaches the editor: it computes
-    /// nothing itself.
+    /// This is the only way a value ever reaches the editor -- it computes
+    /// nothing itself -- and the only place particles are born.
     #[cfg(not(target_arch = "wasm32"))]
-    fn adopt_published_outputs(&mut self) {
-        let Some(conn) = &self.stdb else { return };
-        let mut per_node: HashMap<NodeId, HashMap<String, Value>> = HashMap::new();
-        for (node_id, pin, ty, text) in crate::sync::published_outputs(conn) {
-            if let Some(value) = zeughaus_core::decode_scalar(&ty, &text) {
-                per_node
-                    .entry(NodeId(node_id))
-                    .or_default()
-                    .insert(pin, value);
+    fn apply_traffic(&mut self, traffic: crate::feed::Traffic) {
+        use crate::feed::Traffic;
+        use zeughaus_samples::RuntimeEvent;
+
+        match traffic {
+            Traffic::Snapshot(snapshot) => {
+                // The whole set replaces the whole set: a pin the snapshot does
+                // not name produced nothing, which is what the editor dims.
+                self.remote_outputs.clear();
+                self.output_seq.clear();
+                for row in snapshot.outputs {
+                    let Some(value) = zeughaus_core::decode_scalar(&row.ty, &row.value) else {
+                        continue;
+                    };
+                    let node = NodeId(row.node_id);
+                    self.output_seq
+                        .insert((node, row.pin.clone()), snapshot.seq);
+                    self.remote_outputs
+                        .entry(node)
+                        .or_default()
+                        .insert(row.pin, value);
+                }
+                for id in self.nodes.keys().copied().collect::<Vec<_>>() {
+                    let outputs = self.remote_outputs.get(&id).cloned().unwrap_or_default();
+                    self.executor.set_remote_outputs(id, outputs);
+                }
+                self.traffic_live = true;
+                self.update_display_values();
             }
+            Traffic::Event(RuntimeEvent::Output {
+                seq,
+                node_id,
+                pin,
+                ty,
+                value,
+            }) => {
+                let node = NodeId(node_id);
+                if !self.accept_output_seq(node, &pin, seq) {
+                    return;
+                }
+                let Some(value) = zeughaus_core::decode_scalar(&ty, &value) else {
+                    return;
+                };
+                self.remote_outputs.entry(node).or_default().insert(pin, value);
+                self.reapply_remote_outputs(node);
+            }
+            Traffic::Event(RuntimeEvent::OutputCleared { seq, node_id, pin }) => {
+                let node = NodeId(node_id);
+                if !self.accept_output_seq(node, &pin, seq) {
+                    return;
+                }
+                if let Some(pins) = self.remote_outputs.get_mut(&node) {
+                    pins.remove(&pin);
+                }
+                self.reapply_remote_outputs(node);
+            }
+            Traffic::Event(RuntimeEvent::Edge { edge_id, .. }) => {
+                let now = iced::time::Instant::now();
+                let particles = self.particles.entry(EdgeId(edge_id)).or_default();
+                // A 30 Hz source would otherwise smear into a solid line, which
+                // says less than a countable dot does.
+                let too_soon = particles
+                    .back()
+                    .is_some_and(|born| now.duration_since(*born) < PARTICLE_MIN_GAP);
+                if !too_soon {
+                    particles.push_back(now);
+                }
+                while particles.len() > PARTICLES_PER_EDGE {
+                    particles.pop_front();
+                }
+            }
+            Traffic::Lost => self.traffic_live = false,
         }
-        for id in self.nodes.keys().copied().collect::<Vec<_>>() {
-            let outputs = per_node.remove(&id).unwrap_or_default();
-            self.executor.set_remote_outputs(id, outputs);
+    }
+
+    /// Whether this report is newer than what was already applied for that pin.
+    ///
+    /// Pub/Sub messages travel on separate QUIC streams and the snapshot is
+    /// fetched concurrently, so an older message can arrive last. Storing the
+    /// sequence per pin is what keeps it from overwriting a fresh value.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn accept_output_seq(&mut self, node: NodeId, pin: &str, seq: u64) -> bool {
+        let key = (node, pin.to_owned());
+        if self.output_seq.get(&key).is_some_and(|seen| *seen >= seq) {
+            return false;
         }
+        self.output_seq.insert(key, seq);
+        true
+    }
+
+    /// Pushes one node's current remote outputs into the executor and redraws.
+    ///
+    /// A node whose row has not arrived yet is remembered anyway: the value
+    /// applies as soon as `apply_node_upsert` creates it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn reapply_remote_outputs(&mut self, node: NodeId) {
+        if !self.nodes.contains_key(&node) {
+            return;
+        }
+        let outputs = self.remote_outputs.get(&node).cloned().unwrap_or_default();
+        self.executor.set_remote_outputs(node, outputs);
         self.update_display_values();
     }
 
-    /// Brings the live feeds in line with what the graph and the store now say.
+    /// Brings the event subscription and the live feeds in line with what the
+    /// graph and the store now say.
     ///
-    /// The one place feeds start and stop, called after anything that can change
-    /// the answer: a Display node's wire, its size, its existence, a graph
-    /// reload, or where the runtime serves. A feed that is still wanted with the
-    /// same request is left running -- restarting a video stream because the
-    /// editor redrew would be a stutter the user can see.
+    /// The one place anything is dialled, called after everything that can
+    /// change the answer: a Display node's wire, its size, its existence, a
+    /// graph reload, or where the runtime serves. A feed that is still wanted
+    /// with the same request is left running -- restarting a video stream
+    /// because the editor redrew would be a stutter the user can see.
     ///
-    /// Stopping is by removal: [`LiveFeed`]'s handle aborts on drop.
+    /// Stopping is by removal: every task handle aborts on drop.
     #[cfg(not(target_arch = "wasm32"))]
-    fn reconcile_feeds(&mut self) -> Task<Message> {
+    fn reconcile_runtime(&mut self) -> Task<Message> {
         let announced = self
             .stdb
             .as_ref()
             .and_then(crate::sync::owner_endpoint)
             .map(Endpoint);
         // A runtime that moved, restarted or regenerated its identity
-        // invalidates every address already dialled, so no feed survives it.
+        // invalidates every address already dialled, so nothing survives it.
         let moved = announced != self.endpoint;
         if moved {
             self.endpoint = announced;
+        }
+        let mut tasks = Vec::new();
+        // Also restarted when the endpoint is unchanged but no task is running:
+        // the subscription is what carries every value, so a missing one is not
+        // something to wait out.
+        if moved || (self.traffic.is_none() && self.endpoint.is_some()) {
+            self.traffic = None;
+            self.traffic_live = false;
+            self.remote_outputs.clear();
+            self.output_seq.clear();
+            // A particle in flight belongs to the runtime that sent it; the new
+            // one has not delivered anything yet.
+            self.particles.clear();
+            // Whatever is on screen came from a runtime that is no longer
+            // there, and the next snapshot is what replaces it.
+            for id in self.nodes.keys().copied().collect::<Vec<_>>() {
+                self.executor.set_remote_outputs(id, HashMap::new());
+            }
+            self.update_display_values();
+            if let Some(endpoint) = self.endpoint.clone() {
+                let (task, handle) =
+                    Task::run(feed::events(endpoint), Message::Traffic).abortable();
+                self.traffic = Some(handle.abort_on_drop());
+                tasks.push(task);
+            }
         }
         // With nothing serving frames, a live feed would be reading a dead
         // stream and the frame it left behind is not what the graph shows.
@@ -519,10 +681,9 @@ impl App {
             self.update_display_values();
         }
         let Some(endpoint) = self.endpoint.clone() else {
-            return Task::none();
+            return Task::batch(tasks);
         };
 
-        let mut tasks = Vec::new();
         for (key, tier) in wanted {
             if self.feeds.contains_key(&key) {
                 continue;
@@ -552,9 +713,9 @@ impl App {
 
     /// Which feeds the graph asks for, and at what ladder tier.
     ///
-    /// Only image-typed source pins: a scalar already arrives through
-    /// `node_output`, and streaming it over QUIC as well would be a second,
-    /// slower path to the same number.
+    /// Only image-typed source pins: a scalar already arrives as a runtime
+    /// event, and streaming it as frames as well would be a second, slower
+    /// path to the same number.
     #[cfg(not(target_arch = "wasm32"))]
     fn wanted_feeds(&self) -> HashMap<FeedKey, u32> {
         let frame_ty = Ty::of::<Image>();
@@ -647,13 +808,6 @@ impl App {
         if live.epoch != frame.epoch {
             return;
         }
-        if live
-            .latest
-            .as_ref()
-            .is_some_and(|(order, _)| frame.order <= *order)
-        {
-            return;
-        }
         let image = frame.image.clone();
         live.latest = Some((frame.order, frame.image));
         self.frames_received += 1;
@@ -691,6 +845,16 @@ impl App {
             // The store elects the lowest `seq`; the spares are standby.
             n => format!(" | runtime connected (1 of {n} executing)"),
         };
+        // Whether values are arriving, not just whether a runner exists: the
+        // event subscription is what carries them, and a dropped one leaves
+        // every number on screen a leftover.
+        if self.runtimes > 0 {
+            text.push_str(if self.traffic_live {
+                " | live"
+            } else {
+                " | reconnecting"
+            });
+        }
         if !self.feeds.is_empty() {
             let feeds = self.feeds.len();
             let plural = if feeds == 1 { "" } else { "s" };
@@ -1067,7 +1231,7 @@ impl App {
                 // The Display node's source changed, so what it should be
                 // watching changed with it.
                 #[cfg(not(target_arch = "wasm32"))]
-                return self.reconcile_feeds();
+                return self.reconcile_runtime();
             }
             Message::EdgeDisconnected { from, to } => {
                 self.disconnect_edge(
@@ -1077,7 +1241,7 @@ impl App {
                     to.pin_id,
                 );
                 #[cfg(not(target_arch = "wasm32"))]
-                return self.reconcile_feeds();
+                return self.reconcile_runtime();
             }
             Message::GroupMoved { node_ids, delta } => {
                 // Fires once on drag release; persist the new positions.
@@ -1125,7 +1289,7 @@ impl App {
                 self.autosave();
                 // A deleted Display node's feed has nobody left to draw it.
                 #[cfg(not(target_arch = "wasm32"))]
-                return self.reconcile_feeds();
+                return self.reconcile_runtime();
             }
             Message::CameraChanged { position, zoom } => {
                 self.camera_position = position;
@@ -1206,13 +1370,21 @@ impl App {
                 self.autosave();
             }
             Message::NodeTriggered { node_id } => {
-                // The press is recorded in the store rather than in the local
-                // executor: it has to reach the one process that executes, which
-                // is never this one. That is what makes a trigger work from any
-                // window, local or remote.
+                // The press has to reach the one process that executes, which
+                // is never this one. Pushed straight to that runtime, so it
+                // works from any window, local or remote.
                 #[cfg(not(target_arch = "wasm32"))]
-                if let Some(conn) = &self.stdb {
-                    crate::sync::send_trigger_node(conn, node_id);
+                if let Some(endpoint) = self.endpoint.clone() {
+                    return Task::perform(feed::trigger(endpoint, node_id), |result| {
+                        if let Err(e) = result {
+                            eprintln!("[trigger] {e}");
+                        }
+                        Message::Tick
+                    });
+                } else {
+                    // The status bar already says "no runtime"; this names the
+                    // press that went nowhere.
+                    eprintln!("[trigger] no runtime");
                 }
                 // The wasm editor has no sync layer, so it has nobody to ask.
                 #[cfg(target_arch = "wasm32")]
@@ -1225,7 +1397,7 @@ impl App {
                 // A drag only re-requests when it crosses a ladder tier; see
                 // `feed::requested_box`.
                 #[cfg(not(target_arch = "wasm32"))]
-                return self.reconcile_feeds();
+                return self.reconcile_runtime();
             }
             Message::Tick => {
                 // No-op: re-rendering advances the widget's animation clock.
@@ -1234,12 +1406,12 @@ impl App {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     self.drain_sync();
-                    // Also where the feed endpoint is noticed. A runtime
+                    // Also where the runtime endpoint is noticed. A runtime
                     // announces its address by updating its own `runtime` row,
                     // and the sync layer reports inserts and deletes of that
                     // table but not updates -- so there is no event to wait for,
                     // and the client cache is read instead.
-                    return self.reconcile_feeds();
+                    return self.reconcile_runtime();
                 }
             }
             Message::CopySessionId => {
@@ -1311,11 +1483,15 @@ impl App {
                 // `load_document` stopped every feed; this reopens what the new
                 // document asks for.
                 #[cfg(not(target_arch = "wasm32"))]
-                return self.reconcile_feeds();
+                return self.reconcile_runtime();
             }
             #[cfg(not(target_arch = "wasm32"))]
             Message::FeedFrame(frame) => {
                 self.apply_feed_frame(frame);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::Traffic(traffic) => {
+                self.apply_traffic(traffic);
             }
         }
         Task::none()
@@ -1498,6 +1674,22 @@ impl App {
                     ..base
                 }
             });
+            // One dot per value the runtime delivered across this edge. Keyed
+            // by edge id, so a wire that carries an unchanged value still shows
+            // the traffic on it -- which the colour alone cannot.
+            #[cfg(not(target_arch = "wasm32"))]
+            let edge_widget = edge_widget.particles(
+                self.particles
+                    .get(&edge.id)
+                    .into_iter()
+                    .flatten()
+                    .map(move |born| {
+                        particle(*born, PARTICLE_SPEED).style(move |theme| ParticleStyle {
+                            color: edge_color,
+                            ..default_particle_style(theme)
+                        })
+                    }),
+            );
             ng = ng.push_edge(edge_widget);
         }
 
@@ -1749,11 +1941,6 @@ impl App {
         // The node an edge was waiting for may have been in this very batch.
         self.resolve_pending_edges();
         self.applying_remote = false;
-        // Adopt once after the whole batch, not per event: the first
-        // subscription delivers the node rows and the output rows together with
-        // no ordering guarantee between the two tables, so an output arriving
-        // before its node would be dropped and a fresh window would open blank.
-        self.adopt_published_outputs();
     }
 
     fn apply_sync_event(&mut self, ev: crate::sync::SyncEvent) {
@@ -1764,14 +1951,8 @@ impl App {
             SyncEvent::EdgeInsert(ed) => self.apply_edge_insert(ed),
             SyncEvent::EdgeRemove(id) => self.apply_edge_remove(EdgeId(id)),
             SyncEvent::RuntimesChanged => self.apply_runtimes_changed(),
-            // Answered once per batch in `drain_sync`: a per-pin event cannot
-            // say which pins are now absent, so the whole cache is re-read.
-            SyncEvent::OutputsChanged => {}
-            // A press is for the process that executes. An editor only sends
-            // these; seeing its own request come back is not news.
-            SyncEvent::TriggerRequested { .. } => {}
-            // The batch that carries it already ends in an adopt, so the
-            // snapshot needs nothing extra here.
+            // The batch may have brought this editor's first look at the
+            // runtime table, which is where the endpoint to dial comes from.
             SyncEvent::SubscriptionApplied => {}
         }
     }
@@ -1801,6 +1982,10 @@ impl App {
             self.apply_params(id, &nd.type_id, &nd.params);
         } else {
             self.insert_node_from_data(&nd);
+            // A value can arrive before the node row it belongs to: this is
+            // where the one that was waiting is applied.
+            #[cfg(not(target_arch = "wasm32"))]
+            self.reapply_remote_outputs(id);
         }
     }
 
@@ -1842,10 +2027,21 @@ impl App {
     fn apply_node_remove(&mut self, id: NodeId) {
         self.nodes.remove(&id);
         self.node_order.retain(|n| *n != id);
+        #[cfg(not(target_arch = "wasm32"))]
+        for edge in self.edges.iter().filter(|e| e.from_node == id || e.to_node == id) {
+            self.particles.remove(&edge.id);
+        }
         self.edges.retain(|e| e.from_node != id && e.to_node != id);
         self.executor.remove_node(id);
         self.const_inputs.remove(&id);
         self.node_settings.remove(&id);
+        // A value whose producer is gone is not a value any more, and node ids
+        // are never reused, so nothing can inherit it.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.remote_outputs.remove(&id);
+            self.output_seq.retain(|(node, _), _| *node != id);
+        }
     }
 
     fn apply_edge_insert(&mut self, ed: EdgeData) {
@@ -1891,6 +2087,9 @@ impl App {
             let edge = self.edges.remove(pos);
             self.executor.disconnect_edge(edge.id);
             self.resync_pins(edge.to_node);
+            // The wire the particles were riding is gone.
+            #[cfg(not(target_arch = "wasm32"))]
+            self.particles.remove(&edge.id);
         }
     }
 
