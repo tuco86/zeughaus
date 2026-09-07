@@ -37,6 +37,10 @@ pub struct Runner {
     /// on every batch rather than remembered, because ownership changes by
     /// another runner disappearing, not by a handshake.
     is_owner: bool,
+    /// Which generation of ownership this process is on. Bumped every time
+    /// ownership is gained, so deferred work dispatched under a previous one is
+    /// recognizable when its result comes back. See [`Runner::deliver`].
+    owner_epoch: u64,
     /// Role and runner count as last reported. A headless standby that logged
     /// nothing would be indistinguishable from one that is stuck, so the role is
     /// stated as soon as it is known and again whenever it or the number of
@@ -130,6 +134,7 @@ impl Runner {
             plugins,
             executor,
             is_owner: false,
+            owner_epoch: 0,
             logged_role: None,
             published: Published::default(),
             publisher,
@@ -190,6 +195,10 @@ impl Runner {
             self.published.flush(self.seq, &self.snapshot);
             return;
         }
+        // A new generation of ownership: work this process dispatched under the
+        // previous one belongs to a graph another runner has been executing
+        // since, so its result is no longer this owner's to apply.
+        self.owner_epoch += 1;
         // Ownership was just inherited, so this process has never run this
         // graph: every node is stale.
         for id in self.executor.graph.node_ids().collect::<Vec<_>>() {
@@ -295,9 +304,33 @@ impl Runner {
             .map_or(cap, |wait| wait.min(cap))
     }
 
+    /// Which generation of ownership this process is currently executing under.
+    ///
+    /// Dispatched work carries it, so a result that comes back after ownership
+    /// moved can be told from one this owner is still waiting for.
+    pub fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+
     /// Applies the result of one node's deferred work, resuming the downstream
     /// nodes it was holding back.
-    pub fn deliver(&mut self, node_id: NodeId, result: AsyncResult) -> DeferredWork {
+    ///
+    /// A result from an earlier ownership generation is dropped: delivering it
+    /// runs every node downstream of it, and doing that while another runner
+    /// owns the graph is the split brain the single-owner rule exists to
+    /// prevent -- two processes inserting the same row, writing the same frame
+    /// or issuing the same request. The node's pending state is cleared
+    /// anyway, so if this process owns the graph again the node is retried
+    /// rather than left waiting for a result that has been thrown away.
+    pub fn deliver(&mut self, node_id: NodeId, epoch: u64, result: AsyncResult) -> DeferredWork {
+        if !accepts_async_result(self.is_owner, self.owner_epoch, epoch) {
+            eprintln!(
+                "[runner] dropping {node_id}'s result from epoch {epoch} (now {}, owner: {})",
+                self.owner_epoch, self.is_owner
+            );
+            self.executor.clear_pending(node_id);
+            return DeferredWork::new();
+        }
         let deferred = match result {
             Ok(outputs) => match self.executor.deliver_async_result(node_id, outputs) {
                 Ok(deferred) => deferred,
@@ -738,6 +771,21 @@ fn param_value(type_id: &str, text: &str) -> Option<Value> {
     }
 }
 
+/// Whether an async result dispatched under `dispatched` may still be applied.
+///
+/// Applying one runs every node downstream of it, so it takes the two facts
+/// that make that safe: this process owns the graph, and it is the same
+/// ownership it dispatched the work under. A standby fails the first, and an
+/// owner that lost and regained ownership in between fails the second -- in
+/// that gap another runner ran the graph, so the result describes a pass
+/// nobody is waiting for any more.
+///
+/// Pure so it can be tested: [`Runner`] needs a live store connection, and
+/// this decision must not.
+fn accepts_async_result(is_owner: bool, current: u64, dispatched: u64) -> bool {
+    is_owner && current == dispatched
+}
+
 /// The parameter text last handed to each node, and the answer to "what in this
 /// row is new".
 ///
@@ -1062,5 +1110,21 @@ mod tests {
             applied.changed(NodeId(1), &row),
             vec![("path".to_string(), "/tmp/db.sqlite".to_string())]
         );
+    }
+
+    /// The owner applies what it is waiting for, and nothing else. A result
+    /// from the generation before the handover would run every node downstream
+    /// of it a second time, in parallel with the runner that owns the graph
+    /// now.
+    #[test]
+    fn only_the_current_owner_applies_its_own_results() {
+        assert!(accepts_async_result(true, 3, 3));
+        // Lost ownership while the work was running.
+        assert!(!accepts_async_result(false, 3, 3));
+        // Lost and regained it: another runner ran the graph in between.
+        assert!(!accepts_async_result(true, 4, 3));
+        // A result stamped with an epoch this process has not reached cannot be
+        // its own either.
+        assert!(!accepts_async_result(true, 3, 4));
     }
 }

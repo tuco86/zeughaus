@@ -151,7 +151,10 @@ fn main() -> ExitCode {
     if let Some(transport) = &transport {
         runner.set_endpoint(transport.url().to_string());
     }
-    let (async_tx, async_rx) = std::sync::mpsc::channel::<(NodeId, AsyncResult)>();
+    // The epoch travels with the work: a result that comes back after ownership
+    // moved must not be applied, and the sender is the only place that knows
+    // which ownership it was dispatched under.
+    let (async_tx, async_rx) = std::sync::mpsc::channel::<(NodeId, u64, AsyncResult)>();
 
     // Ctrl-C is left to the default disposition on purpose: the process dies,
     // its connection closes, and the module drops its `runtime` row -- which is
@@ -196,9 +199,9 @@ fn main() -> ExitCode {
         // and stops.
         let ticked = runner.mark_due_ticks();
 
-        for (node_id, result) in results {
-            let deferred = runner.deliver(node_id, result);
-            dispatch(&rt, &async_tx, deferred);
+        for (node_id, epoch, result) in results {
+            let deferred = runner.deliver(node_id, epoch, result);
+            dispatch(&rt, &async_tx, runner.owner_epoch(), deferred);
         }
 
         for node_id in presses {
@@ -210,7 +213,7 @@ fn main() -> ExitCode {
                 runner.apply(event);
             }
             let deferred = runner.pass();
-            dispatch(&rt, &async_tx, deferred);
+            dispatch(&rt, &async_tx, runner.owner_epoch(), deferred);
         }
     }
 }
@@ -225,7 +228,8 @@ fn main() -> ExitCode {
 /// panicking node that never reported would freeze that whole subtree.
 fn dispatch(
     rt: &tokio::runtime::Runtime,
-    tx: &Sender<(NodeId, AsyncResult)>,
+    tx: &Sender<(NodeId, u64, AsyncResult)>,
+    epoch: u64,
     deferred: DeferredWork,
 ) {
     for (node_id, work) in deferred {
@@ -239,7 +243,7 @@ fn dispatch(
                             "background task failed: {e}"
                         )))
                     });
-            let _ = tx.send((node_id, outputs.map_err(|e| e.to_string())));
+            let _ = tx.send((node_id, epoch, outputs.map_err(|e| e.to_string())));
         });
     }
 }
