@@ -477,14 +477,14 @@ impl Runner {
         let from_pin: Arc<str> = Arc::from(ed.from_pin.as_str());
         let to_pin: Arc<str> = Arc::from(ed.to_pin.as_str());
 
-        // An input pin holds at most one edge; a re-route arrives as a new edge
-        // without a removal for the old one.
+        // A data input pin holds at most one edge; a re-route arrives as a new
+        // edge without a removal for the old one. `incoming_edges` yields only
+        // data edges, so a relation is untouched here -- a field referenced by
+        // several others is the normal case for a primary key.
         let stale: Vec<EdgeId> = self
             .executor
             .graph
             .incoming_edges(to_node)
-            .iter()
-            .copied()
             .filter(|eid| {
                 self.executor
                     .graph

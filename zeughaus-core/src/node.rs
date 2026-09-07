@@ -11,7 +11,34 @@ pub struct NodeConfig {
     pub capture: bool,
 }
 
-/// An editable text setting rendered directly inside the node widget.
+/// How the editor renders a setting.
+///
+/// A hint, not a type: the value is always the same string that reaches the
+/// store and the node's `set_parameter`. Nothing behind the editor learns
+/// which widget the user typed into.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SettingKind {
+    /// One line of text.
+    Text,
+    /// A taller, multi-line text field.
+    Multiline,
+    /// The node's own name, drawn as an editable title above its body instead
+    /// of as one labeled field among others. For a node that *is* the thing it
+    /// names -- a table, a boundary pin -- the name is the heading, not a
+    /// setting to scroll past.
+    Title,
+    /// A list of `name:type` rows -- one per line of the value -- each with a
+    /// name field, a type choice out of `types`, and a way to remove it.
+    ///
+    /// Deliberately generic. The value stays the newline-separated text a
+    /// multiline field would hold, so a node parses it exactly as before, and
+    /// the type vocabulary travels in the setting rather than being read from
+    /// the plugin that declared it -- which is what lets the browser editor
+    /// render the rows for a plugin it cannot even link.
+    Fields { types: Vec<String> },
+}
+
+/// An editable setting rendered directly inside the node widget.
 /// Distinct from input pins: settings are node-local configuration the user
 /// types (e.g. an LLM base URL or model name), persisted as node parameters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -19,8 +46,8 @@ pub struct SettingDef {
     pub name: Arc<str>,
     pub default: Arc<str>,
     pub placeholder: Arc<str>,
-    /// Hint for the editor to render a taller, multi-line field.
-    pub multiline: bool,
+    /// Which widget the editor draws for this setting.
+    pub kind: SettingKind,
 }
 
 impl SettingDef {
@@ -30,7 +57,7 @@ impl SettingDef {
             name: name.into(),
             placeholder: default.clone(),
             default,
-            multiline: false,
+            kind: SettingKind::Text,
         }
     }
 
@@ -40,7 +67,22 @@ impl SettingDef {
     }
 
     pub fn multiline(mut self) -> Self {
-        self.multiline = true;
+        self.kind = SettingKind::Multiline;
+        self
+    }
+
+    /// Renders as the node's editable title.
+    pub fn title(mut self) -> Self {
+        self.kind = SettingKind::Title;
+        self
+    }
+
+    /// Renders as a row editor over the value's `name:type` lines, offering
+    /// `types` per row.
+    pub fn fields<S: Into<String>>(mut self, types: impl IntoIterator<Item = S>) -> Self {
+        self.kind = SettingKind::Fields {
+            types: types.into_iter().map(Into::into).collect(),
+        };
         self
     }
 }
@@ -99,10 +141,18 @@ mod tests {
     fn setting_defaults_to_its_value_as_placeholder() {
         let def = SettingDef::new("model", "qwen3");
         assert_eq!(&*def.placeholder, "qwen3");
-        assert!(!def.multiline);
+        assert_eq!(def.kind, SettingKind::Text);
 
         let prompt = SettingDef::new("prompt", "").placeholder("ask...").multiline();
         assert_eq!(&*prompt.placeholder, "ask...");
-        assert!(prompt.multiline);
+        assert_eq!(prompt.kind, SettingKind::Multiline);
+
+        let columns = SettingDef::new("columns", "id:int").fields(["int", "str"]);
+        assert_eq!(
+            columns.kind,
+            SettingKind::Fields {
+                types: vec!["int".to_string(), "str".to_string()]
+            }
+        );
     }
 }

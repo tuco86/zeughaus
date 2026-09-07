@@ -201,7 +201,7 @@ impl GraphExecutor {
     fn build_input_set(&mut self, node_id: NodeId) -> InputSet {
         let mut inputs = InputSet::new();
 
-        let incoming: Vec<EdgeId> = self.graph.incoming_edges(node_id).to_vec();
+        let incoming: Vec<EdgeId> = self.graph.incoming_edges(node_id).collect();
         for edge_id in incoming {
             let Some(edge) = self.graph.edge(edge_id) else {
                 continue;
@@ -265,7 +265,7 @@ impl GraphExecutor {
 
     /// True if any input edge of `node_id` originates from a blocked node.
     fn has_blocked_input(&self, node_id: NodeId, blocked: &HashSet<NodeId>) -> bool {
-        self.graph.incoming_edges(node_id).iter().any(|&edge_id| {
+        self.graph.incoming_edges(node_id).any(|edge_id| {
             self.graph
                 .edge(edge_id)
                 .is_some_and(|e| blocked.contains(&e.from_node))
@@ -316,8 +316,6 @@ impl GraphExecutor {
         let stale: Vec<EdgeId> = self
             .graph
             .outgoing_edges(node)
-            .iter()
-            .copied()
             .filter(|id| {
                 self.graph
                     .edge(*id)
@@ -342,7 +340,8 @@ impl GraphExecutor {
     }
 
     fn apply_outputs(&mut self, node_id: NodeId, outputs: HashMap<String, Value>) {
-        for &edge_id in self.graph.outgoing_edges(node_id) {
+        let outgoing: Vec<EdgeId> = self.graph.outgoing_edges(node_id).collect();
+        for edge_id in outgoing {
             if let Some(edge) = self.graph.edge(edge_id)
                 && let Some(value) = outputs.get(&*edge.from_pin)
             {
@@ -365,7 +364,14 @@ impl GraphExecutor {
     /// immediately) and marks only the target's subtree dirty. The source is
     /// NOT re-executed -- avoids re-firing nodes with side effects. Only when
     /// the source has no cached output do we fall back to running it.
+    ///
+    /// A relation is not a wire and nothing happens here: it carries no value
+    /// to seed, and what it changes about the nodes it joins reaches them as a
+    /// parameter (see [`Graph::is_dataflow`](crate::Graph::is_dataflow)).
     pub fn on_edge_added(&mut self, edge_id: EdgeId) {
+        if !self.graph.is_dataflow(edge_id) {
+            return;
+        }
         let Some(edge) = self.graph.edge(edge_id) else {
             return;
         };
@@ -406,13 +412,7 @@ impl GraphExecutor {
     /// Remove a node, all its edges, and clean up all associated cache entries.
     pub fn remove_node(&mut self, id: NodeId) {
         // Collect edge IDs to remove (incoming + outgoing)
-        let edge_ids: Vec<EdgeId> = self
-            .graph
-            .incoming_edges(id)
-            .iter()
-            .chain(self.graph.outgoing_edges(id).iter())
-            .copied()
-            .collect();
+        let edge_ids: Vec<EdgeId> = self.graph.edges_of(id).collect();
 
         for eid in edge_ids {
             self.cache.remove(eid);
@@ -512,8 +512,7 @@ impl GraphExecutor {
     fn input_bindings(&self, id: NodeId) -> Vec<(Arc<str>, Ty)> {
         self.graph
             .incoming_edges(id)
-            .iter()
-            .filter_map(|&edge_id| {
+            .filter_map(|edge_id| {
                 let edge = self.graph.edge(edge_id)?;
                 let ty = match self.cache.get(edge_id) {
                     Some(value) => value.ty().clone(),
@@ -873,6 +872,7 @@ mod tests {
         let pin_def = match dir {
             PinDirection::Input => PinDefinition::input(pin, ty, PinKind::Sample),
             PinDirection::Output => PinDefinition::output(pin, ty),
+            PinDirection::Both => PinDefinition::field(pin, ty),
         };
         GraphNode {
             id,

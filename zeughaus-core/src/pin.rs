@@ -20,10 +20,16 @@ pub enum PinKind {
     Sample,
 }
 
+/// Which way a pin connects.
+///
+/// `Both` is neither: an edge between two `Both` pins is not dataflow at all
+/// but a declared relationship between the two nodes -- see
+/// [`PinDefinition::field`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PinDirection {
     Input,
     Output,
+    Both,
 }
 
 /// One pin of a node.
@@ -65,6 +71,26 @@ impl PinDefinition {
         }
     }
 
+    /// A field pin: an endpoint an edge may attach to from either side.
+    ///
+    /// Neither an input nor an output, because the edge it carries is not a
+    /// value in flight but a relationship between the two nodes it joins --
+    /// two table fields wired together declare a foreign key. Which end is
+    /// which follows from the fields, not from the direction the user dragged.
+    ///
+    /// The runtime therefore keeps such an edge out of execution entirely (see
+    /// `Graph::is_dataflow` in `zeughaus-runtime`), which is what makes two
+    /// tables referencing each other a legal graph rather than a cycle.
+    pub fn field(name: impl Into<Arc<str>>, ty: Ty) -> Self {
+        Self {
+            name: name.into(),
+            direction: PinDirection::Both,
+            data_mode: DataMode::Value,
+            pin_kind: PinKind::Sample,
+            ty,
+        }
+    }
+
     /// Declares continuous, high-frequency data instead of a single value.
     pub fn streaming(mut self) -> Self {
         self.data_mode = DataMode::Stream;
@@ -97,6 +123,10 @@ mod tests {
         assert_eq!(output.direction, PinDirection::Output);
         assert_eq!(output.pin_kind, PinKind::Sample);
         assert_eq!(output.ty, Ty::Float);
+
+        let field = PinDefinition::field("customer_id", Ty::opaque("db.field"));
+        assert_eq!(field.direction, PinDirection::Both);
+        assert_eq!(field.pin_kind, PinKind::Sample);
 
         assert_eq!(
             PinDefinition::output("frame", Ty::Any).streaming().data_mode,

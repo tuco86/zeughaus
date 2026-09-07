@@ -13,7 +13,7 @@ pub fn topological_sort(graph: &Graph) -> Result<Vec<NodeId>> {
 
     for node_id in graph.node_ids() {
         in_degree.entry(node_id).or_insert(0);
-        for &edge_id in graph.outgoing_edges(node_id) {
+        for edge_id in graph.outgoing_edges(node_id) {
             if let Some(edge) = graph.edge(edge_id) {
                 *in_degree.entry(edge.to_node).or_insert(0) += 1;
             }
@@ -31,7 +31,7 @@ pub fn topological_sort(graph: &Graph) -> Result<Vec<NodeId>> {
 
     while let Some(Reverse(node)) = heap.pop() {
         result.push(node);
-        for &edge_id in graph.outgoing_edges(node) {
+        for edge_id in graph.outgoing_edges(node) {
             if let Some(edge) = graph.edge(edge_id)
                 && let Some(deg) = in_degree.get_mut(&edge.to_node)
             {

@@ -193,7 +193,7 @@ impl ExecutableNode for TimerNode {
             name: "hz".into(),
             default: Self::DEFAULT_HZ.to_string().into(),
             placeholder: "30".into(),
-            multiline: false,
+            kind: SettingKind::Text,
         }]
     }
 

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use zeughaus_core::{EdgeId, EdgeSemantic, NodeConfig, NodeId, PinDefinition};
+use zeughaus_core::{EdgeId, EdgeSemantic, NodeConfig, NodeId, PinDefinition, PinDirection};
 
 pub struct GraphNode {
     pub id: NodeId,
@@ -98,12 +98,71 @@ impl Graph {
         self.edges.get(&id)
     }
 
-    pub fn incoming_edges(&self, node: NodeId) -> &[EdgeId] {
-        self.incoming.get(&node).map_or(&[], |v| v.as_slice())
+    /// Whether an edge carries data.
+    ///
+    /// It does unless one of its ends is a bidirectional field pin
+    /// ([`PinDirection::Both`]). Such an edge is a *relation*: it declares a
+    /// relationship between the two nodes -- two table fields wired together
+    /// are a foreign key -- rather than a value in flight. It must never
+    /// become a dependency, because two tables referencing each other is a
+    /// legal schema and a legal cycle: as a dependency it would make the whole
+    /// graph unorderable and no node at all would run.
+    ///
+    /// One end is enough. A field a relation still points at may already have
+    /// been renamed away on the other side, and that half-stale wire must not
+    /// turn into a dependency on the way out.
+    ///
+    /// This is the one place the rule lives. Every propagation path in this
+    /// crate -- [`Self::incoming_edges`], [`Self::outgoing_edges`] and
+    /// therefore the topological order, the dirty walk and a node's input set
+    /// -- reads it from here. Node type ids play no part: the editor and the
+    /// runner build their graph from the same store and get the same answer.
+    pub fn is_dataflow(&self, id: EdgeId) -> bool {
+        let Some(edge) = self.edges.get(&id) else {
+            return false;
+        };
+        !self.is_field(edge.from_node, &edge.from_pin) && !self.is_field(edge.to_node, &edge.to_pin)
     }
 
-    pub fn outgoing_edges(&self, node: NodeId) -> &[EdgeId] {
-        self.outgoing.get(&node).map_or(&[], |v| v.as_slice())
+    fn is_field(&self, node: NodeId, pin: &str) -> bool {
+        self.nodes.get(&node).is_some_and(|n| {
+            n.pin_defs
+                .iter()
+                .any(|p| &*p.name == pin && p.direction == PinDirection::Both)
+        })
+    }
+
+    /// The data edges entering `node` (see [`Self::is_dataflow`]).
+    pub fn incoming_edges(&self, node: NodeId) -> impl Iterator<Item = EdgeId> + '_ {
+        self.incoming
+            .get(&node)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(move |id| self.is_dataflow(*id))
+    }
+
+    /// The data edges leaving `node` (see [`Self::is_dataflow`]).
+    pub fn outgoing_edges(&self, node: NodeId) -> impl Iterator<Item = EdgeId> + '_ {
+        self.outgoing
+            .get(&node)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(move |id| self.is_dataflow(*id))
+    }
+
+    /// Every edge with an endpoint on `node`, relations included.
+    ///
+    /// Structure rather than dataflow: this is what removing a node has to
+    /// clean up, and a relation is as much a wire to forget as any other.
+    pub fn edges_of(&self, node: NodeId) -> impl Iterator<Item = EdgeId> + '_ {
+        self.outgoing
+            .get(&node)
+            .into_iter()
+            .flatten()
+            .chain(self.incoming.get(&node).into_iter().flatten())
+            .copied()
     }
 
     pub fn node_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
@@ -129,7 +188,7 @@ impl Graph {
         let mut result = Vec::new();
 
         while let Some(node) = stack.pop() {
-            for &edge_id in self.outgoing_edges(node) {
+            for edge_id in self.outgoing_edges(node) {
                 if let Some(edge) = self.edge(edge_id)
                     && visited.insert(edge.to_node)
                 {
@@ -152,7 +211,7 @@ impl Default for Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeughaus_core::NodeConfig;
+    use zeughaus_core::{NodeConfig, Ty};
 
     fn make_node(id: NodeId) -> GraphNode {
         GraphNode {
@@ -164,6 +223,17 @@ mod tests {
         }
     }
 
+    /// A node with one bidirectional field pin, as a table's field is.
+    fn make_field_node(id: NodeId) -> GraphNode {
+        GraphNode {
+            id,
+            type_id: "table".to_string(),
+            config: NodeConfig::default(),
+            pin_defs: vec![PinDefinition::field("id", Ty::opaque("db.field"))],
+            position: (0.0, 0.0),
+        }
+    }
+
     fn make_edge(from: NodeId, to: NodeId) -> GraphEdge {
         GraphEdge {
             id: EdgeId::next(),
@@ -171,6 +241,17 @@ mod tests {
             from_pin: "out".into(),
             to_node: to,
             to_pin: "in".into(),
+            semantic: EdgeSemantic::default(),
+        }
+    }
+
+    fn make_relation(from: NodeId, to: NodeId) -> GraphEdge {
+        GraphEdge {
+            id: EdgeId::next(),
+            from_node: from,
+            from_pin: "id".into(),
+            to_node: to,
+            to_pin: "id".into(),
             semantic: EdgeSemantic::default(),
         }
     }
@@ -196,8 +277,8 @@ mod tests {
         g.add_node(make_node(b));
         g.add_edge(make_edge(a, b));
         assert_eq!(g.edge_count(), 1);
-        assert_eq!(g.outgoing_edges(a).len(), 1);
-        assert_eq!(g.incoming_edges(b).len(), 1);
+        assert_eq!(g.outgoing_edges(a).count(), 1);
+        assert_eq!(g.incoming_edges(b).count(), 1);
     }
 
     #[test]
@@ -212,8 +293,8 @@ mod tests {
         g.add_edge(edge);
         g.remove_edge(eid);
         assert_eq!(g.edge_count(), 0);
-        assert_eq!(g.outgoing_edges(a).len(), 0);
-        assert_eq!(g.incoming_edges(b).len(), 0);
+        assert_eq!(g.outgoing_edges(a).count(), 0);
+        assert_eq!(g.incoming_edges(b).count(), 0);
     }
 
     #[test]
@@ -247,5 +328,50 @@ mod tests {
         assert!(ds.contains(&b));
         assert!(ds.contains(&c));
         assert!(!ds.contains(&a));
+    }
+
+    /// A relation between two field pins is held by the graph but is not a
+    /// dependency: two tables referencing each other has to stay orderable.
+    #[test]
+    fn a_relation_between_field_pins_is_not_dataflow() {
+        let mut g = Graph::new();
+        let a = NodeId::next();
+        let b = NodeId::next();
+        g.add_node(make_field_node(a));
+        g.add_node(make_field_node(b));
+        let there = make_relation(a, b);
+        let back = make_relation(b, a);
+        let (there_id, back_id) = (there.id, back.id);
+        g.add_edge(there);
+        g.add_edge(back);
+
+        assert_eq!(g.edge_count(), 2);
+        assert!(!g.is_dataflow(there_id));
+        assert!(!g.is_dataflow(back_id));
+        assert_eq!(g.outgoing_edges(a).count(), 0);
+        assert_eq!(g.incoming_edges(b).count(), 0);
+        assert!(g.downstream(a).is_empty());
+        // Structure still knows them, which is what removing a node cleans up.
+        assert_eq!(g.edges_of(a).count(), 2);
+        g.remove_node(a);
+        assert_eq!(g.edge_count(), 0);
+    }
+
+    /// A relation whose other end has already been renamed away is still a
+    /// relation: one bidirectional end is enough, so a half-edited schema
+    /// cannot turn a foreign key into a dependency.
+    #[test]
+    fn one_field_end_is_enough_to_keep_a_relation_out_of_dataflow() {
+        let mut g = Graph::new();
+        let a = NodeId::next();
+        let b = NodeId::next();
+        g.add_node(make_field_node(a));
+        g.add_node(make_node(b));
+        let edge = make_relation(a, b);
+        let id = edge.id;
+        g.add_edge(edge);
+        assert!(!g.is_dataflow(id));
+        assert_eq!(g.outgoing_edges(a).count(), 0);
+        assert_eq!(g.incoming_edges(b).count(), 0);
     }
 }

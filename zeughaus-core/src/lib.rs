@@ -19,7 +19,7 @@ pub use edge::EdgeSemantic;
 pub use error::{Result, ZeughausError};
 pub use id::{EdgeId, NodeId, PinId};
 pub use image::Image;
-pub use node::{NodeConfig, NodeDefinition, SettingDef, catalog_entry};
+pub use node::{NodeConfig, NodeDefinition, SettingDef, SettingKind, catalog_entry};
 pub use pin::{DataMode, PinBinding, PinDefinition, PinDirection, PinKind};
 pub use plugin::{DomainPlugin, ExecutableNode};
 pub use ty::{Field, Record, Repr, Ty, Typed};
