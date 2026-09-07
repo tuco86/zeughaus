@@ -4211,13 +4211,19 @@ fn field_setting<'a>(
         // list right against it, so a click a pixel too far left opened the
         // list instead of removing the field. Padding plus the row spacing
         // below keep the two apart.
+        //
+        // The last row keeps its button disabled: a table with no columns is
+        // not a table, and removing it only trades the row for a red `no
+        // fields: give the table at least one` that nothing but adding a
+        // field back clears. A field is renamed or retyped in place, so the
+        // click has nothing to offer.
         let remove = button(text("x").size(11))
             .padding([3.0, 6.0])
-            .on_press(Message::NodeSettingChanged {
+            .on_press_maybe((rows.len() > 1).then(|| Message::NodeSettingChanged {
                 node_id: node_raw_id,
                 key: def.name.to_string(),
                 value: field_edit(&rows, index, None),
-            });
+            }));
 
         // The pin the field declares, for its color and shape. A half-typed
         // row has none yet, and drawing it anyway is what keeps the widget
