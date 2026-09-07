@@ -21,7 +21,8 @@ use zeughaus_core::{
 use weida::Publisher;
 use zeughaus_runtime::{DeferredWork, Graph, GraphEdge, GraphExecutor, GraphNode};
 use zeughaus_samples::{
-    ErrorRow, OutputRow, RuntimeEvent, Snapshot, TOPIC_EDGE, TOPIC_ERROR, TOPIC_OUTPUT,
+    ErrorRow, OutputRow, RejectionRow, RuntimeEvent, Snapshot, TOPIC_EDGE, TOPIC_ERROR,
+    TOPIC_OUTPUT,
 };
 use zeughaus_sync::{Store, SyncEvent};
 
@@ -525,22 +526,53 @@ impl Runner {
             // Two ways a value does not arrive: the text is not a value of the
             // node's parameter type at all, or the node refuses it. Either way
             // the node keeps what it had, which is a node whose setting on
-            // screen is not the setting it runs on -- so it is reported as a
-            // node error and reaches the editor that typed it. The next value
-            // the node does accept marks it dirty, and the clean run that
-            // follows clears the error.
-            let Some(value) = param_value(type_id, &text) else {
-                let message = format!("{name}: {text:?} is not a value this node takes");
-                eprintln!("[runner] {id} ({type_id}): {message}");
-                self.executor.report_error(id, message);
-                continue;
+            // screen is not the setting it runs on -- so the editor that typed
+            // it, and every other window, is told which setting and why.
+            //
+            // Its own event rather than a node error: nothing failed, the node
+            // goes on running with the value it kept, and raising the failure
+            // alarm for it put a red border around a working node and an
+            // `ERROR:` line in every editor's status bar.
+            let refusal = match param_value(type_id, &text) {
+                None => Some(format!("{text:?} is not a value this node takes")),
+                Some(value) => self
+                    .executor
+                    .set_parameter(id, &name, value)
+                    .err()
+                    .map(|e| e.to_string()),
             };
-            if let Err(e) = self.executor.set_parameter(id, &name, value) {
-                let message = format!("{name}: {e}");
-                eprintln!("[runner] {id} ({type_id}) refused {text:?}: {message}");
-                self.executor.report_error(id, message);
+            match refusal {
+                Some(message) => {
+                    eprintln!("[runner] {id} ({type_id}) refused {name}={text:?}: {message}");
+                    if self.published.reject(id, &name, message.clone()) && self.is_owner {
+                        let seq = self.next_seq();
+                        let event = RuntimeEvent::SettingRejected {
+                            seq,
+                            node_id: id.0,
+                            key: name.clone(),
+                            message,
+                        };
+                        self.emit(TOPIC_ERROR, event);
+                    }
+                }
+                // The value arrived, so whatever was refused for this setting
+                // is over. Said explicitly, because an editor cannot infer it:
+                // a node that runs cleanly with a setting it once refused
+                // never mentions that setting again.
+                None => {
+                    if self.published.accept(id, &name) && self.is_owner {
+                        let seq = self.next_seq();
+                        let event = RuntimeEvent::SettingAccepted {
+                            seq,
+                            node_id: id.0,
+                            key: name.clone(),
+                        };
+                        self.emit(TOPIC_ERROR, event);
+                    }
+                }
             }
         }
+        self.published.flush(self.seq, &self.snapshot);
         // A setting can decide a node's pins (a table's column list is one), so
         // the graph's declaration is re-read once the parameters are in. Without
         // it the edges into a node the editor already drew with new pins would
@@ -992,6 +1024,11 @@ pub struct Published {
     baseline: HashMap<NodeId, HashMap<String, (String, String)>>,
     /// Why each failing node is failing, as editors were last told.
     errors: HashMap<NodeId, String>,
+    /// Why each refused setting was refused, as editors were last told, keyed
+    /// by the node and the setting. Held beside the failures because a late
+    /// editor has to learn both from the one snapshot, and kept apart from
+    /// them because a refused setting is not a failed run.
+    rejections: HashMap<(NodeId, String), String>,
     /// Whether the snapshot still matches the baseline. Rebuilding is deferred
     /// because one pass touches many nodes and the snapshot only has to be
     /// current when it is read.
@@ -1010,11 +1047,38 @@ impl Published {
         self.stale = true;
     }
 
-    /// Forgets a node: its outputs and its failure are gone with it.
+    /// Forgets a node: its outputs, its failure and its refusals go with it.
     pub fn forget(&mut self, node: NodeId) {
-        if self.baseline.remove(&node).is_some() | self.errors.remove(&node).is_some() {
+        let had_rejections = self.rejections.keys().any(|(id, _)| *id == node);
+        if self.baseline.remove(&node).is_some() | self.errors.remove(&node).is_some()
+            || had_rejections
+        {
             self.stale = true;
         }
+        self.rejections.retain(|(id, _), _| *id != node);
+    }
+
+    /// Records that a node refused a setting. `true` when that is news, which
+    /// is what decides whether an event is published: a node asked for the
+    /// same refused text again says nothing new.
+    pub fn reject(&mut self, node: NodeId, key: &str, message: String) -> bool {
+        let slot = self.rejections.entry((node, key.to_string())).or_default();
+        if *slot == message {
+            return false;
+        }
+        *slot = message;
+        self.stale = true;
+        true
+    }
+
+    /// Records that a setting is no longer refused. `true` when it was.
+    pub fn accept(&mut self, node: NodeId, key: &str) -> bool {
+        let key = (node, key.to_string());
+        if self.rejections.remove(&key).is_none() {
+            return false;
+        }
+        self.stale = true;
+        true
     }
 
     /// Which nodes editors were last told are failing, for the diff.
@@ -1032,11 +1096,12 @@ impl Published {
 
     /// Forgets everything, as when this process stops owning execution.
     pub fn clear(&mut self) {
-        if !self.baseline.is_empty() || !self.errors.is_empty() {
+        if !self.baseline.is_empty() || !self.errors.is_empty() || !self.rejections.is_empty() {
             self.stale = true;
         }
         self.baseline.clear();
         self.errors.clear();
+        self.rejections.clear();
     }
 
     /// Writes the snapshot if the baseline moved since the last call.
@@ -1068,10 +1133,20 @@ impl Published {
                 message: message.clone(),
             })
             .collect();
+        let rejections: Vec<RejectionRow> = self
+            .rejections
+            .iter()
+            .map(|((id, key), message)| RejectionRow {
+                node_id: id.0,
+                key: key.clone(),
+                message: message.clone(),
+            })
+            .collect();
         *into.lock().unwrap_or_else(|e| e.into_inner()) = Snapshot {
             seq,
             outputs,
             errors,
+            rejections,
         };
         self.stale = false;
     }

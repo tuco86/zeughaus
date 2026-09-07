@@ -343,7 +343,19 @@ pub struct App {
     /// What a node said about a setting it refused, per setting key. Drawn
     /// under the field, so a rejected value does not sit there looking
     /// accepted.
+    ///
+    /// Filled from two directions: this window applying a setting locally, and
+    /// the runtime reporting a refusal for a value some window pushed
+    /// ([`zeughaus_samples::RuntimeEvent::SettingRejected`]). They agree about
+    /// what a refusal is, so they share the map; a snapshot or a lost runtime
+    /// replaces it wholesale, and a local refusal that has not reached the
+    /// store yet is recorded again by the next keystroke.
     setting_errors: HashMap<NodeId, HashMap<String, String>>,
+    /// The newest sequence applied per refused setting. Its own guard, keyed
+    /// by (node, setting): a refusal is about one setting, so one setting's
+    /// late report must not silence another's.
+    #[cfg(not(target_arch = "wasm32"))]
+    rejection_seq: HashMap<(NodeId, String), u64>,
     /// Settings edits the store has not seen yet. See [`crate::pending`].
     #[cfg(not(target_arch = "wasm32"))]
     pending: crate::pending::PendingEdits,
@@ -501,6 +513,8 @@ impl App {
             #[cfg(not(target_arch = "wasm32"))]
             particles: HashMap::new(),
             setting_errors: HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            rejection_seq: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             pending: crate::pending::PendingEdits::new(),
         };
@@ -1377,6 +1391,19 @@ impl App {
                     .keys()
                     .map(|id| (*id, snapshot.seq))
                     .collect();
+                // And the refused settings replace the refused settings: what
+                // the runtime holds is the whole truth about what it refused.
+                self.setting_errors.clear();
+                self.rejection_seq.clear();
+                for row in snapshot.rejections {
+                    let node = NodeId(row.node_id);
+                    self.rejection_seq
+                        .insert((node, row.key.clone()), snapshot.seq);
+                    self.setting_errors
+                        .entry(node)
+                        .or_default()
+                        .insert(row.key, row.message);
+                }
                 for row in snapshot.outputs {
                     let Some(value) = zeughaus_core::decode_scalar(&row.ty, &row.value) else {
                         continue;
@@ -1457,6 +1484,26 @@ impl App {
                     self.remote_errors.remove(&node);
                 }
             }
+            // A refused setting is not a failed run, so it goes where the
+            // reason belongs -- under the field -- and raises none of the
+            // alarm a failure raises: no red border, no status-bar ERROR.
+            Traffic::Event(RuntimeEvent::SettingRejected {
+                seq,
+                node_id,
+                key,
+                message,
+            }) => {
+                let node = NodeId(node_id);
+                if self.accept_rejection_seq(node, &key, seq) {
+                    self.setting_errors.entry(node).or_default().insert(key, message);
+                }
+            }
+            Traffic::Event(RuntimeEvent::SettingAccepted { seq, node_id, key }) => {
+                let node = NodeId(node_id);
+                if self.accept_rejection_seq(node, &key, seq) {
+                    self.record_setting_error(node, &key, None);
+                }
+            }
             Traffic::Lost => {
                 self.traffic_live = false;
                 // Values stay on screen as last-known, because the status bar
@@ -1467,6 +1514,10 @@ impl App {
                 // than none.
                 self.remote_errors.clear();
                 self.error_seq.clear();
+                // Same for a refusal: it is a claim about what the runtime
+                // holds, and there is no runtime holding it any more.
+                self.setting_errors.clear();
+                self.rejection_seq.clear();
             }
         }
     }
@@ -1494,6 +1545,19 @@ impl App {
             return false;
         }
         self.error_seq.insert(node, seq);
+        true
+    }
+
+    /// The same guard for a refused setting, keyed by node and setting: a
+    /// refusal is about one setting, and two settings refused in one pass are
+    /// two independent reports.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn accept_rejection_seq(&mut self, node: NodeId, key: &str, seq: u64) -> bool {
+        let key = (node, key.to_owned());
+        if self.rejection_seq.get(&key).is_some_and(|seen| *seen >= seq) {
+            return false;
+        }
+        self.rejection_seq.insert(key, seq);
         true
     }
 
@@ -2445,6 +2509,8 @@ impl App {
                         self.const_inputs.remove(&id);
                         self.node_settings.remove(&id);
                         self.setting_errors.remove(&id);
+                        #[cfg(not(target_arch = "wasm32"))]
+                        self.rejection_seq.retain(|(node, _), _| *node != id);
                         // Looking into a graph that no longer exists shows
                         // nothing and offers no way out.
                         if self.current_graph == id {
@@ -3629,6 +3695,7 @@ impl App {
             self.output_seq.retain(|(node, _), _| *node != id);
             self.remote_errors.remove(&id);
             self.error_seq.remove(&id);
+            self.rejection_seq.retain(|(node, _), _| *node != id);
         }
         // A removed boundary node is a pin its container loses; a removed
         // container is a graph nobody can be looking at any more.

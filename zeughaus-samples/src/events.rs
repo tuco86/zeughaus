@@ -48,6 +48,24 @@ pub enum RuntimeEvent {
     /// A node stopped failing. Recovery is a state an editor has to be able to
     /// reach, or a fixed node would keep its red border for the session.
     NodeErrorCleared { seq: u64, node_id: u64 },
+    /// A node refused one of its settings, with the reason and the setting it
+    /// is about.
+    ///
+    /// Its own event rather than a [`RuntimeEvent::NodeError`] because it is
+    /// not a failed run: the node kept the value it had and goes on working.
+    /// An editor draws it under the field it belongs to, and a refused setting
+    /// therefore does not raise the alarm a failure raises. The runtime is the
+    /// only process that can report it for a window that did not type it.
+    SettingRejected {
+        seq: u64,
+        node_id: u64,
+        key: String,
+        message: String,
+    },
+    /// A setting that was refused is no longer refused: the node took a value
+    /// for that key. The counterpart of [`RuntimeEvent::SettingRejected`], for
+    /// the same reason [`RuntimeEvent::OutputCleared`] exists.
+    SettingAccepted { seq: u64, node_id: u64, key: String },
 }
 
 impl RuntimeEvent {
@@ -80,6 +98,14 @@ pub struct ErrorRow {
     pub message: String,
 }
 
+/// One refused setting in a [`Snapshot`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectionRow {
+    pub node_id: u64,
+    pub key: String,
+    pub message: String,
+}
+
 /// Everything the runtime currently holds, for an editor that joined after the
 /// values were produced.
 ///
@@ -93,6 +119,10 @@ pub struct Snapshot {
     /// absent output means "produced nothing".
     #[serde(default)]
     pub errors: Vec<ErrorRow>,
+    /// The settings currently refused, one row per (node, setting). Absence
+    /// means "accepted", the same way an absent error means "not failing".
+    #[serde(default)]
+    pub rejections: Vec<RejectionRow>,
 }
 
 impl Snapshot {
@@ -127,7 +157,11 @@ pub const TOPIC_OUTPUT: &str = "output";
 /// Topic of [`RuntimeEvent::Edge`].
 pub const TOPIC_EDGE: &str = "edge";
 
-/// Topic of [`RuntimeEvent::NodeError`] and [`RuntimeEvent::NodeErrorCleared`].
+/// Topic of everything an editor draws in red: the node failures
+/// ([`RuntimeEvent::NodeError`], [`RuntimeEvent::NodeErrorCleared`]) and the
+/// refused settings ([`RuntimeEvent::SettingRejected`],
+/// [`RuntimeEvent::SettingAccepted`]). One subscription, because a viewer
+/// wants both or neither.
 pub const TOPIC_ERROR: &str = "error";
 
 /// Largest event payload a subscriber reads. An event is a few identifiers and
@@ -173,6 +207,17 @@ mod tests {
                 seq: 11,
                 node_id: 5,
             },
+            RuntimeEvent::SettingRejected {
+                seq: 12,
+                node_id: 5,
+                key: "limit".to_owned(),
+                message: "expected a row count between 1 and 10000".to_owned(),
+            },
+            RuntimeEvent::SettingAccepted {
+                seq: 13,
+                node_id: 5,
+                key: "limit".to_owned(),
+            },
         ];
         for event in events {
             assert_eq!(RuntimeEvent::decode(&event.encode()), Some(event));
@@ -201,6 +246,11 @@ mod tests {
                 node_id: 2,
                 message: "cannot open /srv/x.sqlite".to_owned(),
             }],
+            rejections: vec![RejectionRow {
+                node_id: 3,
+                key: "name".to_owned(),
+                message: "a table needs a name".to_owned(),
+            }],
         };
         assert_eq!(Snapshot::decode(&snapshot.encode()), Some(snapshot));
     }
@@ -213,6 +263,7 @@ mod tests {
         let decoded = Snapshot::decode(br#"{"seq":3,"outputs":[]}"#).expect("snapshot");
         assert_eq!(decoded.seq, 3);
         assert!(decoded.errors.is_empty());
+        assert!(decoded.rejections.is_empty());
     }
 
     #[test]
