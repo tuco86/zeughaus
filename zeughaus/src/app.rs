@@ -860,6 +860,35 @@ impl App {
             self.connect_edge(from_node, from_pin, to_node, to_pin);
         }
 
+        let mut copies: Vec<NodeId> = copy_of.values().copied().collect();
+        copies.sort_unstable();
+
+        // A container's pins are synthesized from its children's `name`
+        // settings, and `spawn_node_into` built them while every copied
+        // boundary still held its default name. Two copied `graph.input`s
+        // therefore collapsed into one pin, and worse: the container's pins
+        // carried the default names while `boundary_name` reported the copied
+        // ones, so `resolve_boundary` matched nothing and a wire dropped on
+        // the clone's pin was silently discarded.
+        for copy in &copies {
+            if self.nodes.get(copy).is_some_and(|n| n.is_container) {
+                self.refresh_container_pins(*copy);
+            }
+        }
+
+        // The derived parameters say where the copy sits and what is wired to
+        // it; they are not the original's to inherit. `spawn_node_into`
+        // derived them before the settings arrived, and the settings copy then
+        // wrote the original's over them -- including a `relations` line for a
+        // wire that was NOT copied, which had the runner create a foreign key
+        // the graph does not show. Re-derived last, when the copied edges
+        // exist and the answer is knowable.
+        #[cfg(not(target_arch = "wasm32"))]
+        for copy in &copies {
+            self.derive_db_params(*copy);
+            self.derive_db_dependents(*copy);
+        }
+
         copy_of.get(&root).copied()
     }
 
