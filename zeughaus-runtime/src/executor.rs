@@ -38,6 +38,11 @@ pub struct GraphExecutor {
     /// types (e.g. a u8 output into an f64 input). Shared with the editor's
     /// connection validation so "what may connect" and "what is coerced" agree.
     converters: Arc<TypeConverters>,
+    /// Edges a value was delivered across since the last
+    /// [`Self::take_delivered`]. The record of traffic, not of state: this is
+    /// what lets a viewer draw one particle per message instead of guessing
+    /// from a value that may not have changed.
+    delivered: Vec<EdgeId>,
 }
 
 impl GraphExecutor {
@@ -52,6 +57,7 @@ impl GraphExecutor {
             node_errors: HashMap::new(),
             trace_counter: 0,
             converters: Arc::new(TypeConverters::new()),
+            delivered: Vec::new(),
         }
     }
 
@@ -285,7 +291,12 @@ impl GraphExecutor {
     /// which is the honest rendering of "the owner did not publish this".
     pub fn set_remote_outputs(&mut self, node: NodeId, outputs: HashMap<String, Value>) {
         self.last_outputs.insert(node, outputs.clone());
+        // Replication is not traffic: the edge already carried this value where
+        // it was computed, and counting it again would draw a second particle
+        // for one message.
+        let mark = self.delivered.len();
         self.apply_outputs(node, outputs);
+        self.delivered.truncate(mark);
     }
 
     /// Clears a node's pending state without delivering outputs (e.g. after the
@@ -300,8 +311,17 @@ impl GraphExecutor {
                 && let Some(value) = outputs.get(&*edge.from_pin)
             {
                 self.cache.set(edge_id, value.clone());
+                self.delivered.push(edge_id);
             }
         }
+    }
+
+    /// Takes the edges a value crossed since the last call.
+    ///
+    /// Duplicates are possible within one pass -- two writes to one edge are
+    /// two messages -- and the consumer decides whether it cares.
+    pub fn take_delivered(&mut self) -> Vec<EdgeId> {
+        std::mem::take(&mut self.delivered)
     }
 
     /// Notifies the executor that an edge was just added. Seeds the edge from
@@ -1066,5 +1086,33 @@ mod tests {
         exec.execute_dirty().unwrap();
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         assert_eq!(exec.pending_count(), 0);
+    }
+
+    /// Traffic is what a viewer animates, so an executed pass has to name every
+    /// edge a value crossed -- and adopting another runtime's outputs must not,
+    /// or the message would be counted twice for one delivery.
+    #[test]
+    fn delivering_a_value_records_its_edge_but_replicating_one_does_not() {
+        let mut graph = Graph::new();
+        let a = NodeId::next();
+        let b = NodeId::next();
+        graph.add_node(make_node(a));
+        graph.add_node(make_node(b));
+        let edge = make_edge(a, "value", b, "in");
+        let edge_id = edge.id;
+        graph.add_edge(edge);
+
+        let mut exec = GraphExecutor::new(graph);
+        exec.register_node(a, Box::new(ConstNode(2.0)));
+        exec.register_node(b, Box::new(DoubleNode));
+        exec.execute_all().unwrap();
+        assert_eq!(exec.take_delivered(), vec![edge_id]);
+        // Taking is draining: the next pass reports its own traffic only.
+        assert!(exec.take_delivered().is_empty());
+
+        let mut outputs = HashMap::new();
+        outputs.insert("value".to_string(), Value::new(9.0_f64));
+        exec.set_remote_outputs(a, outputs);
+        assert!(exec.take_delivered().is_empty());
     }
 }

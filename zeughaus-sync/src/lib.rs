@@ -1,16 +1,18 @@
 //! SpacetimeDB client for the shared graph: generated bindings plus the
-//! connect/subscribe/publish layer both processes use.
+//! connect/subscribe layer both processes use.
 //!
-//! - Receive: subscribes to `node`, `edge`, `runtime` and `node_output`; row
-//!   changes become [`SyncEvent`]s on a channel the caller drains on its own
-//!   schedule (the SDK callbacks run on a background thread, so state is never
-//!   touched from there).
+//! - Receive: subscribes to `node`, `edge` and `runtime`; row changes become
+//!   [`SyncEvent`]s on a channel the caller drains on its own schedule (the SDK
+//!   callbacks run on a background thread, so state is never touched from
+//!   there).
 //! - Send: helper functions call the module's reducers for local edits and for
-//!   publishing computed outputs.
+//!   announcing where a runtime is reachable.
 //!
-//! This is a library because the editor and the headless runtime are separate
-//! processes that both speak to the same store: the GUI edits the graph and
-//! displays results, the runtime executes it and publishes them.
+//! The store carries the graph document and runtime presence, and nothing a
+//! pass produces: values, edge traffic, frames and trigger presses travel over
+//! weida, straight between the runner and the editors. This is a library
+//! because the editor and the headless runtime are separate processes that both
+//! speak to the same store.
 //!
 //! Conflict model: fine-grained reducers, last-writer-wins per row. Node/edge
 //! ids are made process-unique at startup (see `NodeId::seed_unique`) so two
@@ -28,10 +30,9 @@ use spacetimedb_sdk::{DbContext, Table, TableWithPrimaryKey};
 use zeughaus_core::{EdgeData, NodeData};
 
 use crate::module_bindings::{
-    DbConnection, Edge, EdgeTableAccess, Node, NodeOutputTableAccess, NodeTableAccess,
-    NodeTriggerTableAccess, RuntimeTableAccess, announce_endpoint, clear_node_outputs,
-    connect_edge, create_node, delete_node, disconnect_edge, join_runtime, move_node,
-    publish_output, set_node_params, trigger_node,
+    DbConnection, Edge, EdgeTableAccess, Node, NodeTableAccess, RuntimeTableAccess,
+    announce_endpoint, connect_edge, create_node, delete_node, disconnect_edge, join_runtime,
+    move_node, set_node_params,
 };
 
 pub const DEFAULT_PORT: u16 = 3000;
@@ -48,17 +49,8 @@ pub enum SyncEvent {
     /// changed with it. Carries no payload: the editor recomputes ownership from
     /// the client cache, which is the authority.
     RuntimesChanged,
-    /// A published output value changed or disappeared. Also payload-free for
-    /// the same reason -- a viewer rebuilds a node's whole output set from the
-    /// cache, because a per-pin event cannot say which pins are still absent.
-    OutputsChanged,
-    /// An editor asked for a node to be fired once. Only the executing runtime
-    /// acts on it; the count identifies the press so a re-subscription does not
-    /// replay one that was already handled.
-    TriggerRequested { node_id: u64, count: u64 },
     /// The first subscription snapshot has been delivered. Everything before it
-    /// is existing state, not something that just happened -- which is the
-    /// difference between adopting a pending trigger and firing it.
+    /// is existing state rather than something that just happened.
     SubscriptionApplied,
 }
 
@@ -148,34 +140,6 @@ pub fn connect(
     conn.db.runtime().on_insert(move |_ctx, _r| send(&t, SyncEvent::RuntimesChanged));
     let t = tx.clone();
     conn.db.runtime().on_delete(move |_ctx, _r| send(&t, SyncEvent::RuntimesChanged));
-    let t = tx.clone();
-    conn.db.node_output().on_insert(move |_ctx, _o| send(&t, SyncEvent::OutputsChanged));
-    let t = tx.clone();
-    conn.db
-        .node_output()
-        .on_update(move |_ctx, _old, _new| send(&t, SyncEvent::OutputsChanged));
-    let t = tx.clone();
-    conn.db.node_output().on_delete(move |_ctx, _o| send(&t, SyncEvent::OutputsChanged));
-    let t = tx.clone();
-    conn.db.node_trigger().on_insert(move |_ctx, r| {
-        send(
-            &t,
-            SyncEvent::TriggerRequested {
-                node_id: r.node_id,
-                count: r.count,
-            },
-        )
-    });
-    let t = tx.clone();
-    conn.db.node_trigger().on_update(move |_ctx, _old, r| {
-        send(
-            &t,
-            SyncEvent::TriggerRequested {
-                node_id: r.node_id,
-                count: r.count,
-            },
-        )
-    });
 
     let t = tx.clone();
     conn.subscription_builder()
@@ -188,8 +152,6 @@ pub fn connect(
             "SELECT * FROM node",
             "SELECT * FROM edge",
             "SELECT * FROM runtime",
-            "SELECT * FROM node_output",
-            "SELECT * FROM node_trigger",
         ]);
 
     conn.run_threaded();
@@ -259,21 +221,6 @@ pub fn runtime_count(conn: &DbConnection) -> usize {
     conn.db.runtime().count() as usize
 }
 
-/// Every pending press as `(node_id, count)`.
-///
-/// A runtime reads this once the snapshot is applied instead of trusting the
-/// order of row callbacks: the SDK delivers `on_applied` and the per-row
-/// callbacks in an order that is not specified, so "was this row here before I
-/// arrived" has to be answered from state, not from event sequence. Getting it
-/// wrong means every runtime restart re-presses every button in the graph.
-pub fn pending_triggers(conn: &DbConnection) -> Vec<(u64, u64)> {
-    conn.db
-        .node_trigger()
-        .iter()
-        .map(|t| (t.node_id, t.count))
-        .collect()
-}
-
 /// The pinned URL the executing runtime is reachable at. `None` while no
 /// runtime is connected or the owning one serves nothing.
 ///
@@ -290,19 +237,6 @@ pub fn send_announce_endpoint(conn: &DbConnection, addr: &str) {
     if let Err(e) = conn.reducers.announce_endpoint(addr.to_string()) {
         eprintln!("[stdb] announce_endpoint failed: {e}");
     }
-}
-
-/// Every published output as `(node_id, pin, type tag, text)`.
-///
-/// A viewer rebuilds a node's whole output set from this, because absence is
-/// meaningful: a pin with no row produced no value, which is what the editor
-/// draws dimmed.
-pub fn published_outputs(conn: &DbConnection) -> Vec<(u64, String, String, String)> {
-    conn.db
-        .node_output()
-        .iter()
-        .map(|o| (o.node_id, o.pin, o.ty, o.value))
-        .collect()
 }
 
 // --- Send side: local edits -> reducers. Errors are logged, not fatal. -------
@@ -338,23 +272,6 @@ pub fn send_delete_node(conn: &DbConnection, id: u64) {
     }
 }
 
-/// Publishes one scalar output. The module drops it unless this client owns
-/// execution, so a viewer calling this is harmless.
-pub fn send_publish_output(conn: &DbConnection, node_id: u64, pin: &str, ty: &str, value: &str) {
-    if let Err(e) = conn
-        .reducers
-        .publish_output(node_id, pin.to_string(), ty.to_string(), value.to_string())
-    {
-        eprintln!("[stdb] publish_output failed: {e}");
-    }
-}
-
-pub fn send_clear_node_outputs(conn: &DbConnection, node_id: u64) {
-    if let Err(e) = conn.reducers.clear_node_outputs(node_id) {
-        eprintln!("[stdb] clear_node_outputs failed: {e}");
-    }
-}
-
 pub fn send_connect_edge(conn: &DbConnection, e: &EdgeData) {
     if let Err(err) = conn.reducers.connect_edge(
         e.id,
@@ -370,16 +287,5 @@ pub fn send_connect_edge(conn: &DbConnection, e: &EdgeData) {
 pub fn send_disconnect_edge(conn: &DbConnection, id: u64) {
     if let Err(e) = conn.reducers.disconnect_edge(id) {
         eprintln!("[stdb] disconnect_edge failed: {e}");
-    }
-}
-
-/// Asks the executing runtime to fire a node once (the manual trigger button).
-///
-/// The editor does not execute, so a press has to travel: this bumps a counter
-/// the runtime watches, which is why a press survives a reconnect instead of
-/// vanishing with the window that made it.
-pub fn send_trigger_node(conn: &DbConnection, node_id: u64) {
-    if let Err(e) = conn.reducers.trigger_node(node_id) {
-        eprintln!("[stdb] trigger_node failed: {e}");
     }
 }

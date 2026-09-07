@@ -5,11 +5,12 @@
 //! changes via subscriptions. Node parameters are stored as a JSON string to
 //! avoid nested tables in this first iteration.
 //!
-//! Beyond the graph itself, the store decides WHO runs it. Every connected
-//! editor registers in `runtime`; the one with the lowest `seq` owns execution
-//! and publishes its scalar results into `node_output`, which the others
-//! display. Without that, each window ran the graph for itself -- two windows
-//! meant two screenshots from one capture node, each seeing its own.
+//! Beyond the graph itself, the store decides WHO runs it and WHERE that
+//! runtime is reachable: every runner registers in `runtime`, the one with the
+//! lowest `seq` owns execution, and its row carries the pinned URL editors
+//! dial. What a pass produces does not travel through here at all -- values,
+//! edge traffic, frames and trigger presses go over weida, straight between
+//! the process that computed them and the windows that draw them.
 //!
 //! Built for the wasm32 module target with `spacetime build` (this crate is
 //! excluded from the native workspace build).
@@ -39,23 +40,6 @@ pub struct Runtime {
     pub addr: String,
 }
 
-/// One output pin's last published value, owned by the executing runtime.
-///
-/// Only scalars travel: the key is `"<node_id>:<pin>"` because a table takes a
-/// single primary key, and the value is text tagged with its type so a viewer
-/// can rebuild the value without guessing. Frames and other opaque payloads are
-/// deliberately absent -- a 4K frame is 33 MB and a state store is the wrong
-/// pipe for it; they travel over the sample feed instead.
-#[table(accessor = node_output, name = "node_output", public)]
-pub struct NodeOutput {
-    #[primary_key]
-    pub key: String,
-    pub node_id: u64,
-    pub pin: String,
-    pub ty: String,
-    pub value: String,
-}
-
 /// A graph node: position, type, display name, and serialized parameters.
 #[table(accessor = node, name = "node", public)]
 pub struct Node {
@@ -67,20 +51,6 @@ pub struct Node {
     pub y: f32,
     /// JSON-encoded parameter list (name -> value), mirroring NodeData::params.
     pub params: String,
-}
-
-/// A pending "fire this node once" request, raised by an editor and consumed by
-/// the executing runtime.
-///
-/// A counter rather than a queue: the editor bumps it, the runtime notices the
-/// change and fires once. A press cannot be lost by a reconnect (the row
-/// survives) and cannot be double-fired by a re-subscription (the count the
-/// runtime already handled is the count it compares against).
-#[table(accessor = node_trigger, name = "node_trigger", public)]
-pub struct NodeTrigger {
-    #[primary_key]
-    pub node_id: u64,
-    pub count: u64,
 }
 
 /// A directed edge between two node pins.
@@ -145,22 +115,6 @@ pub fn delete_node(ctx: &ReducerContext, id: u64) {
     for eid in dangling {
         ctx.db.edge().id().delete(eid);
     }
-    // Published outputs die with their node, exactly like its edges: a value
-    // whose producer is gone would otherwise sit in the store forever and be
-    // adopted by every viewer that joins later.
-    let orphaned: Vec<String> = ctx
-        .db
-        .node_output()
-        .iter()
-        .filter(|o| o.node_id == id)
-        .map(|o| o.key)
-        .collect();
-    for key in orphaned {
-        ctx.db.node_output().key().delete(&key);
-    }
-    // The press counter goes with it. Node ids are never reused, so a surviving
-    // row could only be read as a press for a node that no longer exists.
-    ctx.db.node_trigger().node_id().delete(id);
 }
 
 #[reducer]
@@ -240,88 +194,11 @@ pub fn announce_endpoint(ctx: &ReducerContext, addr: String) {
     }
 }
 
-/// Asks the executing runtime to fire a node once. Callable by any editor: it
-/// is a request, not a result, and the runtime decides what to do with it.
-#[reducer]
-pub fn trigger_node(ctx: &ReducerContext, node_id: u64) {
-    let count = ctx
-        .db
-        .node_trigger()
-        .node_id()
-        .find(node_id)
-        .map_or(1, |t| t.count + 1);
-    let row = NodeTrigger { node_id, count };
-    if count == 1 {
-        ctx.db.node_trigger().insert(row);
-    } else {
-        ctx.db.node_trigger().node_id().update(row);
-    }
-}
-
 /// Drops a runtime when its editor disconnects, which is what hands ownership
-/// to the next one. Published outputs stay: they are the last known values of
-/// the graph, and the new owner overwrites them as it runs.
+/// to the next one. Nothing else has to be cleaned up: values live in the
+/// runner that computed them, so they leave with it.
 #[reducer(client_disconnected)]
 pub fn on_client_disconnected(ctx: &ReducerContext) {
     ctx.db.runtime().identity().delete(ctx.sender());
 }
 
-/// Publishes one output pin's value. Ignored unless the caller is the owning
-/// runtime, so a viewer cannot overwrite what it is only supposed to display.
-#[reducer]
-pub fn publish_output(
-    ctx: &ReducerContext,
-    node_id: u64,
-    pin: String,
-    ty: String,
-    value: String,
-) {
-    if !is_owner(ctx, ctx.sender()) {
-        return;
-    }
-    let key = output_key(node_id, &pin);
-    let row = NodeOutput {
-        key: key.clone(),
-        node_id,
-        pin,
-        ty,
-        value,
-    };
-    if ctx.db.node_output().key().find(&key).is_some() {
-        ctx.db.node_output().key().update(row);
-    } else {
-        ctx.db.node_output().insert(row);
-    }
-}
-
-/// Drops every published output of a node. The owner calls this when a node
-/// stops producing a value, so a stale number cannot outlive its source.
-#[reducer]
-pub fn clear_node_outputs(ctx: &ReducerContext, node_id: u64) {
-    if !is_owner(ctx, ctx.sender()) {
-        return;
-    }
-    let keys: Vec<String> = ctx
-        .db
-        .node_output()
-        .iter()
-        .filter(|o| o.node_id == node_id)
-        .map(|o| o.key)
-        .collect();
-    for key in keys {
-        ctx.db.node_output().key().delete(&key);
-    }
-}
-
-/// The owning runtime is the one with the lowest `seq`.
-fn is_owner(ctx: &ReducerContext, who: Identity) -> bool {
-    ctx.db
-        .runtime()
-        .iter()
-        .min_by_key(|r| r.seq)
-        .is_some_and(|r| r.identity == who)
-}
-
-fn output_key(node_id: u64, pin: &str) -> String {
-    format!("{node_id}:{pin}")
-}

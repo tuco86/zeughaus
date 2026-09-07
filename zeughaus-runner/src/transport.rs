@@ -14,8 +14,14 @@
 //! store later on.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
-use weida::{Binding, EndpointAddr, Identity, Listener, Runtime, RuntimeConfig};
+use weida::{
+    Binding, EndpointAddr, Identity, Listener, Puller, Replier, Runtime, RuntimeConfig,
+    TransferMeta,
+};
+use zeughaus_samples::{MAX_TRIGGER_BYTES, Snapshot, TriggerRequest};
 
 /// A bound weida listener and the pinned URL that reaches it.
 pub struct Transport {
@@ -98,6 +104,76 @@ fn announced_host(bind: SocketAddr) -> String {
     match bind.ip() {
         ip if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST).to_string(),
         ip => ip.to_string(),
+    }
+}
+
+/// Takes trigger presses until the puller goes away, which for this process
+/// means never: it owns the puller for the life of the program.
+///
+/// Push/Pull rather than Req/Rep because a press has no answer: the editor
+/// learns that it worked by seeing the value change, and waiting for a reply
+/// would only add a round trip to a button.
+pub async fn accept_triggers(puller: Puller, tx: Sender<u64>) {
+    loop {
+        let transfer = match puller.recv().await {
+            Ok(transfer) => transfer,
+            Err(e) => {
+                eprintln!("[runner] stopped taking triggers: {e}");
+                return;
+            }
+        };
+        let payload = match transfer.collect(MAX_TRIGGER_BYTES).await {
+            Ok(payload) => payload,
+            Err(e) => {
+                eprintln!("[runner] unreadable trigger: {e}");
+                continue;
+            }
+        };
+        let Some(request) = TriggerRequest::decode(&payload) else {
+            eprintln!("[runner] refused a malformed trigger ({} bytes)", payload.len());
+            continue;
+        };
+        // The receiver is the event loop; it outlives this task, so a send
+        // error means the process is going down.
+        if tx.send(request.node_id).is_err() {
+            return;
+        }
+    }
+}
+
+/// Answers snapshot requests with the current output set.
+///
+/// The request body carries nothing -- there is one snapshot and it is the
+/// whole of it -- so it is dropped unread, which refuses whatever a peer sent
+/// instead of buffering it.
+pub async fn serve_snapshots(replier: Replier, snapshot: Arc<Mutex<Snapshot>>) {
+    loop {
+        let mut request = match replier.accept().await {
+            Ok(request) => request,
+            Err(e) => {
+                eprintln!("[runner] stopped serving snapshots: {e}");
+                return;
+            }
+        };
+        drop(request.take_body());
+        let encoded = snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .encode();
+        let mut reply = match request.reply(TransferMeta::default()).await {
+            Ok(reply) => reply,
+            Err(e) => {
+                eprintln!("[runner] cannot reply to a snapshot request: {e}");
+                continue;
+            }
+        };
+        if let Err(e) = reply.write_all(&encoded).await {
+            eprintln!("[runner] cannot write a snapshot: {e}");
+            continue;
+        }
+        if let Err(e) = reply.finish() {
+            eprintln!("[runner] cannot finish a snapshot: {e}");
+        }
     }
 }
 

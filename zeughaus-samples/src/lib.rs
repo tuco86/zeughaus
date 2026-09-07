@@ -1,11 +1,16 @@
-//! The sample feed: how a scaled video signal leaves the runtime and reaches a
-//! viewer.
+//! The weida wire format: how a runtime's samples and its runtime events reach
+//! an editor.
 //!
-//! Graph state travels through SpacetimeDB, but a frame does not: a 3840x2160
-//! RGBA frame is 33 MB, and a state store is the wrong pipe for it. Frames
-//! travel over their own connection instead, and this crate is the wire format
-//! both ends speak -- pure data and pure pixel math, no I/O, so the runtime's
-//! server and the editor's client cannot disagree about the protocol.
+//! Graph state travels through SpacetimeDB, but nothing a pass produces does: a
+//! 3840x2160 RGBA frame is 33 MB, and a value that changes at frame rate is not
+//! what a state store is for. Both travel over the runtime's own QUIC
+//! connection instead, and this crate is the wire format both ends speak --
+//! pure data and pure pixel math, no I/O, so the runtime's server and the
+//! editor's client cannot disagree about the protocol.
+//!
+//! [`FeedRequest`] and [`FrameHeader`] are the sample feed; [`events`] is the
+//! runtime's report of a pass (outputs, edge traffic, snapshots) and the
+//! trigger presses travelling the other way.
 //!
 //! # Shape
 //!
@@ -30,8 +35,15 @@
 //! Sizes snap to a [`ladder`] of tiers so two viewers of similar size share one
 //! scaled result instead of each paying for their own.
 
+pub mod events;
+
 use serde::{Deserialize, Serialize};
 use zeughaus_core::Image;
+
+pub use events::{
+    MAX_EVENT_BYTES, MAX_SNAPSHOT_BYTES, MAX_TRIGGER_BYTES, OutputRow, RuntimeEvent, Snapshot,
+    TOPIC_EDGE, TOPIC_OUTPUT, TriggerRequest,
+};
 
 /// The endpoint a viewer dials for frames. Opaque to weida and matched
 /// exactly, so it is the same string on both sides or nothing works.

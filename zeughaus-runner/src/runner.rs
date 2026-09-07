@@ -11,14 +11,16 @@
 //! rather than mirrored beside it.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use zeughaus_core::{
     DomainPlugin, EdgeData, EdgeId, EdgeSemantic, Image, NodeConfig, NodeData, NodeId,
     PinDirection, Ty, TypeConverters, Value, encode_scalar,
 };
+use weida::Publisher;
 use zeughaus_runtime::{DeferredWork, Graph, GraphEdge, GraphExecutor, GraphNode};
+use zeughaus_samples::{OutputRow, RuntimeEvent, Snapshot, TOPIC_EDGE, TOPIC_OUTPUT};
 use zeughaus_sync::SyncEvent;
 use zeughaus_sync::module_bindings::DbConnection;
 
@@ -45,7 +47,19 @@ pub struct Runner {
     /// pass so an unchanged value costs no reducer call -- a capture graph runs
     /// at frame rate and would otherwise flood the store.
     published: HashMap<NodeId, HashMap<String, (String, String)>>,
-    triggers: TriggerLog,
+    /// Where runtime events go. `None` when the transport failed to start:
+    /// publishing then does nothing, the same degradation as having no feed.
+    publisher: Option<Publisher>,
+    /// Stamped on every event and on the snapshot, so an editor can tell a
+    /// message it already applied from a newer one. Pub/Sub messages travel on
+    /// separate QUIC streams and may reorder.
+    seq: u64,
+    /// The current output set, served to editors that join late. Shared with
+    /// the task answering `/snapshot`.
+    snapshot: Arc<Mutex<Snapshot>>,
+    /// The last publish failure written to the log, so a broken publisher
+    /// reports once instead of once per event.
+    logged_publish: Option<String>,
     /// Edges that named a node this process did not have yet. See
     /// [`Runner::apply_edge_insert`] for why they cannot be dropped.
     pending_edges: Vec<EdgeData>,
@@ -72,7 +86,12 @@ pub struct Runner {
 }
 
 impl Runner {
-    pub fn new(conn: DbConnection, frames: Arc<FrameRegistry>) -> Self {
+    pub fn new(
+        conn: DbConnection,
+        frames: Arc<FrameRegistry>,
+        publisher: Option<Publisher>,
+        snapshot: Arc<Mutex<Snapshot>>,
+    ) -> Self {
         // The same plugin set the native editor registers. Both sides must agree
         // on what exists and what may connect: the editor validates a drag
         // against these converters, this process coerces the value that then
@@ -107,7 +126,10 @@ impl Runner {
             is_owner: false,
             logged_role: None,
             published: HashMap::new(),
-            triggers: TriggerLog::default(),
+            publisher,
+            seq: 0,
+            snapshot,
+            logged_publish: None,
             pending_edges: Vec::new(),
             due: HashMap::new(),
             logged_errors: HashMap::new(),
@@ -154,6 +176,11 @@ impl Runner {
             // Another runtime is producing the real ones now, so its viewers
             // have to be sent away rather than shown a still picture.
             self.frames.clear();
+            // Nothing this process published is current any more, and the
+            // snapshot it serves must not answer with values it no longer
+            // produces.
+            self.published.clear();
+            *self.snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Snapshot::default();
             return;
         }
         // Ownership was just inherited, so this process has never run this
@@ -161,12 +188,10 @@ impl Runner {
         for id in self.executor.graph.node_ids().collect::<Vec<_>>() {
             self.executor.mark_dirty(id);
         }
-        // The rows the previous owner left are what every viewer is showing
-        // right now, so they are the baseline this runner's first pass is
-        // diffed against. Starting from nothing instead would leave a value
-        // this process does not produce sitting in the store forever: the diff
-        // would have no record of the pin, so nothing would ever clear it.
-        self.published = store_outputs(&self.conn);
+        // Nothing was published by this process, so its first pass republishes
+        // everything. Values do not live in the store any more, so there is no
+        // predecessor's row left behind to diff against and nothing to clear.
+        self.published.clear();
     }
 
     pub fn apply(&mut self, event: SyncEvent) {
@@ -177,27 +202,10 @@ impl Runner {
             SyncEvent::EdgeRemove(id) => self.apply_edge_remove(EdgeId(id)),
             // Ownership is read from the client cache, not from the event.
             SyncEvent::RuntimesChanged => {}
-            // This process is the producer of those rows; it has no use for
-            // them, and adopting its own publications would overwrite freshly
-            // computed values with their echo.
-            SyncEvent::OutputsChanged => {}
-            // A press only counts if it happened while this process was alive.
-            // The rows the snapshot already held are adopted below, so the same
-            // event arriving here compares equal and fires nothing.
-            SyncEvent::TriggerRequested { node_id, count } => {
-                self.triggers.request(node_id, count)
-            }
-            // The snapshot's presses belong to whichever runtime was alive when
-            // they were made. Read from the cache rather than inferred from
-            // event order: the SDK does not specify whether `on_applied` runs
-            // before or after the row callbacks, and it turned out to run
-            // first -- so a flag flipped here would have adopted nothing and
-            // every restart re-pressed every button.
+            // Values travel over weida now, so nothing in the store reports
+            // them and nothing here has to be adopted.
             SyncEvent::SubscriptionApplied => {
-                for (node_id, count) in zeughaus_sync::pending_triggers(&self.conn) {
-                    self.triggers.adopt(node_id, count);
-                }
-                // The snapshot is also the first look this process gets at its
+                // The subscription is the first look this process gets at its
                 // own `runtime` row, and a reconnect recreates that row without
                 // the endpoint. Re-announcing here is what keeps an editor from
                 // resolving an owning runtime with an empty address.
@@ -206,15 +214,14 @@ impl Runner {
         }
     }
 
-    /// Runs one pass: fire pending presses, execute the dirty nodes, publish
-    /// what changed. Returns the work that has to run off-thread.
+    /// Runs one pass: execute the dirty nodes and publish what changed.
+    /// Returns the work that has to run off-thread.
     ///
     /// A standby does nothing at all. Executing "just the cheap nodes" would
     /// double-run every side effect in the graph, which is the split brain the
     /// single-owner rule exists to remove.
     pub fn pass(&mut self) -> DeferredWork {
         self.resolve_pending_edges();
-        self.fire_pending_triggers();
         // Logged for a standby too: it tracks the graph so a takeover is
         // immediate, and a silent process is impossible to tell from a stuck one.
         self.log_size();
@@ -306,31 +313,67 @@ impl Runner {
     fn after_pass(&mut self) {
         self.log_errors();
         self.publish();
+        // Traffic, after the values it carried: an editor that draws a particle
+        // has to have the value the particle stands for.
+        let delivered = self.executor.take_delivered();
+        if self.is_owner {
+            let mut seen = HashSet::new();
+            for edge in delivered {
+                // Two writes to one edge in one pass are two messages, but one
+                // particle is all a viewer can see of them.
+                if !seen.insert(edge) {
+                    continue;
+                }
+                let seq = self.next_seq();
+                self.emit(
+                    TOPIC_EDGE,
+                    RuntimeEvent::Edge {
+                        seq,
+                        edge_id: edge.0,
+                    },
+                );
+            }
+        }
         self.refresh_frames();
     }
 
-    /// Fires every press that has not been handled yet.
+    /// Fires one node once, on an editor's request.
     ///
-    /// A standby marks them handled without firing: the owner is firing them
-    /// right now, and a later takeover must not replay a press that already
-    /// ran. A press for a node this process does not have stays unhandled --
-    /// the node row may simply not have arrived yet, and the next batch (the one
-    /// carrying it) fires it.
-    fn fire_pending_triggers(&mut self) {
-        let due: Vec<u64> = self
-            .triggers
-            .pending()
-            .filter(|id| self.executor.graph.node(NodeId(*id)).is_some())
-            .collect();
-        for raw in due {
-            self.triggers.mark_handled(raw);
-            if !self.is_owner {
-                continue;
+    /// Returns whether the graph changed, so the host loop knows to run a pass.
+    /// A standby ignores the request: the owner received the same push and is
+    /// firing it, and a press this process replayed after a takeover would fire
+    /// twice.
+    pub fn trigger(&mut self, node_id: u64) -> bool {
+        let id = NodeId(node_id);
+        if !self.is_owner || self.executor.graph.node(id).is_none() {
+            eprintln!("[runner] ignoring trigger for {id}");
+            return false;
+        }
+        eprintln!("[runner] firing {id}");
+        // The press itself is the signal; the value only has to arrive.
+        let _ = self.executor.set_parameter(id, "fire", Value::new(true));
+        true
+    }
+
+    /// The sequence number of the next event this process sends.
+    fn next_seq(&mut self) -> u64 {
+        self.seq += 1;
+        self.seq
+    }
+
+    /// Publishes one event on `topic`. A failure is reported once per distinct
+    /// message: a broken publisher fails on every event, and a log line per
+    /// event would bury everything else.
+    fn emit(&mut self, topic: &str, event: RuntimeEvent) {
+        let Some(publisher) = &self.publisher else {
+            return;
+        };
+        if let Err(e) = publisher.publish(topic, event.encode()) {
+            let text = e.to_string();
+            if self.logged_publish.as_deref() != Some(text.as_str()) {
+                eprintln!("[runner] cannot publish on {topic}: {text}");
+                self.logged_publish = Some(text);
             }
-            let id = NodeId(raw);
-            eprintln!("[runner] firing {id}");
-            // The press itself is the signal; the value only has to arrive.
-            let _ = self.executor.set_parameter(id, "fire", Value::new(true));
         }
     }
 
@@ -383,7 +426,6 @@ impl Runner {
     fn apply_node_remove(&mut self, id: NodeId) {
         self.executor.remove_node(id);
         self.published.remove(&id);
-        self.triggers.forget(id.0);
         self.logged_errors.remove(&id);
         self.unknown_types.remove(&id.0);
     }
@@ -467,14 +509,18 @@ impl Runner {
 
     /// Publishes this pass's scalar outputs so editors can display them.
     ///
-    /// Only what changed is sent. A pin that lost its value forces a clear of
-    /// that node's rows before the remaining pins are re-published, because
-    /// absence is a state a viewer has to be able to reach -- otherwise a stale
-    /// number would outlive the run that produced it.
+    /// Only what changed is sent: a capture graph runs at frame rate and an
+    /// unchanged value costs nothing. A pin that lost its value is reported as
+    /// cleared, because absence is a state a viewer has to be able to reach --
+    /// otherwise a stale number would outlive the run that produced it.
+    ///
+    /// The snapshot is rebuilt whenever anything was emitted, so an editor that
+    /// joins between two passes sees the same set the live events describe.
     fn publish(&mut self) {
         if !self.is_owner {
             return;
         }
+        let mut emitted = false;
         for id in self.executor.graph.node_ids().collect::<Vec<_>>() {
             let Some(node) = self.executor.graph.node(id) else {
                 continue;
@@ -493,21 +539,73 @@ impl Runner {
             if previous == Some(&current) {
                 continue;
             }
-            let dropped =
-                previous.is_some_and(|prev| prev.keys().any(|pin| !current.contains_key(pin)));
-            if dropped {
-                zeughaus_sync::send_clear_node_outputs(&self.conn, id.0);
+            // Collected while `previous` is borrowed, emitted after: the diff
+            // reads `published` and emitting takes the publisher mutably.
+            let mut events: Vec<(String, Option<(String, String)>)> = Vec::new();
+            if let Some(prev) = previous {
+                for pin in prev.keys() {
+                    if !current.contains_key(pin) {
+                        events.push((pin.clone(), None));
+                    }
+                }
             }
             for (pin, (ty, text)) in &current {
-                let unchanged = !dropped
-                    && previous.and_then(|prev| prev.get(pin)) == Some(&(ty.clone(), text.clone()));
+                let unchanged = previous
+                    .and_then(|prev| prev.get(pin))
+                    .is_some_and(|(was_ty, was_text)| was_ty == ty && was_text == text);
                 if unchanged {
                     continue;
                 }
-                zeughaus_sync::send_publish_output(&self.conn, id.0, pin, ty, text);
+                events.push((pin.clone(), Some((ty.clone(), text.clone()))));
             }
             self.published.insert(id, current);
+            for (pin, value) in events {
+                let seq = self.next_seq();
+                let event = match value {
+                    Some((ty, value)) => RuntimeEvent::Output {
+                        seq,
+                        node_id: id.0,
+                        pin,
+                        ty,
+                        value,
+                    },
+                    None => RuntimeEvent::OutputCleared {
+                        seq,
+                        node_id: id.0,
+                        pin,
+                    },
+                };
+                self.emit(TOPIC_OUTPUT, event);
+                emitted = true;
+            }
         }
+        if emitted {
+            self.rebuild_snapshot();
+        }
+    }
+
+    /// Restates the whole output set for editors that join later.
+    ///
+    /// Rebuilt rather than patched: the snapshot has to be exactly what the
+    /// diff baseline says, or a late editor would inherit a value the live
+    /// events already cleared.
+    fn rebuild_snapshot(&mut self) {
+        let outputs: Vec<OutputRow> = self
+            .published
+            .iter()
+            .flat_map(|(id, pins)| {
+                pins.iter().map(move |(pin, (ty, value))| OutputRow {
+                    node_id: id.0,
+                    pin: pin.clone(),
+                    ty: ty.clone(),
+                    value: value.clone(),
+                })
+            })
+            .collect();
+        *self.snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Snapshot {
+            seq: self.seq,
+            outputs,
+        };
     }
 
     /// Records the pinned URL this process serves on and announces it.
@@ -620,150 +718,9 @@ fn param_value(type_id: &str, text: &str) -> Option<Value> {
     }
 }
 
-/// The published outputs currently in the store, in the shape
-/// [`Runner::published`] diffs against.
-fn store_outputs(conn: &DbConnection) -> HashMap<NodeId, HashMap<String, (String, String)>> {
-    let mut per_node: HashMap<NodeId, HashMap<String, (String, String)>> = HashMap::new();
-    for (node_id, pin, ty, value) in zeughaus_sync::published_outputs(conn) {
-        per_node
-            .entry(NodeId(node_id))
-            .or_default()
-            .insert(pin, (ty, value));
-    }
-    per_node
-}
-
-/// Which manual-trigger count has been requested and which has been handled,
-/// per node.
-///
-/// The store keeps one row per node holding a monotonic press count, and a
-/// re-subscription replays that row. Firing on every event would turn one press
-/// into one press per reconnect, so the count that was handled is what a new
-/// event is compared against. Requests are kept apart from the fired ones
-/// because a press can arrive before the node it names.
-#[derive(Default)]
-pub struct TriggerLog {
-    requested: HashMap<u64, u64>,
-    handled: HashMap<u64, u64>,
-}
-
-impl TriggerLog {
-    /// Records a press. The count only ever moves forward: an out-of-order
-    /// replay of an older row must not undo a newer press.
-    pub fn request(&mut self, node_id: u64, count: u64) {
-        let slot = self.requested.entry(node_id).or_insert(count);
-        *slot = (*slot).max(count);
-    }
-
-    /// Records a press as already handled, without firing it. Used for the rows
-    /// the store already held when this process connected.
-    pub fn adopt(&mut self, node_id: u64, count: u64) {
-        self.request(node_id, count);
-        self.mark_handled(node_id);
-    }
-
-    /// Nodes with a press that has not been handled yet.
-    pub fn pending(&self) -> impl Iterator<Item = u64> + '_ {
-        self.requested
-            .iter()
-            .filter(|(node_id, count)| self.handled.get(node_id) < Some(count))
-            .map(|(node_id, _)| *node_id)
-    }
-
-    /// Marks the node's outstanding press as handled.
-    pub fn mark_handled(&mut self, node_id: u64) {
-        if let Some(count) = self.requested.get(&node_id) {
-            self.handled.insert(node_id, *count);
-        }
-    }
-
-    /// Drops a removed node's history. Node ids are process-unique, so nothing
-    /// can inherit the count.
-    pub fn forget(&mut self, node_id: u64) {
-        self.requested.remove(&node_id);
-        self.handled.remove(&node_id);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn pending(log: &TriggerLog) -> Vec<u64> {
-        let mut ids: Vec<u64> = log.pending().collect();
-        ids.sort_unstable();
-        ids
-    }
-
-    #[test]
-    fn first_press_is_pending() {
-        let mut log = TriggerLog::default();
-        log.request(7, 1);
-        assert_eq!(pending(&log), vec![7]);
-    }
-
-    #[test]
-    fn replayed_row_does_not_refire() {
-        let mut log = TriggerLog::default();
-        log.request(7, 3);
-        log.mark_handled(7);
-        assert!(pending(&log).is_empty());
-
-        // A re-subscription replays the same row.
-        log.request(7, 3);
-        assert!(pending(&log).is_empty());
-    }
-
-    /// A runner that starts into a graph with an old press must not fire it: the
-    /// press was aimed at whichever runtime was alive at the time.
-    #[test]
-    fn adopted_press_never_fires() {
-        let mut log = TriggerLog::default();
-        log.adopt(7, 4);
-        assert!(pending(&log).is_empty());
-
-        // A real press after startup still counts.
-        log.request(7, 5);
-        assert_eq!(pending(&log), vec![7]);
-    }
-
-    #[test]
-    fn later_press_fires_again() {
-        let mut log = TriggerLog::default();
-        log.request(7, 1);
-        log.mark_handled(7);
-        log.request(7, 2);
-        assert_eq!(pending(&log), vec![7]);
-        log.mark_handled(7);
-        assert!(pending(&log).is_empty());
-    }
-
-    #[test]
-    fn stale_replay_after_newer_press_is_ignored() {
-        let mut log = TriggerLog::default();
-        log.request(7, 5);
-        log.mark_handled(7);
-        // An older count arriving late must not resurrect a handled press.
-        log.request(7, 4);
-        assert!(pending(&log).is_empty());
-    }
-
-    #[test]
-    fn presses_are_tracked_per_node() {
-        let mut log = TriggerLog::default();
-        log.request(1, 1);
-        log.request(2, 1);
-        log.mark_handled(1);
-        assert_eq!(pending(&log), vec![2]);
-    }
-
-    #[test]
-    fn forgotten_node_has_no_pending_press() {
-        let mut log = TriggerLog::default();
-        log.request(9, 1);
-        log.forget(9);
-        assert!(pending(&log).is_empty());
-    }
 
     #[test]
     fn const_f64_param_parses_to_float() {

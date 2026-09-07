@@ -18,12 +18,13 @@ mod transport;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::mpsc::{RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use zeughaus_core::{NodeId, Value, ZeughausError};
 use zeughaus_runtime::DeferredWork;
+use zeughaus_samples::{EVENTS_PATH, FEED_PATH, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH};
 use zeughaus_sync::Role;
 
 use crate::feed::FrameRegistry;
@@ -103,23 +104,51 @@ fn main() -> ExitCode {
             eprintln!("[runner] weida endpoint {}", transport.url());
             Some(transport)
         }
-        // Not fatal. The graph still executes and its scalars still reach every
-        // editor through the store; exiting here would take that away too, and
-        // an editor with no endpoint simply draws no video.
+        // Not fatal. The graph still executes; an editor simply sees no values
+        // and says so, exactly as it does with no runner at all. Exiting here
+        // would take the graph's execution away too.
         Err(e) => {
             eprintln!("[runner] no weida endpoint: {e}");
             None
         }
     };
 
-    let mut runner = Runner::new(conn, Arc::clone(&frames));
+    // `Publisher::publish` is synchronous, but every weida handle was created
+    // on this runtime and quinn's driver has to be reachable from the loop
+    // thread. The guard covers the whole loop below.
+    let _enter = rt.enter();
+
+    let snapshot = Arc::new(Mutex::new(Snapshot::default()));
+    let (trigger_tx, trigger_rx) = std::sync::mpsc::channel::<u64>();
+    let mut publisher = None;
     if let Some(transport) = &transport {
-        match transport.listener().replier(zeughaus_samples::FEED_PATH) {
+        let listener = transport.listener();
+        match listener.replier(FEED_PATH) {
             Ok(replier) => {
                 rt.spawn(feed::accept_feeds(replier, Arc::clone(&frames)));
             }
             Err(e) => eprintln!("[runner] no sample feed: {e}"),
         }
+        match listener.publisher(EVENTS_PATH) {
+            Ok(events) => publisher = Some(events),
+            Err(e) => eprintln!("[runner] no event stream: {e}"),
+        }
+        match listener.replier(SNAPSHOT_PATH) {
+            Ok(replier) => {
+                rt.spawn(transport::serve_snapshots(replier, Arc::clone(&snapshot)));
+            }
+            Err(e) => eprintln!("[runner] no snapshot service: {e}"),
+        }
+        match listener.puller(TRIGGERS_PATH) {
+            Ok(puller) => {
+                rt.spawn(transport::accept_triggers(puller, trigger_tx));
+            }
+            Err(e) => eprintln!("[runner] no trigger intake: {e}"),
+        }
+    }
+
+    let mut runner = Runner::new(conn, Arc::clone(&frames), publisher, Arc::clone(&snapshot));
+    if let Some(transport) = &transport {
         runner.set_endpoint(transport.url().to_string());
     }
     let (async_tx, async_rx) = std::sync::mpsc::channel::<(NodeId, AsyncResult)>();
@@ -152,6 +181,12 @@ fn main() -> ExitCode {
             results.push(result);
         }
 
+        // A press is a request from an editor, so it is drained like any other
+        // input to the pass. Latency is bounded by TICK, the same as an async
+        // result.
+        let mut fired = false;
+        let presses: Vec<u64> = std::iter::from_fn(|| trigger_rx.try_recv().ok()).collect();
+
         // Before anything is applied or published: a pass must not run on an
         // ownership this process no longer has.
         runner.refresh_ownership();
@@ -166,7 +201,11 @@ fn main() -> ExitCode {
             dispatch(&rt, &async_tx, deferred);
         }
 
-        if !events.is_empty() || ticked {
+        for node_id in presses {
+            fired |= runner.trigger(node_id);
+        }
+
+        if !events.is_empty() || ticked || fired {
             for event in events {
                 runner.apply(event);
             }
