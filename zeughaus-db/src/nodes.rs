@@ -26,6 +26,25 @@ fn text_of(value: &Value) -> Option<String> {
     }
 }
 
+/// The columns a table has in the file, as `(name, declared type)` in file
+/// order.
+///
+/// The file is the authority on a schema, not the node: what the node declares
+/// is what the user wants, and the difference between the two is the migration.
+fn table_columns(conn: &rusqlite::Connection, table: &str) -> Result<Vec<(String, String)>> {
+    let sql = format!("PRAGMA table_info({})", quote(table));
+    let mut statement = conn
+        .prepare(&sql)
+        .map_err(|e| failed(format!("{sql}: {e}")))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })
+        .map_err(|e| failed(format!("{sql}: {e}")))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| failed(format!("{sql}: {e}")))
+}
+
 /// The database itself: a container whose `path` names the file.
 ///
 /// It executes nothing. What it contributes is the path its children inherit
@@ -86,9 +105,10 @@ impl ExecutableNode for DatabaseNode {
 /// rather than a value on an input. See the crate docs for which end of such
 /// a wire is the referenced one.
 ///
-/// Creating is the execution. Schema evolution is deliberately manual -- an
-/// existing table with different columns is an error, not a silent migration,
-/// because guessing which `ALTER` the user meant is how data gets lost.
+/// Creating is the execution, and so is following the schema afterwards: a
+/// field the file does not have yet is added, and a field renamed in the graph
+/// is renamed in the file. What stays refused is what SQLite cannot do in
+/// place -- dropping a column or changing its type.
 pub struct TableNode {
     db_path: String,
     name: String,
@@ -96,6 +116,13 @@ pub struct TableNode {
     /// The relations this table's fields declare, as the editor derived them
     /// from the wires: one `field -> table.field` per line.
     relations: String,
+    /// A field renamed since the last pass, as `(old, new)`, waiting to be
+    /// applied to the file.
+    ///
+    /// Held rather than applied at once because `set_parameter` has no
+    /// database: the file is only opened during `execute`, where the path is
+    /// known to be resolved and an error has somewhere to go.
+    pending_rename: Option<(String, String)>,
     pins: Vec<PinDefinition>,
 }
 
@@ -115,6 +142,7 @@ impl TableNode {
             name: Self::DEFAULT_NAME.to_string(),
             columns: Self::DEFAULT_COLUMNS.to_string(),
             relations: String::new(),
+            pending_rename: None,
             pins: Vec::new(),
         };
         node.rebuild_pins();
@@ -209,24 +237,35 @@ impl ExecutableNode for TableNode {
         conn.execute_batch(&ddl)
             .map_err(|e| failed(format!("{ddl}: {e}")))?;
 
+        // A field renamed in the graph is renamed in the file, before the
+        // schemas are compared -- otherwise the same edit would read as a
+        // column dropped and another added, and be refused. Guarded on what
+        // the file actually has: the rename is applied once, and a node that
+        // reruns (or a second runner that never saw the edit) finds nothing to
+        // do rather than an error.
+        if let Some((old, new)) = self.pending_rename.take() {
+            let has = |column: &str, columns: &[(String, String)]| {
+                columns.iter().any(|(name, _)| name == column)
+            };
+            let before = table_columns(&conn, &self.name)?;
+            if has(&old, &before) && !has(&new, &before) {
+                let sql = format!(
+                    "ALTER TABLE {} RENAME COLUMN {} TO {}",
+                    quote(&self.name),
+                    quote(&old),
+                    quote(&new)
+                );
+                conn.execute_batch(&sql)
+                    .map_err(|e| failed(format!("{sql}: {e}")))?;
+            }
+        }
+
         // What is in the file decides, not what this node declared. A field
         // the file does not have yet is added; a column the file has and the
         // node does not, or one whose type changed, is refused -- SQLite
         // cannot drop or retype a column in place, and guessing which of the
         // two the user meant is how data gets lost.
-        let existing: Vec<(String, String)> = {
-            let sql = format!("PRAGMA table_info({})", quote(&self.name));
-            let mut statement = conn
-                .prepare(&sql)
-                .map_err(|e| failed(format!("{sql}: {e}")))?;
-            let rows = statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-                })
-                .map_err(|e| failed(format!("{sql}: {e}")))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| failed(format!("{sql}: {e}")))?
-        };
+        let existing = table_columns(&conn, &self.name)?;
 
         let mut refused: Vec<String> = Vec::new();
         for (name, _) in &existing {
@@ -314,7 +353,18 @@ impl ExecutableNode for TableNode {
             // The pins follow the columns, which is why this node has to be
             // asked for them again after a setting changed
             // (`GraphExecutor::refresh_pins`).
+            //
+            // One name changed in place is a rename, and the file is told so
+            // on the next pass. Renames chain: if the last one has not reached
+            // the file yet, the file still holds the first `old`, so the two
+            // collapse into one.
             "columns" => {
+                if let Some((old, new)) = renamed_field(&self.columns, &text) {
+                    self.pending_rename = match self.pending_rename.take() {
+                        Some((first, waiting)) if waiting == old => Some((first, new)),
+                        _ => Some((old, new)),
+                    };
+                }
                 self.columns = text;
                 self.rebuild_pins();
             }
@@ -874,6 +924,52 @@ mod tests {
                 ("tag".to_string(), "TEXT".to_string()),
             ]
         );
+    }
+
+    /// A field renamed in the graph is renamed in the file, with its data.
+    /// Without this the same edit reads as one column dropped and another
+    /// added, which is refused -- so fixing a typo would be a dead end.
+    #[test]
+    fn a_renamed_field_renames_the_column_and_keeps_its_data() {
+        let path = temp_db("rename");
+        let mut node = TableNode::new();
+        set(&mut node, DB_PATH, &path);
+        set(&mut node, "name", "samples");
+        set(&mut node, "columns", "id:int\nx:float");
+        node.execute(&InputSet::new(), &mut ctx()).expect("create");
+        {
+            let conn = open(&path).expect("open");
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute_batch("INSERT INTO \"samples\" (\"x\") VALUES (1.5)")
+                .expect("row");
+        }
+
+        // Two renames before the next pass, as typing produces them: they
+        // collapse, because the file still holds the first name.
+        set(&mut node, "columns", "id:int\ny:float");
+        set(&mut node, "columns", "id:int\nspan:float");
+        node.execute(&InputSet::new(), &mut ctx()).expect("rename");
+        // A second pass has nothing left to rename and must not fail.
+        node.execute(&InputSet::new(), &mut ctx())
+            .expect("idempotent");
+
+        let (columns, value) = {
+            let conn = open(&path).expect("open");
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            let columns = table_columns(&conn, "samples").expect("columns");
+            let value: f64 = conn
+                .query_row("SELECT \"span\" FROM \"samples\"", [], |row| row.get(0))
+                .expect("value");
+            (columns, value)
+        };
+        assert_eq!(
+            columns,
+            vec![
+                ("id".to_string(), "INTEGER".to_string()),
+                ("span".to_string(), "REAL".to_string()),
+            ]
+        );
+        assert_eq!(value, 1.5);
     }
 
     /// A column the node no longer declares, and one whose type changed, are

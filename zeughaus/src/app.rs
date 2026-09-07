@@ -25,7 +25,7 @@ use zeughaus_core::occupancy_winner;
 use zeughaus_core::{
     DomainPlugin, EdgeData, EdgeId, EdgeSemantic, GraphDocument, Image, NodeConfig, NodeData,
     NodeDefinition, NodeId, PinDefinition, PinDirection, PinKind, SettingDef, SettingKind, Ty,
-    TypeConverters, Value,
+    TypeConverters, Value, field_rows, renamed_field,
 };
 use zeughaus_flow::FlowPlugin;
 use zeughaus_graph::GraphPlugin;
@@ -3482,32 +3482,6 @@ fn relation_references_to(from_pin: &str, to_pin: &str) -> bool {
     to_pin == KEY_FIELD || from_pin != KEY_FIELD
 }
 
-/// The single field a field-list edit renamed, as `(old, new)`.
-///
-/// Recognised deliberately narrowly: the same number of rows, exactly one
-/// position whose name changed, and neither name empty. A row added, removed
-/// or reordered, or two names changed at once, is not a rename.
-///
-/// The asymmetry is on purpose. Guessing "rename" where the user removed one
-/// field and added another would move a foreign key onto a field nobody
-/// pointed it at, silently and in the shared store. Guessing "not a rename"
-/// costs a wire that is redrawn in a second.
-fn renamed_field(before: &str, after: &str) -> Option<(String, String)> {
-    let (before, after) = (field_rows(before), field_rows(after));
-    if before.len() != after.len() {
-        return None;
-    }
-    let mut changed = before
-        .iter()
-        .zip(&after)
-        .filter(|((old, _), (new, _))| old != new);
-    let ((old, _), (new, _)) = changed.next()?;
-    if changed.next().is_some() || old.is_empty() || new.is_empty() {
-        return None;
-    }
-    Some((old.to_string(), new.to_string()))
-}
-
 /// A [`SettingKind::Title`] setting: the node's name, editable in place.
 fn title_setting<'a>(
     node: &'a EditorNode,
@@ -3625,21 +3599,6 @@ fn field_setting<'a>(
             .into(),
     );
     items
-}
-
-/// The `name:type` rows of a field-list setting, as slices of its value.
-///
-/// Borrowed rather than owned so a row can be handed straight to a text input,
-/// and lenient rather than validating: a line whose type is half-typed is
-/// still a row the user is editing, and must not vanish under the cursor.
-fn field_rows(text: &str) -> Vec<(&str, &str)> {
-    text.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| match line.split_once(':') {
-            Some((name, ty)) => (name.trim(), ty.trim()),
-            None => (line.trim(), ""),
-        })
-        .collect()
 }
 
 /// The value these rows mean with row `index` replaced by `row`, or removed
@@ -4048,40 +4007,5 @@ mod tests {
         // vanished for a moment while a setting was half-typed must survive.
         assert!(!is_lost_relation(None, Some(&output)));
         assert!(!is_lost_relation(None, None));
-    }
-
-    /// A rename has to be recognised so the field's relations survive it, and
-    /// only recognised when it really is one: mistaking a remove-plus-add for
-    /// a rename moves a foreign key onto a field nobody pointed it at.
-    #[test]
-    fn one_name_changed_in_place_is_a_rename_and_nothing_else_is() {
-        let before = "id:int\ncustomer_id:int\ntotal:float";
-        assert_eq!(
-            renamed_field(before, "id:int\ncust_id:int\ntotal:float"),
-            Some(("customer_id".to_string(), "cust_id".to_string()))
-        );
-
-        // A type change on its own leaves every name where it was.
-        assert_eq!(
-            renamed_field(before, "id:int\ncustomer_id:str\ntotal:float"),
-            None
-        );
-        // Nothing changed.
-        assert_eq!(renamed_field(before, before), None);
-        // A row added or removed: the rows no longer line up.
-        assert_eq!(renamed_field(before, "id:int\ncustomer_id:int"), None);
-        assert_eq!(
-            renamed_field(before, "id:int\ncustomer_id:int\ntotal:float\nnote:str"),
-            None
-        );
-        // Two names at once, and a reorder, are not one rename.
-        assert_eq!(renamed_field(before, "id:int\ncust:int\nsum:float"), None);
-        assert_eq!(
-            renamed_field(before, "customer_id:int\nid:int\ntotal:float"),
-            None
-        );
-        // A name cleared to nothing is a row being retyped, not a rename to
-        // the empty pin.
-        assert_eq!(renamed_field(before, "id:int\n:int\ntotal:float"), None);
     }
 }
