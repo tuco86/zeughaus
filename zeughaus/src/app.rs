@@ -243,8 +243,10 @@ pub struct App {
     // In-node text settings (node_id -> setting name -> current value)
     node_settings: HashMap<NodeId, HashMap<String, String>>,
 
-    // Spawn offset counter (staggers new nodes so they don't overlap)
-    spawn_counter: u32,
+    /// What the window is showing, in logical pixels. Reported on every
+    /// resize; the initial value is the size `main` asks for, because no
+    /// `Resized` event arrives until the window changes.
+    window_size: iced::Size,
 
     // Status bar
     last_error: String,
@@ -451,7 +453,7 @@ impl App {
             pending_edges: Vec::new(),
             const_inputs: HashMap::new(),
             node_settings: HashMap::new(),
-            spawn_counter: 0,
+            window_size: crate::WINDOW_SIZE,
             last_error: String::new(),
             palette_open: false,
             palette_input: String::new(),
@@ -689,12 +691,46 @@ impl App {
         self.refresh_container_pins(parent);
     }
 
+    /// Creates a node of `type_id` in the graph being edited, at `position` if
+    /// nothing is there and stepped clear of what is.
+    ///
+    /// The palette hands out one position for every node it spawns, so without
+    /// this the second node lands exactly on the first: hidden behind it, with
+    /// its header under the other node's body, and the only way to find out is
+    /// to drag the top one away.
     fn spawn_node(&mut self, type_id: &str, position: Point) {
-        // Stagger each new node so they don't pile up
-        let offset = (self.spawn_counter % 10) as f32 * 30.0;
-        self.spawn_counter += 1;
-        let position = Point::new(position.x + offset, position.y + offset);
+        let position = self.clear_spot(position);
         self.spawn_node_into(type_id, position, self.current_graph);
+    }
+
+    /// `position`, or the first spot down-right of it that no node of the
+    /// graph being edited already starts at.
+    ///
+    /// Compares the top-left corners only: a node's drawn size is the widget's
+    /// business and depends on its content, while what makes a new node
+    /// unfindable is another node's header sitting on top of its own.
+    fn clear_spot(&self, position: Point) -> Point {
+        /// One header height plus a little, so a stepped node's title is
+        /// readable next to the one it stepped around.
+        const STEP: f32 = 32.0;
+        /// Closer than this counts as the same spot.
+        const TAKEN: f32 = 24.0;
+
+        let mut spot = position;
+        // Bounded: a graph with a long diagonal of nodes stops stepping rather
+        // than walking the new node off the far edge of the world.
+        for _ in 0..16 {
+            let taken = self.nodes.values().any(|n| {
+                n.parent == self.current_graph
+                    && (n.position.x - spot.x).abs() < TAKEN
+                    && (n.position.y - spot.y).abs() < TAKEN
+            });
+            if !taken {
+                break;
+            }
+            spot = Point::new(spot.x + STEP, spot.y + STEP);
+        }
+        spot
     }
 
     /// Creates a node of `type_id` inside `parent`, seeded with the defaults
@@ -2176,11 +2212,16 @@ impl App {
         self.update_display_values();
     }
 
+    /// The world point in the middle of what this window is showing.
+    ///
+    /// Where the palette puts a node, so it appears where the user is looking.
+    /// The window size is tracked rather than assumed: a fixed 1280x800 guess
+    /// put every new node in the upper-left quadrant of a maximised window,
+    /// far from the middle it was supposed to be at.
     fn viewport_center(&self) -> Point {
-        let screen_center = Point::new(640.0, 400.0);
         Point::new(
-            screen_center.x / self.camera_zoom - self.camera_position.x,
-            screen_center.y / self.camera_zoom - self.camera_position.y,
+            self.window_size.width * 0.5 / self.camera_zoom - self.camera_position.x,
+            self.window_size.height * 0.5 / self.camera_zoom - self.camera_position.y,
         )
     }
 
@@ -2544,6 +2585,10 @@ impl App {
                 // `feed::requested_box`.
                 #[cfg(not(target_arch = "wasm32"))]
                 return self.reconcile_runtime();
+            }
+            Message::WindowResized { size } => {
+                // Only the palette reads it, and only when it spawns a node.
+                self.window_size = size;
             }
             Message::Tick => {
                 // No-op: re-rendering advances the widget's animation clock.
@@ -3012,6 +3057,9 @@ impl App {
 
     pub fn subscription(&self) -> Subscription<Message> {
         let events = iced::event::listen_with(|event, _status, _id| {
+            if let Event::Window(iced::window::Event::Resized(size)) = event {
+                return Some(Message::WindowResized { size });
+            }
             if let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event {
                 if is_toggle_shortcut(&key, modifiers) {
                     return Some(Message::TogglePalette);

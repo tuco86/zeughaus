@@ -127,6 +127,12 @@ pub enum Message {
         node_id: u64,
         size: iced::Size,
     },
+    // The window changed size. Kept because the palette places a new node in
+    // the middle of what the user is looking at, and nothing else in the
+    // editor knows how big that is.
+    WindowResized {
+        size: iced::Size,
+    },
     // Periodic redraw tick while a node is in error, to animate its border. The
     // wasm editor has no timer subscription, so nothing emits it there.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]

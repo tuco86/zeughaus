@@ -20,6 +20,11 @@ pub use zeughaus_sync::module_bindings;
 
 use app::App;
 
+/// The window the editor opens with. Also what [`App`] assumes it is showing
+/// until the first resize, so a node the palette places lands in the middle
+/// of it either way.
+pub(crate) const WINDOW_SIZE: iced::Size = iced::Size::new(1280.0, 800.0);
+
 fn main() -> iced::Result {
     // Surface Rust panics in the browser console on wasm.
     #[cfg(target_arch = "wasm32")]
@@ -45,7 +50,7 @@ fn main() -> iced::Result {
         .title("Zeughaus Editor")
         .theme(|app: &App| app.theme())
         .window(iced::window::Settings {
-            size: iced::Size::new(1280.0, 800.0),
+            size: WINDOW_SIZE,
             position: iced::window::Position::Centered,
             // The close is handled rather than obeyed: a settings edit is held
             // back for 400 ms after the last keystroke, and typing into a
