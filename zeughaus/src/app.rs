@@ -4206,14 +4206,18 @@ fn field_setting<'a>(
             .text_size(12)
             .padding(2.0)
         };
-        let remove =
-            button(text("x").size(11))
-                .padding(2.0)
-                .on_press(Message::NodeSettingChanged {
-                    node_id: node_raw_id,
-                    key: def.name.to_string(),
-                    value: field_edit(&rows, index, None),
-                });
+        // The row's one destructive control, and the one hardest to hit: at
+        // 2 px of padding it was about 10 x 14 physical pixels with the type
+        // list right against it, so a click a pixel too far left opened the
+        // list instead of removing the field. Padding plus the row spacing
+        // below keep the two apart.
+        let remove = button(text("x").size(11))
+            .padding([3.0, 6.0])
+            .on_press(Message::NodeSettingChanged {
+                node_id: node_raw_id,
+                key: def.name.to_string(),
+                value: field_edit(&rows, index, None),
+            });
 
         // The pin the field declares, for its color and shape. A half-typed
         // row has none yet, and drawing it anyway is what keeps the widget
@@ -4237,7 +4241,7 @@ fn field_setting<'a>(
             node_pin(
                 PinSide::Row,
                 PinLabel(Arc::from(name)),
-                row![rename, retype, remove].spacing(2),
+                row![rename, retype, remove].spacing(4),
             )
             .direction(NgPinDirection::Both)
             .info(visual)
