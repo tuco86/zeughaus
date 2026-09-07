@@ -4187,7 +4187,12 @@ fn relation_references_to(from_pin: &str, to_pin: &str) -> bool {
     to_pin == KEY_FIELD || from_pin != KEY_FIELD
 }
 
-/// A [`SettingKind::Title`] setting: the node's name, editable in place.
+/// A [`SettingKind::Title`] setting: what the node is called, editable in
+/// place, under the same small grey label every other text setting carries.
+///
+/// The label is what tells the two names at the top of a `db.table` apart: the
+/// header is the node type ("Table"), this is the table's own name. Without it
+/// the field read as a second, unexplained heading.
 fn title_setting<'a>(
     node: &'a EditorNode,
     def: &'a SettingDef,
@@ -4195,15 +4200,22 @@ fn title_setting<'a>(
 ) -> Element<'a, Message, Theme> {
     let node_raw_id = node.id.0;
     let key = def.name.clone();
-    text_input(&def.placeholder, current)
+    let field = text_input(&def.placeholder, current)
         .on_input(move |v| Message::NodeSettingChanged {
             node_id: node_raw_id,
             key: key.to_string(),
             value: v,
         })
         .size(14)
-        .width(Length::Fill)
-        .into()
+        .width(Length::Fill);
+    column![
+        text(&*def.name)
+            .size(11)
+            .color(Color::from_rgb(0.6, 0.6, 0.6)),
+        field
+    ]
+    .spacing(1)
+    .into()
 }
 
 /// A [`SettingKind::Fields`] setting: one row per field, plus a way to add one.
