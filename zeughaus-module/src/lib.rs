@@ -27,20 +27,16 @@ pub struct Runtime {
     #[unique]
     #[auto_inc]
     pub seq: u64,
-    /// Where viewers reach this runtime's sample feed
-    /// (`weida://host:port/path`), or empty while it serves none. Frames do not
-    /// travel through this store -- 33 MB per frame is not what a state store is
-    /// for -- so the store's job is to say where they DO travel.
+    /// The pinned root URL editors reach this runtime at
+    /// (`weida://sha256:<fp>@host:port/`), or empty while it serves nothing.
+    /// Runtime values do not travel through this store -- the store's job is to
+    /// say WHERE they travel, and the fingerprint in the URL is what makes that
+    /// address trustworthy without distributing a certificate.
     ///
-    /// Defaulted so adding the feed is an automatic migration: an existing
-    /// session must not have to be deleted to gain one.
+    /// Defaulted so gaining the endpoint is an automatic migration: an existing
+    /// session must not have to be deleted for it.
     #[default("")]
-    pub sample_addr: String,
-    /// PEM a viewer must trust to dial `sample_addr`. Self-signed per runtime
-    /// start, which is honest for a LAN and matches the trust this store itself
-    /// is used with.
-    #[default("")]
-    pub sample_cert: String,
+    pub addr: String,
 }
 
 /// One output pin's last published value, owned by the executing runtime.
@@ -226,22 +222,20 @@ pub fn join_runtime(ctx: &ReducerContext) {
     ctx.db.runtime().insert(Runtime {
         identity: ctx.sender(),
         seq: 0, // auto_inc
-        sample_addr: String::new(),
-        sample_cert: String::new(),
+        addr: String::new(),
     });
 }
 
-/// Announces where this runtime serves its sample feed, and what to trust.
+/// Announces where this runtime is reachable, and thereby whom to trust: the
+/// URL pins the runtime's public-key fingerprint.
 ///
-/// Separate from joining because the feed's address is only known once its
-/// listener is bound, and a runtime is useful (scalars still flow) before that
-/// happens. Only the caller's own row is touched, so no runtime can redirect a
-/// viewer to somewhere else.
+/// Separate from joining because the address is only known once the listener is
+/// bound, and a runtime is useful before that happens. Only the caller's own
+/// row is touched, so no runtime can redirect an editor somewhere else.
 #[reducer]
-pub fn announce_feed(ctx: &ReducerContext, addr: String, cert: String) {
+pub fn announce_endpoint(ctx: &ReducerContext, addr: String) {
     if let Some(mut row) = ctx.db.runtime().identity().find(ctx.sender()) {
-        row.sample_addr = addr;
-        row.sample_cert = cert;
+        row.addr = addr;
         ctx.db.runtime().identity().update(row);
     }
 }

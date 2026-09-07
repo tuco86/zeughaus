@@ -33,6 +33,19 @@
 use serde::{Deserialize, Serialize};
 use zeughaus_core::Image;
 
+/// The endpoint a viewer dials for frames. Opaque to weida and matched
+/// exactly, so it is the same string on both sides or nothing works.
+pub const FEED_PATH: &str = "/samples";
+
+/// Pub/Sub endpoint carrying runtime events (outputs and edge traffic).
+pub const EVENTS_PATH: &str = "/events";
+
+/// Req/Rep endpoint a late-joining editor asks for the current output set.
+pub const SNAPSHOT_PATH: &str = "/snapshot";
+
+/// Push/Pull endpoint an editor pushes manual trigger presses to.
+pub const TRIGGERS_PATH: &str = "/triggers";
+
 /// What a viewer asks for: one node's output pin, at the size it will draw.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeedRequest {

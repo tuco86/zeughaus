@@ -9,8 +9,7 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 pub struct Runtime {
     pub identity: __sdk::Identity,
     pub seq: u64,
-    pub sample_addr: String,
-    pub sample_cert: String,
+    pub addr: String,
 }
 
 impl __sdk::InModule for Runtime {
@@ -23,8 +22,7 @@ impl __sdk::InModule for Runtime {
 pub struct RuntimeCols {
     pub identity: __sdk::__query_builder::Col<Runtime, __sdk::Identity>,
     pub seq: __sdk::__query_builder::Col<Runtime, u64>,
-    pub sample_addr: __sdk::__query_builder::Col<Runtime, String>,
-    pub sample_cert: __sdk::__query_builder::Col<Runtime, String>,
+    pub addr: __sdk::__query_builder::Col<Runtime, String>,
 }
 
 impl __sdk::__query_builder::HasCols for Runtime {
@@ -33,8 +31,7 @@ impl __sdk::__query_builder::HasCols for Runtime {
         RuntimeCols {
             identity: __sdk::__query_builder::Col::new(table_name, "identity"),
             seq: __sdk::__query_builder::Col::new(table_name, "seq"),
-            sample_addr: __sdk::__query_builder::Col::new(table_name, "sample_addr"),
-            sample_cert: __sdk::__query_builder::Col::new(table_name, "sample_cert"),
+            addr: __sdk::__query_builder::Col::new(table_name, "addr"),
         }
     }
 }

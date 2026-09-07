@@ -6,49 +6,44 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
-pub(super) struct AnnounceFeedArgs {
+pub(super) struct AnnounceEndpointArgs {
     pub addr: String,
-    pub cert: String,
 }
 
-impl From<AnnounceFeedArgs> for super::Reducer {
-    fn from(args: AnnounceFeedArgs) -> Self {
-        Self::AnnounceFeed {
-            addr: args.addr,
-            cert: args.cert,
-        }
+impl From<AnnounceEndpointArgs> for super::Reducer {
+    fn from(args: AnnounceEndpointArgs) -> Self {
+        Self::AnnounceEndpoint { addr: args.addr }
     }
 }
 
-impl __sdk::InModule for AnnounceFeedArgs {
+impl __sdk::InModule for AnnounceEndpointArgs {
     type Module = super::RemoteModule;
 }
 
 #[allow(non_camel_case_types)]
-/// Extension trait for access to the reducer `announce_feed`.
+/// Extension trait for access to the reducer `announce_endpoint`.
 ///
 /// Implemented for [`super::RemoteReducers`].
-pub trait announce_feed {
-    /// Request that the remote module invoke the reducer `announce_feed` to run as soon as possible.
+pub trait announce_endpoint {
+    /// Request that the remote module invoke the reducer `announce_endpoint` to run as soon as possible.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and this method provides no way to listen for its completion status.
-    /// /// Use [`announce_feed:announce_feed_then`] to run a callback after the reducer completes.
-    fn announce_feed(&self, addr: String, cert: String) -> __sdk::Result<()> {
-        self.announce_feed_then(addr, cert, |_, _| {})
+    /// /// Use [`announce_endpoint:announce_endpoint_then`] to run a callback after the reducer completes.
+    fn announce_endpoint(&self, addr: String) -> __sdk::Result<()> {
+        self.announce_endpoint_then(addr, |_, _| {})
     }
 
-    /// Request that the remote module invoke the reducer `announce_feed` to run as soon as possible,
+    /// Request that the remote module invoke the reducer `announce_endpoint` to run as soon as possible,
     /// registering `callback` to run when we are notified that the reducer completed.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and its status can be observed with the `callback`.
-    fn announce_feed_then(
+    fn announce_endpoint_then(
         &self,
         addr: String,
-        cert: String,
 
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
@@ -56,17 +51,16 @@ pub trait announce_feed {
     ) -> __sdk::Result<()>;
 }
 
-impl announce_feed for super::RemoteReducers {
-    fn announce_feed_then(
+impl announce_endpoint for super::RemoteReducers {
+    fn announce_endpoint_then(
         &self,
         addr: String,
-        cert: String,
 
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
             + 'static,
     ) -> __sdk::Result<()> {
         self.imp
-            .invoke_reducer_with_callback(AnnounceFeedArgs { addr, cert }, callback)
+            .invoke_reducer_with_callback(AnnounceEndpointArgs { addr }, callback)
     }
 }

@@ -29,9 +29,9 @@ use zeughaus_core::{EdgeData, NodeData};
 
 use crate::module_bindings::{
     DbConnection, Edge, EdgeTableAccess, Node, NodeOutputTableAccess, NodeTableAccess,
-    NodeTriggerTableAccess, RuntimeTableAccess, clear_node_outputs, connect_edge, create_node,
-    delete_node, announce_feed, disconnect_edge, join_runtime, move_node, publish_output, set_node_params,
-    trigger_node,
+    NodeTriggerTableAccess, RuntimeTableAccess, announce_endpoint, clear_node_outputs,
+    connect_edge, create_node, delete_node, disconnect_edge, join_runtime, move_node,
+    publish_output, set_node_params, trigger_node,
 };
 
 pub const DEFAULT_PORT: u16 = 3000;
@@ -274,26 +274,21 @@ pub fn pending_triggers(conn: &DbConnection) -> Vec<(u64, u64)> {
         .collect()
 }
 
-/// Where the executing runtime serves its sample feed, as
-/// `(address, trust anchor PEM)`. `None` while no runtime is connected or the
-/// owning one serves no feed.
+/// The pinned URL the executing runtime is reachable at. `None` while no
+/// runtime is connected or the owning one serves nothing.
 ///
-/// Reads the OWNING runtime specifically: an editor watching a video signal has
-/// to watch the process that is producing it, and a standby produces nothing.
-pub fn feed_endpoint(conn: &DbConnection) -> Option<(String, String)> {
+/// Reads the OWNING runtime specifically: an editor watching a runtime has to
+/// watch the process that is producing values, and a standby produces nothing.
+pub fn owner_endpoint(conn: &DbConnection) -> Option<String> {
     let owner = conn.db.runtime().iter().min_by_key(|r| r.seq)?;
-    (!owner.sample_addr.is_empty() && !owner.sample_cert.is_empty())
-        .then_some((owner.sample_addr, owner.sample_cert))
+    (!owner.addr.is_empty()).then_some(owner.addr)
 }
 
-/// Announces this runtime's sample feed. The store rejects nothing here -- a
+/// Announces this runtime's endpoint. The store rejects nothing here -- a
 /// runtime may only ever describe its own row.
-pub fn send_announce_feed(conn: &DbConnection, addr: &str, cert: &str) {
-    if let Err(e) = conn
-        .reducers
-        .announce_feed(addr.to_string(), cert.to_string())
-    {
-        eprintln!("[stdb] announce_feed failed: {e}");
+pub fn send_announce_endpoint(conn: &DbConnection, addr: &str) {
+    if let Err(e) = conn.reducers.announce_endpoint(addr.to_string()) {
+        eprintln!("[stdb] announce_endpoint failed: {e}");
     }
 }
 

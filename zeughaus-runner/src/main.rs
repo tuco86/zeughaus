@@ -13,6 +13,7 @@
 
 mod feed;
 mod runner;
+mod transport;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -25,8 +26,9 @@ use zeughaus_core::{NodeId, Value, ZeughausError};
 use zeughaus_runtime::DeferredWork;
 use zeughaus_sync::Role;
 
-use crate::feed::{FeedServer, FrameRegistry};
+use crate::feed::FrameRegistry;
 use crate::runner::{AsyncResult, Runner};
+use crate::transport::Transport;
 
 /// How long the loop blocks on the event channel before looking around.
 ///
@@ -93,26 +95,32 @@ fn main() -> ExitCode {
     };
 
     // Bound before the runner exists, because the address is announced from the
-    // runner's first look at the store and a viewer must never be handed an
+    // runner's first look at the store and an editor must never be handed an
     // endpoint that is not serving yet.
     let frames = Arc::new(FrameRegistry::new());
-    let feed = match rt.block_on(FeedServer::start(feed_addr, Arc::clone(&frames))) {
-        Ok(server) => {
-            eprintln!("[runner] sample feed on {}", server.url());
-            Some(server)
+    let transport = match rt.block_on(Transport::start(feed_addr)) {
+        Ok(transport) => {
+            eprintln!("[runner] weida endpoint {}", transport.url());
+            Some(transport)
         }
         // Not fatal. The graph still executes and its scalars still reach every
         // editor through the store; exiting here would take that away too, and
-        // an editor with no feed endpoint simply draws no video.
+        // an editor with no endpoint simply draws no video.
         Err(e) => {
-            eprintln!("[runner] no sample feed: {e}");
+            eprintln!("[runner] no weida endpoint: {e}");
             None
         }
     };
 
-    let mut runner = Runner::new(conn, frames);
-    if let Some(feed) = &feed {
-        runner.set_feed_endpoint(feed.url().to_string(), feed.cert_pem().to_string());
+    let mut runner = Runner::new(conn, Arc::clone(&frames));
+    if let Some(transport) = &transport {
+        match transport.listener().replier(zeughaus_samples::FEED_PATH) {
+            Ok(replier) => {
+                rt.spawn(feed::accept_feeds(replier, Arc::clone(&frames)));
+            }
+            Err(e) => eprintln!("[runner] no sample feed: {e}"),
+        }
+        runner.set_endpoint(transport.url().to_string());
     }
     let (async_tx, async_rx) = std::sync::mpsc::channel::<(NodeId, AsyncResult)>();
 

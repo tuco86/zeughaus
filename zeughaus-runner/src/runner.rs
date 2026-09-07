@@ -65,10 +65,10 @@ pub struct Runner {
     /// server's tasks. Rebuilt after every pass: see
     /// [`Runner::refresh_frames`].
     frames: Arc<FrameRegistry>,
-    /// Where this process serves its sample feed, as `(url, certificate PEM)`.
-    /// `None` until the listener is bound -- a viewer must never be pointed at
-    /// a runtime that is not serving yet.
-    feed: Option<(String, String)>,
+    /// The pinned root URL this process serves on
+    /// (`weida://sha256:<fp>@host:port/`). `None` until the listener is bound
+    /// -- an editor must never be pointed at a runtime that is not serving yet.
+    endpoint: Option<String>,
 }
 
 impl Runner {
@@ -114,7 +114,7 @@ impl Runner {
             unknown_types: HashSet::new(),
             logged_size: (0, 0),
             frames,
-            feed: None,
+            endpoint: None,
         }
     }
 
@@ -144,10 +144,11 @@ impl Runner {
             return;
         }
         self.is_owner = owner;
-        // Ownership decides where viewers are pointed: `feed_endpoint` resolves
-        // the *owning* runtime's row, so a standby inheriting execution becomes
-        // the row every editor reads and has to be sure its address is in it.
-        self.announce_feed();
+        // Ownership decides where editors are pointed: `owner_endpoint`
+        // resolves the *owning* runtime's row, so a standby inheriting
+        // execution becomes the row every editor reads and has to be sure its
+        // address is in it.
+        self.announce_endpoint();
         if !owner {
             // The frames this process holds are the last ones it produced.
             // Another runtime is producing the real ones now, so its viewers
@@ -198,9 +199,9 @@ impl Runner {
                 }
                 // The snapshot is also the first look this process gets at its
                 // own `runtime` row, and a reconnect recreates that row without
-                // the feed address. Re-announcing here is what keeps a viewer
-                // from resolving an owning runtime with an empty address.
-                self.announce_feed();
+                // the endpoint. Re-announcing here is what keeps an editor from
+                // resolving an owning runtime with an empty address.
+                self.announce_endpoint();
             }
         }
     }
@@ -509,23 +510,23 @@ impl Runner {
         }
     }
 
-    /// Records where this process serves its sample feed and announces it.
+    /// Records the pinned URL this process serves on and announces it.
     ///
-    /// Called once the listener is bound and never before: a viewer that
+    /// Called once the listener is bound and never before: an editor that
     /// reached a runtime which is not serving yet would fail its first request
     /// and have no reason to try again.
-    pub fn set_feed_endpoint(&mut self, url: String, cert_pem: String) {
-        self.feed = Some((url, cert_pem));
-        self.announce_feed();
+    pub fn set_endpoint(&mut self, url: String) {
+        self.endpoint = Some(url);
+        self.announce_endpoint();
     }
 
-    /// Writes the feed endpoint into this runtime's row. Idempotent, which is
-    /// what lets it be repeated whenever ownership or the subscription changes.
-    fn announce_feed(&self) {
-        let Some((url, cert_pem)) = &self.feed else {
+    /// Writes the endpoint into this runtime's row. Idempotent, which is what
+    /// lets it be repeated whenever ownership or the subscription changes.
+    fn announce_endpoint(&self) {
+        let Some(url) = &self.endpoint else {
             return;
         };
-        zeughaus_sync::send_announce_feed(&self.conn, url, cert_pem);
+        zeughaus_sync::send_announce_endpoint(&self.conn, url);
     }
 
     /// Hands this pass's frames to the feed server.

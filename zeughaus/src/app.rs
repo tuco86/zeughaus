@@ -27,7 +27,7 @@ use zeughaus_runtime::{Graph, GraphEdge, GraphExecutor, GraphNode};
 use zeughaus_transform::TransformPlugin;
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::feed::{self, FeedEndpoint, FeedKey, FeedSpec, FrameOrder};
+use crate::feed::{self, Endpoint, FeedKey, FeedSpec, FrameOrder};
 use crate::message::{GraphIds, Message, PinLabel};
 use crate::palette;
 
@@ -156,11 +156,11 @@ pub struct App {
     // "is anything computing the values on screen".
     #[cfg(not(target_arch = "wasm32"))]
     runtimes: usize,
-    // Where the executing runtime last said it serves frames. Kept so a runner
+    // Where the executing runtime last said it is reachable. Kept so a runner
     // that restarted on another port, or vanished, is detectable: every live
     // feed dialled the old address and has to be redialled.
     #[cfg(not(target_arch = "wasm32"))]
-    feed_endpoint: Option<FeedEndpoint>,
+    endpoint: Option<Endpoint>,
     // Live video feeds, keyed by the source pin they carry rather than by the
     // Display node drawing it: two nodes watching one pin need the same frame,
     // so they share one feed.
@@ -282,7 +282,7 @@ impl App {
             // No feed until a runtime announces one and a Display node is wired
             // to a frame; both are discovered from the store, never assumed.
             #[cfg(not(target_arch = "wasm32"))]
-            feed_endpoint: None,
+            endpoint: None,
             #[cfg(not(target_arch = "wasm32"))]
             feeds: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -495,18 +495,20 @@ impl App {
     /// Stopping is by removal: [`LiveFeed`]'s handle aborts on drop.
     #[cfg(not(target_arch = "wasm32"))]
     fn reconcile_feeds(&mut self) -> Task<Message> {
-        let announced = self.stdb.as_ref().and_then(|conn| {
-            crate::sync::feed_endpoint(conn).map(|(url, cert)| FeedEndpoint { url, cert })
-        });
-        // A runtime that moved, restarted or reissued its certificate
+        let announced = self
+            .stdb
+            .as_ref()
+            .and_then(crate::sync::owner_endpoint)
+            .map(Endpoint);
+        // A runtime that moved, restarted or regenerated its identity
         // invalidates every address already dialled, so no feed survives it.
-        let moved = announced != self.feed_endpoint;
+        let moved = announced != self.endpoint;
         if moved {
-            self.feed_endpoint = announced;
+            self.endpoint = announced;
         }
         // With nothing serving frames, a live feed would be reading a dead
         // stream and the frame it left behind is not what the graph shows.
-        let wanted = match self.feed_endpoint {
+        let wanted = match self.endpoint {
             None => HashMap::new(),
             Some(_) => self.wanted_feeds(),
         };
@@ -516,7 +518,7 @@ impl App {
         if lost {
             self.update_display_values();
         }
-        let Some(endpoint) = self.feed_endpoint.clone() else {
+        let Some(endpoint) = self.endpoint.clone() else {
             return Task::none();
         };
 
@@ -1427,11 +1429,13 @@ impl App {
                             },
                         }
                     })
-                    .pin_style(|theme, pin: &PinInfo<'_, GraphIds>, _other, status| PinStyle {
-                        color: pin.info().color.into(),
-                        shape: pin.info().shape,
-                        ..default_pin_style(theme, status)
-                    });
+                    .pin_style(
+                        |theme, pin: &PinInfo<'_, GraphIds>, _other, status| PinStyle {
+                            color: pin.info().color.into(),
+                            shape: pin.info().shape,
+                            ..default_pin_style(theme, status)
+                        },
+                    );
                 ng = ng.push_node(node_widget);
             }
         }

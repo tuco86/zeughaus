@@ -17,9 +17,9 @@ use std::sync::{Arc, LazyLock};
 use iced::futures::channel::mpsc;
 use iced::futures::{SinkExt, Stream};
 use tokio::io::AsyncReadExt;
-use weida::{ClientTls, Runtime, RuntimeConfig, TransferMeta};
+use weida::{ClientTls, EndpointAddr, Runtime, RuntimeConfig, TransferMeta, Trust};
 use zeughaus_core::Image;
-use zeughaus_samples::{FeedRequest, FrameHeader, ladder};
+use zeughaus_samples::{FEED_PATH, FeedRequest, FrameHeader, ladder};
 
 /// The one QUIC client this process needs.
 ///
@@ -53,25 +53,40 @@ pub struct FeedKey {
     pub pin: Arc<str>,
 }
 
-/// Where the runtime serves frames: the address it announced and the trust
-/// anchor that authenticates it.
+/// Where a runtime is reachable: the pinned root URL it announced.
 ///
 /// Compared for equality to notice a runner that restarted on a different port
-/// or with a fresh self-signed certificate; every feed dialled the old one and
-/// has to be redialled.
+/// or with a fresh identity; every feed dialled the old one and has to be
+/// redialled.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FeedEndpoint {
-    /// A full `weida://host:port/path` URL, exactly as the runtime announced it.
-    pub url: String,
-    /// PEM trust anchor for that URL.
-    pub cert: String,
+pub struct Endpoint(pub String);
+
+impl Endpoint {
+    /// The URL of one endpoint path on this runtime.
+    ///
+    /// The announced URL is the root (`/`); every path this editor dials is the
+    /// same authority and the same pinned fingerprint with the path replaced,
+    /// so a runtime announces one address and not a list.
+    pub fn path(&self, path: &str) -> Result<String, String> {
+        let mut addr =
+            EndpointAddr::parse(&self.0).map_err(|e| format!("endpoint {}: {e}", self.0))?;
+        addr.path = path.to_owned();
+        Ok(addr.to_string())
+    }
+}
+
+/// The trust every dial uses: the fingerprint pinned in the URL the runtime
+/// announced, and nothing else. This is the client-side swap point for a later
+/// mTLS integration.
+fn client_tls() -> ClientTls {
+    ClientTls::new(Trust::by_address())
 }
 
 /// Everything one feed task needs: where to dial, what to ask for, and which
 /// generation of the feed it is.
 #[derive(Debug, Clone)]
 pub struct FeedSpec {
-    pub endpoint: FeedEndpoint,
+    pub endpoint: Endpoint,
     pub key: FeedKey,
     /// Distinguishes this feed from the one it replaced. See [`Frame::epoch`].
     pub epoch: u64,
@@ -212,11 +227,12 @@ async fn pump(
     out: &mut mpsc::Sender<Frame>,
 ) -> Result<Wanted, String> {
     let quic = QUIC.as_ref().ok_or("no QUIC runtime")?;
-    let requester = quic.requester(ClientTls::from_pem(spec.endpoint.cert.clone()));
+    let url = spec.endpoint.path(FEED_PATH)?;
+    let requester = quic.requester(client_tls());
     requester
-        .connect(&spec.endpoint.url)
+        .connect(&url)
         .await
-        .map_err(|e| format!("connect {}: {e}", spec.endpoint.url))?;
+        .map_err(|e| format!("connect {url}: {e}"))?;
 
     let (mut request, reply) = requester
         .open(TransferMeta::default())
@@ -332,5 +348,24 @@ mod tests {
         assert_eq!(retry_delay(1), std::time::Duration::from_millis(500));
         assert_eq!(retry_delay(4), std::time::Duration::from_millis(4000));
         assert_eq!(retry_delay(99), std::time::Duration::from_millis(4000));
+    }
+
+    /// Every endpoint this editor dials is derived from the one announced URL,
+    /// so deriving must keep the pinned fingerprint: dropping it would turn a
+    /// pinned dial into one that trusts nothing and fails.
+    #[test]
+    fn a_derived_path_keeps_the_pinned_fingerprint() {
+        let fingerprint = "sha256:".to_owned() + &"ab".repeat(32);
+        let root = Endpoint(format!("weida://{fingerprint}@127.0.0.1:7443/"));
+        assert_eq!(
+            root.path(FEED_PATH).expect("derive"),
+            format!("weida://{fingerprint}@127.0.0.1:7443{FEED_PATH}")
+        );
+    }
+
+    /// A malformed announcement is a runtime problem, not a panic here.
+    #[test]
+    fn a_bad_endpoint_reports_instead_of_panicking() {
+        assert!(Endpoint("not a url".to_owned()).path(FEED_PATH).is_err());
     }
 }

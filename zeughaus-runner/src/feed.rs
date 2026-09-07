@@ -14,8 +14,9 @@
 //!   is `Arc`-backed and the registry holds a refcount, not a buffer.
 //! * [`ScaleCache`] -- one scaled result per (pin, tier, source frame), shared
 //!   by every viewer. That sharing is the whole reason the tier ladder exists.
-//! * [`FeedServer`] -- the `/samples` replier: one long-lived exchange per
-//!   viewer, a [`FeedRequest`] in and headed frames out until the viewer stops.
+//! * [`accept_feeds`] -- the `/samples` accept loop: one long-lived exchange
+//!   per viewer, a [`FeedRequest`] in and headed frames out until the viewer
+//!   stops.
 //!
 //! The registry is deliberately *authoritative* rather than additive. Each pass
 //! states the full set of frame pins the graph has, so a pin that vanished is
@@ -24,22 +25,14 @@
 //! it would both outlive the node.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use tokio::sync::watch;
-use weida::{
-    EndpointAddr, IncomingRequest, OutgoingTransfer, Replier, Runtime as Transport, RuntimeConfig,
-    ServerTls, TransferMeta,
-};
+use weida::{IncomingRequest, OutgoingTransfer, Replier, TransferMeta};
 use zeughaus_core::{Image, NodeId};
 use zeughaus_samples::{FeedRequest, FrameHeader, MAX_DIMENSION, ladder, scale_to_fit};
-
-/// The endpoint a viewer dials. Opaque to weida and matched exactly, so it is
-/// the same string on both sides or nothing works.
-pub const FEED_PATH: &str = "/samples";
 
 /// Largest [`FeedRequest`] this server will read.
 ///
@@ -335,96 +328,9 @@ impl Default for ScaleCache {
     }
 }
 
-// --- the server ---------------------------------------------------------------
-
-/// A bound feed listener: the address to announce, the certificate a viewer has
-/// to trust, and the accept loop behind them.
-pub struct FeedServer {
-    url: String,
-    cert_pem: String,
-    /// The weida runtime owns the connection pool and the bound socket. Held
-    /// for the life of the process because the feed has no shutdown short of
-    /// exit.
-    _transport: Transport,
-}
-
-impl FeedServer {
-    /// Binds `bind`, generates a certificate for the host it will be announced
-    /// under, and starts accepting feeds.
-    ///
-    /// Nothing is announced from here: the caller does that once it has a store
-    /// connection, and it must not happen before this returns -- a viewer
-    /// pointed at a runtime that is not yet serving would fail its first
-    /// request and have no reason to try again.
-    pub async fn start(bind: SocketAddr, frames: Arc<FrameRegistry>) -> Result<FeedServer, String> {
-        let host = announced_host(bind);
-        // Self-signed, in memory, per start. Honest for a LAN and for the same
-        // machine, and the same trust model the store connection already has.
-        // The SAN has to be the host the viewer dials, because that is the name
-        // rustls checks the certificate against.
-        let cert = rcgen::generate_simple_self_signed(vec![host.clone()])
-            .map_err(|e| format!("cannot generate a feed certificate for {host}: {e}"))?;
-        let cert_pem = cert.cert.pem();
-
-        let transport =
-            Transport::new(RuntimeConfig::default()).map_err(|e| format!("weida runtime: {e}"))?;
-        let listener = transport.listener();
-        let binding = listener
-            .bind_quic(
-                bind,
-                ServerTls::from_pem(cert_pem.clone(), cert.signing_key.serialize_pem()),
-            )
-            .await
-            .map_err(|e| format!("cannot bind {bind}: {e}"))?;
-        let replier = listener
-            .replier(FEED_PATH)
-            .map_err(|e| format!("cannot serve {FEED_PATH}: {e}"))?;
-
-        // Built through `EndpointAddr` rather than `format!` so an IPv6 bind
-        // address is bracketed the way the parser on the other side expects.
-        let url = EndpointAddr {
-            host,
-            port: binding.local_addr().port(),
-            path: FEED_PATH.to_owned(),
-        }
-        .to_string();
-
-        tokio::spawn(accept_feeds(replier, frames));
-
-        Ok(FeedServer {
-            url,
-            cert_pem,
-            _transport: transport,
-        })
-    }
-
-    /// The `weida://host:port/samples` address to announce.
-    pub fn url(&self) -> &str {
-        &self.url
-    }
-
-    /// The PEM a viewer has to trust to reach [`FeedServer::url`].
-    pub fn cert_pem(&self) -> &str {
-        &self.cert_pem
-    }
-}
-
-/// The host a viewer will dial, and the name the certificate is issued for.
-///
-/// Taken from the bind address, so `--feed-addr` on a routable interface is
-/// announced as that interface. An unspecified address (`0.0.0.0`) names no
-/// reachable host, so loopback is announced instead: right for the local case,
-/// and a remote viewer needs an explicit `--feed-addr` regardless.
-fn announced_host(bind: SocketAddr) -> String {
-    match bind.ip() {
-        ip if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST).to_string(),
-        ip => ip.to_string(),
-    }
-}
-
 /// Accepts feeds until the replier goes away, which for this process means
 /// never: it owns the replier for the life of the program.
-async fn accept_feeds(replier: Replier, frames: Arc<FrameRegistry>) {
+pub async fn accept_feeds(replier: Replier, frames: Arc<FrameRegistry>) {
     let cache = Arc::new(ScaleCache::new());
     loop {
         match replier.accept().await {
@@ -825,18 +731,6 @@ mod tests {
         assert_eq!(
             cache.entries.lock().expect("cache").len(),
             SCALE_CACHE_ENTRIES
-        );
-    }
-
-    #[test]
-    fn an_unspecified_bind_address_is_announced_as_loopback() {
-        assert_eq!(
-            announced_host("0.0.0.0:7443".parse().expect("addr")),
-            "127.0.0.1"
-        );
-        assert_eq!(
-            announced_host("10.0.0.8:7443".parse().expect("addr")),
-            "10.0.0.8"
         );
     }
 }
