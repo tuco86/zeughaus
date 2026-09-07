@@ -258,6 +258,16 @@ pub struct App {
     // The newest sequence applied per (node, pin). See `accept_output_seq`.
     #[cfg(not(target_arch = "wasm32"))]
     output_seq: HashMap<(NodeId, String), u64>,
+    // Why each node is failing, as last reported by the runtime. The only path
+    // a failure has to this window: the process that ran the node is not the
+    // one drawing it, so before this the report existed nowhere but the
+    // runtime's own log.
+    #[cfg(not(target_arch = "wasm32"))]
+    remote_errors: HashMap<NodeId, String>,
+    // The newest sequence applied per node. Same guard as the outputs: the
+    // error topic is its own stream, so a stale report can arrive last.
+    #[cfg(not(target_arch = "wasm32"))]
+    error_seq: HashMap<NodeId, u64>,
     // When each in-flight particle was born, per edge. One per delivered value,
     // which is why an unchanged value still animates: traffic, not state.
     #[cfg(not(target_arch = "wasm32"))]
@@ -402,6 +412,10 @@ impl App {
             remote_outputs: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             output_seq: HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            remote_errors: HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            error_seq: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             particles: HashMap::new(),
             setting_errors: HashMap::new(),
@@ -1215,6 +1229,18 @@ impl App {
                 // not name produced nothing, which is what the editor dims.
                 self.remote_outputs.clear();
                 self.output_seq.clear();
+                // The failing nodes replace the failing nodes, for the same
+                // reason: a node the snapshot does not name is not failing.
+                self.remote_errors = snapshot
+                    .errors
+                    .into_iter()
+                    .map(|row| (NodeId(row.node_id), row.message))
+                    .collect();
+                self.error_seq = self
+                    .remote_errors
+                    .keys()
+                    .map(|id| (*id, snapshot.seq))
+                    .collect();
                 for row in snapshot.outputs {
                     let Some(value) = zeughaus_core::decode_scalar(&row.ty, &row.value) else {
                         continue;
@@ -1276,12 +1302,33 @@ impl App {
                     particles.pop_front();
                 }
             }
-            // The runtime now reports node failures, and drawing them is the
-            // editor's half of that change: not wired up yet, so they are
-            // dropped rather than half-applied.
-            Traffic::Event(RuntimeEvent::NodeError { .. })
-            | Traffic::Event(RuntimeEvent::NodeErrorCleared { .. }) => {}
-            Traffic::Lost => self.traffic_live = false,
+            Traffic::Event(RuntimeEvent::NodeError {
+                seq,
+                node_id,
+                message,
+            }) => {
+                let node = NodeId(node_id);
+                if self.accept_error_seq(node, seq) {
+                    self.remote_errors.insert(node, message);
+                }
+            }
+            Traffic::Event(RuntimeEvent::NodeErrorCleared { seq, node_id }) => {
+                let node = NodeId(node_id);
+                if self.accept_error_seq(node, seq) {
+                    self.remote_errors.remove(&node);
+                }
+            }
+            Traffic::Lost => {
+                self.traffic_live = false;
+                // Values stay on screen as last-known, because the status bar
+                // says so and a number nobody claims is still the last one
+                // anybody claimed. An error is not like that: it is a claim
+                // about a run, made by a process that is no longer there to
+                // make it, and a red border with nothing behind it is worse
+                // than none.
+                self.remote_errors.clear();
+                self.error_seq.clear();
+            }
         }
     }
 
@@ -1298,6 +1345,44 @@ impl App {
         }
         self.output_seq.insert(key, seq);
         true
+    }
+
+    /// The same guard for the error topic, keyed by node: an error report is
+    /// about a whole run, not about one pin.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn accept_error_seq(&mut self, node: NodeId, seq: u64) -> bool {
+        if self.error_seq.get(&node).is_some_and(|seen| *seen >= seq) {
+            return false;
+        }
+        self.error_seq.insert(node, seq);
+        true
+    }
+
+    /// Why a node is failing, whoever noticed.
+    ///
+    /// The runtime's report wins: the process that RAN the node is the only
+    /// one that can know why it failed. This window never executes, so its own
+    /// executor holds only what it refused itself before the value ever left --
+    /// a rejected setting -- which is the fallback and all a browser editor
+    /// ever has.
+    fn node_error(&self, node: NodeId) -> Option<&str> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(message) = self.remote_errors.get(&node) {
+            return Some(message.as_str());
+        }
+        self.executor.node_error(node)
+    }
+
+    /// Every failing node with its message, in node order so the status bar
+    /// does not name a different one on every redraw.
+    fn failing_nodes(&self) -> Vec<(NodeId, &str)> {
+        let mut failing: Vec<(NodeId, &str)> = self
+            .node_order
+            .iter()
+            .filter_map(|id| self.node_error(*id).map(|message| (*id, message)))
+            .collect();
+        failing.sort_by_key(|(id, _)| *id);
+        failing
     }
 
     /// Pushes one node's current remote outputs into the executor and redraws.
@@ -1349,6 +1434,10 @@ impl App {
             self.traffic_epoch += 1;
             self.remote_outputs.clear();
             self.output_seq.clear();
+            // A failure belongs to the runtime that reported it; a different
+            // one has not run anything yet.
+            self.remote_errors.clear();
+            self.error_seq.clear();
             // A particle in flight belongs to the runtime that sent it; the new
             // one has not delivered anything yet.
             self.particles.clear();
@@ -1575,15 +1664,15 @@ impl App {
     /// The status bar's error text: one failing node's message, plus a count
     /// when several failed. Empty while every node is fine.
     fn node_error_summary(&self) -> String {
-        let mut errors = self.executor.errors();
-        let Some((id, message)) = errors.next() else {
+        let failing = self.failing_nodes();
+        let Some((id, message)) = failing.first() else {
             return String::new();
         };
         let name = self
             .nodes
-            .get(&id)
+            .get(id)
             .map_or("node", |n| n.display_name.as_str());
-        match errors.count() {
+        match failing.len() - 1 {
             0 => format!("{name}: {message}"),
             more => format!("{name}: {message} (+{more} more)"),
         }
@@ -2517,6 +2606,7 @@ impl App {
                         const_input: self.const_inputs.get(id).map(|s| s.as_str()),
                         settings: self.node_settings.get(id),
                         errors: self.setting_errors.get(id),
+                        failure: self.node_error(*id),
                         dim_mask: self.dim_mask(*id, node),
                         size: self.node_sizes.get(id).copied(),
                         is_container: node.is_container,
@@ -2525,7 +2615,7 @@ impl App {
                 // Per-node activity feedback: red marching-ants on error. There
                 // is no "working" state to draw -- this process does not
                 // execute, so a node is never mid-run here.
-                let errored = self.executor.is_error(*id);
+                let errored = self.node_error(*id).is_some();
                 let node_widget = ng_node(node.id.0, node.position, content)
                     .resizable(is_display(&node.type_id))
                     .style(move |theme, status| {
@@ -2598,7 +2688,7 @@ impl App {
 
             // An edge reflects its source node's state: red marching-ants when
             // the source errored (broken data).
-            let src_error = self.executor.is_error(edge.from_node);
+            let src_error = self.node_error(edge.from_node).is_some();
 
             // Transmission mode is decided by the target pin: a Trigger input
             // carries Events (animated flowing dash), a Sample input carries
@@ -2802,7 +2892,7 @@ impl App {
         // border animates. Native only: iced::time::every needs the tokio
         // executor feature.
         #[cfg(not(target_arch = "wasm32"))]
-        if self.executor.errors().next().is_some() {
+        if !self.failing_nodes().is_empty() {
             subs.push(
                 iced::time::every(std::time::Duration::from_millis(33)).map(|_| Message::Tick),
             );
@@ -3481,6 +3571,8 @@ struct NodeChrome<'a> {
     settings: Option<&'a HashMap<String, String>>,
     /// What the node refused, per setting key.
     errors: Option<&'a HashMap<String, String>>,
+    /// Why the node's last run failed, as the runtime reported it.
+    failure: Option<&'a str>,
     dim_mask: u64,
     size: Option<iced::Size>,
     is_container: bool,
@@ -3495,6 +3587,7 @@ fn build_node_element<'a>(
         const_input,
         settings,
         errors,
+        failure,
         dim_mask,
         size,
         is_container,
@@ -3711,6 +3804,17 @@ fn build_node_element<'a>(
             .into(),
         );
     }
+
+    // Why the last run failed, in the node that failed. The red border says
+    // THAT something is wrong; only the text says what, and the status bar
+    // shows one node's message at a time. Always a widget so the body's child
+    // count stays stable between redraws.
+    items.push(
+        text(failure.unwrap_or(""))
+            .size(10)
+            .color(Color::from_rgb(0.95, 0.45, 0.45))
+            .into(),
+    );
 
     let body = column(items).spacing(4);
     let header = node_header(
