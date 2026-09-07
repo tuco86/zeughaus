@@ -741,16 +741,26 @@ impl App {
         }
     }
 
+    /// What a node declares for this pin, if it declares it at all.
+    ///
+    /// `None` and "declared, but not a field" are different answers, and the
+    /// difference decides whether a wire is a lost relation or a live one.
+    fn pin_def(&self, node: NodeId, pin: &str) -> Option<&PinDefinition> {
+        self.nodes
+            .get(&node)?
+            .pin_defs
+            .iter()
+            .find(|p| &*p.name == pin)
+    }
+
     /// Whether a node declares this pin as a bidirectional field pin.
     ///
     /// Read off the pin declaration, never off a node type: what makes an edge
     /// a relation is the same fact here, in the runtime and in the runner.
+    #[cfg(not(target_arch = "wasm32"))]
     fn is_field_pin(&self, node: NodeId, pin: &str) -> bool {
-        self.nodes.get(&node).is_some_and(|n| {
-            n.pin_defs
-                .iter()
-                .any(|p| &*p.name == pin && p.direction == PinDirection::Both)
-        })
+        self.pin_def(node, pin)
+            .is_some_and(|p| p.direction == PinDirection::Both)
     }
 
     /// Whether an edge is a relation: both its ends are field pins.
@@ -764,11 +774,17 @@ impl App {
     }
 
     /// Drops every relation of `node` whose field pin the node no longer
-    /// declares.
+    /// declares at all.
     ///
-    /// Called after a setting reshaped a node's pins. The other end still
-    /// being a field pin is what identifies the wire as a relation, and a
-    /// relation without its field is nothing: it would stay in the store,
+    /// Called after a setting reshaped a node's pins. A relation is recognised
+    /// by its *other* end being a field pin; it is lost when the pin this end
+    /// lands on is no longer declared. Both halves matter: an edge whose own
+    /// end is a pin that still exists is not this node's lost relation, even
+    /// when that pin is an ordinary input or output rather than a field --
+    /// reading "not a field pin" as "gone" deleted live wires from the store
+    /// the first time any setting on the node was edited.
+    ///
+    /// A relation without its field is nothing: it would stay in the store,
     /// invisible in every view, and reattach itself if a field of that name
     /// ever came back. Renaming a field therefore drops its relations, which
     /// is the honest reading of "that field is gone".
@@ -782,7 +798,7 @@ impl App {
                     (_, true) => (e.to_pin.as_str(), (e.from_node, e.from_pin.as_str())),
                     _ => return false,
                 };
-                self.is_field_pin(other.0, other.1) && !self.is_field_pin(node, own)
+                is_lost_relation(self.pin_def(node, own), self.pin_def(other.0, other.1))
             })
             .map(|e| e.id)
             .collect();
@@ -3169,6 +3185,23 @@ fn pin_geometry(direction: PinDirection) -> (PinSide, NgPinDirection) {
     }
 }
 
+/// Whether an edge end is a relation the node has lost, given what each end's
+/// node declares for the pin the edge lands on.
+///
+/// Two conditions, and both are load-bearing:
+///
+/// * the OTHER end is a field pin -- that is what made the edge a relation
+///   rather than a wire carrying a value;
+/// * this end's pin is not declared at all -- the field it sat on is gone.
+///
+/// A pin that is still declared, field or not, is not lost. Treating "not a
+/// field pin" as "gone" is how an ordinary output wired to a table's field --
+/// the shape every graph written before relations existed has -- got deleted
+/// from the store the moment any setting on that node was touched.
+fn is_lost_relation(own: Option<&PinDefinition>, other: Option<&PinDefinition>) -> bool {
+    own.is_none() && other.is_some_and(|p| p.direction == PinDirection::Both)
+}
+
 /// The field name a relation treats as the key it points at.
 #[cfg(not(target_arch = "wasm32"))]
 const KEY_FIELD: &str = "id";
@@ -3700,5 +3733,34 @@ mod tests {
         assert!(relation_references_to("owner", "seq"));
         // Both are: the only tie left to break is the drop target.
         assert!(relation_references_to("id", "id"));
+    }
+
+    /// Reshaping a node's pins may only drop the relations whose field is
+    /// actually gone. A wire on a pin that still exists stays -- deleting it
+    /// would remove a live edge from the shared store, where nothing brings it
+    /// back.
+    #[test]
+    fn only_a_relation_whose_field_is_gone_is_dropped() {
+        let field = PinDefinition::field("customer_id", Ty::opaque("db.field"));
+        let output = PinDefinition::output("table", Ty::opaque("db.table"));
+        let input = PinDefinition::input("table", Ty::opaque("db.table"), PinKind::Sample);
+
+        // The field this end sat on is gone, the other end is still a field:
+        // a relation with nothing left to attach to.
+        assert!(is_lost_relation(None, Some(&field)));
+
+        // This end is still a field pin: the relation is intact.
+        assert!(!is_lost_relation(Some(&field), Some(&field)));
+
+        // This end is an ordinary output or input that the node still
+        // declares. Not a relation of ours, and above all not ours to delete
+        // -- this is the case that used to take live wires with it.
+        assert!(!is_lost_relation(Some(&output), Some(&field)));
+        assert!(!is_lost_relation(Some(&input), Some(&field)));
+
+        // Nothing to do with relations at all: a dataflow wire whose pin
+        // vanished for a moment while a setting was half-typed must survive.
+        assert!(!is_lost_relation(None, Some(&output)));
+        assert!(!is_lost_relation(None, None));
     }
 }
