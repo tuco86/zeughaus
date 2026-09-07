@@ -27,6 +27,12 @@ pub struct Graph {
     edges: HashMap<EdgeId, GraphEdge>,
     outgoing: HashMap<NodeId, Vec<EdgeId>>,
     incoming: HashMap<NodeId, Vec<EdgeId>>,
+    /// Bumped by every mutator this type has. What it buys is a cache key for
+    /// anything derived from the topology -- the execution order above all --
+    /// and it is trustworthy because these fields are private: there is no way
+    /// to move a node, a wire or a pin declaration without passing through one
+    /// of the methods below.
+    revision: u64,
 }
 
 impl Graph {
@@ -36,11 +42,22 @@ impl Graph {
             edges: HashMap::new(),
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
+            revision: 0,
         }
+    }
+
+    /// How many times this graph has been changed.
+    ///
+    /// The cache key for anything derived from the topology: equal revisions
+    /// mean the same nodes, the same wires and the same pin declarations, so
+    /// the same execution order.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn add_node(&mut self, node: GraphNode) {
         let id = node.id;
+        self.revision += 1;
         self.nodes.insert(id, node);
         self.outgoing.entry(id).or_default();
         self.incoming.entry(id).or_default();
@@ -64,12 +81,14 @@ impl Graph {
         self.nodes.remove(&id);
         self.outgoing.remove(&id);
         self.incoming.remove(&id);
+        self.revision += 1;
     }
 
     pub fn add_edge(&mut self, edge: GraphEdge) {
         let id = edge.id;
         let from = edge.from_node;
         let to = edge.to_node;
+        self.revision += 1;
         self.edges.insert(id, edge);
         self.outgoing.entry(from).or_default().push(id);
         self.incoming.entry(to).or_default().push(id);
@@ -77,6 +96,7 @@ impl Graph {
 
     pub fn remove_edge(&mut self, id: EdgeId) {
         if let Some(edge) = self.edges.remove(&id) {
+            self.revision += 1;
             if let Some(out) = self.outgoing.get_mut(&edge.from_node) {
                 out.retain(|e| *e != id);
             }
@@ -90,7 +110,11 @@ impl Graph {
         self.nodes.get(&id)
     }
 
+    /// A node, mutable. Counts as a change: a pin declaration decides whether
+    /// an edge to it carries data at all (see [`Self::is_dataflow`]), so this
+    /// can move the topology and not only the node's position.
     pub fn node_mut(&mut self, id: NodeId) -> Option<&mut GraphNode> {
+        self.revision += 1;
         self.nodes.get_mut(&id)
     }
 
@@ -396,5 +420,46 @@ mod tests {
         assert!(!g.is_dataflow(id));
         assert_eq!(g.outgoing_edges(a).count(), 0);
         assert_eq!(g.incoming_edges(b).count(), 0);
+    }
+
+    /// The revision is a cache key for the execution order, so every change
+    /// that can move that order has to move it -- a pin declaration included,
+    /// because it decides whether an edge is a dependency at all. A call that
+    /// changed nothing must not move it, or the cache would never hold.
+    #[test]
+    fn every_structural_change_moves_the_revision() {
+        let mut g = Graph::new();
+        let a = NodeId::next();
+        let b = NodeId::next();
+
+        let start = g.revision();
+        g.add_node(make_node(a));
+        g.add_node(make_node(b));
+        let after_nodes = g.revision();
+        assert!(after_nodes > start, "adding a node is a change");
+
+        let edge = make_edge(a, b);
+        let edge_id = edge.id;
+        g.add_edge(edge);
+        let after_edge = g.revision();
+        assert!(after_edge > after_nodes, "adding a wire is a change");
+
+        g.node_mut(a).expect("node").pin_defs.clear();
+        let after_pins = g.revision();
+        assert!(after_pins > after_edge, "a pin declaration is a change");
+
+        g.remove_edge(edge_id);
+        let after_remove = g.revision();
+        assert!(after_remove > after_pins, "removing a wire is a change");
+
+        g.remove_edge(edge_id);
+        assert_eq!(
+            g.revision(),
+            after_remove,
+            "removing a wire that is not there changes nothing"
+        );
+
+        g.remove_node(a);
+        assert!(g.revision() > after_remove, "removing a node is a change");
     }
 }

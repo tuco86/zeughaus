@@ -56,6 +56,21 @@ pub struct GraphExecutor {
     /// The cache generation each incoming edge had when a node last ran, per
     /// node. The difference is what [`InputSet::changed`] reports.
     seen: HashMap<NodeId, HashMap<EdgeId, u64>>,
+    /// The execution order as of a graph revision, so a pass over an unchanged
+    /// graph does not recompute it. See [`Self::topology`].
+    topology: Option<Topology>,
+}
+
+/// A graph's execution order, and the nodes that have none, as of one
+/// revision of that graph.
+///
+/// `Arc<[NodeId]>` rather than `Vec`: a pass iterates the order while it
+/// mutates the executor, so it needs its own handle on it, and an `Arc` clone
+/// is what makes that free instead of a copy of the whole order per pass.
+struct Topology {
+    revision: u64,
+    order: Arc<[NodeId]>,
+    stuck: Arc<[NodeId]>,
 }
 
 impl GraphExecutor {
@@ -72,6 +87,7 @@ impl GraphExecutor {
             converters: Arc::new(TypeConverters::new()),
             delivered: Vec::new(),
             seen: HashMap::new(),
+            topology: None,
         }
     }
 
@@ -141,6 +157,33 @@ impl GraphExecutor {
         self.execute_dirty()
     }
 
+    /// The execution order and the nodes that have no place in it, computed
+    /// once per change to the graph.
+    ///
+    /// A ticked graph runs a pass tens of times a second, and Kahn's algorithm
+    /// costs an in-degree map of every node, a heap and a walk of every edge
+    /// each time -- for a graph that in between two ticks did not move at all.
+    /// [`Graph::revision`] is what makes reusing the answer safe: the graph
+    /// bumps it in every mutator it has and its fields are private, so a
+    /// topology cannot change without invalidating this.
+    fn topology(&mut self) -> (Arc<[NodeId]>, Arc<[NodeId]>) {
+        let revision = self.graph.revision();
+        if self
+            .topology
+            .as_ref()
+            .is_none_or(|cached| cached.revision != revision)
+        {
+            let (order, stuck) = topological_order(&self.graph);
+            self.topology = Some(Topology {
+                revision,
+                order: order.into(),
+                stuck: stuck.into(),
+            });
+        }
+        let cached = self.topology.as_ref().expect("just computed");
+        (Arc::clone(&cached.order), Arc::clone(&cached.stuck))
+    }
+
     /// Executes all dirty nodes in topological order. Nodes that defer async
     /// work (or are already awaiting a result) are skipped, and their
     /// downstream nodes are held back until the result is delivered. Returns
@@ -161,8 +204,8 @@ impl GraphExecutor {
     /// wire closed into a loop froze every unrelated part of the document,
     /// with nothing on screen to say why.
     pub fn execute_dirty(&mut self) -> Result<DeferredWork> {
-        let (order, stuck) = topological_order(&self.graph);
-        for id in stuck {
+        let (order, stuck) = self.topology();
+        for id in stuck.iter().copied() {
             // Not `mark_error`: a node in a cycle that is awaiting an async
             // result is still awaiting it, and forgetting that would let the
             // node be dispatched twice.
@@ -175,7 +218,7 @@ impl GraphExecutor {
         // pass, already pending, failed, or transitively downstream of any.
         let mut blocked: HashSet<NodeId> = HashSet::new();
 
-        for node_id in order {
+        for node_id in order.iter().copied() {
             if !dirty.contains(&node_id) {
                 continue;
             }
@@ -494,7 +537,7 @@ impl GraphExecutor {
         if !self.node_errors.values().any(|msg| msg == CYCLE_ERROR) {
             return;
         }
-        let (_, stuck) = topological_order(&self.graph);
+        let (_, stuck) = self.topology();
         let freed: Vec<NodeId> = self
             .node_errors
             .iter()
@@ -1512,5 +1555,34 @@ mod tests {
         exec.mark_error(a, "too late".to_string());
         assert!(exec.node_error(a).is_none());
         assert_eq!(exec.errors().count(), 0);
+    }
+
+    /// The execution order is cached per graph revision, so the case worth
+    /// defending is the one where the cache must not be used: a wire added
+    /// after a pass changes who runs first.
+    #[test]
+    fn a_new_wire_reorders_the_next_pass() {
+        let mut graph = Graph::new();
+        let a = NodeId::next();
+        let b = NodeId::next();
+        graph.add_node(make_node(a));
+        graph.add_node(make_node(b));
+
+        let runs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut exec = GraphExecutor::new(graph);
+        exec.register_node(a, Box::new(Tally(runs.clone())));
+        exec.register_node(b, Box::new(Tally(runs.clone())));
+
+        // Unconnected, so the order is by id.
+        exec.execute_dirty().expect("pass");
+        assert_eq!(runs.lock().expect("log").clone(), vec![a, b]);
+
+        // b feeds a now, so a has to wait for it.
+        runs.lock().expect("log").clear();
+        exec.graph.add_edge(make_edge(b, "value", a, "in"));
+        exec.mark_dirty(a);
+        exec.mark_dirty(b);
+        exec.execute_dirty().expect("pass");
+        assert_eq!(runs.lock().expect("log").clone(), vec![b, a]);
     }
 }
