@@ -246,6 +246,8 @@ impl App {
             #[cfg(not(target_arch = "wasm32"))]
             Box::new(CapturePlugin),
             #[cfg(not(target_arch = "wasm32"))]
+            Box::new(zeughaus_db::DbPlugin),
+            #[cfg(not(target_arch = "wasm32"))]
             Box::new(LlmPlugin),
         ];
         let catalog: Vec<NodeDefinition> = plugins.iter().flat_map(|p| p.node_catalog()).collect();
@@ -613,6 +615,8 @@ impl App {
         // A boundary node spawned inside a container is a new pin on it.
         self.refresh_container_pins(self.current_graph);
         #[cfg(not(target_arch = "wasm32"))]
+        self.derive_db_params(id);
+        #[cfg(not(target_arch = "wasm32"))]
         self.push_node(id);
         self.autosave();
     }
@@ -665,6 +669,10 @@ impl App {
         if let Some(e) = self.edges.last() {
             self.push_edge(e);
         }
+        // A table wired into a `table` pin is the column list the target works
+        // from.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.derive_db_params(to_node);
         self.update_display_values();
         self.autosave();
     }
@@ -716,6 +724,10 @@ impl App {
             self.particles.remove(&edge.id);
             #[cfg(not(target_arch = "wasm32"))]
             self.push_edge_remove(edge.id);
+            // A table pin that lost its wire is a column list that no longer
+            // applies.
+            #[cfg(not(target_arch = "wasm32"))]
+            self.derive_db_params(to_node);
             self.update_display_values();
             self.autosave();
         }
@@ -1686,6 +1698,10 @@ impl App {
                 if key == "name" {
                     self.refresh_boundary_owner(id);
                 }
+                // A database's path reaches its children, a table's columns
+                // reach everything it feeds.
+                #[cfg(not(target_arch = "wasm32"))]
+                self.derive_db_dependents(id);
                 #[cfg(not(target_arch = "wasm32"))]
                 self.push_params(id);
                 self.autosave();
@@ -2326,6 +2342,12 @@ impl App {
         // The node an edge was waiting for may have been in this very batch.
         self.resolve_pending_edges();
         self.applying_remote = false;
+        // After the guard, not during: deriving a database node's parameters is
+        // this editor's own decision and has to reach the store, which
+        // `push_params` refuses while a remote change is being applied. It is
+        // also the whole batch that decides the answer -- the table a node
+        // reads its columns from may have arrived in it.
+        self.derive_all_db_params();
     }
 
     fn apply_sync_event(&mut self, ev: crate::sync::SyncEvent) {
@@ -2375,6 +2397,145 @@ impl App {
         // A boundary node arriving from another window is a pin its container
         // gains here, and a renamed one is a pin that changed name.
         self.refresh_container_pins(NodeId(nd.parent));
+        // The database parameters this node needs are derived once the whole
+        // batch has been applied (`derive_all_db_params`): they have to reach
+        // the store, and `push_params` is silent while a remote change is
+        // being applied.
+    }
+
+    /// A node's setting value, or the default its type declares.
+    fn setting_or_default(&self, node: NodeId, key: &str) -> String {
+        let default = || {
+            self.nodes
+                .get(&node)
+                .and_then(|n| n.settings.iter().find(|s| &*s.name == key))
+                .map(|s| s.default.to_string())
+                .unwrap_or_default()
+        };
+        self.node_settings
+            .get(&node)
+            .and_then(|s| s.get(key))
+            .cloned()
+            .unwrap_or_else(default)
+    }
+
+    /// Fills in the parameters a database node cannot know by itself: which
+    /// file it works on, and the columns of the table it is wired to.
+    ///
+    /// Derived rather than typed twice. A node inside a `db.database` works on
+    /// that database, and an insert wired to a table has that table's columns
+    /// -- restating either by hand is a chance for the two to disagree. They
+    /// are ordinary parameters from the runner's point of view, so nothing on
+    /// that side has to know they were derived.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn derive_db_params(&mut self, node: NodeId) {
+        let Some(type_id) = self.nodes.get(&node).map(|n| n.type_id.clone()) else {
+            return;
+        };
+        if !type_id.starts_with("db.") {
+            return;
+        }
+        let mut derived: Vec<(String, String)> = Vec::new();
+
+        let parent = self.nodes.get(&node).map(|n| n.parent).unwrap_or(NodeId(0));
+        // An empty path is the honest answer for a node outside a database:
+        // the node reports that instead of creating a file somewhere.
+        let path = if self
+            .nodes
+            .get(&parent)
+            .is_some_and(|p| p.type_id == "db.database")
+        {
+            self.setting_or_default(parent, "path")
+        } else {
+            String::new()
+        };
+        derived.push((zeughaus_db::DB_PATH.to_string(), path));
+
+        if matches!(type_id.as_str(), "db.insert" | "db.query") {
+            let source = self
+                .edges
+                .iter()
+                .find(|e| e.to_node == node && e.to_pin.as_str() == "table")
+                .map(|e| e.from_node)
+                .filter(|from| {
+                    self.nodes
+                        .get(from)
+                        .is_some_and(|n| n.type_id == "db.table")
+                });
+            let columns = source
+                .map(|table| self.setting_or_default(table, "columns"))
+                .unwrap_or_default();
+            derived.push(("columns".to_string(), columns));
+        }
+
+        let mut changed = false;
+        for (key, value) in derived {
+            if self
+                .node_settings
+                .get(&node)
+                .and_then(|s| s.get(&key))
+                .is_some_and(|current| *current == value)
+            {
+                continue;
+            }
+            self.node_settings
+                .entry(node)
+                .or_default()
+                .insert(key.clone(), value.clone());
+            let _ = self.executor.set_parameter(node, &key, Value::new(value));
+            changed = true;
+        }
+        if changed {
+            // The column list decides an insert's pins, and the store carries
+            // the parameter to the runner, which derives nothing itself.
+            self.refresh_node_pins(node);
+            self.push_params(node);
+        }
+    }
+
+    /// Re-derives the database parameters of every node that depends on this
+    /// one: the children of a database, and everything a table feeds.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn derive_db_dependents(&mut self, node: NodeId) {
+        let Some(type_id) = self.nodes.get(&node).map(|n| n.type_id.clone()) else {
+            return;
+        };
+        let dependents: Vec<NodeId> = match type_id.as_str() {
+            "db.database" => self.children(node).map(|child| child.id).collect(),
+            "db.table" => self
+                .edges
+                .iter()
+                .filter(|e| e.from_node == node && e.to_pin.as_str() == "table")
+                .map(|e| e.to_node)
+                .collect(),
+            _ => return,
+        };
+        for dependent in dependents {
+            self.derive_db_params(dependent);
+        }
+    }
+
+    /// Re-derives every database node's parameters.
+    ///
+    /// Cheap and idempotent: a node whose derived values are unchanged writes
+    /// nothing. Called once per applied batch, because a batch can move any of
+    /// the three things the answer depends on -- the node's parent, a
+    /// database's path, a table's columns.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn derive_all_db_params(&mut self) {
+        let database_nodes: Vec<NodeId> = self
+            .node_order
+            .iter()
+            .filter(|id| {
+                self.nodes
+                    .get(id)
+                    .is_some_and(|node| node.type_id.starts_with("db."))
+            })
+            .copied()
+            .collect();
+        for node in database_nodes {
+            self.derive_db_params(node);
+        }
     }
 
     fn apply_params(&mut self, id: NodeId, type_id: &str, params: &[(String, String)]) {

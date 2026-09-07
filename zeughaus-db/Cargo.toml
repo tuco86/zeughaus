@@ -1,0 +1,14 @@
+[package]
+name = "zeughaus-db"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zeughaus-core.workspace = true
+# `bundled` compiles SQLite in: a workbench must not depend on which sqlite the
+# host happens to have, and the database this plugin writes is a plain file the
+# user can open with anything else.
+rusqlite = { version = "0.40", features = ["bundled"] }
+# Query results leave as text, because the graph carries scalars and a row set
+# is neither a scalar nor worth a nominal type yet.
+serde_json = "1.0"

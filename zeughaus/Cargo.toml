@@ -23,6 +23,9 @@ serde_json = "1.0"
 # native file dialog, and the tokio executor iced needs for its timers.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 zeughaus-capture.workspace = true
+# SQLite tables, inserts and queries as nodes. Native only: it links SQLite and
+# opens files, neither of which a browser editor can do.
+zeughaus-db.workspace = true
 zeughaus-llm.workspace = true
 rfd = "0.15"
 # `image` decodes/uploads raw RGBA frames (screen capture -> Display node).
