@@ -7180,6 +7180,7 @@ dependencies = [
  "zeughaus-graph",
  "zeughaus-llm",
  "zeughaus-ml",
+ "zeughaus-record",
  "zeughaus-runtime",
  "zeughaus-samples",
  "zeughaus-sync",
@@ -7250,6 +7251,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeughaus-record"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "serde_json",
+ "zeughaus-core",
+]
+
+[[package]]
 name = "zeughaus-runner"
 version = "0.1.0"
 dependencies = [
@@ -7262,6 +7272,7 @@ dependencies = [
  "zeughaus-graph",
  "zeughaus-llm",
  "zeughaus-ml",
+ "zeughaus-record",
  "zeughaus-runtime",
  "zeughaus-samples",
  "zeughaus-sync",

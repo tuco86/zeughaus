@@ -10,6 +10,7 @@ members = [
     "zeughaus-flow",
     "zeughaus-graph",
     "zeughaus-db",
+    "zeughaus-record",
     "zeughaus-sync",
     "zeughaus-samples",
     "zeughaus-runner",
@@ -34,6 +35,7 @@ zeughaus-ml = { path = "zeughaus-ml" }
 zeughaus-flow = { path = "zeughaus-flow" }
 zeughaus-graph = { path = "zeughaus-graph" }
 zeughaus-db = { path = "zeughaus-db" }
+zeughaus-record = { path = "zeughaus-record" }
 zeughaus-sync = { path = "zeughaus-sync" }
 zeughaus-samples = { path = "zeughaus-samples" }
 # The QUIC sample transport lives in a sibling checkout: frames are streams, and

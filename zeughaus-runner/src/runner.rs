@@ -102,6 +102,7 @@ impl Runner {
             Box::new(zeughaus_graph::GraphPlugin),
             Box::new(zeughaus_capture::CapturePlugin),
             Box::new(zeughaus_db::DbPlugin),
+            Box::new(zeughaus_record::RecordPlugin),
             Box::new(zeughaus_llm::LlmPlugin),
         ];
         let converters = Arc::new({

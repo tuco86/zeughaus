@@ -1,0 +1,13 @@
+[package]
+name = "zeughaus-record"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zeughaus-core.workspace = true
+# PNG only, as in the capture plugin: a recording is frames plus scalars, and
+# the default feature set would pull every codec in the crate in for nothing.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# The index is one JSON object per line, so a dataset can be read by anything
+# that can read a line.
+serde_json = "1.0"

@@ -248,6 +248,8 @@ impl App {
             #[cfg(not(target_arch = "wasm32"))]
             Box::new(zeughaus_db::DbPlugin),
             #[cfg(not(target_arch = "wasm32"))]
+            Box::new(zeughaus_record::RecordPlugin),
+            #[cfg(not(target_arch = "wasm32"))]
             Box::new(LlmPlugin),
         ];
         let catalog: Vec<NodeDefinition> = plugins.iter().flat_map(|p| p.node_catalog()).collect();
