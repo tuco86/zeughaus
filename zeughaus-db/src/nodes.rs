@@ -407,11 +407,15 @@ impl ExecutableNode for TableNode {
         };
         match name {
             DB_PATH => self.db_path = text.trim().to_string(),
+            // A cleared name used to be dropped in silence: the field showed
+            // nothing while the node kept the old name and went on writing
+            // that table. Refusing it says so where it was typed.
             "name" => {
                 let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    self.name = trimmed.to_string();
+                if trimmed.is_empty() {
+                    return Err(rejected("a table needs a name"));
                 }
+                self.name = trimmed.to_string();
             }
             // The pins follow the columns, which is why this node has to be
             // asked for them again after a setting changed
@@ -1272,6 +1276,24 @@ mod tests {
         // An absurd one is capped rather than refused: the intent is clear.
         set(&mut node, "limit", "999999");
         assert!(node.sql("samples").ends_with("LIMIT 10000"));
+    }
+
+    /// A table's name is refused where it is typed rather than dropped: an
+    /// emptied field used to leave the node writing the old table with
+    /// nothing on screen to say which one that was.
+    #[test]
+    fn an_empty_table_name_is_refused() {
+        let mut node = TableNode::new();
+        set(&mut node, "name", "samples");
+
+        for bad in ["", "   "] {
+            let error = node
+                .set_parameter("name", Value::new(bad.to_string()))
+                .expect_err("refused");
+            assert!(matches!(error, ZeughausError::InvalidParameter(_)), "{bad}");
+            assert!(error.to_string().contains("a table needs a name"));
+        }
+        assert!(node.ddl().contains("\"samples\""));
     }
 
     /// A statement that returns no rows still reports what it did.
