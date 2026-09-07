@@ -57,6 +57,11 @@ const PARTICLE_MIN_GAP: std::time::Duration = std::time::Duration::from_millis(1
 #[cfg(not(target_arch = "wasm32"))]
 const PARTICLES_PER_EDGE: usize = 32;
 
+/// How long a status-bar hint stays. Long enough to read one sentence after
+/// the drop that produced it, short enough that it is gone before the next
+/// thing the user tries.
+const HINT_LIFETIME: std::time::Duration = std::time::Duration::from_secs(3);
+
 pub struct EditorNode {
     pub id: NodeId,
     pub type_id: String,
@@ -250,6 +255,11 @@ pub struct App {
 
     // Status bar
     last_error: String,
+    /// A sentence about something the editor just turned down, and when it was
+    /// said. Shown in the status bar until [`HINT_LIFETIME`] has passed: a
+    /// refused wire is worth one sentence and nothing more, and a notice that
+    /// stays becomes furniture nobody reads.
+    hint: Option<(String, iced::time::Instant)>,
 
     // Command palette state
     palette_open: bool,
@@ -467,6 +477,7 @@ impl App {
             node_settings: HashMap::new(),
             window_size: crate::WINDOW_SIZE,
             last_error: String::new(),
+            hint: None,
             palette_open: false,
             palette_input: String::new(),
             palette_selected: 0,
@@ -1348,6 +1359,57 @@ impl App {
             .pin_defs
             .iter()
             .find(|p| &*p.name == pin)
+    }
+
+    /// Why the wire between these two pins was turned down, in one sentence,
+    /// or `None` if these rules would have allowed it after all.
+    ///
+    /// The same [`wire_refusal`] `can_connect` asks, so the sentence names the
+    /// rule that actually refused the drop. What differs is where the two get
+    /// their facts: the widget hands `can_connect` the occupancy it knows, and
+    /// a refused drop arrives as bare ids, so occupancy is read off the edges
+    /// this window holds.
+    fn refusal_sentence(&self, from: &PinRef<GraphIds>, to: &PinRef<GraphIds>) -> Option<String> {
+        let from_id = NodeId(from.node_id);
+        let to_id = NodeId(to.node_id);
+        let closes_cycle = |from_is_output: bool| {
+            let (source, target) = if from_is_output {
+                (from_id, to_id)
+            } else {
+                (to_id, from_id)
+            };
+            flow_reaches(&self.edge_index, target, source)
+        };
+        wire_refusal(&Wire {
+            same_node: from_id == to_id,
+            from: self.pin_def(from_id, from.pin_id.as_str()),
+            to: self.pin_def(to_id, to.pin_id.as_str()),
+            from_free: !self.input_taken(from_id, from.pin_id.as_str()),
+            to_free: !self.input_taken(to_id, to.pin_id.as_str()),
+            closes_cycle: &closes_cycle,
+            converters: &self.converters,
+        })
+    }
+
+    /// Whether this pin is an input that already carries a wire.
+    fn input_taken(&self, node: NodeId, pin: &str) -> bool {
+        self.pin_def(node, pin)
+            .is_some_and(|p| p.direction == PinDirection::Input)
+            && self
+                .edges
+                .iter()
+                .any(|e| e.to_node == node && e.to_pin.as_str() == pin)
+    }
+
+    /// Drops the status-bar hint once it has been on screen long enough.
+    fn expire_hint(&mut self) {
+        if self
+            .hint
+            .as_ref()
+            .is_some_and(|(_, said)| said.elapsed() >= HINT_LIFETIME)
+        {
+            self.hint = None;
+        }
     }
 
     /// Whether a node declares this pin as a bidirectional field pin.
@@ -2410,6 +2472,15 @@ impl App {
                 #[cfg(not(target_arch = "wasm32"))]
                 return self.reconcile_runtime();
             }
+            Message::ConnectRefused { from, to } => {
+                // The widget says which pair, never why: it only knows that
+                // `can_connect` said no. Re-running the rules here is what
+                // turns that into a sentence, and it is the same call, so the
+                // reason cannot disagree with the refusal.
+                if let Some(reason) = self.refusal_sentence(&from, &to) {
+                    self.hint = Some((reason, iced::time::Instant::now()));
+                }
+            }
             Message::EnterGraph(raw_id) => {
                 let target = NodeId(raw_id);
                 if target == self.current_graph {
@@ -2705,7 +2776,9 @@ impl App {
                 self.window_size = size;
             }
             Message::Tick => {
-                // No-op: re-rendering advances the widget's animation clock.
+                // Re-rendering advances the widget's animation clock; the one
+                // piece of state that ages on its own is the hint.
+                self.expire_hint();
             }
             Message::SyncPoll => {
                 #[cfg(not(target_arch = "wasm32"))]
@@ -2719,6 +2792,7 @@ impl App {
                         store.poll();
                     }
                     self.commit_settled();
+                    self.expire_hint();
                     self.drain_sync();
                     // Also where the runtime endpoint is noticed. A runtime
                     // announces its address by updating its own `runtime` row,
@@ -2839,77 +2913,45 @@ impl App {
             .camera(self.camera_position, self.camera_zoom)
             .can_connect({
                 // With a custom can_connect, iced_nodegraph stops enforcing pin
-                // direction itself, so we must validate it here: exactly one
-                // output and one input, distinct nodes, compatible types --
-                // or, between two field pins, a relation.
+                // direction itself, so every rule lives here -- and in
+                // `wire_refusal`, which is the same rules and the sentence for
+                // each of them. What this closure adds is the lookup: the pin
+                // declarations, the occupancy the widget reports and the
+                // reachability over the real, flat edges.
                 let nodes = &self.nodes;
                 let edge_index = &self.edge_index;
                 let converters = &self.converters;
                 move |from, to| {
                     let from_id = NodeId(*from.node_id());
                     let to_id = NodeId(*to.node_id());
-                    if from_id == to_id {
-                        return false;
-                    }
-                    let (Some(f), Some(t)) = (nodes.get(&from_id), nodes.get(&to_id)) else {
-                        return false;
+                    let pin = |node: NodeId, name: &str| {
+                        nodes
+                            .get(&node)?
+                            .pin_defs
+                            .iter()
+                            .find(|p| &*p.name == name)
                     };
-                    let from_pin = f
-                        .pin_defs
-                        .iter()
-                        .find(|p| &*p.name == from.pin_id().as_str());
-                    let to_pin = t.pin_defs.iter().find(|p| &*p.name == to.pin_id().as_str());
-                    let (Some(fp), Some(tp)) = (from_pin, to_pin) else {
-                        return false;
+                    let closes_cycle = |from_is_output: bool| {
+                        let (source, target) = if from_is_output {
+                            (from_id, to_id)
+                        } else {
+                            (to_id, from_id)
+                        };
+                        flow_reaches(edge_index, target, source)
                     };
-                    // Two field pins are a relation: it carries nothing, so
-                    // there is no direction to respect and no occupancy to
-                    // check -- one primary key is referenced by many. Only the
-                    // type has to agree, which keeps a field pin from
-                    // swallowing an unrelated bidirectional pin.
-                    if fp.direction == PinDirection::Both && tp.direction == PinDirection::Both {
-                        return fp.ty == tp.ty;
-                    }
-                    // Anything else must be one output and one input, so a
-                    // field pin wired to a data pin is refused: a value has
-                    // nowhere to go on a pin that is not an endpoint of flow.
-                    let opposite = (fp.direction == PinDirection::Output
-                        && tp.direction == PinDirection::Input)
-                        || (fp.direction == PinDirection::Input
-                            && tp.direction == PinDirection::Output);
-                    if !opposite {
-                        return false;
-                    }
-                    // Single-slot inputs: reject a second edge here instead of
-                    // silently dropping the existing one on connect. The widget
-                    // excludes the edge being dragged from occupancy, so
-                    // re-routing a wire back onto its own input still passes.
-                    if !input_not_occupied(from) || !input_not_occupied(to) {
-                        return false;
-                    }
-                    // Converters are directional (output type -> input type), so
-                    // resolve which side is the output before checking.
-                    let (out_pin, in_pin, source, target) = if fp.direction == PinDirection::Output
-                    {
-                        (fp, tp, from_id, to_id)
-                    } else {
-                        (tp, fp, to_id, from_id)
-                    };
-                    // A wire whose target already feeds its source closes a
-                    // cycle. The runtime survives one now -- it runs the
-                    // acyclic part -- but a component that quietly stops is
-                    // not what the user asked for, and the drop is the one
-                    // moment where saying no needs no explanation.
-                    //
-                    // Over the real edges, which are flat: a cycle that runs
-                    // through a subgraph boundary is a cycle the executor sees,
-                    // whatever the canvas draws it as.
-                    if flow_reaches(edge_index, target, source) {
-                        return false;
-                    }
-                    converters.compatible(&out_pin.ty, &in_pin.ty)
+                    wire_refusal(&Wire {
+                        same_node: from_id == to_id,
+                        from: pin(from_id, from.pin_id().as_str()),
+                        to: pin(to_id, to.pin_id().as_str()),
+                        from_free: input_not_occupied(from),
+                        to_free: input_not_occupied(to),
+                        closes_cycle: &closes_cycle,
+                        converters,
+                    })
+                    .is_none()
                 }
-            });
+            })
+            .on_connect_refused(|from, to| Message::ConnectRefused { from, to });
 
         for id in &self.node_order {
             if let Some(node) = self.nodes.get(id) {
@@ -3076,9 +3118,8 @@ impl App {
             graph_area
         };
 
-        // Status bar. A failing node outranks the last UI notice: broken data is
-        // the more urgent thing to say. Node errors are not computed here -- they
-        // arrive with the runtime's published state, like every other value.
+        // Status bar. Node errors are not computed here -- they arrive with the
+        // runtime's published state, like every other value.
         let error = {
             let node_error = self.node_error_summary();
             if node_error.is_empty() {
@@ -3087,26 +3128,28 @@ impl App {
                 node_error
             }
         };
-        let status_text = if error.is_empty() {
-            format!(
-                "  {} nodes | {} edges{}",
-                self.nodes.len(),
-                self.edges.len(),
-                self.runtime_text(),
+        // A hint outranks a failing node for the few seconds it lasts: it is
+        // the answer to something the user just did, and a graph almost always
+        // has something failing in it, which would leave the answer unread.
+        let hint = self.hint.as_ref().map(|(text, _)| text.as_str());
+        let head = format!(
+            "  {} nodes | {} edges{}",
+            self.nodes.len(),
+            self.edges.len(),
+            self.runtime_text(),
+        );
+        let (status_text, error_color) = if let Some(hint) = hint {
+            (
+                format!("{head} | {hint}"),
+                Color::from_rgb(0.9, 0.75, 0.35),
+            )
+        } else if !error.is_empty() {
+            (
+                format!("{head} | ERROR: {error}"),
+                Color::from_rgb(0.9, 0.3, 0.3),
             )
         } else {
-            format!(
-                "  {} nodes | {} edges{} | ERROR: {error}",
-                self.nodes.len(),
-                self.edges.len(),
-                self.runtime_text(),
-            )
-        };
-
-        let error_color = if error.is_empty() {
-            Color::from_rgb(0.5, 0.5, 0.5)
-        } else {
-            Color::from_rgb(0.9, 0.3, 0.3)
+            (head, Color::from_rgb(0.5, 0.5, 0.5))
         };
 
         let status_bar = container(text(status_text).size(12).color(error_color))
@@ -3215,6 +3258,16 @@ impl App {
         if !self.failing_nodes().is_empty() {
             subs.push(
                 iced::time::every(std::time::Duration::from_millis(33)).map(|_| Message::Tick),
+            );
+        }
+
+        // A hint ages out on its own, so it needs a clock of its own: the
+        // error tick only runs while a node is failing, and the sync poll only
+        // while a store is connected.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.hint.is_some() {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(250)).map(|_| Message::Tick),
             );
         }
 
@@ -3934,6 +3987,89 @@ fn flow_reaches(index: &HashMap<NodeId, NodeEdges>, start: NodeId, goal: NodeId)
         }
     }
     false
+}
+
+/// Everything the connection rules read about one attempted wire.
+///
+/// The rules run twice: once while a cable is being dragged, to decide whether
+/// the pin under the cursor is a target at all, and once when a drag ends over
+/// a pin that was not ([`Message::ConnectRefused`]). They have to agree, so
+/// both ask [`wire_refusal`] and this is what it is given.
+pub struct Wire<'a> {
+    /// Whether both ends are on the same node.
+    pub same_node: bool,
+    /// What each end's node declares for the pin, `None` when it declares no
+    /// such pin any more.
+    pub from: Option<&'a PinDefinition>,
+    pub to: Option<&'a PinDefinition>,
+    /// Whether each end, if it is a single-slot input, is still free. The
+    /// widget excludes the cable being dragged, so re-routing a wire onto its
+    /// own input is free.
+    pub from_free: bool,
+    pub to_free: bool,
+    /// Whether the wire would close a dataflow loop. Asked with `true` when
+    /// the `from` end is the output, because the answer depends on which way
+    /// the value would travel.
+    pub closes_cycle: &'a dyn Fn(bool) -> bool,
+    /// Which output type reaches which input type, directly or by conversion.
+    pub converters: &'a TypeConverters,
+}
+
+/// Why this wire is refused, or `None` when it is allowed.
+///
+/// One function for the verdict and the sentence: a refusal the user reads has
+/// to be the reason the drop was actually turned down, and two copies of these
+/// rules would drift the first time one of them changed.
+pub fn wire_refusal(wire: &Wire<'_>) -> Option<String> {
+    let (Some(from), Some(to)) = (wire.from, wire.to) else {
+        return Some("that pin is no longer there".to_string());
+    };
+    let both_fields =
+        from.direction == PinDirection::Both && to.direction == PinDirection::Both;
+    if wire.same_node {
+        return Some(if both_fields {
+            "a table cannot reference itself".to_string()
+        } else {
+            "a node cannot feed itself".to_string()
+        });
+    }
+    // Two field pins are a relation: it carries nothing, so there is no
+    // direction to respect and no occupancy to check -- one primary key is
+    // referenced by many. Only the type has to agree.
+    if both_fields {
+        return (from.ty != to.ty).then(|| {
+            format!(
+                "{} and {} fields cannot be related",
+                from.ty, to.ty
+            )
+        });
+    }
+    // A field pin wired to a data pin: a value has nowhere to go on a pin that
+    // is not an endpoint of flow.
+    if from.direction == PinDirection::Both || to.direction == PinDirection::Both {
+        return Some("a field only relates to another field".to_string());
+    }
+    let from_is_output = from.direction == PinDirection::Output;
+    if from.direction == to.direction {
+        return Some(if from_is_output {
+            "two outputs cannot be wired together".to_string()
+        } else {
+            "two inputs cannot be wired together".to_string()
+        });
+    }
+    if !wire.from_free || !wire.to_free {
+        return Some("that input already has a wire".to_string());
+    }
+    if (wire.closes_cycle)(from_is_output) {
+        return Some("that wire would close a loop".to_string());
+    }
+    let (out, into) = if from_is_output {
+        (from, to)
+    } else {
+        (to, from)
+    };
+    (!wire.converters.compatible(&out.ty, &into.ty))
+        .then(|| format!("nothing converts {} into {}", out.ty, into.ty))
 }
 
 /// The containers between the root graph and `graph`, outermost first.
@@ -4674,6 +4810,107 @@ mod tests {
             .find(|(id, _)| id.0 == node)
             .map(|(_, p)| *p)
             .unwrap_or_else(|| panic!("node {node} was not placed"))
+    }
+
+    /// Every refusal the drop can meet, and the sentence it produces. The
+    /// widget only reports the pair, so this function is the whole of what the
+    /// user is told -- and the whole of what `can_connect` decides.
+    #[test]
+    fn a_refused_wire_names_the_rule_that_refused_it() {
+        let converters = TypeConverters::with_builtins();
+        let never = |_: bool| false;
+        let always = |_: bool| true;
+        let out = PinDefinition::output("out", Ty::Int);
+        let out_str = PinDefinition::output("out", Ty::Str);
+        let input = PinDefinition::input("a", Ty::Int, PinKind::Sample);
+        let field_int = PinDefinition::field("id", Ty::Int);
+        let field_str = PinDefinition::field("name", Ty::Str);
+        let wire = |from, to, same_node, from_free, to_free, cycle: &dyn Fn(bool) -> bool| {
+            wire_refusal(&Wire {
+                same_node,
+                from,
+                to,
+                from_free,
+                to_free,
+                closes_cycle: cycle,
+                converters: &converters,
+            })
+        };
+
+        // What is allowed says nothing.
+        assert_eq!(
+            wire(Some(&out), Some(&input), false, true, true, &never),
+            None
+        );
+        assert_eq!(
+            wire(
+                Some(&field_int),
+                Some(&field_int),
+                false,
+                true,
+                true,
+                &never
+            ),
+            None
+        );
+
+        // A relation onto the same table, and a value onto its own node, are
+        // two different sentences about the same mistake.
+        assert_eq!(
+            wire(Some(&field_int), Some(&field_str), true, true, true, &never),
+            Some("a table cannot reference itself".to_string())
+        );
+        assert_eq!(
+            wire(Some(&out), Some(&input), true, true, true, &never),
+            Some("a node cannot feed itself".to_string())
+        );
+
+        assert_eq!(
+            wire(
+                Some(&field_int),
+                Some(&field_str),
+                false,
+                true,
+                true,
+                &never
+            ),
+            Some("int and str fields cannot be related".to_string())
+        );
+        assert_eq!(
+            wire(Some(&field_int), Some(&input), false, true, true, &never),
+            Some("a field only relates to another field".to_string())
+        );
+        assert_eq!(
+            wire(Some(&out), Some(&out), false, true, true, &never),
+            Some("two outputs cannot be wired together".to_string())
+        );
+        assert_eq!(
+            wire(Some(&input), Some(&input), false, true, true, &never),
+            Some("two inputs cannot be wired together".to_string())
+        );
+        assert_eq!(
+            wire(Some(&out), Some(&input), false, true, false, &never),
+            Some("that input already has a wire".to_string())
+        );
+        assert_eq!(
+            wire(Some(&out), Some(&input), false, true, true, &always),
+            Some("that wire would close a loop".to_string())
+        );
+        // No converter between the two types, named by type rather than by pin.
+        let opaque = PinDefinition::output("table", Ty::opaque("db.table"));
+        assert_eq!(
+            wire(Some(&opaque), Some(&input), false, true, true, &never),
+            Some("nothing converts db.table into int".to_string())
+        );
+        assert_eq!(
+            wire(Some(&out_str), Some(&input), false, true, true, &never),
+            Some("nothing converts str into int".to_string())
+        );
+        // A pin the node stopped declaring: the drop landed on nothing.
+        assert_eq!(
+            wire(None, Some(&input), false, true, true, &never),
+            Some("that pin is no longer there".to_string())
+        );
     }
 
     /// The layout has to say something for every node, put each one to the

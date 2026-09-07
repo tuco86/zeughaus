@@ -75,6 +75,13 @@ pub enum Message {
         from: PinRef<GraphIds>,
         to: PinRef<GraphIds>,
     },
+    // A cable was released over a pin that is not an accepted target. The
+    // widget reports the pair in drag order and gives no reason; the editor
+    // re-runs its own rules to say which one turned it down.
+    ConnectRefused {
+        from: PinRef<GraphIds>,
+        to: PinRef<GraphIds>,
+    },
     // Show the contents of a container node, or the root graph for id 0. The
     // one navigation the editor has: a subgraph is drawn nowhere else.
     EnterGraph(u64),
