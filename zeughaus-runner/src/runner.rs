@@ -391,8 +391,13 @@ impl Runner {
             return false;
         }
         eprintln!("[runner] firing {id}");
-        // The press itself is the signal; the value only has to arrive.
-        let _ = self.executor.set_parameter(id, "fire", Value::new(true));
+        // The press itself is the signal; the value only has to arrive. A node
+        // that refuses it did not fire, so asking for a pass would report a
+        // press that never happened.
+        if let Err(e) = self.executor.set_parameter(id, "fire", Value::new(true)) {
+            eprintln!("[runner] {id} refused the trigger: {e}");
+            return false;
+        }
         true
     }
 
@@ -471,8 +476,19 @@ impl Runner {
             return;
         }
         for (name, text) in changed {
-            if let Some(value) = param_value(type_id, &text) {
-                let _ = self.executor.set_parameter(id, &name, value);
+            // Two ways a value does not arrive, and a silent one is
+            // indistinguishable from a setting that never reached this process:
+            // the text is not a value of the node's parameter type at all, or
+            // the node refuses it. Either way the node keeps what it had, and
+            // naming the node, the key and the text is what a user needs to
+            // find the field to fix. There is no node-error channel to editors
+            // yet, so this log is the only place it surfaces.
+            let Some(value) = param_value(type_id, &text) else {
+                eprintln!("[runner] {id} ({type_id}): {name} = {text:?} is not a value it takes");
+                continue;
+            };
+            if let Err(e) = self.executor.set_parameter(id, &name, value) {
+                eprintln!("[runner] {id} ({type_id}) refused {name} = {text:?}: {e}");
             }
         }
         // A setting can decide a node's pins (a table's column list is one), so
