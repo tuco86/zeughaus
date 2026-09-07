@@ -15,15 +15,23 @@
 //! Built for the wasm32 module target with `spacetime build` (this crate is
 //! excluded from the native workspace build).
 
-use spacetimedb::{Identity, ReducerContext, Table, log, reducer, table};
+use spacetimedb::{ConnectionId, Identity, ReducerContext, Table, log, reducer, table};
 
-/// A connected editor. `seq` is monotonic, so "lowest seq" is a stable,
+/// One connected runner. `seq` is monotonic, so "lowest seq" is a stable,
 /// server-decided answer to "who executes" that needs no election protocol:
 /// whoever has been here longest owns it, and when they leave the next one
 /// inherits it.
+///
+/// Keyed by CONNECTION, not by identity: every process on one machine loads the
+/// same saved token and is therefore the same identity, so an identity key made
+/// a closing editor delete the running runner's row -- and made the documented
+/// hot standby impossible, because the second runner's `join_runtime` found the
+/// first one's row. The identity stays as a plain column: it says who owns the
+/// process, which is what a future permission check reads.
 #[table(accessor = runtime, name = "runtime", public)]
 pub struct Runtime {
     #[primary_key]
+    pub connection_id: ConnectionId,
     pub identity: Identity,
     #[unique]
     #[auto_inc]
@@ -33,9 +41,6 @@ pub struct Runtime {
     /// Runtime values do not travel through this store -- the store's job is to
     /// say WHERE they travel, and the fingerprint in the URL is what makes that
     /// address trustworthy without distributing a certificate.
-    ///
-    /// Defaulted so gaining the endpoint is an automatic migration: an existing
-    /// session must not have to be deleted for it.
     #[default("")]
     pub addr: String,
 }
@@ -197,20 +202,28 @@ pub fn replace_graph(ctx: &ReducerContext, nodes: Vec<Node>, edges: Vec<Edge>) {
     }
 }
 
-/// Registers the caller as a runtime that wants to run the graph. `seq` is
-/// assigned by the store, so ownership never depends on client clocks or on who
-/// shouts first.
+/// Registers the calling CONNECTION as a runtime that wants to run the graph.
+/// `seq` is assigned by the store, so ownership never depends on client clocks
+/// or on who shouts first.
 ///
-/// Explicitly called by editors rather than hooked to `client_connected`: every
+/// Explicitly called by runners rather than hooked to `client_connected`: every
 /// `spacetime sql` or `spacetime call` is a client too, and one of those holding
 /// the lowest seq would make a CLI invocation the owner of execution -- leaving
 /// every editor waiting for a runtime that is not there.
+///
+/// Two runners on one machine are two connections with one identity, so the
+/// second one joins as a standby instead of finding the first one's row.
 #[reducer]
 pub fn join_runtime(ctx: &ReducerContext) {
-    if ctx.db.runtime().identity().find(ctx.sender()).is_some() {
+    let Some(conn) = ctx.connection_id() else {
+        log::warn!("join_runtime from {} without a connection", ctx.sender());
+        return;
+    };
+    if ctx.db.runtime().connection_id().find(conn).is_some() {
         return;
     }
     ctx.db.runtime().insert(Runtime {
+        connection_id: conn,
         identity: ctx.sender(),
         seq: 0, // auto_inc
         addr: String::new(),
@@ -221,21 +234,29 @@ pub fn join_runtime(ctx: &ReducerContext) {
 /// URL pins the runtime's public-key fingerprint.
 ///
 /// Separate from joining because the address is only known once the listener is
-/// bound, and a runtime is useful before that happens. Only the caller's own
-/// row is touched, so no runtime can redirect an editor somewhere else.
+/// bound, and a runtime is useful before that happens. Only the calling
+/// connection's own row is touched, so no runtime can redirect an editor
+/// somewhere else -- not even another process of the same user.
 #[reducer]
 pub fn announce_endpoint(ctx: &ReducerContext, addr: String) {
-    if let Some(mut row) = ctx.db.runtime().identity().find(ctx.sender()) {
+    let Some(conn) = ctx.connection_id() else {
+        return;
+    };
+    if let Some(mut row) = ctx.db.runtime().connection_id().find(conn) {
         row.addr = addr;
-        ctx.db.runtime().identity().update(row);
+        ctx.db.runtime().connection_id().update(row);
     }
 }
 
-/// Drops a runtime when its editor disconnects, which is what hands ownership
+/// Drops a runtime when its connection goes away, which is what hands ownership
 /// to the next one. Nothing else has to be cleaned up: values live in the
 /// runner that computed them, so they leave with it.
+///
+/// By connection, so an editor closing on the same machine -- same identity,
+/// different connection -- leaves the running runner registered.
 #[reducer(client_disconnected)]
 pub fn on_client_disconnected(ctx: &ReducerContext) {
-    ctx.db.runtime().identity().delete(ctx.sender());
+    if let Some(conn) = ctx.connection_id() {
+        ctx.db.runtime().connection_id().delete(conn);
+    }
 }
-

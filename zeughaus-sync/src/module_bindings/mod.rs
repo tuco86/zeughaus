@@ -237,7 +237,7 @@ impl __sdk::DbUpdate for DbUpdate {
             .with_updates_by_pk(|row| &row.id);
         diff.runtime = cache
             .apply_diff_to_table::<Runtime>("runtime", &self.runtime)
-            .with_updates_by_pk(|row| &row.identity);
+            .with_updates_by_pk(|row| &row.connection_id);
 
         diff
     }

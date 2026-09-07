@@ -127,10 +127,11 @@ fn build(
     role: Role,
     tx: Sender<SyncEvent>,
 ) -> Result<DbConnection, String> {
-    // The identity is the token: without reusing it every reconnect is a
-    // different client to the store, which is a new `runtime` row, a new
-    // ownership sequence and -- once anything in the store is owned by an
-    // identity -- a client that cannot touch what it wrote before.
+    // The identity is the token: it says WHO this process is, and once anything
+    // in the store is owned by an identity, a client that came back as a
+    // different one could not touch what it wrote before. Presence is a
+    // separate question -- a `runtime` row belongs to a connection, so a
+    // reconnect joins as a new row with a fresh ownership sequence.
     let store_key = credential_key(uri, module);
     let saved = credentials::File::new(&store_key)
         .load()
@@ -392,16 +393,23 @@ fn params_json(params: &[(String, String)]) -> String {
 /// the graph, a second one is a standby. Only meaningful for a
 /// [`Role::Runtime`] client.
 ///
+/// Compared by CONNECTION, not by identity: two runners on one machine share
+/// the saved token and are therefore one identity, and by identity both of them
+/// would believe they own the graph.
+///
 /// Read from the client cache rather than remembered, so a runtime leaving
 /// hands ownership over without any handshake. While the cache is still empty
 /// (before the first subscription applies) nobody owns anything, which keeps a
 /// starting runner from executing a graph it has not seen yet.
 pub fn is_owner(conn: &DbConnection) -> bool {
+    let Some(me) = conn.try_connection_id() else {
+        return false;
+    };
     conn.db
         .runtime()
         .iter()
         .min_by_key(|r| r.seq)
-        .is_some_and(|r| r.identity == conn.identity())
+        .is_some_and(|r| r.connection_id == me)
 }
 
 /// How many runtimes are connected. An editor uses this to say whether anything

@@ -7,6 +7,7 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
 pub struct Runtime {
+    pub connection_id: __sdk::ConnectionId,
     pub identity: __sdk::Identity,
     pub seq: u64,
     pub addr: String,
@@ -20,6 +21,7 @@ impl __sdk::InModule for Runtime {
 ///
 /// Provides typed access to columns for query building.
 pub struct RuntimeCols {
+    pub connection_id: __sdk::__query_builder::Col<Runtime, __sdk::ConnectionId>,
     pub identity: __sdk::__query_builder::Col<Runtime, __sdk::Identity>,
     pub seq: __sdk::__query_builder::Col<Runtime, u64>,
     pub addr: __sdk::__query_builder::Col<Runtime, String>,
@@ -29,6 +31,7 @@ impl __sdk::__query_builder::HasCols for Runtime {
     type Cols = RuntimeCols;
     fn cols(table_name: &'static str) -> Self::Cols {
         RuntimeCols {
+            connection_id: __sdk::__query_builder::Col::new(table_name, "connection_id"),
             identity: __sdk::__query_builder::Col::new(table_name, "identity"),
             seq: __sdk::__query_builder::Col::new(table_name, "seq"),
             addr: __sdk::__query_builder::Col::new(table_name, "addr"),
@@ -40,7 +43,7 @@ impl __sdk::__query_builder::HasCols for Runtime {
 ///
 /// Provides typed access to indexed columns for query building.
 pub struct RuntimeIxCols {
-    pub identity: __sdk::__query_builder::IxCol<Runtime, __sdk::Identity>,
+    pub connection_id: __sdk::__query_builder::IxCol<Runtime, __sdk::ConnectionId>,
     pub seq: __sdk::__query_builder::IxCol<Runtime, u64>,
 }
 
@@ -48,7 +51,7 @@ impl __sdk::__query_builder::HasIxCols for Runtime {
     type IxCols = RuntimeIxCols;
     fn ix_cols(table_name: &'static str) -> Self::IxCols {
         RuntimeIxCols {
-            identity: __sdk::__query_builder::IxCol::new(table_name, "identity"),
+            connection_id: __sdk::__query_builder::IxCol::new(table_name, "connection_id"),
             seq: __sdk::__query_builder::IxCol::new(table_name, "seq"),
         }
     }

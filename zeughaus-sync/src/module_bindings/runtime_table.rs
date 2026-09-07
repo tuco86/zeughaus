@@ -164,34 +164,34 @@ impl<'ctx> __sdk::WithUpdate for RuntimeTableHandle<'ctx> {
     }
 }
 
-/// Access to the `identity` unique index on the table `runtime`,
+/// Access to the `connection_id` unique index on the table `runtime`,
 /// which allows point queries on the field of the same name
-/// via the [`RuntimeIdentityUnique::find`] method.
+/// via the [`RuntimeConnectionIdUnique::find`] method.
 ///
 /// Users are encouraged not to explicitly reference this type,
 /// but to directly chain method calls,
-/// like `ctx.db.runtime().identity().find(...)`.
-pub struct RuntimeIdentityUnique<'ctx> {
-    imp: __sdk::UniqueConstraintHandle<Runtime, __sdk::Identity>,
+/// like `ctx.db.runtime().connection_id().find(...)`.
+pub struct RuntimeConnectionIdUnique<'ctx> {
+    imp: __sdk::UniqueConstraintHandle<Runtime, __sdk::ConnectionId>,
     phantom: std::marker::PhantomData<&'ctx super::RemoteTables>,
 }
 
 impl<'ctx> RuntimeTableHandle<'ctx> {
-    /// Get a handle on the `identity` unique index on the table `runtime`.
-    pub fn identity(&self) -> RuntimeIdentityUnique<'ctx> {
-        RuntimeIdentityUnique {
+    /// Get a handle on the `connection_id` unique index on the table `runtime`.
+    pub fn connection_id(&self) -> RuntimeConnectionIdUnique<'ctx> {
+        RuntimeConnectionIdUnique {
             imp: self
                 .imp
-                .get_unique_constraint::<__sdk::Identity>("identity"),
+                .get_unique_constraint::<__sdk::ConnectionId>("connection_id"),
             phantom: std::marker::PhantomData,
         }
     }
 }
 
-impl<'ctx> RuntimeIdentityUnique<'ctx> {
-    /// Find the subscribed row whose `identity` column value is equal to `col_val`,
+impl<'ctx> RuntimeConnectionIdUnique<'ctx> {
+    /// Find the subscribed row whose `connection_id` column value is equal to `col_val`,
     /// if such a row is present in the client cache.
-    pub fn find(&self, col_val: &__sdk::Identity) -> Option<Runtime> {
+    pub fn find(&self, col_val: &__sdk::ConnectionId) -> Option<Runtime> {
         self.imp.find(col_val)
     }
 }
@@ -229,7 +229,7 @@ impl<'ctx> RuntimeSeqUnique<'ctx> {
 #[doc(hidden)]
 pub(super) fn register_table(client_cache: &mut __sdk::ClientCache<super::RemoteModule>) {
     let _table = client_cache.get_or_make_table::<Runtime>("runtime");
-    _table.add_unique_constraint::<__sdk::Identity>("identity", |row| &row.identity);
+    _table.add_unique_constraint::<__sdk::ConnectionId>("connection_id", |row| &row.connection_id);
     _table.add_unique_constraint::<u64>("seq", |row| &row.seq);
 }
 
