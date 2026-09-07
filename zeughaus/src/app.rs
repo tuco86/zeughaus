@@ -67,6 +67,11 @@ pub struct EditorNode {
     /// The container node this node lives inside, `NodeId(0)` for the root
     /// graph. Only the editor knows about it: the executor stays flat.
     pub parent: NodeId,
+    /// Whether this node type holds a subgraph, read off the catalog once when
+    /// the node is inserted. A node type never changes, and `view` asked per
+    /// drawn node per frame -- each answer a linear scan of the whole plugin
+    /// catalog comparing strings.
+    pub is_container: bool,
 }
 
 pub struct EditorEdge {
@@ -135,6 +140,13 @@ pub struct App {
     executor: GraphExecutor,
     plugins: Vec<Box<dyn DomainPlugin>>,
     catalog: Vec<NodeDefinition>,
+    /// The palette's command list, built once from the catalog.
+    ///
+    /// The catalog is fixed at startup -- plugins are registered in `new` and
+    /// never again -- so this used to be one `String` per catalog entry
+    /// rebuilt on every redraw while the palette was open, i.e. per keystroke
+    /// and per sync poll. Search filtering stays dynamic; it reads this list.
+    palette_commands: Vec<iced_palette::Command<Message>>,
     /// Type converters built from the plugins. Shared with the executor; used
     /// here for connection validation so the editor and runtime agree on which
     /// type pairs may connect.
@@ -327,6 +339,7 @@ impl App {
             cameras: HashMap::new(),
             executor,
             plugins,
+            palette_commands: palette::build_commands(&catalog),
             catalog,
             converters,
             display_values: HashMap::new(),
@@ -463,7 +476,7 @@ impl App {
         let Some(node) = self.nodes.get(&container) else {
             return;
         };
-        if !self.is_container(&node.type_id) {
+        if !node.is_container {
             return;
         }
         let boundaries: Vec<(NodeId, bool)> = self
@@ -509,8 +522,7 @@ impl App {
         pin: &PinLabel,
         is_source: bool,
     ) -> Option<(NodeId, PinLabel)> {
-        let type_id = &self.nodes.get(&node)?.type_id;
-        if !self.is_container(type_id) {
+        if !self.nodes.get(&node)?.is_container {
             return Some((node, pin.clone()));
         }
         let wanted = if is_source {
@@ -623,6 +635,7 @@ impl App {
                 pin_defs,
                 settings: setting_defs,
                 parent: self.current_graph,
+                is_container: self.is_container(type_id),
             },
         );
         self.node_order.push(id);
@@ -1688,6 +1701,7 @@ impl App {
                 pin_defs,
                 settings: setting_defs,
                 parent: NodeId(node_data.parent),
+                is_container: self.is_container(&node_data.type_id),
             },
         );
         self.node_order.push(id);
@@ -1733,11 +1747,7 @@ impl App {
         let containers: Vec<NodeId> = self
             .node_order
             .iter()
-            .filter(|id| {
-                self.nodes
-                    .get(id)
-                    .is_some_and(|node| self.is_container(&node.type_id))
-            })
+            .filter(|id| self.nodes.get(id).is_some_and(|node| node.is_container))
             .copied()
             .collect();
         for container in containers {
@@ -1788,9 +1798,9 @@ impl App {
         if !self.palette_open {
             return None;
         }
-        let commands = palette::build_commands(&self.catalog);
+        let commands = &self.palette_commands;
         let original_idx =
-            get_filtered_command_index(&self.palette_input, &commands, self.palette_selected)?;
+            get_filtered_command_index(&self.palette_input, commands, self.palette_selected)?;
 
         let cmd = commands.get(original_idx)?;
         if let iced_palette::CommandAction::Message(msg) = &cmd.action {
@@ -1866,7 +1876,7 @@ impl App {
                     || self
                         .nodes
                         .get(&target)
-                        .is_some_and(|node| self.is_container(&node.type_id));
+                        .is_some_and(|node| node.is_container);
                 if !enterable {
                     return Task::none();
                 }
@@ -2324,7 +2334,7 @@ impl App {
                         errors: self.setting_errors.get(id),
                         dim_mask: self.dim_mask(*id, node),
                         size: self.node_sizes.get(id).copied(),
-                        is_container: self.is_container(&node.type_id),
+                        is_container: node.is_container,
                     },
                 );
                 // Per-node activity feedback: red marching-ants on error. There
@@ -2461,8 +2471,11 @@ impl App {
             .into();
 
         let graph_view = if self.palette_open {
-            let commands = palette::build_commands(&self.catalog);
-            let palette_view = palette::view(&self.palette_input, &commands, self.palette_selected);
+            let palette_view = palette::view(
+                &self.palette_input,
+                &self.palette_commands,
+                self.palette_selected,
+            );
             let overlay = container(palette_view)
                 .width(Length::Fill)
                 .padding(80.0)
