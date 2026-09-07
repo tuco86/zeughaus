@@ -2851,13 +2851,17 @@ impl App {
 
     // Send: local edits -> reducers. Guarded by `applying_remote` so a change
     // applied from the store does not echo back as a new reducer call.
-
+    //
+    // The sync layer now answers whether the edit reached the store, and
+    // showing that -- an edit the shared graph does not have -- is the
+    // editor's half of the disconnect work, which comes later. Discarded here
+    // on purpose so this window behaves exactly as it did.
     fn push_node(&self, id: NodeId) {
         if self.applying_remote {
             return;
         }
         if let (Some(conn), Some(nd)) = (&self.stdb, self.node_data(id)) {
-            crate::sync::send_create_node(conn, &nd);
+            let _ = crate::sync::send_create_node(conn, &nd);
         }
     }
 
@@ -2866,7 +2870,7 @@ impl App {
             return;
         }
         if let (Some(conn), Some(nd)) = (&self.stdb, self.node_data(id)) {
-            crate::sync::send_set_params(conn, id.0, &nd.params);
+            let _ = crate::sync::send_set_params(conn, id.0, &nd.params);
         }
     }
 
@@ -2875,7 +2879,7 @@ impl App {
             return;
         }
         if let Some(conn) = &self.stdb {
-            crate::sync::send_move_node(conn, id.0, x, y);
+            let _ = crate::sync::send_move_node(conn, id.0, x, y);
         }
     }
 
@@ -2884,7 +2888,7 @@ impl App {
             return;
         }
         if let Some(conn) = &self.stdb {
-            crate::sync::send_delete_node(conn, id.0);
+            let _ = crate::sync::send_delete_node(conn, id.0);
         }
     }
 
@@ -2893,7 +2897,7 @@ impl App {
             return;
         }
         if let Some(conn) = &self.stdb {
-            crate::sync::send_connect_edge(
+            let _ = crate::sync::send_connect_edge(
                 conn,
                 &EdgeData {
                     id: e.id.0,
@@ -2911,7 +2915,7 @@ impl App {
             return;
         }
         if let Some(conn) = &self.stdb {
-            crate::sync::send_disconnect_edge(conn, id.0);
+            let _ = crate::sync::send_disconnect_edge(conn, id.0);
         }
     }
 
@@ -2950,7 +2954,7 @@ impl App {
             self.forget_edge(loser);
             #[cfg(not(target_arch = "wasm32"))]
             if let Some(conn) = &self.stdb {
-                crate::sync::send_disconnect_edge(conn, loser.0);
+                let _ = crate::sync::send_disconnect_edge(conn, loser.0);
             }
         }
         winner == arriving
@@ -2998,6 +3002,10 @@ impl App {
             // The batch may have brought this editor's first look at the
             // runtime table, which is where the endpoint to dial comes from.
             SyncEvent::SubscriptionApplied => {}
+            // The sync layer now reports the connection going away and coming
+            // back, and saying so in the status bar (plus surviving it) is the
+            // editor's half of that change: not wired up yet.
+            SyncEvent::Connected | SyncEvent::Disconnected => {}
         }
     }
 

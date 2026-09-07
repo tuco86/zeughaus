@@ -23,8 +23,7 @@ use zeughaus_runtime::{DeferredWork, Graph, GraphEdge, GraphExecutor, GraphNode}
 use zeughaus_samples::{
     ErrorRow, OutputRow, RuntimeEvent, Snapshot, TOPIC_EDGE, TOPIC_ERROR, TOPIC_OUTPUT,
 };
-use zeughaus_sync::SyncEvent;
-use zeughaus_sync::module_bindings::DbConnection;
+use zeughaus_sync::{Store, SyncEvent};
 
 use crate::feed::FrameRegistry;
 
@@ -32,7 +31,10 @@ use crate::feed::FrameRegistry;
 pub type AsyncResult = Result<HashMap<String, Value>, String>;
 
 pub struct Runner {
-    conn: DbConnection,
+    /// The store connection, and the retry behind it. An `Option` inside,
+    /// because "there is no store right now" is a state this process has to
+    /// handle rather than one it can pretend away.
+    store: Store,
     plugins: Vec<Box<dyn DomainPlugin>>,
     executor: GraphExecutor,
     /// Whether this process currently owns execution. Read back from the store
@@ -96,7 +98,7 @@ pub struct Runner {
 
 impl Runner {
     pub fn new(
-        conn: DbConnection,
+        store: Store,
         frames: Arc<FrameRegistry>,
         publisher: Option<Publisher>,
         snapshot: Arc<Mutex<Snapshot>>,
@@ -132,7 +134,7 @@ impl Runner {
         executor.set_converters(converters);
 
         Self {
-            conn,
+            store,
             plugins,
             executor,
             is_owner: false,
@@ -154,10 +156,27 @@ impl Runner {
         }
     }
 
+    /// Reconnects the store if it went away, so an outage costs this process
+    /// nothing more than the outage.
+    ///
+    /// Called once per turn of the host loop: the retry has to be somebody's
+    /// decision, and it is the loop that also knows when to stop.
+    pub fn poll_store(&mut self) {
+        self.store.poll();
+    }
+
     /// Re-reads who owns execution, and reports the role a human debugging this
     /// process needs before anything else.
     pub fn refresh_ownership(&mut self) {
-        let runners = zeughaus_sync::runtime_count(&self.conn);
+        let Some(conn) = self.store.conn() else {
+            // Without the store this process cannot learn that another runner
+            // took over -- and one has: the module drops a runtime's row when
+            // its client disconnects, so the graph belongs to somebody else by
+            // now. Executing on would be two owners with one graph.
+            self.lose_ownership();
+            return;
+        };
+        let runners = zeughaus_sync::runtime_count(conn);
         if runners == 0 {
             // The runtime table has not reached this client yet, so the store
             // has said nothing about who executes. Staying a non-owner is the
@@ -165,7 +184,7 @@ impl Runner {
             // double-execute a graph another one is already running.
             return;
         }
-        let owner = zeughaus_sync::is_owner(&self.conn);
+        let owner = self.store.conn().is_some_and(zeughaus_sync::is_owner);
         if self.logged_role != Some((owner, runners)) {
             self.logged_role = Some((owner, runners));
             if owner {
@@ -179,24 +198,16 @@ impl Runner {
         if owner == self.is_owner {
             return;
         }
-        self.is_owner = owner;
+        if !owner {
+            self.lose_ownership();
+            return;
+        }
+        self.is_owner = true;
         // Ownership decides where editors are pointed: `owner_endpoint`
         // resolves the *owning* runtime's row, so a standby inheriting
         // execution becomes the row every editor reads and has to be sure its
         // address is in it.
         self.announce_endpoint();
-        if !owner {
-            // The frames this process holds are the last ones it produced.
-            // Another runtime is producing the real ones now, so its viewers
-            // have to be sent away rather than shown a still picture.
-            self.frames.clear();
-            // Nothing this process published is current any more, and the
-            // snapshot it serves must not answer with values it no longer
-            // produces.
-            self.published.clear();
-            self.published.flush(self.seq, &self.snapshot);
-            return;
-        }
         // A new generation of ownership: work this process dispatched under the
         // previous one belongs to a graph another runner has been executing
         // since, so its result is no longer this owner's to apply.
@@ -209,6 +220,24 @@ impl Runner {
         // Nothing was published by this process, so its first pass republishes
         // everything. Values do not live in the store any more, so there is no
         // predecessor's row left behind to diff against and nothing to clear.
+        self.published.clear();
+        self.published.flush(self.seq, &self.snapshot);
+    }
+
+    /// Stops executing: another runtime has the graph, or this process can no
+    /// longer tell that it does not.
+    ///
+    /// One path for both, because what has to happen is the same. The frames
+    /// this process holds are the last ones it produced and another runtime is
+    /// producing the real ones now, so its viewers are sent away rather than
+    /// shown a still picture; and nothing it published is current, so the
+    /// snapshot it serves must not answer with values it no longer produces.
+    fn lose_ownership(&mut self) {
+        if !self.is_owner {
+            return;
+        }
+        self.is_owner = false;
+        self.frames.clear();
         self.published.clear();
         self.published.flush(self.seq, &self.snapshot);
     }
@@ -230,6 +259,15 @@ impl Runner {
                 // resolving an owning runtime with an empty address.
                 self.announce_endpoint();
             }
+            // A reconnect is a new client to the store: a new `runtime` row
+            // with no address in it, and a new position in the ownership
+            // order. Announcing again is what keeps an editor from resolving
+            // an owning runtime it cannot dial.
+            SyncEvent::Connected => self.announce_endpoint(),
+            // The store is gone, so the module has already dropped this
+            // process's `runtime` row and handed the graph to the next runner.
+            // Executing on would be two owners with one graph.
+            SyncEvent::Disconnected => self.lose_ownership(),
         }
     }
 
@@ -745,7 +783,14 @@ impl Runner {
         let Some(url) = &self.endpoint else {
             return;
         };
-        zeughaus_sync::send_announce_endpoint(&self.conn, url);
+        // Nothing to announce to while the store is away; the reconnect
+        // announces again through `SyncEvent::Connected`.
+        let Some(conn) = self.store.conn() else {
+            return;
+        };
+        if let Err(e) = zeughaus_sync::send_announce_endpoint(conn, url) {
+            eprintln!("[runner] {e}");
+        }
     }
 
     /// Hands this pass's frames to the feed server.

@@ -73,7 +73,10 @@ fn main() -> ExitCode {
     let (uri, db, token) = resolve_session(parse_join_arg());
     eprintln!("[runner] session {token} -> {uri} / {db}");
 
-    let (conn, sync_rx) = match zeughaus_sync::connect(&uri, &db, Role::Runtime) {
+    // A `Store` rather than a bare connection: a runner outlives a host
+    // restart, and a dead connection it kept would leave it executing a graph
+    // another runner has taken over.
+    let (store, sync_rx) = match zeughaus_sync::Store::open(&uri, &db, Role::Runtime) {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!(
@@ -161,7 +164,7 @@ fn main() -> ExitCode {
         }
     }
 
-    let mut runner = Runner::new(conn, Arc::clone(&frames), publisher, Arc::clone(&snapshot));
+    let mut runner = Runner::new(store, Arc::clone(&frames), publisher, Arc::clone(&snapshot));
     if let Some(transport) = &transport {
         runner.set_endpoint(transport.url().to_string());
     }
@@ -184,8 +187,11 @@ fn main() -> ExitCode {
         match sync_rx.recv_timeout(runner.next_wait(TICK)) {
             Ok(event) => events.push(event),
             Err(RecvTimeoutError::Timeout) => {}
+            // Every sender is held by the store, which this process owns for
+            // its whole life, so this cannot happen while it is running -- and
+            // if it ever did, nothing would ever be received again.
             Err(RecvTimeoutError::Disconnected) => {
-                eprintln!("[runner] store connection closed, exiting");
+                eprintln!("[runner] the store channel closed, exiting");
                 return ExitCode::FAILURE;
             }
         }
@@ -207,6 +213,10 @@ fn main() -> ExitCode {
         let presses: Vec<u64> = std::iter::from_fn(|| trigger_rx.try_recv().ok())
             .take(MAX_PRESSES_PER_TURN)
             .collect();
+
+        // The store first: an outage costs this process its ownership, and
+        // nothing below should decide anything on a connection that is gone.
+        runner.poll_store();
 
         // Before anything is applied or published: a pass must not run on an
         // ownership this process no longer has.
