@@ -82,6 +82,17 @@ pub struct EditorEdge {
     pub to_pin: PinLabel,
 }
 
+/// The edges on one node, by direction.
+///
+/// The index behind [`App::edge_index`]: without it every arriving value
+/// scanned `App::edges` twice per node, which is O(nodes x edges) at the rate
+/// a capture graph delivers.
+#[derive(Default)]
+struct NodeEdges {
+    outgoing: Vec<EdgeId>,
+    incoming: Vec<EdgeId>,
+}
+
 /// What a node shows inline: either the value rendered as text, or a decoded
 /// image frame.
 ///
@@ -123,6 +134,11 @@ pub struct App {
     nodes: HashMap<NodeId, EditorNode>,
     node_order: Vec<NodeId>,
     edges: Vec<EditorEdge>,
+    /// `edges` grouped by the nodes they touch, rebuilt whenever the edge set
+    /// changes. What a node shows is read from the values on its own edges, and
+    /// that question used to be answered by scanning every edge twice, for
+    /// every node, on every arriving value.
+    edge_index: HashMap<NodeId, NodeEdges>,
     selected: HashSet<NodeId>,
     camera_position: Point,
     camera_zoom: f32,
@@ -332,6 +348,7 @@ impl App {
             nodes: HashMap::new(),
             node_order: Vec::new(),
             edges: Vec::new(),
+            edge_index: HashMap::new(),
             selected: HashSet::new(),
             camera_position: Point::ORIGIN,
             camera_zoom: 1.0,
@@ -700,6 +717,7 @@ impl App {
             to_node,
             to_pin,
         });
+        self.reindex_edges();
         // Seed the new wire from the source's last published output so it shows
         // a value immediately instead of staying blank until the runtime's next
         // publish. Nothing is executed here: this process does not run nodes.
@@ -760,6 +778,7 @@ impl App {
                 && e.to_pin == to_pin
         }) {
             let edge = self.edges.remove(pos);
+            self.reindex_edges();
             self.executor.disconnect_edge(edge.id);
             self.resync_pins(to_node);
             // The wire the particles were riding is gone; without this every
@@ -940,6 +959,7 @@ impl App {
     /// and the particle queue that was riding it.
     fn forget_edge(&mut self, id: EdgeId) {
         self.edges.retain(|e| e.id != id);
+        self.reindex_edges();
         self.executor.disconnect_edge(id);
         #[cfg(not(target_arch = "wasm32"))]
         self.particles.remove(&id);
@@ -1006,6 +1026,7 @@ impl App {
                 to_node,
                 to_pin,
             });
+            self.reindex_edges();
             self.executor.on_edge_added(fresh);
             #[cfg(not(target_arch = "wasm32"))]
             if let Some(e) = self.edges.last() {
@@ -1195,7 +1216,7 @@ impl App {
         }
         let outputs = self.remote_outputs.get(&node).cloned().unwrap_or_default();
         self.executor.set_remote_outputs(node, outputs);
-        self.update_display_values();
+        self.update_displays_from(node);
     }
 
     /// Brings the event subscription and the live feeds in line with what the
@@ -1514,43 +1535,103 @@ impl App {
     #[cfg(target_arch = "wasm32")]
     fn load_autosave(&mut self) {}
 
-    /// Recomputes what each node shows inline from the values on its edges, and
-    /// from the video feeds for the nodes that have one.
+    /// Rebuilds [`Self::edge_index`] from the current edge set.
+    ///
+    /// Called from every place that adds or removes an edge. Rebuilding the
+    /// whole thing is O(edges) and happens on a user action; the index exists
+    /// to keep the O(nodes x edges) scan out of the path a value takes, which
+    /// runs at frame rate.
+    fn reindex_edges(&mut self) {
+        let mut index: HashMap<NodeId, NodeEdges> = HashMap::new();
+        for edge in &self.edges {
+            index
+                .entry(edge.from_node)
+                .or_default()
+                .outgoing
+                .push(edge.id);
+            index
+                .entry(edge.to_node)
+                .or_default()
+                .incoming
+                .push(edge.id);
+        }
+        self.edge_index = index;
+    }
+
+    /// What one node shows inline: the value on one of its own edges, or the
+    /// frame its feed delivered.
     ///
     /// A node shows what it produced; a sink (no outgoing edges) shows what it
     /// received, which is what makes the Display node work. Image frames reuse
     /// the previous `image::Handle` when the pixels are literally the same
     /// buffer, so an unchanged frame is not re-uploaded to the GPU.
+    fn display_for(&self, node_id: NodeId) -> Option<DisplayValue> {
+        // A frame from a feed outranks the edge cache, because for an image
+        // pin the edge cache is empty by design: pixels never travel through
+        // the store, so the feed is the only thing that has the frame.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(frame) = self.feed_frame(node_id) {
+            return Some(self.frame_display(node_id, frame));
+        }
+        let edges = self.edge_index.get(&node_id)?;
+        let value = edges
+            .outgoing
+            .iter()
+            .find_map(|id| self.executor.edge_value(*id))
+            .or_else(|| {
+                edges
+                    .incoming
+                    .iter()
+                    .find_map(|id| self.executor.edge_value(*id))
+            })?;
+        Some(match value.downcast_ref::<Image>() {
+            Some(frame) => self.frame_display(node_id, frame),
+            None => DisplayValue::Text(value.to_string()),
+        })
+    }
+
+    /// Recomputes what every node shows.
+    ///
+    /// For the paths that change the whole picture at once: a graph loaded, a
+    /// snapshot adopted, a runtime gone. A single delivered value uses
+    /// [`Self::update_displays_from`] instead.
     fn update_display_values(&mut self) {
         let mut next: HashMap<NodeId, DisplayValue> = HashMap::new();
         for &node_id in self.nodes.keys() {
-            // A frame from a feed outranks the edge cache, because for an image
-            // pin the edge cache is empty by design: pixels never travel through
-            // the store, so the feed is the only thing that has the frame.
-            #[cfg(not(target_arch = "wasm32"))]
-            if let Some(frame) = self.feed_frame(node_id) {
-                next.insert(node_id, self.frame_display(node_id, frame));
-                continue;
+            if let Some(display) = self.display_for(node_id) {
+                next.insert(node_id, display);
             }
-            let value = self
-                .edges
-                .iter()
-                .filter(|e| e.from_node == node_id)
-                .find_map(|e| self.executor.edge_value(e.id))
-                .or_else(|| {
-                    self.edges
-                        .iter()
-                        .filter(|e| e.to_node == node_id)
-                        .find_map(|e| self.executor.edge_value(e.id))
-                });
-            let Some(value) = value else { continue };
-            let display = match value.downcast_ref::<Image>() {
-                Some(frame) => self.frame_display(node_id, frame),
-                None => DisplayValue::Text(value.to_string()),
-            };
-            next.insert(node_id, display);
         }
         self.display_values = next;
+    }
+
+    /// Recomputes only the displays a value delivered by `node` can change:
+    /// the node itself, and whatever its outgoing edges reach.
+    ///
+    /// Nothing further downstream: a node deeper in the chain shows what it
+    /// produced, and that arrives as its own delivery. This is called once per
+    /// output event, which on a capture graph is 30 times a second. Only the
+    /// sync layer delivers values, so only the native editor needs it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn update_displays_from(&mut self, node: NodeId) {
+        let mut touched: Vec<NodeId> = vec![node];
+        if let Some(edges) = self.edge_index.get(&node) {
+            for id in &edges.outgoing {
+                if let Some(edge) = self.edges.iter().find(|e| e.id == *id) {
+                    touched.push(edge.to_node);
+                }
+            }
+        }
+        for id in touched {
+            match self.display_for(id) {
+                Some(display) => {
+                    self.display_values.insert(id, display);
+                }
+                None => {
+                    self.display_values.remove(&id);
+                }
+            }
+        }
     }
 
     /// A frame's inline display, reusing the cached handle while the pixel
@@ -1712,6 +1793,7 @@ impl App {
         self.nodes.clear();
         self.node_order.clear();
         self.edges.clear();
+        self.edge_index.clear();
         self.const_inputs.clear();
         self.node_settings.clear();
         self.display_values.clear();
@@ -1777,6 +1859,7 @@ impl App {
                 to_pin: PinLabel(to_pin),
             });
         }
+        self.reindex_edges();
 
         // Nothing is executed: a loaded graph shows values only once the
         // runtime publishes them.
@@ -2001,6 +2084,7 @@ impl App {
                             self.particles.remove(&edge.id);
                         }
                         self.edges.retain(|e| e.from_node != id && e.to_node != id);
+                        self.reindex_edges();
                         self.executor.remove_node(id);
                         self.const_inputs.remove(&id);
                         self.node_settings.remove(&id);
@@ -3084,6 +3168,7 @@ impl App {
             self.particles.remove(&edge.id);
         }
         self.edges.retain(|e| e.from_node != id && e.to_node != id);
+        self.reindex_edges();
         self.executor.remove_node(id);
         self.const_inputs.remove(&id);
         self.node_settings.remove(&id);
@@ -3146,6 +3231,7 @@ impl App {
             to_node,
             to_pin: PinLabel(to_pin),
         });
+        self.reindex_edges();
         self.executor.on_edge_added(edge_id);
         self.resync_pins(to_node);
     }
@@ -3154,6 +3240,7 @@ impl App {
         self.pending_edges.retain(|ed| ed.id != id.0);
         if let Some(pos) = self.edges.iter().position(|e| e.id == id) {
             let edge = self.edges.remove(pos);
+            self.reindex_edges();
             self.executor.disconnect_edge(edge.id);
             self.resync_pins(edge.to_node);
             // The wire the particles were riding is gone.
