@@ -32,17 +32,19 @@ fn text_of(value: &Value) -> Option<String> {
 /// The file is the authority on a schema, not the node: what the node declares
 /// is what the user wants, and the difference between the two is the migration.
 fn table_columns(conn: &rusqlite::Connection, table: &str) -> Result<Vec<(String, String)>> {
+    // The statement is generated and always the same shape, so what a failure
+    // has to say is which table it was reading and what SQLite said. A node
+    // error is drawn in the node body, where a pasted statement pushes the
+    // message that explains it out of sight.
+    let failure = |e: rusqlite::Error| failed(format!("cannot read the schema of {table}: {e}"));
     let sql = format!("PRAGMA table_info({})", quote(table));
-    let mut statement = conn
-        .prepare(&sql)
-        .map_err(|e| failed(format!("{sql}: {e}")))?;
+    let mut statement = conn.prepare(&sql).map_err(failure)?;
     let rows = statement
         .query_map([], |row| {
             Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
         })
-        .map_err(|e| failed(format!("{sql}: {e}")))?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| failed(format!("{sql}: {e}")))
+        .map_err(failure)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(failure)
 }
 
 /// The one column a rename turned into another, read off the difference
@@ -262,7 +264,7 @@ impl ExecutableNode for TableNode {
         let conn = open(&self.db_path)?;
         let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute_batch(&ddl)
-            .map_err(|e| failed(format!("{ddl}: {e}")))?;
+            .map_err(|e| failed(format!("cannot create table {}: {e}", self.name)))?;
 
         // A field renamed in the graph is renamed in the file, before the
         // schemas are compared -- otherwise the same edit reads as one column
@@ -284,8 +286,12 @@ impl ExecutableNode for TableNode {
                 quote(&old),
                 quote(&new)
             );
-            conn.execute_batch(&sql)
-                .map_err(|e| failed(format!("{sql}: {e}")))?;
+            conn.execute_batch(&sql).map_err(|e| {
+                failed(format!(
+                    "cannot rename column {old} to {new} in table {}: {e}",
+                    self.name
+                ))
+            })?;
             table_columns(&conn, &self.name)?
         } else {
             table_columns(&conn, &self.name)?
@@ -367,8 +373,12 @@ impl ExecutableNode for TableNode {
                     quote(&relation.target)
                 ));
             }
-            conn.execute_batch(&sql)
-                .map_err(|e| failed(format!("{sql}: {e}")))?;
+            conn.execute_batch(&sql).map_err(|e| {
+                failed(format!(
+                    "cannot add column {name} to table {}: {e}",
+                    self.name
+                ))
+            })?;
         }
 
         ctx.emit("table", Value::new(self.table_ref()));
@@ -536,7 +546,7 @@ impl ExecutableNode for InsertNode {
         let conn = open(&self.db_path)?;
         let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(&sql, rusqlite::params_from_iter(values.iter()))
-            .map_err(|e| failed(format!("{sql}: {e}")))?;
+            .map_err(|e| failed(format!("cannot insert into {}: {e}", table.name)))?;
         self.last_id = conn.last_insert_rowid();
         self.count += 1;
         drop(conn);
