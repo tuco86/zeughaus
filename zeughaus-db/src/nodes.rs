@@ -4,13 +4,11 @@
 //! through [`crate::open`], so which database a node works on is decided by
 //! where it sits, not by what it repeats.
 
-use std::collections::HashMap;
-
 use zeughaus_core::*;
 
 use crate::{
-    ColTy, DB_PATH, TableRef, failed, is_query, open, parse_columns, quote, rows_to_json, table_ty,
-    to_sql,
+    ColTy, DB_PATH, RELATIONS, TableRef, failed, field_ty, is_query, open, parse_columns,
+    parse_relations, quote, rows_to_json, table_ty, to_sql,
 };
 
 /// Reads a parameter's text, whatever scalar form it arrives in.
@@ -82,6 +80,12 @@ impl ExecutableNode for DatabaseNode {
 
 /// A table: its schema, and the `CREATE TABLE` that follows from it.
 ///
+/// The schema is designed in the node. The name is an editable title, the
+/// fields are a row editor, and every field is a bidirectional pin spanning
+/// the node -- so a relation to another table is a wire between two fields
+/// rather than a value on an input. See the crate docs for which end of such
+/// a wire is the referenced one.
+///
 /// Creating is the execution. Schema evolution is deliberately manual -- an
 /// existing table with different columns is an error, not a silent migration,
 /// because guessing which `ALTER` the user meant is how data gets lost.
@@ -89,6 +93,9 @@ pub struct TableNode {
     db_path: String,
     name: String,
     columns: String,
+    /// The relations this table's fields declare, as the editor derived them
+    /// from the wires: one `field -> table.field` per line.
+    relations: String,
     pins: Vec<PinDefinition>,
 }
 
@@ -107,38 +114,40 @@ impl TableNode {
             db_path: String::new(),
             name: Self::DEFAULT_NAME.to_string(),
             columns: Self::DEFAULT_COLUMNS.to_string(),
+            relations: String::new(),
             pins: Vec::new(),
         };
         node.rebuild_pins();
         node
     }
 
-    /// One input per column (a wired [`TableRef`] there is a foreign key), plus
-    /// the handle and the DDL text.
+    /// One bidirectional field pin per field, plus the handle and the DDL text.
     fn rebuild_pins(&mut self) {
         let columns = parse_columns(&self.columns);
         let mut pins = Vec::with_capacity(columns.len() + 2);
         for (name, _) in &columns {
-            pins.push(PinDefinition::input(
-                name.clone(),
-                table_ty(),
-                PinKind::Sample,
-            ));
+            pins.push(PinDefinition::field(name.clone(), field_ty()));
         }
         pins.push(PinDefinition::output("table", table_ty()));
         pins.push(PinDefinition::output("ddl", Ty::Str));
         self.pins = pins;
     }
 
-    /// The `CREATE TABLE` this schema means, including the foreign keys the
-    /// wired columns declare.
+    /// The `CREATE TABLE` this schema means, including the foreign keys its
+    /// relations declare.
     ///
-    /// An `id:int` column becomes `INTEGER PRIMARY KEY`, which is SQLite's
+    /// An `id:int` field becomes `INTEGER PRIMARY KEY`, which is SQLite's
     /// rowid alias: a table a workbench inserts into wants one, and naming it
     /// `id` is the convention the rest of these nodes read.
-    pub fn ddl(&self, references: &HashMap<String, String>) -> String {
+    ///
+    /// A relation naming a field this table does not have is dropped rather
+    /// than emitted: the wire may still be there while the field it started on
+    /// is being renamed, and a `FOREIGN KEY` on a column that is not in the
+    /// statement is a syntax error, not a warning.
+    pub fn ddl(&self) -> String {
         let columns = parse_columns(&self.columns);
-        let mut parts: Vec<String> = Vec::with_capacity(columns.len() + references.len());
+        let relations = parse_relations(&self.relations);
+        let mut parts: Vec<String> = Vec::with_capacity(columns.len() + relations.len());
         for (name, ty) in &columns {
             if name == "id" && *ty == ColTy::Int {
                 parts.push(format!("{} INTEGER PRIMARY KEY", quote(name)));
@@ -146,16 +155,15 @@ impl TableNode {
                 parts.push(format!("{} {}", quote(name), ty.affinity()));
             }
         }
-        // Sorted so the same wiring always produces the same text: the DDL is
-        // an output pin, and a set that reordered itself would look like a
-        // change on every pass.
-        let mut wired: Vec<(&String, &String)> = references.iter().collect();
-        wired.sort();
-        for (column, target) in wired {
+        for relation in &relations {
+            if !columns.iter().any(|(name, _)| *name == relation.field) {
+                continue;
+            }
             parts.push(format!(
-                "FOREIGN KEY({}) REFERENCES {}(id)",
-                quote(column),
-                quote(target)
+                "FOREIGN KEY({}) REFERENCES {}({})",
+                quote(&relation.field),
+                quote(&relation.table),
+                quote(&relation.target)
             ));
         }
         format!(
@@ -174,20 +182,12 @@ impl TableNode {
 }
 
 impl ExecutableNode for TableNode {
-    fn execute(&mut self, inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
+    fn execute(&mut self, _inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
         let columns = parse_columns(&self.columns);
         if columns.is_empty() {
-            return Err(failed("no columns: write one name:type per line"));
+            return Err(failed("no fields: give the table at least one"));
         }
-        // A table wired into a column is that column's foreign key.
-        let references: HashMap<String, String> = columns
-            .iter()
-            .filter_map(|(name, _)| {
-                let target = inputs.get_value(name)?.downcast_ref::<TableRef>()?;
-                Some((name.clone(), target.name.clone()))
-            })
-            .collect();
-        let ddl = self.ddl(&references);
+        let ddl = self.ddl();
 
         let conn = open(&self.db_path)?;
         let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
@@ -230,8 +230,11 @@ impl ExecutableNode for TableNode {
 
     fn settings(&self) -> Vec<SettingDef> {
         vec![
-            SettingDef::new("name", self.name.clone()),
-            SettingDef::new("columns", self.columns.clone()).multiline(),
+            SettingDef::new("name", self.name.clone()).title(),
+            // The type vocabulary travels with the setting, so the editor
+            // renders the row editor without linking this plugin -- which it
+            // cannot do in the browser at all.
+            SettingDef::new("columns", self.columns.clone()).fields(ColTy::NAMES),
         ]
     }
 
@@ -254,6 +257,10 @@ impl ExecutableNode for TableNode {
                 self.columns = text;
                 self.rebuild_pins();
             }
+            // Derived by the editor from the wires between field pins, the
+            // same way `db_path` is derived from the enclosing database: a
+            // relation is a fact about the graph, and the runner reads facts.
+            RELATIONS => self.relations = text,
             _ => {}
         }
         Ok(())
@@ -621,28 +628,49 @@ mod tests {
     }
 
     /// The DDL is what the user sees and what the file gets: an `id:int`
-    /// becomes the rowid alias, and a wired table becomes a foreign key.
+    /// becomes the rowid alias, and each relation becomes a foreign key
+    /// naming the referenced field.
     #[test]
-    fn the_ddl_names_a_primary_key_and_the_wired_references() {
+    fn the_ddl_names_a_primary_key_and_the_relations() {
         let mut node = TableNode::new();
-        set(&mut node, "name", "samples");
-        set(&mut node, "columns", "id:int\nrun:int\nx:float");
-        let mut references = HashMap::new();
-        references.insert("run".to_string(), "runs".to_string());
+        set(&mut node, "name", "orders");
+        set(&mut node, "columns", "id:int\ncustomer_id:int\ntotal:float");
+        set(&mut node, RELATIONS, "customer_id -> customers.id\n");
         assert_eq!(
-            node.ddl(&references),
-            "CREATE TABLE IF NOT EXISTS \"samples\" (\"id\" INTEGER PRIMARY KEY, \"run\" INTEGER, \"x\" REAL, FOREIGN KEY(\"run\") REFERENCES \"runs\"(id))"
+            node.ddl(),
+            "CREATE TABLE IF NOT EXISTS \"orders\" (\"id\" INTEGER PRIMARY KEY, \"customer_id\" INTEGER, \"total\" REAL, FOREIGN KEY(\"customer_id\") REFERENCES \"customers\"(\"id\"))"
         );
     }
 
-    /// The column list decides the pins, which is what the editor draws and
-    /// what an insert binds.
+    /// A relation on a field that is no longer there must not reach the
+    /// statement: `FOREIGN KEY` on a column the statement does not declare is
+    /// a syntax error, and the wire outlives the field by one edit.
     #[test]
-    fn a_tables_pins_follow_its_columns() {
+    fn a_relation_on_a_removed_field_is_dropped_from_the_ddl() {
+        let mut node = TableNode::new();
+        set(&mut node, "name", "orders");
+        set(&mut node, RELATIONS, "customer_id -> customers.id");
+        set(&mut node, "columns", "id:int");
+        assert_eq!(
+            node.ddl(),
+            "CREATE TABLE IF NOT EXISTS \"orders\" (\"id\" INTEGER PRIMARY KEY)"
+        );
+    }
+
+    /// Every field is a pin, and a bidirectional one: that is what a relation
+    /// attaches to on either border.
+    #[test]
+    fn a_tables_pins_follow_its_fields() {
         let mut node = TableNode::new();
         set(&mut node, "columns", "id:int\nx:float");
-        let names: Vec<&str> = node.pin_definitions().iter().map(|p| &*p.name).collect();
+        let pins = node.pin_definitions();
+        let names: Vec<&str> = pins.iter().map(|p| &*p.name).collect();
         assert_eq!(names, vec!["id", "x", "table", "ddl"]);
+        assert!(
+            pins[..2]
+                .iter()
+                .all(|p| p.direction == PinDirection::Both && p.ty == field_ty())
+        );
     }
 
     /// An insert takes one input per column except the rowid, which SQLite

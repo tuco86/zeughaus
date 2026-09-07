@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use iced::keyboard;
-use iced::widget::{button, column, container, image, row, stack, text, text_input};
+use iced::widget::{button, column, container, image, pick_list, row, stack, text, text_input};
 use iced::{Color, ContentFit, Element, Event, Length, Point, Subscription, Task, Theme};
 use iced_nodegraph::{
     EdgeStyle, NodeGraph, NodeStatus, NodeStyle, Pattern, PinDirection as NgPinDirection, PinInfo,
@@ -20,8 +20,8 @@ use iced_palette::{get_filtered_command_index, is_toggle_shortcut};
 use zeughaus_capture::CapturePlugin;
 use zeughaus_core::{
     DomainPlugin, EdgeData, EdgeId, EdgeSemantic, GraphDocument, Image, NodeConfig, NodeData,
-    NodeDefinition, NodeId, PinDefinition, PinDirection, PinKind, SettingDef, Ty, TypeConverters,
-    Value,
+    NodeDefinition, NodeId, PinDefinition, PinDirection, PinKind, SettingDef, SettingKind, Ty,
+    TypeConverters, Value,
 };
 use zeughaus_flow::FlowPlugin;
 use zeughaus_graph::GraphPlugin;
@@ -672,9 +672,12 @@ impl App {
             self.push_edge(e);
         }
         // A table wired into a `table` pin is the column list the target works
-        // from.
+        // from, and a wire between two field pins is a foreign key on the
+        // referencing side -- which may be either end.
         #[cfg(not(target_arch = "wasm32"))]
         self.derive_db_params(to_node);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.derive_db_params(from_node);
         self.update_display_values();
         self.autosave();
     }
@@ -727,11 +730,69 @@ impl App {
             #[cfg(not(target_arch = "wasm32"))]
             self.push_edge_remove(edge.id);
             // A table pin that lost its wire is a column list that no longer
-            // applies.
+            // applies, and a field that lost one is a foreign key that is
+            // gone -- from whichever end declared it.
             #[cfg(not(target_arch = "wasm32"))]
             self.derive_db_params(to_node);
+            #[cfg(not(target_arch = "wasm32"))]
+            self.derive_db_params(from_node);
             self.update_display_values();
             self.autosave();
+        }
+    }
+
+    /// Whether a node declares this pin as a bidirectional field pin.
+    ///
+    /// Read off the pin declaration, never off a node type: what makes an edge
+    /// a relation is the same fact here, in the runtime and in the runner.
+    fn is_field_pin(&self, node: NodeId, pin: &str) -> bool {
+        self.nodes.get(&node).is_some_and(|n| {
+            n.pin_defs
+                .iter()
+                .any(|p| &*p.name == pin && p.direction == PinDirection::Both)
+        })
+    }
+
+    /// Whether an edge is a relation: both its ends are field pins.
+    ///
+    /// Only the derivation of the `relations` parameter asks, and that reaches
+    /// the runner through the store -- which the browser editor has no path to.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn is_relation(&self, edge: &EditorEdge) -> bool {
+        self.is_field_pin(edge.from_node, edge.from_pin.as_str())
+            && self.is_field_pin(edge.to_node, edge.to_pin.as_str())
+    }
+
+    /// Drops every relation of `node` whose field pin the node no longer
+    /// declares.
+    ///
+    /// Called after a setting reshaped a node's pins. The other end still
+    /// being a field pin is what identifies the wire as a relation, and a
+    /// relation without its field is nothing: it would stay in the store,
+    /// invisible in every view, and reattach itself if a field of that name
+    /// ever came back. Renaming a field therefore drops its relations, which
+    /// is the honest reading of "that field is gone".
+    fn drop_orphaned_relations(&mut self, node: NodeId) {
+        let orphaned: Vec<EdgeId> = self
+            .edges
+            .iter()
+            .filter(|e| {
+                let (own, other) = match (e.from_node == node, e.to_node == node) {
+                    (true, _) => (e.from_pin.as_str(), (e.to_node, e.to_pin.as_str())),
+                    (_, true) => (e.to_pin.as_str(), (e.from_node, e.from_pin.as_str())),
+                    _ => return false,
+                };
+                self.is_field_pin(other.0, other.1) && !self.is_field_pin(node, own)
+            })
+            .map(|e| e.id)
+            .collect();
+        for edge_id in orphaned {
+            self.edges.retain(|e| e.id != edge_id);
+            self.executor.disconnect_edge(edge_id);
+            #[cfg(not(target_arch = "wasm32"))]
+            self.particles.remove(&edge_id);
+            #[cfg(not(target_arch = "wasm32"))]
+            self.push_edge_remove(edge_id);
         }
     }
 
@@ -1732,12 +1793,19 @@ impl App {
                 // A setting can decide the node's pins (a table's columns are
                 // one), so the widget re-reads what it now declares.
                 self.refresh_node_pins(id);
+                // A field that is gone takes its relations with it: a foreign
+                // key lives on a field, and a wire to a pin the node no longer
+                // declares is one nobody can see or delete.
+                self.drop_orphaned_relations(id);
                 // Renaming a boundary renames its container's pin.
                 if key == "name" {
                     self.refresh_boundary_owner(id);
                 }
                 // A database's path reaches its children, a table's columns
-                // reach everything it feeds.
+                // reach everything it feeds, and its name is what the tables
+                // referencing it name in their foreign keys.
+                #[cfg(not(target_arch = "wasm32"))]
+                self.derive_db_params(id);
                 #[cfg(not(target_arch = "wasm32"))]
                 self.derive_db_dependents(id);
                 #[cfg(not(target_arch = "wasm32"))]
@@ -1890,7 +1958,8 @@ impl App {
             .can_connect({
                 // With a custom can_connect, iced_nodegraph stops enforcing pin
                 // direction itself, so we must validate it here: exactly one
-                // output and one input, distinct nodes, compatible types.
+                // output and one input, distinct nodes, compatible types --
+                // or, between two field pins, a relation.
                 let nodes = &self.nodes;
                 let converters = &self.converters;
                 move |from, to| {
@@ -1910,6 +1979,17 @@ impl App {
                     let (Some(fp), Some(tp)) = (from_pin, to_pin) else {
                         return false;
                     };
+                    // Two field pins are a relation: it carries nothing, so
+                    // there is no direction to respect and no occupancy to
+                    // check -- one primary key is referenced by many. Only the
+                    // type has to agree, which keeps a field pin from
+                    // swallowing an unrelated bidirectional pin.
+                    if fp.direction == PinDirection::Both && tp.direction == PinDirection::Both {
+                        return fp.ty == tp.ty;
+                    }
+                    // Anything else must be one output and one input, so a
+                    // field pin wired to a data pin is refused: a value has
+                    // nowhere to go on a pin that is not an endpoint of flow.
                     let opposite = (fp.direction == PinDirection::Output
                         && tp.direction == PinDirection::Input)
                         || (fp.direction == PinDirection::Input
@@ -2463,14 +2543,62 @@ impl App {
             .unwrap_or_else(default)
     }
 
+    /// The relations a table's fields declare, one `field -> table.field` per
+    /// line, as the `relations` parameter carries them.
+    ///
+    /// Only the referencing side of each relation writes a line; which side
+    /// that is follows from [`relation_references_to`].
+    ///
+    /// Sorted, because this text is an output the runner compares: a set that
+    /// reordered itself would look like a change on every pass.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn relations_of(&self, node: NodeId) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        for edge in &self.edges {
+            if !self.is_relation(edge) {
+                continue;
+            }
+            let to_is_key = relation_references_to(edge.from_pin.as_str(), edge.to_pin.as_str());
+            let (referencing, referenced) = if to_is_key {
+                (
+                    (edge.from_node, &edge.from_pin),
+                    (edge.to_node, &edge.to_pin),
+                )
+            } else {
+                (
+                    (edge.to_node, &edge.to_pin),
+                    (edge.from_node, &edge.from_pin),
+                )
+            };
+            if referencing.0 != node {
+                continue;
+            }
+            let table = self.setting_or_default(referenced.0, "name");
+            if table.is_empty() {
+                continue;
+            }
+            lines.push(format!(
+                "{} -> {}.{}",
+                referencing.1.as_str(),
+                table,
+                referenced.1.as_str()
+            ));
+        }
+        lines.sort();
+        lines.dedup();
+        lines.join("\n")
+    }
+
     /// Fills in the parameters a database node cannot know by itself: which
-    /// file it works on, and the columns of the table it is wired to.
+    /// file it works on, the columns of the table it is wired to, and the
+    /// relations a table's fields declare.
     ///
     /// Derived rather than typed twice. A node inside a `db.database` works on
-    /// that database, and an insert wired to a table has that table's columns
-    /// -- restating either by hand is a chance for the two to disagree. They
-    /// are ordinary parameters from the runner's point of view, so nothing on
-    /// that side has to know they were derived.
+    /// that database, an insert wired to a table has that table's columns, and
+    /// a wire between two field pins is a foreign key -- restating any of them
+    /// by hand is a chance for the two to disagree. They are ordinary
+    /// parameters from the runner's point of view, so nothing on that side has
+    /// to know they were derived, and no wire between fields has to reach it.
     #[cfg(not(target_arch = "wasm32"))]
     fn derive_db_params(&mut self, node: NodeId) {
         let Some(type_id) = self.nodes.get(&node).map(|n| n.type_id.clone()) else {
@@ -2512,6 +2640,10 @@ impl App {
             derived.push(("columns".to_string(), columns));
         }
 
+        if type_id == "db.table" {
+            derived.push((zeughaus_db::RELATIONS.to_string(), self.relations_of(node)));
+        }
+
         let mut changed = false;
         for (key, value) in derived {
             if self
@@ -2538,7 +2670,8 @@ impl App {
     }
 
     /// Re-derives the database parameters of every node that depends on this
-    /// one: the children of a database, and everything a table feeds.
+    /// one: the children of a database, everything a table feeds, and every
+    /// table it is in a relation with (whose foreign key names this one).
     #[cfg(not(target_arch = "wasm32"))]
     fn derive_db_dependents(&mut self, node: NodeId) {
         let Some(type_id) = self.nodes.get(&node).map(|n| n.type_id.clone()) else {
@@ -2549,8 +2682,14 @@ impl App {
             "db.table" => self
                 .edges
                 .iter()
-                .filter(|e| e.from_node == node && e.to_pin.as_str() == "table")
-                .map(|e| e.to_node)
+                .filter(|e| {
+                    (e.from_node == node && e.to_pin.as_str() == "table") || self.is_relation(e)
+                })
+                .filter_map(|e| match (e.from_node == node, e.to_node == node) {
+                    (true, _) => Some(e.to_node),
+                    (_, true) => Some(e.from_node),
+                    _ => None,
+                })
                 .collect(),
             _ => return,
         };
@@ -2671,7 +2810,11 @@ impl App {
         }
         let from_pin: Arc<str> = Arc::from(ed.from_pin.as_str());
         let to_pin: Arc<str> = Arc::from(ed.to_pin.as_str());
-        self.remove_edges_into(to_node, &PinLabel(to_pin.clone()));
+        // A field pin is not a single-slot input: a primary key is referenced
+        // by many, so a relation landing on it displaces nothing.
+        if !self.is_field_pin(to_node, &to_pin) {
+            self.remove_edges_into(to_node, &PinLabel(to_pin.clone()));
+        }
         self.executor.graph.add_edge(GraphEdge {
             id: edge_id,
             from_node,
@@ -2723,6 +2866,10 @@ const DISPLAY_SIZE: iced::Size = iced::Size::new(240.0, 150.0);
 /// Width of every other node. Their content is text and pin rows, which do not
 /// benefit from being resizable.
 const NODE_WIDTH: f32 = 180.0;
+
+/// Width of a node whose body holds a field row editor: a name field, a type
+/// choice and a remove button side by side need more than a pin label does.
+const FIELDS_NODE_WIDTH: f32 = 260.0;
 
 /// The Display node: the one node type whose body shows data rather than pin
 /// rows. That makes it the only one worth resizing, and the only one that asks
@@ -2864,15 +3011,31 @@ fn build_node_element<'a>(
         .into();
         items.push(pin);
     } else {
+        // A title is the node's heading, so it comes before anything else.
+        for def in &node.settings {
+            if def.kind != SettingKind::Title {
+                continue;
+            }
+            items.push(title_setting(node, def, setting_value(settings, def)));
+        }
+        // A field-list setting draws its own pins: each row IS a pin spanning
+        // the node, so the plain pin loop below must not draw them a second
+        // time.
+        let mut fields: HashSet<&str> = HashSet::new();
+        for def in &node.settings {
+            let SettingKind::Fields { types } = &def.kind else {
+                continue;
+            };
+            let current = setting_value(settings, def);
+            fields.extend(field_rows(current).into_iter().map(|(name, _)| name));
+            items.extend(field_setting(node, def, types, current, dim_mask));
+        }
+
         for (index, pin_def) in node.pin_defs.iter().enumerate() {
-            let side = match pin_def.direction {
-                PinDirection::Input => PinSide::Left,
-                PinDirection::Output => PinSide::Right,
-            };
-            let direction = match pin_def.direction {
-                PinDirection::Input => NgPinDirection::Input,
-                PinDirection::Output => NgPinDirection::Output,
-            };
+            if fields.contains(&*pin_def.name) {
+                continue;
+            }
+            let (side, direction) = pin_geometry(pin_def.direction);
 
             let tint = pin_color(&pin_def.ty);
             let visual = PinVisual {
@@ -2898,14 +3061,15 @@ fn build_node_element<'a>(
 
     // In-node text settings (e.g. LLM base_url/model/prompt). Each renders a
     // labeled text input that updates the node parameter on edit. The number of
-    // settings is fixed per node type, so the widget tree stays stable.
+    // settings is fixed per node type, so the widget tree stays stable. Titles
+    // and field lists are already drawn above.
     for def in &node.settings {
+        if matches!(def.kind, SettingKind::Title | SettingKind::Fields { .. }) {
+            continue;
+        }
         let node_raw_id = node.id.0;
         let key = def.name.clone();
-        let current = settings
-            .and_then(|m| m.get(&*def.name))
-            .map(|s| s.as_str())
-            .unwrap_or(&def.default);
+        let current = setting_value(settings, def);
 
         let field = text_input(&def.placeholder, current)
             .on_input(move |v| Message::NodeSettingChanged {
@@ -2967,9 +3131,228 @@ fn build_node_element<'a>(
             .width(size.width)
             .height(size.height)
             .into()
+    } else if node
+        .settings
+        .iter()
+        .any(|def| matches!(def.kind, SettingKind::Fields { .. }))
+    {
+        // A field row is three controls side by side; at the usual width they
+        // would each be too narrow to read.
+        container(inner).width(FIELDS_NODE_WIDTH).into()
     } else {
         container(inner).width(NODE_WIDTH).into()
     }
+}
+
+/// A setting's current value, or the default its type declares.
+fn setting_value<'a>(
+    settings: Option<&'a HashMap<String, String>>,
+    def: &'a SettingDef,
+) -> &'a str {
+    settings
+        .and_then(|m| m.get(&*def.name))
+        .map(|s| s.as_str())
+        .unwrap_or(&def.default)
+}
+
+/// Where a pin sits on the node, and what it may connect to.
+///
+/// A core `Both` pin becomes a [`PinSide::Row`] spanning the node: an edge
+/// attaches on whichever border is nearer its other end, because what such an
+/// edge declares is a relationship between the two nodes and not a value
+/// travelling one way.
+fn pin_geometry(direction: PinDirection) -> (PinSide, NgPinDirection) {
+    match direction {
+        PinDirection::Input => (PinSide::Left, NgPinDirection::Input),
+        PinDirection::Output => (PinSide::Right, NgPinDirection::Output),
+        PinDirection::Both => (PinSide::Row, NgPinDirection::Both),
+    }
+}
+
+/// The field name a relation treats as the key it points at.
+#[cfg(not(target_arch = "wasm32"))]
+const KEY_FIELD: &str = "id";
+
+/// Whether the `to` end of a relation is the referenced one.
+///
+/// The end whose field is named `id` is referenced, and if neither is, the end
+/// the wire was dropped on. `id` is already what the database nodes treat as
+/// the key -- an `id:int` field is SQLite's rowid alias and an insert lets it
+/// be assigned -- so a foreign key pointing at it needs no second declaration,
+/// and dragging from either side gives the same schema. Both ends named `id`
+/// falls back to the drop target, which is the only tie left to break.
+///
+/// Native only, like the `relations` parameter it decides: the database plugin
+/// links SQLite and the browser editor cannot have it.
+#[cfg(not(target_arch = "wasm32"))]
+fn relation_references_to(from_pin: &str, to_pin: &str) -> bool {
+    to_pin == KEY_FIELD || from_pin != KEY_FIELD
+}
+
+/// A [`SettingKind::Title`] setting: the node's name, editable in place.
+fn title_setting<'a>(
+    node: &'a EditorNode,
+    def: &'a SettingDef,
+    current: &'a str,
+) -> Element<'a, Message, Theme> {
+    let node_raw_id = node.id.0;
+    let key = def.name.clone();
+    text_input(&def.placeholder, current)
+        .on_input(move |v| Message::NodeSettingChanged {
+            node_id: node_raw_id,
+            key: key.to_string(),
+            value: v,
+        })
+        .size(14)
+        .width(Length::Fill)
+        .into()
+}
+
+/// A [`SettingKind::Fields`] setting: one row per field, plus a way to add one.
+///
+/// Each row is a pin spanning the node ([`PinSide::Row`]) whose content is the
+/// field's editor -- name, type, remove. So an edge can attach to a field on
+/// either border, which is what a relation between two tables is drawn as.
+///
+/// Every edit renders the whole value again and sends it as one
+/// [`Message::NodeSettingChanged`]. The setting therefore stays the plain
+/// `name:type` text that the store, the runner and the node's own parser
+/// already speak, and this editor needs to know nothing about what the fields
+/// mean.
+fn field_setting<'a>(
+    node: &'a EditorNode,
+    def: &'a SettingDef,
+    types: &'a [String],
+    current: &'a str,
+    dim_mask: u64,
+) -> Vec<Element<'a, Message, Theme>> {
+    let node_raw_id = node.id.0;
+    let rows: Arc<Vec<(&'a str, &'a str)>> = Arc::new(field_rows(current));
+    let options: Vec<&'a str> = types.iter().map(String::as_str).collect();
+    let mut items: Vec<Element<'a, Message, Theme>> = Vec::with_capacity(rows.len() + 1);
+
+    for (index, (name, ty)) in rows.iter().copied().enumerate() {
+        let rename = {
+            let (rows, key) = (Arc::clone(&rows), def.name.clone());
+            text_input("field", name)
+                .on_input(move |v| Message::NodeSettingChanged {
+                    node_id: node_raw_id,
+                    key: key.to_string(),
+                    value: field_edit(&rows, index, Some((v.trim(), ty))),
+                })
+                .size(12)
+                .width(Length::Fill)
+        };
+        let retype = {
+            let (rows, key) = (Arc::clone(&rows), def.name.clone());
+            pick_list(options.clone(), Some(ty), move |chosen: &str| {
+                Message::NodeSettingChanged {
+                    node_id: node_raw_id,
+                    key: key.to_string(),
+                    value: field_edit(&rows, index, Some((name, chosen))),
+                }
+            })
+            .placeholder("type")
+            .text_size(12)
+            .padding(2.0)
+        };
+        let remove =
+            button(text("x").size(11))
+                .padding(2.0)
+                .on_press(Message::NodeSettingChanged {
+                    node_id: node_raw_id,
+                    key: def.name.to_string(),
+                    value: field_edit(&rows, index, None),
+                });
+
+        // The pin the field declares, for its color and shape. A half-typed
+        // row has none yet, and drawing it anyway is what keeps the widget
+        // tree stable while the user types.
+        let pin = node
+            .pin_defs
+            .iter()
+            .enumerate()
+            .find(|(_, p)| &*p.name == name);
+        let tint = pin.map_or_else(|| pin_color(&Ty::Any), |(_, p)| pin_color(&p.ty));
+        let visual = PinVisual {
+            color: if pin.is_some_and(|(index, _)| is_dim(dim_mask, index)) {
+                dim(tint)
+            } else {
+                tint
+            },
+            shape: pin_shape(pin.map_or(PinKind::Sample, |(_, p)| p.pin_kind)),
+        };
+
+        items.push(
+            node_pin(
+                PinSide::Row,
+                PinLabel(Arc::from(name)),
+                row![rename, retype, remove].spacing(2),
+            )
+            .direction(NgPinDirection::Both)
+            .info(visual)
+            .into(),
+        );
+    }
+
+    items.push(
+        button(text("add field").size(11))
+            .padding(2.0)
+            .on_press(Message::NodeSettingChanged {
+                node_id: node_raw_id,
+                key: def.name.to_string(),
+                value: field_added(&rows, &options),
+            })
+            .into(),
+    );
+    items
+}
+
+/// The `name:type` rows of a field-list setting, as slices of its value.
+///
+/// Borrowed rather than owned so a row can be handed straight to a text input,
+/// and lenient rather than validating: a line whose type is half-typed is
+/// still a row the user is editing, and must not vanish under the cursor.
+fn field_rows(text: &str) -> Vec<(&str, &str)> {
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| match line.split_once(':') {
+            Some((name, ty)) => (name.trim(), ty.trim()),
+            None => (line.trim(), ""),
+        })
+        .collect()
+}
+
+/// The value these rows mean with row `index` replaced by `row`, or removed
+/// when `row` is `None`.
+fn field_edit(rows: &[(&str, &str)], index: usize, row: Option<(&str, &str)>) -> String {
+    let mut out = rows.to_vec();
+    match row {
+        Some(row) if index < out.len() => out[index] = row,
+        Some(row) => out.push(row),
+        None if index < out.len() => {
+            out.remove(index);
+        }
+        None => {}
+    }
+    out.iter()
+        .map(|(name, ty)| format!("{name}:{ty}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The value these rows mean with one more row: the first offered type and a
+/// name no existing row has, so adding two fields in a row does not produce
+/// two pins with one id.
+fn field_added(rows: &[(&str, &str)], types: &[&str]) -> String {
+    let ty = types.first().copied().unwrap_or_default();
+    let mut name = "field".to_string();
+    let mut nth = 2;
+    while rows.iter().any(|(taken, _)| *taken == name) {
+        name = format!("field{nth}");
+        nth += 1;
+    }
+    field_edit(rows, rows.len(), Some((&name, ty)))
 }
 
 /// Header background color per node category, mirroring the old content presets.
@@ -3250,5 +3633,72 @@ mod tests {
         let positions = auto_layout(&nodes, &edges);
         assert_eq!(at(&positions, 1), Point::new(40.0, 40.0));
         assert_eq!(at(&positions, 2), Point::new(360.0, 40.0));
+    }
+
+    /// The row editor's whole contract: every edit is the setting's full text
+    /// again, so the store, the runner and the node's parser keep speaking
+    /// `name:type` and never learn there were widgets.
+    #[test]
+    fn editing_a_field_row_renders_the_whole_setting_again() {
+        let text = "id:int\ncustomer_id:int\ntotal:float";
+        let rows = field_rows(text);
+        assert_eq!(
+            rows,
+            vec![("id", "int"), ("customer_id", "int"), ("total", "float")]
+        );
+
+        // Rename, retype, remove -- and appending past the end adds a row.
+        assert_eq!(
+            field_edit(&rows, 1, Some(("cust", "int"))),
+            "id:int\ncust:int\ntotal:float"
+        );
+        assert_eq!(
+            field_edit(&rows, 2, Some(("total", "str"))),
+            "id:int\ncustomer_id:int\ntotal:str"
+        );
+        assert_eq!(field_edit(&rows, 1, None), "id:int\ntotal:float");
+        assert_eq!(
+            field_edit(&rows, 9, Some(("note", "str"))),
+            "id:int\ncustomer_id:int\ntotal:float\nnote:str"
+        );
+    }
+
+    /// A half-typed row is still a row: the field whose type the user has not
+    /// chosen yet must not disappear from under the cursor.
+    #[test]
+    fn a_field_without_a_type_survives_as_a_row() {
+        assert_eq!(
+            field_rows("id:int\nname\n\n"),
+            vec![("id", "int"), ("name", "")]
+        );
+    }
+
+    /// Two added fields must not end up with one name: two pins with one id is
+    /// a relation that could land on either.
+    #[test]
+    fn added_fields_get_names_no_row_already_has() {
+        let types = ["int", "str"];
+        assert_eq!(field_added(&field_rows(""), &types), "field:int");
+        assert_eq!(
+            field_added(&field_rows("field:int"), &types),
+            "field:int\nfield2:int"
+        );
+        assert_eq!(
+            field_added(&field_rows("field:int\nfield2:str"), &types),
+            "field:int\nfield2:str\nfield3:int"
+        );
+    }
+
+    /// Which end of a relation is referenced is a property of the fields, not
+    /// of the drag: dragging `customer_id` onto `id` and dragging `id` onto
+    /// `customer_id` must declare the same foreign key.
+    #[test]
+    fn the_id_end_of_a_relation_is_the_referenced_one() {
+        assert!(relation_references_to("customer_id", "id"));
+        assert!(!relation_references_to("id", "customer_id"));
+        // Neither is a key: the end the wire was dropped on.
+        assert!(relation_references_to("owner", "seq"));
+        // Both are: the only tie left to break is the drop target.
+        assert!(relation_references_to("id", "id"));
     }
 }

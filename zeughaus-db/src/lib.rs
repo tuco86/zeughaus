@@ -13,6 +13,29 @@
 //! design: this is a workbench, the user writes SQL, and pretending otherwise
 //! would mean reinventing a query language badly.
 //!
+//! ## Tables are designed in the graph
+//!
+//! A `db.table` is its schema: an editable name and a list of fields, each of
+//! which is a bidirectional pin spanning the node
+//! ([`PinDefinition::field`]). So a **relation** is a wire between two field
+//! pins -- `orders.customer_id` to `customers.id` -- and not a value on an
+//! input. That is deliberate: such a wire carries nothing, and the runtime
+//! keeps it out of execution entirely (`Graph::is_dataflow`), which is what
+//! makes two tables referencing each other a legal schema instead of a cycle
+//! that stops every pass.
+//!
+//! Which end is referenced follows from the fields, not from the direction
+//! the user dragged: **the end whose field is named `id` is the referenced
+//! side, and if neither is, the end the wire was dropped on is.** `id` is
+//! already the convention these nodes read (an `id:int` field is the rowid
+//! alias, and an insert lets SQLite assign it), so a foreign key pointing at
+//! it needs no second declaration.
+//!
+//! The editor derives the result into the hidden [`RELATIONS`] parameter, one
+//! `field -> table.field` line per relation, exactly as it derives
+//! [`DB_PATH`]. The runner therefore learns the schema by reading parameters
+//! and never has to know what a wire between two fields meant.
+//!
 //! Native only: it opens files and links SQLite, so it is registered in the
 //! runner unconditionally and in the editor outside wasm.
 
@@ -66,6 +89,18 @@ pub fn table_ty() -> Ty {
     Ty::opaque("db.table")
 }
 
+/// The hidden parameter a `db.table` takes: the relations its fields declare,
+/// one `field -> table.field` per line. Derived by the editor from the wires
+/// between field pins, so it is not in any node's `settings()`.
+pub const RELATIONS: &str = "relations";
+
+/// The type a table's field pin declares. Opaque and uniform across field
+/// types: what such a pin connects is a relationship, not a value, so the
+/// column's own type has nothing to say about whether a wire may land.
+pub fn field_ty() -> Ty {
+    Ty::opaque("db.field")
+}
+
 /// A column's declared type, as the user writes it in a `name:type` line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColTy {
@@ -75,7 +110,18 @@ pub enum ColTy {
     Bool,
 }
 
+impl std::fmt::Display for ColTy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 impl ColTy {
+    /// The type names a field may be given, in the order the editor offers
+    /// them. The canonical spelling of each variant, which is also what
+    /// [`Self::parse`] round-trips.
+    pub const NAMES: [&'static str; 4] = ["int", "float", "str", "bool"];
+
     /// Parses `int|float|str|bool`, case-insensitively. `None` for anything
     /// else, which is how an unfinished line is ignored rather than guessed.
     pub fn parse(text: &str) -> Option<ColTy> {
@@ -106,6 +152,16 @@ impl ColTy {
             ColTy::Bool => Ty::Bool,
         }
     }
+
+    /// This type's canonical name, as it is written in a `name:type` line.
+    pub fn name(self) -> &'static str {
+        match self {
+            ColTy::Int => "int",
+            ColTy::Float => "float",
+            ColTy::Str => "str",
+            ColTy::Bool => "bool",
+        }
+    }
 }
 
 /// Parses a column list: one `name:type` per line.
@@ -122,6 +178,38 @@ pub fn parse_columns(text: &str) -> Vec<(String, ColTy)> {
                 return None;
             }
             Some((name.to_string(), ColTy::parse(ty)?))
+        })
+        .collect()
+}
+
+/// One relation a table's field declares: this table's `field` references
+/// `target` in `table`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Relation {
+    pub field: String,
+    pub table: String,
+    pub target: String,
+}
+
+/// Parses a relation list: one `field -> table.field` per line.
+///
+/// Skips whatever does not parse, for the same reason [`parse_columns`] does:
+/// the text is derived while the graph is being edited, and one line that is
+/// mid-rename must not take the finished ones with it.
+pub fn parse_relations(text: &str) -> Vec<Relation> {
+    text.lines()
+        .filter_map(|line| {
+            let (field, reference) = line.split_once("->")?;
+            let (table, target) = reference.rsplit_once('.')?;
+            let (field, table, target) = (field.trim(), table.trim(), target.trim());
+            if field.is_empty() || table.is_empty() || target.is_empty() {
+                return None;
+            }
+            Some(Relation {
+                field: field.to_string(),
+                table: table.to_string(),
+                target: target.to_string(),
+            })
         })
         .collect()
 }
@@ -300,6 +388,41 @@ mod tests {
                 ("name".to_string(), ColTy::Str),
             ]
         );
+    }
+
+    /// The relation text is derived while the graph is being edited, so a line
+    /// that is mid-rename must be skipped and not take the others with it.
+    #[test]
+    fn relations_parse_line_by_line_and_skip_what_is_not_one() {
+        let parsed = parse_relations(
+            "customer_id -> customers.id\n  run  ->  runs . seq \nnoarrow\nx -> nodot\n -> a.b\n",
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                Relation {
+                    field: "customer_id".to_string(),
+                    table: "customers".to_string(),
+                    target: "id".to_string(),
+                },
+                Relation {
+                    field: "run".to_string(),
+                    table: "runs".to_string(),
+                    target: "seq".to_string(),
+                },
+            ]
+        );
+    }
+
+    /// The names the editor offers are the names the parser accepts: a choice
+    /// the row editor could produce but `parse` would drop is a field that
+    /// silently disappears.
+    #[test]
+    fn every_offered_type_name_parses_back_to_itself() {
+        for name in ColTy::NAMES {
+            let parsed = ColTy::parse(name).expect("offered name parses");
+            assert_eq!(parsed.name(), name);
+        }
     }
 
     #[test]
