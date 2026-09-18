@@ -1605,7 +1605,10 @@ impl App {
             }) => {
                 let node = NodeId(node_id);
                 if self.accept_rejection_seq(node, &key, seq) {
-                    self.setting_errors.entry(node).or_default().insert(key, message);
+                    self.setting_errors
+                        .entry(node)
+                        .or_default()
+                        .insert(key, message);
                 }
             }
             Traffic::Event(RuntimeEvent::SettingAccepted { seq, node_id, key }) => {
@@ -1664,7 +1667,11 @@ impl App {
     #[cfg(not(target_arch = "wasm32"))]
     fn accept_rejection_seq(&mut self, node: NodeId, key: &str, seq: u64) -> bool {
         let key = (node, key.to_owned());
-        if self.rejection_seq.get(&key).is_some_and(|seen| *seen >= seq) {
+        if self
+            .rejection_seq
+            .get(&key)
+            .is_some_and(|seen| *seen >= seq)
+        {
             return false;
         }
         self.rejection_seq.insert(key, seq);
@@ -2925,11 +2932,7 @@ impl App {
                     let from_id = NodeId(*from.node_id());
                     let to_id = NodeId(*to.node_id());
                     let pin = |node: NodeId, name: &str| {
-                        nodes
-                            .get(&node)?
-                            .pin_defs
-                            .iter()
-                            .find(|p| &*p.name == name)
+                        nodes.get(&node)?.pin_defs.iter().find(|p| &*p.name == name)
                     };
                     let closes_cycle = |from_is_output: bool| {
                         let (source, target) = if from_is_output {
@@ -3139,10 +3142,7 @@ impl App {
             self.runtime_text(),
         );
         let (status_text, error_color) = if let Some(hint) = hint {
-            (
-                format!("{head} | {hint}"),
-                Color::from_rgb(0.9, 0.75, 0.35),
-            )
+            (format!("{head} | {hint}"), Color::from_rgb(0.9, 0.75, 0.35))
         } else if !error.is_empty() {
             (
                 format!("{head} | ERROR: {error}"),
@@ -4024,8 +4024,7 @@ pub fn wire_refusal(wire: &Wire<'_>) -> Option<String> {
     let (Some(from), Some(to)) = (wire.from, wire.to) else {
         return Some("that pin is no longer there".to_string());
     };
-    let both_fields =
-        from.direction == PinDirection::Both && to.direction == PinDirection::Both;
+    let both_fields = from.direction == PinDirection::Both && to.direction == PinDirection::Both;
     if wire.same_node {
         return Some(if both_fields {
             "a table cannot reference itself".to_string()
@@ -4037,12 +4036,8 @@ pub fn wire_refusal(wire: &Wire<'_>) -> Option<String> {
     // direction to respect and no occupancy to check -- one primary key is
     // referenced by many. Only the type has to agree.
     if both_fields {
-        return (from.ty != to.ty).then(|| {
-            format!(
-                "{} and {} fields cannot be related",
-                from.ty, to.ty
-            )
-        });
+        return (from.ty != to.ty)
+            .then(|| format!("{} and {} fields cannot be related", from.ty, to.ty));
     }
     // A field pin wired to a data pin: a value has nowhere to go on a pin that
     // is not an endpoint of flow.

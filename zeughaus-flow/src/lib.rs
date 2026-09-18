@@ -366,7 +366,8 @@ mod tests {
     #[test]
     fn the_rate_comes_from_the_hz_setting() {
         let mut node = TimerNode::new();
-        node.set_parameter("hz", Value::new("5".to_string())).unwrap();
+        node.set_parameter("hz", Value::new("5".to_string()))
+            .unwrap();
         assert_eq!(node.hz(), 5.0);
         node.set_parameter("hz", Value::new(12.0f64)).unwrap();
         assert_eq!(node.hz(), 12.0);

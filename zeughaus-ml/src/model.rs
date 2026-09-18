@@ -110,7 +110,11 @@ impl KerasModel {
         }
         let inputs: Vec<u64> = branches.iter().filter_map(|b| b.output).collect();
         steps.push(Step { id, layer, inputs });
-        Self { steps, output: Some(id), compile }
+        Self {
+            steps,
+            output: Some(id),
+            compile,
+        }
     }
 
     /// Returns a new model carrying the given compile configuration.
@@ -141,7 +145,12 @@ impl KerasModel {
             }
         }
         let by_id: HashMap<u64, &Step> = self.steps.iter().map(|s| (s.id, s)).collect();
-        let mut queue: Vec<u64> = self.steps.iter().filter(|s| indeg[&s.id] == 0).map(|s| s.id).collect();
+        let mut queue: Vec<u64> = self
+            .steps
+            .iter()
+            .filter(|s| indeg[&s.id] == 0)
+            .map(|s| s.id)
+            .collect();
         let mut order: Vec<&Step> = Vec::new();
         let mut head = 0;
         while head < queue.len() {
@@ -175,31 +184,48 @@ impl KerasModel {
         }
 
         let order = self.ordered();
-        let var: HashMap<u64, String> =
-            order.iter().enumerate().map(|(i, s)| (s.id, format!("x{i}"))).collect();
+        let var: HashMap<u64, String> = order
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.id, format!("x{i}")))
+            .collect();
 
         for step in &order {
             let call = match step.inputs.as_slice() {
                 [] => String::new(),
                 [single] => format!("({})", var[single]),
                 many => {
-                    let refs = many.iter().map(|i| var[i].clone()).collect::<Vec<_>>().join(", ");
+                    let refs = many
+                        .iter()
+                        .map(|i| var[i].clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     format!("([{refs}])")
                 }
             };
-            out.push_str(&format!("{} = {}{}\n", var[&step.id], step.layer.render(), call));
+            out.push_str(&format!(
+                "{} = {}{}\n",
+                var[&step.id],
+                step.layer.render(),
+                call
+            ));
         }
 
         // Roots (no inputs) are the model inputs; a single root is passed bare,
         // multiple as a list.
-        let roots: Vec<String> =
-            order.iter().filter(|s| s.inputs.is_empty()).map(|s| var[&s.id].clone()).collect();
+        let roots: Vec<String> = order
+            .iter()
+            .filter(|s| s.inputs.is_empty())
+            .map(|s| var[&s.id].clone())
+            .collect();
         let inputs = match roots.as_slice() {
             [single] => single.clone(),
             _ => format!("[{}]", roots.join(", ")),
         };
         let outputs = self.output.map(|o| var[&o].clone()).unwrap_or_default();
-        out.push_str(&format!("\nmodel = keras.Model(inputs={inputs}, outputs={outputs})\n"));
+        out.push_str(&format!(
+            "\nmodel = keras.Model(inputs={inputs}, outputs={outputs})\n"
+        ));
 
         if let Some(c) = &self.compile {
             let mut args: Vec<String> = Vec::new();
@@ -254,9 +280,16 @@ fn quote_metrics(raw: &str) -> String {
 impl std::fmt::Display for KerasModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Compact one-line summary for the node value display row.
-        let tip = self.output.and_then(|o| self.steps.iter().find(|s| s.id == o));
+        let tip = self
+            .output
+            .and_then(|o| self.steps.iter().find(|s| s.id == o));
         match tip {
-            Some(s) => write!(f, "[{} layers] -> {}", self.steps.len(), s.layer.keras_class),
+            Some(s) => write!(
+                f,
+                "[{} layers] -> {}",
+                self.steps.len(),
+                s.layer.keras_class
+            ),
             None => write!(f, "[empty model]"),
         }
     }
@@ -304,7 +337,10 @@ mod tests {
     }
 
     fn concat() -> Layer {
-        Layer { keras_class: "Concatenate".to_string(), kwargs: vec![] }
+        Layer {
+            keras_class: "Concatenate".to_string(),
+            kwargs: vec![],
+        }
     }
 
     #[test]
@@ -340,8 +376,15 @@ mod tests {
         let merged = KerasModel::join(4, concat(), &[&a, &b]);
         let py = merged.with_layer(5, dense("10")).to_python();
 
-        assert_eq!(py.matches("layers.Input").count(), 1, "shared Input emitted once");
-        assert!(py.contains("layers.Concatenate()(["), "merge uses list call");
+        assert_eq!(
+            py.matches("layers.Input").count(),
+            1,
+            "shared Input emitted once"
+        );
+        assert!(
+            py.contains("layers.Concatenate()(["),
+            "merge uses list call"
+        );
         // The concat references both branch tips.
         assert!(py.contains("(x0)\n"), "branch dense wired to shared input");
         assert!(py.contains("model = keras.Model(inputs=x0, outputs=x4)"));
@@ -359,18 +402,28 @@ mod tests {
 
     #[test]
     fn codegen_emits_compile_when_set() {
-        let model = KerasModel::new().with_layer(1, dense("10")).with_compile(CompileConfig {
-            optimizer: "adam".to_string(),
-            loss: "mse".to_string(),
-            metrics: "accuracy, mae".to_string(),
-        });
+        let model = KerasModel::new()
+            .with_layer(1, dense("10"))
+            .with_compile(CompileConfig {
+                optimizer: "adam".to_string(),
+                loss: "mse".to_string(),
+                metrics: "accuracy, mae".to_string(),
+            });
         let py = model.to_python();
-        assert!(py.contains("model.compile(optimizer='adam', loss='mse', metrics=['accuracy', 'mae'])"));
+        assert!(
+            py.contains("model.compile(optimizer='adam', loss='mse', metrics=['accuracy', 'mae'])")
+        );
     }
 
     #[test]
     fn compile_config_is_set_detects_empty() {
         assert!(!CompileConfig::default().is_set());
-        assert!(CompileConfig { optimizer: "adam".into(), ..Default::default() }.is_set());
+        assert!(
+            CompileConfig {
+                optimizer: "adam".into(),
+                ..Default::default()
+            }
+            .is_set()
+        );
     }
 }

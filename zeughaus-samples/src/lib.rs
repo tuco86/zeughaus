@@ -342,7 +342,10 @@ mod tests {
         let frame = solid(800, 600, [200, 100, 50, 255]);
         let scaled = scale_to_fit(&frame, 200, 200);
         assert_eq!(&scaled.rgba()[0..4], &[200, 100, 50, 255]);
-        assert_eq!(scaled.rgba().len(), scaled.width() as usize * scaled.height() as usize * 4);
+        assert_eq!(
+            scaled.rgba().len(),
+            scaled.width() as usize * scaled.height() as usize * 4
+        );
     }
 
     /// Averaging must actually average: a checkerboard reduced 2:1 is uniform
@@ -360,7 +363,10 @@ mod tests {
         let scaled = scale_to_fit(&frame, 2, 2);
         assert_eq!((scaled.width(), scaled.height()), (2, 2));
         for px in scaled.rgba().as_chunks::<4>().0 {
-            assert_eq!(px[0], 127, "each output pixel averages two black and two white");
+            assert_eq!(
+                px[0], 127,
+                "each output pixel averages two black and two white"
+            );
             assert_eq!(px[3], 255);
         }
     }

@@ -1,6 +1,6 @@
 use zeughaus_core::*;
 
-use crate::model::{keras_model_ty, KerasModel};
+use crate::model::{KerasModel, keras_model_ty};
 
 /// Terminal node of an ML graph: renders the incoming model to a runnable
 /// Keras (TensorFlow) Python program and emits it as a String on the `code`
@@ -44,7 +44,11 @@ impl ExecutableNode for ExportNode {
         // incoming edge) must be an Input layer -- only Input yields a
         // KerasTensor. Any other root would produce a layer object, not a
         // tensor, and keras.Model would reject it at runtime.
-        if let Some(bad) = model.roots().iter().find(|s| s.layer.keras_class != "Input") {
+        if let Some(bad) = model
+            .roots()
+            .iter()
+            .find(|s| s.layer.keras_class != "Input")
+        {
             return Err(ZeughausError::ExecutionFailed(format!(
                 "every input branch must start with an Input layer, found {}",
                 bad.layer.keras_class
@@ -108,9 +112,13 @@ mod tests {
     #[test]
     fn valid_model_emits_code() {
         let mut node = ExportNode::new();
-        let model = KerasModel::new()
-            .with_layer(1, input_layer())
-            .with_layer(2, Layer { keras_class: "Flatten".to_string(), kwargs: vec![] });
+        let model = KerasModel::new().with_layer(1, input_layer()).with_layer(
+            2,
+            Layer {
+                keras_class: "Flatten".to_string(),
+                kwargs: vec![],
+            },
+        );
         let mut inputs = InputSet::new();
         inputs.insert("model", Value::new(model));
         let mut ctx = NodeContext::new(NodeId(1), 0);

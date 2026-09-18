@@ -156,7 +156,10 @@ pub async fn accept_triggers(puller: Puller, tx: SyncSender<u64>) {
             }
         };
         let Some(request) = TriggerRequest::decode(&payload) else {
-            eprintln!("[runner] refused a malformed trigger ({} bytes)", payload.len());
+            eprintln!(
+                "[runner] refused a malformed trigger ({} bytes)",
+                payload.len()
+            );
             continue;
         };
         match offer(&tx, request.node_id) {
@@ -187,10 +190,7 @@ pub async fn serve_snapshots(replier: Replier, snapshot: Arc<Mutex<Snapshot>>) {
             }
         };
         drop(request.take_body());
-        let encoded = snapshot
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .encode();
+        let encoded = snapshot.lock().unwrap_or_else(|e| e.into_inner()).encode();
         let mut reply = match request.reply(TransferMeta::default()).await {
             Ok(reply) => reply,
             Err(e) => {

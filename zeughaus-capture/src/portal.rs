@@ -103,12 +103,7 @@ async fn request_screenshot() -> Result<PathBuf, String> {
     };
     let response = tokio::time::timeout(PORTAL_TIMEOUT, request)
         .await
-        .map_err(|_| {
-            format!(
-                "portal: no response within {}s",
-                PORTAL_TIMEOUT.as_secs()
-            )
-        })??;
+        .map_err(|_| format!("portal: no response within {}s", PORTAL_TIMEOUT.as_secs()))??;
     file_uri_to_path(response.uri().as_str())
 }
 

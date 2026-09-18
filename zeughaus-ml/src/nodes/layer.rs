@@ -5,7 +5,7 @@
 
 use zeughaus_core::*;
 
-use crate::model::{keras_model_ty, KerasModel, Layer};
+use crate::model::{KerasModel, Layer, keras_model_ty};
 
 /// Whether a parameter is a Python string (quoted in codegen) or a raw literal
 /// (number, tuple, bool, identifier -- emitted verbatim).
@@ -35,8 +35,18 @@ pub struct LayerSpec {
     pub params: &'static [ParamDef],
 }
 
-const fn p(name: &'static str, default: &'static str, placeholder: &'static str, ty: ParamType) -> ParamDef {
-    ParamDef { name, default, placeholder, ty }
+const fn p(
+    name: &'static str,
+    default: &'static str,
+    placeholder: &'static str,
+    ty: ParamType,
+) -> ParamDef {
+    ParamDef {
+        name,
+        default,
+        placeholder,
+        ty,
+    }
 }
 
 use ParamType::{Raw, Str};
@@ -213,8 +223,16 @@ pub struct LayerNode {
 
 impl LayerNode {
     pub fn new(spec: &'static LayerSpec) -> Self {
-        let values = spec.params.iter().map(|d| (d.name, d.default.to_string())).collect();
-        Self { spec, values, pins: layer_pins() }
+        let values = spec
+            .params
+            .iter()
+            .map(|d| (d.name, d.default.to_string()))
+            .collect();
+        Self {
+            spec,
+            values,
+            pins: layer_pins(),
+        }
     }
 
     /// Builds the rendered `Layer` from this node's params and current values.
@@ -284,9 +302,14 @@ mod tests {
     #[test]
     fn setting_overrides_param() {
         let mut node = LayerNode::new(spec("ml.dense").unwrap());
-        node.set_parameter("units", Value::new("10".to_string())).unwrap();
-        node.set_parameter("activation", Value::new("softmax".to_string())).unwrap();
-        assert_eq!(node.build_layer().render(), "layers.Dense(units=10, activation='softmax')");
+        node.set_parameter("units", Value::new("10".to_string()))
+            .unwrap();
+        node.set_parameter("activation", Value::new("softmax".to_string()))
+            .unwrap();
+        assert_eq!(
+            node.build_layer().render(),
+            "layers.Dense(units=10, activation='softmax')"
+        );
     }
 
     #[test]

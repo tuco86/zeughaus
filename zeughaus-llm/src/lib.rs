@@ -22,7 +22,12 @@ impl DomainPlugin for LlmPlugin {
 
     fn node_catalog(&self) -> Vec<NodeDefinition> {
         vec![
-            catalog_entry("llm.system", "System Message", "LLM", &SystemMessageNode::new()),
+            catalog_entry(
+                "llm.system",
+                "System Message",
+                "LLM",
+                &SystemMessageNode::new(),
+            ),
             catalog_entry("llm.user", "User Message", "LLM", &UserMessageNode::new()),
             catalog_entry("llm.chat", "Chat (LM Studio)", "LLM", &ChatNode::new()),
             catalog_entry("llm.last_reply", "Last Reply", "LLM", &LastReplyNode::new()),

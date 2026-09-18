@@ -14,13 +14,38 @@ impl DomainPlugin for TransformPlugin {
     fn node_catalog(&self) -> Vec<NodeDefinition> {
         vec![
             // Constants
-            catalog_entry("transform.const_f64", "Const (f64)", "Const", &ConstF64Node::new(0.0)),
-            catalog_entry("transform.const_bool", "Const (bool)", "Const", &ConstBoolNode::new(false)),
-            catalog_entry("transform.const_string", "Const (String)", "Const", &ConstStringNode::new("")),
+            catalog_entry(
+                "transform.const_f64",
+                "Const (f64)",
+                "Const",
+                &ConstF64Node::new(0.0),
+            ),
+            catalog_entry(
+                "transform.const_bool",
+                "Const (bool)",
+                "Const",
+                &ConstBoolNode::new(false),
+            ),
+            catalog_entry(
+                "transform.const_string",
+                "Const (String)",
+                "Const",
+                &ConstStringNode::new(""),
+            ),
             // Math
             catalog_entry("transform.add", "Add", "Math", &AddNode::new()),
-            catalog_entry("transform.subtract", "Subtract", "Math", &SubtractNode::new()),
-            catalog_entry("transform.multiply", "Multiply", "Math", &MultiplyNode::new()),
+            catalog_entry(
+                "transform.subtract",
+                "Subtract",
+                "Math",
+                &SubtractNode::new(),
+            ),
+            catalog_entry(
+                "transform.multiply",
+                "Multiply",
+                "Math",
+                &MultiplyNode::new(),
+            ),
             catalog_entry("transform.divide", "Divide", "Math", &DivideNode::new()),
             catalog_entry("transform.negate", "Negate", "Math", &NegateNode::new()),
             catalog_entry("transform.abs", "Abs", "Math", &AbsNode::new()),
@@ -41,20 +66,45 @@ impl DomainPlugin for TransformPlugin {
             catalog_entry("transform.cos", "Cos", "Trig", &CosNode::new()),
             catalog_entry("transform.tan", "Tan", "Trig", &TanNode::new()),
             // Logic
-            catalog_entry("transform.greater_than", "Greater Than", "Logic", &GreaterThanNode::new()),
+            catalog_entry(
+                "transform.greater_than",
+                "Greater Than",
+                "Logic",
+                &GreaterThanNode::new(),
+            ),
             catalog_entry("transform.equal", "Equal", "Logic", &EqualNode::new()),
             catalog_entry("transform.select", "Select", "Logic", &SelectNode::new()),
             catalog_entry("transform.not", "Not", "Logic", &NotNode::new()),
             catalog_entry("transform.and", "And", "Logic", &AndNode::new()),
             catalog_entry("transform.or", "Or", "Logic", &OrNode::new()),
             // Utility
-            catalog_entry("transform.map_range", "Map Range", "Utility", &MapRangeNode::new()),
+            catalog_entry(
+                "transform.map_range",
+                "Map Range",
+                "Utility",
+                &MapRangeNode::new(),
+            ),
             // String
-            catalog_entry("transform.to_string", "To String", "String", &ToStringNode::new()),
+            catalog_entry(
+                "transform.to_string",
+                "To String",
+                "String",
+                &ToStringNode::new(),
+            ),
             catalog_entry("transform.concat", "Concat", "String", &ConcatNode::new()),
-            catalog_entry("transform.string_len", "String Length", "String", &StringLenNode::new()),
+            catalog_entry(
+                "transform.string_len",
+                "String Length",
+                "String",
+                &StringLenNode::new(),
+            ),
             // Output
-            catalog_entry("transform.display", "Display", "Output", &DisplayNode::new()),
+            catalog_entry(
+                "transform.display",
+                "Display",
+                "Output",
+                &DisplayNode::new(),
+            ),
         ]
     }
 

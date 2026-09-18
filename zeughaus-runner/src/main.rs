@@ -298,7 +298,9 @@ fn parse_feed_addr() -> Result<SocketAddr, String> {
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         if a == "--feed-addr" {
-            let text = args.next().ok_or("--feed-addr needs a host:port argument")?;
+            let text = args
+                .next()
+                .ok_or("--feed-addr needs a host:port argument")?;
             return feed_addr_from(&text);
         }
     }

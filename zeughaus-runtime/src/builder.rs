@@ -25,11 +25,7 @@ impl GraphBuilder {
         self.plugins.push(plugin);
     }
 
-    pub fn add_node(
-        &mut self,
-        type_id: &str,
-        position: (f32, f32),
-    ) -> Result<NodeId> {
+    pub fn add_node(&mut self, type_id: &str, position: (f32, f32)) -> Result<NodeId> {
         let exec = self
             .plugins
             .iter()

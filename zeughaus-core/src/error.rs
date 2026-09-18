@@ -9,10 +9,7 @@ pub enum ZeughausError {
     PinNotFound(PinId),
 
     #[error("type mismatch: expected {expected}, got {actual}")]
-    TypeMismatch {
-        expected: String,
-        actual: String,
-    },
+    TypeMismatch { expected: String, actual: String },
 
     #[error("cycle detected in graph")]
     CycleDetected,

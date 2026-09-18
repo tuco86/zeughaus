@@ -117,7 +117,10 @@ mod tests {
         inputs.insert("input", Value::new(true));
         let mut ctx = NodeContext::new(NodeId(1), 0);
         node.execute(&inputs, &mut ctx).unwrap();
-        assert_eq!(ctx.take_outputs()["result"].downcast_ref::<bool>(), Some(&false));
+        assert_eq!(
+            ctx.take_outputs()["result"].downcast_ref::<bool>(),
+            Some(&false)
+        );
     }
 
     #[test]
@@ -127,12 +130,20 @@ mod tests {
         inputs.insert("input", Value::new(false));
         let mut ctx = NodeContext::new(NodeId(1), 0);
         node.execute(&inputs, &mut ctx).unwrap();
-        assert_eq!(ctx.take_outputs()["result"].downcast_ref::<bool>(), Some(&true));
+        assert_eq!(
+            ctx.take_outputs()["result"].downcast_ref::<bool>(),
+            Some(&true)
+        );
     }
 
     #[test]
     fn and_truth_table() {
-        for (a, b, expected) in [(false, false, false), (true, false, false), (false, true, false), (true, true, true)] {
+        for (a, b, expected) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, true),
+        ] {
             let mut node = AndNode::new();
             let mut inputs = InputSet::new();
             inputs.insert("a", Value::new(a));
@@ -149,7 +160,12 @@ mod tests {
 
     #[test]
     fn or_truth_table() {
-        for (a, b, expected) in [(false, false, false), (true, false, true), (false, true, true), (true, true, true)] {
+        for (a, b, expected) in [
+            (false, false, false),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+        ] {
             let mut node = OrNode::new();
             let mut inputs = InputSet::new();
             inputs.insert("a", Value::new(a));

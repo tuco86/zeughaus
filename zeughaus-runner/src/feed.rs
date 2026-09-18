@@ -127,7 +127,10 @@ impl FrameRegistry {
     /// has, and re-stamping it would make all of them resend it -- which is
     /// what makes "never send the same frame twice" free rather than a
     /// per-viewer comparison of 33 MB.
-    pub fn publish<'a>(&self, pins: impl IntoIterator<Item = (NodeId, &'a str, Option<&'a Image>)>) {
+    pub fn publish<'a>(
+        &self,
+        pins: impl IntoIterator<Item = (NodeId, &'a str, Option<&'a Image>)>,
+    ) {
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let Slots {
             pins: stored,
@@ -491,7 +494,10 @@ async fn serve_feed(
     // Dropping the request without replying tells the viewer no reply is
     // coming, which is the honest answer to bytes that are not a request.
     let Some(feed) = FeedRequest::decode(&encoded) else {
-        eprintln!("[feed] refused a malformed request ({} bytes)", encoded.len());
+        eprintln!(
+            "[feed] refused a malformed request ({} bytes)",
+            encoded.len()
+        );
         return;
     };
 
@@ -683,7 +689,10 @@ mod tests {
         let Lookup::Frame(second, _) = registry.lookup(NodeId(7), "frame") else {
             panic!("published frame missing");
         };
-        assert_eq!(first, second, "a pass that changed nothing must not restamp");
+        assert_eq!(
+            first, second,
+            "a pass that changed nothing must not restamp"
+        );
     }
 
     #[test]

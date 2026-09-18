@@ -1,6 +1,6 @@
 use zeughaus_core::*;
 
-use crate::model::{keras_model_ty, CompileConfig, KerasModel};
+use crate::model::{CompileConfig, KerasModel, keras_model_ty};
 
 /// Attaches a training configuration (optimizer, loss, metrics) to the model.
 /// Place it after the layer stack; the Export node renders the resulting

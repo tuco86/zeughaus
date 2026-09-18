@@ -328,13 +328,7 @@ impl GraphExecutor {
     /// target accepts anything, the value passes through. Otherwise a registered
     /// converter is applied; a missing converter for a genuine mismatch is
     /// logged and the value passed through unchanged.
-    fn coerce(
-        &self,
-        to_type: Option<&Ty>,
-        value: &Value,
-        node_id: NodeId,
-        to_pin: &str,
-    ) -> Value {
+    fn coerce(&self, to_type: Option<&Ty>, value: &Value, node_id: NodeId, to_pin: &str) -> Value {
         let Some(to) = to_type else {
             return value.clone();
         };
@@ -1389,7 +1383,10 @@ mod tests {
         exec.cache.set(edge_a, Value::new(1.0_f64));
         exec.mark_dirty(sink);
         exec.execute_dirty().expect("pass");
-        assert_eq!(seen.lock().expect("log").last().copied(), Some((true, false)));
+        assert_eq!(
+            seen.lock().expect("log").last().copied(),
+            Some((true, false))
+        );
 
         // Nothing delivered since: a rerun for another reason reports neither.
         exec.mark_dirty(sink);
@@ -1404,7 +1401,10 @@ mod tests {
         exec.cache.set(edge_b, Value::new(2.0_f64));
         exec.mark_dirty(sink);
         exec.execute_dirty().expect("pass");
-        assert_eq!(seen.lock().expect("log").last().copied(), Some((true, true)));
+        assert_eq!(
+            seen.lock().expect("log").last().copied(),
+            Some((true, true))
+        );
     }
 
     /// A node that records every run, so a test can tell "ran once" from

@@ -101,4 +101,3 @@ macro_rules! unary_f64_node {
         }
     };
 }
-

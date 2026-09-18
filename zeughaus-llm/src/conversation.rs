@@ -89,7 +89,13 @@ impl std::fmt::Display for Conversation {
         match self.last() {
             Some(m) => {
                 let preview: String = m.content.chars().take(40).collect();
-                write!(f, "[{}] {}: {}", self.messages.len(), m.role.as_str(), preview)
+                write!(
+                    f,
+                    "[{}] {}: {}",
+                    self.messages.len(),
+                    m.role.as_str(),
+                    preview
+                )
             }
             None => write!(f, "[empty]"),
         }

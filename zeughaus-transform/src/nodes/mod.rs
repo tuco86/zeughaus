@@ -28,9 +28,14 @@ pub use display::DisplayNode;
 pub use lerp::LerpNode;
 pub use logic::{AndNode, NotNode, OrNode};
 pub use map_range::MapRangeNode;
-pub use math::{AbsNode, AddNode, DivideNode, MaxNode, MinNode, ModuloNode, MultiplyNode, NegateNode, SubtractNode};
+pub use math::{
+    AbsNode, AddNode, DivideNode, MaxNode, MinNode, ModuloNode, MultiplyNode, NegateNode,
+    SubtractNode,
+};
 pub use power::PowerNode;
 pub use select_node::SelectNode;
 pub use string_len::StringLenNode;
 pub use to_string::ToStringNode;
-pub use trig::{CeilNode, CosNode, FloorNode, LnNode, Log2Node, RoundNode, SinNode, SqrtNode, TanNode};
+pub use trig::{
+    CeilNode, CosNode, FloorNode, LnNode, Log2Node, RoundNode, SinNode, SqrtNode, TanNode,
+};

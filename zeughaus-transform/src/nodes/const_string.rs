@@ -45,7 +45,9 @@ mod tests {
         let mut ctx = NodeContext::new(NodeId(1), 0);
         node.execute(&InputSet::new(), &mut ctx).unwrap();
         assert_eq!(
-            ctx.take_outputs()["value"].downcast_ref::<String>().unwrap(),
+            ctx.take_outputs()["value"]
+                .downcast_ref::<String>()
+                .unwrap(),
             "hello"
         );
     }
@@ -53,11 +55,14 @@ mod tests {
     #[test]
     fn set_parameter_updates() {
         let mut node = ConstStringNode::new("");
-        node.set_parameter("value", Value::new("world".to_string())).unwrap();
+        node.set_parameter("value", Value::new("world".to_string()))
+            .unwrap();
         let mut ctx = NodeContext::new(NodeId(1), 0);
         node.execute(&InputSet::new(), &mut ctx).unwrap();
         assert_eq!(
-            ctx.take_outputs()["value"].downcast_ref::<String>().unwrap(),
+            ctx.take_outputs()["value"]
+                .downcast_ref::<String>()
+                .unwrap(),
             "world"
         );
     }

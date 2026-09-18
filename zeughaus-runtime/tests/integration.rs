@@ -14,17 +14,25 @@ fn setup() -> GraphBuilder {
 fn add_pipeline_produces_correct_result() {
     let mut builder = setup();
     let const_a = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
-    let const_b = builder.add_node("transform.const_f64", (0.0, 100.0)).unwrap();
+    let const_b = builder
+        .add_node("transform.const_f64", (0.0, 100.0))
+        .unwrap();
     let add = builder.add_node("transform.add", (200.0, 50.0)).unwrap();
-    let display = builder.add_node("transform.display", (400.0, 50.0)).unwrap();
+    let display = builder
+        .add_node("transform.display", (400.0, 50.0))
+        .unwrap();
 
     builder.connect(const_a, "value", add, "a").unwrap();
     builder.connect(const_b, "value", add, "b").unwrap();
     let add_out_edge = builder.connect(add, "result", display, "input").unwrap();
 
     let mut executor = builder.build().unwrap();
-    executor.set_parameter(const_a, "value", Value::new(3.0f64)).unwrap();
-    executor.set_parameter(const_b, "value", Value::new(4.0f64)).unwrap();
+    executor
+        .set_parameter(const_a, "value", Value::new(3.0f64))
+        .unwrap();
+    executor
+        .set_parameter(const_b, "value", Value::new(4.0f64))
+        .unwrap();
     executor.execute_all().unwrap();
 
     let result = executor.edge_value(add_out_edge).unwrap();
@@ -35,17 +43,27 @@ fn add_pipeline_produces_correct_result() {
 fn multiply_pipeline() {
     let mut builder = setup();
     let const_a = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
-    let const_b = builder.add_node("transform.const_f64", (0.0, 100.0)).unwrap();
-    let mul = builder.add_node("transform.multiply", (200.0, 50.0)).unwrap();
-    let display = builder.add_node("transform.display", (400.0, 50.0)).unwrap();
+    let const_b = builder
+        .add_node("transform.const_f64", (0.0, 100.0))
+        .unwrap();
+    let mul = builder
+        .add_node("transform.multiply", (200.0, 50.0))
+        .unwrap();
+    let display = builder
+        .add_node("transform.display", (400.0, 50.0))
+        .unwrap();
 
     builder.connect(const_a, "value", mul, "a").unwrap();
     builder.connect(const_b, "value", mul, "b").unwrap();
     let mul_out = builder.connect(mul, "result", display, "input").unwrap();
 
     let mut executor = builder.build().unwrap();
-    executor.set_parameter(const_a, "value", Value::new(5.0f64)).unwrap();
-    executor.set_parameter(const_b, "value", Value::new(6.0f64)).unwrap();
+    executor
+        .set_parameter(const_a, "value", Value::new(5.0f64))
+        .unwrap();
+    executor
+        .set_parameter(const_b, "value", Value::new(6.0f64))
+        .unwrap();
     executor.execute_all().unwrap();
 
     let result = executor.edge_value(mul_out).unwrap();
@@ -56,17 +74,27 @@ fn multiply_pipeline() {
 fn subtract_pipeline() {
     let mut builder = setup();
     let const_a = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
-    let const_b = builder.add_node("transform.const_f64", (0.0, 100.0)).unwrap();
-    let sub = builder.add_node("transform.subtract", (200.0, 50.0)).unwrap();
-    let display = builder.add_node("transform.display", (400.0, 50.0)).unwrap();
+    let const_b = builder
+        .add_node("transform.const_f64", (0.0, 100.0))
+        .unwrap();
+    let sub = builder
+        .add_node("transform.subtract", (200.0, 50.0))
+        .unwrap();
+    let display = builder
+        .add_node("transform.display", (400.0, 50.0))
+        .unwrap();
 
     builder.connect(const_a, "value", sub, "a").unwrap();
     builder.connect(const_b, "value", sub, "b").unwrap();
     let sub_out = builder.connect(sub, "result", display, "input").unwrap();
 
     let mut executor = builder.build().unwrap();
-    executor.set_parameter(const_a, "value", Value::new(10.0f64)).unwrap();
-    executor.set_parameter(const_b, "value", Value::new(3.0f64)).unwrap();
+    executor
+        .set_parameter(const_a, "value", Value::new(10.0f64))
+        .unwrap();
+    executor
+        .set_parameter(const_b, "value", Value::new(3.0f64))
+        .unwrap();
     executor.execute_all().unwrap();
 
     let result = executor.edge_value(sub_out).unwrap();
@@ -90,7 +118,9 @@ fn edge_direction_from_output_to_input() {
     let out_edge = builder.connect(add, "result", display, "input").unwrap();
 
     let mut executor = builder.build().unwrap();
-    executor.set_parameter(const_a, "value", Value::new(42.0f64)).unwrap();
+    executor
+        .set_parameter(const_a, "value", Value::new(42.0f64))
+        .unwrap();
     executor.execute_all().unwrap();
 
     // Add received 42.0 on pin "a", default 0.0 on pin "b" -> result = 42.0
@@ -113,13 +143,24 @@ fn multi_hop_edge_direction() {
     let e3 = builder.connect(abs, "result", display, "input").unwrap();
 
     let mut executor = builder.build().unwrap();
-    executor.set_parameter(src, "value", Value::new(7.0f64)).unwrap();
+    executor
+        .set_parameter(src, "value", Value::new(7.0f64))
+        .unwrap();
     executor.execute_all().unwrap();
 
     // src=7 -> negate=-7 -> abs=7
-    assert_eq!(executor.edge_value(e1).unwrap().downcast_ref::<f64>(), Some(&7.0));
-    assert_eq!(executor.edge_value(e2).unwrap().downcast_ref::<f64>(), Some(&-7.0));
-    assert_eq!(executor.edge_value(e3).unwrap().downcast_ref::<f64>(), Some(&7.0));
+    assert_eq!(
+        executor.edge_value(e1).unwrap().downcast_ref::<f64>(),
+        Some(&7.0)
+    );
+    assert_eq!(
+        executor.edge_value(e2).unwrap().downcast_ref::<f64>(),
+        Some(&-7.0)
+    );
+    assert_eq!(
+        executor.edge_value(e3).unwrap().downcast_ref::<f64>(),
+        Some(&7.0)
+    );
 }
 
 // -- Dirty propagation tests --
@@ -128,26 +169,42 @@ fn multi_hop_edge_direction() {
 fn dirty_re_execution_after_parameter_change() {
     let mut builder = setup();
     let const_a = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
-    let const_b = builder.add_node("transform.const_f64", (0.0, 100.0)).unwrap();
+    let const_b = builder
+        .add_node("transform.const_f64", (0.0, 100.0))
+        .unwrap();
     let add = builder.add_node("transform.add", (200.0, 50.0)).unwrap();
-    let display = builder.add_node("transform.display", (400.0, 50.0)).unwrap();
+    let display = builder
+        .add_node("transform.display", (400.0, 50.0))
+        .unwrap();
 
     builder.connect(const_a, "value", add, "a").unwrap();
     builder.connect(const_b, "value", add, "b").unwrap();
     let out_edge = builder.connect(add, "result", display, "input").unwrap();
 
     let mut executor = builder.build().unwrap();
-    executor.set_parameter(const_a, "value", Value::new(10.0f64)).unwrap();
-    executor.set_parameter(const_b, "value", Value::new(20.0f64)).unwrap();
+    executor
+        .set_parameter(const_a, "value", Value::new(10.0f64))
+        .unwrap();
+    executor
+        .set_parameter(const_b, "value", Value::new(20.0f64))
+        .unwrap();
     executor.execute_all().unwrap();
 
-    assert_eq!(executor.edge_value(out_edge).unwrap().downcast_ref::<f64>(), Some(&30.0));
+    assert_eq!(
+        executor.edge_value(out_edge).unwrap().downcast_ref::<f64>(),
+        Some(&30.0)
+    );
 
     // Change only const_b, re-execute dirty
-    executor.set_parameter(const_b, "value", Value::new(100.0f64)).unwrap();
+    executor
+        .set_parameter(const_b, "value", Value::new(100.0f64))
+        .unwrap();
     executor.execute_dirty().unwrap();
 
-    assert_eq!(executor.edge_value(out_edge).unwrap().downcast_ref::<f64>(), Some(&110.0));
+    assert_eq!(
+        executor.edge_value(out_edge).unwrap().downcast_ref::<f64>(),
+        Some(&110.0)
+    );
 }
 
 // -- Fan-out: one output feeding multiple inputs --
@@ -157,25 +214,41 @@ fn fan_out_one_source_to_many_consumers() {
     let mut builder = setup();
     let src = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
     let add = builder.add_node("transform.add", (200.0, 0.0)).unwrap();
-    let mul = builder.add_node("transform.multiply", (200.0, 100.0)).unwrap();
+    let mul = builder
+        .add_node("transform.multiply", (200.0, 100.0))
+        .unwrap();
     let display_add = builder.add_node("transform.display", (400.0, 0.0)).unwrap();
-    let display_mul = builder.add_node("transform.display", (400.0, 100.0)).unwrap();
+    let display_mul = builder
+        .add_node("transform.display", (400.0, 100.0))
+        .unwrap();
 
     // src feeds both "a" pins
     builder.connect(src, "value", add, "a").unwrap();
     builder.connect(src, "value", add, "b").unwrap();
     builder.connect(src, "value", mul, "a").unwrap();
     builder.connect(src, "value", mul, "b").unwrap();
-    let add_out = builder.connect(add, "result", display_add, "input").unwrap();
-    let mul_out = builder.connect(mul, "result", display_mul, "input").unwrap();
+    let add_out = builder
+        .connect(add, "result", display_add, "input")
+        .unwrap();
+    let mul_out = builder
+        .connect(mul, "result", display_mul, "input")
+        .unwrap();
 
     let mut executor = builder.build().unwrap();
-    executor.set_parameter(src, "value", Value::new(5.0f64)).unwrap();
+    executor
+        .set_parameter(src, "value", Value::new(5.0f64))
+        .unwrap();
     executor.execute_all().unwrap();
 
     // 5+5=10, 5*5=25
-    assert_eq!(executor.edge_value(add_out).unwrap().downcast_ref::<f64>(), Some(&10.0));
-    assert_eq!(executor.edge_value(mul_out).unwrap().downcast_ref::<f64>(), Some(&25.0));
+    assert_eq!(
+        executor.edge_value(add_out).unwrap().downcast_ref::<f64>(),
+        Some(&10.0)
+    );
+    assert_eq!(
+        executor.edge_value(mul_out).unwrap().downcast_ref::<f64>(),
+        Some(&25.0)
+    );
 }
 
 // -- Diamond graph: A -> B, A -> C, B -> D, C -> D --
@@ -185,9 +258,15 @@ fn diamond_graph_correct_result() {
     let mut builder = setup();
     let src = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
     let add_left = builder.add_node("transform.add", (200.0, 0.0)).unwrap();
-    let mul_right = builder.add_node("transform.multiply", (200.0, 100.0)).unwrap();
-    let sub = builder.add_node("transform.subtract", (400.0, 50.0)).unwrap();
-    let display = builder.add_node("transform.display", (600.0, 50.0)).unwrap();
+    let mul_right = builder
+        .add_node("transform.multiply", (200.0, 100.0))
+        .unwrap();
+    let sub = builder
+        .add_node("transform.subtract", (400.0, 50.0))
+        .unwrap();
+    let display = builder
+        .add_node("transform.display", (600.0, 50.0))
+        .unwrap();
 
     // src -> add_left "a" (b defaults to 0, so add_left = src + 0 = src)
     builder.connect(src, "value", add_left, "a").unwrap();
@@ -200,11 +279,16 @@ fn diamond_graph_correct_result() {
     let out_edge = builder.connect(sub, "result", display, "input").unwrap();
 
     let mut executor = builder.build().unwrap();
-    executor.set_parameter(src, "value", Value::new(3.0f64)).unwrap();
+    executor
+        .set_parameter(src, "value", Value::new(3.0f64))
+        .unwrap();
     executor.execute_all().unwrap();
 
     // 3 - (3*3) = 3 - 9 = -6
-    assert_eq!(executor.edge_value(out_edge).unwrap().downcast_ref::<f64>(), Some(&-6.0));
+    assert_eq!(
+        executor.edge_value(out_edge).unwrap().downcast_ref::<f64>(),
+        Some(&-6.0)
+    );
 }
 
 // -- Select (conditional) pipeline --
@@ -213,8 +297,12 @@ fn diamond_graph_correct_result() {
 fn select_node_pipeline() {
     let mut builder = setup();
     let const_a = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
-    let const_b = builder.add_node("transform.const_f64", (0.0, 100.0)).unwrap();
-    let gt = builder.add_node("transform.greater_than", (200.0, 0.0)).unwrap();
+    let const_b = builder
+        .add_node("transform.const_f64", (0.0, 100.0))
+        .unwrap();
+    let gt = builder
+        .add_node("transform.greater_than", (200.0, 0.0))
+        .unwrap();
     let sel = builder.add_node("transform.select", (400.0, 0.0)).unwrap();
     let display = builder.add_node("transform.display", (600.0, 0.0)).unwrap();
 
@@ -226,19 +314,31 @@ fn select_node_pipeline() {
     let out_edge = builder.connect(sel, "result", display, "input").unwrap();
 
     let mut executor = builder.build().unwrap();
-    executor.set_parameter(const_a, "value", Value::new(10.0f64)).unwrap();
-    executor.set_parameter(const_b, "value", Value::new(5.0f64)).unwrap();
+    executor
+        .set_parameter(const_a, "value", Value::new(10.0f64))
+        .unwrap();
+    executor
+        .set_parameter(const_b, "value", Value::new(5.0f64))
+        .unwrap();
     executor.execute_all().unwrap();
 
     // 10 > 5 is true -> select true_val = 10
-    assert_eq!(executor.edge_value(out_edge).unwrap().downcast_ref::<f64>(), Some(&10.0));
+    assert_eq!(
+        executor.edge_value(out_edge).unwrap().downcast_ref::<f64>(),
+        Some(&10.0)
+    );
 
     // Flip: make a < b
-    executor.set_parameter(const_a, "value", Value::new(2.0f64)).unwrap();
+    executor
+        .set_parameter(const_a, "value", Value::new(2.0f64))
+        .unwrap();
     executor.execute_dirty().unwrap();
 
     // 2 > 5 is false -> select false_val = 5
-    assert_eq!(executor.edge_value(out_edge).unwrap().downcast_ref::<f64>(), Some(&5.0));
+    assert_eq!(
+        executor.edge_value(out_edge).unwrap().downcast_ref::<f64>(),
+        Some(&5.0)
+    );
 }
 
 // -- Error handling --
@@ -255,10 +355,16 @@ fn unknown_node_type_returns_error() {
 fn clamp_pipeline() {
     let mut builder = setup();
     let src = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
-    let min = builder.add_node("transform.const_f64", (0.0, 50.0)).unwrap();
-    let max = builder.add_node("transform.const_f64", (0.0, 100.0)).unwrap();
+    let min = builder
+        .add_node("transform.const_f64", (0.0, 50.0))
+        .unwrap();
+    let max = builder
+        .add_node("transform.const_f64", (0.0, 100.0))
+        .unwrap();
     let clamp = builder.add_node("transform.clamp", (200.0, 50.0)).unwrap();
-    let display = builder.add_node("transform.display", (400.0, 50.0)).unwrap();
+    let display = builder
+        .add_node("transform.display", (400.0, 50.0))
+        .unwrap();
 
     builder.connect(src, "value", clamp, "input").unwrap();
     builder.connect(min, "value", clamp, "min").unwrap();
@@ -266,13 +372,22 @@ fn clamp_pipeline() {
     let out_edge = builder.connect(clamp, "result", display, "input").unwrap();
 
     let mut executor = builder.build().unwrap();
-    executor.set_parameter(src, "value", Value::new(15.0f64)).unwrap();
-    executor.set_parameter(min, "value", Value::new(0.0f64)).unwrap();
-    executor.set_parameter(max, "value", Value::new(10.0f64)).unwrap();
+    executor
+        .set_parameter(src, "value", Value::new(15.0f64))
+        .unwrap();
+    executor
+        .set_parameter(min, "value", Value::new(0.0f64))
+        .unwrap();
+    executor
+        .set_parameter(max, "value", Value::new(10.0f64))
+        .unwrap();
     executor.execute_all().unwrap();
 
     // 15 clamped to [0, 10] = 10
-    assert_eq!(executor.edge_value(out_edge).unwrap().downcast_ref::<f64>(), Some(&10.0));
+    assert_eq!(
+        executor.edge_value(out_edge).unwrap().downcast_ref::<f64>(),
+        Some(&10.0)
+    );
 }
 
 // ===========================================================================
@@ -284,7 +399,9 @@ fn clamp_pipeline() {
 fn workflow_const_add_display() {
     let mut builder = setup();
     let c1 = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
-    let c2 = builder.add_node("transform.const_f64", (100.0, 0.0)).unwrap();
+    let c2 = builder
+        .add_node("transform.const_f64", (100.0, 0.0))
+        .unwrap();
     let add = builder.add_node("transform.add", (200.0, 0.0)).unwrap();
     let disp = builder.add_node("transform.display", (400.0, 0.0)).unwrap();
 
@@ -297,7 +414,10 @@ fn workflow_const_add_display() {
     exec.set_parameter(c2, "value", Value::new(4.0f64)).unwrap();
     exec.execute_all().unwrap();
 
-    assert_eq!(exec.edge_value(out).unwrap().downcast_ref::<f64>(), Some(&7.0));
+    assert_eq!(
+        exec.edge_value(out).unwrap().downcast_ref::<f64>(),
+        Some(&7.0)
+    );
 }
 
 /// Disconnect one input from Add, re-execute.
@@ -306,7 +426,9 @@ fn workflow_const_add_display() {
 fn workflow_disconnect_and_reexecute() {
     let mut builder = setup();
     let c1 = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
-    let c2 = builder.add_node("transform.const_f64", (100.0, 0.0)).unwrap();
+    let c2 = builder
+        .add_node("transform.const_f64", (100.0, 0.0))
+        .unwrap();
     let add = builder.add_node("transform.add", (200.0, 0.0)).unwrap();
     let disp = builder.add_node("transform.display", (400.0, 0.0)).unwrap();
 
@@ -319,14 +441,20 @@ fn workflow_disconnect_and_reexecute() {
     exec.set_parameter(c2, "value", Value::new(4.0f64)).unwrap();
     exec.execute_all().unwrap();
 
-    assert_eq!(exec.edge_value(out).unwrap().downcast_ref::<f64>(), Some(&7.0));
+    assert_eq!(
+        exec.edge_value(out).unwrap().downcast_ref::<f64>(),
+        Some(&7.0)
+    );
 
     // Disconnect c2 from add's "b" pin (properly clears cache)
     exec.disconnect_edge(edge_b);
     exec.execute_dirty().unwrap();
 
     // Add should now compute a=3 + b=0(default) = 3
-    assert_eq!(exec.edge_value(out).unwrap().downcast_ref::<f64>(), Some(&3.0));
+    assert_eq!(
+        exec.edge_value(out).unwrap().downcast_ref::<f64>(),
+        Some(&3.0)
+    );
 }
 
 /// Reconnect a different value after disconnect.
@@ -334,8 +462,12 @@ fn workflow_disconnect_and_reexecute() {
 fn workflow_reconnect_with_new_value() {
     let mut builder = setup();
     let c1 = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
-    let c2 = builder.add_node("transform.const_f64", (100.0, 0.0)).unwrap();
-    let c3 = builder.add_node("transform.const_f64", (100.0, 100.0)).unwrap();
+    let c2 = builder
+        .add_node("transform.const_f64", (100.0, 0.0))
+        .unwrap();
+    let c3 = builder
+        .add_node("transform.const_f64", (100.0, 100.0))
+        .unwrap();
     let add = builder.add_node("transform.add", (200.0, 0.0)).unwrap();
     let disp = builder.add_node("transform.display", (400.0, 0.0)).unwrap();
 
@@ -344,12 +476,18 @@ fn workflow_reconnect_with_new_value() {
     let out = builder.connect(add, "result", disp, "input").unwrap();
 
     let mut exec = builder.build().unwrap();
-    exec.set_parameter(c1, "value", Value::new(10.0f64)).unwrap();
-    exec.set_parameter(c2, "value", Value::new(20.0f64)).unwrap();
-    exec.set_parameter(c3, "value", Value::new(100.0f64)).unwrap();
+    exec.set_parameter(c1, "value", Value::new(10.0f64))
+        .unwrap();
+    exec.set_parameter(c2, "value", Value::new(20.0f64))
+        .unwrap();
+    exec.set_parameter(c3, "value", Value::new(100.0f64))
+        .unwrap();
     exec.execute_all().unwrap();
 
-    assert_eq!(exec.edge_value(out).unwrap().downcast_ref::<f64>(), Some(&30.0));
+    assert_eq!(
+        exec.edge_value(out).unwrap().downcast_ref::<f64>(),
+        Some(&30.0)
+    );
 
     // Disconnect c2, connect c3 instead
     exec.disconnect_edge(edge_b);
@@ -368,7 +506,10 @@ fn workflow_reconnect_with_new_value() {
     exec.execute_dirty().unwrap();
 
     // add = 10 + 100 = 110
-    assert_eq!(exec.edge_value(out).unwrap().downcast_ref::<f64>(), Some(&110.0));
+    assert_eq!(
+        exec.edge_value(out).unwrap().downcast_ref::<f64>(),
+        Some(&110.0)
+    );
 }
 
 /// Delete a node mid-chain. Remaining graph should not panic.
@@ -400,7 +541,9 @@ fn workflow_delete_node_mid_chain() {
 fn workflow_unconnected_nodes() {
     let mut builder = setup();
     let c1 = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
-    let c2 = builder.add_node("transform.const_f64", (100.0, 0.0)).unwrap();
+    let c2 = builder
+        .add_node("transform.const_f64", (100.0, 0.0))
+        .unwrap();
     let _disp = builder.add_node("transform.display", (200.0, 0.0)).unwrap();
 
     let mut exec = builder.build().unwrap();
@@ -425,7 +568,8 @@ fn sink_node_executes_and_incoming_edge_readable() {
     let edge_to_display = builder.connect(src, "value", disp, "input").unwrap();
 
     let mut exec = builder.build().unwrap();
-    exec.set_parameter(src, "value", Value::new(42.0f64)).unwrap();
+    exec.set_parameter(src, "value", Value::new(42.0f64))
+        .unwrap();
     exec.execute_all().unwrap();
 
     // The incoming edge to display must have the cached value from src
@@ -439,17 +583,26 @@ fn multiple_sink_nodes_from_same_source() {
     let mut builder = setup();
     let src = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
     let disp1 = builder.add_node("transform.display", (200.0, 0.0)).unwrap();
-    let disp2 = builder.add_node("transform.display", (200.0, 100.0)).unwrap();
+    let disp2 = builder
+        .add_node("transform.display", (200.0, 100.0))
+        .unwrap();
 
     let e1 = builder.connect(src, "value", disp1, "input").unwrap();
     let e2 = builder.connect(src, "value", disp2, "input").unwrap();
 
     let mut exec = builder.build().unwrap();
-    exec.set_parameter(src, "value", Value::new(99.0f64)).unwrap();
+    exec.set_parameter(src, "value", Value::new(99.0f64))
+        .unwrap();
     exec.execute_all().unwrap();
 
-    assert_eq!(exec.edge_value(e1).unwrap().downcast_ref::<f64>(), Some(&99.0));
-    assert_eq!(exec.edge_value(e2).unwrap().downcast_ref::<f64>(), Some(&99.0));
+    assert_eq!(
+        exec.edge_value(e1).unwrap().downcast_ref::<f64>(),
+        Some(&99.0)
+    );
+    assert_eq!(
+        exec.edge_value(e2).unwrap().downcast_ref::<f64>(),
+        Some(&99.0)
+    );
 }
 
 /// Sink node after a chain: Const -> Add -> Display.
@@ -458,7 +611,9 @@ fn multiple_sink_nodes_from_same_source() {
 fn sink_node_after_chain() {
     let mut builder = setup();
     let c1 = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
-    let c2 = builder.add_node("transform.const_f64", (0.0, 100.0)).unwrap();
+    let c2 = builder
+        .add_node("transform.const_f64", (0.0, 100.0))
+        .unwrap();
     let add = builder.add_node("transform.add", (200.0, 0.0)).unwrap();
     let disp = builder.add_node("transform.display", (400.0, 0.0)).unwrap();
 
@@ -471,13 +626,20 @@ fn sink_node_after_chain() {
     exec.set_parameter(c2, "value", Value::new(3.0f64)).unwrap();
     exec.execute_all().unwrap();
 
-    assert_eq!(exec.edge_value(edge_to_disp).unwrap().downcast_ref::<f64>(), Some(&8.0));
+    assert_eq!(
+        exec.edge_value(edge_to_disp).unwrap().downcast_ref::<f64>(),
+        Some(&8.0)
+    );
 
     // Update a source and dirty-execute: display's incoming edge should update
-    exec.set_parameter(c1, "value", Value::new(10.0f64)).unwrap();
+    exec.set_parameter(c1, "value", Value::new(10.0f64))
+        .unwrap();
     exec.execute_dirty().unwrap();
 
-    assert_eq!(exec.edge_value(edge_to_disp).unwrap().downcast_ref::<f64>(), Some(&13.0));
+    assert_eq!(
+        exec.edge_value(edge_to_disp).unwrap().downcast_ref::<f64>(),
+        Some(&13.0)
+    );
 }
 
 // ===========================================================================
@@ -523,9 +685,7 @@ fn executor_to_document(
 }
 
 /// Helper: rebuild executor from a GraphDocument.
-fn document_to_executor(
-    doc: &GraphDocument,
-) -> zeughaus_runtime::GraphExecutor {
+fn document_to_executor(doc: &GraphDocument) -> zeughaus_runtime::GraphExecutor {
     use zeughaus_core::{EdgeId, EdgeSemantic, NodeConfig, NodeId};
     use zeughaus_runtime::{Graph, GraphEdge, GraphExecutor, GraphNode};
 
@@ -582,7 +742,9 @@ fn save_load_round_trip_add_pipeline() {
     // Step 1: Build original graph
     let mut builder = setup();
     let c1 = builder.add_node("transform.const_f64", (0.0, 0.0)).unwrap();
-    let c2 = builder.add_node("transform.const_f64", (100.0, 0.0)).unwrap();
+    let c2 = builder
+        .add_node("transform.const_f64", (100.0, 0.0))
+        .unwrap();
     let add = builder.add_node("transform.add", (200.0, 0.0)).unwrap();
     let disp = builder.add_node("transform.display", (400.0, 0.0)).unwrap();
 
@@ -596,7 +758,10 @@ fn save_load_round_trip_add_pipeline() {
     exec.execute_all().unwrap();
 
     // Verify original works
-    assert_eq!(exec.edge_value(out_edge).unwrap().downcast_ref::<f64>(), Some(&7.0));
+    assert_eq!(
+        exec.edge_value(out_edge).unwrap().downcast_ref::<f64>(),
+        Some(&7.0)
+    );
 
     // Step 2: Convert to document and serialize
     let doc = executor_to_document(&exec, &[(c1, 3.0), (c2, 4.0)]);
@@ -612,8 +777,14 @@ fn save_load_round_trip_add_pipeline() {
     exec2.execute_all().unwrap();
 
     // Step 5: Find the add->display edge and verify result
-    let add_disp_edge = loaded_doc.edges.iter().find(|e| e.from_pin == "result" && e.to_pin == "input").unwrap();
-    let result = exec2.edge_value(zeughaus_core::EdgeId(add_disp_edge.id)).unwrap();
+    let add_disp_edge = loaded_doc
+        .edges
+        .iter()
+        .find(|e| e.from_pin == "result" && e.to_pin == "input")
+        .unwrap();
+    let result = exec2
+        .edge_value(zeughaus_core::EdgeId(add_disp_edge.id))
+        .unwrap();
     assert_eq!(result.downcast_ref::<f64>(), Some(&7.0));
 }
 
@@ -631,9 +802,13 @@ fn save_load_round_trip_chain() {
     let out = builder.connect(abs, "result", disp, "input").unwrap();
 
     let mut exec = builder.build().unwrap();
-    exec.set_parameter(src, "value", Value::new(7.0f64)).unwrap();
+    exec.set_parameter(src, "value", Value::new(7.0f64))
+        .unwrap();
     exec.execute_all().unwrap();
-    assert_eq!(exec.edge_value(out).unwrap().downcast_ref::<f64>(), Some(&7.0));
+    assert_eq!(
+        exec.edge_value(out).unwrap().downcast_ref::<f64>(),
+        Some(&7.0)
+    );
 
     // Round-trip
     let doc = executor_to_document(&exec, &[(src, 7.0)]);
@@ -643,8 +818,15 @@ fn save_load_round_trip_chain() {
     exec2.execute_all().unwrap();
 
     // Find the abs->display edge by locating the display node
-    let disp_id = loaded.nodes.iter().find(|n| n.type_id == "transform.display").unwrap().id;
+    let disp_id = loaded
+        .nodes
+        .iter()
+        .find(|n| n.type_id == "transform.display")
+        .unwrap()
+        .id;
     let abs_disp_edge = loaded.edges.iter().find(|e| e.to_node == disp_id).unwrap();
-    let result = exec2.edge_value(zeughaus_core::EdgeId(abs_disp_edge.id)).unwrap();
+    let result = exec2
+        .edge_value(zeughaus_core::EdgeId(abs_disp_edge.id))
+        .unwrap();
     assert_eq!(result.downcast_ref::<f64>(), Some(&7.0));
 }

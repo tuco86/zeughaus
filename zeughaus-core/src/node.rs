@@ -191,7 +191,9 @@ mod tests {
         assert_eq!(&*def.placeholder, "qwen3");
         assert_eq!(def.kind, SettingKind::Text);
 
-        let prompt = SettingDef::new("prompt", "").placeholder("ask...").multiline();
+        let prompt = SettingDef::new("prompt", "")
+            .placeholder("ask...")
+            .multiline();
         assert_eq!(&*prompt.placeholder, "ask...");
         assert_eq!(prompt.kind, SettingKind::Multiline);
 

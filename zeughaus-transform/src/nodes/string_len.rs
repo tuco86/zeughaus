@@ -45,7 +45,10 @@ mod tests {
         inputs.insert("input", Value::new("hello".to_string()));
         let mut ctx = NodeContext::new(NodeId(1), 0);
         node.execute(&inputs, &mut ctx).unwrap();
-        assert_eq!(ctx.take_outputs()["result"].downcast_ref::<f64>(), Some(&5.0));
+        assert_eq!(
+            ctx.take_outputs()["result"].downcast_ref::<f64>(),
+            Some(&5.0)
+        );
     }
 
     #[test]
@@ -54,6 +57,9 @@ mod tests {
         let inputs = InputSet::new();
         let mut ctx = NodeContext::new(NodeId(1), 0);
         node.execute(&inputs, &mut ctx).unwrap();
-        assert_eq!(ctx.take_outputs()["result"].downcast_ref::<f64>(), Some(&0.0));
+        assert_eq!(
+            ctx.take_outputs()["result"].downcast_ref::<f64>(),
+            Some(&0.0)
+        );
     }
 }

@@ -68,7 +68,10 @@ mod tests {
         inputs.insert("out_max", Value::new(100.0f64));
         let mut ctx = NodeContext::new(NodeId(1), 0);
         node.execute(&inputs, &mut ctx).unwrap();
-        assert_eq!(ctx.take_outputs()["result"].downcast_ref::<f64>(), Some(&50.0));
+        assert_eq!(
+            ctx.take_outputs()["result"].downcast_ref::<f64>(),
+            Some(&50.0)
+        );
     }
 
     #[test]
@@ -82,7 +85,10 @@ mod tests {
         inputs.insert("out_max", Value::new(212.0f64));
         let mut ctx = NodeContext::new(NodeId(1), 0);
         node.execute(&inputs, &mut ctx).unwrap();
-        assert_eq!(ctx.take_outputs()["result"].downcast_ref::<f64>(), Some(&212.0));
+        assert_eq!(
+            ctx.take_outputs()["result"].downcast_ref::<f64>(),
+            Some(&212.0)
+        );
     }
 
     #[test]
@@ -96,6 +102,9 @@ mod tests {
         inputs.insert("out_max", Value::new(20.0f64));
         let mut ctx = NodeContext::new(NodeId(1), 0);
         node.execute(&inputs, &mut ctx).unwrap();
-        assert_eq!(ctx.take_outputs()["result"].downcast_ref::<f64>(), Some(&10.0));
+        assert_eq!(
+            ctx.take_outputs()["result"].downcast_ref::<f64>(),
+            Some(&10.0)
+        );
     }
 }

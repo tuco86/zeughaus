@@ -11,8 +11,8 @@ unary_f64_node!(LnNode, f64::ln);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeughaus_core::*;
     use std::f64::consts::PI;
+    use zeughaus_core::*;
 
     fn exec_unary(node: &mut dyn ExecutableNode, input: f64) -> f64 {
         let mut inputs = InputSet::new();

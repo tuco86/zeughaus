@@ -28,10 +28,7 @@ impl LastReplyNode {
 impl ExecutableNode for LastReplyNode {
     fn execute(&mut self, inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
         let conv: Conversation = inputs.get("conv").unwrap_or_default();
-        let text = conv
-            .last()
-            .map(|m| m.content.clone())
-            .unwrap_or_default();
+        let text = conv.last().map(|m| m.content.clone()).unwrap_or_default();
         ctx.emit_typed("text", text);
         ctx.flush();
         Ok(())

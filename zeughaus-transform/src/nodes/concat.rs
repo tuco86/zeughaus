@@ -57,7 +57,9 @@ mod tests {
         let mut ctx = NodeContext::new(NodeId(1), 0);
         node.execute(&inputs, &mut ctx).unwrap();
         assert_eq!(
-            ctx.take_outputs()["result"].downcast_ref::<String>().unwrap(),
+            ctx.take_outputs()["result"]
+                .downcast_ref::<String>()
+                .unwrap(),
             "helloworld"
         );
     }
@@ -72,7 +74,9 @@ mod tests {
         let mut ctx = NodeContext::new(NodeId(1), 0);
         node.execute(&inputs, &mut ctx).unwrap();
         assert_eq!(
-            ctx.take_outputs()["result"].downcast_ref::<String>().unwrap(),
+            ctx.take_outputs()["result"]
+                .downcast_ref::<String>()
+                .unwrap(),
             "hello world"
         );
     }

@@ -14,11 +14,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use weida::Publisher;
 use zeughaus_core::{
     DomainPlugin, EdgeData, EdgeId, EdgeSemantic, Image, NodeConfig, NodeData, NodeId,
     PinDirection, Ty, TypeConverters, Value, encode_scalar, occupancy_winner,
 };
-use weida::Publisher;
 use zeughaus_runtime::{DeferredWork, Graph, GraphEdge, GraphExecutor, GraphNode};
 use zeughaus_samples::{
     ErrorRow, OutputRow, RejectionRow, RuntimeEvent, Snapshot, TOPIC_EDGE, TOPIC_ERROR,
@@ -191,9 +191,7 @@ impl Runner {
             if owner {
                 eprintln!("[runner] executing this session ({runners} runner(s) connected)");
             } else {
-                eprintln!(
-                    "[runner] standby ({runners} runners connected): another one executes"
-                );
+                eprintln!("[runner] standby ({runners} runners connected): another one executes");
             }
         }
         if owner == self.is_owner {
@@ -312,7 +310,8 @@ impl Runner {
         }
         let now = Instant::now();
         let clocked: Vec<(NodeId, Duration)> = self.executor.clocked_nodes().collect();
-        self.due.retain(|id, _| clocked.iter().any(|(c, _)| c == id));
+        self.due
+            .retain(|id, _| clocked.iter().any(|(c, _)| c == id));
         let mut fired = false;
         for (id, interval) in clocked {
             // A node seen for the first time is due immediately: a source should

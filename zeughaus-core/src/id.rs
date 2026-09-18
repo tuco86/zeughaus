@@ -29,8 +29,10 @@ macro_rules! define_id {
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0);
-                let prefix =
-                    pid.wrapping_mul(0x9E37_79B1).wrapping_add(nanos.rotate_left(17)) & 0x7FFF_FFFF;
+                let prefix = pid
+                    .wrapping_mul(0x9E37_79B1)
+                    .wrapping_add(nanos.rotate_left(17))
+                    & 0x7FFF_FFFF;
                 Self::bump_above(prefix << 32);
             }
 

@@ -21,8 +21,8 @@ pub use model::{CompileConfig, KerasModel, Layer};
 
 use zeughaus_core::*;
 
-use nodes::layer::{spec, LayerNode, LAYERS};
-use nodes::merge::{merge_spec, MergeNode, MERGES};
+use nodes::layer::{LAYERS, LayerNode, spec};
+use nodes::merge::{MERGES, MergeNode, merge_spec};
 use nodes::{CompileNode, ExportNode};
 
 pub struct MlPlugin;
@@ -42,8 +42,18 @@ impl DomainPlugin for MlPlugin {
                 .iter()
                 .map(|s| catalog_entry(s.type_id, s.display_name, "ML Merge", &MergeNode::new(s))),
         );
-        catalog.push(catalog_entry("ml.compile", "Compile", "ML", &CompileNode::new()));
-        catalog.push(catalog_entry("ml.export", "Export Code", "ML", &ExportNode::new()));
+        catalog.push(catalog_entry(
+            "ml.compile",
+            "Compile",
+            "ML",
+            &CompileNode::new(),
+        ));
+        catalog.push(catalog_entry(
+            "ml.export",
+            "Export Code",
+            "ML",
+            &ExportNode::new(),
+        ));
         catalog
     }
 
@@ -55,7 +65,8 @@ impl DomainPlugin for MlPlugin {
                 if let Some(s) = spec(other) {
                     Some(Box::new(LayerNode::new(s)))
                 } else {
-                    merge_spec(other).map(|s| Box::new(MergeNode::new(s)) as Box<dyn ExecutableNode>)
+                    merge_spec(other)
+                        .map(|s| Box::new(MergeNode::new(s)) as Box<dyn ExecutableNode>)
                 }
             }
         }
@@ -92,7 +103,14 @@ mod tests {
         // Build the stack: each node appends one layer to the model value.
         let chain = [
             ("ml.input", vec![("shape", "(28, 28, 1)")]),
-            ("ml.conv2d", vec![("filters", "32"), ("kernel_size", "(3, 3)"), ("activation", "relu")]),
+            (
+                "ml.conv2d",
+                vec![
+                    ("filters", "32"),
+                    ("kernel_size", "(3, 3)"),
+                    ("activation", "relu"),
+                ],
+            ),
             ("ml.maxpool2d", vec![("pool_size", "(2, 2)")]),
             ("ml.flatten", vec![]),
             ("ml.dropout", vec![("rate", "0.5")]),
@@ -111,26 +129,41 @@ mod tests {
             inputs.insert("model", Value::new(model.clone()));
             let mut ctx = NodeContext::new(NodeId(i as u64 + 1), 0);
             node.execute(&inputs, &mut ctx).unwrap();
-            model = ctx.take_outputs()["out"].downcast_ref::<KerasModel>().unwrap().clone();
+            model = ctx.take_outputs()["out"]
+                .downcast_ref::<KerasModel>()
+                .unwrap()
+                .clone();
         }
 
         // Compile, then export.
         let mut compile = plugin.create_node("ml.compile").unwrap();
-        compile.set_parameter("optimizer", Value::new("adam".to_string())).unwrap();
-        compile.set_parameter("loss", Value::new("categorical_crossentropy".to_string())).unwrap();
-        compile.set_parameter("metrics", Value::new("accuracy".to_string())).unwrap();
+        compile
+            .set_parameter("optimizer", Value::new("adam".to_string()))
+            .unwrap();
+        compile
+            .set_parameter("loss", Value::new("categorical_crossentropy".to_string()))
+            .unwrap();
+        compile
+            .set_parameter("metrics", Value::new("accuracy".to_string()))
+            .unwrap();
         let mut inputs = InputSet::new();
         inputs.insert("model", Value::new(model));
         let mut ctx = NodeContext::new(NodeId(100), 0);
         compile.execute(&inputs, &mut ctx).unwrap();
-        let model = ctx.take_outputs()["out"].downcast_ref::<KerasModel>().unwrap().clone();
+        let model = ctx.take_outputs()["out"]
+            .downcast_ref::<KerasModel>()
+            .unwrap()
+            .clone();
 
         let mut export = plugin.create_node("ml.export").unwrap();
         let mut inputs = InputSet::new();
         inputs.insert("model", Value::new(model));
         let mut ctx = NodeContext::new(NodeId(1), 0);
         export.execute(&inputs, &mut ctx).unwrap();
-        let code = ctx.take_outputs()["code"].downcast_ref::<String>().unwrap().clone();
+        let code = ctx.take_outputs()["code"]
+            .downcast_ref::<String>()
+            .unwrap()
+            .clone();
 
         let expected = concat!(
             "import keras\n",
@@ -152,7 +185,13 @@ mod tests {
     }
 
     /// Runs a layer node with the given id and params on an incoming model.
-    fn run(plugin: &MlPlugin, type_id: &str, id: u64, params: &[(&str, &str)], model: &KerasModel) -> KerasModel {
+    fn run(
+        plugin: &MlPlugin,
+        type_id: &str,
+        id: u64,
+        params: &[(&str, &str)],
+        model: &KerasModel,
+    ) -> KerasModel {
         let mut node = plugin.create_node(type_id).unwrap();
         for (k, v) in params {
             node.set_parameter(k, Value::new(v.to_string())).unwrap();
@@ -161,7 +200,10 @@ mod tests {
         inputs.insert("model", Value::new(model.clone()));
         let mut ctx = NodeContext::new(NodeId(id), 0);
         node.execute(&inputs, &mut ctx).unwrap();
-        ctx.take_outputs()["out"].downcast_ref::<KerasModel>().unwrap().clone()
+        ctx.take_outputs()["out"]
+            .downcast_ref::<KerasModel>()
+            .unwrap()
+            .clone()
     }
 
     /// End-to-end with a branch: one Input fans out to two Conv2D branches that
@@ -171,10 +213,28 @@ mod tests {
     fn branching_model_renders_functional_dag() {
         let plugin = MlPlugin;
 
-        let inp = run(&plugin, "ml.input", 1, &[("shape", "(32, 32, 3)")], &KerasModel::new());
+        let inp = run(
+            &plugin,
+            "ml.input",
+            1,
+            &[("shape", "(32, 32, 3)")],
+            &KerasModel::new(),
+        );
         // The Input value is delivered to two separate branch nodes.
-        let a = run(&plugin, "ml.conv2d", 2, &[("filters", "16"), ("kernel_size", "(3, 3)")], &inp);
-        let b = run(&plugin, "ml.conv2d", 3, &[("filters", "16"), ("kernel_size", "(5, 5)")], &inp);
+        let a = run(
+            &plugin,
+            "ml.conv2d",
+            2,
+            &[("filters", "16"), ("kernel_size", "(3, 3)")],
+            &inp,
+        );
+        let b = run(
+            &plugin,
+            "ml.conv2d",
+            3,
+            &[("filters", "16"), ("kernel_size", "(5, 5)")],
+            &inp,
+        );
 
         // Merge node joins both branches.
         let mut merge = plugin.create_node("ml.concatenate").unwrap();
@@ -183,16 +243,28 @@ mod tests {
         minputs.insert("b", Value::new(b));
         let mut ctx = NodeContext::new(NodeId(4), 0);
         merge.execute(&minputs, &mut ctx).unwrap();
-        let merged = ctx.take_outputs()["out"].downcast_ref::<KerasModel>().unwrap().clone();
+        let merged = ctx.take_outputs()["out"]
+            .downcast_ref::<KerasModel>()
+            .unwrap()
+            .clone();
 
-        let head = run(&plugin, "ml.dense", 5, &[("units", "10"), ("activation", "softmax")], &merged);
+        let head = run(
+            &plugin,
+            "ml.dense",
+            5,
+            &[("units", "10"), ("activation", "softmax")],
+            &merged,
+        );
 
         let mut export = plugin.create_node("ml.export").unwrap();
         let mut einputs = InputSet::new();
         einputs.insert("model", Value::new(head));
         let mut ctx = NodeContext::new(NodeId(6), 0);
         export.execute(&einputs, &mut ctx).unwrap();
-        let code = ctx.take_outputs()["code"].downcast_ref::<String>().unwrap().clone();
+        let code = ctx.take_outputs()["code"]
+            .downcast_ref::<String>()
+            .unwrap()
+            .clone();
 
         let expected = concat!(
             "import keras\n",

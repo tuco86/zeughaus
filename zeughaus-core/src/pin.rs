@@ -129,7 +129,9 @@ mod tests {
         assert_eq!(field.pin_kind, PinKind::Sample);
 
         assert_eq!(
-            PinDefinition::output("frame", Ty::Any).streaming().data_mode,
+            PinDefinition::output("frame", Ty::Any)
+                .streaming()
+                .data_mode,
             DataMode::Stream
         );
     }
@@ -138,10 +140,7 @@ mod tests {
     fn pins_with_runtime_types_survive_serialization() {
         let pin = PinDefinition::output(
             "row",
-            Ty::record(
-                "Customer",
-                vec![crate::ty::Field::new("id", Ty::Int)],
-            ),
+            Ty::record("Customer", vec![crate::ty::Field::new("id", Ty::Int)]),
         );
         let json = serde_json::to_string(&pin).unwrap();
         assert_eq!(serde_json::from_str::<PinDefinition>(&json).unwrap(), pin);

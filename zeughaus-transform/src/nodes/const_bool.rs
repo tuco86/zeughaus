@@ -46,7 +46,10 @@ mod tests {
         let mut node = ConstBoolNode::new(true);
         let mut ctx = NodeContext::new(NodeId(1), 0);
         node.execute(&InputSet::new(), &mut ctx).unwrap();
-        assert_eq!(ctx.take_outputs()["value"].downcast_ref::<bool>(), Some(&true));
+        assert_eq!(
+            ctx.take_outputs()["value"].downcast_ref::<bool>(),
+            Some(&true)
+        );
     }
 
     #[test]
@@ -55,15 +58,22 @@ mod tests {
         node.set_parameter("value", Value::new(true)).unwrap();
         let mut ctx = NodeContext::new(NodeId(1), 0);
         node.execute(&InputSet::new(), &mut ctx).unwrap();
-        assert_eq!(ctx.take_outputs()["value"].downcast_ref::<bool>(), Some(&true));
+        assert_eq!(
+            ctx.take_outputs()["value"].downcast_ref::<bool>(),
+            Some(&true)
+        );
     }
 
     #[test]
     fn set_parameter_from_string() {
         let mut node = ConstBoolNode::new(false);
-        node.set_parameter("value", Value::new("true".to_string())).unwrap();
+        node.set_parameter("value", Value::new("true".to_string()))
+            .unwrap();
         let mut ctx = NodeContext::new(NodeId(1), 0);
         node.execute(&InputSet::new(), &mut ctx).unwrap();
-        assert_eq!(ctx.take_outputs()["value"].downcast_ref::<bool>(), Some(&true));
+        assert_eq!(
+            ctx.take_outputs()["value"].downcast_ref::<bool>(),
+            Some(&true)
+        );
     }
 }

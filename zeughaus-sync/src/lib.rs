@@ -185,19 +185,33 @@ fn build(
     // Forward table changes onto the channel. Self-originated changes are echoed
     // back here too; the editor applies them idempotently.
     let t = tx.clone();
-    conn.db.node().on_insert(move |_ctx, n| send(&t, SyncEvent::NodeUpsert(to_node_data(n))));
+    conn.db
+        .node()
+        .on_insert(move |_ctx, n| send(&t, SyncEvent::NodeUpsert(to_node_data(n))));
     let t = tx.clone();
-    conn.db.node().on_update(move |_ctx, _old, n| send(&t, SyncEvent::NodeUpsert(to_node_data(n))));
+    conn.db
+        .node()
+        .on_update(move |_ctx, _old, n| send(&t, SyncEvent::NodeUpsert(to_node_data(n))));
     let t = tx.clone();
-    conn.db.node().on_delete(move |_ctx, n| send(&t, SyncEvent::NodeRemove(n.id)));
+    conn.db
+        .node()
+        .on_delete(move |_ctx, n| send(&t, SyncEvent::NodeRemove(n.id)));
     let t = tx.clone();
-    conn.db.edge().on_insert(move |_ctx, e| send(&t, SyncEvent::EdgeInsert(to_edge_data(e))));
+    conn.db
+        .edge()
+        .on_insert(move |_ctx, e| send(&t, SyncEvent::EdgeInsert(to_edge_data(e))));
     let t = tx.clone();
-    conn.db.edge().on_delete(move |_ctx, e| send(&t, SyncEvent::EdgeRemove(e.id)));
+    conn.db
+        .edge()
+        .on_delete(move |_ctx, e| send(&t, SyncEvent::EdgeRemove(e.id)));
     let t = tx.clone();
-    conn.db.runtime().on_insert(move |_ctx, _r| send(&t, SyncEvent::RuntimesChanged));
+    conn.db
+        .runtime()
+        .on_insert(move |_ctx, _r| send(&t, SyncEvent::RuntimesChanged));
     let t = tx.clone();
-    conn.db.runtime().on_delete(move |_ctx, _r| send(&t, SyncEvent::RuntimesChanged));
+    conn.db
+        .runtime()
+        .on_delete(move |_ctx, _r| send(&t, SyncEvent::RuntimesChanged));
 
     let t = tx.clone();
     conn.subscription_builder()
@@ -381,7 +395,10 @@ pub fn parse_token(token: &str) -> (String, String) {
             };
             (format!("http://{host}"), db.to_string())
         }
-        None => (format!("http://127.0.0.1:{DEFAULT_PORT}"), token.to_string()),
+        None => (
+            format!("http://127.0.0.1:{DEFAULT_PORT}"),
+            token.to_string(),
+        ),
     }
 }
 

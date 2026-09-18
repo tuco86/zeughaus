@@ -5,8 +5,8 @@
 
 use zeughaus_core::*;
 
-use super::layer::{build_kwargs, ParamDef, ParamType};
-use crate::model::{keras_model_ty, KerasModel, Layer};
+use super::layer::{ParamDef, ParamType, build_kwargs};
+use crate::model::{KerasModel, Layer, keras_model_ty};
 
 /// Static description of a merge node type. Mirrors `LayerSpec` but for the
 /// two-input merge layers.
@@ -18,8 +18,18 @@ pub struct MergeSpec {
     pub params: &'static [ParamDef],
 }
 
-const fn p(name: &'static str, default: &'static str, placeholder: &'static str, ty: ParamType) -> ParamDef {
-    ParamDef { name, default, placeholder, ty }
+const fn p(
+    name: &'static str,
+    default: &'static str,
+    placeholder: &'static str,
+    ty: ParamType,
+) -> ParamDef {
+    ParamDef {
+        name,
+        default,
+        placeholder,
+        ty,
+    }
 }
 
 /// The catalog of supported Keras merge layers. Most take no parameters; the
@@ -31,12 +41,42 @@ pub static MERGES: &[MergeSpec] = &[
         keras_class: "Concatenate",
         params: &[p("axis", "", "-1", ParamType::Raw)],
     },
-    MergeSpec { type_id: "ml.add", display_name: "Add", keras_class: "Add", params: &[] },
-    MergeSpec { type_id: "ml.subtract", display_name: "Subtract", keras_class: "Subtract", params: &[] },
-    MergeSpec { type_id: "ml.multiply", display_name: "Multiply", keras_class: "Multiply", params: &[] },
-    MergeSpec { type_id: "ml.average", display_name: "Average", keras_class: "Average", params: &[] },
-    MergeSpec { type_id: "ml.maximum", display_name: "Maximum", keras_class: "Maximum", params: &[] },
-    MergeSpec { type_id: "ml.minimum", display_name: "Minimum", keras_class: "Minimum", params: &[] },
+    MergeSpec {
+        type_id: "ml.add",
+        display_name: "Add",
+        keras_class: "Add",
+        params: &[],
+    },
+    MergeSpec {
+        type_id: "ml.subtract",
+        display_name: "Subtract",
+        keras_class: "Subtract",
+        params: &[],
+    },
+    MergeSpec {
+        type_id: "ml.multiply",
+        display_name: "Multiply",
+        keras_class: "Multiply",
+        params: &[],
+    },
+    MergeSpec {
+        type_id: "ml.average",
+        display_name: "Average",
+        keras_class: "Average",
+        params: &[],
+    },
+    MergeSpec {
+        type_id: "ml.maximum",
+        display_name: "Maximum",
+        keras_class: "Maximum",
+        params: &[],
+    },
+    MergeSpec {
+        type_id: "ml.minimum",
+        display_name: "Minimum",
+        keras_class: "Minimum",
+        params: &[],
+    },
     MergeSpec {
         type_id: "ml.dot",
         display_name: "Dot",
@@ -62,7 +102,10 @@ fn input_pin(name: &'static str) -> PinDefinition {
 
 /// Builds `input_count` ordered input pins (a, b, c, ...) plus the `out` pin.
 fn merge_pins(input_count: usize) -> Vec<PinDefinition> {
-    let mut pins: Vec<PinDefinition> = LETTERS[..input_count].iter().map(|n| input_pin(n)).collect();
+    let mut pins: Vec<PinDefinition> = LETTERS[..input_count]
+        .iter()
+        .map(|n| input_pin(n))
+        .collect();
     pins.push(PinDefinition::output("out", keras_model_ty()));
     pins
 }
@@ -77,9 +120,17 @@ pub struct MergeNode {
 
 impl MergeNode {
     pub fn new(spec: &'static MergeSpec) -> Self {
-        let values = spec.params.iter().map(|d| (d.name, d.default.to_string())).collect();
+        let values = spec
+            .params
+            .iter()
+            .map(|d| (d.name, d.default.to_string()))
+            .collect();
         // Start with two inputs (a, b); more appear as they are filled.
-        Self { spec, values, pins: merge_pins(2) }
+        Self {
+            spec,
+            values,
+            pins: merge_pins(2),
+        }
     }
 
     /// Number of input pins currently exposed (all pins minus the `out` pin).
@@ -166,7 +217,10 @@ mod tests {
     fn input_model(id: u64) -> KerasModel {
         KerasModel::new().with_layer(
             id,
-            Layer { keras_class: "Input".to_string(), kwargs: vec![("shape".to_string(), "(4,)".to_string())] },
+            Layer {
+                keras_class: "Input".to_string(),
+                kwargs: vec![("shape".to_string(), "(4,)".to_string())],
+            },
         )
     }
 
@@ -174,7 +228,13 @@ mod tests {
     /// pin, all carrying a model.
     fn connected(names: &[&'static str]) -> Vec<PinBinding<'static>> {
         static MODEL_TY: LazyLock<Ty> = LazyLock::new(keras_model_ty);
-        names.iter().map(|n| PinBinding { name: n, ty: &MODEL_TY }).collect()
+        names
+            .iter()
+            .map(|n| PinBinding {
+                name: n,
+                ty: &MODEL_TY,
+            })
+            .collect()
     }
 
     fn names(node: &MergeNode) -> Vec<&str> {
@@ -210,13 +270,17 @@ mod tests {
     #[test]
     fn dot_carries_axes_param() {
         let mut node = MergeNode::new(merge_spec("ml.dot").unwrap());
-        node.set_parameter("axes", Value::new("(1, 2)".to_string())).unwrap();
+        node.set_parameter("axes", Value::new("(1, 2)".to_string()))
+            .unwrap();
         let mut inputs = InputSet::new();
         inputs.insert("a", Value::new(input_model(1)));
         inputs.insert("b", Value::new(input_model(2)));
         let mut ctx = NodeContext::new(NodeId(3), 0);
         node.execute(&inputs, &mut ctx).unwrap();
-        let model = ctx.take_outputs()["out"].downcast_ref::<KerasModel>().unwrap().clone();
+        let model = ctx.take_outputs()["out"]
+            .downcast_ref::<KerasModel>()
+            .unwrap()
+            .clone();
         let step = model.steps.iter().find(|s| s.id == 3).unwrap();
         assert_eq!(step.layer.render(), "layers.Dot(axes=(1, 2))");
     }
@@ -264,7 +328,10 @@ mod tests {
         inputs.insert("c", Value::new(input_model(3)));
         let mut ctx = NodeContext::new(NodeId(9), 0);
         node.execute(&inputs, &mut ctx).unwrap();
-        let model = ctx.take_outputs()["out"].downcast_ref::<KerasModel>().unwrap().clone();
+        let model = ctx.take_outputs()["out"]
+            .downcast_ref::<KerasModel>()
+            .unwrap()
+            .clone();
         let step = model.steps.iter().find(|s| s.id == 9).unwrap();
         assert_eq!(step.inputs, vec![1, 2, 3]);
     }

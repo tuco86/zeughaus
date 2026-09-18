@@ -236,9 +236,12 @@ async fn request_session(restore_token: Option<&str>) -> Result<(OwnedFd, u32), 
         let proxy = Screencast::new().await.map_err(|e| {
             HandshakeError::unreachable(format!("screencast: no ScreenCast portal: {e}"))
         })?;
-        let session = proxy.create_session(Default::default()).await.map_err(|e| {
-            HandshakeError::unreachable(format!("screencast: cannot create session: {e}"))
-        })?;
+        let session = proxy
+            .create_session(Default::default())
+            .await
+            .map_err(|e| {
+                HandshakeError::unreachable(format!("screencast: cannot create session: {e}"))
+            })?;
 
         proxy
             .select_sources(
@@ -300,9 +303,7 @@ async fn request_session(restore_token: Option<&str>) -> Result<(OwnedFd, u32), 
             .open_pipe_wire_remote(&session, Default::default())
             .await
             .map_err(|e| {
-                HandshakeError::unreachable(format!(
-                    "screencast: cannot open pipewire remote: {e}"
-                ))
+                HandshakeError::unreachable(format!("screencast: cannot open pipewire remote: {e}"))
             })?;
 
         *SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(session);
@@ -719,7 +720,9 @@ mod tests {
         let out = to_rgba(format(PixelOrder::Bgra, 2, 2), 12, &plane).unwrap();
         assert_eq!(
             out,
-            vec![3, 2, 1, 0xFF, 7, 6, 5, 0xFF, 11, 10, 9, 0xFF, 15, 14, 13, 0xFF]
+            vec![
+                3, 2, 1, 0xFF, 7, 6, 5, 0xFF, 11, 10, 9, 0xFF, 15, 14, 13, 0xFF
+            ]
         );
     }
 
@@ -732,7 +735,9 @@ mod tests {
         let out = to_rgba(format(PixelOrder::Rgba, 2, 2), 12, &plane).unwrap();
         assert_eq!(
             out,
-            vec![1, 2, 3, 0xFF, 5, 6, 7, 0xFF, 9, 10, 11, 0xFF, 13, 14, 15, 0xFF]
+            vec![
+                1, 2, 3, 0xFF, 5, 6, 7, 0xFF, 9, 10, 11, 0xFF, 13, 14, 15, 0xFF
+            ]
         );
     }
 

@@ -5,5 +5,5 @@ pub mod merge;
 
 pub use compile::CompileNode;
 pub use export::ExportNode;
-pub use layer::{LayerNode, LayerSpec, ParamType, LAYERS, spec};
-pub use merge::{MergeNode, MergeSpec, MERGES, merge_spec};
+pub use layer::{LAYERS, LayerNode, LayerSpec, ParamType, spec};
+pub use merge::{MERGES, MergeNode, MergeSpec, merge_spec};
