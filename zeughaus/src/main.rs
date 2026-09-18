@@ -5,6 +5,9 @@ mod app;
 mod feed;
 mod message;
 mod palette;
+// The weida client under the feed: the runtime, the trust, the first dial.
+#[cfg(not(target_arch = "wasm32"))]
+mod transport;
 mod workspace;
 // Settings edits waiting to reach the store. Native-only: without a store
 // there is nothing to hold them back from.

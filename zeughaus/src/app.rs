@@ -38,9 +38,11 @@ use zeughaus_runtime::{Graph, GraphEdge, GraphExecutor, GraphNode};
 use zeughaus_transform::TransformPlugin;
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::feed::{self, Endpoint, FeedKey, FeedSpec, FrameOrder};
+use crate::feed::{self, FeedKey, FeedSpec, FrameOrder};
 use crate::message::{GraphIds, Message, PinLabel};
 use crate::palette;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::transport::Endpoint;
 use crate::workspace::{self, Surface, Workspace};
 
 /// How fast a particle travels along its cable, in world units per second.

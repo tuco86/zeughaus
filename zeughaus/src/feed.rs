@@ -6,44 +6,32 @@
 //! SpacetimeDB, pixels get their own QUIC connection. This module is the
 //! dialling half of that connection -- one long-lived exchange per (source node,
 //! pin), asking for the size the node body actually draws, reading
-//! [`FrameHeader`]-prefixed frames until the editor stops wanting them.
+//! [`FrameHeader`]-prefixed frames until the editor stops wanting them -- and
+//! of the runtime's event stream beside it.
+//!
+//! Nothing here redials. Every address is dialled once through
+//! [`first_dial`] and kept alive by weida from then on; what this module owns
+//! is what a redial does not restore: the snapshot a subscription needs after
+//! a gap, and the exchange a feed needs after its stream ended.
 //!
 //! Native only: the wasm editor has no sync layer, so it never learns where a
 //! runtime serves frames and has nothing to dial.
 
 use std::fmt;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use iced::futures::channel::mpsc;
 use iced::futures::{SinkExt, Stream};
 use tokio::io::AsyncReadExt;
-use weida::{ClientTls, EndpointAddr, Runtime, RuntimeConfig, TransferMeta, Trust};
+use weida::{PeerEvent, PeerEvents, Requester, TransferMeta};
 use zeughaus_core::Image;
 use zeughaus_samples::{
     EVENTS_PATH, FEED_PATH, FeedRequest, FrameHeader, MAX_EVENT_BYTES, MAX_SNAPSHOT_BYTES,
     RuntimeEvent, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, TriggerRequest, ladder,
 };
 
-/// The one QUIC client this process needs.
-///
-/// A process-wide `Runtime` rather than one per feed, because connections are
-/// pooled per (address, trust anchors) inside it: several Display nodes watching
-/// the same runner then share one QUIC connection instead of each opening its
-/// own UDP socket and handshake.
-///
-/// Built on first use, which happens inside a feed task and therefore inside
-/// iced's tokio runtime -- `Runtime::new` requires an ambient reactor, and the
-/// editor's `App::new` runs before there is one.
-static QUIC: LazyLock<Option<Runtime>> = LazyLock::new(|| {
-    match Runtime::new(RuntimeConfig::default()) {
-        Ok(runtime) => Some(runtime),
-        // Not fatal: the editor still edits graphs, it just cannot show video.
-        Err(e) => {
-            eprintln!("[feed] no QUIC runtime, video disabled: {e}");
-            None
-        }
-    }
-});
+use crate::transport::{Endpoint, QUIC, client_tls, explain, first_dial, gave_up, policy};
 
 /// Which feed: one output pin of one node in the shared graph.
 ///
@@ -54,35 +42,6 @@ static QUIC: LazyLock<Option<Runtime>> = LazyLock::new(|| {
 pub struct FeedKey {
     pub node_id: u64,
     pub pin: Arc<str>,
-}
-
-/// Where a runtime is reachable: the pinned root URL it announced.
-///
-/// Compared for equality to notice a runner that restarted on a different port
-/// or with a fresh identity; every feed dialled the old one and has to be
-/// redialled.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Endpoint(pub String);
-
-impl Endpoint {
-    /// The URL of one endpoint path on this runtime.
-    ///
-    /// The announced URL is the root (`/`); every path this editor dials is the
-    /// same authority and the same pinned fingerprint with the path replaced,
-    /// so a runtime announces one address and not a list.
-    pub fn path(&self, path: &str) -> Result<String, String> {
-        let mut addr =
-            EndpointAddr::parse(&self.0).map_err(|e| format!("endpoint {}: {e}", self.0))?;
-        addr.path = path.to_owned();
-        Ok(addr.to_string())
-    }
-}
-
-/// The trust every dial uses: the fingerprint pinned in the URL the runtime
-/// announced, and nothing else. This is the client-side swap point for a later
-/// mTLS integration.
-fn client_tls() -> ClientTls {
-    ClientTls::new(Trust::by_address())
 }
 
 /// Everything one feed task needs: where to dial, what to ask for, and which
@@ -192,60 +151,193 @@ pub enum Traffic {
 /// Subscribes to a runtime's events and keeps them coming for as long as the
 /// editor wants them.
 ///
-/// The stream never ends on its own, for the same reason [`frames`] does not: a
-/// runtime that restarted is a reason to redial, and the editor stops wanting
-/// this by dropping the task.
+/// The stream never ends on its own, for the same reason [`frames`] does not:
+/// the editor stops wanting this by dropping the task. Weida keeps the two
+/// addresses -- the event topic and the snapshot endpoint -- alive across a
+/// lost connection and re-sends the filter on the redialled one. What it does
+/// not restore is what was published in the gap, so every `Connected` asks for
+/// a snapshot, and every `Lost` says so downstream.
+///
+/// The stream does end when weida gives the address up: a runner that
+/// restarted has a fresh identity, so the address that was dialled names a
+/// peer that no longer exists. The store announces the replacement, and this
+/// task is replaced by one that dials it.
 pub fn events(endpoint: Endpoint) -> impl Stream<Item = Traffic> {
     // Room for a burst of events while the UI is mid-redraw. Unlike frames
     // these are a few hundred bytes each, so buffering them is cheap and
     // dropping one loses a value nothing else will restate.
     iced::stream::channel(64, async move |mut out| {
-        let mut attempt = 0u64;
-        loop {
-            if attempt > 0 {
-                tokio::time::sleep(retry_delay(attempt)).await;
-            }
-            // Whether this attempt got as far as delivering a snapshot. Only
-            // then is there state on screen that can go stale, and only then
-            // has the runtime answered at all.
-            let mut served = false;
-            let started = std::time::Instant::now();
-            match subscribe(&endpoint, &mut out, &mut served).await {
-                // The receiver is gone: this editor stopped watching.
-                Ok(Wanted::No) => return,
-                Ok(Wanted::Yes) => {}
-                Err(e) => eprintln!("[traffic] {e}"),
-            }
-            attempt = next_attempt(attempt, started.elapsed());
-            if served {
-                // Values on screen are last-known, not wrong; saying so is the
-                // honest state until a snapshot replaces them.
-                if out.send(Traffic::Lost).await.is_err() {
+        let Some(quic) = QUIC.as_ref() else {
+            eprintln!("[traffic] no QUIC runtime");
+            return;
+        };
+        let (events_url, snapshot_url) =
+            match (endpoint.path(EVENTS_PATH), endpoint.path(SNAPSHOT_PATH)) {
+                (Ok(events), Ok(snapshot)) => (events, snapshot),
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!("[traffic] {e}");
                     return;
+                }
+            };
+
+        let subscriber = quic.subscriber(client_tls());
+        // Watched from before the dial, so the first `Connected` is seen like
+        // every later one: it is what asks for a snapshot.
+        let mut link = subscriber.events();
+        // The empty filter is every topic: outputs and edge traffic alike.
+        // Registered before the dial, so it is sent as part of attaching to
+        // every connection the address gets, the first and each redial alike;
+        // subscribing before asking for the snapshot is what keeps an event
+        // between the two from being lost, with `seq` resolving the overlap.
+        if let Err(e) = subscriber.subscribe("").await {
+            eprintln!("[traffic] subscribe: {e}");
+            return;
+        }
+        let requester = quic.requester(client_tls());
+        let mut snapshots = requester.events();
+        if let Err(e) = first_dial(&events_url, || subscriber.connect(&events_url)).await {
+            eprintln!("[traffic] {e}");
+            return;
+        }
+        if let Err(e) = first_dial(&snapshot_url, || requester.connect(&snapshot_url)).await {
+            eprintln!("[traffic] {e}");
+            return;
+        }
+
+        // Whether a snapshot is on screen. Only then is there state that can
+        // go stale, and only then is a loss worth reporting.
+        let mut served = false;
+        loop {
+            tokio::select! {
+                event = link.recv() => {
+                    let resync = match event {
+                        // The endpoint is gone, which for one this task owns
+                        // means the task is ending.
+                        None => return,
+                        Some(PeerEvent::Connected { .. }) => true,
+                        Some(PeerEvent::Retrying { .. }) => continue,
+                        Some(PeerEvent::Lost { cause, .. }) => {
+                            eprintln!("[traffic] runtime lost: {cause}");
+                            false
+                        }
+                        // Whether a `Connected` was among the missed ones is
+                        // unknowable; what the address is now is not.
+                        Some(PeerEvent::Missed(n)) => {
+                            eprintln!("[traffic] missed {n} peer event(s)");
+                            subscriber.peer_count() > 0
+                        }
+                        Some(PeerEvent::GaveUp { why, .. }) => {
+                            eprintln!("[traffic] {}", explain(&why));
+                            if served {
+                                let _ = out.send(Traffic::Lost).await;
+                            }
+                            return;
+                        }
+                    };
+                    if resync {
+                        match snapshot(&requester, &mut snapshots).await {
+                            Ok(snapshot) => {
+                                if out.send(Traffic::Snapshot(snapshot)).await.is_err() {
+                                    return;
+                                }
+                                served = true;
+                            }
+                            Err(e) => eprintln!("[traffic] {e}"),
+                        }
+                    } else if served {
+                        served = false;
+                        // Values on screen are last-known, not wrong; saying
+                        // so is the honest state until a snapshot replaces them.
+                        if out.send(Traffic::Lost).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                message = subscriber.recv() => {
+                    let message = match message {
+                        Ok(message) => message,
+                        Err(e) => {
+                            eprintln!("[traffic] subscription: {e}");
+                            return;
+                        }
+                    };
+                    let payload = match message.collect(MAX_EVENT_BYTES).await {
+                        Ok(payload) => payload,
+                        Err(e) => {
+                            eprintln!("[traffic] event: {e}");
+                            continue;
+                        }
+                    };
+                    let Some(event) = RuntimeEvent::decode(&payload) else {
+                        eprintln!(
+                            "[traffic] skipped a malformed event ({} bytes)",
+                            payload.len()
+                        );
+                        continue;
+                    };
+                    if out.send(Traffic::Event(event)).await.is_err() {
+                        return;
+                    }
                 }
             }
         }
     })
 }
 
-/// How long a subscription has to last to count as a working connection.
+/// Asks the runtime for its whole current output set.
 ///
-/// Below this it is a runtime that accepts and then drops -- restarting,
-/// half-broken, refusing after the handshake -- and asking it again
-/// immediately is a full-speed loop of QUIC handshakes and snapshot
-/// transfers. Above it, the runtime was serving and merely went away, which
-/// deserves the shortest wait there is.
-const STABLE_UPTIME: std::time::Duration = std::time::Duration::from_secs(5);
+/// The snapshot endpoint is its own address and comes back on its own
+/// schedule, so a request that fails on the connection waits for that
+/// address's next `Connected` rather than for the subscription's. A request
+/// on an address weida is still redialling waits inside `request`; one on an
+/// address weida gave up fails at once, which is why the wait ends on
+/// `GaveUp` instead of turning into a loop on the loss cause.
+async fn snapshot(requester: &Requester, link: &mut PeerEvents) -> Result<Snapshot, String> {
+    loop {
+        let reply = match requester.request(b"").await {
+            Ok(reply) => reply,
+            Err(e @ (weida::Error::ConnectionLost(_) | weida::Error::Indeterminate)) => {
+                eprintln!("[traffic] snapshot: {e}; waiting for the endpoint");
+                loop {
+                    match link.recv().await {
+                        Some(PeerEvent::Connected { .. } | PeerEvent::Missed(_)) => break,
+                        Some(PeerEvent::GaveUp { why, .. }) => {
+                            return Err(format!("snapshot: {}", explain(&why)));
+                        }
+                        None => return Err("snapshot: endpoint gone".to_owned()),
+                        Some(_) => {}
+                    }
+                }
+                continue;
+            }
+            Err(e) => return Err(format!("snapshot: {e}")),
+        };
+        let encoded = reply
+            .collect(MAX_SNAPSHOT_BYTES)
+            .await
+            .map_err(|e| format!("snapshot: {e}"))?;
+        return Snapshot::decode(&encoded).ok_or_else(|| "snapshot: malformed".to_owned());
+    }
+}
 
-/// The attempt number the next dial carries, given how long the one that just
-/// ended lasted.
+/// How long a feed has to last to count as a working one.
 ///
-/// Never zero: the loop sleeps for any attempt above zero, and a subscription
-/// that ended -- however well it had been going -- must not be redialled in
+/// Below this it is a runtime that accepts and then ends the exchange -- a pin
+/// it no longer serves, a standby that does not execute, a burst it refused --
+/// and asking it again immediately is a full-speed loop of exchanges on a
+/// live connection. Above it, the runtime was serving and merely stopped,
+/// which deserves the shortest wait there is.
+const STABLE_UPTIME: Duration = Duration::from_secs(5);
+
+/// The attempt number the next exchange carries, given how long the one that
+/// just ended lasted.
+///
+/// Never zero: the loop sleeps for any attempt above zero, and an exchange
+/// that ended -- however well it had been going -- must not be reopened in
 /// the same instant. Resetting to the *first* delay rather than to none is the
-/// whole fix: a runtime that served a snapshot and then dropped the stream
-/// used to reset the backoff to nothing and be redialled at once, forever.
-fn next_attempt(attempt: u64, lasted: std::time::Duration) -> u64 {
+/// whole fix: a runtime that served and then ended the stream used to reset
+/// the backoff to nothing and be asked again at once, forever.
+fn next_attempt(attempt: u32, lasted: Duration) -> u32 {
     if lasted >= STABLE_UPTIME {
         return 1;
     }
@@ -270,97 +362,65 @@ pub async fn trigger(endpoint: Endpoint, node_id: u64) -> Result<(), String> {
         .map_err(|e| format!("trigger {node_id}: {e}"))
 }
 
-/// One attempt: subscribe, fetch the snapshot, then relay events.
-///
-/// Subscribing before requesting the snapshot is deliberate. An event that
-/// happens between the two is then not lost, and `seq` resolves the overlap --
-/// the other order would leave a gap nothing restates.
-async fn subscribe(
-    endpoint: &Endpoint,
-    out: &mut mpsc::Sender<Traffic>,
-    served: &mut bool,
-) -> Result<Wanted, String> {
-    let quic = QUIC.as_ref().ok_or("no QUIC runtime")?;
-    let events_url = endpoint.path(EVENTS_PATH)?;
-    let subscriber = quic.subscriber(client_tls());
-    subscriber
-        .connect(&events_url)
-        .await
-        .map_err(|e| format!("connect {events_url}: {e}"))?;
-    // The empty filter is every topic: outputs and edge traffic alike.
-    subscriber
-        .subscribe("")
-        .await
-        .map_err(|e| format!("subscribe: {e}"))?;
-
-    let snapshot_url = endpoint.path(SNAPSHOT_PATH)?;
-    let requester = quic.requester(client_tls());
-    requester
-        .connect(&snapshot_url)
-        .await
-        .map_err(|e| format!("connect {snapshot_url}: {e}"))?;
-    let reply = requester
-        .request(b"")
-        .await
-        .map_err(|e| format!("snapshot: {e}"))?;
-    let encoded = reply
-        .collect(MAX_SNAPSHOT_BYTES)
-        .await
-        .map_err(|e| format!("snapshot: {e}"))?;
-    let snapshot = Snapshot::decode(&encoded).ok_or("snapshot: malformed")?;
-    if out.send(Traffic::Snapshot(snapshot)).await.is_err() {
-        return Ok(Wanted::No);
-    }
-    *served = true;
-
-    loop {
-        let message = subscriber
-            .recv()
-            .await
-            .map_err(|e| format!("subscription: {e}"))?;
-        let payload = message
-            .collect(MAX_EVENT_BYTES)
-            .await
-            .map_err(|e| format!("event: {e}"))?;
-        let Some(event) = RuntimeEvent::decode(&payload) else {
-            eprintln!(
-                "[traffic] skipped a malformed event ({} bytes)",
-                payload.len()
-            );
-            continue;
-        };
-        if out.send(Traffic::Event(event)).await.is_err() {
-            return Ok(Wanted::No);
-        }
-    }
-}
-
 /// Streams one feed's frames for as long as the editor wants them.
 ///
-/// The stream never ends on its own. A runtime that drops the exchange -- it
-/// restarted, the source stopped producing, the network blinked -- is a reason
-/// to redial, not a reason to stop wanting video: the editor decides that, and
-/// it decides it by dropping this task. Each attempt is a fresh stream numbering
-/// its frames from zero, hence [`FrameOrder::stream`].
+/// The stream never ends on its own. A runtime that ends the exchange -- the
+/// source stopped producing, the node went away, the network blinked -- is a
+/// reason to ask again, not a reason to stop wanting video: the editor decides
+/// that, and it decides it by dropping this task. Each attempt is a fresh
+/// stream numbering its frames from zero, hence [`FrameOrder::stream`].
+///
+/// A lost connection is weida's to redial: `open` waits for it. The wait
+/// between attempts here is for the exchange the runtime ended on a live
+/// connection, which no redial paces. The stream does end when weida gives
+/// the address up -- a restarted runner is a stranger to it -- because every
+/// `open` from then on would fail at once, and the store's new address
+/// replaces this task anyway.
 pub fn frames(spec: FeedSpec) -> impl Stream<Item = Frame> {
     // Capacity zero: the futures channel still admits one message per sender, so
     // at most one frame waits for the UI while the next is being read. Any more
     // and a viewer that redraws slowly would accumulate frames at 33 MB each
     // instead of just receiving fewer of them.
     iced::stream::channel(0, async move |mut out| {
+        let label = format!("[feed] node {} pin {}", spec.key.node_id, spec.key.pin);
+        let Some(quic) = QUIC.as_ref() else {
+            eprintln!("{label}: no QUIC runtime");
+            return;
+        };
+        let url = match spec.endpoint.path(FEED_PATH) {
+            Ok(url) => url,
+            Err(e) => {
+                eprintln!("{label}: {e}");
+                return;
+            }
+        };
+        let requester = quic.requester(client_tls());
+        let mut link = requester.events();
+        if let Err(e) = first_dial(&url, || requester.connect(&url)).await {
+            eprintln!("{label}: {e}");
+            return;
+        }
+
+        let policy = policy();
+        let mut attempt = 0u32;
         for stream in 0.. {
-            if stream > 0 {
-                // Backing off matters because the common reason to be here is a
-                // runtime that is not serving: redialling at frame rate would
-                // spend a handshake per attempt on a peer that has nothing.
-                tokio::time::sleep(retry_delay(stream)).await;
+            if attempt > 0 {
+                tokio::time::sleep(policy.delay(attempt)).await;
             }
-            match pump(&spec, stream, &mut out).await {
-                // The receiver is gone: nobody is drawing this feed any more.
-                Ok(Wanted::No) => return,
-                Ok(Wanted::Yes) => {}
-                Err(e) => eprintln!("[feed] node {} pin {}: {e}", spec.key.node_id, spec.key.pin),
+            let started = Instant::now();
+            tokio::select! {
+                result = pump(&requester, &spec, stream, &mut out) => match result {
+                    // The receiver is gone: nobody is drawing this feed any more.
+                    Ok(Wanted::No) => return,
+                    Ok(Wanted::Yes) => {}
+                    Err(e) => eprintln!("{label}: {e}"),
+                },
+                why = gave_up(&mut link) => {
+                    eprintln!("{label}: {}", explain(&why));
+                    return;
+                }
             }
+            attempt = next_attempt(attempt, started.elapsed());
         }
     })
 }
@@ -371,29 +431,14 @@ enum Wanted {
     No,
 }
 
-/// How long to wait before redialling after `attempt` failures: doubling from
-/// 250 ms, capped at 4 s. Long enough that a runtime restart is not a storm,
-/// short enough that a viewer notices the runtime coming back.
-fn retry_delay(attempt: u64) -> std::time::Duration {
-    let ms = 250u64 << attempt.min(4);
-    std::time::Duration::from_millis(ms)
-}
-
-/// Dials the feed, sends the request once, then reads frames until the stream
-/// ends or the receiver goes away.
+/// Opens the exchange, sends the request once, then reads frames until the
+/// stream ends or the receiver goes away.
 async fn pump(
+    requester: &Requester,
     spec: &FeedSpec,
     stream: u64,
     out: &mut mpsc::Sender<Frame>,
 ) -> Result<Wanted, String> {
-    let quic = QUIC.as_ref().ok_or("no QUIC runtime")?;
-    let url = spec.endpoint.path(FEED_PATH)?;
-    let requester = quic.requester(client_tls());
-    requester
-        .connect(&url)
-        .await
-        .map_err(|e| format!("connect {url}: {e}"))?;
-
     let (mut request, reply) = requester
         .open(TransferMeta::default())
         .await
@@ -501,55 +546,196 @@ mod tests {
         assert!(after > before);
     }
 
-    /// Backoff is bounded in both directions: quick enough to notice a runtime
-    /// coming back, slow enough that one that is not serving is not hammered.
-    #[test]
-    fn redial_backoff_is_bounded() {
-        assert_eq!(retry_delay(1), std::time::Duration::from_millis(500));
-        assert_eq!(retry_delay(4), std::time::Duration::from_millis(4000));
-        assert_eq!(retry_delay(99), std::time::Duration::from_millis(4000));
-    }
-
-    /// Every endpoint this editor dials is derived from the one announced URL,
-    /// so deriving must keep the pinned fingerprint: dropping it would turn a
-    /// pinned dial into one that trusts nothing and fails.
-    #[test]
-    fn a_derived_path_keeps_the_pinned_fingerprint() {
-        let fingerprint = "sha256:".to_owned() + &"ab".repeat(32);
-        let root = Endpoint(format!("weida://{fingerprint}@127.0.0.1:7443/"));
-        assert_eq!(
-            root.path(FEED_PATH).expect("derive"),
-            format!("weida://{fingerprint}@127.0.0.1:7443{FEED_PATH}")
-        );
-    }
-
-    /// A malformed announcement is a runtime problem, not a panic here.
-    #[test]
-    fn a_bad_endpoint_reports_instead_of_panicking() {
-        assert!(Endpoint("not a url".to_owned()).path(FEED_PATH).is_err());
-    }
-
     /// The loop this schedule drives sleeps for any attempt above zero, so
     /// what has to hold is: never zero, growing while the runtime keeps
-    /// dropping the stream, and back to the shortest wait once one connection
-    /// actually lasted. A runtime that serves a snapshot and drops the stream
-    /// used to reset the backoff to nothing, which redialled it at once and
-    /// paid a handshake plus a whole snapshot per turn.
+    /// ending the exchange, and back to the shortest wait once one exchange
+    /// actually lasted. A runtime that served and then ended the stream used
+    /// to reset the backoff to nothing, which asked it again at once and paid
+    /// an exchange per turn on a live connection.
     #[test]
-    fn a_dropped_stream_always_costs_at_least_one_backoff_step() {
-        let brief = std::time::Duration::from_millis(20);
+    fn an_ended_exchange_always_costs_at_least_one_backoff_step() {
+        let brief = Duration::from_millis(20);
         assert_eq!(next_attempt(0, brief), 1, "even the first end waits");
         assert_eq!(next_attempt(1, brief), 2);
-        assert_eq!(next_attempt(2, brief), 3, "one that keeps dropping waits");
+        assert_eq!(next_attempt(2, brief), 3, "one that keeps ending waits");
         // Just short of stable is still not stable.
         assert_eq!(next_attempt(3, STABLE_UPTIME - brief), 4);
 
-        // A connection that lasted is a runtime that went away, not one that
-        // refuses: the next dial is the shortest wait, not none.
+        // An exchange that lasted is a runtime that stopped, not one that
+        // refuses: the next ask is the shortest wait, not none.
         assert_eq!(next_attempt(7, STABLE_UPTIME), 1);
         assert_eq!(next_attempt(7, STABLE_UPTIME * 100), 1);
 
-        // And no attempt count wraps back to "redial immediately".
-        assert_eq!(next_attempt(u64::MAX, brief), u64::MAX);
+        // And no attempt count wraps back to "ask again immediately".
+        assert_eq!(next_attempt(u32::MAX, brief), u32::MAX);
+    }
+
+    /// One incarnation of a runtime's transport side: a bound listener with
+    /// the event topic, the snapshot service and a feed that answers every
+    /// request with one 2x2 frame stamped `seq` and then ends the exchange.
+    struct FakeRuntime {
+        runtime: weida::Runtime,
+        binding: weida::Binding,
+        publisher: weida::Publisher,
+    }
+
+    impl FakeRuntime {
+        async fn bind(port: u16, identity: weida::Identity, seq: u64) -> FakeRuntime {
+            let runtime = weida::Runtime::new(weida::RuntimeConfig::default()).expect("runtime");
+            let listener = runtime.listener();
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            let binding = listener.bind_quic(addr, identity).await.expect("bind");
+            let publisher = listener.publisher(EVENTS_PATH).expect("publisher");
+            let replier = listener.replier(SNAPSHOT_PATH).expect("replier");
+            tokio::spawn(async move {
+                while let Ok(mut request) = replier.accept().await {
+                    drop(request.take_body());
+                    let snapshot = Snapshot {
+                        seq,
+                        ..Snapshot::default()
+                    };
+                    let mut reply = request.reply(TransferMeta::default()).await.expect("reply");
+                    reply.write_all(&snapshot.encode()).await.expect("write");
+                    reply.finish().expect("finish");
+                }
+            });
+            let feed = listener.replier(FEED_PATH).expect("feed replier");
+            tokio::spawn(async move {
+                while let Ok(mut request) = feed.accept().await {
+                    let ask = request
+                        .take_body()
+                        .read_capped(4096)
+                        .await
+                        .expect("request");
+                    assert!(FeedRequest::decode(&ask).is_some(), "a well-formed request");
+                    let mut reply = request.reply(TransferMeta::default()).await.expect("reply");
+                    let header = FrameHeader::new(seq, 2, 2);
+                    reply.write_all(&header.encode()).await.expect("header");
+                    reply.write_all(&[7u8; 16]).await.expect("pixels");
+                    reply.finish().expect("finish");
+                }
+            });
+            FakeRuntime {
+                runtime,
+                binding,
+                publisher,
+            }
+        }
+
+        fn port(&self) -> u16 {
+            self.binding.local_addr().port()
+        }
+
+        /// Publishes until the subscriber is there to receive: a subscription
+        /// registered on a redialled connection lands a moment after the
+        /// address reports `Connected`.
+        async fn publish(&self, seq: u64) {
+            let event = RuntimeEvent::Edge { seq, edge_id: 1 };
+            for _ in 0..100 {
+                if self.publisher.subscriber_count() > 0 {
+                    self.publisher
+                        .publish(zeughaus_samples::TOPIC_EDGE, event.encode())
+                        .expect("publish");
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("no subscriber arrived");
+        }
+
+        /// Ends this incarnation the way a stopping runner does: every
+        /// connection closed with a shutdown, then the socket released.
+        async fn stop(self) {
+            self.binding.close().await;
+            self.runtime.shutdown().await;
+        }
+    }
+
+    /// The whole point of the cutover: a runtime that goes away and comes
+    /// back under the same identity on the same port is redialled by weida,
+    /// and this side's only work is to say `Lost`, fetch the snapshot the
+    /// gap needs, and reopen the feed exchange. No second dial happens here
+    /// -- there is no loop left that could make one. Loopback QUIC, so it
+    /// needs a reactor; the process-wide client runtime binds to this test's
+    /// reactor, which is why it is the one network test in this module.
+    #[tokio::test]
+    async fn a_restarted_runtime_is_redialled_by_weida_not_by_us() {
+        use iced::futures::StreamExt;
+        use weida::EndpointAddr;
+
+        let identity = weida::Identity::generate_for(["127.0.0.1"]).expect("identity");
+        let fingerprint = identity.fingerprint().expect("fingerprint");
+        let first = FakeRuntime::bind(0, identity.clone(), 1).await;
+        let port = first.port();
+        let endpoint = Endpoint(
+            EndpointAddr {
+                host: "127.0.0.1".to_owned(),
+                port: Some(port),
+                path: "/".to_owned(),
+                peer: Some(fingerprint),
+            }
+            .to_string(),
+        );
+
+        let mut traffic = std::pin::pin!(events(endpoint.clone()));
+        let mut video = std::pin::pin!(frames(FeedSpec {
+            endpoint,
+            key: FeedKey {
+                node_id: 9,
+                pin: Arc::from("frame"),
+            },
+            epoch: 0,
+            tier: 240,
+        }));
+        async fn next<T>(stream: &mut (impl Stream<Item = T> + Unpin)) -> T {
+            tokio::time::timeout(Duration::from_secs(10), stream.next())
+                .await
+                .expect("an item within 10 s")
+                .expect("stream still open")
+        }
+
+        assert!(matches!(next(&mut traffic).await, Traffic::Snapshot(s) if s.seq == 1));
+        first.publish(2).await;
+        assert!(matches!(
+            next(&mut traffic).await,
+            Traffic::Event(RuntimeEvent::Edge { seq: 2, .. })
+        ));
+        let frame = next(&mut video).await;
+        assert_eq!((frame.order.stream, frame.order.seq), (0, 1));
+        assert_eq!(frame.image.width(), 2);
+
+        first.stop().await;
+        assert!(matches!(next(&mut traffic).await, Traffic::Lost));
+
+        let second = FakeRuntime::bind(port, identity, 3).await;
+        assert!(matches!(next(&mut traffic).await, Traffic::Snapshot(s) if s.seq == 3));
+        second.publish(4).await;
+        assert!(matches!(
+            next(&mut traffic).await,
+            Traffic::Event(RuntimeEvent::Edge { seq: 4, .. })
+        ));
+        // The feed's exchange was reopened on the redialled connection: a
+        // later stream number, and the second incarnation's frame on it.
+        let frame = next(&mut video).await;
+        assert!(frame.order.stream > 0, "a fresh stream after the restart");
+        assert_eq!(frame.order.seq, 3);
+        second.stop().await;
+        assert!(matches!(next(&mut traffic).await, Traffic::Lost));
+
+        // A runner restarted with a fresh identity is a stranger to the
+        // address: weida refuses it in the handshake and gives the address
+        // up, and both streams end rather than looping on the loss. The
+        // store's new address is what replaces them.
+        let stranger = weida::Identity::generate_for(["127.0.0.1"]).expect("identity");
+        let third = FakeRuntime::bind(port, stranger, 5).await;
+        let ended = tokio::time::timeout(Duration::from_secs(10), traffic.next())
+            .await
+            .expect("the event stream ends within 10 s");
+        assert!(ended.is_none(), "got {ended:?} from a stranger");
+        let ended = tokio::time::timeout(Duration::from_secs(10), video.next())
+            .await
+            .expect("the feed ends within 10 s");
+        assert!(ended.is_none(), "got {ended:?} from a stranger");
+        third.stop().await;
     }
 }
