@@ -6335,6 +6335,7 @@ name = "weida"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "futures-io",
  "quinn",
  "rand 0.9.5",
  "rcgen",
@@ -6345,6 +6346,7 @@ dependencies = [
  "tracing",
  "weida-core",
  "weida-protocol",
+ "weida-runtime",
 ]
 
 [[package]]
@@ -6357,6 +6359,23 @@ version = "0.1.0"
 dependencies = [
  "minicbor",
  "weida-core",
+]
+
+[[package]]
+name = "weida-runtime"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "weida-core",
+ "weida-winpipe",
+]
+
+[[package]]
+name = "weida-winpipe"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

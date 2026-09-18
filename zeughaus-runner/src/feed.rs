@@ -393,7 +393,7 @@ impl Drop for FeedSlot {
 /// is also why the limit is global and not per peer. A per-peer share needs an
 /// identity to divide by, and this is where it would come from.
 fn peer_name(meta: &weida::IncomingMeta) -> String {
-    match meta.peer {
+    match &meta.peer {
         Some(fingerprint) => fingerprint.to_string(),
         None => "an anonymous viewer".to_string(),
     }

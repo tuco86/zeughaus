@@ -68,7 +68,7 @@ impl Transport {
         // address is bracketed the way the parser on the other side expects.
         let url = EndpointAddr {
             host,
-            port: binding.local_addr().port(),
+            port: Some(binding.local_addr().port()),
             path: "/".to_owned(),
             peer: Some(fingerprint),
         }
