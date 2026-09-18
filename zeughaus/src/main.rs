@@ -5,6 +5,7 @@ mod app;
 mod feed;
 mod message;
 mod palette;
+mod workspace;
 // Settings edits waiting to reach the store. Native-only: without a store
 // there is nothing to hold them back from.
 #[cfg(not(target_arch = "wasm32"))]

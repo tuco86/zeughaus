@@ -17,6 +17,7 @@ zeughaus-flow.workspace = true
 zeughaus-graph.workspace = true
 iced_nodegraph.workspace = true
 iced_palette.workspace = true
+iced_tabs.workspace = true
 serde_json = "1.0"
 
 # Native-only: process/capture plugins (DLL injection, DXGI capture), the

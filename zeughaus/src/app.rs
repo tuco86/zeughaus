@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use iced::keyboard;
-use iced::widget::{button, column, container, image, pick_list, row, stack, text, text_input};
+use iced::widget::{
+    button, column, container, image, pane_grid, pick_list, row, stack, text, text_input,
+};
 use iced::{Color, ContentFit, Element, Event, Length, Point, Subscription, Task, Theme, Vector};
 use iced_nodegraph::{
     EdgeStyle, NodeGraph, NodeStatus, NodeStyle, Pattern, PinDirection as NgPinDirection, PinInfo,
@@ -39,6 +41,7 @@ use zeughaus_transform::TransformPlugin;
 use crate::feed::{self, Endpoint, FeedKey, FeedSpec, FrameOrder};
 use crate::message::{GraphIds, Message, PinLabel};
 use crate::palette;
+use crate::workspace::{self, Surface, Workspace};
 
 /// How fast a particle travels along its cable, in world units per second.
 /// Fast enough to read as a message in flight, slow enough to be seen on a
@@ -189,6 +192,7 @@ struct LiveFeed {
 }
 
 pub struct App {
+    workspace: Workspace,
     // Editor state
     nodes: HashMap<NodeId, EditorNode>,
     node_order: Vec<NodeId>,
@@ -455,6 +459,7 @@ impl App {
         };
 
         let mut app = Self {
+            workspace: Workspace::new(),
             nodes: HashMap::new(),
             node_order: Vec::new(),
             edges: Vec::new(),
@@ -2443,6 +2448,9 @@ impl App {
             self.flush_pending();
         }
         match message {
+            Message::Workspace(message) => {
+                self.workspace.update(message);
+            }
             Message::EdgeConnected { from, to } => {
                 // iced_nodegraph normalizes on_connect to (output, input), so
                 // `from` is always the output pin and `to` the input pin. A pin
@@ -2904,6 +2912,120 @@ impl App {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
+        self.workspace_view()
+    }
+
+    fn workspace_view(&self) -> Element<'_, Message> {
+        let tab = self.workspace.active();
+        let tab_count = self.workspace.tabs.len();
+        let pane_count = tab.panes.iter().count();
+        let tabs = self.workspace.tabs.iter().map(|tab| {
+            iced_tabs::Tab::new(tab.id, tab.title.as_str())
+                .group(tab.group.as_str())
+                .accent(tab.accent)
+                .closable(tab_count > 1)
+        });
+        let tab_bar = iced_tabs::view(
+            tabs,
+            self.workspace.active_tab,
+            self.workspace.placement,
+            |id| Message::Workspace(workspace::Message::ActivateTab(id)),
+            |id| Message::Workspace(workspace::Message::CloseTab(id)),
+        );
+
+        let panes = pane_grid::PaneGrid::new(&tab.panes, |pane, surface, _maximized| {
+            let body: Element<'_, Message> = match surface {
+                Surface::Graph => self.graph_view(),
+                Surface::Empty => container(
+                    column![
+                        text("Empty pane").size(18),
+                        text("A terminal or another surface can be opened here later.").size(12)
+                    ]
+                    .spacing(6),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::Alignment::Center)
+                .align_y(iced::Alignment::Center)
+                .into(),
+            };
+
+            let mut controls = row![
+                button(text("H").size(11))
+                    .padding([3, 6])
+                    .on_press(Message::Workspace(workspace::Message::SplitPane {
+                        pane,
+                        axis: pane_grid::Axis::Horizontal,
+                    })),
+                button(text("V").size(11))
+                    .padding([3, 6])
+                    .on_press(Message::Workspace(workspace::Message::SplitPane {
+                        pane,
+                        axis: pane_grid::Axis::Vertical,
+                    })),
+            ]
+            .spacing(2);
+            if pane_count > 1 {
+                controls = controls.push(
+                    button(text("x").size(11))
+                        .padding([3, 6])
+                        .on_press(Message::Workspace(workspace::Message::ClosePane(pane))),
+                );
+            }
+            let controls: Element<'_, Message> = controls.into();
+            let title_color = if pane == tab.active_pane {
+                Color::from_rgb(0.45, 0.7, 1.0)
+            } else {
+                Color::from_rgb(0.65, 0.65, 0.68)
+            };
+            let title_bar =
+                pane_grid::TitleBar::new(text(surface.title()).size(12).color(title_color))
+                    .controls(controls)
+                    .padding([3, 5]);
+
+            pane_grid::Content::new(body).title_bar(title_bar)
+        })
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .spacing(2)
+        .on_click(|pane| Message::Workspace(workspace::Message::ActivatePane(pane)))
+        .on_resize(8, |event| {
+            Message::Workspace(workspace::Message::ResizePane(event))
+        });
+
+        let add_tab = button(text("+").size(14))
+            .padding([4, 8])
+            .on_press(Message::Workspace(workspace::Message::NewTab));
+        let placement_label = match self.workspace.placement {
+            iced_tabs::Placement::Top => "Tabs left",
+            iced_tabs::Placement::Left => "Tabs top",
+        };
+        let toggle_placement = button(text(placement_label).size(11))
+            .padding([5, 8])
+            .on_press(Message::Workspace(workspace::Message::TogglePlacement));
+
+        match self.workspace.placement {
+            iced_tabs::Placement::Top => column![
+                row![tab_bar, add_tab, toggle_placement]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center),
+                panes,
+            ]
+            .height(Length::Fill)
+            .into(),
+            iced_tabs::Placement::Left => row![
+                column![row![add_tab, toggle_placement].spacing(4), tab_bar]
+                    .width(180)
+                    .height(Length::Fill),
+                panes,
+            ]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+        }
+    }
+
+    fn graph_view(&self) -> Element<'_, Message> {
         // NodeGraph is generic over the id vocabulary declared by `GraphIds`;
         // theme and renderer stay at their defaults.
         let mut ng: NodeGraph<'_, GraphIds, Message> = NodeGraph::new();

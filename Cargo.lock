@@ -2384,6 +2384,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "iced_tabs"
+version = "0.1.0"
+dependencies = [
+ "iced",
+]
+
+[[package]]
 name = "iced_tiny_skia"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7187,6 +7194,7 @@ dependencies = [
  "iced",
  "iced_nodegraph",
  "iced_palette",
+ "iced_tabs",
  "rfd",
  "serde_json",
  "spacetimedb-sdk",

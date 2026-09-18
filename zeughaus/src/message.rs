@@ -66,6 +66,9 @@ impl fmt::Display for PinLabel {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    // Workspace chrome and pane layout. Graph messages remain flat below;
+    // surfaces own their interaction vocabulary while the shell owns placement.
+    Workspace(crate::workspace::Message),
     // Graph events (u64 IDs from iced_nodegraph)
     EdgeConnected {
         from: PinRef<GraphIds>,
