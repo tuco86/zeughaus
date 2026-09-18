@@ -49,6 +49,11 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 /// user in the loop, so it either happens promptly or it is broken.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a transient portal or PipeWire outage is remembered before another
+/// capture may try to reconnect. This bounds work on a ticking graph without
+/// turning a portal that started late into a process-lifetime failure.
+const RETRY_DELAY: Duration = Duration::from_secs(5);
+
 /// The newest frame the PipeWire thread has produced, or `None` before the first
 /// one arrives.
 ///
@@ -58,12 +63,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// stall the realtime callback.
 static LATEST: Mutex<Option<Image>> = Mutex::new(None);
 
-/// Whether the handshake has already run, and how it went.
+/// Whether the stream is running, permanently refused, or waiting to retry a
+/// transient infrastructure failure.
 ///
-/// A failure is cached rather than retried. If this session has no `ScreenCast`
-/// interface, or the user denied the request, retrying on every execution would
-/// mean a denied dialog reappearing once per graph tick. The caller falls back
-/// to [`crate::portal`] instead, which is slow but works.
+/// A refusal is cached for the process lifetime so a denied consent dialog does
+/// not reappear on every graph tick. An unreachable portal is different: desktop
+/// services routinely start after the runner or restart independently, so that
+/// failure is retried after [`RETRY_DELAY`].
 static START: Mutex<StartState> = Mutex::new(StartState::Idle);
 
 /// The portal session, parked for the lifetime of the process.
@@ -77,31 +83,76 @@ static SESSION: Mutex<Option<Session<Screencast>>> = Mutex::new(None);
 enum StartState {
     Idle,
     Running,
+    RetryAt { message: String, at: Instant },
     Failed(String),
 }
 
-/// Opens the capture stream, once per process. Cheap and idempotent on every
-/// call after the first.
+impl StartState {
+    /// Whether this call should perform the expensive connection attempt.
+    fn should_start(&self, now: Instant) -> Result<bool, String> {
+        match self {
+            Self::Idle => Ok(true),
+            Self::Running => Ok(false),
+            Self::RetryAt { message, at } if now < *at => Err(message.clone()),
+            Self::RetryAt { .. } => Ok(true),
+            Self::Failed(message) => Err(message.clone()),
+        }
+    }
+
+    fn from_failure(failure: &StartFailure, now: Instant) -> Self {
+        if failure.retryable {
+            Self::RetryAt {
+                message: failure.message.clone(),
+                at: now + RETRY_DELAY,
+            }
+        } else {
+            Self::Failed(failure.message.clone())
+        }
+    }
+}
+
+struct StartFailure {
+    message: String,
+    retryable: bool,
+}
+
+impl StartFailure {
+    fn retryable(message: String) -> Self {
+        Self {
+            message,
+            retryable: true,
+        }
+    }
+
+    fn from_handshake(error: HandshakeError) -> Self {
+        Self {
+            message: error.message,
+            retryable: !error.refused,
+        }
+    }
+}
+
+/// Opens the capture stream once and cheaply reuses it after success.
 ///
-/// Returns when the stream is connected and streaming, which is the point from
-/// which frames start arriving; the first one still takes a compositor frame
-/// interval, so callers that need a frame use [`wait_for_frame`].
+/// A user refusal remains terminal for this process. Infrastructure failures
+/// are returned during the backoff and retried after [`RETRY_DELAY`].
 pub fn start() -> Result<(), String> {
     // Poisoning carries no state worth protecting here, and a panicking start
     // must not permanently disable capture for the rest of the process.
     let mut state = START.lock().unwrap_or_else(|e| e.into_inner());
-    match &*state {
-        StartState::Running => return Ok(()),
-        StartState::Failed(message) => return Err(message.clone()),
-        StartState::Idle => {}
+    let now = Instant::now();
+    if !state.should_start(now)? {
+        return Ok(());
     }
+
     match open_stream() {
         Ok(()) => {
             *state = StartState::Running;
             Ok(())
         }
-        Err(message) => {
-            *state = StartState::Failed(message.clone());
+        Err(failure) => {
+            let message = failure.message.clone();
+            *state = StartState::from_failure(&failure, now);
             Err(message)
         }
     }
@@ -146,8 +197,11 @@ pub fn wait_for_frame(timeout: Duration) -> Result<Image, String> {
 
 /// The handshake plus the loop thread. Called under the [`START`] lock, so it
 /// runs at most once concurrently.
-fn open_stream() -> Result<(), String> {
-    let (fd, node_id) = crate::portal::runtime()?.block_on(handshake())?;
+fn open_stream() -> Result<(), StartFailure> {
+    let runtime = crate::portal::runtime().map_err(StartFailure::retryable)?;
+    let (fd, node_id) = runtime
+        .block_on(handshake())
+        .map_err(StartFailure::from_handshake)?;
 
     let (ready_tx, ready_rx) = mpsc::channel();
     // A dedicated thread, not a pooled one: `MainLoop::run` never returns, and
@@ -160,14 +214,16 @@ fn open_stream() -> Result<(), String> {
                 let _ = ready_tx.send(Err(message));
             }
         })
-        .map_err(|e| format!("screencast: cannot spawn pipewire thread: {e}"))?;
+        .map_err(|e| {
+            StartFailure::retryable(format!("screencast: cannot spawn pipewire thread: {e}"))
+        })?;
 
     match ready_rx.recv_timeout(CONNECT_TIMEOUT) {
-        Ok(result) => result,
-        Err(_) => Err(format!(
+        Ok(result) => result.map_err(StartFailure::retryable),
+        Err(_) => Err(StartFailure::retryable(format!(
             "screencast: pipewire stream not streaming within {} s",
             CONNECT_TIMEOUT.as_secs()
-        )),
+        ))),
     }
 }
 
@@ -214,21 +270,21 @@ impl HandshakeError {
 /// A stored token is offered first. If the portal refuses it -- a reboot, a
 /// revoked grant, a changed monitor layout -- the token is discarded and the
 /// handshake retried once without it, so a dead token costs the user a fresh
-/// dialog rather than a capture error. Any other failure keeps the token and
-/// fails immediately: retrying an unreachable portal cannot help, and the token
-/// is still the user's valid grant for when it comes back.
-async fn handshake() -> Result<(OwnedFd, u32), String> {
+/// dialog rather than a capture error. Any other failure keeps the token: an
+/// immediate retry cannot help, but [`start`] may retry later when the portal
+/// or PipeWire service has recovered.
+async fn handshake() -> Result<(OwnedFd, u32), HandshakeError> {
     let token = read_token(token_path());
     if token.is_some() {
         match request_session(token.as_deref()).await {
             Ok(result) => return Ok(result),
-            Err(error) if !error.implicates_token() => return Err(error.message),
+            Err(error) if !error.implicates_token() => return Err(error),
             Err(_) => {
                 let _ = std::fs::remove_file(token_path());
             }
         }
     }
-    request_session(None).await.map_err(|e| e.message)
+    request_session(None).await
 }
 
 async fn request_session(restore_token: Option<&str>) -> Result<(OwnedFd, u32), HandshakeError> {
@@ -698,6 +754,30 @@ mod tests {
         assert_eq!(refused.message, "screencast: denied or cancelled: x");
         let unreachable = HandshakeError::unreachable("screencast: no portal".to_string());
         assert_eq!(unreachable.message, "screencast: no portal");
+    }
+
+    #[test]
+    fn transient_start_failure_retries_after_backoff() {
+        let now = Instant::now();
+        let message = "screencast: no ScreenCast portal".to_string();
+        let failure = StartFailure::retryable(message.clone());
+        let state = StartState::from_failure(&failure, now);
+
+        assert_eq!(state.should_start(now), Err(message));
+        assert_eq!(state.should_start(now + RETRY_DELAY), Ok(true));
+    }
+
+    #[test]
+    fn portal_refusal_stays_terminal() {
+        let now = Instant::now();
+        let message = "screencast: denied or cancelled".to_string();
+        let failure = StartFailure::from_handshake(HandshakeError::refused(message.clone()));
+        let state = StartState::from_failure(&failure, now);
+
+        assert_eq!(
+            state.should_start(now + RETRY_DELAY + RETRY_DELAY),
+            Err(message)
+        );
     }
 
     fn format(order: PixelOrder, width: u32, height: u32) -> Format {
