@@ -7927,6 +7927,7 @@ dependencies = [
  "iced_nodegraph",
  "iced_palette",
  "iced_tabs",
+ "iced_terminal",
  "rfd",
  "serde_json",
  "spacetimedb-sdk",

@@ -40,16 +40,24 @@ use zeughaus_transform::TransformPlugin;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::feed::{self, FeedKey, FeedSpec, FrameOrder};
 use crate::message::{GraphIds, Message, PinLabel};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::mux::{self, MuxEvent, TerminalAction};
 use crate::palette;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::transport::Endpoint;
-use crate::workspace::{self, Surface, Workspace};
+use crate::workspace::{self, Surface, Workspace, surface_title};
 
 /// How fast a particle travels along its cable, in world units per second.
 /// Fast enough to read as a message in flight, slow enough to be seen on a
 /// short wire.
 #[cfg(not(target_arch = "wasm32"))]
 const PARTICLE_SPEED: f32 = 240.0;
+
+/// The terminal's font size in logical pixels. One size for every pane:
+/// the cell grid is measured from it, and two panes at different sizes
+/// would report different geometries for the same terminal.
+#[cfg(not(target_arch = "wasm32"))]
+const TERMINAL_FONT_SIZE: f32 = 14.0;
 
 /// Shortest gap between two particles on one edge: at most ten per second. A
 /// 30 Hz source would otherwise smear into a solid line, which says less than
@@ -191,6 +199,74 @@ struct LiveFeed {
     /// Newest frame accepted, with the order it arrived in.
     latest: Option<(FrameOrder, Image)>,
     _task: iced::task::Handle,
+}
+
+/// Everything this editor holds about one runner's terminal multiplexer.
+///
+/// Replaced wholesale when the runner endpoint changes: a different runner is
+/// a different set of terminals, and nothing cached about the old one means
+/// anything to the new one. The control task's handle aborts on drop, so
+/// dropping this is also how the attachment is given up.
+#[cfg(not(target_arch = "wasm32"))]
+struct MuxState {
+    /// This editor process, as the runner names it when it hands out a
+    /// control lease.
+    client: zeughaus_mux::ClientInstanceId,
+    /// Sends topology commands, once the control task has attached far
+    /// enough to hand one out.
+    commands: Option<crate::mux::CommandSender>,
+    /// Which runner process this is. A different one on attach means every
+    /// cached terminal belongs to terminals that no longer exist.
+    incarnation: Option<zeughaus_mux::RunnerIncarnation>,
+    /// Whether the last thing the control task said was an attach. Drives
+    /// the status bar and decides whether a structural command may be sent.
+    attached: bool,
+    workspace: Option<zeughaus_mux::WorkspaceSnapshot>,
+    terminals: HashMap<zeughaus_mux::TerminalId, LiveTerminal>,
+    /// Commands sent and not yet answered, by their correlation id. Resent
+    /// with the same id after a reattach, which the runner deduplicates, so a
+    /// split made while the network blinked happens once rather than twice or
+    /// not at all.
+    pending: HashMap<zeughaus_mux::RequestId, zeughaus_mux::TopologyCommand>,
+    next_request: u64,
+    _control: iced::task::Handle,
+}
+
+/// One terminal as this editor holds it: the screen, the way to type into it,
+/// and the task carrying both.
+#[cfg(not(target_arch = "wasm32"))]
+struct LiveTerminal {
+    /// `None` until the first head arrives. A pane with no view yet draws
+    /// its placeholder rather than nothing.
+    view: Option<zeughaus_mux::view::TerminalView>,
+    commands: Option<crate::mux::TerminalSender>,
+    serials: crate::mux::Serials,
+    /// Aborts on drop, so removing the entry stops the stream. `None` while
+    /// the connection is down: the view stays on screen, the task does not.
+    task: Option<iced::task::Handle>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl LiveTerminal {
+    fn detached() -> LiveTerminal {
+        LiveTerminal {
+            view: None,
+            commands: None,
+            serials: crate::mux::Serials::default(),
+            task: None,
+        }
+    }
+}
+
+/// Puts a fresh head into a terminal's view, creating it if this is the
+/// first one. `apply_head` keeps the scroll position when the rows it names
+/// still exist, which a rebuild from scratch would lose.
+#[cfg(not(target_arch = "wasm32"))]
+fn apply_head(live: &mut LiveTerminal, head: zeughaus_mux::TerminalHead, capacity: usize) {
+    match live.view.as_mut() {
+        Some(view) => view.apply_head(head),
+        None => live.view = Some(zeughaus_mux::view::TerminalView::from_head(head, capacity)),
+    }
 }
 
 pub struct App {
@@ -375,6 +451,15 @@ pub struct App {
     /// Settings edits the store has not seen yet. See [`crate::pending`].
     #[cfg(not(target_arch = "wasm32"))]
     pending: crate::pending::PendingEdits,
+    /// The runner's terminal multiplexer, while one is reachable. `None`
+    /// leaves the workspace graph-only and every terminal action refused.
+    #[cfg(not(target_arch = "wasm32"))]
+    mux: Option<MuxState>,
+    /// Which attachment the events on screen came from. Bumped whenever the
+    /// control task is replaced, so a message the old one queued is
+    /// recognizable -- the same guard as `traffic_epoch`.
+    #[cfg(not(target_arch = "wasm32"))]
+    mux_epoch: u64,
 }
 
 impl App {
@@ -535,6 +620,12 @@ impl App {
             rejection_seq: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             pending: crate::pending::PendingEdits::new(),
+            // No mux until a runtime announces where it serves; the
+            // workspace stays graph-only until one attaches.
+            #[cfg(not(target_arch = "wasm32"))]
+            mux: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            mux_epoch: 0,
         };
 
         // Restore the last local session. A no-op while syncing: the shared
@@ -1798,6 +1889,12 @@ impl App {
                 tasks.push(task);
             }
         }
+        // The mux hangs off the same address and is replaced by the same
+        // rule: a runner that moved owns different terminals, and one that
+        // has no control task is not attached to anything.
+        if moved || (self.mux.is_none() && self.endpoint.is_some()) {
+            tasks.push(self.restart_mux());
+        }
         // With nothing serving frames, a live feed would be reading a dead
         // stream and the frame it left behind is not what the graph shows.
         let wanted = match self.endpoint {
@@ -1839,6 +1936,463 @@ impl App {
             tasks.push(task);
         }
         Task::batch(tasks)
+    }
+
+    /// Replaces the control task with one for the current endpoint.
+    ///
+    /// The epoch is bumped first: whatever the old task still has queued
+    /// describes a runner this editor no longer talks to. Terminal views are
+    /// dropped with it -- a terminal id is the old runner's, and the new one
+    /// will hand out its own.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn restart_mux(&mut self) -> Task<Message> {
+        self.mux = None;
+        self.mux_epoch += 1;
+        let Some(endpoint) = self.endpoint.clone() else {
+            // Nothing serves a shell: back to the workspace an editor has on
+            // its own, which is the graph and nothing else.
+            self.workspace.detach();
+            return Task::none();
+        };
+        let epoch = self.mux_epoch;
+        let (task, handle) = Task::run(mux::control(endpoint), move |event| {
+            Message::Mux(epoch, event)
+        })
+        .abortable();
+        self.mux = Some(MuxState {
+            client: mux::client_instance(),
+            commands: None,
+            incarnation: None,
+            attached: false,
+            workspace: None,
+            terminals: HashMap::new(),
+            pending: HashMap::new(),
+            next_request: 0,
+            _control: handle.abort_on_drop(),
+        });
+        task
+    }
+
+    /// What the control task said.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn apply_mux(&mut self, epoch: u64, event: MuxEvent) -> Task<Message> {
+        if epoch != self.mux_epoch {
+            return Task::none();
+        }
+        match event {
+            MuxEvent::Ready(sender) => {
+                if let Some(mux) = self.mux.as_mut() {
+                    mux.commands = Some(sender);
+                }
+                Task::none()
+            }
+            MuxEvent::Attached {
+                hello,
+                workspace,
+                heads,
+            } => {
+                let Some(mux) = self.mux.as_mut() else {
+                    return Task::none();
+                };
+                // A different runner process owns different terminals: every
+                // id this editor holds names something that no longer exists.
+                if mux
+                    .incarnation
+                    .is_some_and(|held| held != hello.incarnation)
+                {
+                    mux.terminals.clear();
+                }
+                mux.incarnation = Some(hello.incarnation);
+                mux.attached = true;
+                for head in heads {
+                    let live = mux
+                        .terminals
+                        .entry(head.terminal)
+                        .or_insert_with(LiveTerminal::detached);
+                    apply_head(live, head, mux::ROW_CAPACITY);
+                }
+                mux.workspace = Some((*workspace).clone());
+                // Sent before the blink and unanswered: the runner
+                // deduplicates by request id, so this applies at most once.
+                let resend: Vec<zeughaus_mux::message::Command> = mux
+                    .pending
+                    .iter()
+                    .map(|(request, command)| zeughaus_mux::message::Command {
+                        request: *request,
+                        command: command.clone(),
+                    })
+                    .collect();
+                if let Some(sender) = mux.commands.as_mut() {
+                    for command in resend {
+                        let _ = sender.try_send(command);
+                    }
+                }
+                self.workspace.apply_snapshot(*workspace);
+                self.reconcile_terminals()
+            }
+            MuxEvent::Workspace(snapshot) => {
+                let Some(mux) = self.mux.as_mut() else {
+                    return Task::none();
+                };
+                mux.workspace = Some((*snapshot).clone());
+                self.workspace.apply_snapshot(*snapshot);
+                self.reconcile_terminals()
+            }
+            MuxEvent::Reply(reply) => {
+                let Some(mux) = self.mux.as_mut() else {
+                    return Task::none();
+                };
+                mux.pending.remove(&reply.request);
+                if let zeughaus_mux::CommandOutcome::Refused { reason } = reply.outcome {
+                    self.hint = Some((reason, iced::time::Instant::now()));
+                }
+                Task::none()
+            }
+            MuxEvent::Lost => {
+                let Some(mux) = self.mux.as_mut() else {
+                    return Task::none();
+                };
+                mux.attached = false;
+                // The screens stay on display as last-known; their streams
+                // belong to a connection that no longer exists.
+                for live in mux.terminals.values_mut() {
+                    live.task = None;
+                    live.commands = None;
+                }
+                Task::none()
+            }
+            MuxEvent::GaveUp => {
+                // This address names a peer that is gone for good. The store
+                // announces the replacement, and reconciliation dials it.
+                self.mux = None;
+                self.workspace.detach();
+                Task::none()
+            }
+        }
+    }
+
+    /// Brings the terminal streams in line with what the workspace shows.
+    ///
+    /// One task per terminal any tab references; nothing for a terminal that
+    /// was closed, and no second task for one already streaming. A terminal
+    /// whose view survived a blink reattaches at the sequence it holds, so
+    /// the runner continues with deltas instead of resending the screen.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn reconcile_terminals(&mut self) -> Task<Message> {
+        let epoch = self.mux_epoch;
+        let Some(endpoint) = self.endpoint.clone() else {
+            return Task::none();
+        };
+        let Some(mux) = self.mux.as_mut() else {
+            return Task::none();
+        };
+        let wanted: Vec<zeughaus_mux::TerminalId> = mux
+            .workspace
+            .iter()
+            .flat_map(|workspace| workspace.terminals())
+            .collect();
+        // Removal is the whole lifetime: the handle aborts on drop, so a
+        // closed pane's stream cannot outlive it.
+        mux.terminals.retain(|id, _| wanted.contains(id));
+        let client = mux.client;
+        let mut tasks = Vec::new();
+        for terminal in wanted {
+            let live = mux
+                .terminals
+                .entry(terminal)
+                .or_insert_with(LiveTerminal::detached);
+            if live.task.is_some() {
+                continue;
+            }
+            let known = live
+                .view
+                .as_ref()
+                .map(|view| (view.epoch, view.applied_seq));
+            let size = live
+                .view
+                .as_ref()
+                .map_or(mux::DEFAULT_GRID, |view| view.dimensions);
+            let attach = zeughaus_mux::TerminalAttach {
+                client,
+                terminal,
+                known,
+                size,
+            };
+            let (task, handle) = Task::run(mux::terminal(endpoint.clone(), attach), move |event| {
+                Message::Terminal(epoch, terminal, event)
+            })
+            .abortable();
+            live.task = Some(handle.abort_on_drop());
+            tasks.push(task);
+        }
+        Task::batch(tasks)
+    }
+
+    /// What one terminal's stream said.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn apply_terminal(
+        &mut self,
+        epoch: u64,
+        terminal: zeughaus_mux::TerminalId,
+        event: crate::mux::TerminalEvent,
+    ) -> Task<Message> {
+        use crate::mux::TerminalEvent;
+
+        if epoch != self.mux_epoch {
+            return Task::none();
+        }
+        let capacity = mux::ROW_CAPACITY;
+        let Some(mux) = self.mux.as_mut() else {
+            return Task::none();
+        };
+        let Some(live) = mux.terminals.get_mut(&terminal) else {
+            return Task::none();
+        };
+        // What the event needs from `self` after the terminal's own state
+        // has been updated: the borrow above covers the whole match, so the
+        // follow-up has to happen once it has ended.
+        let mut resync = false;
+        let mut refusal = None;
+        match event {
+            TerminalEvent::Ready(sender) => live.commands = Some(sender),
+            TerminalEvent::Attached(attached) => {
+                if let Some(head) = attached.head {
+                    apply_head(live, head, capacity);
+                }
+            }
+            TerminalEvent::Head(head) => apply_head(live, *head, capacity),
+            TerminalEvent::Delta(delta) => match live.view.as_mut() {
+                // No head yet: the runner is about to send one, and a delta
+                // with nothing to apply it to is not an error.
+                None => {}
+                Some(view) => {
+                    if let Err(rejected) = view.apply_delta(*delta) {
+                        // A gap is not patched speculatively. Dropping the
+                        // view and the stream makes the next attach ask for
+                        // a fresh head, which is the only correct resync.
+                        eprintln!("[mux] {terminal}: delta rejected ({rejected:?}), resyncing");
+                        live.view = None;
+                        live.commands = None;
+                        live.task = None;
+                        resync = true;
+                    }
+                }
+            },
+            TerminalEvent::Error(error) => {
+                eprintln!("[mux] {terminal}: {}", error.message);
+                refusal = Some(error.message);
+            }
+            // The runner ended this stream. The pane keeps its last screen;
+            // the workspace snapshot is what removes it.
+            TerminalEvent::Ended => {
+                live.commands = None;
+                live.task = None;
+            }
+        }
+        if let Some(refusal) = refusal {
+            self.hint = Some((refusal, iced::time::Instant::now()));
+        }
+        if resync {
+            return self.reconcile_terminals();
+        }
+        Task::none()
+    }
+
+    /// A scrollback page, or why it did not arrive.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn apply_row_page(
+        &mut self,
+        epoch: u64,
+        terminal: zeughaus_mux::TerminalId,
+        page: Result<zeughaus_mux::RowPage, String>,
+    ) {
+        if epoch != self.mux_epoch {
+            return;
+        }
+        let page = match page {
+            Ok(page) => page,
+            Err(e) => {
+                eprintln!("[mux] {terminal}: {e}");
+                return;
+            }
+        };
+        if let Some(view) = self
+            .mux
+            .as_mut()
+            .and_then(|mux| mux.terminals.get_mut(&terminal))
+            .and_then(|live| live.view.as_mut())
+        {
+            view.apply_page(page);
+        }
+    }
+
+    /// What a terminal pane reported the user did.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn apply_terminal_action(
+        &mut self,
+        pane: zeughaus_mux::PaneId,
+        action: TerminalAction,
+    ) -> Task<Message> {
+        let Some(Surface::Terminal(terminal)) = self.workspace.surface_of(pane) else {
+            return Task::none();
+        };
+        match action {
+            TerminalAction::Command(command) => {
+                self.send_input(terminal, command);
+                Task::none()
+            }
+            TerminalAction::ScrollBy(lines) => self.scroll_terminal(terminal, lines),
+            TerminalAction::Copy(text) => iced::clipboard::write(text),
+            TerminalAction::OpenLink(url) => {
+                // Opening is an explicit, separate action and not this cut's:
+                // a terminal-supplied target must never reach a launcher by
+                // way of a click the user did not mean as one.
+                eprintln!("[mux] link: {url}");
+                self.hint = Some((format!("link: {url}"), iced::time::Instant::now()));
+                Task::none()
+            }
+            TerminalAction::TakeControl => {
+                self.send_topology(zeughaus_mux::TopologyCommand::TakeControl { terminal });
+                Task::none()
+            }
+            TerminalAction::Focused(focused) => {
+                if focused {
+                    self.workspace.focus(pane);
+                }
+                Task::none()
+            }
+        }
+    }
+
+    /// Sends one input command, remembering the serial it went out with.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn send_input(
+        &mut self,
+        terminal: zeughaus_mux::TerminalId,
+        command: zeughaus_mux::TerminalCommand,
+    ) {
+        let Some(live) = self
+            .mux
+            .as_mut()
+            .and_then(|mux| mux.terminals.get_mut(&terminal))
+        else {
+            return;
+        };
+        let serial = command.serial();
+        let Some(sender) = live.commands.as_mut() else {
+            // Nothing is connected: input is discarded rather than queued.
+            // A keystroke replayed after a resync would be typed into a
+            // screen that has moved on.
+            return;
+        };
+        if sender.try_send(command).is_err() {
+            return;
+        }
+        if let Some(serial) = serial {
+            live.serials.record(serial);
+        }
+    }
+
+    /// Scrolls one terminal's viewport and tells the runner which rows this
+    /// client now watches, fetching the ones it does not hold.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn scroll_terminal(&mut self, terminal: zeughaus_mux::TerminalId, lines: i64) -> Task<Message> {
+        let epoch = self.mux_epoch;
+        let Some(endpoint) = self.endpoint.clone() else {
+            return Task::none();
+        };
+        let Some(live) = self
+            .mux
+            .as_mut()
+            .and_then(|mux| mux.terminals.get_mut(&terminal))
+        else {
+            return Task::none();
+        };
+        let Some(view) = live.view.as_mut() else {
+            return Task::none();
+        };
+        if !view.scroll_by(lines) {
+            return Task::none();
+        }
+        let viewport = view.viewport();
+        if let Some(sender) = live.commands.as_mut() {
+            let _ = sender.try_send(zeughaus_mux::TerminalCommand::Viewport {
+                first_row: viewport.start,
+                rows: view.dimensions.rows,
+            });
+        }
+        let view_epoch = view.epoch;
+        let mut tasks = Vec::new();
+        for range in view.missing_rows(viewport) {
+            // One fetch cannot ask for more than the protocol allows, and a
+            // viewport is never that tall anyway.
+            let range = zeughaus_mux::StableRange {
+                start: range.start,
+                end: range
+                    .end
+                    .min(range.start + zeughaus_mux::message::MAX_FETCH_ROWS as i64),
+            };
+            let fetch = zeughaus_mux::RowFetch {
+                terminal,
+                epoch: view_epoch,
+                range,
+                generation: view.next_fetch_generation(),
+            };
+            tasks.push(Task::perform(
+                mux::fetch(endpoint.clone(), fetch),
+                move |page| Message::RowPage(epoch, terminal, page),
+            ));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Sends a structural change to the runner, or says why it cannot.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn send_topology(&mut self, command: zeughaus_mux::TopologyCommand) {
+        let refusal = match self.mux.as_mut() {
+            None => Some("no runner: the shared workspace cannot be changed"),
+            Some(mux) if !mux.attached => Some("reconnecting: the change was not sent"),
+            Some(mux) => {
+                mux.next_request += 1;
+                let request = zeughaus_mux::RequestId(mux.next_request);
+                let wire = zeughaus_mux::message::Command {
+                    request,
+                    command: command.clone(),
+                };
+                match mux.commands.as_mut().map(|sender| sender.try_send(wire)) {
+                    Some(Ok(())) => {
+                        mux.pending.insert(request, command);
+                        None
+                    }
+                    Some(Err(_)) | None => Some("the runner is not taking commands"),
+                }
+            }
+        };
+        if let Some(refusal) = refusal {
+            self.hint = Some((refusal.to_owned(), iced::time::Instant::now()));
+        }
+    }
+
+    /// The browser editor has no transport to a runner, so a structural
+    /// change has nowhere to go. Unreachable while the chrome disables the
+    /// buttons, and the honest answer if it ever is reached.
+    #[cfg(target_arch = "wasm32")]
+    fn send_topology(&mut self, _command: zeughaus_mux::TopologyCommand) {
+        self.hint = Some((
+            "the browser editor cannot change the shared workspace".to_owned(),
+            iced::time::Instant::now(),
+        ));
+    }
+
+    /// The terminal a pane shows, as this editor holds it, with the serials
+    /// its input carries.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn terminal_view(
+        &self,
+        terminal: zeughaus_mux::TerminalId,
+    ) -> Option<(&zeughaus_mux::view::TerminalView, mux::Serials)> {
+        let live = self.mux.as_ref()?.terminals.get(&terminal)?;
+        Some((live.view.as_ref()?, live.serials))
     }
 
     /// Which feeds the graph asks for, and at what ladder tier.
@@ -2003,6 +2557,14 @@ impl App {
                 " | {feeds} feed{plural}, {} frames",
                 self.frames_received
             ));
+        }
+        // Whether a shell is reachable, said in its own words: a terminal
+        // pane showing a last-known screen looks exactly like a live one.
+        match self.mux.as_ref() {
+            Some(mux) if mux.attached => text.push_str(" | mux: attached"),
+            Some(_) => text.push_str(" | mux: reconnecting"),
+            None if self.runtimes > 0 => text.push_str(" | no mux"),
+            None => {}
         }
         text
     }
@@ -2451,7 +3013,14 @@ impl App {
         }
         match message {
             Message::Workspace(message) => {
-                self.workspace.update(message);
+                let update = self.workspace.update(message);
+                if let Some(hint) = update.hint {
+                    self.hint = Some((hint.to_owned(), iced::time::Instant::now()));
+                }
+                // Structural changes are the runner's to make.
+                for command in update.commands {
+                    self.send_topology(command);
+                }
             }
             Message::EdgeConnected { from, to } => {
                 // iced_nodegraph normalizes on_connect to (output, input), so
@@ -2909,6 +3478,22 @@ impl App {
             Message::Traffic(epoch, traffic) => {
                 self.apply_traffic(epoch, traffic);
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::Mux(epoch, event) => {
+                return self.apply_mux(epoch, event);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::Terminal(epoch, terminal, event) => {
+                return self.apply_terminal(epoch, terminal, event);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::RowPage(epoch, terminal, page) => {
+                self.apply_row_page(epoch, terminal, page);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::TerminalAction(pane, action) => {
+                return self.apply_terminal_action(pane, action);
+            }
         }
         Task::none()
     }
@@ -2918,86 +3503,94 @@ impl App {
     }
 
     fn workspace_view(&self) -> Element<'_, Message> {
-        let tab = self.workspace.active();
-        let tab_count = self.workspace.tabs.len();
-        let pane_count = tab.panes.iter().count();
-        let tabs = self.workspace.tabs.iter().map(|tab| {
-            iced_tabs::Tab::new(tab.id, tab.title.as_str())
-                .group(tab.group.as_str())
-                .accent(tab.accent)
-                .closable(tab_count > 1)
+        let tab_count = self.workspace.tabs().len();
+        let tabs = self.workspace.tabs().iter().map(|tab| {
+            let mut entry = iced_tabs::Tab::new(tab.id, tab.title.as_str()).closable(tab_count > 1);
+            if let Some(group) = tab.group.as_deref() {
+                entry = entry.group(group);
+            }
+            if let Some(accent) = workspace::accent(tab) {
+                entry = entry.accent(accent);
+            }
+            entry
         });
         let tab_bar = iced_tabs::view(
             tabs,
-            self.workspace.active_tab,
+            self.workspace.active_tab(),
             self.workspace.placement,
             |id| Message::Workspace(workspace::Message::ActivateTab(id)),
             |id| Message::Workspace(workspace::Message::CloseTab(id)),
         );
 
-        let panes = pane_grid::PaneGrid::new(&tab.panes, |pane, surface, _maximized| {
-            let body: Element<'_, Message> = match surface {
-                Surface::Graph => self.graph_view(),
-                Surface::Empty => container(
-                    column![
-                        text("Empty pane").size(18),
-                        text("A terminal or another surface can be opened here later.").size(12)
-                    ]
-                    .spacing(6),
-                )
+        let panes: Element<'_, Message> = match self.workspace.active() {
+            // Only reachable between a snapshot and its rebuild, which does
+            // not happen: a workspace always has its active tab built.
+            None => container(text("No tab").size(14))
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .align_x(iced::Alignment::Center)
-                .align_y(iced::Alignment::Center)
                 .into(),
-            };
+            Some(tab) => {
+                let pane_count = tab.panes.len();
+                let focused = self.workspace.focused_pane();
+                pane_grid::PaneGrid::new(&tab.panes, move |pane, surface, _maximized| {
+                    let id = tab.pane_id(pane);
+                    let body: Element<'_, Message> = match surface {
+                        Surface::Graph => self.graph_view(),
+                        Surface::Empty => unavailable(
+                            "Empty pane",
+                            "Its surface could not be restored. Close it or split it again.",
+                        ),
+                        Surface::Terminal(terminal) => self.terminal_pane(id, *terminal),
+                    };
 
-            let mut controls = row![
-                button(text("H").size(11))
-                    .padding([3, 6])
-                    .on_press(Message::Workspace(workspace::Message::SplitPane {
-                        pane,
-                        axis: pane_grid::Axis::Horizontal,
-                    })),
-                button(text("V").size(11))
-                    .padding([3, 6])
-                    .on_press(Message::Workspace(workspace::Message::SplitPane {
-                        pane,
-                        axis: pane_grid::Axis::Vertical,
-                    })),
-            ]
-            .spacing(2);
-            if pane_count > 1 {
-                controls = controls.push(
-                    button(text("x").size(11))
-                        .padding([3, 6])
-                        .on_press(Message::Workspace(workspace::Message::ClosePane(pane))),
-                );
+                    // Structural changes are the runner's; with none
+                    // attached the buttons are dead rather than a click that
+                    // earns a refusal.
+                    let attached = self.workspace.attached();
+                    let mut controls = row![
+                        split_button("H", attached, pane, zeughaus_mux::Axis::Horizontal),
+                        split_button("V", attached, pane, zeughaus_mux::Axis::Vertical),
+                    ]
+                    .spacing(2);
+                    // The graph pane is unique and the runner refuses to
+                    // close it; offering the button would only earn a hint.
+                    if pane_count > 1 && *surface != Surface::Graph {
+                        let mut close = button(text("x").size(11)).padding([3, 6]);
+                        if attached {
+                            close = close
+                                .on_press(Message::Workspace(workspace::Message::ClosePane(pane)));
+                        }
+                        controls = controls.push(close);
+                    }
+                    let controls: Element<'_, Message> = controls.into();
+                    let title_color = if id.is_some() && id == focused {
+                        Color::from_rgb(0.45, 0.7, 1.0)
+                    } else {
+                        Color::from_rgb(0.65, 0.65, 0.68)
+                    };
+                    let title = self.pane_title(*surface);
+                    let title_bar =
+                        pane_grid::TitleBar::new(text(title).size(12).color(title_color))
+                            .controls(controls)
+                            .padding([3, 5]);
+
+                    pane_grid::Content::new(body).title_bar(title_bar)
+                })
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .spacing(2)
+                .on_click(|pane| Message::Workspace(workspace::Message::ActivatePane(pane)))
+                .on_resize(8, |event| {
+                    Message::Workspace(workspace::Message::Resize(event))
+                })
+                .into()
             }
-            let controls: Element<'_, Message> = controls.into();
-            let title_color = if pane == tab.active_pane {
-                Color::from_rgb(0.45, 0.7, 1.0)
-            } else {
-                Color::from_rgb(0.65, 0.65, 0.68)
-            };
-            let title_bar =
-                pane_grid::TitleBar::new(text(surface.title()).size(12).color(title_color))
-                    .controls(controls)
-                    .padding([3, 5]);
+        };
 
-            pane_grid::Content::new(body).title_bar(title_bar)
-        })
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .spacing(2)
-        .on_click(|pane| Message::Workspace(workspace::Message::ActivatePane(pane)))
-        .on_resize(8, |event| {
-            Message::Workspace(workspace::Message::ResizePane(event))
-        });
-
-        let add_tab = button(text("+").size(14))
-            .padding([4, 8])
-            .on_press(Message::Workspace(workspace::Message::NewTab));
+        let mut add_tab = button(text("+").size(14)).padding([4, 8]);
+        if self.workspace.attached() {
+            add_tab = add_tab.on_press(Message::Workspace(workspace::Message::NewTab));
+        }
         let placement_label = match self.workspace.placement {
             iced_tabs::Placement::Top => "Tabs left",
             iced_tabs::Placement::Left => "Tabs top",
@@ -3025,6 +3618,76 @@ impl App {
             .height(Length::Fill)
             .into(),
         }
+    }
+
+    /// What the pane's title bar calls a surface: a terminal's own title
+    /// when one has arrived, the surface's word otherwise.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pane_title(&self, surface: Surface) -> String {
+        match surface {
+            Surface::Terminal(terminal) => self
+                .terminal_view(terminal)
+                .map(|(view, _)| view)
+                .filter(|view| !view.title.is_empty())
+                .map_or_else(
+                    || surface_title(surface).to_owned(),
+                    |view| view.title.clone(),
+                ),
+            other => surface_title(other).to_owned(),
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn pane_title(&self, surface: Surface) -> String {
+        surface_title(surface).to_owned()
+    }
+
+    /// One terminal pane.
+    ///
+    /// The terminal itself: one widget drawing the view, with the keyboard
+    /// when its pane is focused and the runner's lease when this client
+    /// holds it. A viewer sees the same rows and gets the take-control
+    /// shortcut instead of the keys.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn terminal_pane(
+        &self,
+        pane: Option<zeughaus_mux::PaneId>,
+        terminal: zeughaus_mux::TerminalId,
+    ) -> Element<'_, Message> {
+        let Some((view, serials)) = self.terminal_view(terminal) else {
+            return unavailable("Terminal", "Waiting for the runner's first screen.");
+        };
+        let controlling = view
+            .controller
+            .as_ref()
+            .is_some_and(|controller| controller.client == mux::client_instance());
+        let focused = pane.is_some() && pane == self.workspace.focused_pane();
+        let widget = iced_terminal::Terminal::new(view, terminal.0)
+            .controlling(controlling)
+            .focused(focused)
+            .next_serial(serials.next())
+            .font_size(TERMINAL_FONT_SIZE);
+        match pane {
+            None => widget.into(),
+            Some(pane) => widget
+                .on_action(move |action| Message::TerminalAction(pane, action))
+                .into(),
+        }
+    }
+
+    /// A terminal pane in the browser editor: the topology is the same, the
+    /// terminal is not there. No PTY, no native transport, and nothing the
+    /// user can type into.
+    #[cfg(target_arch = "wasm32")]
+    fn terminal_pane(
+        &self,
+        _pane: Option<zeughaus_mux::PaneId>,
+        _terminal: zeughaus_mux::TerminalId,
+    ) -> Element<'_, Message> {
+        unavailable(
+            "Terminal",
+            "Terminals run on the runner and are not shown in the browser editor.",
+        )
     }
 
     fn graph_view(&self) -> Element<'_, Message> {
@@ -3400,6 +4063,17 @@ impl App {
         if self.stdb.is_some() {
             subs.push(
                 iced::time::every(std::time::Duration::from_millis(100)).map(|_| Message::SyncPoll),
+            );
+        }
+
+        // A split drag holds its newest ratio back; without a clock the last
+        // one of a gesture would never be sent, and the runner would keep a
+        // ratio from the middle of the drag.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.workspace.resize_pending() {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(100))
+                    .map(|_| Message::Workspace(workspace::Message::FlushResize)),
             );
         }
 
@@ -4047,6 +4721,34 @@ const FIELDS_NODE_WIDTH: f32 = 260.0;
 /// the runtime for a video feed.
 fn is_display(type_id: &str) -> bool {
     type_id == "transform.display"
+}
+
+/// A pane with nothing to draw: what it should hold, and why it does not.
+/// Centred and plain, so an unreachable surface reads as a state and not as
+/// a broken layout.
+fn unavailable<'a>(what: &'a str, why: &'a str) -> Element<'a, Message, Theme> {
+    container(column![text(what).size(18), text(why).size(12)].spacing(6))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::Alignment::Center)
+        .align_y(iced::Alignment::Center)
+        .into()
+}
+
+/// One of a pane's split buttons, pressable only while a runner is attached:
+/// splitting creates a terminal, and there is no terminal without a runner.
+fn split_button<'a>(
+    label: &'a str,
+    attached: bool,
+    pane: pane_grid::Pane,
+    axis: zeughaus_mux::Axis,
+) -> iced::widget::Button<'a, Message, Theme> {
+    let split = button(text(label).size(11)).padding([3, 6]);
+    if attached {
+        split.on_press(Message::Workspace(workspace::Message::Split { pane, axis }))
+    } else {
+        split
+    }
 }
 
 /// Halves a color's brightness, marking a pin or edge that currently carries no

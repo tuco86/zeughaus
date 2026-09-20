@@ -15,6 +15,10 @@ zeughaus-flow.workspace = true
 # Subgraph containers and their boundary nodes. Pure, cross-platform: the
 # nesting is drawn here and executed nowhere.
 zeughaus-graph.workspace = true
+# The terminal mux's wire model: the workspace topology the editor rebuilds
+# its pane grid from, and the terminal cache it draws. Pure types, so the
+# wasm editor deserializes the same topology as the native one.
+zeughaus-mux.workspace = true
 iced_nodegraph.workspace = true
 iced_palette.workspace = true
 iced_tabs.workspace = true
@@ -41,9 +45,16 @@ zeughaus-sync.workspace = true
 # itself is iced's tokio executor, which every feed task already runs on.
 zeughaus-samples.workspace = true
 weida.workspace = true
+# The terminal surface: draws a `TerminalView` with one wgpu primitive per
+# pane and bundles the font the grid is measured from.
+iced_terminal.workspace = true
 # `io-util` reads a frame off the QUIC stream, `time` paces the first dial of a
 # runtime, `macros` is `select!` between a subscription and its peer events.
 tokio = { version = "1", features = ["io-util", "time", "macros"] }
+# Sixteen random bytes, once per process, for the `ClientInstanceId` a control
+# lease is bound to. Already in the tree under weida; a full `rand` would be a
+# generator this process has no other use for.
+getrandom = "0.4"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # `#[tokio::test]` for the first-dial schedule, with a paused clock.

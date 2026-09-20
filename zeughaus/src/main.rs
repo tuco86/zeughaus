@@ -3,7 +3,11 @@ mod app;
 // needs the sync layer to learn where a runtime serves.
 #[cfg(not(target_arch = "wasm32"))]
 mod feed;
+// The terminal path: the runner's mux, its shared workspace and one stream
+// per terminal. Native-only, for the same reason as `feed`.
 mod message;
+#[cfg(not(target_arch = "wasm32"))]
+mod mux;
 mod palette;
 // The weida client under the feed: the runtime, the trust, the first dial.
 #[cfg(not(target_arch = "wasm32"))]
@@ -49,23 +53,28 @@ fn main() -> iced::Result {
     #[cfg(target_arch = "wasm32")]
     let session: Option<String> = None;
 
-    iced::application(move || App::new(session.clone()), App::update, App::view)
+    let app = iced::application(move || App::new(session.clone()), App::update, App::view)
         .subscription(App::subscription)
         .title("Zeughaus Editor")
-        .theme(|app: &App| app.theme())
-        .window(iced::window::Settings {
-            size: WINDOW_SIZE,
-            position: iced::window::Position::Centered,
-            // The close is handled rather than obeyed: a settings edit is held
-            // back for 400 ms after the last keystroke, and typing into a
-            // field and closing the window used to lose it from the store
-            // without a word. `App` flushes and then ends the runtime itself.
-            // Set here rather than through `exit_on_close_request`, which
-            // `window` would overwrite.
-            exit_on_close_request: false,
-            ..Default::default()
-        })
-        .run()
+        .theme(|app: &App| app.theme());
+    // The terminal's font is bundled, not looked up: a terminal grid needs
+    // every glyph at one advance width, and whatever the host has installed
+    // does not promise that. The wasm editor draws no terminal.
+    #[cfg(not(target_arch = "wasm32"))]
+    let app = iced_terminal::font_bytes().fold(app, |app, bytes| app.font(bytes));
+    app.window(iced::window::Settings {
+        size: WINDOW_SIZE,
+        position: iced::window::Position::Centered,
+        // The close is handled rather than obeyed: a settings edit is held
+        // back for 400 ms after the last keystroke, and typing into a
+        // field and closing the window used to lose it from the store
+        // without a word. `App` flushes and then ends the runtime itself.
+        // Set here rather than through `exit_on_close_request`, which
+        // `window` would overwrite.
+        exit_on_close_request: false,
+        ..Default::default()
+    })
+    .run()
 }
 
 /// Parses `join <sessionid>` from the CLI args. Returns the session id to join,

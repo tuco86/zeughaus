@@ -175,6 +175,27 @@ pub enum Message {
     // Native-only for the same reason as `FeedFrame`.
     #[cfg(not(target_arch = "wasm32"))]
     Traffic(u64, crate::feed::Traffic),
+    // The runner's mux said something on the control exchange of that epoch.
+    // Same guard as `Traffic`: a control task that has been replaced may
+    // still have events queued, and a workspace from a runner this editor no
+    // longer talks to must not replace the one on screen.
+    #[cfg(not(target_arch = "wasm32"))]
+    Mux(u64, crate::mux::MuxEvent),
+    // One terminal's stream reported a head, a delta or its end.
+    #[cfg(not(target_arch = "wasm32"))]
+    Terminal(u64, zeughaus_mux::TerminalId, crate::mux::TerminalEvent),
+    // A scrollback page the client scrolled to, or why it did not arrive.
+    #[cfg(not(target_arch = "wasm32"))]
+    RowPage(
+        u64,
+        zeughaus_mux::TerminalId,
+        Result<zeughaus_mux::RowPage, String>,
+    ),
+    // A terminal pane reported what the user did in it. Carries the pane
+    // rather than the terminal: focus is a property of the pane, and the
+    // terminal it shows is one lookup away in the workspace.
+    #[cfg(not(target_arch = "wasm32"))]
+    TerminalAction(zeughaus_mux::PaneId, iced_terminal::Action),
 }
 
 #[cfg(test)]
