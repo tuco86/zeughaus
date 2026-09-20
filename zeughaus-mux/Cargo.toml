@@ -1,0 +1,10 @@
+[package]
+name = "zeughaus-mux"
+edition.workspace = true
+version.workspace = true
+description = "Wire model of the terminal multiplexer: stable ids, workspace topology, terminal rows and deltas, bounded frames"
+
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true

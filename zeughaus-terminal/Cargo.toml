@@ -1,0 +1,12 @@
+[package]
+name = "zeughaus-terminal"
+edition.workspace = true
+version.workspace = true
+description = "The runner's terminal engine: a PTY, a parser and a canonical screen per session, delivered as mux rows and deltas"
+
+[dependencies]
+zeughaus-mux.workspace = true
+portable-pty.workspace = true
+wezterm-term.workspace = true
+termwiz.workspace = true
+tokio = { version = "1", features = ["sync", "rt", "macros"] }

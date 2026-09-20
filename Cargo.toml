@@ -15,6 +15,8 @@ members = [
     "zeughaus-sync",
     "zeughaus-samples",
     "zeughaus-runner",
+    "zeughaus-mux",
+    "zeughaus-terminal",
 ]
 # zeughaus-module is a SpacetimeDB server module: it only builds for the
 # wasm32 module target via `spacetime build`, so it is kept out of the native
@@ -43,6 +45,18 @@ zeughaus-samples = { path = "zeughaus-samples" }
 # a state store is the wrong pipe for 33 MB per frame.
 weida = { path = "../weida/crates/weida" }
 zeughaus-runner = { path = "zeughaus-runner" }
+# The terminal multiplexer's wire model, shared by runner and editor (wasm
+# included): pure types and a bounded codec, nothing that opens a PTY or draws.
+zeughaus-mux = { path = "zeughaus-mux" }
+# The runner's terminal engine: PTYs from `portable-pty`, escape parsing and
+# the canonical screen from a pinned `wezterm-term` -- the parts of WezTerm that
+# are a terminal, without its mux, client, GUI, Lua or configuration stack.
+zeughaus-terminal = { path = "zeughaus-terminal" }
+portable-pty = "0.9.0"
+wezterm-term = { git = "https://github.com/wezterm/wezterm", rev = "2658f629cd7251ce63a1698f238da2585676aa4e", default-features = false }
+termwiz = { git = "https://github.com/wezterm/wezterm", rev = "2658f629cd7251ce63a1698f238da2585676aa4e", default-features = false }
+# Compact self-describing serde bytes for the mux frames.
+postcard = { version = "1.1", features = ["use-std"] }
 
 iced = { version = "0.14", features = ["advanced", "wgpu", "tokio"] }
 iced_nodegraph = { path = "../iced_nodegraph/iced_nodegraph" }
