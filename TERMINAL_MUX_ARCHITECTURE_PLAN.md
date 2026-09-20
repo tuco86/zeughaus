@@ -1,5 +1,25 @@
 # Terminal Mux Architecture Plan
 
+**Status (2026-09-20): implemented, phases 1-7.** Crates: `zeughaus-mux`
+(phase 1, plus the client-side `TerminalView` cache), `zeughaus-terminal`
+(phase 2), `zeughaus-runner/src/mux` (phase 3, with the identity and mTLS
+provisioning in `zeughaus-samples::credentials`), `zeughaus/src/mux.rs` and
+`zeughaus/src/workspace.rs` (phases 4 and 5), `iced_terminal` (phase 6).
+Deviations from the text below, each for a reason: the widget and pipeline
+are the `iced_terminal` crate rather than `zeughaus/src/terminal/`, so they
+compile and test apart from the editor; a delta carries every retained row
+written since the subscriber's sequence number rather than only the watched
+and visible ones, because a burst scrolls rows out of the screen between two
+deltas and a client holding those stable rows from an earlier head would keep
+stale content (`Viewport` is accepted and ignored); zstd is reserved by
+capability id and frame flag but not offered; the listener requires a client
+certificate for every path, not only `/mux`, because one binding serves them
+all. Measured on loopback in release: fresh dial plus control attach p50
+1.1 ms / p95 2.1 ms, warm attach p50 78 us / p95 153 us, keystroke to the
+delta that echoes it p50 13.3 ms / p95 13.5 ms (12 ms of that is the
+coalescing window), a 24-row head 346 bytes. Windows compiles by
+construction and is untested.
+
 ## Summary
 
 Build a runner-owned terminal multiplexer inspired by WezTerm's architecture, without importing WezTerm's mux, client, codec, GUI, SSH, Lua, or global configuration stack.
