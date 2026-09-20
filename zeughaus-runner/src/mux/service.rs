@@ -27,8 +27,8 @@ use zeughaus_mux::workspace::ProfileId;
 use zeughaus_mux::{
     ClientHello, ClientInstanceId, CommandOutcome, CommandReply, ControlAttach, Controller,
     Dimensions, MAJOR, MINOR, Message, RequestId, RowFetch, RowPage, RunnerIncarnation,
-    ServerHello, StableRange, TerminalAttach, TerminalAttached, TerminalCommand, TerminalId,
-    TopologyCommand, WireError, WorkspaceSnapshot,
+    ServerHello, TerminalAttach, TerminalAttached, TerminalCommand, TerminalId, TopologyCommand,
+    WireError, WorkspaceSnapshot,
 };
 use zeughaus_terminal::{Profile, Session};
 
@@ -295,10 +295,9 @@ impl MuxService {
         .await
         .map_err(|e| gone(&e))?;
 
-        // What this client watches: its viewport when it scrolled into
-        // history, the screen otherwise. Replacements are computed for the
-        // union with the visible rows, so the screen is always current.
-        let mut watched: Option<StableRange> = None;
+        // Every row written since the last delta travels, wherever the
+        // screen has scrolled it to, so what a client is scrolled to needs no
+        // bookkeeping here; `Viewport` is accepted and changes nothing.
         let mut size = attach.size;
         if self.controls(terminal, client) {
             let _ = session.apply(&TerminalCommand::Resize(size));
@@ -316,8 +315,7 @@ impl MuxService {
                     // milliseconds goes into the same delta.
                     tokio::time::sleep(COALESCE).await;
                     changes.borrow_and_update();
-                    let range = watched.unwrap_or(StableRange { start: 0, end: 0 });
-                    let mut delta = session.delta_since(sent_seq, range);
+                    let mut delta = session.delta_since(sent_seq);
                     delta.input_serial_ack = acked_serial;
                     sent_seq = delta.to_seq;
                     if let Err(e) = write_frame(reply, &Message::TerminalDelta(delta), 0).await {
@@ -345,12 +343,7 @@ impl MuxService {
                         });
                     };
                     match command {
-                        TerminalCommand::Viewport { first_row, rows } => {
-                            watched = Some(StableRange {
-                                start: first_row,
-                                end: first_row + i64::from(rows),
-                            });
-                        }
+                        TerminalCommand::Viewport { .. } => {}
                         TerminalCommand::Resize(d) => {
                             size = d;
                             if self.acquire_if_free(terminal, client, &principal, &session)
@@ -1018,6 +1011,85 @@ mod tests {
             "a viewer's input is dropped: {seen}"
         );
 
+        // Semantic keys, not text: what a widget sends per keystroke.
+        let mut serial = 3;
+        for ch in "echo key-ok".chars() {
+            term.send(
+                Message::TerminalCommand(TerminalCommand::Key {
+                    serial,
+                    input: KeyInput {
+                        key: Key::Char(ch),
+                        modifiers: Modifiers::default(),
+                    },
+                }),
+                0,
+            )
+            .await;
+            serial += 1;
+        }
+        term.send(
+            Message::TerminalCommand(TerminalCommand::Key {
+                serial,
+                input: KeyInput {
+                    key: Key::Named(NamedKey::Enter),
+                    modifiers: Modifiers::default(),
+                },
+            }),
+            0,
+        )
+        .await;
+        let mut seen = String::new();
+        until(&mut term, |delta| {
+            seen.push_str(&row_text(&delta.row_replacements));
+            seen.contains("key-ok") && delta.input_serial_ack >= serial
+        })
+        .await;
+
+        // A burst that scrolls: rows that left the screen between two deltas
+        // were never sent, and a fetch is how a viewer gets them.
+        term.send(
+            Message::TerminalCommand(TerminalCommand::Text {
+                serial: serial + 1,
+                text: "seq 1 100\n".into(),
+            }),
+            0,
+        )
+        .await;
+        let mut visible = None;
+        until(&mut term, |delta| {
+            if row_text(&delta.row_replacements).contains("100") {
+                visible = delta.visible;
+                true
+            } else {
+                false
+            }
+        })
+        .await;
+        let visible = visible.expect("a delta names the visible rows");
+        let mut fetch = open(
+            &alice,
+            Message::RowFetch(RowFetch {
+                terminal,
+                epoch: 1,
+                range: zeughaus_mux::StableRange {
+                    start: (visible.start - 40).max(0),
+                    end: visible.start,
+                },
+                generation: 7,
+            }),
+        )
+        .await;
+        let Message::RowPage(page) = fetch.next().await else {
+            panic!("expected a page");
+        };
+        assert_eq!(page.generation, 7);
+        assert!(!page.rows.is_empty(), "the rows above the screen exist");
+        let text = row_text(&page.rows);
+        assert!(
+            text.contains("|5|") || text.contains("50"),
+            "the page holds the burst's earlier lines: {text}"
+        );
+
         bob_control
             .send(
                 Message::Command(Command {
@@ -1057,7 +1129,7 @@ mod tests {
         let Message::ControlAttached(attached) = control.next().await else {
             panic!("expected ControlAttached");
         };
-        assert!(row_text(&attached.heads[0].rows).contains("alice-again"));
+        assert!(row_text(&attached.heads[0].rows).contains("100"));
         // Bob's lease is within its grace: Carol cannot type yet.
         assert!(service.controls(terminal, bob.id));
 
@@ -1150,5 +1222,139 @@ mod tests {
             }
         }
         assert!(split_seen);
+    }
+
+    /// The plan's acceptance numbers, measured on loopback: a fresh dial plus
+    /// attach (QUIC, TLS, HELLO, one control exchange), a warm attach on the
+    /// pooled connection, and a keystroke's round trip to the delta that
+    /// echoes it. Ignored in the gate: it is a measurement, not a contract,
+    /// and it is meant for `cargo test --release -- --ignored perf`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn perf_attach_and_keystroke_latency() {
+        fn percentiles(samples: &mut [Duration]) -> (Duration, Duration) {
+            samples.sort();
+            let p50 = samples[samples.len() / 2];
+            let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
+            (p50, p95)
+        }
+
+        let (_service, runtime, _binding, url, identity) = setup().await;
+
+        // Fresh dial: a new requester each time, so the pool cannot reuse.
+        let mut fresh = Vec::new();
+        for i in 0..20u8 {
+            // A runtime of its own per dial: the pool keys on the trust
+            // configuration, and an equal one would hand back the warm
+            // connection.
+            let fresh_runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+            let started = Instant::now();
+            let client = client(&fresh_runtime, &url, &identity, 10 + i).await;
+            let mut control = open(&client, hello(&client)).await;
+            let Message::ControlAttached(_) = control.next().await else {
+                panic!("expected ControlAttached");
+            };
+            fresh.push(started.elapsed());
+        }
+        let (p50, p95) = percentiles(&mut fresh);
+        eprintln!("fresh dial + attach: p50 {p50:?} p95 {p95:?}");
+
+        // Warm attach: one requester, one pooled connection, many exchanges.
+        let alice = client(&runtime, &url, &identity, 1).await;
+        let mut warm = Vec::new();
+        for _ in 0..50 {
+            let started = Instant::now();
+            let mut control = open(&alice, hello(&alice)).await;
+            let Message::ControlAttached(_) = control.next().await else {
+                panic!("expected ControlAttached");
+            };
+            warm.push(started.elapsed());
+        }
+        let (p50, p95) = percentiles(&mut warm);
+        eprintln!("warm attach: p50 {p50:?} p95 {p95:?}");
+
+        // A terminal, then keystrokes: the time from sending a key to the
+        // delta that shows its echo.
+        let mut control = open(&alice, hello(&alice)).await;
+        let _ = control.next().await;
+        control
+            .send(
+                Message::Command(Command {
+                    request: RequestId(1),
+                    command: TopologyCommand::NewTerminalTab {
+                        profile: ProfileId::DEFAULT,
+                    },
+                }),
+                1,
+            )
+            .await;
+        let mut terminal = None;
+        for _ in 0..2 {
+            if let Message::WorkspaceSnapshot(s) = control.next().await {
+                terminal = s.terminals().next();
+            }
+        }
+        let terminal = terminal.expect("terminal");
+        let mut term = open(
+            &alice,
+            Message::TerminalAttach(TerminalAttach {
+                client: alice.id,
+                terminal,
+                known: None,
+                size: Dimensions { cols: 80, rows: 24 },
+            }),
+        )
+        .await;
+        let _ = term.next().await;
+        // Let the shell print its prompt before timing anything.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        while tokio::time::timeout(Duration::from_millis(200), term.next())
+            .await
+            .is_ok()
+        {}
+
+        let mut keys = Vec::new();
+        for i in 0..50u64 {
+            let ch = char::from(b'a' + (i % 26) as u8);
+            let started = Instant::now();
+            term.send(
+                Message::TerminalCommand(TerminalCommand::Key {
+                    serial: i + 1,
+                    input: KeyInput {
+                        key: Key::Char(ch),
+                        modifiers: Modifiers::default(),
+                    },
+                }),
+                0,
+            )
+            .await;
+            until(&mut term, |delta| delta.input_serial_ack > i).await;
+            keys.push(started.elapsed());
+        }
+        let (p50, p95) = percentiles(&mut keys);
+        eprintln!("keystroke to echoed delta: p50 {p50:?} p95 {p95:?}");
+
+        // Codec cost of what an attach carries.
+        let head = _service
+            .session(terminal)
+            .expect("session")
+            .head(HEAD_ROWS_ABOVE);
+        let started = Instant::now();
+        let bytes = Message::TerminalHead(head.clone())
+            .encode(0)
+            .expect("encode");
+        let encode = started.elapsed();
+        let started = Instant::now();
+        let header = zeughaus_mux::FrameHeader::decode(
+            bytes[..zeughaus_mux::FrameHeader::LEN].try_into().unwrap(),
+        )
+        .unwrap();
+        let _ = Message::decode(header.kind, &bytes[zeughaus_mux::FrameHeader::LEN..]).unwrap();
+        let decode = started.elapsed();
+        eprintln!(
+            "head of {} rows: {} bytes, encode {encode:?}, decode {decode:?}",
+            head.rows.len(),
+            bytes.len()
+        );
     }
 }

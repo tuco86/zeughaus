@@ -294,10 +294,10 @@ impl Session {
         self.inner.model().head(self.inner.id, rows_above)
     }
 
-    /// Everything that changed since `seq`, for the visible screen and the
-    /// rows this client watches.
-    pub fn delta_since(&self, seq: u64, watched: StableRange) -> TerminalDelta {
-        self.inner.model().delta_since(self.inner.id, seq, watched)
+    /// Everything that changed since `seq`: every retained row written since
+    /// then, wherever the screen has scrolled it to.
+    pub fn delta_since(&self, seq: u64) -> TerminalDelta {
+        self.inner.model().delta_since(self.inner.id, seq)
     }
 
     /// The still-retained rows of `range`, the sequence number they were read

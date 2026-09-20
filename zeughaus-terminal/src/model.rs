@@ -47,6 +47,10 @@ pub const MAX_ROWS_ABOVE: usize = 512;
 /// this bounds what a client that asks for everything gets.
 pub const MAX_FETCH_ROWS: usize = 2048;
 
+/// Most rows one delta carries: the wire's bound. A burst past it within one
+/// coalescing window leaves its oldest rows for a fetch.
+pub const MAX_DELTA_ROWS: usize = zeughaus_mux::codec::MAX_ROWS_PER_MESSAGE;
+
 /// Ordered events kept. They are drained by subscribers as they advance their
 /// sequence number; the bound is what a subscriber may fall behind by before
 /// the oldest events are dropped, and a subscriber that far behind is resynced
@@ -211,23 +215,25 @@ impl Model {
 
     /// Everything that changed since `seq`.
     ///
-    /// Rows are reported for the union of `watched` and the visible screen:
-    /// the screen is current for every client whatever it is scrolled to, and
-    /// `watched` adds the scrollback window a scrolled-back viewer is looking
-    /// at. The metadata is always sent -- it is a few dozen bytes against a
-    /// row's worth of text, and letting the client compare is cheaper than
-    /// keeping per-subscriber copies of it here.
-    pub(crate) fn delta_since(
-        &self,
-        terminal: TerminalId,
-        seq: u64,
-        watched: StableRange,
-    ) -> TerminalDelta {
+    /// Rows are reported wherever they are: a burst that scrolls a hundred
+    /// lines through the screen between two deltas leaves most of them in
+    /// scrollback by the time the delta is built, and a client that held
+    /// those stable rows from an earlier head would otherwise keep stale
+    /// content it cannot tell from current. The scan is a sequence-number
+    /// comparison per retained line, which is microseconds for a full
+    /// scrollback, and the rows it yields are exactly the ones written since
+    /// the last delta. Above [`MAX_DELTA_ROWS`] the oldest are left out and
+    /// only a fetch refreshes them. The metadata is always sent -- it is a
+    /// few dozen bytes against a row's worth of text, and letting the client
+    /// compare is cheaper than keeping per-subscriber copies of it here.
+    pub(crate) fn delta_since(&self, terminal: TerminalId, seq: u64) -> TerminalDelta {
         let screen = self.terminal.screen();
         let visible = visible_range(screen);
         let mut row_replacements = Vec::new();
-        for range in union(watched, visible).into_iter().flatten() {
-            collect_rows(screen, range, Some(seq), &mut row_replacements);
+        collect_rows(screen, retained(screen), Some(seq), &mut row_replacements);
+        if row_replacements.len() > MAX_DELTA_ROWS {
+            let excess = row_replacements.len() - MAX_DELTA_ROWS;
+            row_replacements.drain(..excess);
         }
         TerminalDelta {
             terminal,
@@ -320,29 +326,6 @@ fn retained(screen: &Screen) -> StableRange {
         start,
         end: start + screen.scrollback_rows() as i64,
     }
-}
-
-/// The one or two ranges covering both `watched` and `visible`, ascending.
-/// Two only when a viewer is scrolled far enough back that its window does
-/// not touch the screen; then sending the gap between them would be sending
-/// rows nobody is looking at.
-fn union(watched: StableRange, visible: StableRange) -> [Option<StableRange>; 2] {
-    if watched.is_empty() {
-        return [Some(visible), None];
-    }
-    if watched.end < visible.start {
-        return [Some(watched), Some(visible)];
-    }
-    if watched.start > visible.end {
-        return [Some(visible), Some(watched)];
-    }
-    [
-        Some(StableRange {
-            start: watched.start.min(visible.start),
-            end: watched.end.max(visible.end),
-        }),
-        None,
-    ]
 }
 
 /// Append the rows of `range` that are still retained, optionally only those
@@ -653,10 +636,7 @@ mod tests {
         );
         assert_eq!(text_of(wrapped[0]), "aaaaa");
 
-        let delta =
-            fixture
-                .model
-                .delta_since(TerminalId(1), before, StableRange { start: 0, end: 0 });
+        let delta = fixture.model.delta_since(TerminalId(1), before);
         assert!(delta.to_seq > before);
         let changed: Vec<i64> = delta
             .row_replacements
@@ -678,9 +658,7 @@ mod tests {
         let seq = head.seq;
 
         fixture.feed("second");
-        let delta = fixture
-            .model
-            .delta_since(TerminalId(1), seq, StableRange { start: 0, end: 0 });
+        let delta = fixture.model.delta_since(TerminalId(1), seq);
 
         assert!(delta.to_seq > seq);
         assert_eq!(delta.from_seq, seq);
@@ -694,11 +672,7 @@ mod tests {
         assert!(delta.applies_to(EPOCH, seq));
 
         // Nothing happened since: a client at `to_seq` gets no rows at all.
-        let idle = fixture.model.delta_since(
-            TerminalId(1),
-            delta.to_seq,
-            StableRange { start: 0, end: 0 },
-        );
+        let idle = fixture.model.delta_since(TerminalId(1), delta.to_seq);
         assert!(idle.row_replacements.is_empty());
     }
 
@@ -721,9 +695,7 @@ mod tests {
         // Screen plus scrollback, and not one row more.
         assert_eq!(head.visible.end - head.first_retained, 3 + 5);
 
-        let delta = fixture
-            .model
-            .delta_since(TerminalId(1), seq, StableRange { start: 0, end: 0 });
+        let delta = fixture.model.delta_since(TerminalId(1), seq);
         assert_eq!(delta.evicted_before, Some(head.first_retained));
         assert!(
             delta
@@ -755,9 +727,7 @@ mod tests {
 
         // The viewer is looking at the top of the scrollback, nowhere near
         // the screen; the screen is current for it anyway.
-        let delta = fixture
-            .model
-            .delta_since(TerminalId(1), seq, StableRange { start: 0, end: 3 });
+        let delta = fixture.model.delta_since(TerminalId(1), seq);
         assert!(
             delta
                 .row_replacements
@@ -811,9 +781,7 @@ mod tests {
         fixture.model.record(TerminalEvent::Bell);
         fixture.model.set_exit(ExitState::Exited { code: 3 });
 
-        let delta = fixture
-            .model
-            .delta_since(TerminalId(1), seq, StableRange { start: 0, end: 0 });
+        let delta = fixture.model.delta_since(TerminalId(1), seq);
         assert_eq!(
             delta.ordered_events,
             vec![
@@ -838,9 +806,7 @@ mod tests {
         fixture.model.set_controller(Some(controller.clone()));
 
         assert!(fixture.model.seq() > seq, "a takeover wakes a subscriber");
-        let delta = fixture
-            .model
-            .delta_since(TerminalId(1), seq, StableRange { start: 0, end: 0 });
+        let delta = fixture.model.delta_since(TerminalId(1), seq);
         assert_eq!(
             delta.ordered_events,
             vec![TerminalEvent::ControllerChanged(Some(controller.clone()))]
