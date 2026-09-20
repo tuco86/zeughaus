@@ -7,3 +7,25 @@ description = "An iced widget that draws a zeughaus_mux TerminalView with one wg
 [dependencies]
 zeughaus-mux.workspace = true
 iced.workspace = true
+# The custom-primitive seam. `iced` re-exports `Primitive`/`Pipeline`/`Storage`
+# through `iced::widget::shader`, but not the `primitive::Renderer` trait the
+# widget needs as its renderer bound, so the backend crate is named directly.
+# Both resolve to the same 0.14 build `iced` itself depends on.
+iced_wgpu = "0.14"
+iced_graphics = "0.14"
+wgpu = { version = "27.0", default-features = false, features = ["std", "wgsl"] }
+bytemuck = { version = "1.0", features = ["derive"] }
+# Cell widths: a combining mark shares its base cell, a wide glyph owns two.
+# The runner counts cells the same way, so the two must agree.
+unicode-width = "0.2"
+log = "0.4"
+
+[dev-dependencies]
+zeughaus-mux.workspace = true
+# Blocks on the headless adapter request in the GPU smoke test. Nothing in
+# the crate itself is async.
+pollster = "0.4"
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
