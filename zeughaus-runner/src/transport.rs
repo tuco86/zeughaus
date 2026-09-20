@@ -5,28 +5,33 @@
 //! triggers) are registered on the same listener, so an editor learns one
 //! address and derives every path from it.
 //!
-//! Trust is fingerprint pinning: the identity is generated in memory per start
-//! and its fingerprint is carried in the announced URL
-//! (`weida://sha256:<fp>@host:port/`), so a viewer accepts exactly the process
-//! that announced itself and nothing else -- no certificate to distribute, no
-//! authority to run. [`Transport::start`] is the one place the server identity
-//! is built, and therefore the swap point for a certificate issued by a secret
-//! store later on.
+//! Trust is fingerprint pinning in both directions. The server identity is
+//! loaded from the runner's state directory, not minted per start: its
+//! fingerprint is what the announced URL carries
+//! (`weida://sha256:<fp>@host:port/`), so an editor accepts exactly this
+//! runner -- and a fingerprint that survived the restart is also what lets
+//! weida redial transparently instead of handing the editor a stale pin.
+//! Every dialling peer must present a key the runner trusts
+//! ([`zeughaus_samples::credentials::client_trust`]); an anonymous editor is
+//! refused in the handshake, because a terminal endpoint on this listener
+//! hands out a shell and an opaque id is not a credential.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::Path;
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
 use weida::{
-    Binding, EndpointAddr, Identity, Listener, Puller, Replier, Runtime, RuntimeConfig,
-    TransferMeta,
+    Binding, EndpointAddr, Fingerprint, Listener, Puller, Replier, Runtime, RuntimeConfig,
+    ServerTls, TransferMeta, Trust,
 };
-use zeughaus_samples::{MAX_TRIGGER_BYTES, Snapshot, TriggerRequest};
+use zeughaus_samples::{MAX_TRIGGER_BYTES, Snapshot, TriggerRequest, credentials};
 
-/// A bound weida listener and the pinned URL that reaches it.
+/// A bound weida listener, the pinned URL that reaches it, and whom it lets in.
 pub struct Transport {
     url: String,
     listener: Listener,
+    trusted_clients: Vec<Fingerprint>,
     /// The bound socket. Held for the life of the process: dropping it would
     /// stop accepting, and the transport has no shutdown short of exit.
     _binding: Binding,
@@ -35,32 +40,36 @@ pub struct Transport {
 }
 
 impl Transport {
-    /// Binds `bind` under a fresh in-memory identity and returns the pinned
-    /// root URL for it.
+    /// Binds `bind` under the identity stored in `state_dir` and returns the
+    /// pinned root URL for it.
+    ///
+    /// The identity comes off disk so the announced fingerprint outlives a
+    /// restart, and `client.pem` is bootstrapped here because the runner is
+    /// the process that exists first: an editor on this machine must find a
+    /// key that is already trusted rather than one it minted itself.
     ///
     /// Nothing is announced from here: the caller does that once it has a store
     /// connection, and it must not happen before this returns -- an editor
     /// pointed at a runtime that is not yet serving would fail its first
     /// request and have no reason to try again.
-    pub async fn start(bind: SocketAddr) -> Result<Transport, String> {
+    pub async fn start(bind: SocketAddr, state_dir: &Path) -> Result<Transport, String> {
         let host = announced_host(bind);
-        // Named for the host it will be announced under so that a peer trusting
-        // the certificate as an anchor can still verify it; pinning by
-        // fingerprint does not consult the name, but the two trust models then
-        // cost the same identity.
-        let identity = Identity::generate_for([host.clone()])
-            .map_err(|e| format!("cannot generate an identity for {host}: {e}"))?;
+        let identity = credentials::runner_identity(state_dir)?;
         // Before the identity moves into the binding: the fingerprint is what
         // the URL pins, and it is read off the certificate.
         let fingerprint = identity
             .fingerprint()
-            .map_err(|e| format!("cannot fingerprint the identity: {e}"))?;
+            .map_err(|e| format!("cannot fingerprint the runner identity: {e}"))?;
+        credentials::client_identity(state_dir)?;
+        let trust = credentials::client_trust(state_dir)?;
+        refuse_anonymous_exposure(bind, &trust)?;
+        let trusted_clients = trust.pins.clone();
 
         let runtime =
             Runtime::new(RuntimeConfig::default()).map_err(|e| format!("weida runtime: {e}"))?;
         let listener = runtime.listener();
         let binding = listener
-            .bind_quic(bind, identity)
+            .bind_quic(bind, ServerTls::new(identity).require_client(trust))
             .await
             .map_err(|e| format!("cannot bind {bind}: {e}"))?;
 
@@ -77,6 +86,7 @@ impl Transport {
         Ok(Transport {
             url,
             listener,
+            trusted_clients,
             _binding: binding,
             _runtime: runtime,
         })
@@ -92,6 +102,31 @@ impl Transport {
     pub fn listener(&self) -> &Listener {
         &self.listener
     }
+
+    /// The client keys this binding accepts. Logged at startup: a refused
+    /// editor is otherwise a handshake failure with no side saying which keys
+    /// were on the list.
+    pub fn trusted_clients(&self) -> &[Fingerprint] {
+        &self.trusted_clients
+    }
+}
+
+/// Refuses a reachable bind that would accept anybody.
+///
+/// The local bootstrap always leaves one pinned client, so an empty trust here
+/// means the state directory could not be written or was emptied by hand. On
+/// loopback that is still only this machine's users; on any other interface it
+/// is the whole network, and this listener carries terminal endpoints -- so it
+/// fails closed and says which address made it refuse.
+fn refuse_anonymous_exposure(bind: SocketAddr, trust: &Trust) -> Result<(), String> {
+    if trust.is_empty() && !bind.ip().is_loopback() {
+        return Err(format!(
+            "refusing to serve {bind}: no client is trusted, and a non-loopback \
+             address must not be served anonymously -- provision a client \
+             certificate under <state-dir>/clients/ or bind loopback"
+        ));
+    }
+    Ok(())
 }
 
 /// The host an editor will dial, and the name the identity is issued for.
@@ -211,6 +246,91 @@ pub async fn serve_snapshots(replier: Replier, snapshot: Arc<Mutex<Snapshot>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use weida::{ClientTls, Trust};
+    use zeughaus_samples::SNAPSHOT_PATH;
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    /// A state directory that removes itself, so the tests below start from
+    /// no credentials at all rather than from the developer's own.
+    struct TempState(PathBuf);
+
+    impl TempState {
+        fn new(tag: &str) -> TempState {
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "zeughaus-runner-{tag}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            TempState(path)
+        }
+    }
+
+    impl Drop for TempState {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn loopback() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 0))
+    }
+
+    fn pinned(url: &str) -> Fingerprint {
+        EndpointAddr::parse(url)
+            .expect("announced url")
+            .peer
+            .expect("a pinned fingerprint")
+    }
+
+    /// Why the identity is a file: an editor pins what the URL named, and a
+    /// runner that re-keyed on restart would be a different peer to every one
+    /// of them -- which is also what would defeat weida's transparent redial.
+    #[tokio::test]
+    async fn the_announced_fingerprint_survives_a_restart() {
+        let state = TempState::new("restart");
+        let first = Transport::start(loopback(), &state.0).await.expect("start");
+        let before = pinned(first.url());
+        drop(first);
+
+        let second = Transport::start(loopback(), &state.0)
+            .await
+            .expect("restart");
+        assert_eq!(before, pinned(second.url()));
+    }
+
+    /// Authorization is the handshake: this listener carries terminal
+    /// endpoints, so a client whose key was never pinned must not reach an
+    /// endpoint at all -- and the key the runner bootstrapped must.
+    #[tokio::test]
+    async fn only_a_trusted_client_gets_a_connection() {
+        let state = TempState::new("mtls");
+        let transport = Transport::start(loopback(), &state.0).await.expect("start");
+        let _replier = transport
+            .listener()
+            .replier(SNAPSHOT_PATH)
+            .expect("snapshot endpoint");
+        let mut addr = EndpointAddr::parse(transport.url()).expect("announced url");
+        addr.path = SNAPSHOT_PATH.to_owned();
+        let url = addr.to_string();
+
+        let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
+        let anonymous = client.requester(ClientTls::new(Trust::by_address()));
+        let refused =
+            tokio::time::timeout(std::time::Duration::from_secs(10), anonymous.connect(&url))
+                .await
+                .expect("the handshake must fail rather than hang");
+        assert!(refused.is_err(), "an anonymous editor must be refused");
+
+        let identity = credentials::load_client_identity(&state.0).expect("bootstrapped client");
+        let trusted = client.requester(ClientTls::new(Trust::by_address()).with_identity(identity));
+        trusted.connect(&url).await.expect("the pinned client");
+    }
 
     #[test]
     fn an_unspecified_bind_address_is_announced_as_loopback() {
@@ -222,6 +342,27 @@ mod tests {
             announced_host("10.0.0.8:7443".parse().expect("addr")),
             "10.0.0.8"
         );
+    }
+
+    /// Shell endpoints live on this listener, so a reachable address with an
+    /// empty client list must not come up at all -- a runner that served the
+    /// network anonymously would be indistinguishable from one that is
+    /// configured, right up to the first stranger.
+    #[test]
+    fn a_reachable_bind_without_client_trust_is_refused() {
+        let exposed: SocketAddr = "10.0.0.8:7443".parse().expect("addr");
+        let local: SocketAddr = "127.0.0.1:7443".parse().expect("addr");
+        let any: SocketAddr = "0.0.0.0:7443".parse().expect("addr");
+        let nobody = Trust::by_address();
+        let somebody = Trust::pin(Fingerprint::from_bytes([7; 32]));
+
+        let refused = refuse_anonymous_exposure(exposed, &nobody).expect_err("must refuse");
+        assert!(refused.contains("10.0.0.8:7443"), "{refused}");
+        assert!(refuse_anonymous_exposure(any, &nobody).is_err());
+        // Loopback is this machine's own users, which is the bootstrap case
+        // before any client was ever provisioned.
+        assert!(refuse_anonymous_exposure(local, &nobody).is_ok());
+        assert!(refuse_anonymous_exposure(exposed, &somebody).is_ok());
     }
 
     /// A full queue must cost a dropped press, not a stalled transport: this

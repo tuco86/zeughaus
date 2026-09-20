@@ -15,13 +15,14 @@
 //! Native only: the wasm editor has no sync layer, so it never learns where a
 //! runtime serves and has nothing to dial.
 
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Once};
 use std::time::Duration;
 
 use weida::{
     ClientTls, EndpointAddr, GiveUp, PeerEvent, PeerEvents, ReconnectPolicy, Runtime,
     RuntimeConfig, Trust,
 };
+use zeughaus_samples::credentials;
 
 /// The one QUIC client this process needs.
 ///
@@ -89,11 +90,34 @@ impl Endpoint {
     }
 }
 
-/// The trust every dial uses: the fingerprint pinned in the URL the runtime
-/// announced, and nothing else. This is the client-side swap point for a later
-/// mTLS integration.
+/// The TLS every dial uses: the fingerprint pinned in the URL the runtime
+/// announced, and this machine's client identity when one was bootstrapped.
+///
+/// The identity is not created here. A runner pins the key it wrote itself, so
+/// a key this editor minted would authenticate nothing -- the absence of one
+/// means no runner ever ran under this state directory, and the honest
+/// outcome is a refused handshake with a log line naming the path, not a
+/// second key nobody trusts.
 pub fn client_tls() -> ClientTls {
-    ClientTls::new(Trust::by_address())
+    let dir = credentials::state_dir();
+    match credentials::load_client_identity(&dir) {
+        Some(identity) => ClientTls::new(Trust::by_address()).with_identity(identity),
+        None => {
+            // Once per process: every feed, event subscription and snapshot
+            // request builds its own `ClientTls`, and each of them would
+            // otherwise repeat the same line for the same missing file.
+            static ANNOUNCED: Once = Once::new();
+            ANNOUNCED.call_once(|| {
+                eprintln!(
+                    "[editor] no client identity in {} -- a runner that requires \
+                     a client will refuse every connection (start a runner on \
+                     this machine, or copy client.pem from the one you dial)",
+                    dir.display()
+                );
+            });
+            ClientTls::new(Trust::by_address())
+        }
+    }
 }
 
 /// Dials `url` until the first dial succeeds, paced by [`policy`].

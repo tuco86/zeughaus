@@ -35,6 +35,11 @@
 //! Sizes snap to a [`ladder`] of tiers so two viewers of similar size share one
 //! scaled result instead of each paying for their own.
 
+// The credentials both ends of that transport authenticate with. Here because
+// runner and editor must agree on the files down to their location: a client
+// key the runner never pinned is refused, and a runner identity the editor
+// cannot find makes every feed anonymous.
+pub mod credentials;
 pub mod events;
 
 use serde::{Deserialize, Serialize};
@@ -57,6 +62,13 @@ pub const SNAPSHOT_PATH: &str = "/snapshot";
 
 /// Push/Pull endpoint an editor pushes manual trigger presses to.
 pub const TRIGGERS_PATH: &str = "/triggers";
+
+/// Req/Rep endpoint carrying every terminal-mux exchange: the control
+/// stream, one stream per attached terminal and the short scrollback
+/// fetches. One path so weida pools them onto one QUIC connection -- the
+/// pool key includes the path, so splitting them would cost a handshake
+/// each and a warm attach would stop being warm.
+pub const MUX_PATH: &str = "/mux";
 
 /// What a viewer asks for: one node's output pin, at the size it will draw.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -17,6 +17,7 @@ mod transport;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc::{RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -24,7 +25,9 @@ use std::time::Duration;
 
 use zeughaus_core::{NodeId, Value, ZeughausError};
 use zeughaus_runtime::DeferredWork;
-use zeughaus_samples::{EVENTS_PATH, FEED_PATH, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH};
+use zeughaus_samples::{
+    EVENTS_PATH, FEED_PATH, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, credentials,
+};
 use zeughaus_sync::Role;
 
 use crate::feed::FrameRegistry;
@@ -70,6 +73,14 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let state_dir = match parse_state_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("[runner] {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("[runner] state dir {}", state_dir.display());
     let (uri, db, token) = resolve_session(parse_join_arg());
     eprintln!("[runner] session {token} -> {uri} / {db}");
 
@@ -113,9 +124,15 @@ fn main() -> ExitCode {
     // runner's first look at the store and an editor must never be handed an
     // endpoint that is not serving yet.
     let frames = Arc::new(FrameRegistry::new());
-    let transport = match rt.block_on(Transport::start(feed_addr)) {
+    let transport = match rt.block_on(Transport::start(feed_addr, &state_dir)) {
         Ok(transport) => {
             eprintln!("[runner] weida endpoint {}", transport.url());
+            // One line per key, because the answer to "why was my editor
+            // refused" is a fingerprint comparison and nothing else says
+            // which keys this process accepted.
+            for fingerprint in transport.trusted_clients() {
+                eprintln!("[runner] trusted client {fingerprint}");
+            }
             Some(transport)
         }
         // Not fatal. The graph still executes; an editor simply sees no values
@@ -310,6 +327,25 @@ fn parse_feed_addr() -> Result<SocketAddr, String> {
 fn feed_addr_from(text: &str) -> Result<SocketAddr, String> {
     text.parse()
         .map_err(|e| format!("--feed-addr {text:?} is not a host:port address: {e}"))
+}
+
+/// Where the runner's credentials live, from `--state-dir <path>`.
+///
+/// The flag exists for a second runner on one machine (a test fixture, a
+/// service account): two processes sharing one `runner.pem` would announce the
+/// same fingerprint from two ports, and an editor pooling by identity has no
+/// way to tell them apart. Without it,
+/// [`credentials::state_dir`](zeughaus_samples::credentials::state_dir)
+/// decides, which `ZEUGHAUS_STATE_DIR` already overrides.
+fn parse_state_dir() -> Result<PathBuf, String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--state-dir" {
+            let text = args.next().ok_or("--state-dir needs a path argument")?;
+            return Ok(PathBuf::from(text));
+        }
+    }
+    Ok(credentials::state_dir())
 }
 
 /// Turns a session token into `(uri, database, token)`. Without one, the runner

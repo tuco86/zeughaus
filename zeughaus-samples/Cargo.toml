@@ -7,3 +7,7 @@ edition.workspace = true
 zeughaus-core.workspace = true
 serde = { workspace = true }
 serde_json = "1.0"
+# The transport whose credentials `credentials` manages: identities, trust and
+# the fingerprints a pinned URL carries are weida's types, so the files on disk
+# are written and read as weida sees them and nothing translates in between.
+weida.workspace = true
