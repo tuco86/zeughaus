@@ -611,7 +611,18 @@ impl<Message> Terminal<'_, Message> {
         shell: &mut Shell<'_, Message>,
     ) {
         state.held = None;
-        state.dragging = false;
+        let was_dragging = std::mem::take(&mut state.dragging);
+        // A click that never moved selected nothing: a single-cell highlight
+        // left behind every click would read as a stray cursor. Word and
+        // line selections are whole by construction and stay.
+        if was_dragging
+            && let Some(selection) = &state.selection
+            && selection.mode == Mode::Char
+            && selection.anchor == selection.head
+        {
+            state.selection = None;
+            shell.request_redraw();
+        }
 
         if self.view.modes.mouse_reporting
             && self.controlling

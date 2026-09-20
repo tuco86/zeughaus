@@ -3599,25 +3599,76 @@ impl App {
             .padding([5, 8])
             .on_press(Message::Workspace(workspace::Message::TogglePlacement));
 
+        let status_bar = self.status_bar();
         match self.workspace.placement {
             iced_tabs::Placement::Top => column![
                 row![tab_bar, add_tab, toggle_placement]
                     .spacing(4)
                     .align_y(iced::Alignment::Center),
                 panes,
+                status_bar,
             ]
             .height(Length::Fill)
             .into(),
-            iced_tabs::Placement::Left => row![
-                column![row![add_tab, toggle_placement].spacing(4), tab_bar]
-                    .width(180)
-                    .height(Length::Fill),
-                panes,
+            iced_tabs::Placement::Left => column![
+                row![
+                    column![row![add_tab, toggle_placement].spacing(4), tab_bar]
+                        .width(180)
+                        .height(Length::Fill),
+                    panes,
+                ]
+                .width(Length::Fill)
+                .height(Length::Fill),
+                status_bar,
             ]
-            .width(Length::Fill)
-            .height(Length::Fill)
             .into(),
         }
+    }
+
+    /// The one line at the bottom of every tab: the graph's size, the
+    /// runtime and mux state, and either a hint the user just earned or the
+    /// worst error the runtime reports. Workspace-wide, because "reconnecting"
+    /// is as true in a terminal tab as in the graph.
+    fn status_bar(&self) -> Element<'_, Message> {
+        // Node errors are not computed here -- they arrive with the
+        // runtime's published state, like every other value.
+        let error = {
+            let node_error = self.node_error_summary();
+            if node_error.is_empty() {
+                self.last_error.clone()
+            } else {
+                node_error
+            }
+        };
+        // A hint outranks a failing node for the few seconds it lasts: it is
+        // the answer to something the user just did, and a graph almost always
+        // has something failing in it, which would leave the answer unread.
+        let hint = self.hint.as_ref().map(|(text, _)| text.as_str());
+        let head = format!(
+            "  {} nodes | {} edges{}",
+            self.nodes.len(),
+            self.edges.len(),
+            self.runtime_text(),
+        );
+        let (status_text, error_color) = if let Some(hint) = hint {
+            (format!("{head} | {hint}"), Color::from_rgb(0.9, 0.75, 0.35))
+        } else if !error.is_empty() {
+            (
+                format!("{head} | ERROR: {error}"),
+                Color::from_rgb(0.9, 0.3, 0.3),
+            )
+        } else {
+            (head, Color::from_rgb(0.5, 0.5, 0.5))
+        };
+
+        container(text(status_text).size(12).color(error_color))
+            .width(Length::Fill)
+            .padding(4.0)
+            .style(|_theme: &Theme| container::Style {
+                background: Some(Color::from_rgb(0.1, 0.1, 0.12).into()),
+                ..Default::default()
+            })
+            .into()
     }
 
     /// What the pane's title bar calls a surface: a terminal's own title
@@ -3646,8 +3697,9 @@ impl App {
     ///
     /// The terminal itself: one widget drawing the view, with the keyboard
     /// when its pane is focused and the runner's lease when this client
-    /// holds it. A viewer sees the same rows and gets the take-control
-    /// shortcut instead of the keys.
+    /// holds it -- or when nobody does: the first client that types acquires
+    /// an unclaimed terminal, so its keys must go out. A viewer sees the same
+    /// rows and gets the take-control shortcut instead of the keys.
     #[cfg(not(target_arch = "wasm32"))]
     fn terminal_pane(
         &self,
@@ -3660,7 +3712,7 @@ impl App {
         let controlling = view
             .controller
             .as_ref()
-            .is_some_and(|controller| controller.client == mux::client_instance());
+            .is_none_or(|controller| controller.client == mux::client_instance());
         let focused = pane.is_some() && pane == self.workspace.focused_pane();
         let widget = iced_terminal::Terminal::new(view, terminal.0)
             .controlling(controlling)
@@ -3908,46 +3960,7 @@ impl App {
             graph_area
         };
 
-        // Status bar. Node errors are not computed here -- they arrive with the
-        // runtime's published state, like every other value.
-        let error = {
-            let node_error = self.node_error_summary();
-            if node_error.is_empty() {
-                self.last_error.clone()
-            } else {
-                node_error
-            }
-        };
-        // A hint outranks a failing node for the few seconds it lasts: it is
-        // the answer to something the user just did, and a graph almost always
-        // has something failing in it, which would leave the answer unread.
-        let hint = self.hint.as_ref().map(|(text, _)| text.as_str());
-        let head = format!(
-            "  {} nodes | {} edges{}",
-            self.nodes.len(),
-            self.edges.len(),
-            self.runtime_text(),
-        );
-        let (status_text, error_color) = if let Some(hint) = hint {
-            (format!("{head} | {hint}"), Color::from_rgb(0.9, 0.75, 0.35))
-        } else if !error.is_empty() {
-            (
-                format!("{head} | ERROR: {error}"),
-                Color::from_rgb(0.9, 0.3, 0.3),
-            )
-        } else {
-            (head, Color::from_rgb(0.5, 0.5, 0.5))
-        };
-
-        let status_bar = container(text(status_text).size(12).color(error_color))
-            .width(Length::Fill)
-            .padding(4.0)
-            .style(|_theme: &Theme| container::Style {
-                background: Some(Color::from_rgb(0.1, 0.1, 0.12).into()),
-                ..Default::default()
-            });
-
-        column![self.breadcrumb(), graph_view, status_bar].into()
+        column![self.breadcrumb(), graph_view].into()
     }
 
     /// The path from the root graph to what is on screen, each step a way back.
