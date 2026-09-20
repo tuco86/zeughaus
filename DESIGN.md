@@ -48,10 +48,56 @@ Which runner executes is decided by the store, not negotiated: every runner
 registers in `runtime` and the lowest `seq` owns it, so a second runner is a hot
 standby that takes over when the first disconnects.
 
-Results travel as scalars through the store (`node_output`). Frames and other
-bulk payloads deliberately do not: a state store is the wrong pipe for 33 MB per
-frame, and they wait for a dedicated sample channel.
+Results travel over weida: scalars and node errors on the `/events` topic, a
+snapshot for late joiners on `/snapshot`, trigger presses on `/triggers`, and
+frames on `/samples`. A state store is the wrong pipe for 33 MB per frame, so
+nothing a pass produces goes through SpacetimeDB.
 
+### Terminals: a runner-owned multiplexer -- implemented
+
+The runner is also a terminal multiplexer, in the shape of WezTerm's mux and
+without its code: `portable-pty` spawns the child, a pinned `wezterm-term`
+parses its output into a canonical screen with stable row indices and change
+sequence numbers, and `zeughaus-runner/src/mux` serves that screen to every
+editor over one `/mux` path. PTY bytes never leave the runner; what travels
+is `zeughaus-mux`'s wire model -- rows as spans with wire-stable styles,
+deltas of the rows that changed since the sequence number the client holds,
+and whole workspace snapshots for the tab and split topology.
+
+Three exchange kinds ride one pooled QUIC connection. A **control** exchange
+per client carries the attach (hello, topology, one head per terminal, so the
+first paint is one round trip), the structural commands and their replies,
+and every later snapshot. A **terminal** exchange per attached terminal is
+full duplex: input up, deltas down, neither waiting for the other. **Row
+fetches** are short exchanges of their own so a scrollback page cannot block
+a keystroke. A delta is computed per subscriber from the last sequence number
+that subscriber received, so a slow client gets fewer, larger deltas and never
+a queue; output is coalesced at a 12 ms cadence.
+
+Ownership is the plan's: the runner owns tab order, splits, ratios, pane and
+terminal ids, and exactly one pane shows the graph; each editor owns its
+active tab, focused pane, scroll position, selection and blink. Any client
+may view a terminal; exactly one holds its lease and may type, resize and move
+the mouse in it. The first client that types acquires an unowned terminal,
+another takes it with an explicit command, and a lease survives a network
+blink for ten seconds so a redial does not turn a shell read-only. Closing a
+pane kills its child; closing an editor window does not. A runner restart is
+a new incarnation with an empty workspace: terminals do not migrate.
+
+Security: the runner's identity and one client identity are persisted under
+the state directory (`~/.local/state/zeughaus`, `ZEUGHAUS_STATE_DIR`), the
+listener requires a trusted client certificate, and a bind on anything but
+loopback without configured client trust refuses to start. Every `/mux`
+exchange is authorized by the peer identity weida proved; a terminal id is a
+name, never a credential. Terminals are created only from runner-side
+profiles (the runner user's login shell today); no command carries an argv.
+OSC 52 clipboard writes and downloads are not wired and cannot reach the
+editor; a hyperlink is only reported, never opened, by a click.
+
+Rendering is one custom wgpu primitive per pane (`iced_terminal`): rows are
+shaped once per content and instanced once per palette, a changed row replaces
+its arena ranges, and a cursor move touches no row. The font is bundled so the
+cell grid is the same on every host.
 ## Collaboration (SpacetimeDB)
 
 Real-time collaborative graph editing via [SpacetimeDB](https://spacetimedb.com/).

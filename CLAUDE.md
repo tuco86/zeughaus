@@ -29,6 +29,10 @@ zeughaus-graph/        # graph plugin (Subgraph: a container node; Input/Output:
 zeughaus-db/           # database plugin (Database container, Table, Insert, Query, SQL; tables designed in the graph -- field rows are bidirectional pins, a wire between two is a FOREIGN KEY; SQLite, native only)
 zeughaus-record/       # record plugin (Recorder: frames + values to disk; Player: the same dataset as a source)
 zeughaus-module/       # SpacetimeDB server module (excluded from the native workspace)
+zeughaus-mux/          # the terminal mux wire model: stable ids, workspace topology, terminal rows/deltas, bounded codec, client-side TerminalView cache (pure, wasm too)
+zeughaus-terminal/     # the runner's terminal engine: PTY sessions over portable-pty and a pinned wezterm-term, delivered as mux heads/deltas (native only)
+iced_terminal/         # the terminal widget: one wgpu primitive per pane drawing a TerminalView, input to TerminalCommands, bundled ComicShannsMono Nerd Font
+iced_tabs/             # the tab bar the workspace shell uses
 ```
 
 ## Related Projects
@@ -96,9 +100,10 @@ regex patterns, or when the LSP server is unavailable.
 
 ### Core Concepts
 - **Runtime Type System**: Pins declare a `Ty` built at runtime (scalars, `List`, `Option`, `Record`, `Opaque`), not a compile-time string. `Typed::ty()` is the single source of truth for both a pin's declaration and a value's tag, so they cannot disagree. Nodes may derive their pins from what is connected (`sync_pins`).
-- **Editor and Runtime are Separate Processes**: `zeughaus` edits and views, `zeughaus-runner` executes. They meet in the store, so a local editor and a remote one are the same thing. Runners register in `runtime` and the lowest `seq` owns execution (a second runner is a hot standby); results reach editors as scalars in `node_output`. Frames do not travel -- only `bool`/`int`/`float`/`str` (`zeughaus-core/src/wire.rs`). A trigger press travels the other way, through `node_trigger`.
+- **Editor and Runtime are Separate Processes**: `zeughaus` edits and views, `zeughaus-runner` executes. They meet in the store, so a local editor and a remote one are the same thing. Runners register in `runtime` and the lowest `seq` owns execution (a second runner is a hot standby). Results travel over weida, not the store: outputs and node errors on `/events`, a late-join snapshot on `/snapshot`, trigger presses the other way on `/triggers`, frames on `/samples`, terminals on `/mux`. Only `bool`/`int`/`float`/`str` are values on the wire (`zeughaus-core/src/wire.rs`).
 - **Sample Feed**: Frames never touch the store. The runtime binds a QUIC listener (`weida`), announces it in the `runtime` row, and a viewer holds one standing exchange per (node, pin): it names the size it draws, the runtime scales to a tier ladder and streams frames until the viewer stops. Backpressure is QUIC's, so a slow viewer gets fewer frames -- always the current one, never a backlog.
-- **Weida Redials, the Editor Resyncs**: The editor dials each runtime address once (`zeughaus/src/transport.rs`, `first_dial`) and weida keeps it alive under a `ReconnectPolicy` (250 ms doubling to 4 s, never giving up), re-sending the event filter on the redialled connection. What a redial does not restore, `zeughaus/src/feed.rs` does on `PeerEvent::Connected`: a fresh `/snapshot` and a reopened feed exchange. A runner that restarted has a new identity, so weida reports `PeerChanged` and the stream ends; the new address in the `runtime` row is what replaces it.
+- **Weida Redials, the Editor Resyncs**: The editor dials each runtime address once (`zeughaus/src/transport.rs`, `first_dial`) and weida keeps it alive under a `ReconnectPolicy` (250 ms doubling to 4 s, never giving up), re-sending the event filter on the redialled connection. What a redial does not restore, `zeughaus/src/feed.rs` and `zeughaus/src/mux.rs` do on `PeerEvent::Connected`: a fresh `/snapshot`, a reopened feed exchange, a fresh mux attach. A runner that restarted is a new peer to weida; the new address in the `runtime` row is what replaces the tasks.
+- **Terminal Mux**: The runner owns every terminal (`zeughaus-runner/src/mux`): `WorkspaceActor`-style state under one mutex for tabs/splits/panes, a `zeughaus_terminal::Session` per terminal, a lease per terminal (first typist acquires, `TakeControl` revokes, ten seconds of grace across a redial). One `/mux` replier serves three exchange kinds told apart by their first frame: control (attach = hello + topology + every head; then commands, replies, snapshots), terminal (full duplex, input up, coalesced deltas down, computed per subscriber from its last sequence number -- every retained row written since, wherever it scrolled to), row fetch (short). The editor keeps a `TerminalView` per terminal (`zeughaus-mux/src/view.rs`): heads replace, deltas apply only at their exact base, pages fill holes, the store is bounded around the viewport. `iced_terminal::Terminal` draws it and emits `Action`s; the app routes them (`App::apply_terminal_action`). A runner restart is a new incarnation and an empty workspace; terminals never migrate. See `DESIGN.md`, "Terminals: a runner-owned multiplexer".
 - **A Source Needs a Clock**: Nothing upstream wakes a screen capture, so `ExecutableNode::tick_interval` lets a node ask to be run periodically and the host schedules it. `flow.timer` is that clock; without one in the graph a capture node produces exactly one frame and stops.
 - **Push/Pull Reactive Dataflow**: Every edge has a last-value cache. Push notifies downstream, pull triggers lazy computation.
 - **Trigger vs Sample Pins**: Input pins are either trigger (causes execution) or sample (read passively).
@@ -128,9 +133,23 @@ Three processes, in this order:
 
 ```
 spacetime start                 # store, 127.0.0.1:3000, data in ~/.local/share/spacetime/data
-cargo run -p zeughaus-runner    # executes the graph; nothing runs without it
+cargo run -p zeughaus-runner    # executes the graph and owns the terminals; nothing runs without it
 cargo run -p zeughaus           # editor; start as many as you like
 ```
+
+The runner keeps its identity and one client identity under the state
+directory (`$ZEUGHAUS_STATE_DIR`, else `$XDG_STATE_HOME/zeughaus`, else
+`~/.local/state/zeughaus`; `--state-dir` on the runner): `runner.pem` is what
+the announced `weida://sha256:<fp>@..` URL pins, so the fingerprint survives a
+restart; `client.pem` is bootstrapped by the runner and presented by every
+editor on the same machine. The listener requires a trusted client
+certificate (that one, plus any `clients/*.pem`), and a bind on anything but
+loopback without client trust refuses to start. A remote editor needs
+`client.pem` copied into its own state directory. In the editor, `+` opens a
+terminal tab, `H`/`V` split a pane with a terminal, `x` closes one (and kills
+its child); `Ctrl+Shift+T` takes control of a terminal someone else drives,
+`Ctrl+Shift+C`/`V` copy and paste, `Ctrl+Shift+Escape` gives the keyboard
+back to the app.
 
 An editor with no runner still edits the graph -- it just shows no values, and
 says so in the status bar. Publish the module once per schema change:
