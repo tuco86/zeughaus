@@ -30,6 +30,7 @@ pub mod id;
 pub mod input;
 pub mod message;
 pub mod terminal;
+pub mod view;
 pub mod workspace;
 
 pub use codec::{CodecError, FrameHeader, Kind, MAJOR, MINOR};
