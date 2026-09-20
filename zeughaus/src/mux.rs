@@ -32,11 +32,12 @@ use iced::futures::channel::mpsc;
 use iced::futures::{SinkExt, Stream, StreamExt};
 use tokio::io::AsyncReadExt;
 use weida::{IncomingTransfer, OutgoingTransfer, PeerEvent, PeerEvents, Requester, TransferMeta};
-use zeughaus_mux::message::{Command, ControlAttached, TerminalAttached};
+use zeughaus_mux::message::{Command, ControlAttached};
+use zeughaus_mux::view::TerminalView;
 use zeughaus_mux::{
     ClientHello, ClientInstanceId, CommandReply, FrameHeader, MAJOR, MINOR, Message as Wire,
     RowFetch, RowPage, RunnerIncarnation, ServerHello, TerminalAttach, TerminalCommand,
-    TerminalDelta, TerminalHead, WireError, WorkspaceSnapshot,
+    TerminalHead, WireError, WorkspaceSnapshot,
 };
 use zeughaus_samples::MUX_PATH;
 
@@ -96,17 +97,37 @@ pub enum MuxEvent {
     GaveUp,
 }
 
-/// What one terminal's task reports.
+/// The terminal state a pane shows, written by its task and read by the
+/// widget: the task applies heads and deltas under a short lock and the
+/// Elm loop only learns that something changed, never what.
+pub type SharedView = iced_terminal::SharedView;
+
+/// What one terminal's task reports. No payload beyond the first event: the
+/// rows go straight into the [`SharedView`], and `Changed` is a wake.
 #[derive(Debug, Clone)]
 pub enum TerminalEvent {
     /// The first event: how to send input to this terminal.
     Ready(TerminalSender),
-    Attached(Box<TerminalAttached>),
-    Delta(Box<TerminalDelta>),
-    Head(Box<TerminalHead>),
+    /// The shared view moved; redraw.
+    Changed,
+    /// A delta did not fit the view's sequence. The view was cleared and
+    /// the stream ended; attaching again asks for a fresh head, which is
+    /// the only correct resync.
+    Desynced,
     Error(WireError),
     /// The exchange ended. The app decides whether to attach again.
     Ended,
+}
+
+/// Puts a fresh head into a shared view, creating the view if this is the
+/// first one. `apply_head` keeps the scroll position when the rows it names
+/// still exist, which a rebuild from scratch would lose.
+pub fn apply_head(view: &SharedView, head: zeughaus_mux::TerminalHead) {
+    let mut guard = view.lock().unwrap_or_else(|e| e.into_inner());
+    match guard.as_mut() {
+        Some(view) => view.apply_head(head),
+        None => *guard = Some(TerminalView::from_head(head, ROW_CAPACITY)),
+    }
 }
 
 /// How much of a terminal's scrollback one client keeps in rows. Ten screens
@@ -408,12 +429,17 @@ async fn read_control(
     }
 }
 
-/// Streams one terminal: input up, deltas and heads down.
+/// Streams one terminal: input up, deltas and heads down, applied into
+/// `view` as they arrive.
 ///
 /// Ends when the exchange does. The app owns whether a terminal is attached
 /// at all -- it starts one of these per terminal the workspace references --
 /// so a stream that ended is reported and not reopened from here.
-pub fn terminal(endpoint: Endpoint, attach: TerminalAttach) -> impl Stream<Item = TerminalEvent> {
+pub fn terminal(
+    endpoint: Endpoint,
+    attach: TerminalAttach,
+    view: SharedView,
+) -> impl Stream<Item = TerminalEvent> {
     // Deltas are coalesced by the runner, so this only has to hold the few
     // that a mid-redraw moment can produce.
     iced::stream::channel(32, async move |mut out| {
@@ -481,17 +507,53 @@ pub fn terminal(endpoint: Endpoint, attach: TerminalAttach) -> impl Stream<Item 
                     break;
                 }
             };
-            let event = match message {
-                Wire::TerminalAttached(attached) => TerminalEvent::Attached(Box::new(attached)),
-                Wire::TerminalDelta(delta) => TerminalEvent::Delta(Box::new(delta)),
-                Wire::TerminalHead(head) => TerminalEvent::Head(Box::new(head)),
-                Wire::Error(error) => TerminalEvent::Error(error),
+            match message {
+                Wire::TerminalAttached(attached) => {
+                    if let Some(head) = attached.head {
+                        apply_head(&view, head);
+                    }
+                }
+                Wire::TerminalHead(head) => apply_head(&view, head),
+                Wire::TerminalDelta(delta) => {
+                    // The guard lives in this block and never across an
+                    // await: a `MutexGuard` is not `Send`, and this stream
+                    // runs on iced's executor.
+                    let rejected = {
+                        let mut guard = view.lock().unwrap_or_else(|e| e.into_inner());
+                        // No head yet: the runner is about to send one, and
+                        // a delta with nothing to apply it to is not an error.
+                        let rejected = match guard.as_mut() {
+                            Some(view) => view.apply_delta(delta).err(),
+                            None => None,
+                        };
+                        if rejected.is_some() {
+                            *guard = None;
+                        }
+                        rejected
+                    };
+                    if let Some(rejected) = rejected {
+                        eprintln!("[mux] {terminal}: delta rejected ({rejected:?}), resyncing");
+                        drop(writer);
+                        let _ = out.send(TerminalEvent::Desynced).await;
+                        return;
+                    }
+                }
+                Wire::Error(error) => {
+                    if out.send(TerminalEvent::Error(error)).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 other => {
                     eprintln!("[mux] {terminal}: unexpected {:?}", other.kind());
                     continue;
                 }
-            };
-            if out.send(event).await.is_err() {
+            }
+            // A wake, not a queue: while one is pending the UI has not drawn
+            // yet, and it will draw the newest state when it does.
+            if let Err(e) = out.try_send(TerminalEvent::Changed)
+                && e.is_disconnected()
+            {
                 break;
             }
         }

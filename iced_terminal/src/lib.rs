@@ -1,15 +1,20 @@
 //! An iced widget that draws a [`zeughaus_mux::view::TerminalView`].
 //!
 //! The runner owns the terminal; this crate owns the pixels and the input.
+//! The view itself lives behind a [`SharedView`] handle the transport task
+//! writes and the widget reads under a short lock, so a head or a delta
+//! arriving never has to travel through the application's message loop.
 //! One [`Terminal`] per surface renders one custom `wgpu` primitive -- not a
 //! widget per cell, not a text object per row -- and reports what the user did
 //! as an [`Action`] the application turns into a
 //! [`zeughaus_mux::TerminalCommand`] or applies to its own view.
 //!
 //! ```no_run
+//! # use std::sync::{Arc, Mutex};
 //! # use zeughaus_mux::view::TerminalView;
-//! # fn demo<Message: Clone>(view: &TerminalView, wrap: impl Fn(iced_terminal::Action) -> Message + 'static) {
-//! let terminal = iced_terminal::Terminal::new(view, 1)
+//! # fn demo<Message: Clone>(view: TerminalView, wrap: impl Fn(iced_terminal::Action) -> Message + 'static) {
+//! let view: iced_terminal::SharedView = Arc::new(Mutex::new(Some(view)));
+//! let terminal = iced_terminal::Terminal::new(view.clone(), 1)
 //!     .controlling(true)
 //!     .focused(true)
 //!     .next_serial(42)
@@ -39,4 +44,4 @@ pub mod selection;
 pub use font::{FAMILY, FONT, FONT_BOLD, cell_geometry, font_bytes};
 pub use geometry::{CellMetrics, cell_at, grid_size};
 pub use input::{key_input, modifiers, mouse_button};
-pub use widget::{Action, Terminal};
+pub use widget::{Action, SharedView, Terminal};

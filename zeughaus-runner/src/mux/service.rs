@@ -43,8 +43,10 @@ const HEAD_ROWS_ABOVE: usize = 128;
 /// blink does not make its terminals read-only.
 const LEASE_GRACE: Duration = Duration::from_secs(10);
 
-/// The render cadence a subscriber coalesces at: a delta at most this often
-/// per terminal per client, whatever the child prints.
+/// The render cadence a subscriber coalesces at during a burst: a delta at
+/// most this often per terminal per client, whatever the child prints. A
+/// change after quiet goes out at once -- a keystroke's echo is not a burst,
+/// and waiting for company would put this whole window on every keystroke.
 const COALESCE: Duration = Duration::from_millis(12);
 
 /// Replies remembered per client for deduplicating a command resent after a
@@ -304,6 +306,7 @@ impl MuxService {
         }
 
         let mut canceled = std::pin::pin!(canceled);
+        let mut last_sent = Instant::now() - COALESCE;
         loop {
             tokio::select! {
                 () = &mut canceled => break Ok(()),
@@ -311,10 +314,16 @@ impl MuxService {
                     if changed.is_err() {
                         break Ok(());
                     }
-                    // Coalesce: whatever else arrives in the next few
-                    // milliseconds goes into the same delta.
-                    tokio::time::sleep(COALESCE).await;
+                    // Pace, do not delay: a change within the cadence of the
+                    // last delta waits for the rest of it, a change after
+                    // quiet is sent as it is.
+                    let due = last_sent + COALESCE;
+                    let now = Instant::now();
+                    if due > now {
+                        tokio::time::sleep(due - now).await;
+                    }
                     changes.borrow_and_update();
+                    last_sent = Instant::now();
                     let mut delta = session.delta_since(sent_seq);
                     delta.input_serial_ack = acked_serial;
                     sent_seq = delta.to_seq;
@@ -1316,6 +1325,9 @@ mod tests {
         let mut keys = Vec::new();
         for i in 0..50u64 {
             let ch = char::from(b'a' + (i % 26) as u8);
+            // A person types with gaps well past the coalescing window;
+            // back-to-back keys would measure the burst pacing instead.
+            tokio::time::sleep(Duration::from_millis(40)).await;
             let started = Instant::now();
             term.send(
                 Message::TerminalCommand(TerminalCommand::Key {

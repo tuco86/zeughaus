@@ -726,15 +726,18 @@ mod tests {
         // address: weida refuses it in the handshake and gives the address
         // up, and both streams end rather than looping on the loss. The
         // store's new address is what replaces them.
+        // Bounded by the redial schedule: two addresses back off
+        // independently up to 4 s per attempt, and the feed's own re-open
+        // pace sits on top, so the sum can pass ten seconds on a busy host.
         let stranger = weida::Identity::generate_for(["127.0.0.1"]).expect("identity");
         let third = FakeRuntime::bind(port, stranger, 5).await;
-        let ended = tokio::time::timeout(Duration::from_secs(10), traffic.next())
+        let ended = tokio::time::timeout(Duration::from_secs(30), traffic.next())
             .await
-            .expect("the event stream ends within 10 s");
+            .expect("the event stream ends within 30 s");
         assert!(ended.is_none(), "got {ended:?} from a stranger");
-        let ended = tokio::time::timeout(Duration::from_secs(10), video.next())
+        let ended = tokio::time::timeout(Duration::from_secs(30), video.next())
             .await
-            .expect("the feed ends within 10 s");
+            .expect("the feed ends within 30 s");
         assert!(ended.is_none(), "got {ended:?} from a stranger");
         third.stop().await;
     }

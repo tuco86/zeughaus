@@ -236,9 +236,10 @@ struct MuxState {
 /// and the task carrying both.
 #[cfg(not(target_arch = "wasm32"))]
 struct LiveTerminal {
-    /// `None` until the first head arrives. A pane with no view yet draws
-    /// its placeholder rather than nothing.
-    view: Option<zeughaus_mux::view::TerminalView>,
+    /// Written by the terminal's task, read by the pane. `None` inside
+    /// until the first head arrives; a pane with no view yet draws its
+    /// placeholder rather than nothing.
+    view: crate::mux::SharedView,
     commands: Option<crate::mux::TerminalSender>,
     serials: crate::mux::Serials,
     /// Aborts on drop, so removing the entry stops the stream. `None` while
@@ -250,22 +251,21 @@ struct LiveTerminal {
 impl LiveTerminal {
     fn detached() -> LiveTerminal {
         LiveTerminal {
-            view: None,
+            view: Arc::new(std::sync::Mutex::new(None)),
             commands: None,
             serials: crate::mux::Serials::default(),
             task: None,
         }
     }
-}
 
-/// Puts a fresh head into a terminal's view, creating it if this is the
-/// first one. `apply_head` keeps the scroll position when the rows it names
-/// still exist, which a rebuild from scratch would lose.
-#[cfg(not(target_arch = "wasm32"))]
-fn apply_head(live: &mut LiveTerminal, head: zeughaus_mux::TerminalHead, capacity: usize) {
-    match live.view.as_mut() {
-        Some(view) => view.apply_head(head),
-        None => live.view = Some(zeughaus_mux::view::TerminalView::from_head(head, capacity)),
+    /// The epoch and sequence the view holds, for an attach that continues
+    /// with deltas, and the size it was drawn at.
+    fn known(&self) -> (Option<(u64, u64)>, zeughaus_mux::Dimensions) {
+        let guard = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(view) => (Some((view.epoch, view.applied_seq)), view.dimensions),
+            None => (None, mux::DEFAULT_GRID),
+        }
     }
 }
 
@@ -2009,7 +2009,7 @@ impl App {
                         .terminals
                         .entry(head.terminal)
                         .or_insert_with(LiveTerminal::detached);
-                    apply_head(live, head, mux::ROW_CAPACITY);
+                    mux::apply_head(&live.view, head);
                 }
                 mux.workspace = Some((*workspace).clone());
                 // Sent before the blink and unanswered: the runner
@@ -2104,23 +2104,17 @@ impl App {
             if live.task.is_some() {
                 continue;
             }
-            let known = live
-                .view
-                .as_ref()
-                .map(|view| (view.epoch, view.applied_seq));
-            let size = live
-                .view
-                .as_ref()
-                .map_or(mux::DEFAULT_GRID, |view| view.dimensions);
+            let (known, size) = live.known();
             let attach = zeughaus_mux::TerminalAttach {
                 client,
                 terminal,
                 known,
                 size,
             };
-            let (task, handle) = Task::run(mux::terminal(endpoint.clone(), attach), move |event| {
-                Message::Terminal(epoch, terminal, event)
-            })
+            let (task, handle) = Task::run(
+                mux::terminal(endpoint.clone(), attach, Arc::clone(&live.view)),
+                move |event| Message::Terminal(epoch, terminal, event),
+            )
             .abortable();
             live.task = Some(handle.abort_on_drop());
             tasks.push(task);
@@ -2128,7 +2122,9 @@ impl App {
         Task::batch(tasks)
     }
 
-    /// What one terminal's stream said.
+    /// What one terminal's stream said. The rows themselves never come this
+    /// way: the task wrote them into the shared view, and `Changed` is the
+    /// redraw this message already causes.
     #[cfg(not(target_arch = "wasm32"))]
     fn apply_terminal(
         &mut self,
@@ -2141,46 +2137,25 @@ impl App {
         if epoch != self.mux_epoch {
             return Task::none();
         }
-        let capacity = mux::ROW_CAPACITY;
         let Some(mux) = self.mux.as_mut() else {
             return Task::none();
         };
         let Some(live) = mux.terminals.get_mut(&terminal) else {
             return Task::none();
         };
-        // What the event needs from `self` after the terminal's own state
-        // has been updated: the borrow above covers the whole match, so the
-        // follow-up has to happen once it has ended.
-        let mut resync = false;
-        let mut refusal = None;
         match event {
             TerminalEvent::Ready(sender) => live.commands = Some(sender),
-            TerminalEvent::Attached(attached) => {
-                if let Some(head) = attached.head {
-                    apply_head(live, head, capacity);
-                }
+            TerminalEvent::Changed => {}
+            // The task cleared the view and ended; attaching again asks for
+            // a fresh head.
+            TerminalEvent::Desynced => {
+                live.commands = None;
+                live.task = None;
+                return self.reconcile_terminals();
             }
-            TerminalEvent::Head(head) => apply_head(live, *head, capacity),
-            TerminalEvent::Delta(delta) => match live.view.as_mut() {
-                // No head yet: the runner is about to send one, and a delta
-                // with nothing to apply it to is not an error.
-                None => {}
-                Some(view) => {
-                    if let Err(rejected) = view.apply_delta(*delta) {
-                        // A gap is not patched speculatively. Dropping the
-                        // view and the stream makes the next attach ask for
-                        // a fresh head, which is the only correct resync.
-                        eprintln!("[mux] {terminal}: delta rejected ({rejected:?}), resyncing");
-                        live.view = None;
-                        live.commands = None;
-                        live.task = None;
-                        resync = true;
-                    }
-                }
-            },
             TerminalEvent::Error(error) => {
                 eprintln!("[mux] {terminal}: {}", error.message);
-                refusal = Some(error.message);
+                self.hint = Some((error.message, iced::time::Instant::now()));
             }
             // The runner ended this stream. The pane keeps its last screen;
             // the workspace snapshot is what removes it.
@@ -2188,12 +2163,6 @@ impl App {
                 live.commands = None;
                 live.task = None;
             }
-        }
-        if let Some(refusal) = refusal {
-            self.hint = Some((refusal, iced::time::Instant::now()));
-        }
-        if resync {
-            return self.reconcile_terminals();
         }
         Task::none()
     }
@@ -2216,11 +2185,11 @@ impl App {
                 return;
             }
         };
-        if let Some(view) = self
+        if let Some(live) = self
             .mux
             .as_mut()
             .and_then(|mux| mux.terminals.get_mut(&terminal))
-            .and_then(|live| live.view.as_mut())
+            && let Some(view) = live.view.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
         {
             view.apply_page(page);
         }
@@ -2308,7 +2277,10 @@ impl App {
         else {
             return Task::none();
         };
-        let Some(view) = live.view.as_mut() else {
+        // The lock covers the scroll and the bookkeeping, not the fetch
+        // tasks: they are only built here and run later.
+        let mut guard = live.view.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(view) = guard.as_mut() else {
             return Task::none();
         };
         if !view.scroll_by(lines) {
@@ -2385,14 +2357,19 @@ impl App {
     }
 
     /// The terminal a pane shows, as this editor holds it, with the serials
-    /// its input carries.
+    /// its input carries. `None` while no head has arrived.
     #[cfg(not(target_arch = "wasm32"))]
     fn terminal_view(
         &self,
         terminal: zeughaus_mux::TerminalId,
-    ) -> Option<(&zeughaus_mux::view::TerminalView, mux::Serials)> {
+    ) -> Option<(&mux::SharedView, mux::Serials)> {
         let live = self.mux.as_ref()?.terminals.get(&terminal)?;
-        Some((live.view.as_ref()?, live.serials))
+        let present = live
+            .view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        present.then_some((&live.view, live.serials))
     }
 
     /// Which feeds the graph asks for, and at what ladder tier.
@@ -3678,12 +3655,14 @@ impl App {
         match surface {
             Surface::Terminal(terminal) => self
                 .terminal_view(terminal)
-                .map(|(view, _)| view)
-                .filter(|view| !view.title.is_empty())
-                .map_or_else(
-                    || surface_title(surface).to_owned(),
-                    |view| view.title.clone(),
-                ),
+                .and_then(|(view, _)| {
+                    let guard = view.lock().unwrap_or_else(|e| e.into_inner());
+                    guard
+                        .as_ref()
+                        .map(|view| view.title.clone())
+                        .filter(|title| !title.is_empty())
+                })
+                .unwrap_or_else(|| surface_title(surface).to_owned()),
             other => surface_title(other).to_owned(),
         }
     }
@@ -3709,12 +3688,16 @@ impl App {
         let Some((view, serials)) = self.terminal_view(terminal) else {
             return unavailable("Terminal", "Waiting for the runner's first screen.");
         };
-        let controlling = view
-            .controller
-            .as_ref()
-            .is_none_or(|controller| controller.client == mux::client_instance());
+        let controlling = {
+            let guard = view.lock().unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().is_none_or(|view| {
+                view.controller
+                    .as_ref()
+                    .is_none_or(|controller| controller.client == mux::client_instance())
+            })
+        };
         let focused = pane.is_some() && pane == self.workspace.focused_pane();
-        let widget = iced_terminal::Terminal::new(view, terminal.0)
+        let widget = iced_terminal::Terminal::new(Arc::clone(view), terminal.0)
             .controlling(controlling)
             .focused(focused)
             .next_serial(serials.next())

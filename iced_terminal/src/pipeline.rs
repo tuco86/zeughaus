@@ -56,10 +56,10 @@ const CURSOR_ALPHA: f32 = 0.65;
 
 /// Everything the GPU needs about one frame of one terminal.
 ///
-/// Built by the widget from the borrowed [`zeughaus_mux::view::TerminalView`],
-/// because a primitive has to outlive the borrow. Copying the visible text is
-/// the only per-frame allocation the renderer makes; shaping and instance
-/// building are both behind content-addressed caches.
+/// Built by the widget from the shared [`zeughaus_mux::view::TerminalView`]
+/// while the lock is held, because a primitive outlives it. Copying the
+/// visible text is the only per-frame allocation the renderer makes; shaping
+/// and instance building are both behind content-addressed caches.
 #[derive(Debug)]
 pub(crate) struct Frame {
     pub cols: u16,
@@ -1638,6 +1638,128 @@ mod tests {
             shaped_rows,
             "moving the cursor shaped a row again"
         );
+    }
+
+    /// A pane whose view has not arrived yet still has to be a pane: its
+    /// frame carries no rows at all, and the pipeline has to paint the
+    /// background across the whole surface instead of walking them.
+    #[test]
+    fn a_pane_without_a_view_paints_only_its_background() {
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("iced_terminal: no wgpu adapter, skipping the GPU smoke test");
+            return;
+        };
+
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut pipeline = TerminalPipeline::new(&device, &queue, format);
+
+        let terminal: crate::widget::Terminal<'_, ()> =
+            crate::widget::Terminal::new(Arc::new(std::sync::Mutex::new(None)), 7);
+        let (width, height) = (96u32, 48u32);
+        let frame = terminal.empty_frame(iced::Size::new(width as f32, height as f32));
+        assert!(frame.lines.is_empty(), "no view is no rows");
+
+        let bounds = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: width as f32,
+            height: height as f32,
+        };
+        let viewport = Viewport::with_physical_size(iced::Size::new(width, height), 1.0);
+        let primitive = TerminalPrimitive {
+            id: 7,
+            frame: Arc::new(frame),
+        };
+        primitive.prepare(&mut pipeline, &device, &queue, &bounds, &viewport);
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("empty target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let bytes_per_row = (width * 4).div_ceil(256) * 256;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("empty readback"),
+            size: u64::from(bytes_per_row) * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("empty pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_viewport(0.0, 0.0, width as f32, height as f32, 0.0, 1.0);
+            assert!(
+                primitive.draw(&pipeline, &mut pass),
+                "an empty pane still draws its background"
+            );
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let _ = queue.submit([encoder.finish()]);
+
+        readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let pixels = readback.slice(..).get_mapped_range().to_vec();
+
+        let background = shader_color(Palette::default().background, 1.0);
+        let expected = [
+            (background[0] * 255.0).round() as u8,
+            (background[1] * 255.0).round() as u8,
+            (background[2] * 255.0).round() as u8,
+        ];
+        for row in 0..height as usize {
+            let start = row * bytes_per_row as usize;
+            for pixel in pixels[start..start + width as usize * 4].as_chunks::<4>().0 {
+                assert_eq!(pixel[3], 255, "the background is opaque everywhere");
+                assert_eq!(pixel[..3], expected, "nothing but the background is drawn");
+            }
+        }
     }
 
     fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {

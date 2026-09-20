@@ -3,14 +3,18 @@
 //! Builds a [`TerminalView`] from a hand-made [`TerminalHead`] -- no runner,
 //! no PTY, no QUIC -- so the widget, the font and the pipeline can be looked
 //! at on their own. Typing reports actions to the status line instead of
-//! sending them anywhere.
+//! sending them anywhere. The view sits behind a [`SharedView`] exactly as it
+//! would in the editor, where a transport task writes it; here the update
+//! function is the writer.
 //!
 //! `cargo run -p iced_terminal --example demo`
+
+use std::sync::{Arc, Mutex};
 
 use iced::widget::{column, container, text};
 use iced::{Element, Fill, Task};
 
-use iced_terminal::{Action, Terminal};
+use iced_terminal::{Action, SharedView, Terminal};
 use zeughaus_mux::view::TerminalView;
 use zeughaus_mux::{
     CellSpan, CellStyle, Cursor, CursorShape, Dimensions, Modes, Palette, RowData, StableRange,
@@ -35,7 +39,7 @@ fn theme(_state: &Demo) -> iced::Theme {
 }
 
 struct Demo {
-    view: TerminalView,
+    view: SharedView,
     last: String,
     serial: u64,
 }
@@ -49,7 +53,7 @@ impl Demo {
     fn new() -> (Self, Task<Message>) {
         (
             Demo {
-                view: TerminalView::from_head(head(), 1024),
+                view: Arc::new(Mutex::new(Some(TerminalView::from_head(head(), 1024)))),
                 last: "press a key, drag a selection, scroll".to_string(),
                 serial: 1,
             },
@@ -61,7 +65,16 @@ impl Demo {
         let Message::Terminal(action) = message;
         match action {
             Action::ScrollBy(lines) => {
-                let _ = self.view.scroll_by(lines);
+                // The widget never writes the view; whoever owns the handle
+                // does. In the editor that is the mux task.
+                let mut view = self
+                    .view
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                if let Some(view) = view.as_mut() {
+                    let _ = view.scroll_by(lines);
+                }
+                drop(view);
                 self.last = format!("scroll by {lines}");
             }
             Action::Command(command) => {
@@ -76,7 +89,7 @@ impl Demo {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let terminal = Terminal::new(&self.view, 1)
+        let terminal = Terminal::new(self.view.clone(), 1)
             .controlling(true)
             .focused(true)
             .next_serial(self.serial)

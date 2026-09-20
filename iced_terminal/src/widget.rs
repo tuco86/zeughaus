@@ -1,10 +1,11 @@
 //! The widget: one terminal surface, one primitive, and the input it turns
 //! into [`TerminalCommand`]s.
 //!
-//! The widget owns no terminal state. It borrows a
+//! The widget owns no terminal state. It reads a
 //! [`zeughaus_mux::view::TerminalView`] -- the client's copy of what the
-//! runner has -- and reports what the user did through [`Action`]; the caller
-//! decides what to send and what to apply locally. That split is what lets a
+//! runner has -- through a [`SharedView`] handle whose writer is the
+//! transport task, and reports what the user did through [`Action`]; the
+//! caller decides what to send and what to apply. That split is what lets a
 //! second client view the same terminal: a viewer renders identically and its
 //! keystrokes simply never become commands.
 //!
@@ -18,8 +19,11 @@
 //!   changing -- dragging a split otherwise sends one per frame.
 //! - An idle terminal schedules nothing. The only timer is the cursor blink,
 //!   and it only runs while this pane has the keyboard.
+//! - The shared view is locked only for as long as it takes to copy out what
+//!   one event or one frame needs, and never across a `publish`: the
+//!   application's message handler is free to lock the very same mutex.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use iced::advanced::input_method::{self, InputMethod};
@@ -63,8 +67,8 @@ pub enum Action {
     /// the serial handed in through [`Terminal::next_serial`].
     Command(TerminalCommand),
     /// Scroll the view by this many rows (negative is up, into history), then
-    /// send a fresh `Viewport`. The widget cannot do it: it only borrows the
-    /// view.
+    /// send a fresh `Viewport`. The widget does not do it itself: the shared
+    /// view has exactly one writer, and it is not the widget.
     ScrollBy(i64),
     /// The selected text, for the clipboard.
     Copy(String),
@@ -76,9 +80,14 @@ pub enum Action {
     Focused(bool),
 }
 
+/// The terminal state a pane shows: written by the transport task that
+/// receives heads and deltas, read by the widget under a short lock. `None`
+/// until the first head arrived.
+pub type SharedView = Arc<Mutex<Option<TerminalView>>>;
+
 /// A terminal surface.
 pub struct Terminal<'a, Message> {
-    view: &'a TerminalView,
+    view: SharedView,
     id: u64,
     on_action: Option<Box<dyn Fn(Action) -> Message + 'a>>,
     controlling: bool,
@@ -88,9 +97,9 @@ pub struct Terminal<'a, Message> {
 }
 
 impl<'a, Message> Terminal<'a, Message> {
-    /// A terminal drawing `view`. `id` must be stable for the surface: the
-    /// renderer keeps this pane's GPU buffers under it.
-    pub fn new(view: &'a TerminalView, id: u64) -> Self {
+    /// A terminal drawing whatever `view` holds. `id` must be stable for the
+    /// surface: the renderer keeps this pane's GPU buffers under it.
+    pub fn new(view: SharedView, id: u64) -> Self {
         Terminal {
             view,
             id,
@@ -225,7 +234,12 @@ where
     ) {
         let state = tree.state.downcast_ref::<State>();
         let bounds = layout.bounds();
-        let frame = self.frame(state, bounds.size());
+        // The snapshot is built while the lock is held and the guard is gone
+        // before the primitive is handed over: from here on the frame is the
+        // renderer's own data.
+        let frame = self
+            .with_view(|view| self.frame(view, state, bounds.size()))
+            .unwrap_or_else(|| self.empty_frame(bounds.size()));
         renderer.draw_primitive(
             bounds,
             TerminalPrimitive {
@@ -247,9 +261,12 @@ where
             return mouse::Interaction::None;
         }
         let state = tree.state.downcast_ref::<State>();
+        let Some(mouse_reporting) = self.with_view(|view| view.modes.mouse_reporting) else {
+            return mouse::Interaction::default();
+        };
         if state.hovered_link.is_some() && state.modifiers.control() {
             mouse::Interaction::Pointer
-        } else if self.view.modes.mouse_reporting && self.controlling {
+        } else if mouse_reporting && self.controlling {
             mouse::Interaction::None
         } else {
             mouse::Interaction::Text
@@ -345,6 +362,19 @@ where
 }
 
 impl<Message> Terminal<'_, Message> {
+    /// Reads the shared view under the shortest possible lock: the guard is
+    /// dropped on the way out, so a caller can only ever publish, redraw or
+    /// send after it let go. `None` means no head arrived yet.
+    fn with_view<T>(&self, read: impl FnOnce(&TerminalView) -> T) -> Option<T> {
+        // A panic in some other thread's message handler must not take the
+        // interface down with it; the data behind the lock is still whole.
+        let view = self
+            .view
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        view.as_ref().map(read)
+    }
+
     fn publish(&self, shell: &mut Shell<'_, Message>, action: Action) {
         if let Some(on_action) = &self.on_action {
             shell.publish(on_action(action));
@@ -357,11 +387,6 @@ impl<Message> Terminal<'_, Message> {
 
     fn grid(&self, size: Size) -> Dimensions {
         grid_size(size, self.metrics())
-    }
-
-    /// The stable row the top of the pane shows.
-    fn top_row(&self) -> i64 {
-        self.view.viewport().start
     }
 
     // ------------------------------------------------------------ input ---
@@ -388,10 +413,18 @@ impl<Message> Terminal<'_, Message> {
             return;
         }
 
+        // Everything below this point needs a live view: before the first
+        // head there is nothing to scroll and no child to type into, and the
+        // keys are still swallowed so the application's shortcuts stay quiet.
+        let Some(rows) = self.with_view(|view| view.dimensions.rows.max(1)) else {
+            shell.capture_event();
+            return;
+        };
+
         if modifiers.shift()
             && let keyboard::Key::Named(named) = key
         {
-            let page = i64::from(self.view.dimensions.rows.max(1));
+            let page = i64::from(rows);
             let lines = match named {
                 keyboard::key::Named::PageUp => Some(-page),
                 keyboard::key::Named::PageDown => Some(page),
@@ -451,7 +484,7 @@ impl<Message> Terminal<'_, Message> {
                 match character {
                     'c' => {
                         let selection = state.selection.as_ref()?;
-                        let text = selection::extract(self.view, selection);
+                        let text = self.with_view(|view| selection::extract(view, selection))?;
                         (!text.is_empty()).then_some(Action::Copy(text))
                     }
                     'v' => {
@@ -489,7 +522,20 @@ impl<Message> Terminal<'_, Message> {
         let grid = self.grid(size);
         let (col, row) = cell_at(local, self.metrics(), grid);
 
-        if self.view.modes.mouse_reporting && self.controlling {
+        // One lock for everything this press needs from the view. The link
+        // is looked up here because it needs the same borrow, not because a
+        // click on a link is decided early.
+        let Some((mouse_reporting, stable, link)) = self.with_view(|view| {
+            let stable = top_row(view) + i64::from(row);
+            let link = (state.modifiers.control() && button == mouse::Button::Left)
+                .then(|| selection::link_at(view, stable, col).map(str::to_string))
+                .flatten();
+            (view.modes.mouse_reporting, stable, link)
+        }) else {
+            return;
+        };
+
+        if mouse_reporting && self.controlling {
             if let Some(button) = input::mouse_button(button) {
                 let serial = state.next_serial();
                 self.publish(
@@ -514,14 +560,10 @@ impl<Message> Terminal<'_, Message> {
             return;
         }
 
-        let stable = self.top_row() + i64::from(row);
-
         // A link is only ever followed on an explicit modified click, and
         // only reported: nothing here opens anything.
-        if state.modifiers.control()
-            && let Some(link) = selection::link_at(self.view, stable, col)
-        {
-            self.publish(shell, Action::OpenLink(link.to_string()));
+        if let Some(link) = link {
+            self.publish(shell, Action::OpenLink(link));
             shell.capture_event();
             return;
         }
@@ -563,15 +605,20 @@ impl<Message> Terminal<'_, Message> {
 
         let grid = self.grid(bounds.size());
         let (col, row) = cell_at(local, self.metrics(), grid);
-        let stable = self.top_row() + i64::from(row);
+        let Some((mouse_reporting, stable, link)) = self.with_view(|view| {
+            let stable = top_row(view) + i64::from(row);
+            let link = selection::link_at(view, stable, col).map(str::to_string);
+            (view.modes.mouse_reporting, stable, link)
+        }) else {
+            return;
+        };
 
-        let link = selection::link_at(self.view, stable, col).map(str::to_string);
         if link != state.hovered_link {
             state.hovered_link = link;
             shell.request_redraw();
         }
 
-        if self.view.modes.mouse_reporting && self.controlling {
+        if mouse_reporting && self.controlling {
             if let Some(button) = state.held.and_then(input::mouse_button) {
                 let serial = state.next_serial();
                 self.publish(
@@ -624,7 +671,9 @@ impl<Message> Terminal<'_, Message> {
             shell.request_redraw();
         }
 
-        if self.view.modes.mouse_reporting
+        if self
+            .with_view(|view| view.modes.mouse_reporting)
+            .unwrap_or(false)
             && self.controlling
             && let Some(local) = cursor.position_in(bounds)
             && let Some(button) = input::mouse_button(button)
@@ -665,7 +714,12 @@ impl<Message> Terminal<'_, Message> {
             return;
         }
 
-        if self.view.modes.mouse_reporting && self.controlling {
+        // No view is no viewport either: there is nothing to scroll yet.
+        let Some(mouse_reporting) = self.with_view(|view| view.modes.mouse_reporting) else {
+            return;
+        };
+
+        if mouse_reporting && self.controlling {
             let Some(local) = cursor.position_in(bounds) else {
                 return;
             };
@@ -716,13 +770,28 @@ impl<Message> Terminal<'_, Message> {
         shell: &mut Shell<'_, Message>,
     ) {
         self.resize(state, now, bounds.size(), shell);
-        self.blink(state, now, shell);
 
-        if self.focused && self.controlling {
+        // One lock for the two things a redraw asks the view: whether the
+        // cursor blinks at all, and where it sits for the input method.
+        let cursor_cell = self.with_view(|view| {
+            let blinking = view.is_blinking_cursor() && view.exit.is_none();
+            (blinking, view.cursor.x, view.cursor.y)
+        });
+        self.blink(
+            state,
+            now,
+            cursor_cell.is_some_and(|(blinking, ..)| blinking),
+            shell,
+        );
+
+        if self.focused
+            && self.controlling
+            && let Some((_, col, row)) = cursor_cell
+        {
             let metrics = self.metrics();
             let cursor = Rectangle {
-                x: bounds.x + f32::from(self.view.cursor.x) * metrics.width,
-                y: bounds.y + f32::from(self.view.cursor.y) * metrics.height,
+                x: bounds.x + f32::from(col) * metrics.width,
+                y: bounds.y + f32::from(row) * metrics.height,
                 width: metrics.width,
                 height: metrics.height,
             };
@@ -770,8 +839,15 @@ impl<Message> Terminal<'_, Message> {
 
     /// The only animation in the widget, and only while this pane has the
     /// keyboard: an unfocused or non-blinking terminal asks for no frames.
-    fn blink(&self, state: &mut State, now: Instant, shell: &mut Shell<'_, Message>) {
-        if !self.focused || !self.view.is_blinking_cursor() || self.view.exit.is_some() {
+    /// `blinking` is what the view said, read before the lock was released.
+    fn blink(
+        &self,
+        state: &mut State,
+        now: Instant,
+        blinking: bool,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        if !self.focused || !blinking {
             state.blink_on = true;
             state.blink_at = None;
             return;
@@ -795,12 +871,12 @@ impl<Message> Terminal<'_, Message> {
 
     // ----------------------------------------------------------- render ---
 
-    fn frame(&self, state: &State, size: Size) -> Frame {
+    fn frame(&self, view: &TerminalView, state: &State, size: Size) -> Frame {
         let metrics = self.metrics();
         let grid = grid_size(size, metrics);
-        let top = self.top_row();
+        let top = top_row(view);
 
-        let cursor_row = i64::from(self.view.cursor.y) + self.view.visible.start;
+        let cursor_row = i64::from(view.cursor.y) + view.visible.start;
         let preedit = state
             .preedit
             .as_deref()
@@ -809,13 +885,12 @@ impl<Message> Terminal<'_, Message> {
         let mut lines = Vec::with_capacity(usize::from(grid.rows));
         for index in 0..grid.rows {
             let stable = top + i64::from(index);
-            let mut spans = self
-                .view
+            let mut spans = view
                 .row(stable)
                 .map(|row| row.spans.clone())
                 .unwrap_or_default();
             if let Some(preedit) = preedit.filter(|_| stable == cursor_row) {
-                overlay_preedit(&mut spans, self.view.cursor.x, preedit, grid.cols);
+                overlay_preedit(&mut spans, view.cursor.x, preedit, grid.cols);
             }
             lines.push(FrameRow {
                 key: row_key(&spans, self.font_size),
@@ -826,7 +901,7 @@ impl<Message> Terminal<'_, Message> {
         let selection = state
             .selection
             .as_ref()
-            .map(|selection| selection.resolve(self.view))
+            .map(|selection| selection.resolve(view))
             .map(|range| {
                 (0..grid.rows)
                     .filter_map(|index| {
@@ -841,44 +916,70 @@ impl<Message> Terminal<'_, Message> {
             })
             .unwrap_or_default();
 
-        let cursor = self.cursor_spec(state, grid, top, cursor_row);
+        let cursor = self.cursor_spec(view, state, grid, top, cursor_row);
 
         Frame {
             cols: grid.cols,
             rows: grid.rows,
             metrics,
             font_size: self.font_size,
-            palette: self.view.palette.clone(),
-            palette_generation: palette_generation(&self.view.palette),
-            reverse_video: self.view.modes.reverse_video,
+            palette: view.palette.clone(),
+            palette_generation: palette_generation(&view.palette),
+            reverse_video: view.modes.reverse_video,
             lines,
             selection,
             cursor,
         }
     }
 
+    /// The frame of a pane whose view has not arrived yet: the right size,
+    /// the default palette, and nothing on it.
+    pub(crate) fn empty_frame(&self, size: Size) -> Frame {
+        let metrics = self.metrics();
+        let grid = grid_size(size, metrics);
+        let palette = zeughaus_mux::Palette::default();
+        Frame {
+            cols: grid.cols,
+            rows: grid.rows,
+            metrics,
+            font_size: self.font_size,
+            palette_generation: palette_generation(&palette),
+            palette,
+            reverse_video: false,
+            lines: Vec::new(),
+            selection: Vec::new(),
+            cursor: None,
+        }
+    }
+
     fn cursor_spec(
         &self,
+        view: &TerminalView,
         state: &State,
         grid: Dimensions,
         top: i64,
         cursor_row: i64,
     ) -> Option<CursorSpec> {
-        if !self.view.cursor.visible || self.view.exit.is_some() || !state.blink_on {
+        if !view.cursor.visible || view.exit.is_some() || !state.blink_on {
             return None;
         }
         // Scrolled into history, the cursor is not on screen at all.
         let row = u16::try_from(cursor_row - top).ok()?;
-        if row >= grid.rows || self.view.cursor.x >= grid.cols {
+        if row >= grid.rows || view.cursor.x >= grid.cols {
             return None;
         }
         Some(CursorSpec {
-            col: self.view.cursor.x,
+            col: view.cursor.x,
             row,
-            shape: self.view.cursor.shape,
+            shape: view.cursor.shape,
             focused: self.focused,
         })
     }
+}
+
+/// The stable row the top of the pane shows.
+fn top_row(view: &TerminalView) -> i64 {
+    view.viewport().start
 }
 
 /// Draws the IME's pre-edit where the cursor is, underlined, so composing
