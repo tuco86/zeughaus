@@ -2546,7 +2546,14 @@ dependencies = [
 name = "iced_terminal"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "iced",
+ "iced_graphics",
+ "iced_wgpu",
+ "log",
+ "pollster",
+ "unicode-width",
+ "wgpu",
  "zeughaus-mux",
 ]
 
@@ -7915,6 +7922,7 @@ name = "zeughaus"
 version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
+ "getrandom 0.4.3",
  "iced",
  "iced_nodegraph",
  "iced_palette",
@@ -7931,6 +7939,7 @@ dependencies = [
  "zeughaus-graph",
  "zeughaus-llm",
  "zeughaus-ml",
+ "zeughaus-mux",
  "zeughaus-record",
  "zeughaus-runtime",
  "zeughaus-samples",
@@ -8032,10 +8041,12 @@ dependencies = [
  "zeughaus-graph",
  "zeughaus-llm",
  "zeughaus-ml",
+ "zeughaus-mux",
  "zeughaus-record",
  "zeughaus-runtime",
  "zeughaus-samples",
  "zeughaus-sync",
+ "zeughaus-terminal",
  "zeughaus-transform",
 ]
 
@@ -8054,6 +8065,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "weida",
  "zeughaus-core",
 ]
 

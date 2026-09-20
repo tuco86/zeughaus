@@ -10,3 +10,8 @@ portable-pty.workspace = true
 wezterm-term.workspace = true
 termwiz.workspace = true
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
+
+[dev-dependencies]
+# `time` only for the two PTY tests: they bound how long they wait on a real
+# child instead of hanging a suite.
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
