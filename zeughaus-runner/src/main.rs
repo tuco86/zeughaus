@@ -12,6 +12,7 @@
 //! store on every batch.
 
 mod feed;
+mod mux;
 mod runner;
 mod transport;
 
@@ -26,11 +27,12 @@ use std::time::Duration;
 use zeughaus_core::{NodeId, Value, ZeughausError};
 use zeughaus_runtime::DeferredWork;
 use zeughaus_samples::{
-    EVENTS_PATH, FEED_PATH, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, credentials,
+    EVENTS_PATH, FEED_PATH, MUX_PATH, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, credentials,
 };
 use zeughaus_sync::Role;
 
 use crate::feed::FrameRegistry;
+use crate::mux::MuxService;
 use crate::runner::{AsyncResult, Runner};
 use crate::transport::Transport;
 
@@ -178,6 +180,16 @@ fn main() -> ExitCode {
                 rt.spawn(transport::accept_triggers(puller, trigger_tx));
             }
             Err(e) => eprintln!("[runner] no trigger intake: {e}"),
+        }
+        // The terminal mux: one replier, three exchange kinds, every terminal
+        // this process will ever run. Its incarnation is what tells an editor
+        // that a restarted runner's terminals are not the ones it cached.
+        match listener.replier(MUX_PATH) {
+            Ok(replier) => {
+                let service = MuxService::new(mux::incarnation(), Vec::new());
+                rt.spawn(service.accept(replier));
+            }
+            Err(e) => eprintln!("[runner] no terminal mux: {e}"),
         }
     }
 

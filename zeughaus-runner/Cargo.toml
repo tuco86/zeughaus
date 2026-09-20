@@ -24,6 +24,10 @@ zeughaus-record.workspace = true
 # Frames leave this process over QUIC, not through the store: a 4K RGBA frame
 # is 33 MB and a state store is the wrong pipe for it.
 weida.workspace = true
+# The terminal multiplexer: `zeughaus-mux` is the wire model every editor
+# shares, `zeughaus-terminal` the PTYs and screens only this process holds.
+zeughaus-mux.workspace = true
+zeughaus-terminal.workspace = true
 # Blocking node work (LLM requests, screen capture) runs on tokio's blocking
 # pool so the event loop keeps draining the store. Multi-threaded because the
 # feed server's tasks live here too: they park on QUIC flow control and scale

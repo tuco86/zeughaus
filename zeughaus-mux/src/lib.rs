@@ -41,8 +41,9 @@ pub use input::{
     KeyInput, Modifiers, MouseButton, MouseInput, MouseKind, NamedKey, TerminalCommand,
 };
 pub use message::{
-    ClientHello, CommandOutcome, CommandReply, ControlAttach, Message, RowFetch, RowPage,
-    ServerHello, TerminalAttach, WireError,
+    Capability, ClientHello, Command, CommandOutcome, CommandReply, ControlAttach, ControlAttached,
+    ErrorCode, Message, RowFetch, RowPage, ServerHello, TerminalAttach, TerminalAttached,
+    WireError,
 };
 pub use terminal::{
     CellSpan, CellStyle, Controller, Cursor, CursorShape, Dimensions, ExitState, Modes, Palette,
