@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "iced_tabs",
+    "iced_terminal",
     "zeughaus",
     "zeughaus-core",
     "zeughaus-runtime",
@@ -61,6 +62,10 @@ postcard = { version = "1.1", features = ["use-std"] }
 iced = { version = "0.14", features = ["advanced", "wgpu", "tokio"] }
 iced_nodegraph = { path = "../iced_nodegraph/iced_nodegraph" }
 iced_tabs = { path = "iced_tabs" }
+# The terminal surface: one widget, one wgpu primitive per pane, drawing a
+# `zeughaus_mux::view::TerminalView`. Its own crate so the pipeline compiles
+# and tests apart from the editor.
+iced_terminal = { path = "iced_terminal" }
 iced_palette = { git = "https://github.com/tuco86/iced_palette.git", branch = "main" }
 
 # `rc` provides Serialize/Deserialize for Arc<str> / Arc<T>, which pin names,
