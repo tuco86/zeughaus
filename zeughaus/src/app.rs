@@ -53,11 +53,12 @@ use crate::workspace::{self, Surface, Workspace, surface_title};
 #[cfg(not(target_arch = "wasm32"))]
 const PARTICLE_SPEED: f32 = 240.0;
 
-/// The terminal's font size in logical pixels. One size for every pane:
-/// the cell grid is measured from it, and two panes at different sizes
-/// would report different geometries for the same terminal.
+/// The terminal's font size in logical pixels: 12 pt at 96 dpi, what a
+/// desktop terminal defaults to. One size for every pane: the cell grid is
+/// measured from it, and two panes at different sizes would report
+/// different geometries for the same terminal.
 #[cfg(not(target_arch = "wasm32"))]
-const TERMINAL_FONT_SIZE: f32 = 14.0;
+const TERMINAL_FONT_SIZE: f32 = 16.0;
 
 /// Shortest gap between two particles on one edge: at most ten per second. A
 /// 30 Hz source would otherwise smear into a solid line, which says less than
@@ -218,6 +219,10 @@ struct MuxState {
     /// Which runner process this is. A different one on attach means every
     /// cached terminal belongs to terminals that no longer exist.
     incarnation: Option<zeughaus_mux::RunnerIncarnation>,
+    /// How the runner names this editor's identity to the others. A lease
+    /// held by another instance under the same principal -- this user's
+    /// previous editor -- is one this editor may type through.
+    principal: Option<String>,
     /// Whether the last thing the control task said was an attach. Drives
     /// the status bar and decides whether a structural command may be sent.
     attached: bool,
@@ -1963,6 +1968,7 @@ impl App {
             client: mux::client_instance(),
             commands: None,
             incarnation: None,
+            principal: None,
             attached: false,
             workspace: None,
             terminals: HashMap::new(),
@@ -2003,6 +2009,7 @@ impl App {
                     mux.terminals.clear();
                 }
                 mux.incarnation = Some(hello.incarnation);
+                mux.principal = Some(hello.principal);
                 mux.attached = true;
                 for head in heads {
                     let live = mux
@@ -3372,10 +3379,24 @@ impl App {
                 // does hold it is not read while a store exists.
                 self.flush_pending();
                 self.autosave();
-                // Ends the runtime rather than closing the window: a closed
-                // window leaves the event loop spinning with nothing to draw.
+                // The runner has to see this editor leave. A process that
+                // exits with its QUIC connections open is, to the peer, one
+                // that stopped answering: the control lease it held stays
+                // attached until the idle timeout, and the next editor on
+                // this machine types into a shell that will not take its
+                // keys. A clean close is a CONNECTION_CLOSE, bounded by
+                // weida's shutdown budget, and only then the exit.
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    return Task::perform(crate::transport::shutdown(), |()| Message::Exit);
+                }
+                #[cfg(target_arch = "wasm32")]
                 return iced::exit();
             }
+            // Ends the runtime rather than closing the window: a closed
+            // window leaves the event loop spinning with nothing to draw.
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::Exit => return iced::exit(),
             Message::CopySessionId => {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
@@ -3691,9 +3712,11 @@ impl App {
         let controlling = {
             let guard = view.lock().unwrap_or_else(|e| e.into_inner());
             guard.as_ref().is_none_or(|view| {
-                view.controller
-                    .as_ref()
-                    .is_none_or(|controller| controller.client == mux::client_instance())
+                view.controller.as_ref().is_none_or(|controller| {
+                    controller.client == mux::client_instance()
+                        || self.mux.as_ref().and_then(|mux| mux.principal.as_deref())
+                            == Some(controller.principal.as_str())
+                })
             })
         };
         let focused = pane.is_some() && pane == self.workspace.focused_pane();

@@ -452,12 +452,48 @@ impl MuxService {
         Ok(())
     }
 
+    /// Marks the client's leases as detached and, once the grace has run
+    /// out without it coming back, releases them for everyone to see: a
+    /// terminal whose controller is gone for good must not keep a
+    /// `controller` that stops every other editor from typing into it.
     fn detach(&self, client: ClientInstanceId) {
         let now = Instant::now();
         let mut leases = self.inner.leases.lock().unwrap_or_else(|e| e.into_inner());
         for lease in leases.values_mut() {
             if lease.client == client && lease.detached_at.is_none() {
                 lease.detached_at = Some(now);
+            }
+        }
+        drop(leases);
+        let service = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(LEASE_GRACE).await;
+            service.release_expired(client);
+        });
+    }
+
+    /// Drops every lease `client` still holds detached and past its grace.
+    fn release_expired(&self, client: ClientInstanceId) {
+        let now = Instant::now();
+        let expired: Vec<TerminalId> = {
+            let leases = self.inner.leases.lock().unwrap_or_else(|e| e.into_inner());
+            leases
+                .iter()
+                .filter(|(_, lease)| lease.client == client && lease.expired(now))
+                .map(|(terminal, _)| *terminal)
+                .collect()
+        };
+        for terminal in expired {
+            let mut leases = self.inner.leases.lock().unwrap_or_else(|e| e.into_inner());
+            if leases
+                .get(&terminal)
+                .is_some_and(|lease| lease.client == client && lease.expired(now))
+            {
+                leases.remove(&terminal);
+                drop(leases);
+                if let Some(session) = self.session(terminal) {
+                    session.set_controller(None);
+                }
             }
         }
     }
@@ -545,7 +581,9 @@ impl MuxService {
     }
 
     /// Whether `client` may drive `terminal`: it holds the lease, or nobody
-    /// does (or the holder's grace ran out) and it takes it now.
+    /// does, or the holder is gone -- for good, or briefly but under the same
+    /// principal (the same user's restarted editor, which a grace meant for
+    /// a network blink must not lock out of its own shell).
     fn acquire_if_free(
         &self,
         terminal: TerminalId,
@@ -557,6 +595,7 @@ impl MuxService {
         let mut leases = self.inner.leases.lock().unwrap_or_else(|e| e.into_inner());
         match leases.get(&terminal) {
             Some(lease) if lease.client == client => return true,
+            Some(lease) if lease.detached_at.is_some() && lease.principal == principal => {}
             Some(lease) if !lease.expired(now) => return false,
             _ => {}
         }
@@ -1139,8 +1178,38 @@ mod tests {
             panic!("expected ControlAttached");
         };
         assert!(row_text(&attached.heads[0].rows).contains("100"));
-        // Bob's lease is within its grace: Carol cannot type yet.
+        // Bob's lease is within its grace, and Carol proves the same identity
+        // Bob did -- the same user's restarted editor. Her first keystroke
+        // takes the shell over rather than waiting the grace out.
         assert!(service.controls(terminal, bob.id));
+        let mut carol_term = open(
+            &carol,
+            Message::TerminalAttach(TerminalAttach {
+                client: carol.id,
+                terminal,
+                known: None,
+                size: Dimensions { cols: 60, rows: 12 },
+            }),
+        )
+        .await;
+        let _ = carol_term.next().await;
+        carol_term
+            .send(
+                Message::TerminalCommand(TerminalCommand::Text {
+                    serial: 1,
+                    text: "echo carol-back\n".into(),
+                }),
+                0,
+            )
+            .await;
+        let mut seen = String::new();
+        until(&mut carol_term, |delta| {
+            seen.push_str(&row_text(&delta.row_replacements));
+            seen.contains("carol-back")
+        })
+        .await;
+        assert!(service.controls(terminal, carol.id));
+        drop(carol_term);
 
         // Closing the pane kills the child and answers with the graph alone.
         let pane = attached.workspace.tabs[1].root.leaves()[0].0;

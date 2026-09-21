@@ -216,11 +216,15 @@ struct Atlas {
     staging: Vec<u8>,
 }
 
-/// sRGB to linear, once, for colour glyph pixels. Mask coverage is not a
-/// colour and is uploaded untouched.
+/// sRGB to linear, once, for colour glyph pixels -- only when iced renders
+/// gamma-corrected. Mask coverage is not a colour and is uploaded untouched.
 static SRGB_TO_LINEAR: LazyLock<[u8; 256]> = LazyLock::new(|| {
     let mut table = [0u8; 256];
     for (value, slot) in table.iter_mut().enumerate() {
+        if !iced_graphics::color::GAMMA_CORRECTION {
+            *slot = value as u8;
+            continue;
+        }
         let srgb = value as f32 / 255.0;
         let linear = if srgb <= 0.04045 {
             srgb / 12.92
@@ -1228,7 +1232,17 @@ fn span_colors(
     default_fg: [u8; 3],
     default_bg: [u8; 3],
 ) -> ([u8; 3], [u8; 3]) {
-    let mut fg = resolve(style.fg, palette, default_fg);
+    // Bold in one of the eight base colours is drawn in the bright variant,
+    // as xterm and WezTerm (`bold_brightens_ansi_colors`) do by default: a
+    // shell prompt is bold and coloured, and without this it reads a shade
+    // darker than in every other terminal.
+    let fg_color = match style.fg {
+        WireColor::Indexed(index @ 0..=7) if style.flags.has(StyleFlags::BOLD) => {
+            WireColor::Indexed(index + 8)
+        }
+        other => other,
+    };
+    let mut fg = resolve(fg_color, palette, default_fg);
     let mut bg = resolve(style.bg, palette, default_bg);
     if style.flags.has(StyleFlags::REVERSE) {
         std::mem::swap(&mut fg, &mut bg);
@@ -1268,10 +1282,13 @@ fn cube_level(step: u8) -> u8 {
     if step == 0 { 0 } else { 55 + step * 40 }
 }
 
-/// iced renders in linear space by default, so a terminal's sRGB colours have
-/// to be converted the same way iced converts its own.
+/// A colour as iced hands its own to a shader. iced renders gamma-corrected
+/// (linear values on an sRGB surface) only without its `web-colors` feature,
+/// which is on by default: then the surface is not sRGB and colours travel
+/// as they are. Converting on our own account would be right on the one
+/// surface and half as bright on the other, so the decision is iced's.
 fn shader_color(rgb: [u8; 3], alpha: f32) -> [f32; 4] {
-    Color::from_rgba8(rgb[0], rgb[1], rgb[2], alpha).into_linear()
+    iced_graphics::color::pack(Color::from_rgba8(rgb[0], rgb[1], rgb[2], alpha)).components()
 }
 
 fn cursor_quads(frame: &Frame, cell_width: f32, cell_height: f32) -> Vec<QuadInstance> {
@@ -1369,6 +1386,27 @@ mod tests {
         };
         let (fg, _) = span_colors(&dim, &palette, [0, 0, 0], [0, 0, 0]);
         assert_eq!(fg, [100, 50, 25]);
+    }
+
+    /// Bold in a base colour reads as the bright variant, as in xterm; bold
+    /// in a bright, cube or true colour is left alone.
+    #[test]
+    fn bold_brightens_the_eight_base_colours_only() {
+        let palette = Palette::default();
+        let bold = |fg: WireColor| CellStyle {
+            fg,
+            bg: WireColor::Default,
+            underline_color: WireColor::Default,
+            flags: StyleFlags::default().with(StyleFlags::BOLD),
+        };
+        let (fg, _) = span_colors(&bold(WireColor::Indexed(1)), &palette, [0; 3], [0; 3]);
+        assert_eq!(fg, palette.ansi[9]);
+        let (fg, _) = span_colors(&bold(WireColor::Indexed(9)), &palette, [0; 3], [0; 3]);
+        assert_eq!(fg, palette.ansi[9]);
+        let (fg, _) = span_colors(&bold(WireColor::Indexed(196)), &palette, [0; 3], [0; 3]);
+        assert_eq!(fg, [255, 0, 0]);
+        let (fg, _) = span_colors(&bold(WireColor::Default), &palette, [7; 3], [0; 3]);
+        assert_eq!(fg, [7; 3]);
     }
 
     #[test]

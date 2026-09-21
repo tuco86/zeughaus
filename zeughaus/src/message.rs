@@ -157,6 +157,9 @@ pub enum Message {
     // settings edit held back for the debounce would otherwise be lost from
     // the store: the editor flushes and then ends the runtime itself.
     CloseRequested,
+    // The transport is closed; now the process may end.
+    #[cfg(not(target_arch = "wasm32"))]
+    Exit,
     // File operations
     SaveGraph,
     LoadGraph,

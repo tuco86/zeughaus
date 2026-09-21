@@ -49,6 +49,17 @@ pub static QUIC: LazyLock<Option<Runtime>> = LazyLock::new(|| {
     }
 });
 
+/// Closes every connection this process holds, so the runner sees it leave
+/// rather than time out. Bounded by weida's shutdown budget; a runtime that
+/// was never built has nothing to close. `LazyLock::get` rather than a
+/// dereference, so a close on an editor that never dialled does not build a
+/// runtime just to close it.
+pub async fn shutdown() {
+    if let Some(Some(runtime)) = LazyLock::get(&QUIC) {
+        runtime.clone().shutdown().await;
+    }
+}
+
 /// How a lost runtime is redialled: doubling from 250 ms, capped at 4 s, and
 /// never given up. Long enough that a runtime restart is not a storm, short
 /// enough that a viewer notices the runtime coming back. Weida's default caps
