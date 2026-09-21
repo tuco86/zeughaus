@@ -50,7 +50,7 @@ mod tests {
         inputs.insert("a", Value::new(10.0f64));
         inputs.insert("b", Value::new(20.0f64));
         inputs.insert("t", Value::new(0.0f64));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         let outputs = ctx.take_outputs();
         assert_eq!(outputs["result"].downcast_ref::<f64>(), Some(&10.0));
@@ -63,7 +63,7 @@ mod tests {
         inputs.insert("a", Value::new(10.0f64));
         inputs.insert("b", Value::new(20.0f64));
         inputs.insert("t", Value::new(1.0f64));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         let outputs = ctx.take_outputs();
         assert_eq!(outputs["result"].downcast_ref::<f64>(), Some(&20.0));
@@ -76,7 +76,7 @@ mod tests {
         inputs.insert("a", Value::new(0.0f64));
         inputs.insert("b", Value::new(100.0f64));
         inputs.insert("t", Value::new(0.5f64));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         let outputs = ctx.take_outputs();
         assert_eq!(outputs["result"].downcast_ref::<f64>(), Some(&50.0));

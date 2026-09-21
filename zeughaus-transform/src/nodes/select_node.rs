@@ -51,7 +51,7 @@ mod tests {
         inputs.insert("condition", Value::new(true));
         inputs.insert("true_val", Value::new(42.0f64));
         inputs.insert("false_val", Value::new(0.0f64));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         let outputs = ctx.take_outputs();
         assert_eq!(outputs["result"].downcast_ref::<f64>(), Some(&42.0));
@@ -64,7 +64,7 @@ mod tests {
         inputs.insert("condition", Value::new(false));
         inputs.insert("true_val", Value::new(42.0f64));
         inputs.insert("false_val", Value::new(99.0f64));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         let outputs = ctx.take_outputs();
         assert_eq!(outputs["result"].downcast_ref::<f64>(), Some(&99.0));
@@ -74,7 +74,7 @@ mod tests {
     fn default_condition_is_false() {
         let mut node = SelectNode::new();
         let inputs = InputSet::new();
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         let outputs = ctx.take_outputs();
         assert_eq!(outputs["result"].downcast_ref::<f64>(), Some(&0.0));

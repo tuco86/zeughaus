@@ -47,7 +47,7 @@ mod tests {
         let mut node = DisplayNode::new();
         let mut inputs = InputSet::new();
         inputs.insert("input", Value::new(42.0f64));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         assert_eq!(node.last_value(), Some("42"));
     }
@@ -56,7 +56,7 @@ mod tests {
     fn no_input_keeps_none() {
         let mut node = DisplayNode::new();
         let inputs = InputSet::new();
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         assert_eq!(node.last_value(), None);
     }

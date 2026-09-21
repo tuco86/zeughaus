@@ -73,7 +73,7 @@ mod tests {
             .unwrap();
         let mut inputs = InputSet::new();
         inputs.insert("text", Value::new("from pin".to_string()));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         let out = ctx.take_outputs();
         let conv = out["out"].downcast_ref::<Conversation>().unwrap();
@@ -88,7 +88,7 @@ mod tests {
         let prior = Conversation::new().with(ChatMessage::new(Role::System, "first"));
         let mut inputs = InputSet::new();
         inputs.insert("conv", Value::new(prior));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         let out = ctx.take_outputs();
         let conv = out["out"].downcast_ref::<Conversation>().unwrap();

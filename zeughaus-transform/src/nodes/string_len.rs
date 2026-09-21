@@ -43,7 +43,7 @@ mod tests {
         let mut node = StringLenNode::new();
         let mut inputs = InputSet::new();
         inputs.insert("input", Value::new("hello".to_string()));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         assert_eq!(
             ctx.take_outputs()["result"].downcast_ref::<f64>(),
@@ -55,7 +55,7 @@ mod tests {
     fn len_of_empty() {
         let mut node = StringLenNode::new();
         let inputs = InputSet::new();
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         assert_eq!(
             ctx.take_outputs()["result"].downcast_ref::<f64>(),

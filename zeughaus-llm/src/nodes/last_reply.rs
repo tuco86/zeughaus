@@ -52,7 +52,7 @@ mod tests {
         let mut inputs = InputSet::new();
         inputs.insert("conv", Value::new(conv));
         let mut node = LastReplyNode::new();
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         assert_eq!(
             ctx.take_outputs()["text"].downcast_ref::<String>().unwrap(),

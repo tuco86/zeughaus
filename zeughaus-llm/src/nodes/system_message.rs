@@ -68,7 +68,7 @@ mod tests {
         let mut node = SystemMessageNode::new();
         node.set_parameter("text", Value::new("be terse".to_string()))
             .unwrap();
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&InputSet::new(), &mut ctx).unwrap();
         let out = ctx.take_outputs();
         let conv = out["out"].downcast_ref::<Conversation>().unwrap();

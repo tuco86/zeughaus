@@ -251,12 +251,12 @@ mod tests {
         let mut node = HoldNode::new();
         let mut inputs = InputSet::new();
         inputs.insert("in", Value::new(5.0f64));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         assert_eq!(ctx.take_outputs()["out"].downcast_ref::<f64>(), Some(&5.0));
 
         // No event this run: the held state persists (event consumed, state stays).
-        let mut ctx2 = NodeContext::new(NodeId(1), 0);
+        let mut ctx2 = NodeContext::new(NodeId(1));
         node.execute(&InputSet::new(), &mut ctx2).unwrap();
         assert_eq!(ctx2.take_outputs()["out"].downcast_ref::<f64>(), Some(&5.0));
     }
@@ -266,7 +266,7 @@ mod tests {
         let mut node = HoldNode::new();
         let mut inputs = InputSet::new();
         inputs.insert("in", Value::new("hi".to_string()));
-        let mut ctx = NodeContext::new(NodeId(2), 0);
+        let mut ctx = NodeContext::new(NodeId(2));
         node.execute(&inputs, &mut ctx).unwrap();
         let out = ctx.take_outputs();
         assert_eq!(
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn no_output_before_first_event() {
         let mut node = HoldNode::new();
-        let mut ctx = NodeContext::new(NodeId(3), 0);
+        let mut ctx = NodeContext::new(NodeId(3));
         node.execute(&InputSet::new(), &mut ctx).unwrap();
         assert!(ctx.take_outputs().is_empty());
     }
@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn button_emits_nothing_until_pressed() {
         let mut node = ButtonNode::new();
-        let mut ctx = NodeContext::new(NodeId(4), 0);
+        let mut ctx = NodeContext::new(NodeId(4));
         node.execute(&InputSet::new(), &mut ctx).unwrap();
         assert!(ctx.take_outputs().is_empty());
     }
@@ -296,7 +296,7 @@ mod tests {
         let mut node = ButtonNode::new();
         node.set_parameter("fire", Value::new(true)).unwrap();
 
-        let mut ctx = NodeContext::new(NodeId(5), 0);
+        let mut ctx = NodeContext::new(NodeId(5));
         node.execute(&InputSet::new(), &mut ctx).unwrap();
         assert_eq!(
             ctx.take_outputs()["out"].downcast_ref::<bool>(),
@@ -304,7 +304,7 @@ mod tests {
         );
 
         // Not re-armed: the event was consumed, so nothing is emitted.
-        let mut ctx2 = NodeContext::new(NodeId(5), 0);
+        let mut ctx2 = NodeContext::new(NodeId(5));
         node.execute(&InputSet::new(), &mut ctx2).unwrap();
         assert!(ctx2.take_outputs().is_empty());
     }
@@ -313,7 +313,7 @@ mod tests {
     fn button_arms_regardless_of_parameter_value() {
         let mut node = ButtonNode::new();
         node.set_parameter("fire", Value::new(false)).unwrap();
-        let mut ctx = NodeContext::new(NodeId(6), 0);
+        let mut ctx = NodeContext::new(NodeId(6));
         node.execute(&InputSet::new(), &mut ctx).unwrap();
         assert_eq!(
             ctx.take_outputs()["out"].downcast_ref::<bool>(),
@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn a_timer_ticks_every_execution() {
         let mut node = TimerNode::new();
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&InputSet::new(), &mut ctx).unwrap();
         assert_eq!(
             ctx.take_outputs()["tick"].downcast_ref::<bool>(),

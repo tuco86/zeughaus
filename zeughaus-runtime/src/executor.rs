@@ -43,7 +43,6 @@ pub struct GraphExecutor {
     /// by node. Cleared when the node next runs cleanly. Drives error styling in
     /// the editor and the message it shows.
     node_errors: HashMap<NodeId, String>,
-    trace_counter: u64,
     /// Coerces values that cross an edge whose endpoints declare different
     /// types (e.g. a u8 output into an f64 input). Shared with the editor's
     /// connection validation so "what may connect" and "what is coerced" agree.
@@ -83,7 +82,6 @@ impl GraphExecutor {
             pending: HashSet::new(),
             last_outputs: HashMap::new(),
             node_errors: HashMap::new(),
-            trace_counter: 0,
             converters: Arc::new(TypeConverters::new()),
             delivered: Vec::new(),
             seen: HashMap::new(),
@@ -253,8 +251,7 @@ impl GraphExecutor {
             }
 
             let inputs = self.build_input_set(node_id);
-            self.trace_counter += 1;
-            let mut ctx = NodeContext::new(node_id, self.trace_counter);
+            let mut ctx = NodeContext::new(node_id);
 
             if let Some(node) = self.nodes.get_mut(&node_id)
                 && let Err(e) = node.execute(&inputs, &mut ctx)

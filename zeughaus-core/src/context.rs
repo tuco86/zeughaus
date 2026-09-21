@@ -77,18 +77,19 @@ pub struct NodeContext {
     buffered: HashMap<String, Value>,
     flushed: HashMap<String, Value>,
     deferred: Option<Box<dyn AsyncWork>>,
+    /// The node being executed. A value that carries an identity across
+    /// nodes (an ML step) takes it from here, so two branches of one graph
+    /// never mint the same id.
     pub source_node: NodeId,
-    pub trace_id: u64,
 }
 
 impl NodeContext {
-    pub fn new(source_node: NodeId, trace_id: u64) -> Self {
+    pub fn new(source_node: NodeId) -> Self {
         Self {
             buffered: HashMap::new(),
             flushed: HashMap::new(),
             deferred: None,
             source_node,
-            trace_id,
         }
     }
 
@@ -152,7 +153,7 @@ mod tests {
 
     #[test]
     fn emit_is_invisible_until_flush() {
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         ctx.emit_typed("out", 1.0f64);
         assert!(ctx.take_outputs().is_empty());
         ctx.emit_typed("out", 2.0f64);
@@ -163,13 +164,12 @@ mod tests {
 
     #[test]
     fn flush_releases_all_pins_together() {
-        let mut ctx = NodeContext::new(NodeId(1), 7);
+        let mut ctx = NodeContext::new(NodeId(1));
         ctx.emit_typed("a", 1.0f64);
         ctx.emit_typed("b", "x".to_string());
         ctx.flush();
         let outputs = ctx.take_outputs();
         assert_eq!(outputs.len(), 2);
-        assert_eq!(ctx.trace_id, 7);
     }
 
     #[test]
@@ -180,7 +180,7 @@ mod tests {
                 Ok(HashMap::new())
             }
         }
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         ctx.defer(Box::new(Noop));
         assert!(ctx.take_deferred().is_some());
         assert!(ctx.take_deferred().is_none());

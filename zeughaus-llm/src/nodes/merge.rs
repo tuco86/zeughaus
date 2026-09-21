@@ -54,7 +54,7 @@ mod tests {
         inputs.insert("a", Value::new(a));
         inputs.insert("b", Value::new(b));
         let mut node = MergeNode::new();
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         let out = ctx.take_outputs();
         let conv = out["out"].downcast_ref::<Conversation>().unwrap();

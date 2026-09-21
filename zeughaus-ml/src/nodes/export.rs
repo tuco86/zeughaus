@@ -82,14 +82,14 @@ mod tests {
         let mut node = ExportNode::new();
         let mut inputs = InputSet::new();
         inputs.insert("model", Value::new(KerasModel::new()));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         assert!(node.execute(&inputs, &mut ctx).is_err());
     }
 
     #[test]
     fn missing_input_pin_errors() {
         let mut node = ExportNode::new();
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         assert!(node.execute(&InputSet::new(), &mut ctx).is_err());
     }
 
@@ -105,7 +105,7 @@ mod tests {
         );
         let mut inputs = InputSet::new();
         inputs.insert("model", Value::new(model));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         assert!(node.execute(&inputs, &mut ctx).is_err());
     }
 
@@ -121,7 +121,7 @@ mod tests {
         );
         let mut inputs = InputSet::new();
         inputs.insert("model", Value::new(model));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         let out = ctx.take_outputs();
         let code = out["code"].downcast_ref::<String>().unwrap();

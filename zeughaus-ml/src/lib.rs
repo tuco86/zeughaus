@@ -127,7 +127,7 @@ mod tests {
             }
             let mut inputs = InputSet::new();
             inputs.insert("model", Value::new(model.clone()));
-            let mut ctx = NodeContext::new(NodeId(i as u64 + 1), 0);
+            let mut ctx = NodeContext::new(NodeId(i as u64 + 1));
             node.execute(&inputs, &mut ctx).unwrap();
             model = ctx.take_outputs()["out"]
                 .downcast_ref::<KerasModel>()
@@ -148,7 +148,7 @@ mod tests {
             .unwrap();
         let mut inputs = InputSet::new();
         inputs.insert("model", Value::new(model));
-        let mut ctx = NodeContext::new(NodeId(100), 0);
+        let mut ctx = NodeContext::new(NodeId(100));
         compile.execute(&inputs, &mut ctx).unwrap();
         let model = ctx.take_outputs()["out"]
             .downcast_ref::<KerasModel>()
@@ -158,7 +158,7 @@ mod tests {
         let mut export = plugin.create_node("ml.export").unwrap();
         let mut inputs = InputSet::new();
         inputs.insert("model", Value::new(model));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         export.execute(&inputs, &mut ctx).unwrap();
         let code = ctx.take_outputs()["code"]
             .downcast_ref::<String>()
@@ -198,7 +198,7 @@ mod tests {
         }
         let mut inputs = InputSet::new();
         inputs.insert("model", Value::new(model.clone()));
-        let mut ctx = NodeContext::new(NodeId(id), 0);
+        let mut ctx = NodeContext::new(NodeId(id));
         node.execute(&inputs, &mut ctx).unwrap();
         ctx.take_outputs()["out"]
             .downcast_ref::<KerasModel>()
@@ -241,7 +241,7 @@ mod tests {
         let mut minputs = InputSet::new();
         minputs.insert("a", Value::new(a));
         minputs.insert("b", Value::new(b));
-        let mut ctx = NodeContext::new(NodeId(4), 0);
+        let mut ctx = NodeContext::new(NodeId(4));
         merge.execute(&minputs, &mut ctx).unwrap();
         let merged = ctx.take_outputs()["out"]
             .downcast_ref::<KerasModel>()
@@ -259,7 +259,7 @@ mod tests {
         let mut export = plugin.create_node("ml.export").unwrap();
         let mut einputs = InputSet::new();
         einputs.insert("model", Value::new(head));
-        let mut ctx = NodeContext::new(NodeId(6), 0);
+        let mut ctx = NodeContext::new(NodeId(6));
         export.execute(&einputs, &mut ctx).unwrap();
         let code = ctx.take_outputs()["code"]
             .downcast_ref::<String>()

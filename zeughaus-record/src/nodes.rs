@@ -526,7 +526,7 @@ mod tests {
     }
 
     fn ctx() -> NodeContext {
-        NodeContext::new(NodeId(1), 0)
+        NodeContext::new(NodeId(1))
     }
 
     /// A 2x2 frame whose pixels are derived from `tint`, so two frames are

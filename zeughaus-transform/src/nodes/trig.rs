@@ -17,7 +17,7 @@ mod tests {
     fn exec_unary(node: &mut dyn ExecutableNode, input: f64) -> f64 {
         let mut inputs = InputSet::new();
         inputs.insert("input", Value::new(input));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         *ctx.take_outputs()["result"].downcast_ref::<f64>().unwrap()
     }

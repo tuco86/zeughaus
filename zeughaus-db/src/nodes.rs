@@ -848,7 +848,7 @@ mod tests {
     }
 
     fn ctx() -> NodeContext {
-        NodeContext::new(NodeId(1), 0)
+        NodeContext::new(NodeId(1))
     }
 
     /// The DDL is what the user sees and what the file gets: an `id:int`

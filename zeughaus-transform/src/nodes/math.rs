@@ -26,7 +26,7 @@ mod tests {
         let mut inputs = InputSet::new();
         inputs.insert("a", Value::new(a));
         inputs.insert("b", Value::new(b));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         *ctx.take_outputs()["result"].downcast_ref::<f64>().unwrap()
     }
@@ -34,7 +34,7 @@ mod tests {
     fn exec_unary(node: &mut dyn ExecutableNode, v: f64) -> f64 {
         let mut inputs = InputSet::new();
         inputs.insert("input", Value::new(v));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         *ctx.take_outputs()["result"].downcast_ref::<f64>().unwrap()
     }
@@ -103,7 +103,7 @@ mod tests {
     fn defaults_to_zero() {
         let mut node = AddNode::new();
         let inputs = InputSet::new();
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         assert_eq!(
             *ctx.take_outputs()["result"].downcast_ref::<f64>().unwrap(),
@@ -116,7 +116,7 @@ mod tests {
         let mut node = DivideNode::new();
         let mut inputs = InputSet::new();
         inputs.insert("a", Value::new(7.0f64));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         assert_eq!(
             *ctx.take_outputs()["result"].downcast_ref::<f64>().unwrap(),

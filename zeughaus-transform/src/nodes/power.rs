@@ -46,7 +46,7 @@ mod tests {
         let mut inputs = InputSet::new();
         inputs.insert("base", Value::new(2.0f64));
         inputs.insert("exp", Value::new(10.0f64));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         let outputs = ctx.take_outputs();
         assert_eq!(outputs["result"].downcast_ref::<f64>(), Some(&1024.0));
@@ -58,7 +58,7 @@ mod tests {
         let mut inputs = InputSet::new();
         inputs.insert("base", Value::new(9.0f64));
         inputs.insert("exp", Value::new(0.5f64));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         let outputs = ctx.take_outputs();
         assert_eq!(outputs["result"].downcast_ref::<f64>(), Some(&3.0));

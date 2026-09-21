@@ -122,7 +122,7 @@ mod tests {
     #[test]
     fn empty_conversation_errors() {
         let mut node = ChatNode::new();
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         let err = node.execute(&InputSet::new(), &mut ctx);
         assert!(err.is_err());
     }

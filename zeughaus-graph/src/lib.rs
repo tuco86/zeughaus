@@ -195,7 +195,7 @@ mod tests {
         let mut node = BoundaryNode::new(Boundary::Input);
         let mut inputs = InputSet::new();
         inputs.insert("in", Value::new(7.0_f64));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).expect("execute");
         let outputs = ctx.take_outputs();
         assert_eq!(
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn an_unwired_boundary_emits_nothing() {
         let mut node = BoundaryNode::new(Boundary::Output);
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&InputSet::new(), &mut ctx).expect("execute");
         assert!(ctx.take_outputs().is_empty());
     }

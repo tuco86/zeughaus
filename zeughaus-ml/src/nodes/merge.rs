@@ -247,7 +247,7 @@ mod tests {
         let mut inputs = InputSet::new();
         inputs.insert("a", Value::new(input_model(1)));
         inputs.insert("b", Value::new(input_model(2)));
-        let mut ctx = NodeContext::new(NodeId(3), 0);
+        let mut ctx = NodeContext::new(NodeId(3));
         node.execute(&inputs, &mut ctx).unwrap();
         let out = ctx.take_outputs();
         let model = out["out"].downcast_ref::<KerasModel>().unwrap();
@@ -263,7 +263,7 @@ mod tests {
         let mut inputs = InputSet::new();
         inputs.insert("a", Value::new(input_model(1)));
         // b missing -> empty
-        let mut ctx = NodeContext::new(NodeId(3), 0);
+        let mut ctx = NodeContext::new(NodeId(3));
         assert!(node.execute(&inputs, &mut ctx).is_err());
     }
 
@@ -275,7 +275,7 @@ mod tests {
         let mut inputs = InputSet::new();
         inputs.insert("a", Value::new(input_model(1)));
         inputs.insert("b", Value::new(input_model(2)));
-        let mut ctx = NodeContext::new(NodeId(3), 0);
+        let mut ctx = NodeContext::new(NodeId(3));
         node.execute(&inputs, &mut ctx).unwrap();
         let model = ctx.take_outputs()["out"]
             .downcast_ref::<KerasModel>()
@@ -326,7 +326,7 @@ mod tests {
         inputs.insert("a", Value::new(input_model(1)));
         inputs.insert("b", Value::new(input_model(2)));
         inputs.insert("c", Value::new(input_model(3)));
-        let mut ctx = NodeContext::new(NodeId(9), 0);
+        let mut ctx = NodeContext::new(NodeId(9));
         node.execute(&inputs, &mut ctx).unwrap();
         let model = ctx.take_outputs()["out"]
             .downcast_ref::<KerasModel>()

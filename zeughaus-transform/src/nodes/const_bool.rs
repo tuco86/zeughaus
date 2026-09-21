@@ -44,7 +44,7 @@ mod tests {
     #[test]
     fn emits_true() {
         let mut node = ConstBoolNode::new(true);
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&InputSet::new(), &mut ctx).unwrap();
         assert_eq!(
             ctx.take_outputs()["value"].downcast_ref::<bool>(),
@@ -56,7 +56,7 @@ mod tests {
     fn set_parameter_toggles() {
         let mut node = ConstBoolNode::new(false);
         node.set_parameter("value", Value::new(true)).unwrap();
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&InputSet::new(), &mut ctx).unwrap();
         assert_eq!(
             ctx.take_outputs()["value"].downcast_ref::<bool>(),
@@ -69,7 +69,7 @@ mod tests {
         let mut node = ConstBoolNode::new(false);
         node.set_parameter("value", Value::new("true".to_string()))
             .unwrap();
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&InputSet::new(), &mut ctx).unwrap();
         assert_eq!(
             ctx.take_outputs()["value"].downcast_ref::<bool>(),

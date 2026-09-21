@@ -79,7 +79,7 @@ mod tests {
         let mut node = CompileNode::new();
         let mut inputs = InputSet::new();
         inputs.insert("model", Value::new(KerasModel::new()));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         let out = ctx.take_outputs();
         let model = out["out"].downcast_ref::<KerasModel>().unwrap();

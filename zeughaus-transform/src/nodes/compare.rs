@@ -84,7 +84,7 @@ mod tests {
         let mut inputs = InputSet::new();
         inputs.insert("a", Value::new(5.0f64));
         inputs.insert("b", Value::new(3.0f64));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         let outputs = ctx.take_outputs();
         assert_eq!(outputs["result"].downcast_ref::<bool>(), Some(&true));
@@ -96,7 +96,7 @@ mod tests {
         let mut inputs = InputSet::new();
         inputs.insert("a", Value::new(2.0f64));
         inputs.insert("b", Value::new(3.0f64));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         let outputs = ctx.take_outputs();
         assert_eq!(outputs["result"].downcast_ref::<bool>(), Some(&false));
@@ -108,7 +108,7 @@ mod tests {
         let mut inputs = InputSet::new();
         inputs.insert("a", Value::new(1.0f64));
         inputs.insert("b", Value::new(1.00000000001f64));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         let outputs = ctx.take_outputs();
         assert_eq!(outputs["result"].downcast_ref::<bool>(), Some(&true));
@@ -120,7 +120,7 @@ mod tests {
         let mut inputs = InputSet::new();
         inputs.insert("a", Value::new(1.0f64));
         inputs.insert("b", Value::new(2.0f64));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         let outputs = ctx.take_outputs();
         assert_eq!(outputs["result"].downcast_ref::<bool>(), Some(&false));

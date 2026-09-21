@@ -43,7 +43,7 @@ mod tests {
     fn emits_configured_value() {
         let mut node = ConstF64Node::new(42.0);
         let inputs = InputSet::new();
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         ctx.flush(); // already flushed inside, but harmless
         let outputs = ctx.take_outputs();
@@ -55,7 +55,7 @@ mod tests {
         let mut node = ConstF64Node::new(0.0);
         node.set_parameter("value", Value::new(99.0f64)).unwrap();
         let inputs = InputSet::new();
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         let outputs = ctx.take_outputs();
         assert_eq!(outputs["value"].downcast_ref::<f64>(), Some(&99.0));

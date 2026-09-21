@@ -42,7 +42,7 @@ mod tests {
     #[test]
     fn emits_string() {
         let mut node = ConstStringNode::new("hello");
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&InputSet::new(), &mut ctx).unwrap();
         assert_eq!(
             ctx.take_outputs()["value"]
@@ -57,7 +57,7 @@ mod tests {
         let mut node = ConstStringNode::new("");
         node.set_parameter("value", Value::new("world".to_string()))
             .unwrap();
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&InputSet::new(), &mut ctx).unwrap();
         assert_eq!(
             ctx.take_outputs()["value"]

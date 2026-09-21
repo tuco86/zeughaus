@@ -54,7 +54,7 @@ mod tests {
         let mut inputs = InputSet::new();
         inputs.insert("a", Value::new("hello".to_string()));
         inputs.insert("b", Value::new("world".to_string()));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         assert_eq!(
             ctx.take_outputs()["result"]
@@ -71,7 +71,7 @@ mod tests {
         inputs.insert("a", Value::new("hello".to_string()));
         inputs.insert("b", Value::new("world".to_string()));
         inputs.insert("sep", Value::new(" ".to_string()));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         assert_eq!(
             ctx.take_outputs()["result"]

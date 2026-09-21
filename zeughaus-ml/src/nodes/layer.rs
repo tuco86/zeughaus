@@ -324,7 +324,7 @@ mod tests {
         );
         let mut inputs = InputSet::new();
         inputs.insert("model", Value::new(prior));
-        let mut ctx = NodeContext::new(NodeId(7), 0);
+        let mut ctx = NodeContext::new(NodeId(7));
         node.execute(&inputs, &mut ctx).unwrap();
         let out = ctx.take_outputs();
         let model = out["out"].downcast_ref::<KerasModel>().unwrap();

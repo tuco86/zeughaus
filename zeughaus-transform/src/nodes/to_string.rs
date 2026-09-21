@@ -47,7 +47,7 @@ mod tests {
         let mut node = ToStringNode::new();
         let mut inputs = InputSet::new();
         inputs.insert("input", Value::new(2.5f64));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         let outputs = ctx.take_outputs();
         assert_eq!(outputs["result"].downcast_ref::<String>().unwrap(), "2.5");
@@ -58,7 +58,7 @@ mod tests {
         let mut node = ToStringNode::new();
         let mut inputs = InputSet::new();
         inputs.insert("input", Value::new(String::from("hello")));
-        let mut ctx = NodeContext::new(NodeId(1), 0);
+        let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).unwrap();
         let outputs = ctx.take_outputs();
         assert_eq!(outputs["result"].downcast_ref::<String>().unwrap(), "hello");

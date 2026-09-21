@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn failure_emits_only_captured_and_error() {
-        let mut ctx = NodeContext::new(NodeId::next(), 0);
+        let mut ctx = NodeContext::new(NodeId::next());
         fail(&mut ctx, "display: none".to_string()).unwrap();
         let outputs = ctx.take_outputs();
         assert_eq!(outputs.len(), 2);
