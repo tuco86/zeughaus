@@ -3,7 +3,7 @@
 //! Everything the graph computes reaches an editor through SpacetimeDB except
 //! frames. A 3840x2160 RGBA frame is 33 177 600 bytes, so it travels over its
 //! own QUIC connection instead ([`weida`]), and this module is the serving end
-//! of the protocol that [`zeughaus_samples`] defines.
+//! of the protocol that [`zeughaus_link`] defines.
 //!
 //! Three pieces, in the order a frame passes through them:
 //!

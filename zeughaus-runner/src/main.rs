@@ -348,7 +348,7 @@ fn feed_addr_from(text: &str) -> Result<SocketAddr, String> {
 /// service account): two processes sharing one `runner.pem` would announce the
 /// same fingerprint from two ports, and an editor pooling by identity has no
 /// way to tell them apart. Without it,
-/// [`credentials::state_dir`](zeughaus_samples::credentials::state_dir)
+/// [`credentials::state_dir`](zeughaus_link::credentials::state_dir)
 /// decides, which `ZEUGHAUS_STATE_DIR` already overrides.
 fn parse_state_dir() -> Result<PathBuf, String> {
     let mut args = std::env::args().skip(1);

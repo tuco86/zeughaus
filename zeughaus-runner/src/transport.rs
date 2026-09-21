@@ -12,7 +12,7 @@
 //! runner -- and a fingerprint that survived the restart is also what lets
 //! weida redial transparently instead of handing the editor a stale pin.
 //! Every dialling peer must present a key the runner trusts
-//! ([`zeughaus_samples::credentials::client_trust`]); an anonymous editor is
+//! ([`zeughaus_link::credentials::client_trust`]); an anonymous editor is
 //! refused in the handshake, because a terminal endpoint on this listener
 //! hands out a shell and an opaque id is not a credential.
 
