@@ -1,612 +1,393 @@
-# Zeughaus - Design Document
+# Zeughaus - Architecture
 
-A visual dataflow workbench built on [iced](https://github.com/iced-rs/iced) and [iced_nodegraph](https://github.com/your/iced_nodegraph).
-Zeughaus connects heterogeneous tools -- DLL injection, database management, AI pipelines, process instrumentation -- through a unified node graph interface.
+A visual dataflow workbench built on [iced](https://github.com/iced-rs/iced)
+and `iced_nodegraph`. Heterogeneous tools -- math and string transforms,
+screen capture, SQLite schemas, LLM conversations, Keras model design,
+recordings -- are composed as one node graph, edited collaboratively, and
+executed by a headless process that also multiplexes terminals for its
+editors.
 
-**Status**: Pre-development design phase
+This document describes the system as it is. Every section names the crate
+that implements it. Ideas that are not implemented are collected at the end
+under "Not built", so that nothing above that heading is aspirational.
 
-## Vision
-
-Zeughaus is a Swiss-army-knife node editor where pluggable domains (DLL injection, database schemas, AI inference, workflow automation) are composed visually. Each domain lives in its own subgraph with domain-specific semantics, while a shared dataflow model connects them.
-
-The node graph is the universal interface. The execution happens elsewhere.
-
-## Architecture Overview
+## 1. Processes and where they meet
 
 ```
-+----------------------------------+
-|  Editor UI (iced / WASM)         |  Graph editing, visualization, previews
-+----------------------------------+
-|  Document Layer (SpacetimeDB)    |  Graph state, collaboration, versioning
-+----------------------------------+
-|  Execution Layer                 |  Runs nodes
-|  +-- Local Runner (native)       |    DLL inject, filesystem, GPU
-|  +-- Remote Runner (agent/VM)    |    Kubernetes, SSH, managed
-|  +-- Browser Runner (WASM)       |    Transforms, previews, lightweight
-+----------------------------------+
-|  Storage Layer                   |  Persistence
-|  +-- Postgres                    |    Production data, captured events
-|  +-- SQLite                      |    Local/offline
-|  +-- SpacetimeDB                 |    Collaborative graph state
-+----------------------------------+
+ editor (zeughaus)          editor (zeughaus, another machine / browser)
+   edits, draws               edits, draws
+        |   ^                        |   ^
+  rows  |   | events, frames,        |   |
+        v   | terminals              v   |
+ +-------------------+     weida (QUIC, mTLS)      +------------------+
+ |  SpacetimeDB      |<---------------------------->|  zeughaus-runner |
+ |  node, edge,      |  rows in, presence out       |  executes graph, |
+ |  runtime          |                              |  owns terminals  |
+ +-------------------+                              +------------------+
 ```
 
-### Separation of Editor and Executor -- implemented
+Two processes, and the split is not optional. `zeughaus` is an editor that
+never executes a node; `zeughaus-runner` is a headless process that does
+nothing else. That is what makes every editor -- the one on the same machine,
+one on another continent, one in a browser -- the same thing, a remote view,
+and what keeps a side effect from happening twice: a screen capture fires once
+per session, not once per open window.
 
-Two processes, and the split is not optional: `zeughaus` is an editor that never
-executes, `zeughaus-runner` is a headless process that does nothing else.
+They meet in two places:
 
-They meet in the SpacetimeDB store: the editor writes the graph, the runner
-reads it, executes it, and publishes results back. Every editor -- the one on
-the same machine and one on another continent -- is therefore the same thing, a
-remote view. That is what makes a browser editor a plain consequence of the
-architecture rather than a special case, and it is what stops a side effect from
-happening twice: two editor windows used to mean two runtimes, so a screen
-capture node fired once per window, each seeing its own screen.
+- **The store (SpacetimeDB, `zeughaus-module`, client in `zeughaus-sync`)**
+  holds the graph document and runtime presence, and nothing a pass produces.
+  Tables: `node` (id, type_id, display_name, x, y, params as JSON, parent),
+  `edge` (id, from_node, from_pin, to_node, to_pin), `runtime` (connection,
+  identity, auto-incremented `seq`, announced address). Reducers are
+  fine-grained (`create_node`, `move_node`, `set_node_params`, `delete_node`,
+  `connect_edge`, `disconnect_edge`, `join_runtime`, `announce_endpoint`);
+  conflicts are last-writer-wins per row. Ids are made process-unique at
+  startup (`NodeId::seed_unique`) so two editors never collide.
+- **The link (weida, `zeughaus-link`)** carries everything a pass produces,
+  straight from the runner to each editor: scalar outputs, node errors and
+  edge traffic on `/events` (pub/sub), a `/snapshot` for a late joiner
+  (req/rep), trigger presses the other way on `/triggers` (push/pull), frames
+  on `/samples` (one standing exchange per node pin), terminals on `/mux`.
+  Only `bool`/`int`/`float`/`str` are values on the wire
+  (`zeughaus-core/src/wire.rs`); frames have their own path; everything else
+  stays in the runner.
 
-Which runner executes is decided by the store, not negotiated: every runner
-registers in `runtime` and the lowest `seq` owns it, so a second runner is a hot
-standby that takes over when the first disconnects.
+**Who executes** is decided by the store, not negotiated: every runner calls
+`join_runtime`, the lowest `seq` owns execution, the others are hot standbys
+that take over when it disconnects. The owner announces the pinned URL
+(`weida://sha256:<fp>@host:port/`) in its `runtime` row; editors dial that.
 
-Results travel over weida: scalars and node errors on the `/events` topic, a
-snapshot for late joiners on `/snapshot`, trigger presses on `/triggers`, and
-frames on `/samples`. A state store is the wrong pipe for 33 MB per frame, so
-nothing a pass produces goes through SpacetimeDB.
+**Redial is weida's, resync is ours.** An editor dials each runtime address
+once (`zeughaus/src/transport.rs`, `first_dial`) under a `ReconnectPolicy`
+(250 ms doubling to 4 s, never giving up). What a redial cannot restore, the
+editor does on `PeerEvent::Connected`: a fresh `/snapshot`, reopened feed
+exchanges, a fresh mux attach. A runner that restarted is a new peer; the new
+address in its `runtime` row is what replaces the tasks.
 
-### Terminals: a runner-owned multiplexer -- implemented
+**Without a store**, the runner refuses to start. The editor starts anyway and
+edits a local scratch graph: nothing computes it, the status bar says so, and
+the graph is gone on close unless saved as a file (`.zgh`, the JSON
+`GraphDocument` in `zeughaus-core/src/document.rs`). Save/Load is an explicit
+palette command in both modes; the store is never written from a file behind
+the user's back.
+
+## 2. Crates
+
+| crate | role | wasm |
+|---|---|---|
+| `zeughaus-core` | `Ty`/`Typed`/`Value`, pins, `ExecutableNode`/`DomainPlugin`, settings, converters, scalar wire encoding, store row types | yes |
+| `zeughaus-runtime` | `GraphExecutor`: topology, node instances, edge cache, dirty set, async work, node errors | yes |
+| `zeughaus-sync` | SpacetimeDB client: generated bindings, `Store` (reconnecting connection), `Session` resolution, ownership queries, reducer calls | native |
+| `zeughaus-link` | the runner<->editor protocol over weida: paths, feed, events, snapshot, triggers, and the credentials both ends present | native |
+| `zeughaus-mux` | terminal mux wire model: stable ids, workspace topology, rows/deltas, bounded codec, client-side `TerminalView` | yes |
+| `zeughaus-terminal` | the runner's terminal engine: PTYs (`portable-pty`) and a pinned `wezterm-term` | native |
+| `zeughaus-runner` | the executing process: store loop, executor, weida listener, feed server, mux service | native |
+| `zeughaus` | the editor | native + wasm32 |
+| `iced_terminal` | terminal widget: one wgpu primitive per pane, input to `TerminalCommand`s, bundled font | native |
+| `iced_tabs` | the tab bar the workspace shell uses | yes |
+| `zeughaus-transform`, `-flow`, `-graph`, `-ml` | pure plugins | yes |
+| `zeughaus-capture`, `-db`, `-record`, `-llm` | plugins that touch the OS | native |
+| `zeughaus-module` | the SpacetimeDB server module; outside the native workspace, built by `spacetime build` | wasm module |
+
+Dependency direction: plugins depend on core only. The runtime depends on
+core. The runner depends on runtime, sync, link, mux, terminal and every
+plugin. The editor depends on core, sync, link, mux, the widget crates and the
+plugins it can link -- **not on the runtime**: it holds node instances for what
+a node knows about itself, and gets every value from the runner.
+
+## 3. Type system (`zeughaus-core`)
+
+Pin types are runtime values, not compile-time labels:
+
+```rust
+enum Ty { Any, Bool, Int, Float, Str, List(Arc<Ty>), Option(Arc<Ty>),
+          Record(Arc<Record>), Opaque(Arc<str>) }
+```
+
+`Any` connects to anything and is never coerced. The scalars map 1:1 onto
+`bool`/`i64`/`f64`/`String`; narrower numerics are not pin types, a node
+converts at the emit site. `Record` is built at runtime (a user-designed
+schema); `Opaque` names a plugin's own Rust type (`KerasModel`,
+`Conversation`, `db.table`).
+
+A Rust type declares its `Ty` once through `Typed::ty()`, and both the pin
+declaration and the tag on a `Value` come from it, so they cannot disagree.
+`Typed::repr` gives a borrowed structural view for generic consumers (the
+editor's inline value text); nominal plugin types stay opaque.
+
+Coercion across an edge uses the value's own tag, not the source pin's
+declaration (an `Any` output lands correctly on a typed input). Converters are
+registered per type pair in `TypeConverters`; the one built-in is
+`Int -> Float`. Editor and runner build the same registry from the same
+plugins, so "what may connect" and "what is coerced" agree.
+
+## 4. Nodes, pins, settings
+
+`ExecutableNode` is what a plugin implements; `DomainPlugin` lists and
+instantiates node types. The catalog is data: a `NodeDefinition` carries the
+type id, display name, category, pins, settings and whether the type is a
+container. Pins and settings are owned strings, because a node type is not
+necessarily authored in Rust (a subgraph, a schema).
+
+**Pins.** `PinDefinition::input(name, ty, kind)`, `::output(name, ty)`,
+`::field(name, ty)`. `PinKind::Trigger` declares an event pin -- the node acts
+when something arrives on it, and asks `InputSet::changed(pin)` to know that
+it did -- while `PinKind::Sample` declares a state pin that is read whenever
+the node runs. The editor draws them as squares and circles. Propagation
+itself is uniform (section 5). A `field` pin has `PinDirection::Both`: an edge
+between two field pins is not dataflow but a declared relationship between
+two nodes (section 8).
+
+**Settings** are the one way a node is configured from the editor.
+`SettingDef` names a key, a default, a placeholder and a `SettingKind` --
+`Text`, `Multiline`, `Title` (the node's own name as an editable heading) or
+`Fields { types }` (a `name:type` row editor). The value is always text: the
+editor stores it in the node's `params`, the runner hands it to
+`set_parameter(key, Value::new(text))`, and the node parses. A node that
+refuses a value returns `ZeughausError::InvalidParameter(reason)`; the runner
+publishes `SettingRejected` and every editor draws the reason under the field.
+Const nodes are ordinary nodes with a `value` setting.
+
+Some parameters are **derived by the editor** rather than typed: `db_path`
+(from the enclosing `db.database`), `relations` (from wires between field
+pins), `renamed_from` (a table's previous name). They are plain `params` keys
+the runner applies like any other.
+
+**Derived pins.** `sync_pins(connected)` lets a node reshape its inputs from
+what is wired to it (a variadic merge grows a slot; a recorder takes the
+type arriving on `values`). Both processes call it after every connection
+change. `refresh_pins` re-reads a node's declaration after a setting changed
+it (a table's field list).
+
+**A source needs a clock.** `tick_interval()` lets a node ask to be run
+periodically; the host schedules it. `flow.timer` is that clock: without one
+upstream, a capture node produces one frame and stops.
+
+## 5. Execution (`zeughaus-runtime`, host loop in `zeughaus-runner`)
+
+`GraphExecutor` owns the graph and the node instances; every mutation goes
+through it (`add_node`, `add_edge`, `remove_node`, `disconnect_edge`,
+`set_parameter`). It keeps, per edge, the last value and a generation counter,
+and per node the last output set and the last error.
+
+A pass (`execute_dirty`) runs the dirty nodes in topological order, computed
+once per graph revision. Semantics:
+
+- **Dirty propagation is uniform.** A changed node marks everything
+  downstream dirty; every downstream node reruns. A node that must act only on
+  its own trigger asks `InputSet::changed(pin)`, which compares the edge's
+  cache generation with the one the node saw last.
+- **Atomic flush.** A node buffers with `NodeContext::emit` and releases with
+  `flush`; multi-output nodes never deliver half a result.
+- **Async work.** A node that would block (an LLM request, a portal capture)
+  hands `AsyncWork` to the context; the executor marks it pending, holds its
+  downstream back, and the host runs it on a blocking pool and delivers the
+  result with `deliver_async_result`. A pending node is never dispatched twice.
+- **A failing node does not fail the pass.** Its message is recorded, its
+  downstream is held back, everything unrelated runs. Errors reach editors as
+  `NodeError`/`NodeErrorCleared` events.
+- **A cycle does not fail the pass either.** The nodes in it, and everything
+  downstream of it, get one node error and are dropped from the dirty set; the
+  rest runs. Removing a wire or a node that breaks the cycle wakes them.
+- **Relations are not edges to the executor.** `Graph::is_dataflow` excludes
+  edges with a `Both` endpoint from ordering and input sets.
+- **A new wire is seeded**, not recomputed: `add_edge` copies the source's
+  last output into the edge and dirties only the target's subtree, so a node
+  with side effects does not re-fire because someone drew a wire.
+
+The runner's loop (`zeughaus-runner/src/runner.rs`) applies store rows to the
+executor, diffing parameters against what it last applied so a drag (which
+rewrites the row) does not rerun a node; serves clocked nodes; runs a pass;
+publishes what changed since the last publish (outputs, cleared pins, errors,
+rejections, delivered edges); and answers `/snapshot` from the same state.
+Two runners racing for one input pin resolve it identically from the data
+(`occupancy_winner`: the larger edge id wins), because arrival order differs
+per process.
+
+## 6. The editor (`zeughaus`)
+
+The editor's model is `EditorNode`/`EditorEdge` plus one `ExecutableNode`
+instance per node, used only for what a node knows about itself: its pins,
+its settings, whether it accepts a value, how it reshapes under connections.
+Nothing is executed. Values, errors and setting refusals on screen are what
+the runner reported (`remote_outputs`, `remote_errors`, `setting_errors`),
+sequence-guarded per pin so a late event never overwrites a fresh one, and
+cleared wholesale when the runtime goes away. A pin whose last run produced
+no value is drawn dim.
+
+Local edits go to the store through an outbox that replays after a reconnect;
+settings edits are held back 400 ms after the last keystroke
+(`pending.rs`) and flushed on close. A remote row is applied without echoing
+back as a reducer call. Edits made while a window still owes the store a key
+are not overwritten by an older shared value for that key.
+
+Connection rules run in one place (`wire_refusal`): while a cable is dragged,
+to decide whether the pin under the cursor is a target, and again when a drop
+is refused, to say why. A wire that would close a dataflow cycle is refused
+at the drop.
+
+**Containers and subgraphs** (`zeughaus-graph`). Every node carries a
+`parent`; `0` is the root graph. A container type (`graph.sub`,
+`db.database`) has no pins of its own: the editor synthesizes them from its
+direct `graph.input`/`graph.output` children, named by each child's title. An
+edge drawn onto a container's pin is stored against the boundary child, so
+the store and the executor see one flat graph of real nodes; only the editor
+knows about nesting. Deleting a container deletes its contents, recursively
+in the reducer and locally in every editor.
+
+**Layout.** `AutoLayout` ranks nodes by longest path from a source and orders
+a rank by the barycentre of its placed predecessors; a cycle admits the lowest
+remaining id as if its incoming edges were not there. It is an ordinary move,
+shared through the store.
+
+**Workspace.** The window is tabs of split panes (`iced_tabs`,
+`pane_grid`). Exactly one pane shows the graph; every other pane is a
+terminal (section 9). Tab order, splits and pane ids come from the runner;
+active tab, focus, scroll, selection and blink are per window.
+
+## 7. Plugins
+
+| plugin | nodes | notes |
+|---|---|---|
+| `transform` | 35: constants, math, trig, logic, compare, string, `display` | `transform.display` is the one node whose body shows data and asks for a frame feed |
+| `flow` | `hold` (event -> state), `button` (a manual event, pressed from any editor via `/triggers`), `timer` (the clock) | |
+| `graph` | `sub` (container), `input`, `output` (boundary passthroughs) | |
+| `ml` | Keras layers and merges from static `LAYERS`/`MERGES` tables, `compile`, `export` | a `KerasModel` value is a DAG of steps keyed by the producing node id, so a fan-out that merges emits each step once; `export` renders functional-API Python |
+| `llm` | `system`, `user`, `chat`, `last_reply`, `merge` over a `Conversation` value | LM Studio's OpenAI-style endpoint; `chat` is async work |
+| `capture` | `screen` | xdg-desktop-portal ScreenCast/Screenshot on Wayland (async, retried while the portal warms up), `scrap` otherwise |
+| `db` | `database` (container), `table`, `insert`, `query`, `sql` | SQLite; section 8 |
+| `record` | `writer`, `player` | a recording is a directory of `<seq>.png` plus `index.jsonl`; the player is a clocked source |
+
+Registration is one list in each process (`Runner::new`, `App::new`), the
+same plugins in the same order, native-only ones gated in the editor. A node
+type the runner cannot instantiate is a node that never runs; a type the
+editor cannot instantiate cannot be placed. `catalog_entry(type_id, name,
+category, &instance)` builds a definition from an instance so the two cannot
+drift.
+
+## 8. Database schemas are drawn (`zeughaus-db`)
+
+A `db.table` is its schema: an editable title and a `Fields` setting whose
+rows are field pins spanning the node. A wire between two field pins is a
+relation and becomes a `FOREIGN KEY` in the emitted DDL. The referenced end is
+the one whose field is named `id`; if neither is, the end the wire was dropped
+on. Field pins carry the column type, and the editor only lets equal types
+connect.
+
+The wire carries nothing, and the runtime keeps it out of execution
+(`Graph::is_dataflow`), which is what makes two tables referencing each other
+a legal schema and not a cycle. The relations reach the runner as the derived
+`relations` parameter, exactly as `db_path` is derived from the enclosing
+`db.database`. Renaming a table renames it in the file once (`renamed_from`);
+removing a field drops the column.
+
+## 9. Terminals: a runner-owned multiplexer
 
 The runner is also a terminal multiplexer, in the shape of WezTerm's mux and
 without its code: `portable-pty` spawns the child, a pinned `wezterm-term`
 parses its output into a canonical screen with stable row indices and change
-sequence numbers, and `zeughaus-runner/src/mux` serves that screen to every
-editor over one `/mux` path. PTY bytes never leave the runner; what travels
-is `zeughaus-mux`'s wire model -- rows as spans with wire-stable styles,
-deltas of the rows that changed since the sequence number the client holds,
-and whole workspace snapshots for the tab and split topology.
-
-Three exchange kinds ride one pooled QUIC connection. A **control** exchange
-per client carries the attach (hello, topology, one head per terminal, so the
-first paint is one round trip), the structural commands and their replies,
-and every later snapshot. A **terminal** exchange per attached terminal is
-full duplex: input up, deltas down, neither waiting for the other. **Row
-fetches** are short exchanges of their own so a scrollback page cannot block
-a keystroke. A delta is computed per subscriber from the last sequence number
-that subscriber received, so a slow client gets fewer, larger deltas and never
-a queue; output is coalesced at a 12 ms cadence.
-
-Ownership is the plan's: the runner owns tab order, splits, ratios, pane and
-terminal ids, and exactly one pane shows the graph; each editor owns its
-active tab, focused pane, scroll position, selection and blink. Any client
-may view a terminal; exactly one holds its lease and may type, resize and move
-the mouse in it. The first client that types acquires an unowned terminal,
-another takes it with an explicit command, and a lease survives a network
-blink for ten seconds so a redial does not turn a shell read-only. Closing a
-pane kills its child; closing an editor window does not. A runner restart is
-a new incarnation with an empty workspace: terminals do not migrate.
-
-Security: the runner's identity and one client identity are persisted under
-the state directory (`~/.local/state/zeughaus`, `ZEUGHAUS_STATE_DIR`), the
-listener requires a trusted client certificate, and a bind on anything but
-loopback without configured client trust refuses to start. Every `/mux`
-exchange is authorized by the peer identity weida proved; a terminal id is a
-name, never a credential. Terminals are created only from runner-side
-profiles (the runner user's login shell today); no command carries an argv.
-OSC 52 clipboard writes and downloads are not wired and cannot reach the
-editor; a hyperlink is only reported, never opened, by a click.
-
-Rendering is one custom wgpu primitive per pane (`iced_terminal`): rows are
-shaped once per content and instanced once per palette, a changed row replaces
-its arena ranges, and a cursor move touches no row. The font is bundled so the
-cell grid is the same on every host.
-## Collaboration (SpacetimeDB)
-
-Real-time collaborative graph editing via [SpacetimeDB](https://spacetimedb.com/).
-
-- Graph definition (nodes, edges, positions, config) synced as shared state
-- Server-authoritative conflict resolution
-- Execution state optionally visible to collaborators (read-only)
-- Execution control remains per-user / per-runner
-
-**WASM Compatibility**: SpacetimeDB Rust SDK WASM support is actively developed in
-[PR #4183](https://github.com/clockworklabs/SpacetimeDB/pull/4183) (staff-driven, `web` feature flag).
-No architectural compromise needed -- SpacetimeDB and WASM browser clients will coexist.
-
-### Staging Model
-
-Graph changes follow a git-like deployment model:
-
-| Stage | Purpose |
-|-------|---------|
-| **Draft** | Live collaborative editing, changes are immediate |
-| **Staged** | Explicit "ready for review" checkpoint |
-| **Deployed** | The version the runner executes |
-
-This prevents half-finished edits from breaking running flows.
-Rollback to any previously deployed version is always possible.
-
-## Domain Subgraphs
-
-Different domains live in separate subgraphs. Each subgraph is internally consistent
-(own type system, execution model) but exposes a uniform interface to the parent graph.
-
-```
-[Orchestration Graph]
-  +-- [DB Schema Subgraph]         -> generates SQL
-  +-- [Memory Analyzer Subgraph]   -> reads process data
-  +-- [Transform Subgraph]         -> processes results
-  +-- [AI Pipeline Subgraph]       -> GPU inference
-```
-
-A subgraph appears as a single node in its parent graph with explicitly exposed input/output pins.
-
-### How containers work -- implemented
-
-Every node carries a `parent` node id; `0` is the root graph. A *container*
-node (`NodeDefinition::container`, currently `graph.sub` and `db.database`) has
-no pins of its own: its pins in the parent view are synthesized from its direct
-children of type `graph.input` (one input pin each) and `graph.output` (one
-output pin each), named by that child's `name` setting.
-
-Edges in the store always connect real nodes. A wire drawn onto a container's
-pin `x` is stored as an edge to the `graph.input` child named `x` (pin `in`),
-and a wire from pin `y` comes from the `graph.output` child named `y` (pin
-`out`). Both boundary types are ordinary passthrough nodes, so **the executor
-stays flat and knows nothing about nesting**: it sees one graph of real nodes
-and real edges, which is what keeps dirty propagation, the trigger/sample
-distinction and the type system unchanged by this feature.
-
-The editor is the only component that knows about parents. It filters the
-canvas to the graph currently being viewed, maps each edge's endpoints onto the
-container that holds them for display, resolves them back to the boundary child
-on connect, and offers a way in and out (an `open` button on the container plus
-a breadcrumb). Deleting a container deletes its contents -- recursively in the
-module reducer, and locally in every editor.
-
-### Planned Domains
-
-| Domain | Node Types | Execution Model |
-|--------|-----------|-----------------|
-| Process / DLL Injection | Processes, Inject, Memory Read/Write, Hook | Imperative, event-driven |
-| Database (FileMaker-style) | Database (container), Table, Insert, Query, SQL | Declarative, SQLite implemented (`zeughaus-db`) -- schema designed in the graph, see below |
-| AI / GPU | ONNX Inference, Preprocessing, Postprocessing | Pipeline, batch or stream |
-| Workflow / Automation | HTTP, Transform, Filter, Schedule | Sequential, event-triggered |
-| Screen Capture / Video | Capture, Encode, Stream, Overlay | Real-time stream |
-| Recorder / Dataset | Recorder, Player | Frames plus values as files on disk, implemented (`zeughaus-record`) |
-
-### Database schemas are drawn -- implemented
-
-A `db.table` is not a node with a text field holding a column list; it *is*
-the table. Its name is an editable title and its fields are a row editor
-(`[name] [type] [remove]` plus `add field`), and every field is a
-bidirectional pin spanning the node (`PinDirection::Both` in the core,
-`PinSide::Row` in the widget). So a **relation** is a wire drawn between two
-field pins -- `orders.customer_id` to `customers.id` -- and it becomes a
-`FOREIGN KEY` in the emitted DDL.
-
-That wire carries nothing, and that is the point: **an edge with a
-bidirectional end is excluded from execution**, in one place
-(`Graph::is_dataflow` in `zeughaus-runtime`, read by `incoming_edges` /
-`outgoing_edges` and therefore by the topological order, the dirty walk and
-every input set). Two tables referencing each other is a legal schema and a
-legal cycle; as a dependency it would leave the whole graph unorderable and
-nothing at all would run. The rule is stated on pin declarations, never on
-node type ids, so the editor and the runner -- which both build their graph
-from the same store -- reach the same answer.
-
-The relations themselves reach the runner as a derived hidden parameter
-(`relations`, one `field -> table.field` line each), exactly as `db_path` is
-derived from the enclosing `db.database`. Which end of a wire is the
-referenced one follows from the fields rather than from the drag: the end
-whose field is named `id`, and if neither is, the end the wire was dropped
-on. A runner therefore never has to know what a wire between two fields
-meant.
-
-The field editor is generic, not database-specific: `SettingKind::Fields {
-types }` is a setting kind like `Text` and `Multiline`, its value stays the
-plain `name:type` text a multiline field would have held, and the type
-vocabulary travels in the setting. That is what lets the browser editor render
-the rows for a plugin it cannot even link.
-
-### Machine Learning (Keras) -- implemented
-
-The `zeughaus-ml` plugin turns Keras (TensorFlow) layers into nodes so a neural
-network can be designed entirely in the graph and exported as a runnable Keras
-functional-API program. A `KerasModel` value -- a directed acyclic graph of
-layer steps plus an optional compile config -- flows through the chain: each
-layer node consumes a model and emits it extended by one step, mirroring the LLM
-plugin's Conversation pattern. A plain feed-forward network is just a DAG where
-every step has one input; branches and merges add steps with zero or several.
-
-Codegen uses the functional API so the generated code mirrors the graph edges:
-every step becomes a variable (`x0`, `x1`, ...), and the call syntax reflects its
-inputs -- none for a root (`x0 = layers.Input(...)`), one for a normal layer
-(`x1 = layers.Dense(...)(x0)`), and a list for a merge
-(`x3 = layers.Concatenate()([x1, x2])`). The program closes with
-`keras.Model(inputs, outputs)` (a list of inputs for multi-input models).
-
-Each step carries a stable identity: the editor node that produced it. So when
-one layer fans out into two branches that later merge, the shared step is
-emitted once -- the merge dedups branch step sets by id. This is exactly why the
-identity must come from the producing node (`ctx.source_node`) rather than a
-per-value counter, which would collide across branches.
-
-Layer nodes are data-driven: every supported layer is a row in a static `LAYERS`
-table (Input, Dense, Conv1D/2D, Max/Average/GlobalAveragePooling, Flatten,
-Reshape, Dropout, BatchNormalization, LayerNormalization, Activation, LSTM, GRU,
-Embedding). Merge nodes are a parallel `MERGES` table (Concatenate, Add,
-Subtract, Multiply, Average, Maximum, Minimum, Dot) and have two model inputs
-`a` and `b`; chain them for more. Each parameter is typed -- strings are quoted
-in codegen, raw literals (numbers, tuples, bools) are emitted verbatim, and a
-blank value omits the kwarg so Keras applies its own default. The Export node
-validates at the boundary (non-empty model, every input branch rooted in an
-Input layer) and renders the final Python.
-
-Example graph:
-
-```
-[Input (28,28,1)] -> [Conv2D 32 (3,3) relu] -> [MaxPooling2D (2,2)]
-  -> [Flatten] -> [Dropout 0.5] -> [Dense 10 softmax]
-  -> [Compile adam/categorical_crossentropy/accuracy] -> [Export Code]
-```
-
-The Export node emits:
-
-```python
-import keras
-from keras import layers
-
-x0 = layers.Input(shape=(28, 28, 1))
-x1 = layers.Conv2D(filters=32, kernel_size=(3, 3), activation='relu')(x0)
-x2 = layers.MaxPooling2D(pool_size=(2, 2))(x1)
-x3 = layers.Flatten()(x2)
-x4 = layers.Dropout(rate=0.5)(x3)
-x5 = layers.Dense(units=10, activation='softmax')(x4)
-
-model = keras.Model(inputs=x0, outputs=x5)
-model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
-model.summary()
-```
-
-Branches and merges work the same way. One `Input` fanning out to two `Conv2D`
-nodes joined by a `Concatenate` merge node renders as:
-
-```python
-x0 = layers.Input(shape=(32, 32, 3))
-x1 = layers.Conv2D(filters=16, kernel_size=(3, 3), activation='relu')(x0)
-x2 = layers.Conv2D(filters=16, kernel_size=(5, 5), activation='relu')(x0)
-x3 = layers.Concatenate()([x1, x2])
-x4 = layers.Dense(units=10, activation='softmax')(x3)
-
-model = keras.Model(inputs=x0, outputs=x4)
-model.summary()
-```
-
-The plugin is pure codegen with no platform dependencies, so it is available in
-the wasm editor as well; native runners execute the exported code.
-
-## Type System -- implemented
-
-Pin types are runtime values, not compile-time labels. A pin declares a `Ty`:
-
-```rust
-enum Ty {
-    Any,                       // wildcard: connects to anything, never coerced
-    Bool, Int, Float, Str,     // scalars, bijective with bool/i64/f64/String
-    List(Arc<Ty>),
-    Option(Arc<Ty>),
-    Record(Arc<Record>),       // named, ordered fields -- built at runtime
-    Opaque(Arc<str>),          // a plugin's own Rust type, matched by name
-}
-```
-
-This is what lets a domain describe types nobody wrote in Rust: a user-designed
-database schema, a subgraph's exposed interface, an inferred tensor shape. A node
-derives its pins from what is connected to it via `sync_pins`, so its interface
-can follow its data rather than its source code.
-
-### Types and Values Agree by Construction
-
-A Rust type declares its own `Ty` once, and both the pin declaration and the
-runtime tag on values come from that single definition:
-
-```rust
-trait Typed: Clone + Send + Sync + 'static {
-    fn ty() -> Ty;
-    fn repr(&self) -> Repr<'_> { Repr::Opaque }   // structural view for display
-}
-```
-
-`Value::new::<T>` tags the value with `T::ty()`, so a value's declared type and
-its actual payload cannot drift apart -- the failure mode of the previous string
-labels, where a pin could claim `f64` while carrying something else. The executor
-therefore coerces on the value's own type rather than trusting the source pin's
-declaration, which is also what makes an `Any` output (e.g. `flow.hold`) land
-correctly on a typed input.
-
-The built-in scalars are deliberately a 1:1 mapping onto Rust types. Narrower
-numerics (`u8`, `f32`) are not pin types: a node converts at the emit site, so
-there is no ladder of widening converters papering over mismatches. The one
-remaining built-in coercion is `Int -> Float`.
-
-### Structural Inspection
-
-`Typed::repr` exposes a borrowed structural view (`Repr`) of scalars, lists and
-records. Generic consumers walk it instead of downcasting to every concrete type:
-today the editor's in-node value display, later the edge preview widgets and
-capture. Nominal plugin types (`KerasModel`, `Conversation`) stay opaque -- their
-meaning is their Rust implementation, not a field layout.
-
-Deserializing a value back from its `Repr` is not implemented: `Ty` and
-`PinDefinition` are serializable (a subgraph's derived pins must survive
-save/load), but reconstructing an arbitrary payload needs a per-type decoder,
-which waits for the first consumer (capture or a remote runner).
-
-## Dataflow Model
-
-### Push/Pull Reactive
-
-Every connection follows push/pull semantics:
-
-- **Push**: Source writes a new value, notifies downstream consumers
-- **Pull**: Consumer requests the current value. Triggers first computation if no cached value exists (lazy initialization)
-- **Cache**: Every edge holds the last value. Always readable via pull
-
-```
-[File Node]
-  Never executed, cache empty
-       |
-       v (Pull)
-  Consumer requests value -> File Node reads file -> cache filled -> value delivered
-
-  File changes externally -> File Node pushes update -> cache updated -> consumers notified
-```
-
-### Execution Semantics
-
-Runtime uses dirty-flag propagation:
-
-1. Source changes -> mark all downstream nodes as dirty
-2. Only dirty nodes are recomputed
-3. Recomputation happens on pull (lazy) or immediately for trigger-connected consumers (eager)
-
-Optimal for small, incremental changes -- only affected nodes recompute.
-
-### Pin Kinds
-
-**Output pins** declare what they produce:
-
-| DataMode | Description | Example |
-|----------|-------------|---------|
-| `Stream` | Continuous data, high frequency | Frame data, video, events per tick |
-| `Value` | Single value, changes occasionally | Config, PID, connection string |
-
-**Input pins** declare how they consume:
-
-| PinKind | Description | Example |
-|---------|-------------|---------|
-| `Trigger` | New data causes node execution | Frame input on a parser node |
-| `Sample` | Holds latest value, read passively on trigger | Config offsets on a parser node |
-
-Any output mode is compatible with any input kind:
-- `Value` output -> `Trigger` input: fires on every value change
-- `Stream` output -> `Sample` input: holds only the latest frame
-
-Node authors set defaults. Users can toggle trigger/sample per pin in the editor.
-
-### Atomic Output (Multi-Pin Synchronization)
-
-Nodes with multiple logically related outputs use atomic flush:
-
-```rust
-fn execute(&mut self, ctx: &mut NodeContext) {
-    let data = self.read_memory();
-    let frame = self.capture_frame();
-
-    ctx.emit("unit_data", data);   // buffered
-    ctx.emit("video", frame);      // buffered
-    ctx.flush();                   // now downstream triggers
-}
-```
-
-Between `emit` and `flush`, outputs are buffered. `flush` releases them atomically,
-ensuring consumers always see consistent pairs.
-
-For synchronizing outputs from **different** nodes, an explicit `Zip` node waits for
-one value from each input before emitting a tuple.
-
-### Edge Transport Abstraction
-
-Edges in the graph are abstract connections. Transport depends on node placement:
-
-| Placement | Transport |
-|-----------|-----------|
-| Same process | `tokio::mpsc` channel (zero-copy) |
-| Same machine | Named pipe / shared memory |
-| Different machines | gRPC stream / WebSocket |
-
-The graph designer always sees the same edge. The runtime resolves transport based on placement.
-
-### Edge Data Semantics
-
-| Mode | Behavior | Use Case |
-|------|----------|----------|
-| **Last-Value** (default) | New value overwrites previous | Config, slow data |
-| **Bounded Queue** (opt-in) | Ring buffer, drops oldest on overflow | Video, real-time streams |
-| **Queue** (opt-in) | Unbounded, backpressure if consumer is slow | Batch processing, events |
-
-Start with last-value everywhere. Queue semantics opt-in per edge when needed.
-
-## Event Metadata
-
-Minimal metadata per event -- no event sourcing:
-
-```rust
-struct EventMeta {
-    event_id: u64,
-    trace_id: u64,       // correlates related events through the graph
-    timestamp: Instant,
-    source_node: NodeId,
-}
-
-struct Event<T> {
-    meta: EventMeta,
-    payload: T,
-}
-```
-
-`trace_id` propagates through the graph: DLL Inject produces frame 4217 with `trace_id: 4217`,
-all downstream nodes processing that frame inherit the same trace_id.
-
-### Capture (Opt-In Persistence)
-
-No event sourcing. Instead, individual nodes can opt into capture:
-
-```rust
-struct NodeConfig {
-    capture: bool,  // default: false
-}
-```
-
-When enabled, the node's full output is persisted to the database after each execution.
-
-- **Capture off** (default): Zero overhead, only last-value cache
-- **Capture on**: Full result written to Postgres/SQLite per execution
-
-Use cases:
-- Live debugging: browse captured results in the UI
-- Archival: persist production-relevant outputs
-- Video inspection: scroll through captured frames with preview
-
-### Data Inspection
-
-Every edge's last-value cache is readable by the UI. Click an edge to see a type-specific preview:
-
-| Edge Type | Preview Widget |
-|-----------|---------------|
-| `Image` | Inline image / video player |
-| `Json` | Tree view |
-| `Table` | Data grid |
-| `f32` / numeric | Sparkline / value display |
-| `String` | Text |
-| `Bytes` | Hex view |
-
-Implemented via an `Inspectable` trait:
-
-```rust
-trait Inspectable {
-    fn preview(&self) -> Element;  // iced widget for inline preview
-}
-```
-
-## Distributed Execution and Placement
-
-### Runner Constraints
-
-Nodes have placement constraints -- either explicit (user-annotated) or implicit (by node type):
-
-```
-[DLL Inject]     -> MUST run on Machine A (has the target process)
-[GPU Inference]  -> MUST run on Machine B (has the GPU)
-[JSON Transform] -> PREFERENCE: co-locate with heaviest neighbor
-```
-
-### Placement Optimization
-
-The system minimizes network hops:
-
-1. Fixed constraints are honored (user-defined or implied by node type)
-2. Unconstrained nodes are pulled toward their heaviest data dependency
-3. Network crossings happen at optimal boundaries
-
-```
-[DLL Inject] -> [Memory Read] -> [Transform] -> [GPU Inference] -> [Postgres Write]
-  Machine A      Machine A       Machine A        Machine B          Machine B
-  (constraint)   (constraint)    (optimized)      (constraint)       (optimized)
-```
-
-One network crossing between Transform and GPU Inference -- the minimum possible.
-
-### Collaboration Visibility
-
-| Layer | Shared? | Via |
-|-------|---------|-----|
-| Graph definition (nodes, edges, config) | Yes, live | SpacetimeDB |
-| Execution state (running, results, logs) | Optional, read-only | SpacetimeDB (aggregated) |
-| Execution control (start, stop) | Per-user / per-runner | Local |
-| Captured data (full results) | On-demand | Direct request to owner |
-
-Aggregated metrics (throughput, latency, node status) sync to SpacetimeDB periodically.
-Full captured data stays local; collaborators can request samples.
-
-## Plugin System
-
-Each domain is a plugin that registers:
-
-- **Node catalog**: Available node types with their pin definitions
-- **Pin types**: Domain-specific data types with serialization
-- **Execution logic**: How nodes compute outputs from inputs
-- **Preview widgets**: `Inspectable` implementations for domain types
-- **Subgraph template**: Default layout and configuration
-
-```rust
-trait DomainPlugin {
-    fn name(&self) -> &str;
-    fn node_catalog(&self) -> Vec<NodeDefinition>;
-    fn create_node(&self, type_id: &str) -> Box<dyn ExecutableNode>;
-}
-
-trait ExecutableNode {
-    fn execute(&mut self, inputs: &InputSet, ctx: &mut NodeContext) -> Result<()>;
-    fn pin_definitions(&self) -> &[PinDefinition];
-    // Derive pins from what is connected: variadic arity, or a shape that
-    // follows an incoming type (a schema, a subgraph interface).
-    fn sync_pins(&mut self, connected: &[PinBinding<'_>]) -> bool { false }
-}
-```
-
-## Technology Stack
-
-| Component | Technology | Rationale |
-|-----------|-----------|-----------|
-| Editor UI | iced 0.14 + iced_nodegraph | Existing investment, Rust-native, WASM-capable |
-| Collaboration | SpacetimeDB | Real-time shared state, multiplayer-grade sync |
-| Local Storage | SQLite | Embedded, zero-config, offline |
-| Production DB | PostgreSQL | Robust, extensible, familiar |
-| Async Runtime | Tokio | Standard Rust async, needed for runners |
-| Serialization | serde + BSATN (SpacetimeDB) | Ecosystem standard + SpacetimeDB wire format |
-| IPC | gRPC (tonic) | Cross-machine runner communication |
-
-## Example Flow: D2R Bot Pipeline
-
-```
-[Processes]                        [Config: Offsets]
-  out: pid (Value)                   out: offsets (Value)
-       |                                  |
-       v                                  v
-[DLL Inject]                       +----------------+
-  trigger: pid                     | Unit Parser    |
-  out: frame_data (Stream) ------> |  trigger: data |
-                                   |  sample: offsets|
-[Screen Capture]                   +-------+--------+
-  trigger: pid                             |
-  out: frame (Stream) --+                  v
-                        |           [Bot Logic]
-                        +---------> |  trigger: units|
-                                    |  trigger: frame|
-                                    +---+--------+--+
-                                        |        |
-                                        v        v
-                                [Postgres]   [AI Pipeline]
-                                 capture:on   capture:on
-```
-
-## Open Questions
-
-- [ ] Subgraph pin exposition UX -- how does the user define which pins are exposed?
-- [ ] Hot-reload of plugins -- can domains be added/updated without restarting?
-- [ ] Graph serialization format -- JSON, RON, or binary?
-- [ ] Authentication model for remote runners
-- [ ] Error propagation -- how do node failures affect downstream?
-- [ ] Undo/redo granularity in collaborative editing
-- [ ] Rate limiting / backpressure for high-frequency streams
-- [ ] WASM runner sandboxing for user-defined transform nodes
+sequence numbers (`zeughaus-terminal`), and `zeughaus-runner/src/mux` serves
+that screen to every editor over one `/mux` path. PTY bytes never leave the
+runner; what travels is `zeughaus-mux`'s wire model: rows as spans with
+wire-stable styles, deltas of the rows that changed since the sequence number
+the client holds, and whole workspace snapshots for the tab and split
+topology. The codec is a fixed frame header (length, protocol version, stable
+numeric kind, flags, request id) over `postcard` bodies, every length bounded
+before allocation; golden tests pin the header and the kind numbers.
+
+**Three exchange kinds** ride one pooled QUIC connection, told apart by their
+first frame. A *control* exchange per client carries the attach (hello,
+topology, one head per terminal, so the first paint is one round trip), the
+structural commands with correlated, deduplicated replies, and every later
+snapshot. A *terminal* exchange per attached terminal is full duplex: input
+up, deltas down. *Row fetches* are short exchanges of their own so a
+scrollback page cannot block a keystroke. A delta is computed per subscriber
+from the last sequence number that subscriber received and carries every
+retained row written since, so a slow client gets fewer, larger deltas and
+never a queue; output is coalesced at a 12 ms cadence. The client
+(`zeughaus-mux/src/view.rs`) applies heads by replacement, deltas only at
+their exact base, pages into holes, and keeps its row store bounded around
+the viewport.
+
+**Ownership.** The runner owns tab order, splits, ratios, pane and terminal
+ids; each editor owns its presentation state. Any client may view a terminal;
+exactly one holds its **lease** and may type, resize and move the mouse in
+it. The first client that types acquires an unowned terminal, another takes
+it with `TakeControl` (`Ctrl+Shift+T`), and a lease survives a network blink
+for ten seconds so a redial does not turn a shell read-only. Closing a pane
+kills its child; closing an editor window does not. A runner restart is a new
+incarnation with an empty workspace: terminals do not migrate.
+
+**Security.** The runner's identity (`runner.pem`) and one client identity
+(`client.pem`) live under the state directory (`ZEUGHAUS_STATE_DIR`, else
+`$XDG_STATE_HOME/zeughaus`, else `~/.local/state/zeughaus`), owner-only,
+written atomically; a PEM that exists but does not parse is an error, never
+overwritten. The listener requires a trusted client certificate on every path
+(`client.pem` plus any `clients/*.pem`), and a bind on anything but loopback
+without client trust refuses to start. Every `/mux` exchange is authorized by
+the peer identity weida proved; a terminal id is a name, never a credential.
+Terminals are created only from runner-side profiles (the login shell); no
+command carries an argv. OSC 52 and downloads are not wired; a hyperlink is
+reported, never opened, by a click.
+
+**Rendering** (`iced_terminal`) is one custom wgpu primitive per pane: rows
+are shaped once per content and instanced once per palette, a changed row
+replaces only its arena ranges, a cursor move touches no row, an idle
+terminal schedules no redraw. The font is bundled so the cell grid is the
+same on every host. Keys: `Ctrl+Shift+C`/`V` copy and paste,
+`Ctrl+Shift+Escape` gives the keyboard back to the app.
+
+## 10. The sample feed
+
+Frames never touch the store. A viewer holds one standing exchange per
+(node, pin) on `/samples`: it sends a `FeedRequest` once, naming the size it
+draws, and the runner scales the newest frame to a ladder tier (240, 360,
+480, 720, 1080 lines; box-averaged, at most 4x4 samples per output pixel) and
+writes `FrameHeader`-prefixed frames until the viewer stops reading. Two
+viewers of similar size share one scaled result. Backpressure is QUIC's: a
+slow viewer gets fewer frames -- always the current one, never a backlog.
+The runner keeps an authoritative frame registry per pin and an LRU of scaled
+results keyed by (pin, tier, sequence).
+
+## 11. Configuration
+
+| what | where |
+|---|---|
+| store to join | `zeughaus join <host[:port]/database>`, `zeughaus-runner join <...>`; without it the default session on `127.0.0.1:3000/zeughaus`, and the LAN token is printed for others to join (`Session::resolve` in `zeughaus-sync`) |
+| feed/listener bind | `zeughaus-runner --feed-addr <host:port>`; default loopback with an OS-chosen port, so two runners on one host do not collide |
+| credentials | `--state-dir <path>` on the runner, else `ZEUGHAUS_STATE_DIR`, else XDG state; a remote editor needs `client.pem` copied into its own state directory |
+| capture backend | the portal is used when `WAYLAND_DISPLAY` is set |
+| paths inside nodes | `db.database` `path` and `record.writer` `dir` are settings, resolved against the runner's working directory |
+| LLM endpoint | the `base_url` setting on each conversation node (default `http://localhost:1234/v1`) |
+
+## 12. Testing strategy
+
+- Core and runtime: unit tests on invariants (type agreement, coercion,
+  occupancy, change tracking, cycle handling, async holdback, pin sync).
+  Integration tests in `zeughaus-runtime/tests` build small graphs from the
+  transform plugin and run them.
+- Wire formats (`zeughaus-link`, `zeughaus-mux`): round trips, refusal of
+  malformed and oversized input, golden bytes for the mux header and kinds.
+- Editor: pure functions (layout, wire refusal, relation rules, field
+  editing, pending edits, first-dial schedule) are unit-tested; the widget
+  tree is verified against the running application.
+- Terminal: engine tests (`zeughaus-terminal`) for styles, Unicode, alternate
+  screen, resize, deltas, eviction, exit; the pipeline's CPU side
+  (`iced_terminal`) for shaping and instance caches.
+- The gate before a push: `cargo fmt --check`, `cargo clippy --workspace
+  --all-targets -- -D warnings`, `cargo test --workspace`,
+  `cargo check --target wasm32-unknown-unknown -p zeughaus`.
+
+## 13. Not built
+
+Kept here so they are not mistaken for descriptions of the code:
+
+- Staged deployment of graph versions (draft / staged / deployed).
+- Placement of nodes across several runners; today the owner runs everything.
+- Opt-in per-node capture of results into a database; the recorder plugin
+  writes datasets to disk instead.
+- Queue semantics on edges; every edge is last-value.
+- Rich per-type inspection widgets on edges; nodes show text or a frame.
+- A browser editor that syncs with the store; the wasm build edits locally.
+- Terminal image protocols; the wire model reserves kinds for them.

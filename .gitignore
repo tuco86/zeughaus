@@ -1,4 +1,9 @@
-# Ignore Cargo build output at any level (workspace root and the
-# out-of-workspace zeughaus-module crate).
+# Cargo build output at any level (workspace root and the out-of-workspace
+# zeughaus-module crate).
 target/
 .claude/settings.local.json
+
+# What a runner writes into its working directory: the database plugin's
+# default SQLite file and the recorder's default dataset directory.
+zeughaus.sqlite*
+recordings/

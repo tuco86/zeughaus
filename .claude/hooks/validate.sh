@@ -1,22 +1,19 @@
 #!/bin/bash
-# Post-subagent validation script
-# Only outputs on errors to avoid filling context
+# Stop hook: the pre-push gate, printing only what failed so a clean run costs
+# no context.
 
 cd "$CLAUDE_PROJECT_DIR" || exit 0
 
-# Check native - capture output
-check_output=$(cargo check 2>&1)
+check_output=$(cargo check --workspace --all-targets 2>&1)
 check_status=$?
 
-# Check WASM - capture output
-wasm_output=$(cargo check --target wasm32-unknown-unknown 2>&1)
+# Only the editor targets the browser; native-only crates are not expected to.
+wasm_output=$(cargo check --target wasm32-unknown-unknown -p zeughaus 2>&1)
 wasm_status=$?
 
-# Test - capture output
-test_output=$(cargo test 2>&1)
+test_output=$(cargo test --workspace 2>&1)
 test_status=$?
 
-# Only output if there were errors
 if [ $check_status -ne 0 ]; then
     echo "## cargo check (native) failed"
     echo "$check_output" | grep -E "^error" | head -20
@@ -36,7 +33,7 @@ if [ $test_status -ne 0 ]; then
     echo ""
 fi
 
-# Exit 2 if any errors (shows to Claude)
+# Exit 2 surfaces the report to the agent.
 if [ $check_status -ne 0 ] || [ $wasm_status -ne 0 ] || [ $test_status -ne 0 ]; then
     exit 2
 fi
