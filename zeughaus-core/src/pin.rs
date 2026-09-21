@@ -1,20 +1,19 @@
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
-
 use crate::ty::Ty;
 
-/// What an output pin produces. Only `Value` is currently used.
-/// `Stream` is reserved for high-frequency data (see DESIGN.md).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DataMode {
-    Stream,
-    Value,
-}
-
-/// How an input pin consumes data. Not yet enforced by the executor.
-/// `Trigger` causes node execution, `Sample` reads passively (see DESIGN.md).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// What an input pin means to the node behind it, and to whoever draws it.
+///
+/// `Trigger` is an event pin: the node acts on what arrives there, and asks
+/// [`InputSet::changed`](crate::InputSet::changed) which of its pins a value
+/// was delivered on since it last ran. `Sample` is a state pin, read whenever
+/// the node runs for any reason. The editor draws the two apart (square and
+/// circle), so a graph shows which wire makes something happen.
+///
+/// Dirty propagation itself is uniform: every node downstream of a delivery is
+/// rerun whatever its pins declare. Acting only on its own event is therefore
+/// the node's decision, taken from `changed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinKind {
     Trigger,
     Sample,
@@ -25,7 +24,7 @@ pub enum PinKind {
 /// `Both` is neither: an edge between two `Both` pins is not dataflow at all
 /// but a declared relationship between the two nodes -- see
 /// [`PinDefinition::field`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinDirection {
     Input,
     Output,
@@ -38,23 +37,21 @@ pub enum PinDirection {
 /// a Rust author: a variadic node grows them, and a subgraph or a schema derives
 /// them from its contents. `Arc` keeps the frequent clones (the editor snapshots
 /// pin definitions per node edit) to a refcount bump.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PinDefinition {
     pub name: Arc<str>,
     pub direction: PinDirection,
-    pub data_mode: DataMode,
     pub pin_kind: PinKind,
     pub ty: Ty,
 }
 
 impl PinDefinition {
-    /// An input pin. `kind` decides whether arriving data runs the node
-    /// (`Trigger`) or is only read when it runs for another reason (`Sample`).
+    /// An input pin. `kind` declares whether arriving data is the event the
+    /// node acts on (`Trigger`) or state it reads when it runs (`Sample`).
     pub fn input(name: impl Into<Arc<str>>, ty: Ty, kind: PinKind) -> Self {
         Self {
             name: name.into(),
             direction: PinDirection::Input,
-            data_mode: DataMode::Value,
             pin_kind: kind,
             ty,
         }
@@ -65,7 +62,6 @@ impl PinDefinition {
         Self {
             name: name.into(),
             direction: PinDirection::Output,
-            data_mode: DataMode::Value,
             pin_kind: PinKind::Sample,
             ty,
         }
@@ -85,16 +81,9 @@ impl PinDefinition {
         Self {
             name: name.into(),
             direction: PinDirection::Both,
-            data_mode: DataMode::Value,
             pin_kind: PinKind::Sample,
             ty,
         }
-    }
-
-    /// Declares continuous, high-frequency data instead of a single value.
-    pub fn streaming(mut self) -> Self {
-        self.data_mode = DataMode::Stream;
-        self
     }
 }
 
@@ -116,7 +105,6 @@ mod tests {
     fn constructors_set_the_usual_defaults() {
         let input = PinDefinition::input("model", Ty::opaque("KerasModel"), PinKind::Sample);
         assert_eq!(input.direction, PinDirection::Input);
-        assert_eq!(input.data_mode, DataMode::Value);
         assert_eq!(input.pin_kind, PinKind::Sample);
 
         let output = PinDefinition::output("out", Ty::Float);
@@ -127,22 +115,5 @@ mod tests {
         let field = PinDefinition::field("customer_id", Ty::opaque("db.field"));
         assert_eq!(field.direction, PinDirection::Both);
         assert_eq!(field.pin_kind, PinKind::Sample);
-
-        assert_eq!(
-            PinDefinition::output("frame", Ty::Any)
-                .streaming()
-                .data_mode,
-            DataMode::Stream
-        );
-    }
-
-    #[test]
-    fn pins_with_runtime_types_survive_serialization() {
-        let pin = PinDefinition::output(
-            "row",
-            Ty::record("Customer", vec![crate::ty::Field::new("id", Ty::Int)]),
-        );
-        let json = serde_json::to_string(&pin).unwrap();
-        assert_eq!(serde_json::from_str::<PinDefinition>(&json).unwrap(), pin);
     }
 }

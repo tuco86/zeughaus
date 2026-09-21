@@ -334,9 +334,9 @@ const STABLE_UPTIME: Duration = Duration::from_secs(5);
 ///
 /// Never zero: the loop sleeps for any attempt above zero, and an exchange
 /// that ended -- however well it had been going -- must not be reopened in
-/// the same instant. Resetting to the *first* delay rather than to none is the
-/// whole fix: a runtime that served and then ended the stream used to reset
-/// the backoff to nothing and be asked again at once, forever.
+/// the same instant. Resetting to the *first* delay rather than to none is
+/// what bounds it: a runtime that served and then ended the stream would
+/// otherwise reset the backoff to nothing and be asked again at once, forever.
 fn next_attempt(attempt: u32, lasted: Duration) -> u32 {
     if lasted >= STABLE_UPTIME {
         return 1;
@@ -549,9 +549,8 @@ mod tests {
     /// The loop this schedule drives sleeps for any attempt above zero, so
     /// what has to hold is: never zero, growing while the runtime keeps
     /// ending the exchange, and back to the shortest wait once one exchange
-    /// actually lasted. A runtime that served and then ended the stream used
-    /// to reset the backoff to nothing, which asked it again at once and paid
-    /// an exchange per turn on a live connection.
+    /// actually lasted. Resetting to no wait at all asks the runtime again at
+    /// once and pays an exchange per turn on a live connection.
     #[test]
     fn an_ended_exchange_always_costs_at_least_one_backoff_step() {
         let brief = Duration::from_millis(20);

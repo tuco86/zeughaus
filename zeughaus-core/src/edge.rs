@@ -1,17 +1,4 @@
-use serde::{Deserialize, Serialize};
-
 use crate::id::EdgeId;
-
-/// How an edge delivers data. Only `LastValue` is currently implemented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum EdgeSemantic {
-    #[default]
-    LastValue,
-    /// Reserved: ring buffer, drops oldest on overflow (see DESIGN.md)
-    BoundedQueue(usize),
-    /// Reserved: unbounded backpressure queue (see DESIGN.md)
-    Queue,
-}
 
 /// Which of the wires contending for one single-slot input pin survives.
 ///
@@ -32,11 +19,6 @@ pub fn occupancy_winner(contenders: impl IntoIterator<Item = EdgeId>) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn default_is_last_value() {
-        assert_eq!(EdgeSemantic::default(), EdgeSemantic::LastValue);
-    }
 
     /// Every client must pick the same wire whatever order the rows reached
     /// it, so the verdict may depend on the ids and on nothing else.

@@ -17,7 +17,6 @@ pub mod join_runtime_reducer;
 pub mod move_node_reducer;
 pub mod node_table;
 pub mod node_type;
-pub mod replace_graph_reducer;
 pub mod runtime_table;
 pub mod runtime_type;
 pub mod set_node_params_reducer;
@@ -33,7 +32,6 @@ pub use join_runtime_reducer::join_runtime;
 pub use move_node_reducer::move_node;
 pub use node_table::*;
 pub use node_type::Node;
-pub use replace_graph_reducer::replace_graph;
 pub use runtime_table::*;
 pub use runtime_type::Runtime;
 pub use set_node_params_reducer::set_node_params;
@@ -77,10 +75,6 @@ pub enum Reducer {
         x: f32,
         y: f32,
     },
-    ReplaceGraph {
-        nodes: Vec<Node>,
-        edges: Vec<Edge>,
-    },
     SetNodeParams {
         id: u64,
         params: String,
@@ -101,7 +95,6 @@ impl __sdk::Reducer for Reducer {
             Reducer::DisconnectEdge { .. } => "disconnect_edge",
             Reducer::JoinRuntime => "join_runtime",
             Reducer::MoveNode { .. } => "move_node",
-            Reducer::ReplaceGraph { .. } => "replace_graph",
             Reducer::SetNodeParams { .. } => "set_node_params",
             _ => unreachable!(),
         }
@@ -160,12 +153,6 @@ impl __sdk::Reducer for Reducer {
                     id: id.clone(),
                     x: x.clone(),
                     y: y.clone(),
-                })
-            }
-            Reducer::ReplaceGraph { nodes, edges } => {
-                __sats::bsatn::to_vec(&replace_graph_reducer::ReplaceGraphArgs {
-                    nodes: nodes.clone(),
-                    edges: edges.clone(),
                 })
             }
             Reducer::SetNodeParams { id, params } => {

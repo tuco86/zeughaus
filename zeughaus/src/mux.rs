@@ -32,6 +32,7 @@ use iced::futures::channel::mpsc;
 use iced::futures::{SinkExt, Stream, StreamExt};
 use tokio::io::AsyncReadExt;
 use weida::{IncomingTransfer, OutgoingTransfer, PeerEvent, PeerEvents, Requester, TransferMeta};
+use zeughaus_link::MUX_PATH;
 use zeughaus_mux::message::{Command, ControlAttached};
 use zeughaus_mux::view::TerminalView;
 use zeughaus_mux::{
@@ -39,7 +40,6 @@ use zeughaus_mux::{
     RowFetch, RowPage, RunnerIncarnation, ServerHello, TerminalAttach, TerminalCommand,
     TerminalHead, WireError, WorkspaceSnapshot,
 };
-use zeughaus_link::MUX_PATH;
 
 use crate::transport::{Endpoint, QUIC, client_tls, explain, first_dial, policy};
 

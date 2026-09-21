@@ -1,9 +1,11 @@
 //! SpacetimeDB server module: the central collaborative store for graph state.
 //!
-//! Tables mirror `zeughaus_core::GraphDocument` (node + edge). Reducers are the
-//! only way to mutate state; clients call them and observe the resulting table
-//! changes via subscriptions. Node parameters are stored as a JSON string to
-//! avoid nested tables in this first iteration.
+//! Three tables, all public. `node` and `edge` are the graph every editor and
+//! runner subscribes to -- one row per node and per edge, with a node's
+//! parameters as a JSON string rather than a table of their own, so a
+//! parameter set is written and read in one row. `runtime` is presence:
+//! reducers are the only way to mutate any of it, and clients observe the
+//! resulting row changes through their subscriptions.
 //!
 //! Beyond the graph itself, the store decides WHO runs it and WHERE that
 //! runtime is reachable: every runner registers in `runtime`, the one with the
@@ -23,11 +25,11 @@ use spacetimedb::{ConnectionId, Identity, ReducerContext, Table, log, reducer, t
 /// inherits it.
 ///
 /// Keyed by CONNECTION, not by identity: every process on one machine loads the
-/// same saved token and is therefore the same identity, so an identity key made
-/// a closing editor delete the running runner's row -- and made the documented
-/// hot standby impossible, because the second runner's `join_runtime` found the
-/// first one's row. The identity stays as a plain column: it says who owns the
-/// process, which is what a future permission check reads.
+/// same saved token and is therefore the same identity, so an identity key
+/// would let a closing editor delete the running runner's row, and would make
+/// the hot standby impossible because the second runner's `join_runtime` would
+/// find the first one's row. The identity stays as a plain column: it says who
+/// owns the process, which is what a permission check reads.
 #[table(accessor = runtime, name = "runtime", public)]
 pub struct Runtime {
     #[primary_key]
@@ -123,10 +125,10 @@ pub fn set_node_params(ctx: &ReducerContext, id: u64, params: String) {
 /// row alone would leave its children in the store, parented to a node that no
 /// longer exists and reachable from no graph.
 ///
-/// Every call is logged with its caller. These three are the only reducers
-/// that destroy graph state, and a row that vanished with nobody able to say
-/// which client asked for it is a bug nobody can chase -- `spacetime logs`
-/// otherwise records only the calls that FAILED.
+/// Every call is logged with its caller. This and `disconnect_edge` are the
+/// only reducers that destroy graph state, and a row that vanished with nobody
+/// able to say which client asked for it is a bug nobody can chase --
+/// `spacetime logs` otherwise records only the calls that FAILED.
 #[reducer]
 pub fn delete_node(ctx: &ReducerContext, id: u64) {
     log::info!("delete_node {id} by {}", ctx.sender());
@@ -172,34 +174,6 @@ pub fn connect_edge(
 pub fn disconnect_edge(ctx: &ReducerContext, id: u64) {
     log::info!("disconnect_edge {id} by {}", ctx.sender());
     ctx.db.edge().id().delete(id);
-}
-
-/// Bulk replace: clears all state and inserts the given graph. Used for the
-/// load-from-document flow.
-#[reducer]
-pub fn replace_graph(ctx: &ReducerContext, nodes: Vec<Node>, edges: Vec<Edge>) {
-    let node_ids: Vec<u64> = ctx.db.node().iter().map(|n| n.id).collect();
-    let edge_ids: Vec<u64> = ctx.db.edge().iter().map(|e| e.id).collect();
-    log::info!(
-        "replace_graph by {}: {} nodes and {} edges replace {} nodes and {} edges",
-        ctx.sender(),
-        nodes.len(),
-        edges.len(),
-        node_ids.len(),
-        edge_ids.len()
-    );
-    for id in node_ids {
-        ctx.db.node().id().delete(id);
-    }
-    for id in edge_ids {
-        ctx.db.edge().id().delete(id);
-    }
-    for n in nodes {
-        ctx.db.node().insert(n);
-    }
-    for e in edges {
-        ctx.db.edge().insert(e);
-    }
 }
 
 /// Registers the calling CONNECTION as a runtime that wants to run the graph.

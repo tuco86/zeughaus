@@ -25,10 +25,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use zeughaus_core::{NodeId, Value, ZeughausError};
-use zeughaus_runtime::DeferredWork;
 use zeughaus_link::{
     EVENTS_PATH, FEED_PATH, MUX_PATH, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, credentials,
 };
+use zeughaus_runtime::DeferredWork;
 use zeughaus_sync::Role;
 
 use crate::feed::FrameRegistry;
@@ -83,8 +83,9 @@ fn main() -> ExitCode {
         }
     };
     eprintln!("[runner] state dir {}", state_dir.display());
-    let (uri, db, token) = resolve_session(parse_join_arg());
-    eprintln!("[runner] session {token} -> {uri} / {db}");
+    let session = zeughaus_sync::Session::resolve(parse_join_arg().as_deref());
+    let (uri, db) = (session.uri, session.database);
+    eprintln!("[runner] session {} -> {uri} / {db}", session.token);
 
     // A `Store` rather than a bare connection: a runner outlives a host
     // restart, and a dead connection it kept would leave it executing a graph
@@ -358,29 +359,4 @@ fn parse_state_dir() -> Result<PathBuf, String> {
         }
     }
     Ok(credentials::state_dir())
-}
-
-/// Turns a session token into `(uri, database, token)`. Without one, the runner
-/// serves the default session on the local host, and reports the token a remote
-/// editor would use to reach it.
-fn resolve_session(session: Option<String>) -> (String, String, String) {
-    match session {
-        Some(token) => {
-            let (uri, db) = zeughaus_sync::parse_token(&token);
-            (uri, db, token)
-        }
-        None => {
-            let token = format!(
-                "{}:{}/{}",
-                zeughaus_sync::lan_ip(),
-                zeughaus_sync::DEFAULT_PORT,
-                zeughaus_sync::DEFAULT_SESSION
-            );
-            (
-                format!("http://127.0.0.1:{}", zeughaus_sync::DEFAULT_PORT),
-                zeughaus_sync::DEFAULT_SESSION.to_string(),
-                token,
-            )
-        }
-    }
 }

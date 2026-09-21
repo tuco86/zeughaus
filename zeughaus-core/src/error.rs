@@ -11,9 +11,6 @@ pub enum ZeughausError {
     #[error("type mismatch: expected {expected}, got {actual}")]
     TypeMismatch { expected: String, actual: String },
 
-    #[error("cycle detected in graph")]
-    CycleDetected,
-
     #[error("node execution failed: {0}")]
     ExecutionFailed(String),
 

@@ -5,10 +5,9 @@ use zeughaus_core::*;
 ///
 /// Emits only what actually happened. On success: `frame`, `width`, `height`,
 /// `frame_size`, `captured = true`. On failure: `captured = false` and `error`.
-/// The editor dims output pins that produced no value, so the placeholder zeros
-/// this node used to emit on the failure paths were actively misleading -- a
-/// `width` of 0 reads as a measurement, an absent `width` reads as "no
-/// capture".
+/// No placeholder zeros on the failure paths -- the editor dims output pins
+/// that produced no value, so a `width` of 0 reads as a measurement while an
+/// absent `width` reads as "no capture".
 ///
 /// Which backend runs depends on the session, and their costs are orders of
 /// magnitude apart:

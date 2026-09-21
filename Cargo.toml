@@ -71,9 +71,7 @@ iced_tabs = { path = "iced_tabs" }
 iced_terminal = { path = "iced_terminal" }
 iced_palette = { git = "https://github.com/tuco86/iced_palette.git", branch = "main" }
 
-# `rc` provides Serialize/Deserialize for Arc<str> / Arc<T>, which pin names,
-# node ids and the runtime type system (Ty) use to stay cheap to clone.
-serde = { version = "1.0", features = ["derive", "rc"] }
+serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 
 # SpacetimeDB client SDK. Native uses default (tokio) features; wasm enables the

@@ -5,7 +5,6 @@ edition.workspace = true
 
 [dependencies]
 zeughaus-core.workspace = true
-zeughaus-runtime.workspace = true
 zeughaus-transform.workspace = true
 # Pure codegen plugin, no platform deps, so it is available in the wasm editor
 # too (it designs ML graphs; native runners execute the exported code).

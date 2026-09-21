@@ -1,16 +1,21 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use zeughaus_core::{EdgeId, EdgeSemantic, NodeConfig, NodeId, PinDefinition, PinDirection};
+use zeughaus_core::{EdgeId, NodeId, PinDefinition, PinDirection};
 
+/// One node of the executed graph: its identity, the type the plugins created
+/// it from, and the pins it currently declares.
+///
+/// The pin declarations are held here rather than asked of the node instance
+/// on every read, because the graph answers what an edge means from them (see
+/// [`Graph::is_dataflow`]) on every pass.
 pub struct GraphNode {
     pub id: NodeId,
     pub type_id: String,
-    pub config: NodeConfig,
     pub pin_defs: Vec<PinDefinition>,
-    pub position: (f32, f32),
 }
 
+/// One wire: which pin of which node feeds which pin of which node.
 pub struct GraphEdge {
     pub id: EdgeId,
     pub from_node: NodeId,
@@ -19,7 +24,6 @@ pub struct GraphEdge {
     pub from_pin: Arc<str>,
     pub to_node: NodeId,
     pub to_pin: Arc<str>,
-    pub semantic: EdgeSemantic,
 }
 
 pub struct Graph {
@@ -111,8 +115,8 @@ impl Graph {
     }
 
     /// A node, mutable. Counts as a change: a pin declaration decides whether
-    /// an edge to it carries data at all (see [`Self::is_dataflow`]), so this
-    /// can move the topology and not only the node's position.
+    /// an edge to it carries data at all (see [`Self::is_dataflow`]), so a
+    /// write here can move the topology.
     pub fn node_mut(&mut self, id: NodeId) -> Option<&mut GraphNode> {
         self.revision += 1;
         self.nodes.get_mut(&id)
@@ -139,8 +143,9 @@ impl Graph {
     /// This is the one place the rule lives. Every propagation path in this
     /// crate -- [`Self::incoming_edges`], [`Self::outgoing_edges`] and
     /// therefore the topological order, the dirty walk and a node's input set
-    /// -- reads it from here. Node type ids play no part: the editor and the
-    /// runner build their graph from the same store and get the same answer.
+    /// -- reads it from here. Node type ids play no part: the answer follows
+    /// from the pin declarations, so two processes holding the same graph
+    /// reach the same verdict.
     pub fn is_dataflow(&self, id: EdgeId) -> bool {
         let Some(edge) = self.edges.get(&id) else {
             return false;
@@ -235,15 +240,13 @@ impl Default for Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeughaus_core::{NodeConfig, Ty};
+    use zeughaus_core::Ty;
 
     fn make_node(id: NodeId) -> GraphNode {
         GraphNode {
             id,
             type_id: "test".to_string(),
-            config: NodeConfig::default(),
             pin_defs: vec![],
-            position: (0.0, 0.0),
         }
     }
 
@@ -252,9 +255,7 @@ mod tests {
         GraphNode {
             id,
             type_id: "table".to_string(),
-            config: NodeConfig::default(),
             pin_defs: vec![PinDefinition::field("id", Ty::opaque("db.field"))],
-            position: (0.0, 0.0),
         }
     }
 
@@ -265,7 +266,6 @@ mod tests {
             from_pin: "out".into(),
             to_node: to,
             to_pin: "in".into(),
-            semantic: EdgeSemantic::default(),
         }
     }
 
@@ -276,7 +276,6 @@ mod tests {
             from_pin: "id".into(),
             to_node: to,
             to_pin: "id".into(),
-            semantic: EdgeSemantic::default(),
         }
     }
 

@@ -1,13 +1,14 @@
 //! Edits held back from the shared store until the typing stops.
 //!
-//! A setting is typed one character at a time, and every character used to be
-//! a complete parameter push: seven keystrokes meant seven store writes, seven
-//! re-derivations of everything the value feeds, seven relation edges replaced
-//! -- and, for a `db.database` path, seven SQLite files created on the runner,
-//! one per prefix of what the user was still typing.
+//! A setting is typed one character at a time, and a character that reached
+//! the store on its own would be a complete parameter push: seven keystrokes
+//! would mean seven store writes, seven re-derivations of everything the value
+//! feeds, seven relation edges replaced -- and, for a `db.database` path,
+//! seven SQLite files created on the runner, one per prefix of what the user
+//! was still typing.
 //!
-//! The local state and the local executor keep seeing every character; only
-//! the store waits. Two things make that safe rather than merely quieter:
+//! This window and its nodes keep seeing every character; only the store
+//! waits. Two things make that safe rather than merely quieter:
 //!
 //! * the value the store still holds is remembered per key on the first
 //!   un-pushed edit, so a rename is detected against what was pushed rather

@@ -113,13 +113,9 @@ pub enum Message {
     SpawnNode {
         type_id: String,
     },
-    // Node parameter editing
-    ConstValueChanged {
-        node_id: u64,
-        value: String,
-    },
-    // In-node text settings (e.g. LLM base_url/model/prompt). `key` names the
-    // setting, matching the node's SettingDef and set_parameter key.
+    // In-node settings: one message per edited field, whatever the node does
+    // with the text. `key` names the setting, matching the node's SettingDef
+    // and set_parameter key.
     NodeSettingChanged {
         node_id: u64,
         key: String,
@@ -163,8 +159,8 @@ pub enum Message {
     // File operations
     SaveGraph,
     LoadGraph,
-    // Constructed by the native load dialog; on wasm, loading arrives via the
-    // SpacetimeDB store (later phase).
+    // Constructed by the native load dialog. The browser editor has no file
+    // dialog, so nothing emits it there.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     GraphLoaded(zeughaus_core::GraphDocument),
     // A frame arrived on a Display node's feed. Native-only: the wasm editor
@@ -206,9 +202,7 @@ mod tests {
     use super::*;
 
     /// Save/load and SpacetimeDB sync round-trip pin names through `String`:
-    /// the label must survive as the plain pin name in both directions. This is
-    /// what replaced the old `leak_string`, which fabricated `&'static str` by
-    /// leaking one allocation per loaded edge.
+    /// the label must survive as the plain pin name in both directions.
     #[test]
     fn label_round_trips_through_a_plain_string() {
         let label = PinLabel::from("model");

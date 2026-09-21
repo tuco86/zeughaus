@@ -29,7 +29,9 @@ pub use events::{
     ErrorRow, MAX_EVENT_BYTES, MAX_SNAPSHOT_BYTES, MAX_TRIGGER_BYTES, OutputRow, RejectionRow,
     RuntimeEvent, Snapshot, TOPIC_EDGE, TOPIC_ERROR, TOPIC_OUTPUT, TriggerRequest,
 };
-pub use feed::{FeedRequest, FrameHeader, MAX_DIMENSION, MAX_SAMPLES_PER_AXIS, ladder, scale_to_fit};
+pub use feed::{
+    FeedRequest, FrameHeader, MAX_DIMENSION, MAX_SAMPLES_PER_AXIS, ladder, scale_to_fit,
+};
 
 /// The endpoint a viewer dials for frames. Opaque to weida and matched
 /// exactly, so it is the same string on both sides or nothing works.

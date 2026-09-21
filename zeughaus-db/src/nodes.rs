@@ -267,10 +267,10 @@ impl ExecutableNode for TableNode {
 
         let conn = open(&self.db_path)?;
         let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-        // The table this node used to be called is renamed to what it is
-        // called now -- before the `CREATE TABLE`, which would otherwise
-        // create the new name as an empty second table and leave the data
-        // behind under the old one.
+        // The table under the node's former name is renamed to its current
+        // one -- before the `CREATE TABLE`, which would otherwise create the
+        // new name as an empty second table and leave the data behind under
+        // the old one.
         //
         // Both conditions are the idempotence: the old table has to be there
         // and the new one must not be. A rerun, a second runner and a standby
@@ -304,8 +304,8 @@ impl ExecutableNode for TableNode {
         // Derived from the file, not remembered. A remembered chain (`x->y`
         // then `y->z` collapsing to `x->z`) is per-process state, and there
         // are two processes: a standby accumulates the same chain without
-        // executing it, so killing the owner mid-chain left the file at `y`
-        // and the new owner looking for `x`, which wedged the table forever.
+        // executing it, so losing the owner mid-chain would leave the file at
+        // `y` and the new owner looking for `x`, wedging the table forever.
         // Reading the difference off the file is stateless, idempotent, and
         // survives a pass that failed before it got here.
         let existing = if let Some((old, new)) =
@@ -438,9 +438,9 @@ impl ExecutableNode for TableNode {
         };
         match name {
             DB_PATH => self.db_path = text.trim().to_string(),
-            // A cleared name used to be dropped in silence: the field showed
-            // nothing while the node kept the old name and went on writing
-            // that table. Refusing it says so where it was typed.
+            // A cleared name is refused where it was typed rather than
+            // dropped in silence: a node keeping its old name while the field
+            // shows nothing goes on writing a table nobody can name.
             "name" => {
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
@@ -457,8 +457,8 @@ impl ExecutableNode for TableNode {
             // it survive a standby taking over mid-chain.
             "columns" => {
                 // Validated before anything is replaced: an unparsable line
-                // used to make every field pin (and every wire on it) vanish,
-                // with the only report a later generic "no fields".
+                // must not take every field pin (and every wire on it) with
+                // it, reported only by a later generic "no fields".
                 parse_columns_checked(&text)?;
                 self.columns = text;
                 self.rebuild_pins();
@@ -1388,8 +1388,8 @@ mod tests {
     }
 
     /// A table's name is refused where it is typed rather than dropped: an
-    /// emptied field used to leave the node writing the old table with
-    /// nothing on screen to say which one that was.
+    /// emptied field would leave the node writing the old table with nothing
+    /// on screen to say which one that was.
     #[test]
     fn an_empty_table_name_is_refused() {
         let mut node = TableNode::new();

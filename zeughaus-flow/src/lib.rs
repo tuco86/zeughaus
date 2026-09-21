@@ -1,16 +1,15 @@
-//! Flow plugin: runtime-flow primitives that bridge the two transmission modes
-//! of the dataflow -- Events (one-shot, delivered on Trigger pins) and State
-//! (last-value, sampled on Sample pins).
+//! Flow plugin: the primitives that bridge the two kinds of pin -- events
+//! (delivered on Trigger pins, acted on once) and state (held on Sample pins,
+//! read whenever a node runs).
 //!
-//! `Hold` is the explicit Event -> State adapter: it latches the most recent
-//! event value of any type and exposes it as a steady, samplable state. Its
-//! pin kinds (Trigger in, Sample out) declare the conversion; once the executor
-//! enforces the Trigger/Sample distinction, this node is where a transient
-//! event stream becomes a persistent value other nodes can sample.
+//! `Hold` is the explicit event -> state adapter: it latches the most recent
+//! value of any type and keeps emitting it, so downstream nodes read a steady
+//! value rather than a momentary pulse. Its pin kinds (Trigger in, Sample out)
+//! declare the conversion.
 //!
-//! `Button` is the opposite end of the same bridge: it is the origin of an
-//! Event. Nothing upstream produces it -- a human press does -- which is why it
-//! belongs here next to `Hold` rather than in a domain plugin.
+//! `Button` is the origin of an event: nothing upstream produces it, a press
+//! from any editor does. `Timer` is the clock a source node needs: the host
+//! runs it on its interval, and everything downstream follows.
 
 use zeughaus_core::*;
 

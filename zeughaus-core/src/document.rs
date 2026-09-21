@@ -1,15 +1,24 @@
-//! Serializable graph document format for save/load.
+//! The graph as it is stored: one row per node and per edge.
+//!
+//! [`NodeData`] and [`EdgeData`] are the shape of the store's `node` and
+//! `edge` tables, and what the sync layer hands to the editor and the runner.
+//! [`GraphDocument`] is the same rows as one JSON file, which is what the
+//! editor's explicit Save/Load writes (`.zgh`).
+//!
+//! Pins and settings are not in here: both processes regenerate them from the
+//! plugin instances, so a row carries only what a user decided -- type,
+//! name, position, parent and the parameters typed into the node.
 
 use serde::{Deserialize, Serialize};
 
-/// A complete graph document that can be serialized to/from JSON.
+/// A whole graph as one JSON document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphDocument {
     pub nodes: Vec<NodeData>,
     pub edges: Vec<EdgeData>,
 }
 
-/// Serializable node data (position, type, parameters).
+/// One node as the store holds it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeData {
     pub id: u64,
@@ -18,17 +27,15 @@ pub struct NodeData {
     pub x: f32,
     pub y: f32,
     /// The container node this node lives inside, `0` for the root graph.
-    ///
-    /// Defaulted so a document written before subgraphs existed still loads:
-    /// every node in it belongs to the root graph, which is what `0` says.
+    /// Defaulted so a file that names no parent loads into the root graph.
     #[serde(default)]
     pub parent: u64,
-    /// Serialized parameter values (name -> JSON value string).
+    /// Setting values as the user typed them, by setting key.
     #[serde(default)]
     pub params: Vec<(String, String)>,
 }
 
-/// Serializable edge data.
+/// One edge as the store holds it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgeData {
     pub id: u64,

@@ -3,28 +3,20 @@ mod app;
 // needs the sync layer to learn where a runtime serves.
 #[cfg(not(target_arch = "wasm32"))]
 mod feed;
+mod message;
 // The terminal path: the runner's mux, its shared workspace and one stream
 // per terminal. Native-only, for the same reason as `feed`.
-mod message;
 #[cfg(not(target_arch = "wasm32"))]
 mod mux;
 mod palette;
-// The weida client under the feed: the runtime, the trust, the first dial.
-#[cfg(not(target_arch = "wasm32"))]
-mod transport;
-mod workspace;
 // Settings edits waiting to reach the store. Native-only: without a store
 // there is nothing to hold them back from.
 #[cfg(not(target_arch = "wasm32"))]
 mod pending;
-// The SpacetimeDB client lives in its own crate, shared with the headless
-// runtime process. Re-exported under the old paths so `crate::sync::` and
-// `crate::module_bindings::` keep working. Native-only for now; the wasm editor
-// sync path is a later step.
+// The weida client under the feed: the runtime, the trust, the first dial.
 #[cfg(not(target_arch = "wasm32"))]
-pub use zeughaus_sync as sync;
-#[cfg(not(target_arch = "wasm32"))]
-pub use zeughaus_sync::module_bindings;
+mod transport;
+mod workspace;
 
 use app::App;
 
@@ -46,7 +38,8 @@ fn main() -> iced::Result {
         zeughaus_core::EdgeId::seed_unique();
     }
 
-    // `zeughaus`            -> local editor (no sync)
+    // `zeughaus`            -> edits a local scratch graph unless a store is
+    //                          reachable, then that store is the document
     // `zeughaus join <id>`  -> join collaboration session <id>
     #[cfg(not(target_arch = "wasm32"))]
     let session = parse_join_arg();
@@ -66,19 +59,19 @@ fn main() -> iced::Result {
         size: WINDOW_SIZE,
         position: iced::window::Position::Centered,
         // The close is handled rather than obeyed: a settings edit is held
-        // back for 400 ms after the last keystroke, and typing into a
-        // field and closing the window used to lose it from the store
-        // without a word. `App` flushes and then ends the runtime itself.
-        // Set here rather than through `exit_on_close_request`, which
-        // `window` would overwrite.
+        // back for 400 ms after the last keystroke, and closing the window
+        // in that window has to flush it to the store rather than drop it.
+        // `App` flushes and then ends the runtime itself. Set here rather
+        // than through `exit_on_close_request`, which `window` would
+        // overwrite.
         exit_on_close_request: false,
         ..Default::default()
     })
     .run()
 }
 
-/// Parses `join <sessionid>` from the CLI args. Returns the session id to join,
-/// or `None` for a local (unsynced) editor.
+/// Parses `join <sessionid>` from the CLI args. Returns the session token to
+/// join, or `None` to host the default session on this machine's store.
 #[cfg(not(target_arch = "wasm32"))]
 fn parse_join_arg() -> Option<String> {
     let mut args = std::env::args().skip(1);

@@ -19,8 +19,11 @@
 //! clients never assign colliding ids. Applying a remote change is guarded by
 //! the caller so it does not echo back as a reducer call.
 //!
-//! Always-on: connecting is required, with no local-only fallback. A missing
-//! server is a fatal startup error, not a degraded mode.
+//! What a missing store means differs by process: the runner requires one --
+//! it has nothing to execute without the graph -- while the editor starts
+//! without it and edits a local scratch graph, saying so in its status bar.
+//! Once a connection has been made, losing it is not fatal to either:
+//! [`Store`] hands the caller an `Option` and reconnects on its poll.
 
 pub mod module_bindings;
 
@@ -246,14 +249,14 @@ fn credential_key(uri: &str, module: &str) -> String {
 ///
 /// The connection is not a thing a process can be handed once and rely on: a
 /// host restart, a suspended laptop or a dropped Wi-Fi packet ends it, and the
-/// SDK's message loop simply exits. Before this, the owner of the connection
-/// kept a dead handle: every reducer call failed into a log line nobody reads,
-/// and the process went on as if the store were there.
+/// SDK's message loop simply exits. A caller holding the raw handle could not
+/// tell that apart from a working store: every reducer call would fail into a
+/// log line and the process would go on as if the store were there.
 ///
 /// So the connection lives here, behind [`Store::conn`] returning an `Option`:
-/// "there is no store right now" becomes a state the caller has to handle
-/// rather than one it cannot see. [`Store::poll`] is the retry, called from
-/// the caller's own loop so nothing reconnects behind its back.
+/// "there is no store right now" is a state the caller has to handle rather
+/// than one it cannot see. [`Store::poll`] is the retry, called from the
+/// caller's own loop so nothing reconnects behind its back.
 pub struct Store {
     uri: String,
     module: String,
@@ -369,9 +372,49 @@ fn send(tx: &Sender<SyncEvent>, ev: SyncEvent) {
     let _ = tx.send(ev);
 }
 
+/// Which store a process talks to, and the token another machine uses to reach
+/// the same session.
+///
+/// One resolution for both binaries: the editor shares the token it prints,
+/// and a runner started with that token has to land on the same store, so the
+/// two must not derive it apart.
+pub struct Session {
+    /// The store's connection uri.
+    pub uri: String,
+    /// The database name within that store.
+    pub database: String,
+    /// What another machine passes to join this session.
+    pub token: String,
+}
+
+impl Session {
+    /// Resolves the session to talk to. `join` is the `host[:port]/database`
+    /// token from the command line; `None` hosts the default session on the
+    /// local store and reports the LAN-reachable token for it.
+    pub fn resolve(join: Option<&str>) -> Self {
+        match join {
+            Some(token) => {
+                let (uri, database) = parse_token(token);
+                Self {
+                    uri,
+                    database,
+                    token: token.to_string(),
+                }
+            }
+            None => Self {
+                uri: format!("http://127.0.0.1:{DEFAULT_PORT}"),
+                database: DEFAULT_SESSION.to_string(),
+                // The loopback uri this process connects to is useless to a
+                // remote buddy, so the token names the LAN address instead.
+                token: format!("{}:{DEFAULT_PORT}/{DEFAULT_SESSION}", lan_ip()),
+            },
+        }
+    }
+}
+
 /// Best-effort outbound LAN ip, for building a session token a remote buddy can
 /// reach. Falls back to the loopback address.
-pub fn lan_ip() -> String {
+fn lan_ip() -> String {
     use std::net::UdpSocket;
     UdpSocket::bind("0.0.0.0:0")
         .and_then(|sock| {
@@ -385,7 +428,7 @@ pub fn lan_ip() -> String {
 
 /// Parses a session token `host[:port]/db` (or a bare `db` on localhost) into a
 /// connection uri and database name.
-pub fn parse_token(token: &str) -> (String, String) {
+fn parse_token(token: &str) -> (String, String) {
     match token.split_once('/') {
         Some((host, db)) => {
             let host = if host.contains(':') {
@@ -458,9 +501,9 @@ pub fn send_announce_endpoint(conn: &DbConnection, addr: &str) -> Result<(), Str
 //
 // Every one of these can fail, and a failure means the edit did not happen:
 // the caller has already applied it locally, so it is the only one that can
-// say the shared graph and this window no longer agree. Logging it here and
-// returning nothing is what made a whole editing session vanish quietly when
-// the store went away, so the answer travels to the caller instead.
+// say the shared graph and this window disagree. The answer therefore travels
+// to the caller -- swallowing it here would let a whole editing session vanish
+// quietly when the store goes away.
 
 pub fn send_create_node(conn: &DbConnection, n: &NodeData) -> Result<(), String> {
     conn.reducers
@@ -553,5 +596,27 @@ mod tests {
             credential_key("http://127.0.0.1:3000", "zeughaus")
         );
         assert!(!credential_key("http://host/../x", "db").contains('/'));
+    }
+
+    /// A join token is what one machine hands another, so resolving it has to
+    /// land on the named store, fill in the default port for a bare host, and
+    /// hand the token back unchanged -- the joining editor shares the same
+    /// string onwards.
+    #[test]
+    fn a_join_token_resolves_to_the_store_it_names() {
+        let session = Session::resolve(Some("10.0.0.8:3000/zeughaus"));
+        assert_eq!(session.uri, "http://10.0.0.8:3000");
+        assert_eq!(session.database, "zeughaus");
+        assert_eq!(session.token, "10.0.0.8:3000/zeughaus");
+
+        let implied_port = Session::resolve(Some("buddy/shared"));
+        assert_eq!(implied_port.uri, format!("http://buddy:{DEFAULT_PORT}"));
+        assert_eq!(implied_port.database, "shared");
+
+        // A bare name is a database on the local store, not a host.
+        let local = Session::resolve(Some("scratch"));
+        assert_eq!(local.uri, format!("http://127.0.0.1:{DEFAULT_PORT}"));
+        assert_eq!(local.database, "scratch");
+        assert_eq!(local.token, "scratch");
     }
 }

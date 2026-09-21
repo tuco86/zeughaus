@@ -12,7 +12,7 @@ use zeughaus_core::{
 pub type DeferredWork = Vec<(NodeId, Box<dyn AsyncWork>)>;
 
 use crate::cache::EdgeCache;
-use crate::graph::Graph;
+use crate::graph::{Graph, GraphEdge, GraphNode};
 use crate::topo::topological_order;
 
 /// What every node of a cycle -- and everything downstream of one -- is told,
@@ -26,7 +26,7 @@ use crate::topo::topological_order;
 const CYCLE_ERROR: &str = "cycle detected: this node is in a loop of wires, or downstream of one";
 
 pub struct GraphExecutor {
-    pub graph: Graph,
+    graph: Graph,
     nodes: HashMap<NodeId, Box<dyn ExecutableNode>>,
     cache: EdgeCache,
     dirty: HashSet<NodeId>,
@@ -40,12 +40,13 @@ pub struct GraphExecutor {
     /// (e.g. an LLM chat node must not re-fire just because a wire was drawn).
     last_outputs: HashMap<NodeId, HashMap<String, Value>>,
     /// Why a node's last execution failed (sync error or async failure), keyed
-    /// by node. Cleared when the node next runs cleanly. Drives error styling in
-    /// the editor and the message it shows.
+    /// by node. Cleared when the node next runs cleanly. The host publishes
+    /// these, and an editor styles the node and shows the message.
     node_errors: HashMap<NodeId, String>,
     /// Coerces values that cross an edge whose endpoints declare different
-    /// types (e.g. a u8 output into an f64 input). Shared with the editor's
-    /// connection validation so "what may connect" and "what is coerced" agree.
+    /// types (e.g. a u8 output into an f64 input). Built from the host's
+    /// plugin set, the same registry an editor validates a drag against, so
+    /// "what may connect" and "what is coerced" agree.
     converters: Arc<TypeConverters>,
     /// Edges a value was delivered across since the last
     /// [`Self::take_delivered`]. The record of traffic, not of state: this is
@@ -73,25 +74,35 @@ struct Topology {
 }
 
 impl GraphExecutor {
-    pub fn new(graph: Graph) -> Self {
+    /// An executor with an empty graph.
+    ///
+    /// The converters come from the host's plugins and never change
+    /// afterwards, so they are taken here rather than installed later: a pass
+    /// run before they arrived would let a mismatched value through.
+    pub fn new(converters: Arc<TypeConverters>) -> Self {
         Self {
-            graph,
+            graph: Graph::new(),
             nodes: HashMap::new(),
             cache: EdgeCache::new(),
             dirty: HashSet::new(),
             pending: HashSet::new(),
             last_outputs: HashMap::new(),
             node_errors: HashMap::new(),
-            converters: Arc::new(TypeConverters::new()),
+            converters,
             delivered: Vec::new(),
             seen: HashMap::new(),
             topology: None,
         }
     }
 
-    /// Installs the type-converter registry (built from the plugins at startup).
-    pub fn set_converters(&mut self, converters: Arc<TypeConverters>) {
-        self.converters = converters;
+    /// The topology, to read what the graph holds: node ids, pin
+    /// declarations, edges.
+    ///
+    /// Read-only on purpose. Every change goes through this type, which is
+    /// what keeps the edge cache, the dirty set and the cached execution
+    /// order agreeing with the graph they describe.
+    pub fn graph(&self) -> &Graph {
+        &self.graph
     }
 
     /// Number of nodes currently awaiting an async result.
@@ -146,9 +157,69 @@ impl GraphExecutor {
         self.node_errors.insert(id, message);
     }
 
-    pub fn register_node(&mut self, id: NodeId, exec: Box<dyn ExecutableNode>) {
+    /// Adds a node, keeps its instance, and marks it dirty so the next pass
+    /// runs it.
+    ///
+    /// The pin declaration is read from the instance: a node is the only thing
+    /// that knows its pins, and a second statement of them here could disagree
+    /// with it.
+    pub fn add_node(
+        &mut self,
+        id: NodeId,
+        type_id: impl Into<String>,
+        node: Box<dyn ExecutableNode>,
+    ) {
+        let pin_defs = node.pin_definitions().to_vec();
+        self.graph.add_node(GraphNode {
+            id,
+            type_id: type_id.into(),
+            pin_defs,
+        });
         self.dirty.insert(id);
-        self.nodes.insert(id, exec);
+        self.nodes.insert(id, node);
+    }
+
+    /// Adds a wire and seeds it from the source's last known output, so the
+    /// target sees the value immediately and only its subtree is marked dirty.
+    ///
+    /// The source is not re-executed: a node with side effects (an LLM
+    /// request, a screen capture) must not fire again because somebody drew a
+    /// wire. When the source has produced nothing on that pin yet there is
+    /// nothing to seed, and running it is what fills the wire.
+    ///
+    /// A relation carries no value, so nothing happens here: what it changes
+    /// about the nodes it joins reaches them as a parameter (see
+    /// [`Graph::is_dataflow`]).
+    pub fn add_edge(
+        &mut self,
+        id: EdgeId,
+        from: NodeId,
+        from_pin: Arc<str>,
+        to: NodeId,
+        to_pin: Arc<str>,
+    ) {
+        let seed = self
+            .last_outputs
+            .get(&from)
+            .and_then(|outputs| outputs.get(&*from_pin))
+            .cloned();
+        self.graph.add_edge(GraphEdge {
+            id,
+            from_node: from,
+            from_pin,
+            to_node: to,
+            to_pin,
+        });
+        if !self.graph.is_dataflow(id) {
+            return;
+        }
+        match seed {
+            Some(value) => {
+                self.cache.set(id, value);
+                self.mark_dirty_downstream(to);
+            }
+            None => self.mark_dirty_downstream(from),
+        }
     }
 
     pub fn mark_dirty(&mut self, id: NodeId) {
@@ -203,18 +274,18 @@ impl GraphExecutor {
     ///
     /// A node that fails does not cancel the pass: its error is recorded (see
     /// [`Self::node_error`]), its downstream is held back because its outputs
-    /// are unavailable, and every unrelated node still runs. Bailing out
-    /// instead used to throw away the deferred work already collected in this
-    /// pass while those nodes stayed marked pending -- one broken node left
-    /// every async node in the graph hanging forever.
+    /// are unavailable, and every unrelated node still runs. The deferred work
+    /// this pass has already collected is returned either way -- dropping it
+    /// would leave those nodes marked pending with nothing running, so one
+    /// broken node would hang every async node in the graph forever.
     ///
     /// A cycle is not a failure of the pass either. The nodes in it, and the
     /// nodes downstream of it, have no place in any order and cannot run; they
     /// are told so as a node error and dropped from the dirty set, so the
     /// report reaches the user once instead of the host logging a failed pass
-    /// every 50 ms. Everything else runs. Failing the whole pass meant one
-    /// wire closed into a loop froze every unrelated part of the document,
-    /// with nothing on screen to say why.
+    /// every 50 ms. Everything else runs: one wire closed into a loop must not
+    /// freeze the unrelated parts of the document with nothing on screen to
+    /// say why.
     pub fn execute_dirty(&mut self) -> Result<DeferredWork> {
         let (order, stuck) = self.topology();
         for id in stuck.iter().copied() {
@@ -380,48 +451,6 @@ impl GraphExecutor {
         self.execute_dirty()
     }
 
-    /// Adopts output values produced by another window's runtime.
-    ///
-    /// Exactly one window owns the graph and executes it; every other window is
-    /// a viewer and reaches this method instead of running the node. That is the
-    /// point: executing locally is precisely what this replaces, so a node with
-    /// side effects (a screen capture, an LLM request) fires once for the whole
-    /// session rather than once per open window. Hence nothing is marked dirty,
-    /// no pending state is touched and no node runs here -- the outputs are
-    /// simply recorded and pushed into the outgoing edge caches, so downstream
-    /// nodes and [`Self::output_value`] see them exactly as if they had been
-    /// computed here.
-    ///
-    /// A partial output set is normal, not an error: only scalars are
-    /// replicated, so pins carrying frames or plugin-owned types are absent
-    /// from `outputs`. Such a pin then has no value and the editor dims it,
-    /// which is the honest rendering of "the owner did not publish this".
-    pub fn set_remote_outputs(&mut self, node: NodeId, outputs: HashMap<String, Value>) {
-        self.last_outputs.insert(node, outputs.clone());
-        // A replication states the node's WHOLE output set, so a pin that is
-        // absent has no value -- and the wire leaving it must not keep showing
-        // the last one. Without this a runtime that went away would leave its
-        // final numbers on screen forever.
-        let stale: Vec<EdgeId> = self
-            .graph
-            .outgoing_edges(node)
-            .filter(|id| {
-                self.graph
-                    .edge(*id)
-                    .is_some_and(|edge| !outputs.contains_key(&*edge.from_pin))
-            })
-            .collect();
-        for id in stale {
-            self.cache.remove(id);
-        }
-        // Replication is not traffic: the edge already carried this value where
-        // it was computed, and counting it again would draw a second particle
-        // for one message.
-        let mark = self.delivered.len();
-        self.apply_outputs(node, outputs);
-        self.delivered.truncate(mark);
-    }
-
     /// Clears a node's pending state without delivering outputs (e.g. after the
     /// async work failed). Downstream nodes stay unexecuted until re-triggered.
     pub fn clear_pending(&mut self, node_id: NodeId) {
@@ -446,40 +475,6 @@ impl GraphExecutor {
     /// two messages -- and the consumer decides whether it cares.
     pub fn take_delivered(&mut self) -> Vec<EdgeId> {
         std::mem::take(&mut self.delivered)
-    }
-
-    /// Notifies the executor that an edge was just added. Seeds the edge from
-    /// the source node's last known output (so the target sees the value
-    /// immediately) and marks only the target's subtree dirty. The source is
-    /// NOT re-executed -- avoids re-firing nodes with side effects. Only when
-    /// the source has no cached output do we fall back to running it.
-    ///
-    /// A relation is not a wire and nothing happens here: it carries no value
-    /// to seed, and what it changes about the nodes it joins reaches them as a
-    /// parameter (see [`Graph::is_dataflow`](crate::Graph::is_dataflow)).
-    pub fn on_edge_added(&mut self, edge_id: EdgeId) {
-        if !self.graph.is_dataflow(edge_id) {
-            return;
-        }
-        let Some(edge) = self.graph.edge(edge_id) else {
-            return;
-        };
-        let from_node = edge.from_node;
-        let from_pin = Arc::clone(&edge.from_pin);
-        let to_node = edge.to_node;
-
-        if let Some(value) = self
-            .last_outputs
-            .get(&from_node)
-            .and_then(|outs| outs.get(&*from_pin))
-            .cloned()
-        {
-            self.cache.set(edge_id, value);
-            self.mark_dirty_downstream(to_node);
-        } else {
-            // Source never produced this output yet; run it to populate the edge.
-            self.mark_dirty_downstream(from_node);
-        }
     }
 
     /// Remove an edge and clear its cached value.
@@ -556,6 +551,12 @@ impl GraphExecutor {
         }
     }
 
+    /// The last value that crossed an edge, as its target node reads it.
+    ///
+    /// A cache, not a run: it survives a pass that emitted nothing, and it is
+    /// the only place a value delivered into a sink node (a display, a
+    /// recorder) can be observed at all, because such a node produces no
+    /// output of its own.
     pub fn edge_value(&self, edge_id: EdgeId) -> Option<&Value> {
         self.cache.get(edge_id)
     }
@@ -566,10 +567,11 @@ impl GraphExecutor {
     /// `last_outputs` is replaced wholesale for a node every time it runs
     /// (`execute_dirty` / `deliver_async_result` both `insert` the full output
     /// map), so `None` means "the last run of this node produced no value on
-    /// that pin" -- not "never produced one". That is precisely the state the
-    /// editor dims. Contrast [`Self::edge_value`], which is a cache holding the
-    /// last value that ever crossed an edge and therefore keeps showing a stale
-    /// value after a run that emitted nothing.
+    /// that pin" -- not "never produced one". That distinction is what the
+    /// host publishes: a pin with no value this pass is reported as cleared
+    /// rather than left showing the number before it. Contrast
+    /// [`Self::edge_value`], which keeps the last value that ever crossed an
+    /// edge.
     pub fn output_value(&self, node: NodeId, pin: &str) -> Option<&Value> {
         self.last_outputs.get(&node)?.get(pin)
     }
@@ -586,9 +588,9 @@ impl GraphExecutor {
             .filter_map(|(id, node)| node.tick_interval().map(|interval| (*id, interval)))
     }
 
-    /// Recomputes a node's pins from what is currently connected to its inputs.
-    /// On a change, updates the graph node's pin_defs and returns the new pin
-    /// set so the editor can re-sync its own snapshot. Returns None if unchanged.
+    /// Recomputes a node's pins from what is currently connected to its
+    /// inputs. On a change, updates the graph node's pin declaration and
+    /// returns the new pin set; `None` when it is unchanged.
     ///
     /// The bindings are derived here rather than passed in: the executor already
     /// holds the edges, the pin declarations and the cached values, so it is the
@@ -662,8 +664,61 @@ impl GraphExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{GraphEdge, GraphNode};
     use zeughaus_core::*;
+
+    /// An executor with no conversions registered, for a test whose edges join
+    /// pins of the same declared type.
+    fn executor() -> GraphExecutor {
+        GraphExecutor::new(Arc::new(TypeConverters::new()))
+    }
+
+    /// Wires two nodes together and returns the new edge's id.
+    fn connect(
+        exec: &mut GraphExecutor,
+        from: NodeId,
+        from_pin: &str,
+        to: NodeId,
+        to_pin: &str,
+    ) -> EdgeId {
+        let id = EdgeId::next();
+        exec.add_edge(id, from, from_pin.into(), to, to_pin.into());
+        id
+    }
+
+    /// A node wrapped in a pin declaration. The executor reads a node's pins
+    /// from the instance, so a test about declared types states them here.
+    struct Declaring<N> {
+        node: N,
+        pins: Vec<PinDefinition>,
+    }
+
+    impl<N: ExecutableNode> ExecutableNode for Declaring<N> {
+        fn execute(&mut self, inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
+            self.node.execute(inputs, ctx)
+        }
+        fn pin_definitions(&self) -> &[PinDefinition] {
+            &self.pins
+        }
+    }
+
+    fn declaring(
+        node: impl ExecutableNode + 'static,
+        pins: Vec<PinDefinition>,
+    ) -> Box<dyn ExecutableNode> {
+        Box::new(Declaring { node, pins })
+    }
+
+    /// A node that produces nothing, for an endpoint a test only needs to
+    /// exist.
+    struct Idle;
+    impl ExecutableNode for Idle {
+        fn execute(&mut self, _inputs: &InputSet, _ctx: &mut NodeContext) -> Result<()> {
+            Ok(())
+        }
+        fn pin_definitions(&self) -> &[PinDefinition] {
+            &[]
+        }
+    }
 
     struct ConstNode(f64);
     impl ExecutableNode for ConstNode {
@@ -690,57 +745,37 @@ mod tests {
         }
     }
 
-    fn make_node(id: NodeId) -> GraphNode {
-        GraphNode {
-            id,
-            type_id: "test".to_string(),
-            config: NodeConfig::default(),
-            pin_defs: vec![],
-            position: (0.0, 0.0),
-        }
-    }
-
-    fn make_edge(from: NodeId, from_pin: &str, to: NodeId, to_pin: &str) -> GraphEdge {
-        GraphEdge {
-            id: EdgeId::next(),
-            from_node: from,
-            from_pin: from_pin.into(),
-            to_node: to,
-            to_pin: to_pin.into(),
-            semantic: EdgeSemantic::default(),
-        }
-    }
-
     #[test]
-    fn single_node_execution() {
-        let mut graph = Graph::new();
+    fn a_node_with_no_wires_still_runs() {
+        let mut exec = executor();
         let a = NodeId::next();
-        graph.add_node(make_node(a));
-
-        let mut exec = GraphExecutor::new(graph);
-        exec.register_node(a, Box::new(ConstNode(42.0)));
+        exec.add_node(a, "test", Box::new(ConstNode(42.0)));
         exec.execute_all().unwrap();
-        // No outgoing edges, so no cached values -- but execution should not panic
+
+        assert_eq!(
+            exec.output_value(a, "value")
+                .and_then(Value::downcast_ref::<f64>),
+            Some(&42.0)
+        );
     }
 
     #[test]
     fn linear_chain_propagation() {
-        let mut graph = Graph::new();
+        let mut exec = executor();
         let a = NodeId::next();
         let b = NodeId::next();
-        graph.add_node(make_node(a));
-        graph.add_node(make_node(b));
-        let edge = make_edge(a, "value", b, "in");
-        let edge_id = edge.id;
-        graph.add_edge(edge);
-
-        let mut exec = GraphExecutor::new(graph);
-        exec.register_node(a, Box::new(ConstNode(5.0)));
-        exec.register_node(b, Box::new(DoubleNode));
+        exec.add_node(a, "test", Box::new(ConstNode(5.0)));
+        exec.add_node(b, "test", Box::new(DoubleNode));
+        let edge_id = connect(&mut exec, a, "value", b, "in");
         exec.execute_all().unwrap();
 
         let val = exec.edge_value(edge_id).unwrap();
         assert_eq!(val.downcast_ref::<f64>(), Some(&5.0));
+        assert_eq!(
+            exec.output_value(b, "out")
+                .and_then(Value::downcast_ref::<f64>),
+            Some(&10.0)
+        );
     }
 
     /// A node that defers its output to async work instead of emitting now.
@@ -765,18 +800,12 @@ mod tests {
 
     #[test]
     fn deferred_node_blocks_downstream_until_delivered() {
-        let mut graph = Graph::new();
+        let mut exec = executor();
         let a = NodeId::next();
         let b = NodeId::next();
-        graph.add_node(make_node(a));
-        graph.add_node(make_node(b));
-        let edge = make_edge(a, "value", b, "in");
-        let edge_id = edge.id;
-        graph.add_edge(edge);
-
-        let mut exec = GraphExecutor::new(graph);
-        exec.register_node(a, Box::new(DeferNode(7.0)));
-        exec.register_node(b, Box::new(DoubleNode));
+        exec.add_node(a, "test", Box::new(DeferNode(7.0)));
+        exec.add_node(b, "test", Box::new(DoubleNode));
+        let edge_id = connect(&mut exec, a, "value", b, "in");
 
         // First pass: node a defers, b is held back, no output cached yet.
         let deferred = exec.execute_all().unwrap();
@@ -789,16 +818,24 @@ mod tests {
         let outputs = deferred.into_iter().next().unwrap().1.run().unwrap();
         let more = exec.deliver_async_result(a, outputs).unwrap();
 
-        // a is no longer pending; b ran with a's value (7 * 2 = 14).
+        // a is done, and b ran with a's value (7 * 2 = 14).
         assert!(more.is_empty());
         assert_eq!(exec.pending_count(), 0);
         let val = exec.edge_value(edge_id).unwrap();
         assert_eq!(val.downcast_ref::<f64>(), Some(&7.0));
+        assert_eq!(
+            exec.output_value(b, "out")
+                .and_then(Value::downcast_ref::<f64>),
+            Some(&14.0)
+        );
     }
 
+    /// A wire drawn onto a node that already produced its value carries that
+    /// value without the node running again: a source with side effects (an
+    /// LLM request, a capture) must not fire because somebody connected
+    /// something to it.
     #[test]
-    fn on_edge_added_seeds_without_rerunning_source() {
-        use std::sync::Arc;
+    fn adding_a_wire_seeds_it_without_rerunning_the_source() {
         use std::sync::atomic::{AtomicU32, Ordering};
 
         struct Counting(f64, Arc<AtomicU32>);
@@ -814,27 +851,19 @@ mod tests {
             }
         }
 
-        let mut graph = Graph::new();
+        let mut exec = executor();
         let a = NodeId::next();
         let b = NodeId::next();
-        graph.add_node(make_node(a));
-        graph.add_node(make_node(b));
-
-        let mut exec = GraphExecutor::new(graph);
         let runs = Arc::new(AtomicU32::new(0));
-        exec.register_node(a, Box::new(Counting(9.0, runs.clone())));
-        exec.register_node(b, Box::new(DoubleNode));
+        exec.add_node(a, "test", Box::new(Counting(9.0, runs.clone())));
+        exec.add_node(b, "test", Box::new(DoubleNode));
         exec.execute_all().unwrap();
         assert_eq!(runs.load(Ordering::SeqCst), 1);
 
         // Connect a -> b AFTER a already produced its output.
-        let edge = make_edge(a, "value", b, "in");
-        let edge_id = edge.id;
-        exec.graph.add_edge(edge);
-        exec.on_edge_added(edge_id);
+        let edge_id = connect(&mut exec, a, "value", b, "in");
         exec.execute_dirty().unwrap();
 
-        // Source not re-executed; the new edge is seeded from its cached output.
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         let val = exec.edge_value(edge_id).unwrap();
         assert_eq!(val.downcast_ref::<f64>(), Some(&9.0));
@@ -842,7 +871,6 @@ mod tests {
 
     #[test]
     fn error_state_set_then_cleared() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
         // Fails while `fail` is true, succeeds otherwise.
@@ -861,12 +889,10 @@ mod tests {
             }
         }
 
-        let mut graph = Graph::new();
+        let mut exec = executor();
         let a = NodeId::next();
-        graph.add_node(make_node(a));
-        let mut exec = GraphExecutor::new(graph);
         let fail = Arc::new(AtomicBool::new(true));
-        exec.register_node(a, Box::new(Flaky(fail.clone())));
+        exec.add_node(a, "test", Box::new(Flaky(fail.clone())));
 
         // The pass itself succeeds; the failure is recorded on the node.
         assert!(exec.execute_all().is_ok());
@@ -880,9 +906,9 @@ mod tests {
         assert!(!exec.is_error(a));
     }
 
-    /// A failing node used to abort the whole pass, which threw away deferred
-    /// work already collected from unrelated nodes -- those nodes stayed marked
-    /// pending with nothing running, so their downstream never resumed.
+    /// The deferred work a pass has collected survives another node failing in
+    /// the same pass. Discarding it would leave the deferring node marked
+    /// pending with nothing running, so its downstream would never resume.
     #[test]
     fn a_failing_node_does_not_discard_another_nodes_deferred_work() {
         struct Failing;
@@ -895,16 +921,13 @@ mod tests {
             }
         }
 
-        let mut graph = Graph::new();
-        // The failing node is ordered first (topological sort breaks ties by id),
-        // so it is the one that used to abort before the deferring node ran.
+        let mut exec = executor();
+        // The failing node is ordered first (the order breaks ties by id), so
+        // it is the one that fails before the deferring node runs.
         let failing = NodeId::next();
         let deferring = NodeId::next();
-        graph.add_node(make_node(failing));
-        graph.add_node(make_node(deferring));
-        let mut exec = GraphExecutor::new(graph);
-        exec.register_node(failing, Box::new(Failing));
-        exec.register_node(deferring, Box::new(DeferNode(1.0)));
+        exec.add_node(failing, "test", Box::new(Failing));
+        exec.add_node(deferring, "test", Box::new(DeferNode(1.0)));
 
         let deferred = exec.execute_all().unwrap();
 
@@ -915,96 +938,47 @@ mod tests {
     }
 
     #[test]
-    fn dirty_only_execution() {
-        let mut graph = Graph::new();
-        let a = NodeId::next();
-        let b = NodeId::next();
-        graph.add_node(make_node(a));
-        graph.add_node(make_node(b));
-        let edge = make_edge(a, "value", b, "in");
-        graph.add_edge(edge);
-
-        let mut exec = GraphExecutor::new(graph);
-        exec.register_node(a, Box::new(ConstNode(5.0)));
-        exec.register_node(b, Box::new(DoubleNode));
-
-        // First full execution
-        exec.execute_all().unwrap();
-
-        // Only mark a as dirty (and its downstream)
-        exec.mark_dirty_downstream(a);
-        exec.execute_dirty().unwrap();
-        // Should not panic -- b is also re-executed because it's downstream
-    }
-
-    #[test]
     fn disconnect_edge_clears_cache() {
-        let mut graph = Graph::new();
+        let mut exec = executor();
         let a = NodeId::next();
         let b = NodeId::next();
-        graph.add_node(make_node(a));
-        graph.add_node(make_node(b));
-        let edge = make_edge(a, "value", b, "in");
-        let edge_id = edge.id;
-        graph.add_edge(edge);
-
-        let mut exec = GraphExecutor::new(graph);
-        exec.register_node(a, Box::new(ConstNode(5.0)));
-        exec.register_node(b, Box::new(DoubleNode));
+        exec.add_node(a, "test", Box::new(ConstNode(5.0)));
+        exec.add_node(b, "test", Box::new(DoubleNode));
+        let edge_id = connect(&mut exec, a, "value", b, "in");
         exec.execute_all().unwrap();
 
-        // Edge cache should have the value
         assert!(exec.edge_value(edge_id).is_some());
 
-        // Disconnect the edge properly
         exec.disconnect_edge(edge_id);
 
-        // Cache entry must be gone
         assert!(exec.edge_value(edge_id).is_none());
 
-        // Re-execute: b should get default input (0.0) -> output 0.0
+        // Re-execute: b reads its default input (0.0) and emits 0.0.
         exec.execute_dirty().unwrap();
+        assert_eq!(
+            exec.output_value(b, "out")
+                .and_then(Value::downcast_ref::<f64>),
+            Some(&0.0)
+        );
     }
 
     #[test]
     fn remove_node_cleans_up_cache() {
-        let mut graph = Graph::new();
+        let mut exec = executor();
         let a = NodeId::next();
         let b = NodeId::next();
-        graph.add_node(make_node(a));
-        graph.add_node(make_node(b));
-        let edge = make_edge(a, "value", b, "in");
-        let edge_id = edge.id;
-        graph.add_edge(edge);
-
-        let mut exec = GraphExecutor::new(graph);
-        exec.register_node(a, Box::new(ConstNode(5.0)));
-        exec.register_node(b, Box::new(DoubleNode));
+        exec.add_node(a, "test", Box::new(ConstNode(5.0)));
+        exec.add_node(b, "test", Box::new(DoubleNode));
+        let edge_id = connect(&mut exec, a, "value", b, "in");
         exec.execute_all().unwrap();
 
         assert!(exec.edge_value(edge_id).is_some());
 
         exec.remove_node(a);
 
-        // Cache for the removed edge must be gone
+        // Cache for the removed edge must be gone, and only b is left.
         assert!(exec.edge_value(edge_id).is_none());
-        // Graph should only have node b
-        assert_eq!(exec.graph.node_count(), 1);
-    }
-
-    fn typed_node(id: NodeId, pin: &str, dir: PinDirection, ty: Ty) -> GraphNode {
-        let pin_def = match dir {
-            PinDirection::Input => PinDefinition::input(pin, ty, PinKind::Sample),
-            PinDirection::Output => PinDefinition::output(pin, ty),
-            PinDirection::Both => PinDefinition::field(pin, ty),
-        };
-        GraphNode {
-            id,
-            type_id: "test".to_string(),
-            config: NodeConfig::default(),
-            pin_defs: vec![pin_def],
-            position: (0.0, 0.0),
-        }
+        assert_eq!(exec.graph().node_count(), 1);
     }
 
     /// A converter coerces a value as it crosses an edge whose endpoints
@@ -1023,30 +997,34 @@ mod tests {
             }
         }
 
-        let mut graph = Graph::new();
-        let a = NodeId::next();
-        let b = NodeId::next();
-        let c = NodeId::next();
-        graph.add_node(typed_node(a, "value", PinDirection::Output, Ty::Int));
-        graph.add_node(typed_node(b, "in", PinDirection::Input, Ty::Float));
-        graph.add_node(make_node(c));
-        graph.add_edge(make_edge(a, "value", b, "in"));
-        let bc = make_edge(b, "out", c, "in");
-        let bc_id = bc.id;
-        graph.add_edge(bc);
-
         let mut conv = TypeConverters::new();
         conv.register_typed::<i64, f64, _>(|x| x as f64);
 
-        let mut exec = GraphExecutor::new(graph);
-        exec.set_converters(Arc::new(conv));
-        exec.register_node(a, Box::new(ConstInt(7)));
-        exec.register_node(b, Box::new(DoubleNode)); // reads in:f64, emits out = in*2
-        exec.register_node(c, Box::new(DoubleNode));
+        let mut exec = GraphExecutor::new(Arc::new(conv));
+        let a = NodeId::next();
+        let b = NodeId::next();
+        let c = NodeId::next();
+        exec.add_node(
+            a,
+            "test",
+            declaring(ConstInt(7), vec![PinDefinition::output("value", Ty::Int)]),
+        );
+        // Reads in:f64 and emits out = in * 2.
+        exec.add_node(
+            b,
+            "test",
+            declaring(
+                DoubleNode,
+                vec![PinDefinition::input("in", Ty::Float, PinKind::Sample)],
+            ),
+        );
+        exec.add_node(c, "test", Box::new(DoubleNode));
+        connect(&mut exec, a, "value", b, "in");
+        let bc = connect(&mut exec, b, "out", c, "in");
         exec.execute_all().unwrap();
 
         // Coercion int(7) -> float(7.0); DoubleNode emits 14.0 onto b->c.
-        let val = exec.edge_value(bc_id).unwrap();
+        let val = exec.edge_value(bc).unwrap();
         assert_eq!(val.downcast_ref::<f64>(), Some(&14.0));
     }
 
@@ -1067,28 +1045,31 @@ mod tests {
             }
         }
 
-        let mut graph = Graph::new();
+        let mut exec = GraphExecutor::new(Arc::new(TypeConverters::with_builtins()));
         let a = NodeId::next();
         let b = NodeId::next();
         let c = NodeId::next();
         // Source declares `any` while actually emitting an int.
-        graph.add_node(typed_node(a, "value", PinDirection::Output, Ty::Any));
-        graph.add_node(typed_node(b, "in", PinDirection::Input, Ty::Float));
-        graph.add_node(make_node(c));
-        graph.add_edge(make_edge(a, "value", b, "in"));
-        let bc = make_edge(b, "out", c, "in");
-        let bc_id = bc.id;
-        graph.add_edge(bc);
-
-        let mut exec = GraphExecutor::new(graph);
-        exec.set_converters(Arc::new(TypeConverters::with_builtins()));
-        exec.register_node(a, Box::new(ConstInt));
-        exec.register_node(b, Box::new(DoubleNode));
-        exec.register_node(c, Box::new(DoubleNode));
+        exec.add_node(
+            a,
+            "test",
+            declaring(ConstInt, vec![PinDefinition::output("value", Ty::Any)]),
+        );
+        exec.add_node(
+            b,
+            "test",
+            declaring(
+                DoubleNode,
+                vec![PinDefinition::input("in", Ty::Float, PinKind::Sample)],
+            ),
+        );
+        exec.add_node(c, "test", Box::new(DoubleNode));
+        connect(&mut exec, a, "value", b, "in");
+        let bc = connect(&mut exec, b, "out", c, "in");
         exec.execute_all().unwrap();
 
         assert_eq!(
-            exec.edge_value(bc_id).unwrap().downcast_ref::<f64>(),
+            exec.edge_value(bc).unwrap().downcast_ref::<f64>(),
             Some(&42.0)
         );
     }
@@ -1130,33 +1111,37 @@ mod tests {
             vec![Field::new("id", Ty::Int), Field::new("name", Ty::Str)],
         );
 
-        let mut graph = Graph::new();
+        let mut exec = executor();
         let source = NodeId::next();
         let split = NodeId::next();
-        graph.add_node(typed_node(source, "row", PinDirection::Output, customer));
-        graph.add_node(make_node(split));
-        graph.add_edge(make_edge(source, "row", split, "row"));
-
-        let mut exec = GraphExecutor::new(graph);
-        exec.register_node(
+        exec.add_node(
+            source,
+            "test",
+            declaring(Idle, vec![PinDefinition::output("row", customer)]),
+        );
+        exec.add_node(
             split,
+            "test",
             Box::new(SplitRecord {
                 pins: vec![PinDefinition::input("row", Ty::Any, PinKind::Trigger)],
             }),
         );
+        connect(&mut exec, source, "row", split, "row");
 
         let pins = exec.sync_node_pins(split).expect("pins changed");
         let names: Vec<&str> = pins.iter().map(|p| &*p.name).collect();
         assert_eq!(names, vec!["row", "id", "name"]);
         assert_eq!(pins[1].ty, Ty::Int);
         assert_eq!(pins[2].ty, Ty::Str);
-        // The graph's own snapshot is updated too, so the editor redraws them.
-        assert_eq!(exec.graph.node(split).unwrap().pin_defs.len(), 3);
+        // The graph's declaration follows, so what the host reads back is what
+        // the node grew.
+        assert_eq!(exec.graph().node(split).unwrap().pin_defs.len(), 3);
         // Idempotent: nothing changed on a second sync.
         assert!(exec.sync_node_pins(split).is_none());
     }
 
-    /// The editor dims a pin whose node produced nothing on it in the last run,
+    /// A pin that produced nothing in the last run has no value, and the host
+    /// reports it as cleared rather than leaving the previous number standing,
     /// so `output_value` must reflect only the most recent execution.
     #[test]
     fn output_value_reports_only_the_last_run() {
@@ -1181,13 +1166,11 @@ mod tests {
             }
         }
 
-        let mut graph = Graph::new();
+        let mut exec = executor();
         let node = NodeId::next();
-        graph.add_node(make_node(node));
-
-        let mut exec = GraphExecutor::new(graph);
-        exec.register_node(
+        exec.add_node(
             node,
+            "test",
             Box::new(Alternating {
                 pins: vec![
                     PinDefinition::output("a", Ty::Float),
@@ -1217,122 +1200,20 @@ mod tests {
         );
     }
 
-    /// A viewer window adopts the owner's outputs instead of running the graph.
+    /// Traffic is what a viewer animates, so an executed pass names every edge
+    /// a value crossed -- once per message, and only until the list is taken.
     #[test]
-    fn remote_outputs_are_adopted_without_executing() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicU32, Ordering};
-
-        struct Counting(f64, Arc<AtomicU32>);
-        impl ExecutableNode for Counting {
-            fn execute(&mut self, _inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
-                self.1.fetch_add(1, Ordering::SeqCst);
-                ctx.emit_typed("value", self.0);
-                ctx.flush();
-                Ok(())
-            }
-            fn pin_definitions(&self) -> &[PinDefinition] {
-                &[]
-            }
-        }
-
-        let mut graph = Graph::new();
-        let owner = NodeId::next();
-        let sink = NodeId::next();
-        graph.add_node(make_node(owner));
-        graph.add_node(make_node(sink));
-        let edge = make_edge(owner, "value", sink, "in");
-        let edge_id = edge.id;
-        graph.add_edge(edge);
-
-        let mut exec = GraphExecutor::new(graph);
-        let runs = Arc::new(AtomicU32::new(0));
-        exec.register_node(owner, Box::new(Counting(5.0, runs.clone())));
-        exec.register_node(sink, Box::new(DoubleNode));
-        exec.execute_all().unwrap();
-        assert_eq!(runs.load(Ordering::SeqCst), 1);
-
-        let mut outputs = HashMap::new();
-        outputs.insert("value".to_string(), Value::new(9.0_f64));
-        exec.set_remote_outputs(owner, outputs);
-
-        // Visible to the editor's pin rendering...
-        assert_eq!(
-            exec.output_value(owner, "value")
-                .and_then(Value::downcast_ref::<f64>),
-            Some(&9.0)
-        );
-        // ... and a pin the owner did not publish reads as "no value" (dimmed).
-        assert!(exec.output_value(owner, "frame").is_none());
-        // ... and available to downstream nodes on the wire's own edge.
-        assert_eq!(
-            exec.edge_value(edge_id)
-                .and_then(Value::downcast_ref::<f64>),
-            Some(&9.0)
-        );
-
-        // Nothing ran, and nothing was left dirty for the next pass to run:
-        // re-executing locally is exactly what adopting the outputs replaces.
-        assert_eq!(runs.load(Ordering::SeqCst), 1);
-        exec.execute_dirty().unwrap();
-        assert_eq!(runs.load(Ordering::SeqCst), 1);
-        assert_eq!(exec.pending_count(), 0);
-    }
-
-    /// Traffic is what a viewer animates, so an executed pass has to name every
-    /// edge a value crossed -- and adopting another runtime's outputs must not,
-    /// or the message would be counted twice for one delivery.
-    #[test]
-    fn delivering_a_value_records_its_edge_but_replicating_one_does_not() {
-        let mut graph = Graph::new();
+    fn delivering_a_value_records_its_edge() {
+        let mut exec = executor();
         let a = NodeId::next();
         let b = NodeId::next();
-        graph.add_node(make_node(a));
-        graph.add_node(make_node(b));
-        let edge = make_edge(a, "value", b, "in");
-        let edge_id = edge.id;
-        graph.add_edge(edge);
-
-        let mut exec = GraphExecutor::new(graph);
-        exec.register_node(a, Box::new(ConstNode(2.0)));
-        exec.register_node(b, Box::new(DoubleNode));
+        exec.add_node(a, "test", Box::new(ConstNode(2.0)));
+        exec.add_node(b, "test", Box::new(DoubleNode));
+        let edge_id = connect(&mut exec, a, "value", b, "in");
         exec.execute_all().unwrap();
         assert_eq!(exec.take_delivered(), vec![edge_id]);
         // Taking is draining: the next pass reports its own traffic only.
         assert!(exec.take_delivered().is_empty());
-
-        let mut outputs = HashMap::new();
-        outputs.insert("value".to_string(), Value::new(9.0_f64));
-        exec.set_remote_outputs(a, outputs);
-        assert!(exec.take_delivered().is_empty());
-    }
-
-    /// The editor clears a node's outputs when its runtime goes away, and the
-    /// wire must go with them: a last-known number left on screen is one nobody
-    /// will ever refresh.
-    #[test]
-    fn a_replication_without_a_pin_clears_the_wire_leaving_it() {
-        let mut graph = Graph::new();
-        let a = NodeId::next();
-        let b = NodeId::next();
-        graph.add_node(make_node(a));
-        graph.add_node(make_node(b));
-        let edge = make_edge(a, "value", b, "in");
-        let edge_id = edge.id;
-        graph.add_edge(edge);
-
-        let mut exec = GraphExecutor::new(graph);
-        exec.register_node(a, Box::new(ConstNode(2.0)));
-        exec.register_node(b, Box::new(DoubleNode));
-
-        let mut outputs = HashMap::new();
-        outputs.insert("value".to_string(), Value::new(9.0_f64));
-        exec.set_remote_outputs(a, outputs);
-        assert!(exec.edge_value(edge_id).is_some());
-
-        exec.set_remote_outputs(a, HashMap::new());
-        assert!(exec.edge_value(edge_id).is_none());
-        assert!(exec.output_value(a, "value").is_none());
     }
 
     /// A node that must act only when its own trigger fired asks `changed`,
@@ -1357,24 +1238,18 @@ mod tests {
             }
         }
 
-        let mut graph = Graph::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut exec = executor();
         let source_a = NodeId::next();
         let source_b = NodeId::next();
         let sink = NodeId::next();
-        graph.add_node(make_node(source_a));
-        graph.add_node(make_node(source_b));
-        graph.add_node(make_node(sink));
-        let wire_a = make_edge(source_a, "value", sink, "a");
-        let wire_b = make_edge(source_b, "value", sink, "b");
-        let (edge_a, edge_b) = (wire_a.id, wire_b.id);
-        graph.add_edge(wire_a);
-        graph.add_edge(wire_b);
-
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let mut exec = GraphExecutor::new(graph);
-        // The sources have no executable: this test delivers on their wires by
-        // hand, so that the only node that runs is the one being asked.
-        exec.register_node(sink, Box::new(Watcher(Arc::clone(&seen))));
+        // The sources produce nothing: this test delivers on their wires by
+        // hand, so the sink sees exactly the deliveries it is asked about.
+        exec.add_node(source_a, "test", Box::new(Idle));
+        exec.add_node(source_b, "test", Box::new(Idle));
+        exec.add_node(sink, "test", Box::new(Watcher(Arc::clone(&seen))));
+        let edge_a = connect(&mut exec, source_a, "value", sink, "a");
+        let edge_b = connect(&mut exec, source_b, "value", sink, "b");
 
         // Only `a` has a value on it.
         exec.cache.set(edge_a, Value::new(1.0_f64));
@@ -1419,33 +1294,26 @@ mod tests {
         }
     }
 
-    /// One loop of wires must cost exactly the nodes in it. The unrelated pair
+    /// One loop of wires costs exactly the nodes in it. The unrelated pair
     /// keeps running, the two in the cycle say why they do not, and the pass
-    /// itself does not fail -- the host used to log a failed pass every 50 ms
-    /// and execute nothing at all, anywhere in the document.
+    /// itself does not fail -- a failed pass means the host logs an error
+    /// every 50 ms and executes nothing at all, anywhere in the document.
     #[test]
     fn a_cycle_stops_only_its_own_nodes() {
-        let mut graph = Graph::new();
+        let mut exec = executor();
         let (a, b, c, d) = (
             NodeId::next(),
             NodeId::next(),
             NodeId::next(),
             NodeId::next(),
         );
-        for id in [a, b, c, d] {
-            graph.add_node(make_node(id));
-        }
-        graph.add_edge(make_edge(a, "value", b, "in"));
-        let back = make_edge(b, "value", a, "in");
-        let back_id = back.id;
-        graph.add_edge(back);
-        graph.add_edge(make_edge(c, "value", d, "in"));
-
         let runs = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut exec = GraphExecutor::new(graph);
         for id in [a, b, c, d] {
-            exec.register_node(id, Box::new(Tally(runs.clone())));
+            exec.add_node(id, "test", Box::new(Tally(runs.clone())));
         }
+        connect(&mut exec, a, "value", b, "in");
+        let back_id = connect(&mut exec, b, "value", a, "in");
+        connect(&mut exec, c, "value", d, "in");
 
         exec.execute_dirty().expect("a cycle is not a failed pass");
         let ran = runs.lock().expect("log").clone();
@@ -1474,20 +1342,15 @@ mod tests {
     /// told the same thing: its input can never be computed.
     #[test]
     fn a_node_downstream_of_a_cycle_is_reported_too() {
-        let mut graph = Graph::new();
+        let mut exec = executor();
         let (a, b, sink) = (NodeId::next(), NodeId::next(), NodeId::next());
-        for id in [a, b, sink] {
-            graph.add_node(make_node(id));
-        }
-        graph.add_edge(make_edge(a, "value", b, "in"));
-        graph.add_edge(make_edge(b, "value", a, "in"));
-        graph.add_edge(make_edge(b, "value", sink, "in"));
-
         let runs = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut exec = GraphExecutor::new(graph);
         for id in [a, b, sink] {
-            exec.register_node(id, Box::new(Tally(runs.clone())));
+            exec.add_node(id, "test", Box::new(Tally(runs.clone())));
         }
+        connect(&mut exec, a, "value", b, "in");
+        connect(&mut exec, b, "value", a, "in");
+        connect(&mut exec, b, "value", sink, "in");
 
         exec.execute_dirty().expect("pass");
         assert!(runs.lock().expect("log").is_empty());
@@ -1511,20 +1374,14 @@ mod tests {
             }
         }
 
-        let mut graph = Graph::new();
+        let mut exec = executor();
         let (a, b, broken) = (NodeId::next(), NodeId::next(), NodeId::next());
-        for id in [a, b, broken] {
-            graph.add_node(make_node(id));
-        }
-        graph.add_edge(make_edge(a, "value", b, "in"));
-        let back = make_edge(b, "value", a, "in");
-        let back_id = back.id;
-        graph.add_edge(back);
+        exec.add_node(a, "test", Box::new(ConstNode(1.0)));
+        exec.add_node(b, "test", Box::new(DoubleNode));
+        exec.add_node(broken, "test", Box::new(Failing));
+        connect(&mut exec, a, "value", b, "in");
+        let back_id = connect(&mut exec, b, "value", a, "in");
 
-        let mut exec = GraphExecutor::new(graph);
-        exec.register_node(a, Box::new(ConstNode(1.0)));
-        exec.register_node(b, Box::new(DoubleNode));
-        exec.register_node(broken, Box::new(Failing));
         exec.execute_dirty().expect("pass");
         assert_eq!(exec.node_error(broken), Some(OWN));
 
@@ -1533,20 +1390,16 @@ mod tests {
     }
 
     /// Work outlives the node that asked for it when the node is deleted
-    /// mid-request. Applying the result then wrote an output map and an edge
-    /// cache for an id no node carries, which nothing ever cleaned up again.
+    /// mid-request. Applying the result would write an output map and an edge
+    /// cache for an id no node carries, which nothing ever cleans up again.
     #[test]
     fn a_result_for_a_removed_node_is_ignored() {
-        let mut graph = Graph::new();
+        let mut exec = executor();
         let a = NodeId::next();
         let b = NodeId::next();
-        graph.add_node(make_node(a));
-        graph.add_node(make_node(b));
-        graph.add_edge(make_edge(a, "value", b, "in"));
-
-        let mut exec = GraphExecutor::new(graph);
-        exec.register_node(a, Box::new(DeferNode(7.0)));
-        exec.register_node(b, Box::new(DoubleNode));
+        exec.add_node(a, "test", Box::new(DeferNode(7.0)));
+        exec.add_node(b, "test", Box::new(DoubleNode));
+        connect(&mut exec, a, "value", b, "in");
         let deferred = exec.execute_dirty().expect("pass");
         assert_eq!(exec.pending_count(), 1);
 
@@ -1562,7 +1415,7 @@ mod tests {
         assert!(exec.node_error(a).is_none());
 
         // A failure for the same node is equally not worth recording: nothing
-        // could ever clear an error on a node that no longer exists.
+        // could ever clear an error on a node the graph does not have.
         exec.mark_error(a, "too late".to_string());
         assert!(exec.node_error(a).is_none());
         assert_eq!(exec.errors().count(), 0);
@@ -1573,16 +1426,12 @@ mod tests {
     /// after a pass changes who runs first.
     #[test]
     fn a_new_wire_reorders_the_next_pass() {
-        let mut graph = Graph::new();
+        let mut exec = executor();
         let a = NodeId::next();
         let b = NodeId::next();
-        graph.add_node(make_node(a));
-        graph.add_node(make_node(b));
-
         let runs = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut exec = GraphExecutor::new(graph);
-        exec.register_node(a, Box::new(Tally(runs.clone())));
-        exec.register_node(b, Box::new(Tally(runs.clone())));
+        exec.add_node(a, "test", Box::new(Tally(runs.clone())));
+        exec.add_node(b, "test", Box::new(Tally(runs.clone())));
 
         // Unconnected, so the order is by id.
         exec.execute_dirty().expect("pass");
@@ -1590,7 +1439,7 @@ mod tests {
 
         // b feeds a now, so a has to wait for it.
         runs.lock().expect("log").clear();
-        exec.graph.add_edge(make_edge(b, "value", a, "in"));
+        connect(&mut exec, b, "value", a, "in");
         exec.mark_dirty(a);
         exec.mark_dirty(b);
         exec.execute_dirty().expect("pass");

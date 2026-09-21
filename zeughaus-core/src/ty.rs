@@ -1,12 +1,11 @@
 //! Runtime type system: the domain type of a pin or a value, constructible at
 //! runtime.
 //!
-//! Pin types used to be `&'static str` labels compared by string equality. That
-//! limited the tool to domains whose types are known when the Rust code is
-//! compiled -- a user-designed database schema, a subgraph's exposed pins or an
-//! inferred tensor shape had no way to name themselves. `Ty` is a structural
-//! description instead, and its composites (`Ty::list`, `Ty::record`) are built
-//! at runtime, so a node can derive its pins from data.
+//! `Ty` is a structural description rather than a compile-time label, which is
+//! what lets a domain name types the Rust code never saw: a user-designed
+//! database schema, a subgraph's exposed pins, an inferred tensor shape. Its
+//! composites (`Ty::list`, `Ty::record`) are built at runtime, so a node can
+//! derive its pins from data.
 //!
 //! Plugin-owned Rust types stay nominal via [`Ty::Opaque`]: `KerasModel` and
 //! `Conversation` are matched by name, not structure, because their meaning is
@@ -14,21 +13,19 @@
 //!
 //! The built-in scalars are a bijection with their Rust representation
 //! (`Bool <-> bool`, `Int <-> i64`, `Float <-> f64`, `Str <-> String`). That
-//! bijection is what makes [`crate::Value::ty`] trustworthy: the declared type
-//! and the boxed Rust type can no longer disagree, which was the failure mode of
-//! the old string labels. Narrower Rust numerics (`u8`, `f32`) are deliberately
-//! not pin types -- a node converts at the emit site (`v as f64`) instead of
-//! relying on a widening converter to paper over the mismatch.
+//! bijection is what makes [`crate::Value::ty`] trustworthy: a declared type
+//! and the boxed Rust type behind it cannot disagree. Narrower Rust numerics
+//! (`u8`, `f32`) are deliberately not pin types -- a node converts at the emit
+//! site (`v as f64`) instead of relying on a widening converter to paper over
+//! the mismatch.
 
 use std::fmt;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
-
 /// The type of a pin or a value.
 ///
 /// Cheap to clone: composites share their payload through `Arc`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Ty {
     /// Wildcard. Connects to anything and is never coerced -- the type is
     /// whatever flows through (see the `flow.hold` node).
@@ -46,13 +43,13 @@ pub enum Ty {
 
 /// A named product type with ordered fields. Field order is significant: it is
 /// the order a schema, a subgraph or a table declares them in.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Record {
     pub name: Arc<str>,
     pub fields: Vec<Field>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Field {
     pub name: Arc<str>,
     pub ty: Ty,
@@ -310,22 +307,6 @@ mod tests {
             Ty::record("Point", vec![Field::new("x", Ty::Float)]).to_string(),
             "Point"
         );
-    }
-
-    #[test]
-    fn types_survive_serialization() {
-        // A runtime-built type must round-trip, or a subgraph's derived pins
-        // could not be saved.
-        let ty = Ty::list(Ty::record(
-            "Order",
-            vec![
-                Field::new("id", Ty::Int),
-                Field::new("total", Ty::Float),
-                Field::new("note", Ty::option(Ty::Str)),
-            ],
-        ));
-        let json = serde_json::to_string(&ty).unwrap();
-        assert_eq!(serde_json::from_str::<Ty>(&json).unwrap(), ty);
     }
 
     #[test]

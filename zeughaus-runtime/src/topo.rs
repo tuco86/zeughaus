@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 
-use zeughaus_core::{NodeId, Result, ZeughausError};
+use zeughaus_core::NodeId;
 
 use crate::graph::Graph;
 
@@ -64,34 +64,17 @@ pub fn topological_order(graph: &Graph) -> (Vec<NodeId>, Vec<NodeId>) {
     (result, stuck)
 }
 
-/// The whole graph's order, or [`ZeughausError::CycleDetected`] if it has no
-/// single order at all.
-///
-/// For a caller that refuses a cyclic graph outright rather than working
-/// around one: [`crate::GraphBuilder::build`] validates a graph it is about to
-/// hand over, and a cycle there is a graph that was assembled wrong. Execution
-/// takes [`topological_order`] instead -- by then the graph is the user's
-/// document, and one bad wire must not stop the rest of it.
-pub fn topological_sort(graph: &Graph) -> Result<Vec<NodeId>> {
-    match topological_order(graph) {
-        (order, stuck) if stuck.is_empty() => Ok(order),
-        _ => Err(ZeughausError::CycleDetected),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::graph::{Graph, GraphEdge, GraphNode};
-    use zeughaus_core::{EdgeId, EdgeSemantic, NodeConfig};
+    use zeughaus_core::EdgeId;
 
     fn make_node(id: NodeId) -> GraphNode {
         GraphNode {
             id,
             type_id: "test".to_string(),
-            config: NodeConfig::default(),
             pin_defs: vec![],
-            position: (0.0, 0.0),
         }
     }
 
@@ -102,15 +85,15 @@ mod tests {
             from_pin: "out".into(),
             to_node: to,
             to_pin: "in".into(),
-            semantic: EdgeSemantic::default(),
         }
     }
 
     #[test]
     fn empty_graph() {
         let g = Graph::new();
-        let order = topological_sort(&g).unwrap();
+        let (order, stuck) = topological_order(&g);
         assert!(order.is_empty());
+        assert!(stuck.is_empty());
     }
 
     #[test]
@@ -125,7 +108,8 @@ mod tests {
         g.add_edge(make_edge(a, b));
         g.add_edge(make_edge(b, c));
 
-        let order = topological_sort(&g).unwrap();
+        let (order, stuck) = topological_order(&g);
+        assert!(stuck.is_empty());
         let pos_a = order.iter().position(|&x| x == a).unwrap();
         let pos_b = order.iter().position(|&x| x == b).unwrap();
         let pos_c = order.iter().position(|&x| x == c).unwrap();
@@ -149,7 +133,8 @@ mod tests {
         g.add_edge(make_edge(b, d));
         g.add_edge(make_edge(c, d));
 
-        let order = topological_sort(&g).unwrap();
+        let (order, stuck) = topological_order(&g);
+        assert!(stuck.is_empty());
         let pos_a = order.iter().position(|&x| x == a).unwrap();
         let pos_b = order.iter().position(|&x| x == b).unwrap();
         let pos_c = order.iter().position(|&x| x == c).unwrap();
@@ -158,22 +143,6 @@ mod tests {
         assert!(pos_a < pos_c);
         assert!(pos_b < pos_d);
         assert!(pos_c < pos_d);
-    }
-
-    #[test]
-    fn cycle_detected() {
-        let mut g = Graph::new();
-        let a = NodeId::next();
-        let b = NodeId::next();
-        g.add_node(make_node(a));
-        g.add_node(make_node(b));
-        g.add_edge(make_edge(a, b));
-        g.add_edge(make_edge(b, a));
-
-        assert!(matches!(
-            topological_sort(&g),
-            Err(ZeughausError::CycleDetected)
-        ));
     }
 
     /// What the executor works from: the cycle's nodes and everything after
@@ -216,7 +185,7 @@ mod tests {
             g.add_node(make_node(a));
             g.add_node(make_node(b));
 
-            let order = topological_sort(&g).unwrap();
+            let (order, _) = topological_order(&g);
             assert_eq!(order.len(), 3);
             // Must be sorted by NodeId (which wraps u64, smallest first)
             assert!(order[0] < order[1]);
@@ -243,7 +212,7 @@ mod tests {
             g.add_edge(make_edge(b, d));
             g.add_edge(make_edge(c, d));
 
-            let order = topological_sort(&g).unwrap();
+            let (order, _) = topological_order(&g);
             // a must be first, d must be last
             assert_eq!(order[0], a);
             assert_eq!(order[3], d);

@@ -5,10 +5,10 @@
 //! new one, what type a stored parameter string becomes -- can be tested
 //! without a server.
 //!
-//! The graph itself is the only node bookkeeping here. The editor keeps a second
-//! representation because it has to draw one; this process has nothing to draw,
-//! so type ids, pins and positions are read back out of [`GraphExecutor::graph`]
-//! rather than mirrored beside it.
+//! The graph itself is the only node bookkeeping here. The editor keeps a
+//! second representation because it has to draw one; this process has nothing
+//! to draw, so type ids and pins are read back out of
+//! [`GraphExecutor::graph`] rather than mirrored beside it.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -16,14 +16,14 @@ use std::time::{Duration, Instant};
 
 use weida::Publisher;
 use zeughaus_core::{
-    DomainPlugin, EdgeData, EdgeId, EdgeSemantic, Image, NodeConfig, NodeData, NodeId,
-    PinDirection, Ty, TypeConverters, Value, encode_scalar, occupancy_winner,
+    DomainPlugin, EdgeData, EdgeId, Image, NodeData, NodeId, PinDirection, Ty, TypeConverters,
+    Value, encode_scalar, occupancy_winner,
 };
-use zeughaus_runtime::{DeferredWork, Graph, GraphEdge, GraphExecutor, GraphNode};
 use zeughaus_link::{
     ErrorRow, OutputRow, RejectionRow, RuntimeEvent, Snapshot, TOPIC_EDGE, TOPIC_ERROR,
     TOPIC_OUTPUT,
 };
+use zeughaus_runtime::{DeferredWork, GraphExecutor};
 use zeughaus_sync::{Store, SyncEvent};
 
 use crate::feed::FrameRegistry;
@@ -131,8 +131,7 @@ impl Runner {
             plugins.len()
         );
 
-        let mut executor = GraphExecutor::new(Graph::new());
-        executor.set_converters(converters);
+        let executor = GraphExecutor::new(converters);
 
         Self {
             store,
@@ -213,7 +212,7 @@ impl Runner {
         self.owner_epoch += 1;
         // Ownership was just inherited, so this process has never run this
         // graph: every node is stale.
-        for id in self.executor.graph.node_ids().collect::<Vec<_>>() {
+        for id in self.executor.graph().node_ids().collect::<Vec<_>>() {
             self.executor.mark_dirty(id);
         }
         // Nothing was published by this process, so its first pass republishes
@@ -429,7 +428,7 @@ impl Runner {
     /// twice.
     pub fn trigger(&mut self, node_id: u64) -> bool {
         let id = NodeId(node_id);
-        if !self.is_owner || self.executor.graph.node(id).is_none() {
+        if !self.is_owner || self.executor.graph().node(id).is_none() {
             eprintln!("[runner] ignoring trigger for {id}");
             return false;
         }
@@ -471,18 +470,14 @@ impl Runner {
 
     fn apply_node_upsert(&mut self, nd: NodeData) {
         let id = NodeId(nd.id);
-        if self.executor.graph.node(id).is_some() {
-            // Position has no bearing on execution, but the graph node carries
-            // it and a stale copy would be written back by anything that
-            // serializes the graph.
-            if let Some(gn) = self.executor.graph.node_mut(id) {
-                gn.position = (nd.x, nd.y);
-            }
+        if self.executor.graph().node(id).is_some() {
+            // A row is rewritten for reasons execution does not care about --
+            // a drag writes coordinates -- so only the parameters are applied.
             self.apply_params(id, &nd.type_id, &nd.params);
             return;
         }
 
-        let Some(exec) = self.plugins.iter().find_map(|p| p.create_node(&nd.type_id)) else {
+        let Some(node) = self.plugins.iter().find_map(|p| p.create_node(&nd.type_id)) else {
             if self.unknown_types.insert(nd.id) {
                 eprintln!(
                     "[runner] unknown node type '{}' for {id}: it will not execute here",
@@ -491,16 +486,8 @@ impl Runner {
             }
             return;
         };
-        let pin_defs = exec.pin_definitions().to_vec();
-        self.executor.graph.add_node(GraphNode {
-            id,
-            type_id: nd.type_id.clone(),
-            config: NodeConfig::default(),
-            pin_defs,
-            position: (nd.x, nd.y),
-        });
         // Marks the node dirty, so the pass after this batch runs it.
-        self.executor.register_node(id, exec);
+        self.executor.add_node(id, nd.type_id.clone(), node);
 
         // The node instance already holds its own setting defaults; the stored
         // params are the user's deviations from them.
@@ -513,33 +500,35 @@ impl Runner {
     /// settings -- a drag writes `x`/`y`, and the editor restates the whole
     /// parameter set on every keystroke -- and `set_parameter` marks the node
     /// and its entire downstream subtree dirty. Applying a value that did not
-    /// change therefore re-ran the node: one LLM request per keystroke in a
-    /// chat node's `model` field, one screen capture per drag. Diffing against
-    /// what this process last applied is what makes a move cost nothing.
+    /// change is therefore a re-run of the node: one LLM request per keystroke
+    /// in a chat node's `model` field, one screen capture per drag. Diffing
+    /// against what this process last applied is what makes a move cost
+    /// nothing.
+    ///
+    /// Every value reaches the node as the text the user typed. A node that
+    /// needs a number parses it and refuses what is not one (see
+    /// `SettingDef`), which is the one place that knows what its setting
+    /// means.
     fn apply_params(&mut self, id: NodeId, type_id: &str, params: &[(String, String)]) {
         let changed = self.applied_params.changed(id, params);
         if changed.is_empty() {
             return;
         }
         for (name, text) in changed {
-            // Two ways a value does not arrive: the text is not a value of the
-            // node's parameter type at all, or the node refuses it. Either way
-            // the node keeps what it had, which is a node whose setting on
-            // screen is not the setting it runs on -- so the editor that typed
-            // it, and every other window, is told which setting and why.
+            // A node that refuses the text keeps the value it had, which is a
+            // node whose setting on screen is not the setting it runs on -- so
+            // the editor that typed it, and every other window, is told which
+            // setting and why.
             //
             // Its own event rather than a node error: nothing failed, the node
             // goes on running with the value it kept, and raising the failure
-            // alarm for it put a red border around a working node and an
+            // alarm for it puts a red border around a working node and an
             // `ERROR:` line in every editor's status bar.
-            let refusal = match param_value(type_id, &text) {
-                None => Some(format!("{text:?} is not a value this node takes")),
-                Some(value) => self
-                    .executor
-                    .set_parameter(id, &name, value)
-                    .err()
-                    .map(|e| e.to_string()),
-            };
+            let refusal = self
+                .executor
+                .set_parameter(id, &name, Value::new(text.to_string()))
+                .err()
+                .map(|e| e.to_string());
             match refusal {
                 Some(message) => {
                     eprintln!("[runner] {id} ({type_id}) refused {name}={text:?}: {message}");
@@ -607,7 +596,7 @@ impl Runner {
 
     fn apply_edge_insert(&mut self, ed: EdgeData) {
         let edge_id = EdgeId(ed.id);
-        if self.executor.graph.edge(edge_id).is_some() {
+        if self.executor.graph().edge(edge_id).is_some() {
             return;
         }
         let from_node = NodeId(ed.from_node);
@@ -617,8 +606,8 @@ impl Runner {
         // names. Dropping it would lose that wire for the life of the process --
         // the row never changes again, so no second event would ever bring it
         // back -- hence it waits for its endpoints instead.
-        if self.executor.graph.node(from_node).is_none()
-            || self.executor.graph.node(to_node).is_none()
+        if self.executor.graph().node(from_node).is_none()
+            || self.executor.graph().node(to_node).is_none()
         {
             self.pending_edges.push(ed);
             return;
@@ -640,11 +629,11 @@ impl Runner {
         // then finds nothing left to do.
         let mut contenders: Vec<EdgeId> = self
             .executor
-            .graph
+            .graph()
             .incoming_edges(to_node)
             .filter(|eid| {
                 self.executor
-                    .graph
+                    .graph()
                     .edge(*eid)
                     .is_some_and(|e| e.to_pin == to_pin)
             })
@@ -660,25 +649,18 @@ impl Runner {
             }
         }
 
-        self.executor.graph.add_edge(GraphEdge {
-            id: edge_id,
-            from_node,
-            from_pin,
-            to_node,
-            to_pin,
-            semantic: EdgeSemantic::default(),
-        });
         // Seeds the edge from the source's cached output and dirties only the
         // target's subtree, so the source is not re-run (no duplicate LLM call
         // or capture just because a wire appeared).
-        self.executor.on_edge_added(edge_id);
+        self.executor
+            .add_edge(edge_id, from_node, from_pin, to_node, to_pin);
         // A variadic target (e.g. merge) grows an input once the last one fills.
         self.executor.sync_node_pins(to_node);
     }
 
     fn apply_edge_remove(&mut self, id: EdgeId) {
         self.pending_edges.retain(|ed| ed.id != id.0);
-        let to_node = self.executor.graph.edge(id).map(|e| e.to_node);
+        let to_node = self.executor.graph().edge(id).map(|e| e.to_node);
         self.executor.disconnect_edge(id);
         if let Some(to_node) = to_node {
             self.executor.sync_node_pins(to_node);
@@ -698,8 +680,8 @@ impl Runner {
         if !self.is_owner {
             return;
         }
-        for id in self.executor.graph.node_ids().collect::<Vec<_>>() {
-            let Some(node) = self.executor.graph.node(id) else {
+        for id in self.executor.graph().node_ids().collect::<Vec<_>>() {
+            let Some(node) = self.executor.graph().node(id) else {
                 continue;
             };
             let current: HashMap<String, (String, String)> = node
@@ -842,8 +824,8 @@ impl Runner {
         }
         let frame_ty = Ty::of::<Image>();
         let mut pins: Vec<(NodeId, &str, Option<&Image>)> = Vec::new();
-        for id in self.executor.graph.node_ids() {
-            let Some(node) = self.executor.graph.node(id) else {
+        for id in self.executor.graph().node_ids() {
+            let Some(node) = self.executor.graph().node(id) else {
                 continue;
             };
             for pin in &node.pin_defs {
@@ -883,35 +865,14 @@ impl Runner {
 
     fn log_size(&mut self) {
         let size = (
-            self.executor.graph.node_count(),
-            self.executor.graph.edge_count(),
+            self.executor.graph().node_count(),
+            self.executor.graph().edge_count(),
         );
         if size == self.logged_size {
             return;
         }
         self.logged_size = size;
         eprintln!("[runner] graph: {} nodes, {} edges", size.0, size.1);
-    }
-}
-
-/// The value a stored parameter string becomes for a node of this type.
-///
-/// Const nodes carry their payload as text in `params`, so it has to be parsed
-/// back into the type their output pin declares: a `const_f64` handed a string
-/// would emit a string, and every coercion downstream of it would be working
-/// from a lie. Everything else takes settings as text, which is what a
-/// `SettingDef` promises its node.
-///
-/// `None` means the text is not a value of that type at all (`"abc"` as an
-/// f64). The parameter is then skipped, leaving the node at its previous value
-/// rather than silently substituting zero -- the editor shows the text the user
-/// is still typing, and a half-typed number must not become one.
-fn param_value(type_id: &str, text: &str) -> Option<Value> {
-    match type_id {
-        "transform.const_f64" => text.parse::<f64>().ok().map(Value::new),
-        // Any other text is false, matching the editor's checkbox round-trip.
-        "transform.const_bool" => Some(Value::new(text == "true" || text == "1")),
-        _ => Some(Value::new(text.to_string())),
     }
 }
 
@@ -1009,10 +970,10 @@ fn error_changes(
 /// baseline the next pass is diffed against, and the snapshot a late joiner is
 /// served.
 ///
-/// One type because the two must not disagree. As separate fields they did: a
-/// removed node was dropped from the baseline, the next pass had nothing to
-/// say about a node the graph no longer holds, and the snapshot kept serving
-/// its outputs to every editor that joined afterwards.
+/// One type because the two must not disagree. Kept apart they would: a
+/// removed node drops out of the baseline, the next pass has nothing to say
+/// about a node the graph does not hold, and a snapshot of its own would go
+/// on serving that node's outputs to every editor joining afterwards.
 ///
 /// Failures are held beside the values for exactly that reason: an editor
 /// joining late has to be told which nodes are broken by the same snapshot
@@ -1172,10 +1133,10 @@ mod tests {
     }
 
     /// A late editor is served the snapshot, so it must say exactly what the
-    /// diff baseline says. A node that was removed is the case that broke: the
-    /// next pass has nothing to report about a node the graph no longer holds,
-    /// so if the snapshot kept its rows, every editor joining afterwards saw
-    /// the outputs of a node that does not exist.
+    /// diff baseline says. A removed node is the case that decides it: the
+    /// next pass has nothing to report about a node the graph no longer
+    /// holds, so a snapshot keeping its rows would serve the outputs of a
+    /// node that does not exist to every editor joining afterwards.
     #[test]
     fn forgetting_a_node_takes_its_outputs_out_of_the_snapshot() {
         let snapshot = Mutex::new(Snapshot::default());
@@ -1230,44 +1191,6 @@ mod tests {
         published.forget(NodeId(99));
         published.flush(9, &snapshot);
         assert_eq!(snapshot.lock().expect("snapshot").seq, 5);
-    }
-
-    #[test]
-    fn const_f64_param_parses_to_float() {
-        let value = param_value("transform.const_f64", "1.5").expect("parsable float");
-        assert_eq!(value.downcast_ref::<f64>(), Some(&1.5));
-    }
-
-    #[test]
-    fn unparsable_const_f64_param_is_skipped() {
-        assert!(param_value("transform.const_f64", "1.").is_some());
-        assert!(param_value("transform.const_f64", "").is_none());
-        assert!(param_value("transform.const_f64", "abc").is_none());
-    }
-
-    #[test]
-    fn const_bool_param_parses_to_bool() {
-        for text in ["true", "1"] {
-            let value = param_value("transform.const_bool", text).expect("bool");
-            assert_eq!(value.downcast_ref::<bool>(), Some(&true));
-        }
-        for text in ["false", "0", ""] {
-            let value = param_value("transform.const_bool", text).expect("bool");
-            assert_eq!(value.downcast_ref::<bool>(), Some(&false));
-        }
-    }
-
-    #[test]
-    fn const_string_param_stays_text() {
-        let value = param_value("transform.const_string", "42").expect("string");
-        assert_eq!(value.downcast_ref::<String>(), Some(&"42".to_string()));
-    }
-
-    #[test]
-    fn setting_of_any_other_node_stays_text() {
-        // A setting is a string by contract, even when it reads like a number.
-        let value = param_value("llm.chat", "0.7").expect("setting");
-        assert_eq!(value.downcast_ref::<String>(), Some(&"0.7".to_string()));
     }
 
     fn params(pairs: &[(&str, &str)]) -> Vec<(String, String)> {

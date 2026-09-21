@@ -1,22 +1,13 @@
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
-
 use crate::pin::PinDefinition;
-
-/// Per-node configuration. `capture` is reserved for opt-in result
-/// persistence to database (see DESIGN.md). Not yet implemented.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct NodeConfig {
-    pub capture: bool,
-}
 
 /// How the editor renders a setting.
 ///
 /// A hint, not a type: the value is always the same string that reaches the
 /// store and the node's `set_parameter`. Nothing behind the editor learns
 /// which widget the user typed into.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SettingKind {
     /// One line of text.
     Text,
@@ -89,7 +80,7 @@ pub fn renamed_field(before: &str, after: &str) -> Option<(String, String)> {
 /// An editable setting rendered directly inside the node widget.
 /// Distinct from input pins: settings are node-local configuration the user
 /// types (e.g. an LLM base URL or model name), persisted as node parameters.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SettingDef {
     pub name: Arc<str>,
     pub default: Arc<str>,
@@ -140,7 +131,7 @@ impl SettingDef {
 /// The identifying strings are owned rather than `&'static str`: node types are
 /// not necessarily authored in Rust (a subgraph saved by the user is a node type
 /// too), so the catalog has to be extensible at runtime.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NodeDefinition {
     pub type_id: Arc<str>,
     pub display_name: Arc<str>,
