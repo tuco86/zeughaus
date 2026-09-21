@@ -32,7 +32,7 @@ use std::time::Instant;
 use tokio::sync::watch;
 use weida::{IncomingRequest, OutgoingTransfer, Replier, TransferMeta};
 use zeughaus_core::{Image, NodeId};
-use zeughaus_samples::{FeedRequest, FrameHeader, MAX_DIMENSION, ladder, scale_to_fit};
+use zeughaus_link::{FeedRequest, FrameHeader, MAX_DIMENSION, ladder, scale_to_fit};
 
 /// Largest [`FeedRequest`] this server will read.
 ///

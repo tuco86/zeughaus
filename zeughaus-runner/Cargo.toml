@@ -7,9 +7,9 @@ edition.workspace = true
 zeughaus-core.workspace = true
 zeughaus-runtime.workspace = true
 zeughaus-sync.workspace = true
-# The wire format of the sample feed. Shared with the editor so the two ends
-# cannot disagree about the protocol.
-zeughaus-samples.workspace = true
+# The runner<->editor protocol over weida and the credentials both ends present.
+# Shared with the editor so the two ends cannot disagree about it.
+zeughaus-link.workspace = true
 # Every plugin the editor offers natively must be instantiable here: the editor
 # only draws a node, this process is the one that runs it. A node type missing
 # from the runner is a node that silently never executes.

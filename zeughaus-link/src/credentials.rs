@@ -1,13 +1,12 @@
 //! The weida credentials both processes keep on disk: who the runner is, and
 //! who is allowed to talk to it.
 //!
-//! The sample feed used to mint a server identity per start, which is fine for
-//! a viewer that reads the announced URL after every restart and pins whatever
-//! fingerprint it finds there. A terminal is not fine with it: a pinned URL
-//! that changes on restart breaks weida's transparent redial, and shell access
-//! must be authorized rather than merely encrypted. So the runner's identity
-//! lives in a file, its fingerprint survives a restart, and the runner only
-//! accepts clients whose public keys it already knows.
+//! The runner's identity lives in a file so its fingerprint survives a
+//! restart: the announced URL pins that fingerprint, and a pin that changed on
+//! every start would break weida's transparent redial. And because the same
+//! listener hands out shells, access is authorized rather than merely
+//! encrypted: the runner only accepts clients whose public keys it already
+//! knows.
 //!
 //! Two files under one owner-only directory:
 //!

@@ -1,22 +1,9 @@
-//! The weida wire format: how a runtime's samples and its runtime events reach
-//! an editor.
+//! The sample feed: how a runtime's frames reach an editor.
 //!
-//! Graph state travels through SpacetimeDB, but nothing a pass produces does: a
-//! 3840x2160 RGBA frame is 33 MB, and a value that changes at frame rate is not
-//! what a state store is for. Both travel over the runtime's own QUIC
-//! connection instead, and this crate is the wire format both ends speak --
-//! pure data and pure pixel math, no I/O, so the runtime's server and the
-//! editor's client cannot disagree about the protocol.
-//!
-//! [`FeedRequest`] and [`FrameHeader`] are the sample feed; [`events`] is the
-//! runtime's report of a pass (outputs, edge traffic, snapshots) and the
-//! trigger presses travelling the other way.
-//!
-//! # Shape
-//!
-//! One feed is one long-lived exchange: the viewer sends a [`FeedRequest`] once,
-//! naming the node, the pin and the size it will actually draw, and the runtime
-//! then writes [`FrameHeader`]-prefixed frames until the viewer stops reading.
+//! One feed is one long-lived exchange on [`FEED_PATH`](crate::FEED_PATH): the
+//! viewer sends a [`FeedRequest`] once, naming the node, the pin and the size
+//! it will actually draw, and the runtime then writes [`FrameHeader`]-prefixed
+//! frames until the viewer stops reading.
 //!
 //! That is a standing request rather than one request per repaint, because a
 //! video signal at display rate would otherwise pay a round trip per frame --
@@ -35,40 +22,8 @@
 //! Sizes snap to a [`ladder`] of tiers so two viewers of similar size share one
 //! scaled result instead of each paying for their own.
 
-// The credentials both ends of that transport authenticate with. Here because
-// runner and editor must agree on the files down to their location: a client
-// key the runner never pinned is refused, and a runner identity the editor
-// cannot find makes every feed anonymous.
-pub mod credentials;
-pub mod events;
-
 use serde::{Deserialize, Serialize};
 use zeughaus_core::Image;
-
-pub use events::{
-    ErrorRow, MAX_EVENT_BYTES, MAX_SNAPSHOT_BYTES, MAX_TRIGGER_BYTES, OutputRow, RejectionRow,
-    RuntimeEvent, Snapshot, TOPIC_EDGE, TOPIC_ERROR, TOPIC_OUTPUT, TriggerRequest,
-};
-
-/// The endpoint a viewer dials for frames. Opaque to weida and matched
-/// exactly, so it is the same string on both sides or nothing works.
-pub const FEED_PATH: &str = "/samples";
-
-/// Pub/Sub endpoint carrying runtime events (outputs and edge traffic).
-pub const EVENTS_PATH: &str = "/events";
-
-/// Req/Rep endpoint a late-joining editor asks for the current output set.
-pub const SNAPSHOT_PATH: &str = "/snapshot";
-
-/// Push/Pull endpoint an editor pushes manual trigger presses to.
-pub const TRIGGERS_PATH: &str = "/triggers";
-
-/// Req/Rep endpoint carrying every terminal-mux exchange: the control
-/// stream, one stream per attached terminal and the short scrollback
-/// fetches. One path so weida pools them onto one QUIC connection -- the
-/// pool key includes the path, so splitting them would cost a handshake
-/// each and a warm attach would stop being warm.
-pub const MUX_PATH: &str = "/mux";
 
 /// What a viewer asks for: one node's output pin, at the size it will draw.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

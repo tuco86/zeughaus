@@ -25,7 +25,7 @@ use weida::{
     Binding, EndpointAddr, Fingerprint, Listener, Puller, Replier, Runtime, RuntimeConfig,
     ServerTls, TransferMeta, Trust,
 };
-use zeughaus_samples::{MAX_TRIGGER_BYTES, Snapshot, TriggerRequest, credentials};
+use zeughaus_link::{MAX_TRIGGER_BYTES, Snapshot, TriggerRequest, credentials};
 
 /// A bound weida listener, the pinned URL that reaches it, and whom it lets in.
 pub struct Transport {
@@ -250,7 +250,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use weida::{ClientTls, Trust};
-    use zeughaus_samples::SNAPSHOT_PATH;
+    use zeughaus_link::SNAPSHOT_PATH;
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 

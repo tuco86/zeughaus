@@ -20,7 +20,7 @@ use zeughaus_core::{
     PinDirection, Ty, TypeConverters, Value, encode_scalar, occupancy_winner,
 };
 use zeughaus_runtime::{DeferredWork, Graph, GraphEdge, GraphExecutor, GraphNode};
-use zeughaus_samples::{
+use zeughaus_link::{
     ErrorRow, OutputRow, RejectionRow, RuntimeEvent, Snapshot, TOPIC_EDGE, TOPIC_ERROR,
     TOPIC_OUTPUT,
 };

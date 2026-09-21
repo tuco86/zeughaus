@@ -22,7 +22,7 @@ use weida::{
     ClientTls, EndpointAddr, GiveUp, PeerEvent, PeerEvents, ReconnectPolicy, Runtime,
     RuntimeConfig, Trust,
 };
-use zeughaus_samples::credentials;
+use zeughaus_link::credentials;
 
 /// The one QUIC client this process needs.
 ///

@@ -1,5 +1,5 @@
 [package]
-name = "zeughaus-samples"
+name = "zeughaus-link"
 version.workspace = true
 edition.workspace = true
 

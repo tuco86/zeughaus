@@ -7938,12 +7938,12 @@ dependencies = [
  "zeughaus-db",
  "zeughaus-flow",
  "zeughaus-graph",
+ "zeughaus-link",
  "zeughaus-llm",
  "zeughaus-ml",
  "zeughaus-mux",
  "zeughaus-record",
  "zeughaus-runtime",
- "zeughaus-samples",
  "zeughaus-sync",
  "zeughaus-transform",
 ]
@@ -7994,6 +7994,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeughaus-link"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "weida",
+ "zeughaus-core",
+]
+
+[[package]]
 name = "zeughaus-llm"
 version = "0.1.0"
 dependencies = [
@@ -8040,12 +8050,12 @@ dependencies = [
  "zeughaus-db",
  "zeughaus-flow",
  "zeughaus-graph",
+ "zeughaus-link",
  "zeughaus-llm",
  "zeughaus-ml",
  "zeughaus-mux",
  "zeughaus-record",
  "zeughaus-runtime",
- "zeughaus-samples",
  "zeughaus-sync",
  "zeughaus-terminal",
  "zeughaus-transform",
@@ -8058,16 +8068,6 @@ dependencies = [
  "serde_json",
  "zeughaus-core",
  "zeughaus-transform",
-]
-
-[[package]]
-name = "zeughaus-samples"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "weida",
- "zeughaus-core",
 ]
 
 [[package]]

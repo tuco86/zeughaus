@@ -39,7 +39,7 @@ use zeughaus_mux::{
     RowFetch, RowPage, RunnerIncarnation, ServerHello, TerminalAttach, TerminalCommand,
     TerminalHead, WireError, WorkspaceSnapshot,
 };
-use zeughaus_samples::MUX_PATH;
+use zeughaus_link::MUX_PATH;
 
 use crate::transport::{Endpoint, QUIC, client_tls, explain, first_dial, policy};
 

@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use zeughaus_core::{NodeId, Value, ZeughausError};
 use zeughaus_runtime::DeferredWork;
-use zeughaus_samples::{
+use zeughaus_link::{
     EVENTS_PATH, FEED_PATH, MUX_PATH, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, credentials,
 };
 use zeughaus_sync::Role;

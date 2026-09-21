@@ -14,7 +14,7 @@ members = [
     "zeughaus-db",
     "zeughaus-record",
     "zeughaus-sync",
-    "zeughaus-samples",
+    "zeughaus-link",
     "zeughaus-runner",
     "zeughaus-mux",
     "zeughaus-terminal",
@@ -41,9 +41,12 @@ zeughaus-graph = { path = "zeughaus-graph" }
 zeughaus-db = { path = "zeughaus-db" }
 zeughaus-record = { path = "zeughaus-record" }
 zeughaus-sync = { path = "zeughaus-sync" }
-zeughaus-samples = { path = "zeughaus-samples" }
-# The QUIC sample transport lives in a sibling checkout: frames are streams, and
-# a state store is the wrong pipe for 33 MB per frame.
+# What travels between a runner and its editors over weida, and the identities
+# both ends present: the sample feed, runtime events, path constants and the
+# credentials on disk. Frames are streams, and a state store is the wrong pipe
+# for 33 MB per frame, so this is its own transport. The QUIC transport itself
+# lives in a sibling checkout.
+zeughaus-link = { path = "zeughaus-link" }
 weida = { path = "../weida/crates/weida" }
 zeughaus-runner = { path = "zeughaus-runner" }
 # The terminal multiplexer's wire model, shared by runner and editor (wasm

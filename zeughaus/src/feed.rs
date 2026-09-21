@@ -26,7 +26,7 @@ use iced::futures::{SinkExt, Stream};
 use tokio::io::AsyncReadExt;
 use weida::{PeerEvent, PeerEvents, Requester, TransferMeta};
 use zeughaus_core::Image;
-use zeughaus_samples::{
+use zeughaus_link::{
     EVENTS_PATH, FEED_PATH, FeedRequest, FrameHeader, MAX_EVENT_BYTES, MAX_SNAPSHOT_BYTES,
     RuntimeEvent, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, TriggerRequest, ladder,
 };
@@ -634,7 +634,7 @@ mod tests {
             for _ in 0..100 {
                 if self.publisher.subscriber_count() > 0 {
                     self.publisher
-                        .publish(zeughaus_samples::TOPIC_EDGE, event.encode())
+                        .publish(zeughaus_link::TOPIC_EDGE, event.encode())
                         .expect("publish");
                     return;
                 }

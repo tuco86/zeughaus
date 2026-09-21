@@ -1578,7 +1578,7 @@ impl App {
     #[cfg(not(target_arch = "wasm32"))]
     fn apply_traffic(&mut self, epoch: u64, traffic: crate::feed::Traffic) {
         use crate::feed::Traffic;
-        use zeughaus_samples::RuntimeEvent;
+        use zeughaus_link::RuntimeEvent;
 
         // A task that has been replaced may still have messages queued: its
         // snapshot would clear the values the current runtime just delivered.
