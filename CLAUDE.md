@@ -39,6 +39,7 @@ zeughaus-db/           # plugin: Database container, Table, Insert, Query, SQL; 
 zeughaus-record/       # plugin: Recorder (frames + values to disk) and Player (the same dataset as a source)
 iced_terminal/         # the terminal widget: one wgpu primitive per pane, bundled ComicShannsMono Nerd Font
 iced_tabs/             # the tab bar the workspace shell uses
+vm/win11/              # scripts: headless Windows 11 guest under QEMU/KVM, the reference for a VM-hosted runner (not wired)
 ```
 
 Sibling checkouts this workspace depends on by path: `../iced_nodegraph`

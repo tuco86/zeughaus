@@ -385,9 +385,71 @@ Kept here so they are not mistaken for descriptions of the code:
 
 - Staged deployment of graph versions (draft / staged / deployed).
 - Placement of nodes across several runners; today the owner runs everything.
+  The shape it will take: one runner per machine, each keeping the logs and
+  artifacts of the runs it executed and serving them itself; routing between
+  runners and editors goes over the weida broker, not the store.
 - Opt-in per-node capture of results into a database; the recorder plugin
   writes datasets to disk instead.
 - Queue semantics on edges; every edge is last-value.
 - Rich per-type inspection widgets on edges; nodes show text or a frame.
 - A browser editor that syncs with the store; the wasm build edits locally.
 - Terminal image protocols; the wire model reserves kinds for them.
+
+### Jobs: decided, not built
+
+The runner is to execute processes with a beginning and an end (CI steps,
+all-night agent sessions) inside the mux it already owns, so a failed job is
+a terminal to attach to, not a log to read. Decisions taken; the order is
+roughly the build order.
+
+- **A job is a node** (`zeughaus-job`, plugin `job`): settings `command`,
+  `args`, `env` (additions to the runner's environment), `cwd`,
+  `artifacts` (globs), `keep_on_failure` (default on). Pins: `run: Event`
+  in; `ok: Event`, `failed: Event<i32>`, `run: Path` (the run directory)
+  out. The mux stays argv-free: `TopologyCommand` never carries a command,
+  the graph does. The plugin defines `trait ProcessHost` (spawn, kill,
+  held); the runner implements it over its `MuxService`, the editor
+  registers the plugin detached (catalog only, it never executes).
+- **One run at a time per node.** A trigger while a run is live is refused
+  and reported as a node error; a queue depth is a later setting. Fan-in is a
+  `flow` node that fires once every input has fired. Parallel runs of one
+  pipeline (per-trigger instantiation of a subgraph) are the step that would
+  answer "queue semantics on edges" and are not planned before they are
+  needed.
+- **The log is a file on the runner.** The PTY bytes of a run are teed to
+  `<state-dir>/runs/<run-id>/log`, exit code and timestamps to `exit`,
+  declared artifacts copied to `artifacts/` after exit. The store gets a run
+  row (node, runner, start, end, exit, path), never bytes. Editors fetch a
+  run's files over a `zeughaus-link` path on the runner that produced them.
+  Failed runs stay until deleted; retention for the rest is runner
+  configuration.
+- **A job's terminal has no pane until someone attaches.** Terminal lifetime
+  is separated from pane lifetime: `Hello` lists unattached terminals, a new
+  `AttachTerminal` topology command gives one a pane, closing that pane
+  detaches and does not kill. On failure with `keep_on_failure` the runner
+  starts a shell in the same cwd and environment in the run's terminal.
+- **Jobs die with the runner; the runner drains.** Stopping waits for live
+  runs and accepts no new ones. A shim process per run that owns the PTY and
+  the log, survives a runner restart and is reattached by replaying the log
+  file into `wezterm-term`, is the later design that this log format keeps
+  possible.
+- **Triggers come through weida only.** `TriggerRequest` on `/triggers`
+  gains a payload; a `zeughaus trigger <node> [json]` command sends one with
+  the client identity. Webhooks (Gitea) land on the weida broker once it
+  speaks HTTP and are relayed; no listener and no polling in the runner.
+- **Explicit hold.** A runner command over weida (`hold [duration]`,
+  `release`), visible in the store; a held runner starts no jobs and lets
+  running ones finish. `freeze` (SIGSTOP / cgroup freezer) as a per-node
+  policy and automatic detection (game running, user idle, GPU busy) are
+  later.
+- **Secrets** use weida's wrapped-secret flow: a run receives one refreshable
+  token, orders child tokens per service through it, and the end of the run
+  invalidates the token and every child. Nothing secret-shaped in the store
+  or in node settings.
+- **Workspaces** are just `cwd` for now; caches live per runner under its
+  state directory. Checkout and btrfs-snapshot nodes that produce a `Path`
+  for `cwd` come when a cold `target/` per run hurts.
+- **VM guests** are one more machine with its own runner. `vm/win11/` is the
+  reference QEMU lifecycle for a headless Windows 11 guest (unattended
+  install to a read-only golden image, overlay boot, ssh, guest agent);
+  booting it on demand from a job is not wired.
