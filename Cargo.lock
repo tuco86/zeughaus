@@ -7938,6 +7938,7 @@ dependencies = [
  "zeughaus-db",
  "zeughaus-flow",
  "zeughaus-graph",
+ "zeughaus-job",
  "zeughaus-link",
  "zeughaus-llm",
  "zeughaus-ml",
@@ -7989,6 +7990,14 @@ dependencies = [
 name = "zeughaus-graph"
 version = "0.1.0"
 dependencies = [
+ "zeughaus-core",
+]
+
+[[package]]
+name = "zeughaus-job"
+version = "0.1.0"
+dependencies = [
+ "glob",
  "zeughaus-core",
 ]
 
@@ -8049,6 +8058,7 @@ dependencies = [
  "zeughaus-db",
  "zeughaus-flow",
  "zeughaus-graph",
+ "zeughaus-job",
  "zeughaus-link",
  "zeughaus-llm",
  "zeughaus-ml",

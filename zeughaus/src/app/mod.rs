@@ -234,6 +234,9 @@ impl App {
             Box::new(zeughaus_record::RecordPlugin),
             #[cfg(not(target_arch = "wasm32"))]
             Box::new(LlmPlugin),
+            // Detached: a job node is drawn and configured here and executed
+            // by a runner, so the plugin is registered for its catalog alone.
+            Box::new(zeughaus_job::JobPlugin::detached()),
         ];
         let catalog: Vec<NodeDefinition> = plugins.iter().flat_map(|p| p.node_catalog()).collect();
 
@@ -297,7 +300,9 @@ impl App {
             current_graph: NodeId(0),
             cameras: HashMap::new(),
             plugins,
-            palette_commands: palette::build_commands(&catalog),
+            // Nothing is attached yet: the runner's half of the palette is
+            // filled in by the first workspace snapshot.
+            palette_commands: palette::build_commands(&catalog, &palette::RunnerState::default()),
             catalog,
             converters,
             display_values: HashMap::new(),
@@ -469,6 +474,30 @@ impl App {
         self.palette_open = false;
         self.palette_input.clear();
         self.palette_selected = 0;
+    }
+
+    /// Rebuilds the palette's command list.
+    ///
+    /// The catalog half is fixed at startup; the runner's half is not -- its
+    /// detached terminals come and go with every workspace snapshot, and
+    /// whether it can be held at all depends on an endpoint being known. Per
+    /// snapshot, not per redraw: a structural change is rare, a redraw is not.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn rebuild_palette(&mut self) {
+        // Never under an open palette: the selection is an index into this
+        // list, and a snapshot arriving mid-search would move the entry the
+        // next Enter runs. Opening it rebuilds first.
+        if self.palette_open {
+            return;
+        }
+        let commands = palette::build_commands(
+            &self.catalog,
+            &palette::RunnerState {
+                detached: self.workspace.detached(),
+                reachable: self.runtime.endpoint.is_some(),
+            },
+        );
+        self.palette_commands = commands;
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -708,6 +737,9 @@ impl App {
             }
             // Palette
             Message::TogglePalette => {
+                // Current before it is shown; see `rebuild_palette`.
+                #[cfg(not(target_arch = "wasm32"))]
+                self.rebuild_palette();
                 self.palette_open = !self.palette_open;
                 if self.palette_open {
                     self.palette_input.clear();
@@ -856,6 +888,48 @@ impl App {
                     self.last_error =
                         "no session (start `spacetime start` to host one)".to_string();
                 }
+            }
+            // One of the runner's own terminals, shown in a tab or killed.
+            // The answer is the next workspace snapshot, so nothing about the
+            // structure is applied here.
+            Message::AttachTerminal(terminal) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                self.send_topology(zeughaus_mux::TopologyCommand::AttachTerminal {
+                    terminal,
+                    target: zeughaus_mux::AttachTarget::NewTab,
+                });
+                #[cfg(target_arch = "wasm32")]
+                let _ = terminal;
+            }
+            Message::CloseTerminal(terminal) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                self.send_topology(zeughaus_mux::TopologyCommand::CloseTerminal { terminal });
+                #[cfg(target_arch = "wasm32")]
+                let _ = terminal;
+            }
+            Message::HoldRunner(held) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let Some(endpoint) = self.runtime.endpoint.clone() else {
+                        self.last_error = "no runner to hold".to_string();
+                        return Task::none();
+                    };
+                    return Task::perform(feed::hold(endpoint, held), Message::HoldReplied);
+                }
+                #[cfg(target_arch = "wasm32")]
+                let _ = held;
+            }
+            // Said where the palette says everything else it did: a hold is
+            // worth one line, and the run count is what the next one changes.
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::HoldReplied(reply) => {
+                self.last_error = match reply {
+                    Ok(reply) if reply.held => {
+                        format!("runner held; {} run(s) still live", reply.live_runs)
+                    }
+                    Ok(reply) => format!("runner released; {} run(s) live", reply.live_runs),
+                    Err(e) => e,
+                };
             }
             // File dialogs are native-only (rfd). On wasm these are no-ops;
             // persistence goes through the SpacetimeDB store instead.

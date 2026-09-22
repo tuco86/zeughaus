@@ -37,6 +37,7 @@ zeughaus-llm/          # plugin: Conversation nodes against an LM Studio endpoin
 zeughaus-capture/      # plugin: Screen Capture (xdg-desktop-portal on Wayland, scrap otherwise)
 zeughaus-db/           # plugin: Database container, Table, Insert, Query, SQL; schemas drawn in the graph (SQLite)
 zeughaus-record/       # plugin: Recorder (frames + values to disk) and Player (the same dataset as a source)
+zeughaus-job/          # plugin: Job (a process in a runner-owned terminal, log per run under the state dir) and the ProcessHost trait the runner implements
 iced_terminal/         # the terminal widget: one wgpu primitive per pane, bundled ComicShannsMono Nerd Font
 iced_tabs/             # the tab bar the workspace shell uses
 vm/win11/              # scripts: headless Windows 11 guest under QEMU/KVM, the reference for a VM-hosted runner (not wired)
@@ -72,11 +73,14 @@ remote editor needs `client.pem` copied into its own state directory. An
 editor without a store edits a local scratch graph and shows no values.
 
 In the editor: `Ctrl+Space` opens the command palette (spawn nodes, save/load
-a `.zgh` file, auto layout, copy the session token). `+` opens a terminal
-tab, `H`/`V` split a pane with a terminal, `x` closes one and kills its
-child; `Ctrl+Shift+T` takes control of a terminal someone else drives,
-`Ctrl+Shift+C`/`V` copy and paste, `Ctrl+Shift+Escape` gives the keyboard
-back to the app.
+a `.zgh` file, auto layout, copy the session token, attach or close a job's
+terminal, hold or release the runner). `+` opens a terminal tab, `H`/`V`
+split a pane with a terminal, `x` closes one and kills its child (a job's
+terminal is only detached); `Ctrl+Shift+T` takes control of a terminal
+someone else drives, `Ctrl+Shift+C`/`V` copy and paste, `Ctrl+Shift+Escape`
+gives the keyboard back to the app. A `Job` node runs `command` with `args`
+when its `run` pin fires or it is pressed; a failed run keeps its terminal
+for attaching, every run keeps `<state-dir>/runs/<id>/log`.
 
 ## Development Workflow
 

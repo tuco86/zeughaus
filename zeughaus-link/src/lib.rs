@@ -8,7 +8,7 @@
 //! pure pixel math, no I/O, so the runtime's server and the editor's client
 //! cannot disagree about the protocol.
 //!
-//! One listener, five paths, each a different weida pattern:
+//! One listener, seven paths, each a different weida pattern:
 //!
 //! | path | pattern | carries |
 //! |---|---|---|
@@ -16,6 +16,8 @@
 //! | [`EVENTS_PATH`] | pub/sub | [`events`]: outputs, node errors, edge traffic |
 //! | [`SNAPSHOT_PATH`] | req/rep | [`events::Snapshot`] for a late joiner |
 //! | [`TRIGGERS_PATH`] | push/pull | [`events::TriggerRequest`] from an editor |
+//! | [`RUNS_PATH`] | req/rep | [`runs`]: a range of one file of one run |
+//! | [`HOLD_PATH`] | req/rep | [`runs::HoldRequest`]: start no new runs |
 //! | [`MUX_PATH`] | req/rep exchanges | the terminal mux (`zeughaus-mux`) |
 //!
 //! [`credentials`] is the part both ends must agree on before any of that: the
@@ -24,6 +26,7 @@
 pub mod credentials;
 pub mod events;
 pub mod feed;
+pub mod runs;
 
 pub use events::{
     ErrorRow, MAX_EVENT_BYTES, MAX_SNAPSHOT_BYTES, MAX_TRIGGER_BYTES, OutputRow, RejectionRow,
@@ -31,6 +34,10 @@ pub use events::{
 };
 pub use feed::{
     FeedRequest, FrameHeader, MAX_DIMENSION, MAX_SAMPLES_PER_AXIS, ladder, scale_to_fit,
+};
+pub use runs::{
+    HoldReply, HoldRequest, MAX_HOLD_BYTES, MAX_RUN_CHUNK_BYTES, MAX_RUN_REPLY_BYTES,
+    MAX_RUN_REQUEST_BYTES, RunFileReply, RunFileRequest,
 };
 
 /// The endpoint a viewer dials for frames. Opaque to weida and matched
@@ -45,6 +52,15 @@ pub const SNAPSHOT_PATH: &str = "/snapshot";
 
 /// Push/Pull endpoint an editor pushes manual trigger presses to.
 pub const TRIGGERS_PATH: &str = "/triggers";
+
+/// Req/Rep endpoint an editor fetches a run's files from: its log, its exit
+/// record and its artifacts. On the runner that produced the run, because
+/// that is the only process that holds the bytes.
+pub const RUNS_PATH: &str = "/runs";
+
+/// Req/Rep endpoint that holds and releases the runner: held, it starts no
+/// new run and lets the live ones finish.
+pub const HOLD_PATH: &str = "/hold";
 
 /// Req/Rep endpoint carrying every terminal-mux exchange: the control
 /// stream, one stream per attached terminal and the short scrollback

@@ -50,4 +50,7 @@ pub use terminal::{
     RowData, StableRange, StyleFlags, TerminalDelta, TerminalEvent, TerminalHead, Underline,
     WireColor,
 };
-pub use workspace::{Axis, PaneNode, SurfaceRef, TabSnapshot, TopologyCommand, WorkspaceSnapshot};
+pub use workspace::{
+    AttachTarget, Axis, DetachedTerminal, PaneNode, SurfaceRef, TabSnapshot, TopologyCommand,
+    WorkspaceSnapshot,
+};

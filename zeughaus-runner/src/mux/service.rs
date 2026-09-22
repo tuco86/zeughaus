@@ -127,6 +127,51 @@ impl MuxService {
         }
     }
 
+    /// Starts a terminal the runner owns: a job's process, not a pane's
+    /// shell. No pane shows it until a client attaches it, and closing that
+    /// pane detaches it again instead of ending the child; only
+    /// [`MuxService::close_terminal`] and the runner's exit do that.
+    ///
+    /// `tee` receives a copy of every byte the program writes, which is how
+    /// a run's log is recorded.
+    pub fn spawn_owned(
+        &self,
+        profile: Profile,
+        tee: Option<Box<dyn std::io::Write + Send>>,
+    ) -> Result<TerminalId, String> {
+        let id = TerminalId(self.inner.next_terminal.fetch_add(1, Ordering::Relaxed));
+        let session = Session::spawn_teed(id, &profile, Dimensions { cols: 80, rows: 24 }, tee)
+            .map_err(|e| format!("cannot start {}: {e}", profile.label))?;
+        let revision = {
+            // The lock order is the one `snapshot` takes: sessions, then
+            // the workspace.
+            let mut sessions = self
+                .inner
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            sessions.insert(id, session);
+            let mut workspace = self
+                .inner
+                .workspace
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            workspace.add_owned(id);
+            workspace.revision()
+        };
+        self.inner.revision.send_replace(revision);
+        Ok(id)
+    }
+
+    /// Ends a terminal the runner owns and forgets it, whether a pane shows
+    /// it or not. The same path a client's `CloseTerminal` takes.
+    pub fn close_terminal(&self, terminal: TerminalId) -> Result<(), String> {
+        match self.structural(&TopologyCommand::CloseTerminal { terminal }) {
+            CommandOutcome::Applied { .. } => Ok(()),
+            CommandOutcome::Refused { reason } => Err(reason),
+        }
+    }
+
     /// Accepts exchanges until the replier goes away, which for this process
     /// means never.
     pub async fn accept(self, replier: Replier) {
@@ -554,7 +599,8 @@ impl MuxService {
         snapshot
     }
 
-    fn session(&self, terminal: TerminalId) -> Option<Session> {
+    /// The session behind a terminal id, if it still exists.
+    pub fn session(&self, terminal: TerminalId) -> Option<Session> {
         self.inner
             .sessions
             .lock()
@@ -765,7 +811,8 @@ mod tests {
     use weida::{ClientTls, EndpointAddr, Identity, Runtime, RuntimeConfig, ServerTls, Trust};
     use zeughaus_mux::input::Key;
     use zeughaus_mux::{
-        Axis, KeyInput, Modifiers, NamedKey, PaneId, PaneNode, SurfaceRef, TerminalEvent,
+        AttachTarget, Axis, KeyInput, Modifiers, NamedKey, PaneId, PaneNode, SurfaceRef,
+        TerminalEvent,
     };
 
     struct Client {
@@ -1437,5 +1484,75 @@ mod tests {
             head.rows.len(),
             bytes.len()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_terminal_the_runner_owns_is_listed_attached_and_only_closed_on_demand() {
+        let (service, runtime, _binding, url, identity) = setup().await;
+        let job = service
+            .spawn_owned(
+                Profile {
+                    label: "job".into(),
+                    program: Some("/bin/sh".into()),
+                    args: vec!["-c".into(), "sleep 30".into()],
+                    cwd: None,
+                    env: vec![],
+                    scrollback_rows: 100,
+                },
+                None,
+            )
+            .expect("start the job's process");
+
+        let alice = client(&runtime, &url, &identity, 1).await;
+        let mut control = open(&alice, hello(&alice)).await;
+        let Message::ControlAttached(attached) = control.next().await else {
+            panic!("expected ControlAttached");
+        };
+        assert_eq!(
+            attached
+                .workspace
+                .detached
+                .iter()
+                .map(|d| d.terminal)
+                .collect::<Vec<_>>(),
+            vec![job],
+            "an owned terminal is listed before any pane shows it"
+        );
+        assert_eq!(attached.workspace.terminals().count(), 0);
+
+        control
+            .send(
+                Message::Command(Command {
+                    request: RequestId(1),
+                    command: TopologyCommand::AttachTerminal {
+                        terminal: job,
+                        target: AttachTarget::NewTab,
+                    },
+                }),
+                1,
+            )
+            .await;
+        let mut shown = false;
+        for _ in 0..2 {
+            match control.next().await {
+                Message::CommandReply(reply) => {
+                    assert!(matches!(reply.outcome, CommandOutcome::Applied { .. }));
+                }
+                Message::WorkspaceSnapshot(snapshot) => {
+                    assert!(snapshot.detached.is_empty());
+                    assert_eq!(snapshot.terminals().collect::<Vec<_>>(), vec![job]);
+                    shown = true;
+                }
+                other => panic!("unexpected {:?}", other.kind()),
+            }
+        }
+        assert!(shown, "the snapshot after an attach shows the terminal");
+
+        service.close_terminal(job).expect("close the job terminal");
+        assert!(
+            service.session(job).is_none(),
+            "a closed terminal is forgotten"
+        );
+        assert!(service.close_terminal(job).is_err());
     }
 }

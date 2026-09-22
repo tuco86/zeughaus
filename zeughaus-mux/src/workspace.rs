@@ -21,6 +21,18 @@ pub struct WorkspaceSnapshot {
     pub incarnation: RunnerIncarnation,
     pub revision: u64,
     pub tabs: Vec<TabSnapshot>,
+    /// Terminals the runner owns whose lifetime is not a pane's (jobs) and
+    /// that no pane currently shows. A client lists them and shows one with
+    /// [`TopologyCommand::AttachTerminal`]; closing its pane again puts it
+    /// back here rather than killing it.
+    pub detached: Vec<DetachedTerminal>,
+}
+
+/// One owned terminal no pane shows, with the title a client lists it under.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetachedTerminal {
+    pub terminal: TerminalId,
+    pub title: String,
 }
 
 impl WorkspaceSnapshot {
@@ -183,6 +195,8 @@ pub enum SurfaceRef {
 ///
 /// Terminals are only ever created from a runner-configured profile named by
 /// id: no command carries an argv, an environment or a working directory.
+/// [`TopologyCommand::AttachTerminal`] is no exception -- it shows a
+/// terminal the runner already created for itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TopologyCommand {
     /// A new tab whose single pane is a fresh terminal.
@@ -229,6 +243,24 @@ pub enum TopologyCommand {
     ReleaseControl {
         terminal: TerminalId,
     },
+    /// Show a terminal the runner owns in a new pane. Refused if it is
+    /// already shown, unknown, or not one of the runner's own.
+    AttachTerminal {
+        terminal: TerminalId,
+        target: AttachTarget,
+    },
+    /// Kill a terminal the runner owns, shown or not, and forget it. The
+    /// pane showing it, if any, closes with it.
+    CloseTerminal {
+        terminal: TerminalId,
+    },
+}
+
+/// Where [`TopologyCommand::AttachTerminal`] puts the pane it creates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttachTarget {
+    NewTab,
+    Split { pane: PaneId, axis: Axis },
 }
 
 /// A runner-side shell profile, by id. `0` is the runner's default.
@@ -311,6 +343,7 @@ mod tests {
                 accent_rgba: None,
                 root: tree(),
             }],
+            detached: Vec::new(),
         };
         assert!(snapshot.has_one_graph());
         assert_eq!(snapshot.tab_of(PaneId(2)).map(|t| t.id), Some(TabId(1)));

@@ -21,6 +21,9 @@ zeughaus-flow.workspace = true
 zeughaus-graph.workspace = true
 zeughaus-db.workspace = true
 zeughaus-record.workspace = true
+# Jobs: the node type, and the `ProcessHost` this process implements over its
+# mux so a run is a terminal it owns.
+zeughaus-job.workspace = true
 # Frames leave this process over QUIC, not through the store: a 4K RGBA frame
 # is 33 MB and a state store is the wrong pipe for it.
 weida.workspace = true
@@ -40,4 +43,7 @@ tokio = { version = "1", features = [
     "sync",
     "time",
     "net",
+    # Stopping drains: the signal that used to kill this process now holds it
+    # and waits for the live runs.
+    "signal",
 ] }

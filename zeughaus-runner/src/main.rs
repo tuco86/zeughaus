@@ -12,26 +12,31 @@
 //! store on every batch.
 
 mod feed;
+mod jobs;
 mod mux;
 mod runner;
+mod runs;
 mod transport;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use zeughaus_core::{NodeId, Value, ZeughausError};
 use zeughaus_link::{
-    EVENTS_PATH, FEED_PATH, MUX_PATH, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, credentials,
+    EVENTS_PATH, FEED_PATH, HOLD_PATH, MUX_PATH, RUNS_PATH, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH,
+    TriggerRequest, credentials,
 };
 use zeughaus_runtime::DeferredWork;
 use zeughaus_sync::Role;
 
 use crate::feed::FrameRegistry;
+use crate::jobs::JobHost;
 use crate::mux::MuxService;
 use crate::runner::{AsyncResult, Runner};
 use crate::transport::Transport;
@@ -156,8 +161,10 @@ fn main() -> ExitCode {
     // Bounded: a press is a moment, and a peer that presses in a loop must not
     // be able to make this process grow. `accept_triggers` drops and says so
     // when it is full.
-    let (trigger_tx, trigger_rx) = std::sync::mpsc::sync_channel::<u64>(TRIGGER_BACKLOG);
+    let (trigger_tx, trigger_rx) = std::sync::mpsc::sync_channel::<TriggerRequest>(TRIGGER_BACKLOG);
     let mut publisher = None;
+    // Jobs run in the mux, so a process without one has no host to offer them.
+    let mut job_host: Option<Arc<JobHost>> = None;
     if let Some(transport) = &transport {
         let listener = transport.listener();
         match listener.replier(FEED_PATH) {
@@ -188,13 +195,38 @@ fn main() -> ExitCode {
         match listener.replier(MUX_PATH) {
             Ok(replier) => {
                 let service = MuxService::new(mux::incarnation(), Vec::new());
-                rt.spawn(service.accept(replier));
+                rt.spawn(service.clone().accept(replier));
+                // A run is a terminal this process owns, so the job host is
+                // the mux service plus the state directory its logs go in.
+                job_host = Some(Arc::new(JobHost::new(service, state_dir.clone())));
             }
             Err(e) => eprintln!("[runner] no terminal mux: {e}"),
         }
+        if let Some(host) = &job_host {
+            match listener.replier(HOLD_PATH) {
+                Ok(replier) => {
+                    rt.spawn(jobs::serve_hold(replier, Arc::clone(host)));
+                }
+                Err(e) => eprintln!("[runner] no hold service: {e}"),
+            }
+        }
+        // The runner that produced a run's files is the one that serves them:
+        // they are on this disk and nowhere else.
+        match listener.replier(RUNS_PATH) {
+            Ok(replier) => {
+                rt.spawn(runs::serve_runs(replier, state_dir.clone()));
+            }
+            Err(e) => eprintln!("[runner] no run file service: {e}"),
+        }
     }
 
-    let mut runner = Runner::new(store, Arc::clone(&frames), publisher, Arc::clone(&snapshot));
+    let mut runner = Runner::new(
+        store,
+        Arc::clone(&frames),
+        publisher,
+        Arc::clone(&snapshot),
+        job_host.clone(),
+    );
     if let Some(transport) = &transport {
         runner.set_endpoint(transport.url().to_string());
     }
@@ -203,11 +235,39 @@ fn main() -> ExitCode {
     // which ownership it was dispatched under.
     let (async_tx, async_rx) = std::sync::mpsc::channel::<(NodeId, u64, AsyncResult)>();
 
-    // Ctrl-C is left to the default disposition on purpose: the process dies,
-    // its connection closes, and the module drops its `runtime` row -- which is
-    // exactly the handover a standby waits for. A signal handler could only
-    // repeat that, and would add a dependency to do it.
+    // Stopping drains. A signal holds the host so no further run starts and
+    // the loop leaves once the live ones have finished; the connection then
+    // closes and the module drops this process's `runtime` row, which is the
+    // handover a standby waits for. Killing it outright would take a live
+    // build's terminal with it, which is the one thing a job must survive.
+    let stopping = Arc::new(AtomicBool::new(false));
+    {
+        let stopping = Arc::clone(&stopping);
+        let host = job_host.clone();
+        rt.spawn(async move {
+            wait_for_stop().await;
+            if let Some(host) = &host {
+                host.hold(true);
+            }
+            stopping.store(true, Ordering::SeqCst);
+        });
+    }
+    // Whether the draining line has been written: the loop turns twenty times
+    // a second and the reason for waiting is worth saying once.
+    let mut draining = false;
     loop {
+        if stopping.load(Ordering::SeqCst) {
+            let live = job_host.as_ref().map_or(0, |host| host.live_runs());
+            if live == 0 {
+                eprintln!("[runner] stopped");
+                return ExitCode::SUCCESS;
+            }
+            if !draining {
+                draining = true;
+                eprintln!("[runner] draining {live} runs; new jobs refused");
+            }
+        }
+
         // Block for the first event, then take whatever else is already queued:
         // one pass per burst of row changes rather than one per row. A
         // subscription applying delivers a whole graph this way. The wait is
@@ -240,7 +300,7 @@ fn main() -> ExitCode {
         // takes at most `MAX_PRESSES_PER_TURN` of them before it goes back to
         // serving the store and the clocks.
         let mut fired = false;
-        let presses: Vec<u64> = std::iter::from_fn(|| trigger_rx.try_recv().ok())
+        let presses: Vec<TriggerRequest> = std::iter::from_fn(|| trigger_rx.try_recv().ok())
             .take(MAX_PRESSES_PER_TURN)
             .collect();
 
@@ -262,8 +322,8 @@ fn main() -> ExitCode {
             dispatch(&rt, &async_tx, runner.owner_epoch(), deferred);
         }
 
-        for node_id in presses {
-            fired |= runner.trigger(node_id);
+        for press in presses {
+            fired |= runner.trigger(press.node_id, press.payload);
         }
 
         if !events.is_empty() || ticked || fired {
@@ -303,6 +363,36 @@ fn dispatch(
                     });
             let _ = tx.send((node_id, epoch, outputs.map_err(|e| e.to_string())));
         });
+    }
+}
+
+/// Resolves when this process is asked to stop.
+///
+/// Both signals mean the same thing here -- a terminal's Ctrl-C and a service
+/// manager's `SIGTERM` -- and both are answered by draining rather than by
+/// dying, which is why they are awaited instead of left to the default
+/// disposition.
+async fn wait_for_stop() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            // No SIGTERM handler is not a reason to ignore Ctrl-C too.
+            Err(e) => {
+                eprintln!("[runner] no SIGTERM handler: {e}");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

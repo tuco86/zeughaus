@@ -27,8 +27,9 @@ use tokio::io::AsyncReadExt;
 use weida::{PeerEvent, PeerEvents, Requester, TransferMeta};
 use zeughaus_core::Image;
 use zeughaus_link::{
-    EVENTS_PATH, FEED_PATH, FeedRequest, FrameHeader, MAX_EVENT_BYTES, MAX_SNAPSHOT_BYTES,
-    RuntimeEvent, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, TriggerRequest, ladder,
+    EVENTS_PATH, FEED_PATH, FeedRequest, FrameHeader, HOLD_PATH, HoldReply, HoldRequest,
+    MAX_EVENT_BYTES, MAX_HOLD_BYTES, MAX_SNAPSHOT_BYTES, RuntimeEvent, SNAPSHOT_PATH, Snapshot,
+    TRIGGERS_PATH, TriggerRequest, ladder,
 };
 
 use crate::transport::{Endpoint, QUIC, client_tls, explain, first_dial, gave_up, policy};
@@ -347,7 +348,9 @@ fn next_attempt(attempt: u32, lasted: Duration) -> u32 {
 /// Asks the runtime to fire a node once.
 ///
 /// Push, not request: a press has no answer worth waiting for -- the editor
-/// learns it worked by seeing the value change.
+/// learns it worked by seeing the value change. No payload: a press is the
+/// bare trigger, and what a node makes of text it was fired with is the
+/// business of whoever sends text.
 pub async fn trigger(endpoint: Endpoint, node_id: u64) -> Result<(), String> {
     let quic = QUIC.as_ref().ok_or("no QUIC runtime")?;
     let url = endpoint.path(TRIGGERS_PATH)?;
@@ -357,9 +360,36 @@ pub async fn trigger(endpoint: Endpoint, node_id: u64) -> Result<(), String> {
         .await
         .map_err(|e| format!("connect {url}: {e}"))?;
     pusher
-        .send(&TriggerRequest { node_id }.encode())
+        .send(
+            &TriggerRequest {
+                node_id,
+                payload: None,
+            }
+            .encode(),
+        )
         .await
         .map_err(|e| format!("trigger {node_id}: {e}"))
+}
+
+/// Holds the runner or releases it, and reports what it answered.
+///
+/// Request and reply, unlike [`trigger`]: the point of holding is to watch
+/// the live runs drain, and the count that says whether they have comes back
+/// with the acknowledgement.
+pub async fn hold(endpoint: Endpoint, held: bool) -> Result<HoldReply, String> {
+    let quic = QUIC.as_ref().ok_or("no QUIC runtime")?;
+    let url = endpoint.path(HOLD_PATH)?;
+    let requester = quic.requester(client_tls());
+    first_dial(&url, || requester.connect(&url)).await?;
+    let reply = requester
+        .request(&HoldRequest { held }.encode())
+        .await
+        .map_err(|e| format!("hold: {e}"))?;
+    let encoded = reply
+        .collect(MAX_HOLD_BYTES)
+        .await
+        .map_err(|e| format!("hold: {e}"))?;
+    HoldReply::decode(&encoded).ok_or_else(|| "hold: malformed".to_owned())
 }
 
 /// Streams one feed's frames for as long as the editor wants them.

@@ -103,6 +103,7 @@ impl App {
             // Nothing serves a shell: back to the workspace an editor has on
             // its own, which is the graph and nothing else.
             self.workspace.detach();
+            self.rebuild_palette();
             return Task::none();
         };
         let epoch = self.mux_epoch;
@@ -122,6 +123,8 @@ impl App {
             next_request: 0,
             _control: handle.abort_on_drop(),
         });
+        // What the palette offers about a runner depends on there being one.
+        self.rebuild_palette();
         task
     }
 
@@ -180,6 +183,7 @@ impl App {
                     }
                 }
                 self.workspace.apply_snapshot(*workspace);
+                self.rebuild_palette();
                 self.reconcile_terminals()
             }
             MuxEvent::Workspace(snapshot) => {
@@ -188,6 +192,7 @@ impl App {
                 };
                 mux.workspace = Some((*snapshot).clone());
                 self.workspace.apply_snapshot(*snapshot);
+                self.rebuild_palette();
                 self.reconcile_terminals()
             }
             MuxEvent::Reply(reply) => {
@@ -218,6 +223,7 @@ impl App {
                 // announces the replacement, and reconciliation dials it.
                 self.mux = None;
                 self.workspace.detach();
+                self.rebuild_palette();
                 Task::none()
             }
         }

@@ -27,6 +27,7 @@ use zeughaus_runtime::{DeferredWork, GraphExecutor};
 use zeughaus_sync::{Store, SyncEvent};
 
 use crate::feed::FrameRegistry;
+use crate::jobs::JobHost;
 
 /// Outcome of one node's deferred work, as reported back by the host loop.
 pub type AsyncResult = Result<HashMap<String, Value>, String>;
@@ -103,6 +104,7 @@ impl Runner {
         frames: Arc<FrameRegistry>,
         publisher: Option<Publisher>,
         snapshot: Arc<Mutex<Snapshot>>,
+        host: Option<Arc<JobHost>>,
     ) -> Self {
         // The same plugin set the native editor registers. Both sides must agree
         // on what exists and what may connect: the editor validates a drag
@@ -117,6 +119,14 @@ impl Runner {
             Box::new(zeughaus_db::DbPlugin),
             Box::new(zeughaus_record::RecordPlugin),
             Box::new(zeughaus_llm::LlmPlugin),
+            // Last, and the only plugin that needs this process: a job node
+            // runs a process, and without a mux there is nothing to run it
+            // in, so a runner with no transport registers the same detached
+            // plugin an editor does and every job node refuses.
+            match host {
+                Some(host) => Box::new(zeughaus_job::JobPlugin::new(host)) as Box<dyn DomainPlugin>,
+                None => Box::new(zeughaus_job::JobPlugin::detached()),
+            },
         ];
         let converters = Arc::new({
             let mut c = TypeConverters::with_builtins();
@@ -426,18 +436,26 @@ impl Runner {
     /// A standby ignores the request: the owner received the same push and is
     /// firing it, and a press this process replayed after a takeover would fire
     /// twice.
-    pub fn trigger(&mut self, node_id: u64) -> bool {
+    ///
+    /// `payload` is free text the pressing side attached -- a webhook body, a
+    /// branch name -- handed to the node as the value of its `fire` parameter.
+    /// A node that only wants the event ignores it, which is why a bare press
+    /// (`None`) is the empty string rather than a second parameter nobody
+    /// reads.
+    pub fn trigger(&mut self, node_id: u64, payload: Option<String>) -> bool {
         let id = NodeId(node_id);
         if !self.is_owner || self.executor.graph().node(id).is_none() {
             eprintln!("[runner] ignoring trigger for {id}");
             return false;
         }
         eprintln!("[runner] firing {id}");
-        // The press itself is the signal; the value only has to arrive. A node
-        // that refuses it did not fire, so asking for a pass would report a
-        // press that never happened -- and the editor that pressed has to be
-        // told, which is what the node error is for.
-        if let Err(e) = self.executor.set_parameter(id, "fire", Value::new(true)) {
+        // A node that refuses the press did not fire, so asking for a pass
+        // would report a press that never happened -- and the editor that
+        // pressed has to be told, which is what the node error is for.
+        if let Err(e) =
+            self.executor
+                .set_parameter(id, "fire", Value::new(payload.unwrap_or_default()))
+        {
             let message = format!("the trigger was refused: {e}");
             eprintln!("[runner] {id}: {message}");
             self.executor.report_error(id, message);

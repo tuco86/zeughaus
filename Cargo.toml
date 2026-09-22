@@ -18,6 +18,7 @@ members = [
     "zeughaus-runner",
     "zeughaus-mux",
     "zeughaus-terminal",
+    "zeughaus-job",
 ]
 # zeughaus-module is a SpacetimeDB server module: it only builds for the
 # wasm32 module target via `spacetime build`, so it is kept out of the native
@@ -40,6 +41,10 @@ zeughaus-flow = { path = "zeughaus-flow" }
 zeughaus-graph = { path = "zeughaus-graph" }
 zeughaus-db = { path = "zeughaus-db" }
 zeughaus-record = { path = "zeughaus-record" }
+# Processes with a beginning and an end as graph nodes: the argv, environment
+# and artifact globs live in a node's settings, so the mux never carries a
+# command line. The editor registers it detached; only a runner executes.
+zeughaus-job = { path = "zeughaus-job" }
 zeughaus-sync = { path = "zeughaus-sync" }
 # What travels between a runner and its editors over weida, and the identities
 # both ends present: the sample feed, runtime events, path constants and the

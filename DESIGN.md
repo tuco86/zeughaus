@@ -79,14 +79,15 @@ the user's back.
 | `zeughaus-core` | `Ty`/`Typed`/`Value`, pins, `ExecutableNode`/`DomainPlugin`, settings, converters, scalar wire encoding, store row types | yes |
 | `zeughaus-runtime` | `GraphExecutor`: topology, node instances, edge cache, dirty set, async work, node errors | yes |
 | `zeughaus-sync` | SpacetimeDB client: generated bindings, `Store` (reconnecting connection), `Session` resolution, ownership queries, reducer calls | native |
-| `zeughaus-link` | the runner<->editor protocol over weida: paths, feed, events, snapshot, triggers, and the credentials both ends present | native |
+| `zeughaus-link` | the runner<->editor protocol over weida: paths, feed, events, snapshot, triggers, run files, hold, and the credentials both ends present | native |
 | `zeughaus-mux` | terminal mux wire model: stable ids, workspace topology, rows/deltas, bounded codec, client-side `TerminalView` | yes |
 | `zeughaus-terminal` | the runner's terminal engine: PTYs (`portable-pty`) and a pinned `wezterm-term` | native |
-| `zeughaus-runner` | the executing process: store loop, executor, weida listener, feed server, mux service | native |
+| `zeughaus-runner` | the executing process: store loop, executor, weida listener, feed server, mux service, job host | native |
 | `zeughaus` | the editor | native + wasm32 |
 | `iced_terminal` | terminal widget: one wgpu primitive per pane, input to `TerminalCommand`s, bundled font | native |
 | `iced_tabs` | the tab bar the workspace shell uses | yes |
 | `zeughaus-transform`, `-flow`, `-graph`, `-ml` | pure plugins | yes |
+| `zeughaus-job` | the `job.run` node and the `ProcessHost` trait it executes through; the runner implements the host, the editor registers the plugin detached | yes |
 | `zeughaus-capture`, `-db`, `-record`, `-llm` | plugins that touch the OS | native |
 | `zeughaus-module` | the SpacetimeDB server module; outside the native workspace, built by `spacetime build` | wasm module |
 
@@ -258,6 +259,7 @@ active tab, focus, scroll, selection and blink are per window.
 | `capture` | `screen` | xdg-desktop-portal ScreenCast/Screenshot on Wayland (async, retried while the portal warms up), `scrap` otherwise |
 | `db` | `database` (container), `table`, `insert`, `query`, `sql` | SQLite; section 8 |
 | `record` | `writer`, `player` | a recording is a directory of `<seq>.png` plus `index.jsonl`; the player is a clocked source |
+| `job` | `run` | a process in a terminal the runner owns, log per run on disk; section 13. Registered detached in the editor: same catalog, never executes |
 
 Registration is one list in each process (`Runner::new`, `App::new`), the
 same plugins in the same order, native-only ones gated in the editor. A node
@@ -327,9 +329,10 @@ overwritten. The listener requires a trusted client certificate on every path
 (`client.pem` plus any `clients/*.pem`), and a bind on anything but loopback
 without client trust refuses to start. Every `/mux` exchange is authorized by
 the peer identity weida proved; a terminal id is a name, never a credential.
-Terminals are created only from runner-side profiles (the login shell); no
-command carries an argv. OSC 52 and downloads are not wired; a hyperlink is
-reported, never opened, by a click.
+A client creates terminals only from runner-side profiles (the login shell)
+or attaches ones the runner created for a job; no mux command carries an
+argv. OSC 52 and downloads are not wired; a hyperlink is reported, never
+opened, by a click.
 
 **Rendering** (`iced_terminal`) is one custom wgpu primitive per pane: rows
 are shaped once per content and instanced once per palette, a changed row
@@ -360,6 +363,7 @@ results keyed by (pin, tier, sequence).
 | capture backend | the portal is used when `WAYLAND_DISPLAY` is set |
 | paths inside nodes | `db.database` `path` and `record.writer` `dir` are settings, resolved against the runner's working directory |
 | LLM endpoint | the `base_url` setting on each conversation node (default `http://localhost:1234/v1`) |
+| runs | `<state-dir>/runs/<run-id>/` holds `log`, `exit` and `artifacts/` of every job run this runner executed; nothing deletes them yet |
 
 ## 12. Testing strategy
 
@@ -379,7 +383,59 @@ results keyed by (pin, tier, sequence).
   --all-targets -- -D warnings`, `cargo test --workspace`,
   `cargo check --target wasm32-unknown-unknown -p zeughaus`.
 
-## 13. Not built
+## 13. Jobs: processes the runner owns
+
+A `job.run` node (`zeughaus-job`) executes a process with a beginning and an
+end -- a CI step, an all-night agent session -- as a terminal the runner
+owns. A failed job is therefore a terminal to attach to, not a log to read.
+
+**The node.** Settings `command`, `args` (one per line), `env` (`KEY=VALUE`
+per line, added to the runner's environment), `cwd` (empty: the runner's),
+`artifacts` (globs relative to `cwd`, one per line); a malformed line is
+`InvalidParameter`. Pins: `run` (trigger) in; `ok: Bool`, `failed: Int` (the
+exit code, `-1` for a signal or a kill) and `run: Str` (the run directory)
+out. `ok` and `failed` are separate pins so each can drive its own trigger
+wire. The node acts only on its own trigger or on a press (`fire`, which is
+how `/triggers` and the palette reach it), and refuses while a run is live
+("job busy"), while the runner is held, and in a process that does not
+execute. The mux stays argv-free: no `TopologyCommand` carries a command,
+the graph does. The plugin defines `ProcessHost` (`held`, `new_run_dir`,
+`spawn`); the runner implements it in `zeughaus-runner/src/jobs.rs` over its
+`MuxService`, the editor registers `JobPlugin::detached()`, which only
+contributes the catalog entry.
+
+**A run.** `JobHost::spawn` allocates `<state-dir>/runs/<id>/` (ids continue
+past whatever is on disk, so a restart never reuses one), opens `log`, and
+starts the process through `MuxService::spawn_owned`: a terminal with no
+pane whose PTY bytes are teed to the log before they are parsed
+(`Session::spawn_teed`). The node defers the wait to the blocking pool; when
+the child exits, `exit` is written (`code`, `killed`, `started`, `finished`),
+declared artifacts are copied under `artifacts/`, and the outputs are
+delivered like any async result. A run that exited 0 closes its terminal;
+every other outcome keeps it, screen and all, until someone closes it. The
+store holds nothing about runs; `/runs` on the runner serves any run file by
+range (`RunFileRequest` -> `RunFileReply`, `zeughaus-link/src/runs.rs`), so
+logs and artifacts stay on the machine that produced them.
+
+**Owned terminals in the mux.** Terminal lifetime is separate from pane
+lifetime for terminals the runner owns: the workspace snapshot lists them in
+`detached` while no pane shows them, `AttachTerminal { terminal, target }`
+gives one a pane (a new tab or a split), `ClosePane`/`CloseTab` on such a
+pane detaches instead of killing, and `CloseTerminal` kills and forgets.
+Profile-spawned terminals keep dying with their pane. The editor's palette
+offers "Terminal / Attach" and "Terminal / Close" per detached terminal.
+
+**Hold and drain.** `/hold` (`HoldRequest { held }` -> `HoldReply { held,
+live_runs }`) flips the host's flag; the palette offers "Runner / Hold" and
+"Runner / Release". SIGINT/SIGTERM hold the runner and let it exit once no
+run is live, logging what it is draining; a runner with no live runs exits
+at once.
+
+**Triggers** carry an optional payload (`TriggerRequest { node_id, payload }`)
+that becomes the node's `fire` parameter; a bare press sends none. They come
+through weida only: no HTTP listener and no polling in the runner.
+
+## 14. Not built
 
 Kept here so they are not mistaken for descriptions of the code:
 
@@ -390,66 +446,34 @@ Kept here so they are not mistaken for descriptions of the code:
   runners and editors goes over the weida broker, not the store.
 - Opt-in per-node capture of results into a database; the recorder plugin
   writes datasets to disk instead.
-- Queue semantics on edges; every edge is last-value.
+- Queue semantics on edges; every edge is last-value. For jobs that means
+  one run at a time per node; a queue depth per node, and per-trigger
+  instantiation of a pipeline subgraph for parallel branch builds, come when
+  needed.
 - Rich per-type inspection widgets on edges; nodes show text or a frame.
 - A browser editor that syncs with the store; the wasm build edits locally.
 - Terminal image protocols; the wire model reserves kinds for them.
-
-### Jobs: decided, not built
-
-The runner is to execute processes with a beginning and an end (CI steps,
-all-night agent sessions) inside the mux it already owns, so a failed job is
-a terminal to attach to, not a log to read. Decisions taken; the order is
-roughly the build order.
-
-- **A job is a node** (`zeughaus-job`, plugin `job`): settings `command`,
-  `args`, `env` (additions to the runner's environment), `cwd`,
-  `artifacts` (globs), `keep_on_failure` (default on). Pins: `run: Event`
-  in; `ok: Event`, `failed: Event<i32>`, `run: Path` (the run directory)
-  out. The mux stays argv-free: `TopologyCommand` never carries a command,
-  the graph does. The plugin defines `trait ProcessHost` (spawn, kill,
-  held); the runner implements it over its `MuxService`, the editor
-  registers the plugin detached (catalog only, it never executes).
-- **One run at a time per node.** A trigger while a run is live is refused
-  and reported as a node error; a queue depth is a later setting. Fan-in is a
-  `flow` node that fires once every input has fired. Parallel runs of one
-  pipeline (per-trigger instantiation of a subgraph) are the step that would
-  answer "queue semantics on edges" and are not planned before they are
-  needed.
-- **The log is a file on the runner.** The PTY bytes of a run are teed to
-  `<state-dir>/runs/<run-id>/log`, exit code and timestamps to `exit`,
-  declared artifacts copied to `artifacts/` after exit. The store gets a run
-  row (node, runner, start, end, exit, path), never bytes. Editors fetch a
-  run's files over a `zeughaus-link` path on the runner that produced them.
-  Failed runs stay until deleted; retention for the rest is runner
-  configuration.
-- **A job's terminal has no pane until someone attaches.** Terminal lifetime
-  is separated from pane lifetime: `Hello` lists unattached terminals, a new
-  `AttachTerminal` topology command gives one a pane, closing that pane
-  detaches and does not kill. On failure with `keep_on_failure` the runner
-  starts a shell in the same cwd and environment in the run's terminal.
-- **Jobs die with the runner; the runner drains.** Stopping waits for live
-  runs and accepts no new ones. A shim process per run that owns the PTY and
-  the log, survives a runner restart and is reattached by replaying the log
-  file into `wezterm-term`, is the later design that this log format keeps
-  possible.
-- **Triggers come through weida only.** `TriggerRequest` on `/triggers`
-  gains a payload; a `zeughaus trigger <node> [json]` command sends one with
-  the client identity. Webhooks (Gitea) land on the weida broker once it
-  speaks HTTP and are relayed; no listener and no polling in the runner.
-- **Explicit hold.** A runner command over weida (`hold [duration]`,
-  `release`), visible in the store; a held runner starts no jobs and lets
-  running ones finish. `freeze` (SIGSTOP / cgroup freezer) as a per-node
-  policy and automatic detection (game running, user idle, GPU busy) are
-  later.
-- **Secrets** use weida's wrapped-secret flow: a run receives one refreshable
-  token, orders child tokens per service through it, and the end of the run
-  invalidates the token and every child. Nothing secret-shaped in the store
-  or in node settings.
-- **Workspaces** are just `cwd` for now; caches live per runner under its
-  state directory. Checkout and btrfs-snapshot nodes that produce a `Path`
-  for `cwd` come when a cold `target/` per run hurts.
-- **VM guests** are one more machine with its own runner. `vm/win11/` is the
-  reference QEMU lifecycle for a headless Windows 11 guest (unattended
-  install to a read-only golden image, overlay boot, ssh, guest agent);
-  booting it on demand from a job is not wired.
+- Jobs, decided but not built:
+  - A shell in the failed run's terminal, with its cwd and environment,
+    once the child is gone (`keep_on_failure`); today the terminal keeps the
+    final screen only.
+  - A shim process per run that owns the PTY and the log, survives a runner
+    restart and is reattached by replaying the log into `wezterm-term`;
+    today runs die with the runner, which is why it drains.
+  - Reading run files in the editor; `/runs` is served, nothing calls it.
+  - Retention of run directories; a fan-in `flow` node that fires once
+    every input has fired.
+  - A CLI (`zeughaus trigger <node> [payload]`, `zeughaus hold`) with the
+    client identity; the palette is the only client of `/triggers` and
+    `/hold` today. Webhooks (Gitea) land on the weida broker once it speaks
+    HTTP and are relayed.
+  - `freeze` (SIGSTOP / cgroup freezer) as a per-node hold policy and
+    automatic host-state detection (game running, user idle, GPU busy).
+  - Secrets through weida's wrapped-secret flow: one refreshable token per
+    run, child tokens per service ordered through it, everything invalidated
+    when the run ends. Nothing secret-shaped in the store or in settings.
+  - Workspace nodes (checkout, btrfs snapshot) producing the `cwd` a job
+    runs in; caches per runner under its state directory.
+  - VM guests as machines with their own runner. `vm/win11/` is the reference
+    QEMU lifecycle for a headless Windows 11 guest; booting it from a job is
+    not wired.

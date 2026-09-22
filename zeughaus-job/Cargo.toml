@@ -1,0 +1,10 @@
+[package]
+name = "zeughaus-job"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zeughaus-core.workspace = true
+# Artifacts are declared as globs relative to the run's working directory and
+# expanded after the process exited.
+glob = "0.3"

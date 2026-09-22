@@ -52,6 +52,8 @@ pub const FLAG_COMPRESSED: u8 = 1;
 /// Most tabs in a snapshot, and most leaves in a tree.
 pub const MAX_TABS: usize = 256;
 pub const MAX_LEAVES: usize = 256;
+/// Most owned terminals a snapshot may list as detached.
+pub const MAX_DETACHED: usize = 256;
 /// Most rows in one head, delta or page.
 pub const MAX_ROWS_PER_MESSAGE: usize = 8192;
 /// Most heads in one control attach.
@@ -427,6 +429,14 @@ fn validate_workspace(w: &WorkspaceSnapshot) -> Result<(), CodecError> {
     if graphs > 1 {
         return Err(CodecError::Invalid("more than one graph pane"));
     }
+    if w.detached.len() > MAX_DETACHED {
+        return Err(CodecError::Invalid("too many detached terminals"));
+    }
+    for detached in &w.detached {
+        if detached.title.len() > MAX_TITLE_BYTES {
+            return Err(CodecError::Invalid("detached title too long"));
+        }
+    }
     Ok(())
 }
 
@@ -737,6 +747,10 @@ mod tests {
                     }),
                 },
             }],
+            detached: vec![DetachedTerminal {
+                terminal: TerminalId(4),
+                title: "cargo test".into(),
+            }],
         }
     }
 
@@ -780,6 +794,29 @@ mod tests {
                 pane: PaneId(2),
                 axis: Axis::Vertical,
                 profile: ProfileId::DEFAULT,
+            },
+        }));
+        round_trip(Message::Command(Command {
+            request: RequestId(10),
+            command: TopologyCommand::AttachTerminal {
+                terminal: TerminalId(4),
+                target: AttachTarget::Split {
+                    pane: PaneId(2),
+                    axis: Axis::Horizontal,
+                },
+            },
+        }));
+        round_trip(Message::Command(Command {
+            request: RequestId(11),
+            command: TopologyCommand::AttachTerminal {
+                terminal: TerminalId(4),
+                target: AttachTarget::NewTab,
+            },
+        }));
+        round_trip(Message::Command(Command {
+            request: RequestId(12),
+            command: TopologyCommand::CloseTerminal {
+                terminal: TerminalId(4),
             },
         }));
         round_trip(Message::CommandReply(CommandReply {

@@ -9,10 +9,12 @@
 //! one graph pane, never zero tabs, never an empty tab, split ratios kept
 //! away from the edges.
 
+use std::collections::BTreeSet;
+
 use zeughaus_mux::workspace::{MIN_RATIO, ProfileId};
 use zeughaus_mux::{
-    Axis, PaneId, PaneNode, RunnerIncarnation, SplitId, SurfaceRef, TabId, TabSnapshot, TerminalId,
-    TopologyCommand, WorkspaceSnapshot,
+    AttachTarget, Axis, DetachedTerminal, PaneId, PaneNode, RunnerIncarnation, SplitId, SurfaceRef,
+    TabId, TabSnapshot, TerminalId, TopologyCommand, WorkspaceSnapshot,
 };
 
 /// A tab as the runner keeps it: the user's title override is separate from
@@ -41,6 +43,12 @@ pub struct Workspace {
     next_tab: u64,
     next_split: u64,
     next_pane: u64,
+    /// Terminals the runner started for itself (a job's process). Their
+    /// lifetime is the runner's, not a pane's: closing the pane that shows
+    /// one detaches it, only `CloseTerminal` and the runner ends it.
+    owned: BTreeSet<TerminalId>,
+    /// The subset of `owned` no pane currently shows.
+    detached: BTreeSet<TerminalId>,
 }
 
 impl Workspace {
@@ -62,7 +70,17 @@ impl Workspace {
             next_tab: 2,
             next_split: 1,
             next_pane: 2,
+            owned: BTreeSet::new(),
+            detached: BTreeSet::new(),
         }
+    }
+
+    /// Takes ownership of a terminal the runner started itself. It is
+    /// listed as detached until a client attaches it to a pane.
+    pub fn add_owned(&mut self, terminal: TerminalId) {
+        self.owned.insert(terminal);
+        self.detached.insert(terminal);
+        self.revision += 1;
     }
 
     pub fn revision(&self) -> u64 {
@@ -96,6 +114,16 @@ impl Workspace {
                     group: tab.group.clone(),
                     accent_rgba: tab.accent,
                     root: tab.root.clone(),
+                })
+                .collect(),
+            detached: self
+                .detached
+                .iter()
+                .map(|terminal| DetachedTerminal {
+                    terminal: *terminal,
+                    title: title_of(*terminal)
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or_else(|| terminal.0.to_string()),
                 })
                 .collect(),
         }
@@ -157,38 +185,8 @@ impl Workspace {
                 Applied::default()
             }
             TopologyCommand::ClosePane { pane } => {
-                let tab = self
-                    .tabs
-                    .iter()
-                    .position(|tab| tab.root.find(*pane).is_some())
-                    .ok_or_else(|| format!("no pane {pane}"))?;
-                let surface = match self.tabs[tab].root.find(*pane) {
-                    Some(PaneNode::Leaf { surface, .. }) => *surface,
-                    _ => return Err(format!("no pane {pane}")),
-                };
-                if surface == SurfaceRef::Graph {
-                    return Err("the graph pane cannot be closed".to_owned());
-                }
-                let killed: Vec<TerminalId> = match surface {
-                    SurfaceRef::Terminal(t) => vec![t],
-                    _ => vec![],
-                };
-                if self.tabs[tab].root.leaf_count() == 1 {
-                    if self.tabs.len() == 1 {
-                        return Err("the last pane of the last tab stays".to_owned());
-                    }
-                    self.tabs.remove(tab);
-                } else {
-                    let root = std::mem::replace(
-                        &mut self.tabs[tab].root,
-                        PaneNode::Leaf {
-                            pane_id: PaneId(0),
-                            surface: SurfaceRef::Empty,
-                        },
-                    );
-                    self.tabs[tab].root = remove_leaf(root, *pane).expect("pane was found");
-                }
-                Applied { killed }
+                let surface = self.remove_pane(*pane)?;
+                self.detach_or_kill(terminal_of(surface).into_iter())
             }
             TopologyCommand::CloseTab { tab } => {
                 let index = self
@@ -208,9 +206,7 @@ impl Workspace {
                     return Err("the tab with the graph stays".to_owned());
                 }
                 let removed = self.tabs.remove(index);
-                Applied {
-                    killed: removed.root.terminals().collect(),
-                }
+                self.detach_or_kill(removed.root.terminals())
             }
             TopologyCommand::ResizeSplit { split, ratio } => {
                 if !ratio.is_finite() {
@@ -241,6 +237,71 @@ impl Workspace {
             TopologyCommand::TakeControl { .. } | TopologyCommand::ReleaseControl { .. } => {
                 return Err("not a structural command".to_owned());
             }
+            TopologyCommand::AttachTerminal { terminal, target } => {
+                if !self.owned.contains(terminal) {
+                    return Err(format!("{terminal} is not the runner's"));
+                }
+                if !self.detached.contains(terminal) {
+                    return Err(format!("{terminal} is already shown"));
+                }
+                match target {
+                    AttachTarget::NewTab => {
+                        let id = TabId(self.next_tab);
+                        self.next_tab += 1;
+                        let pane_id = self.mint_pane();
+                        self.tabs.push(Tab {
+                            id,
+                            title: None,
+                            group: None,
+                            accent: None,
+                            root: PaneNode::Leaf {
+                                pane_id,
+                                surface: SurfaceRef::Terminal(*terminal),
+                            },
+                        });
+                    }
+                    AttachTarget::Split { pane, axis } => {
+                        let tab = self
+                            .tabs
+                            .iter()
+                            .position(|tab| tab.root.find(*pane).is_some())
+                            .ok_or_else(|| format!("no pane {pane}"))?;
+                        let split = SplitId(self.next_split);
+                        self.next_split += 1;
+                        let pane_id = self.mint_pane();
+                        let new_leaf = PaneNode::Leaf {
+                            pane_id,
+                            surface: SurfaceRef::Terminal(*terminal),
+                        };
+                        let root = std::mem::replace(
+                            &mut self.tabs[tab].root,
+                            PaneNode::Leaf {
+                                pane_id: PaneId(0),
+                                surface: SurfaceRef::Empty,
+                            },
+                        );
+                        self.tabs[tab].root = split_leaf(root, *pane, split, *axis, new_leaf);
+                    }
+                }
+                self.detached.remove(terminal);
+                Applied::default()
+            }
+            TopologyCommand::CloseTerminal { terminal } => {
+                if !self.owned.contains(terminal) {
+                    return Err(format!("{terminal} is not the runner's"));
+                }
+                // A shown terminal takes its pane with it, under the same
+                // invariants a `ClosePane` obeys: if the pane cannot go,
+                // neither can the terminal.
+                if let Some(pane) = self.pane_of(*terminal) {
+                    self.remove_pane(pane)?;
+                }
+                self.owned.remove(terminal);
+                self.detached.remove(terminal);
+                Applied {
+                    killed: vec![*terminal],
+                }
+            }
         };
         self.revision += 1;
         Ok(applied)
@@ -253,10 +314,76 @@ impl Workspace {
             .ok_or_else(|| format!("no tab {id}"))
     }
 
+    /// The pane showing `terminal`, if one does.
+    fn pane_of(&self, terminal: TerminalId) -> Option<PaneId> {
+        self.tabs.iter().find_map(|tab| {
+            tab.root
+                .leaves()
+                .into_iter()
+                .find(|(_, surface)| *surface == SurfaceRef::Terminal(terminal))
+                .map(|(pane, _)| pane)
+        })
+    }
+
+    /// Takes the leaf `pane` out of its tab, dropping the tab with it when
+    /// it was the last one, and returns what the pane showed. The graph
+    /// pane and the last pane of the last tab stay.
+    fn remove_pane(&mut self, pane: PaneId) -> Result<SurfaceRef, String> {
+        let tab = self
+            .tabs
+            .iter()
+            .position(|tab| tab.root.find(pane).is_some())
+            .ok_or_else(|| format!("no pane {pane}"))?;
+        let surface = match self.tabs[tab].root.find(pane) {
+            Some(PaneNode::Leaf { surface, .. }) => *surface,
+            _ => return Err(format!("no pane {pane}")),
+        };
+        if surface == SurfaceRef::Graph {
+            return Err("the graph pane cannot be closed".to_owned());
+        }
+        if self.tabs[tab].root.leaf_count() == 1 {
+            if self.tabs.len() == 1 {
+                return Err("the last pane of the last tab stays".to_owned());
+            }
+            self.tabs.remove(tab);
+        } else {
+            let root = std::mem::replace(
+                &mut self.tabs[tab].root,
+                PaneNode::Leaf {
+                    pane_id: PaneId(0),
+                    surface: SurfaceRef::Empty,
+                },
+            );
+            self.tabs[tab].root = remove_leaf(root, pane).expect("pane was found");
+        }
+        Ok(surface)
+    }
+
+    /// A terminal that just lost its pane is killed unless the runner owns
+    /// it: an owned one goes back to the detached list instead.
+    fn detach_or_kill(&mut self, terminals: impl Iterator<Item = TerminalId>) -> Applied {
+        let mut killed = Vec::new();
+        for terminal in terminals {
+            if self.owned.contains(&terminal) {
+                self.detached.insert(terminal);
+            } else {
+                killed.push(terminal);
+            }
+        }
+        Applied { killed }
+    }
+
     fn mint_pane(&mut self) -> PaneId {
         let id = PaneId(self.next_pane);
         self.next_pane += 1;
         id
+    }
+}
+
+fn terminal_of(surface: SurfaceRef) -> Option<TerminalId> {
+    match surface {
+        SurfaceRef::Terminal(terminal) => Some(terminal),
+        _ => None,
     }
 }
 
@@ -391,6 +518,23 @@ mod tests {
 
     fn no_titles(_: TerminalId) -> Option<String> {
         None
+    }
+
+    fn pane_showing(ws: &Workspace, terminal: TerminalId) -> Option<PaneId> {
+        ws.snapshot(&no_titles)
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.root.leaves())
+            .find(|(_, surface)| *surface == SurfaceRef::Terminal(terminal))
+            .map(|(pane, _)| pane)
+    }
+
+    fn detached_ids(ws: &Workspace) -> Vec<TerminalId> {
+        ws.snapshot(&no_titles)
+            .detached
+            .into_iter()
+            .map(|d| d.terminal)
+            .collect()
     }
 
     #[test]
@@ -553,5 +697,146 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn an_owned_terminal_outlives_the_pane_that_showed_it() {
+        let mut ws = Workspace::new(RunnerIncarnation::from_bytes([0; 16]));
+        let mut spawn = spawner();
+        let job = TerminalId(500);
+        ws.add_owned(job);
+        assert_eq!(
+            ws.snapshot(&no_titles).detached,
+            vec![DetachedTerminal {
+                terminal: job,
+                title: "500".to_owned(),
+            }],
+            "an untitled terminal is listed under its id"
+        );
+
+        ws.apply(
+            &TopologyCommand::AttachTerminal {
+                terminal: job,
+                target: AttachTarget::Split {
+                    pane: PaneId(1),
+                    axis: Axis::Horizontal,
+                },
+            },
+            &mut spawn,
+        )
+        .unwrap();
+        assert!(
+            detached_ids(&ws).is_empty(),
+            "a shown terminal is not detached"
+        );
+        let pane = pane_showing(&ws, job).expect("the job is shown");
+
+        let applied = ws
+            .apply(&TopologyCommand::ClosePane { pane }, &mut spawn)
+            .unwrap();
+        assert!(
+            applied.killed.is_empty(),
+            "closing a pane must not end the runner's own terminal"
+        );
+        assert_eq!(detached_ids(&ws), vec![job]);
+    }
+
+    #[test]
+    fn closing_an_owned_terminal_kills_and_forgets_it() {
+        let mut ws = Workspace::new(RunnerIncarnation::from_bytes([0; 16]));
+        let mut spawn = spawner();
+        let shown = TerminalId(500);
+        let unshown = TerminalId(501);
+        ws.add_owned(shown);
+        ws.add_owned(unshown);
+        ws.apply(
+            &TopologyCommand::AttachTerminal {
+                terminal: shown,
+                target: AttachTarget::NewTab,
+            },
+            &mut spawn,
+        )
+        .unwrap();
+
+        let applied = ws
+            .apply(
+                &TopologyCommand::CloseTerminal { terminal: shown },
+                &mut spawn,
+            )
+            .unwrap();
+        assert_eq!(applied.killed, vec![shown]);
+        assert!(pane_showing(&ws, shown).is_none(), "its pane went with it");
+        assert_eq!(ws.snapshot(&no_titles).tabs.len(), 1);
+
+        let applied = ws
+            .apply(
+                &TopologyCommand::CloseTerminal { terminal: unshown },
+                &mut spawn,
+            )
+            .unwrap();
+        assert_eq!(applied.killed, vec![unshown]);
+        assert!(detached_ids(&ws).is_empty());
+        assert!(
+            ws.apply(
+                &TopologyCommand::AttachTerminal {
+                    terminal: shown,
+                    target: AttachTarget::NewTab,
+                },
+                &mut spawn,
+            )
+            .is_err(),
+            "a closed terminal is forgotten"
+        );
+    }
+
+    #[test]
+    fn only_an_unshown_terminal_of_the_runners_can_be_attached() {
+        let mut ws = Workspace::new(RunnerIncarnation::from_bytes([0; 16]));
+        let mut spawn = spawner();
+        assert!(
+            ws.apply(
+                &TopologyCommand::AttachTerminal {
+                    terminal: TerminalId(999),
+                    target: AttachTarget::NewTab,
+                },
+                &mut spawn,
+            )
+            .is_err(),
+            "a terminal the runner does not own cannot be attached"
+        );
+        assert!(
+            ws.apply(
+                &TopologyCommand::CloseTerminal {
+                    terminal: TerminalId(999),
+                },
+                &mut spawn,
+            )
+            .is_err()
+        );
+
+        let job = TerminalId(500);
+        ws.add_owned(job);
+        ws.apply(
+            &TopologyCommand::AttachTerminal {
+                terminal: job,
+                target: AttachTarget::NewTab,
+            },
+            &mut spawn,
+        )
+        .unwrap();
+        let revision = ws.revision();
+        assert!(
+            ws.apply(
+                &TopologyCommand::AttachTerminal {
+                    terminal: job,
+                    target: AttachTarget::NewTab,
+                },
+                &mut spawn,
+            )
+            .is_err(),
+            "a terminal shows in one pane at a time"
+        );
+        assert_eq!(ws.revision(), revision, "a refusal changes nothing");
+        assert!(pane_showing(&ws, job).is_some());
     }
 }

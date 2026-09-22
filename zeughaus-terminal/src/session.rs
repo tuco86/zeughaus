@@ -153,6 +153,10 @@ struct Inner {
     /// status the kill produced into [`ExitState::Killed`].
     killed: AtomicBool,
     changes: watch::Sender<u64>,
+    /// A copy of every byte the child writes, taken before the parser sees
+    /// it. A job's log is this sink; a write error ends the tee and leaves
+    /// the terminal running.
+    tee: Mutex<Option<Box<dyn Write + Send>>>,
 }
 
 impl Inner {
@@ -186,6 +190,21 @@ impl Session {
         id: TerminalId,
         profile: &Profile,
         size: Dimensions,
+    ) -> Result<Session, SpawnError> {
+        Session::spawn_teed(id, profile, size, None)
+    }
+
+    /// Like [`Session::spawn`], additionally copying every byte the child
+    /// writes to `tee` before it is parsed.
+    ///
+    /// The tee sees the raw PTY stream, escape sequences included: it is a
+    /// recording of what the program produced, not of what the screen shows.
+    /// A write error drops the sink and the terminal carries on.
+    pub fn spawn_teed(
+        id: TerminalId,
+        profile: &Profile,
+        size: Dimensions,
+        tee: Option<Box<dyn Write + Send>>,
     ) -> Result<Session, SpawnError> {
         if !size.is_valid() {
             return Err(SpawnError::Pty(format!(
@@ -243,6 +262,7 @@ impl Session {
             killer: Mutex::new(killer),
             killed: AtomicBool::new(false),
             changes,
+            tee: Mutex::new(tee),
         });
 
         let session = Session { inner };
@@ -450,6 +470,21 @@ fn read_loop(inner: Arc<Inner>, mut reader: Box<dyn Read + Send>) {
             // back as EOF.
             Err(_) => break,
         };
+        // The tee copies the raw stream first: what a job's log records is
+        // what the program wrote, whatever the parser then makes of it.
+        {
+            let mut tee = inner.tee.lock().unwrap_or_else(|e| e.into_inner());
+            let failed = match tee.as_mut() {
+                Some(sink) => sink
+                    .write_all(&buf[..read])
+                    .and_then(|()| sink.flush())
+                    .is_err(),
+                None => false,
+            };
+            if failed {
+                *tee = None;
+            }
+        }
         {
             let mut model = inner.model();
             model.advance(&buf[..read]);
@@ -631,5 +666,42 @@ mod tests {
 
         assert!(finished, "the child outlived its kill");
         assert_eq!(session.exit(), Some(ExitState::Killed));
+    }
+
+    #[tokio::test]
+    async fn a_teed_child_is_copied_byte_for_byte() {
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let log: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let session = Session::spawn_teed(
+            TerminalId(9),
+            &shell("printf teed-hello; exit 0"),
+            Dimensions { cols: 40, rows: 6 },
+            Some(Box::new(Sink(Arc::clone(&log)))),
+        )
+        .expect("spawn /bin/sh");
+
+        let logged =
+            || String::from_utf8_lossy(&log.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
+        let finished = settle(&session, Duration::from_secs(10), |session| {
+            session.exit().is_some() && logged().contains("teed-hello")
+        })
+        .await;
+
+        assert!(finished, "the tee never saw the output: {:?}", logged());
     }
 }

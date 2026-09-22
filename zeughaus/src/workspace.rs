@@ -30,8 +30,8 @@ use iced::widget::pane_grid::{self, Configuration, Node, Pane, ResizeEvent, Spli
 use iced_tabs::Placement;
 use zeughaus_mux::workspace::ProfileId;
 use zeughaus_mux::{
-    Axis, PaneId, PaneNode, RunnerIncarnation, SplitId, TabId, TabSnapshot, TopologyCommand,
-    WorkspaceSnapshot,
+    Axis, DetachedTerminal, PaneId, PaneNode, RunnerIncarnation, SplitId, TabId, TabSnapshot,
+    TopologyCommand, WorkspaceSnapshot,
 };
 
 /// What a pane shows. The wire type itself: a mirrored copy would only add a
@@ -232,6 +232,13 @@ impl Workspace {
 
     pub fn tabs(&self) -> &[TabSnapshot] {
         &self.snapshot.tabs
+    }
+
+    /// Terminals the runner owns that no pane shows -- a job's, until
+    /// somebody attaches it. Empty while no runner is attached.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn detached(&self) -> &[DetachedTerminal] {
+        &self.snapshot.detached
     }
 
     /// The active tab's id, or the first tab's: a workspace always has one
@@ -444,6 +451,7 @@ fn local_snapshot() -> WorkspaceSnapshot {
                 surface: Surface::Graph,
             },
         }],
+        detached: Vec::new(),
     }
 }
 
@@ -580,6 +588,7 @@ mod tests {
                 accent_rgba: None,
                 root,
             }],
+            detached: Vec::new(),
         }
     }
 

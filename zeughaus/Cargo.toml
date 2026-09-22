@@ -14,6 +14,10 @@ zeughaus-flow.workspace = true
 # Subgraph containers and their boundary nodes. Pure, cross-platform: the
 # nesting is drawn here and executed nowhere.
 zeughaus-graph.workspace = true
+# Job nodes: the argv, environment and artifact globs of a process, drawn and
+# edited here and executed by a runner. Pure settings and pins, so the wasm
+# editor registers the same detached plugin the native one does.
+zeughaus-job.workspace = true
 # The terminal mux's wire model: the workspace topology the editor rebuilds
 # its pane grid from, and the terminal cache it draws. Pure types, so the
 # wasm editor deserializes the same topology as the native one.

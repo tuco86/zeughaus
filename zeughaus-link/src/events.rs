@@ -135,10 +135,18 @@ impl Snapshot {
     }
 }
 
-/// An editor asking for a node to be fired once (the manual trigger button).
+/// A node asked to fire once: a manual press in an editor, or an external
+/// trigger relayed here over weida.
+///
+/// The payload is handed to the node as its `fire` parameter, which is what
+/// lets one trigger carry what it is about (a webhook body, a revision) while
+/// the protocol stays free of anything node-specific. A bare press sends none,
+/// and a sender older than the payload leaves the field out, so it defaults.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TriggerRequest {
     pub node_id: u64,
+    #[serde(default)]
+    pub payload: Option<String>,
 }
 
 impl TriggerRequest {
@@ -173,8 +181,10 @@ pub const MAX_EVENT_BYTES: usize = 64 * 1024;
 /// (one row per producing pin), bounded because it is still one allocation.
 pub const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 
-/// Largest trigger request the runtime reads. It carries one node id.
-pub const MAX_TRIGGER_BYTES: usize = 4096;
+/// Largest trigger request the runtime reads. It carries one node id and a
+/// free-text payload -- a webhook body is the size this has to allow for,
+/// while still being one bounded allocation per press.
+pub const MAX_TRIGGER_BYTES: usize = 64 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -267,8 +277,22 @@ mod tests {
     }
 
     #[test]
-    fn a_trigger_request_round_trips() {
-        let request = TriggerRequest { node_id: 99 };
-        assert_eq!(TriggerRequest::decode(&request.encode()), Some(request));
+    fn a_trigger_request_round_trips_with_and_without_a_payload() {
+        for payload in [None, Some("{\"ref\":\"main\"}".to_owned())] {
+            let request = TriggerRequest {
+                node_id: 99,
+                payload,
+            };
+            assert_eq!(TriggerRequest::decode(&request.encode()), Some(request));
+        }
+    }
+
+    /// A press from an editor that predates the payload carries only the node
+    /// id; refusing it would break the button rather than the addition.
+    #[test]
+    fn a_trigger_request_without_a_payload_still_decodes() {
+        let decoded = TriggerRequest::decode(br#"{"node_id":1}"#).expect("trigger");
+        assert_eq!(decoded.node_id, 1);
+        assert_eq!(decoded.payload, None);
     }
 }

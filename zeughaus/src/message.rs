@@ -195,6 +195,20 @@ pub enum Message {
     // terminal it shows is one lookup away in the workspace.
     #[cfg(not(target_arch = "wasm32"))]
     TerminalAction(zeughaus_mux::PaneId, iced_terminal::Action),
+    // Show one of the runner's own terminals -- a job's -- in a new tab, or
+    // kill it. Offered by the palette from the detached list of the last
+    // workspace snapshot; the runner answers with the next snapshot. The
+    // browser editor never has a runner, so its detached list is empty and
+    // nothing emits these.
+    AttachTerminal(zeughaus_mux::TerminalId),
+    CloseTerminal(zeughaus_mux::TerminalId),
+    // Hold the runner, which starts no new run and lets the live ones
+    // finish, or release it again.
+    HoldRunner(bool),
+    // What the runner answered: the state it is in now and how many runs are
+    // still alive.
+    #[cfg(not(target_arch = "wasm32"))]
+    HoldReplied(Result<zeughaus_link::HoldReply, String>),
 }
 
 #[cfg(test)]
