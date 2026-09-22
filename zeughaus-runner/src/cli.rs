@@ -14,7 +14,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use weida::{ClientTls, EndpointAddr, Runtime, RuntimeConfig, Trust};
+use weida::{ClientTls, EndpointAddr, Runtime, RuntimeConfig, TransferMeta, Trust};
 use zeughaus_link::{
     HOLD_PATH, HoldReply, HoldRequest, MAX_HOLD_BYTES, TRIGGERS_PATH, TriggerRequest, credentials,
 };
@@ -144,10 +144,23 @@ impl Command {
                     .await
                     .map_err(|e| format!("connect {url}: {e}"))?;
                 let node_id = request.node_id;
-                pusher
-                    .send(&request.encode())
+                // The receipt matters here, unlike for an editor's press:
+                // this process exits right after, and a push whose bytes are
+                // still in flight would be discarded with the connection.
+                let mut transfer = pusher
+                    .open(TransferMeta::default())
                     .await
                     .map_err(|e| format!("trigger {node_id}: {e}"))?;
+                transfer
+                    .write_all(&request.encode())
+                    .await
+                    .map_err(|e| format!("trigger {node_id}: {e}"))?;
+                transfer
+                    .finish()
+                    .map_err(|e| format!("trigger {node_id}: {e}"))?
+                    .delivered()
+                    .await
+                    .map_err(|e| format!("trigger {node_id}: not delivered: {e}"))?;
                 Ok(format!("triggered node {node_id}"))
             }
             Command::Hold { endpoint, held } => {
@@ -187,6 +200,52 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The push must be in the runner's hands when `send` returns: the
+    /// process exits right after, and the first version of this command lost
+    /// every trigger by closing the connection with the bytes still in
+    /// flight. Real loopback QUIC with the runner's own listener.
+    #[tokio::test]
+    async fn a_trigger_is_delivered_before_send_returns() {
+        let state = std::env::temp_dir().join(format!("zeughaus-cli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let transport = crate::transport::Transport::start(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            &state,
+        )
+        .await
+        .expect("listener");
+        let puller = transport
+            .listener()
+            .puller(TRIGGERS_PATH)
+            .expect("trigger endpoint");
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        tokio::spawn(crate::transport::accept_triggers(puller, tx));
+
+        let command = parse_trigger(&[
+            transport.url().to_string(),
+            "42".to_string(),
+            "payload".to_string(),
+        ])
+        .expect("parsed");
+        let line = command.send(&state).await.expect("sent");
+        assert_eq!(line, "triggered node 42");
+
+        // Already queued, or the send returned before delivery.
+        let received =
+            tokio::task::spawn_blocking(move || rx.recv_timeout(std::time::Duration::from_secs(5)))
+                .await
+                .expect("join")
+                .expect("the press reached the runner");
+        assert_eq!(
+            received,
+            TriggerRequest {
+                node_id: 42,
+                payload: Some("payload".to_string())
+            }
+        );
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]
