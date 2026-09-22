@@ -22,11 +22,12 @@ use crate::{JobSpec, ProcessHost, RunHandle};
 pub struct JobNode {
     /// `None` in a process that does not execute. See the crate docs.
     host: Option<Arc<dyn ProcessHost>>,
-    command: String,
-    args: Vec<String>,
+    /// The program and its arguments, already split.
+    command: Vec<String>,
     env: Vec<(String, String)>,
     cwd: String,
     artifacts: Vec<String>,
+    keep_on_failure: bool,
     /// A press taken through the parameter channel, spent by the next execute.
     armed: bool,
     /// Whether a run started here is still going. Shared with its deferred
@@ -39,11 +40,11 @@ impl JobNode {
     pub fn new(host: Option<Arc<dyn ProcessHost>>) -> Self {
         Self {
             host,
-            command: String::new(),
-            args: Vec::new(),
+            command: Vec::new(),
             env: Vec::new(),
             cwd: String::new(),
             artifacts: Vec::new(),
+            keep_on_failure: true,
             armed: false,
             live: Arc::new(AtomicBool::new(false)),
             pins: vec![
@@ -80,12 +81,11 @@ impl ExecutableNode for JobNode {
                 "job: the runner is held and starts no new runs".to_string(),
             ));
         }
-        let program = self.command.trim();
-        if program.is_empty() {
+        let Some(program) = self.command.first().map(String::as_str) else {
             return Err(ZeughausError::ExecutionFailed(
                 "job: no command set".to_string(),
             ));
-        }
+        };
         // One run at a time per node. A queue depth is a later setting; until
         // then a trigger arriving mid-run is an error the editor sees, not a
         // second process.
@@ -109,10 +109,11 @@ impl ExecutableNode for JobNode {
             .spawn(JobSpec {
                 label,
                 program: program.to_string(),
-                args: self.args.clone(),
+                args: self.command[1..].to_vec(),
                 env: self.env.clone(),
                 cwd: cwd.clone(),
                 run_dir: run_dir.clone(),
+                keep_on_failure: self.keep_on_failure,
             })
             .map_err(ZeughausError::ExecutionFailed)?;
 
@@ -134,17 +135,11 @@ impl ExecutableNode for JobNode {
 
     fn settings(&self) -> Vec<SettingDef> {
         vec![
-            SettingDef::new("command", "").placeholder("program"),
-            SettingDef::new("args", "")
-                .placeholder("one argument per line")
-                .multiline(),
-            SettingDef::new("env", "")
-                .placeholder("KEY=VALUE per line")
-                .multiline(),
+            SettingDef::new("command", "").placeholder("program arg \"quoted arg\""),
+            SettingDef::new("env", "").placeholder("KEY=VALUE KEY2=\"a b\""),
             SettingDef::new("cwd", "").placeholder("(the runner's directory)"),
-            SettingDef::new("artifacts", "")
-                .placeholder("one glob per line, relative to cwd")
-                .multiline(),
+            SettingDef::new("artifacts", "").placeholder("globs relative to cwd"),
+            SettingDef::new("keep_on_failure", "true"),
         ]
     }
 
@@ -159,45 +154,56 @@ impl ExecutableNode for JobNode {
             return Ok(());
         };
         match name {
-            "command" => self.command = text.clone(),
-            "args" => self.args = lines(text),
+            "command" => self.command = words("command", text)?,
             "env" => self.env = parse_env(text)?,
             "cwd" => self.cwd = text.clone(),
-            "artifacts" => self.artifacts = lines(text),
+            "artifacts" => self.artifacts = words("artifacts", text)?,
+            "keep_on_failure" => {
+                self.keep_on_failure = match text.trim() {
+                    "" | "true" => true,
+                    "false" => false,
+                    other => {
+                        return Err(ZeughausError::InvalidParameter(format!(
+                            "keep_on_failure: '{other}' is neither true nor false"
+                        )));
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
     }
 }
 
-/// The non-blank lines of a multiline setting, one entry each.
-fn lines(text: &str) -> Vec<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect()
+/// Splits a setting the way a POSIX shell splits words -- quotes and
+/// backslashes group, nothing expands -- so a path with a space is one
+/// argument and `$HOME` reaches the program as written. No shell is involved
+/// at run time: the program is started directly with these words.
+///
+/// The settings are single lines because the editor draws them as such; a
+/// list per line would need a widget that does not exist yet.
+fn words(setting: &str, text: &str) -> Result<Vec<String>> {
+    shlex::split(text).ok_or_else(|| {
+        ZeughausError::InvalidParameter(format!(
+            "{setting}: unbalanced quote or trailing backslash"
+        ))
+    })
 }
 
-/// `KEY=VALUE` per line. A line without `=` is refused rather than dropped:
+/// `KEY=VALUE` words. A word without `=` is refused rather than dropped:
 /// silently ignoring it would start the run without the variable it needs and
 /// blame the program for it.
 fn parse_env(text: &str) -> Result<Vec<(String, String)>> {
     let mut env = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
+    for word in words("env", text)? {
+        let Some((key, value)) = word.split_once('=') else {
             return Err(ZeughausError::InvalidParameter(format!(
-                "env: '{line}' is not KEY=VALUE"
+                "env: '{word}' is not KEY=VALUE"
             )));
         };
-        let key = key.trim();
         if key.is_empty() {
             return Err(ZeughausError::InvalidParameter(format!(
-                "env: '{line}' has no name"
+                "env: '{word}' has no name"
             )));
         }
         env.push((key.to_string(), value.to_string()));
@@ -482,11 +488,11 @@ mod tests {
     }
 
     #[test]
-    fn an_env_line_without_an_equals_sign_is_refused() {
+    fn an_env_word_without_an_equals_sign_is_refused() {
         let host = FakeHost::new(ok_exit());
         let mut node = job(&host);
         let err = node
-            .set_parameter("env", Value::new("PATH=/bin\nBROKEN\n".to_string()))
+            .set_parameter("env", Value::new("PATH=/bin BROKEN".to_string()))
             .expect_err("env");
         assert!(matches!(err, ZeughausError::InvalidParameter(_)), "{err}");
         // The refused value never took effect.
@@ -494,12 +500,29 @@ mod tests {
     }
 
     #[test]
+    fn an_unbalanced_quote_is_refused_and_keeps_the_old_command() {
+        let host = FakeHost::new(ok_exit());
+        let mut node = job(&host);
+        let err = node
+            .set_parameter(
+                "command",
+                Value::new("cargo test \"unterminated".to_string()),
+            )
+            .expect_err("command");
+        assert!(matches!(err, ZeughausError::InvalidParameter(_)), "{err}");
+        assert_eq!(node.command, vec!["/bin/echo".to_string()]);
+    }
+
+    #[test]
     fn the_spec_comes_out_of_the_settings() {
         let host = FakeHost::new(ok_exit());
         let mut node = job(&host);
-        node.set_parameter("args", Value::new("-n\n\nhello world\n".to_string()))
-            .expect("args");
-        node.set_parameter("env", Value::new("A=1\nB=two=three\n".to_string()))
+        node.set_parameter(
+            "command",
+            Value::new("/bin/echo -n 'hello world' \\$HOME".to_string()),
+        )
+        .expect("command");
+        node.set_parameter("env", Value::new("A=1 B=two=three C=\"x y\"".to_string()))
             .expect("env");
         node.set_parameter("cwd", Value::new("   ".to_string()))
             .expect("cwd");
@@ -508,12 +531,22 @@ mod tests {
         let spec = host.spec();
         assert_eq!(spec.label, "echo");
         assert_eq!(spec.program, "/bin/echo");
-        assert_eq!(spec.args, vec!["-n".to_string(), "hello world".to_string()]);
+        // Quotes group, nothing expands: no shell stands between the setting
+        // and the program.
+        assert_eq!(
+            spec.args,
+            vec![
+                "-n".to_string(),
+                "hello world".to_string(),
+                "$HOME".to_string()
+            ]
+        );
         assert_eq!(
             spec.env,
             vec![
                 ("A".to_string(), "1".to_string()),
-                ("B".to_string(), "two=three".to_string())
+                ("B".to_string(), "two=three".to_string()),
+                ("C".to_string(), "x y".to_string()),
             ]
         );
         // Blank is the runner's own directory, not a directory named "".
@@ -587,7 +620,7 @@ mod tests {
         let mut node = job(&host);
         node.set_parameter("cwd", Value::new(work_dir.to_string_lossy().into_owned()))
             .expect("cwd");
-        node.set_parameter("artifacts", Value::new("out/*.txt\n".to_string()))
+        node.set_parameter("artifacts", Value::new("out/*.txt".to_string()))
             .expect("artifacts");
         let work = fire(&mut node).expect("run").expect("deferred");
         let outputs = work.run().expect("wait");

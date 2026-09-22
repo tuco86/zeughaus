@@ -9,7 +9,11 @@
 //!
 //! `Button` is the origin of an event: nothing upstream produces it, a press
 //! from any editor does. `Timer` is the clock a source node needs: the host
-//! runs it on its interval, and everything downstream follows.
+//! runs it on its interval, and everything downstream follows. `All` is the
+//! fan-in: it fires once every connected input has fired.
+
+use std::collections::HashSet;
+use std::sync::Arc;
 
 use zeughaus_core::*;
 
@@ -25,6 +29,7 @@ impl DomainPlugin for FlowPlugin {
             catalog_entry("flow.hold", "Hold", "Flow", &HoldNode::new()),
             catalog_entry("flow.button", "Button", "Flow", &ButtonNode::new()),
             catalog_entry("flow.timer", "Timer", "Flow", &TimerNode::new()),
+            catalog_entry("flow.all", "All", "Flow", &AllNode::new()),
         ]
     }
 
@@ -33,6 +38,7 @@ impl DomainPlugin for FlowPlugin {
             "flow.hold" => Some(Box::new(HoldNode::new())),
             "flow.button" => Some(Box::new(ButtonNode::new())),
             "flow.timer" => Some(Box::new(TimerNode::new())),
+            "flow.all" => Some(Box::new(AllNode::new())),
             _ => None,
         }
     }
@@ -229,6 +235,109 @@ impl ExecutableNode for TimerNode {
     }
 }
 
+/// Fan-in: fires `out` once every connected input has fired since the last
+/// time it fired.
+///
+/// This is what joins the branches of a pipeline: two jobs run, and the
+/// third starts when both `ok` pins have fired. Inputs are variadic (`a`,
+/// `b`, ... with one spare kept empty) and typed `Any`, because what arrives
+/// is the event, not the value. An input that is not connected never
+/// counts, so wiring one more branch does not silently block the node
+/// until someone remembers to fire it.
+pub struct AllNode {
+    /// Inputs a value arrived on since the last fire.
+    seen: HashSet<Arc<str>>,
+    /// Inputs currently wired, from the last pin sync.
+    connected: HashSet<Arc<str>>,
+    pins: Vec<PinDefinition>,
+}
+
+impl Default for AllNode {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The input names, in pin order. 26 is the cap on inputs.
+const INPUT_NAMES: [&str; 26] = [
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s",
+    "t", "u", "v", "w", "x", "y", "z",
+];
+
+fn all_pins(inputs: usize) -> Vec<PinDefinition> {
+    let mut pins: Vec<PinDefinition> = INPUT_NAMES[..inputs]
+        .iter()
+        .map(|name| PinDefinition::input(*name, Ty::Any, PinKind::Trigger))
+        .collect();
+    pins.push(PinDefinition::output("out", Ty::Bool));
+    pins
+}
+
+impl AllNode {
+    pub fn new() -> Self {
+        Self {
+            seen: HashSet::new(),
+            connected: HashSet::new(),
+            pins: all_pins(2),
+        }
+    }
+
+    fn input_count(&self) -> usize {
+        self.pins.len() - 1
+    }
+}
+
+impl ExecutableNode for AllNode {
+    fn execute(&mut self, inputs: &InputSet, ctx: &mut NodeContext) -> Result<()> {
+        for name in INPUT_NAMES[..self.input_count()].iter().copied() {
+            if inputs.changed(name) {
+                self.seen.insert(Arc::from(name));
+            }
+        }
+        // Nothing wired means nothing to wait for, and firing on every pass
+        // would make an unconnected join a clock.
+        if self.connected.is_empty() || !self.connected.iter().all(|name| self.seen.contains(name))
+        {
+            return Ok(());
+        }
+        self.seen.clear();
+        ctx.emit("out", Value::new(true));
+        ctx.flush();
+        Ok(())
+    }
+
+    fn pin_definitions(&self) -> &[PinDefinition] {
+        &self.pins
+    }
+
+    fn sync_pins(&mut self, connected: &[PinBinding<'_>]) -> bool {
+        self.connected = connected
+            .iter()
+            .filter(|b| INPUT_NAMES.contains(&b.name))
+            .map(|b| Arc::from(b.name))
+            .collect();
+        // A branch that was unwired is no longer waited for, and what it
+        // fired before must not count towards the next join either.
+        self.seen.retain(|name| self.connected.contains(name));
+        // Highest connected input, then one spare after it, at least two.
+        let last = self
+            .connected
+            .iter()
+            .filter_map(|c| INPUT_NAMES.iter().position(|n| *n == &**c))
+            .max();
+        let desired = match last {
+            Some(i) => (i + 2).clamp(2, INPUT_NAMES.len()),
+            None => 2,
+        };
+        if desired != self.input_count() {
+            self.pins = all_pins(desired);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,6 +509,69 @@ mod tests {
     fn only_the_timer_wants_a_clock() {
         assert!(HoldNode::new().tick_interval().is_none());
         assert!(ButtonNode::new().tick_interval().is_none());
+        assert!(AllNode::new().tick_interval().is_none());
         assert!(TimerNode::new().tick_interval().is_some());
+    }
+
+    /// Wires the named inputs of an `All` node.
+    fn wired(node: &mut AllNode, names: &[&str]) {
+        let bindings: Vec<PinBinding<'_>> = names
+            .iter()
+            .map(|name| PinBinding {
+                name,
+                ty: &Ty::Bool,
+            })
+            .collect();
+        node.sync_pins(&bindings);
+    }
+
+    /// Runs the node with an event on each of `fired`, returning whether
+    /// `out` fired.
+    fn deliver(node: &mut AllNode, fired: &[&str]) -> bool {
+        let mut inputs = InputSet::new();
+        for name in fired {
+            inputs.insert(*name, Value::new(true));
+            inputs.mark_changed(*name);
+        }
+        let mut ctx = NodeContext::new(NodeId(9));
+        node.execute(&inputs, &mut ctx).unwrap();
+        ctx.take_outputs().contains_key("out")
+    }
+
+    #[test]
+    fn all_fires_once_every_wired_input_has_fired() {
+        let mut node = AllNode::new();
+        wired(&mut node, &["a", "b"]);
+        assert!(!deliver(&mut node, &["a"]));
+        // A repeat of the same branch is not the other branch.
+        assert!(!deliver(&mut node, &["a"]));
+        assert!(deliver(&mut node, &["b"]));
+        // Fired: the count starts over.
+        assert!(!deliver(&mut node, &["b"]));
+        assert!(deliver(&mut node, &["a"]));
+        // Both in one pass.
+        assert!(deliver(&mut node, &["a", "b"]));
+    }
+
+    #[test]
+    fn all_waits_only_for_wired_inputs_and_never_fires_unwired() {
+        let mut node = AllNode::new();
+        // Nothing wired: a pass is not an event.
+        assert!(!deliver(&mut node, &[]));
+        wired(&mut node, &["a"]);
+        // One branch wired: every event on it is a complete join.
+        assert!(deliver(&mut node, &["a"]));
+        // Wiring `c` grows the pins to a..d (one spare) and adds it to the
+        // wait; what `a` fires before `c` is remembered.
+        wired(&mut node, &["a", "c"]);
+        assert_eq!(node.pin_definitions().len(), 5);
+        assert!(!deliver(&mut node, &["a"]));
+        assert!(!deliver(&mut node, &[]));
+        assert!(deliver(&mut node, &["c"]));
+        // Unwiring `a` drops it from the wait and forgets what it fired.
+        assert!(!deliver(&mut node, &["a"]));
+        wired(&mut node, &["c"]);
+        assert!(!deliver(&mut node, &[]));
+        assert!(deliver(&mut node, &["c"]));
     }
 }

@@ -39,6 +39,10 @@ pub struct JobSpec {
     /// The directory this run's log, exit record and artifacts go into,
     /// already created by [`ProcessHost::new_run_dir`].
     pub run_dir: PathBuf,
+    /// After a non-zero exit, leave a shell in the run's terminal with the
+    /// same working directory and environment, so the failure can be looked
+    /// at where it happened. A host that cannot do that ignores it.
+    pub keep_on_failure: bool,
 }
 
 /// How a run ended.

@@ -252,7 +252,7 @@ active tab, focus, scroll, selection and blink are per window.
 | plugin | nodes | notes |
 |---|---|---|
 | `transform` | 35: constants, math, trig, logic, compare, string, `display` | `transform.display` is the one node whose body shows data and asks for a frame feed |
-| `flow` | `hold` (event -> state), `button` (a manual event, pressed from any editor via `/triggers`), `timer` (the clock) | |
+| `flow` | `hold` (event -> state), `button` (a manual event, pressed from any editor via `/triggers`), `timer` (the clock), `all` (fan-in: fires once every wired input has fired) | |
 | `graph` | `sub` (container), `input`, `output` (boundary passthroughs) | |
 | `ml` | Keras layers and merges from static `LAYERS`/`MERGES` tables, `compile`, `export` | a `KerasModel` value is a DAG of steps keyed by the producing node id, so a fan-out that merges emits each step once; `export` renders functional-API Python |
 | `llm` | `system`, `user`, `chat`, `last_reply`, `merge` over a `Conversation` value | LM Studio's OpenAI-style endpoint; `chat` is async work |
@@ -389,10 +389,12 @@ A `job.run` node (`zeughaus-job`) executes a process with a beginning and an
 end -- a CI step, an all-night agent session -- as a terminal the runner
 owns. A failed job is therefore a terminal to attach to, not a log to read.
 
-**The node.** Settings `command`, `args` (one per line), `env` (`KEY=VALUE`
-per line, added to the runner's environment), `cwd` (empty: the runner's),
-`artifacts` (globs relative to `cwd`, one per line); a malformed line is
-`InvalidParameter`. Pins: `run` (trigger) in; `ok: Bool`, `failed: Int` (the
+**The node.** Settings `command` (program and arguments on one line, split
+like a shell splits words -- quotes group, nothing expands, no shell runs),
+`env` (`KEY=VALUE` words, added to the runner's environment), `cwd` (empty:
+the runner's), `artifacts` (globs relative to `cwd`), `keep_on_failure`
+(default `true`); a malformed setting is `InvalidParameter`. Pins: `run`
+(trigger) in; `ok: Bool`, `failed: Int` (the
 exit code, `-1` for a signal or a kill) and `run: Str` (the run directory)
 out. `ok` and `failed` are separate pins so each can drive its own trigger
 wire. The node acts only on its own trigger or on a press (`fire`, which is
@@ -412,10 +414,18 @@ pane whose PTY bytes are teed to the log before they are parsed
 the child exits, `exit` is written (`code`, `killed`, `started`, `finished`),
 declared artifacts are copied under `artifacts/`, and the outputs are
 delivered like any async result. A run that exited 0 closes its terminal;
-every other outcome keeps it, screen and all, until someone closes it. The
-store holds nothing about runs; `/runs` on the runner serves any run file by
-range (`RunFileRequest` -> `RunFileReply`, `zeughaus-link/src/runs.rs`), so
-logs and artifacts stay on the machine that produced them.
+every other outcome keeps it until someone closes it. With
+`keep_on_failure` (Unix) the program runs under a five-line `/bin/sh`
+wrapper that, on a non-zero exit, writes the code to `<run_dir>/code` and
+`exec`s `$SHELL` in the same directory and environment: the run is reported
+from the code file while the shell lives on in the terminal, which is what
+makes a failed job a place to look rather than a screen to read. The
+`flow.all` node is the fan-in: it fires once every wired input has fired
+since it last fired, so a job starts when both of its predecessors' `ok`
+pins have. The store holds nothing about runs; `/runs` on the runner serves
+any run file by range (`RunFileRequest` -> `RunFileReply`,
+`zeughaus-link/src/runs.rs`), so logs and artifacts stay on the machine that
+produced them.
 
 **Owned terminals in the mux.** Terminal lifetime is separate from pane
 lifetime for terminals the runner owns: the workspace snapshot lists them in
@@ -454,15 +464,11 @@ Kept here so they are not mistaken for descriptions of the code:
 - A browser editor that syncs with the store; the wasm build edits locally.
 - Terminal image protocols; the wire model reserves kinds for them.
 - Jobs, decided but not built:
-  - A shell in the failed run's terminal, with its cwd and environment,
-    once the child is gone (`keep_on_failure`); today the terminal keeps the
-    final screen only.
   - A shim process per run that owns the PTY and the log, survives a runner
     restart and is reattached by replaying the log into `wezterm-term`;
     today runs die with the runner, which is why it drains.
   - Reading run files in the editor; `/runs` is served, nothing calls it.
-  - Retention of run directories; a fan-in `flow` node that fires once
-    every input has fired.
+  - Retention of run directories.
   - A CLI (`zeughaus trigger <node> [payload]`, `zeughaus hold`) with the
     client identity; the palette is the only client of `/triggers` and
     `/hold` today. Webhooks (Gitea) land on the weida broker once it speaks

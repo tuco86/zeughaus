@@ -7998,6 +7998,7 @@ name = "zeughaus-job"
 version = "0.1.0"
 dependencies = [
  "glob",
+ "shlex 1.3.0",
  "zeughaus-core",
 ]
 

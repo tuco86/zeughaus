@@ -108,12 +108,32 @@ impl ProcessHost for JobHost {
         let log = File::create(&log_path)
             .map_err(|e| format!("cannot create {}: {e}", log_path.display()))?;
 
+        let (program, args, mut env) = if spec.keep_on_failure && cfg!(unix) {
+            // The wrapper runs the program, and on failure records the code
+            // where `wait` finds it and becomes the user's shell in the same
+            // directory and environment. On success it exits 0 like the
+            // program did.
+            let mut args = vec![
+                "-c".to_string(),
+                KEEP_SHELL.to_string(),
+                "zeughaus-job".to_string(),
+                spec.program,
+            ];
+            args.extend(spec.args);
+            ("/bin/sh".to_string(), args, spec.env)
+        } else {
+            (spec.program, spec.args, spec.env)
+        };
+        env.push((
+            "ZEUGHAUS_RUN_DIR".to_string(),
+            spec.run_dir.to_string_lossy().into_owned(),
+        ));
         let profile = Profile {
             label: spec.label,
-            program: Some(PathBuf::from(spec.program)),
-            args: spec.args,
+            program: Some(PathBuf::from(program)),
+            args,
             cwd: spec.cwd,
-            env: spec.env,
+            env,
             scrollback_rows: RUN_SCROLLBACK_ROWS,
         };
         let terminal = self.mux.spawn_owned(profile, Some(Box::new(log)))?;
@@ -121,10 +141,22 @@ impl ProcessHost for JobHost {
         Ok(Box::new(Run {
             mux: self.mux.clone(),
             terminal,
+            code_file: spec.run_dir.join("code"),
             live: Arc::clone(&self.live),
         }))
     }
 }
+
+/// The shell script a `keep_on_failure` run is started through: `$0` is a
+/// name for error messages, `$@` the program and its arguments. The code
+/// file is what tells `wait` that the run is over while the shell that
+/// replaced it lives on; it is written before the shell so the two cannot
+/// be observed in the wrong order.
+const KEEP_SHELL: &str = r##""$@"; rc=$?
+if [ "$rc" -eq 0 ]; then exit 0; fi
+printf '%s\n' "$rc" > "$ZEUGHAUS_RUN_DIR/code"
+printf '\n[zeughaus] exit %s; a shell follows\n' "$rc"
+exec "${SHELL:-/bin/sh}""##;
 
 /// Decrements the live count however the wait ended, panic included: a count
 /// left standing would make a draining runner wait forever.
@@ -140,6 +172,9 @@ impl Drop for LiveGuard {
 struct Run {
     mux: MuxService,
     terminal: TerminalId,
+    /// Written by the wrapper when the program failed and a shell took its
+    /// place; the run is over even though the terminal's child is not.
+    code_file: PathBuf,
     live: Arc<AtomicU32>,
 }
 
@@ -148,6 +183,7 @@ impl RunHandle for Run {
         let Run {
             mux,
             terminal,
+            code_file,
             live,
         } = *self;
         let _guard = LiveGuard(live);
@@ -161,6 +197,15 @@ impl RunHandle for Run {
                     killed: true,
                 };
             };
+            if let Some(code) = std::fs::read_to_string(&code_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+            {
+                return RunExit {
+                    code: Some(code),
+                    killed: false,
+                };
+            }
             if let Some(exit) = session.exit() {
                 let run = match exit {
                     ExitState::Exited { code } => RunExit {
@@ -275,11 +320,13 @@ mod tests {
 
     /// Configure a `job.run` node for `sh -c <script>`, press it, and run
     /// its deferred work to the end as the host loop would.
-    fn run_script(plugin: &JobPlugin, script: &str) -> HashMap<String, Value> {
+    fn run_script(plugin: &JobPlugin, script: &str, keep: bool) -> HashMap<String, Value> {
         let mut node = plugin.create_node("job.run").expect("job.run exists");
-        node.set_parameter("command", Value::new("/bin/sh".to_string()))
+        // Single quotes group the script into one argument; the scripts here
+        // contain none themselves.
+        node.set_parameter("command", Value::new(format!("/bin/sh -c '{script}'")))
             .unwrap();
-        node.set_parameter("args", Value::new(format!("-c\n{script}")))
+        node.set_parameter("keep_on_failure", Value::new(keep.to_string()))
             .unwrap();
         node.set_parameter("fire", Value::new(String::new()))
             .unwrap();
@@ -299,24 +346,31 @@ mod tests {
         let plugin = JobPlugin::new(Arc::clone(&host) as Arc<dyn ProcessHost>);
 
         // First run: fails with 3. Its terminal is the first the mux hands
-        // out and must still be there, holding the screen.
-        let outputs = run_script(&plugin, "echo marker-one; exit 3");
+        // out and must still be there -- with a shell in it, since the run
+        // keeps on failure: the child has not exited even though the run is
+        // over and reported.
+        let outputs = run_script(&plugin, "echo marker-one; exit 3", true);
         assert_eq!(outputs["failed"].downcast_ref::<i64>(), Some(&3));
         assert!(!outputs.contains_key("ok"));
         let run_dir = PathBuf::from(outputs["run"].downcast_ref::<String>().unwrap());
         assert_eq!(run_dir, state_dir.join("runs").join("1"));
         let log = std::fs::read_to_string(run_dir.join("log")).unwrap();
         assert!(log.contains("marker-one"), "log was: {log:?}");
+        assert!(log.contains("a shell follows"), "log was: {log:?}");
         let exit = std::fs::read_to_string(run_dir.join("exit")).unwrap();
         assert!(
             exit.starts_with("code=3\nkilled=false\n"),
             "exit was: {exit:?}"
         );
-        assert!(mux.session(TerminalId(1)).is_some());
+        let kept = mux
+            .session(TerminalId(1))
+            .expect("the failed run's terminal");
+        assert!(kept.exit().is_none(), "the shell should still be running");
         assert_eq!(host.live_runs(), 0);
 
-        // Second run: succeeds. Its terminal is closed, the log stays.
-        let outputs = run_script(&plugin, "echo marker-two");
+        // Second run: succeeds. Its terminal is closed, the log stays, and no
+        // code file was written because the wrapper exited with the program.
+        let outputs = run_script(&plugin, "echo marker-two", true);
         assert_eq!(outputs["ok"].downcast_ref::<bool>(), Some(&true));
         let run_dir = PathBuf::from(outputs["run"].downcast_ref::<String>().unwrap());
         assert_eq!(run_dir, state_dir.join("runs").join("2"));
@@ -325,14 +379,22 @@ mod tests {
                 .unwrap()
                 .contains("marker-two")
         );
+        assert!(!run_dir.join("code").exists());
         assert!(mux.session(TerminalId(2)).is_none());
         assert!(mux.session(TerminalId(1)).is_some());
+
+        // Third run: fails without keeping. The terminal stays with its
+        // final screen, but nothing runs in it any more.
+        let outputs = run_script(&plugin, "exit 7", false);
+        assert_eq!(outputs["failed"].downcast_ref::<i64>(), Some(&7));
+        let dead = mux.session(TerminalId(3)).expect("the terminal is kept");
+        assert!(dead.exit().is_some());
 
         // A restarted host continues the numbering past what is on disk.
         let restarted = JobHost::new(mux, state_dir.clone());
         assert_eq!(
             restarted.new_run_dir().unwrap(),
-            state_dir.join("runs").join("3")
+            state_dir.join("runs").join("4")
         );
 
         let _ = std::fs::remove_dir_all(&state_dir);

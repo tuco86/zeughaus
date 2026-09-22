@@ -8,3 +8,6 @@ zeughaus-core.workspace = true
 # Artifacts are declared as globs relative to the run's working directory and
 # expanded after the process exited.
 glob = "0.3"
+# The command and the env are single-line settings split the way a shell
+# splits words, without a shell: quotes group, nothing expands.
+shlex = "1.3"

@@ -30,7 +30,7 @@ zeughaus-mux/          # terminal mux wire model: stable ids, workspace topology
 zeughaus-terminal/     # the runner's terminal engine: PTYs over portable-pty and a pinned wezterm-term (native only)
 zeughaus-module/       # SpacetimeDB server module (excluded from the native workspace; built by `spacetime build`)
 zeughaus-transform/    # plugin: 35 math/logic/string/trig nodes, constants, Display
-zeughaus-flow/         # plugin: Hold (event -> state), Button (manual event), Timer (the clock a source needs)
+zeughaus-flow/         # plugin: Hold (event -> state), Button (manual event), Timer (the clock a source needs), All (fan-in)
 zeughaus-graph/        # plugin: Subgraph container and its Input/Output boundary nodes
 zeughaus-ml/           # plugin: Keras layers as nodes -> exportable functional-API code
 zeughaus-llm/          # plugin: Conversation nodes against an LM Studio endpoint
@@ -78,7 +78,7 @@ terminal, hold or release the runner). `+` opens a terminal tab, `H`/`V`
 split a pane with a terminal, `x` closes one and kills its child (a job's
 terminal is only detached); `Ctrl+Shift+T` takes control of a terminal
 someone else drives, `Ctrl+Shift+C`/`V` copy and paste, `Ctrl+Shift+Escape`
-gives the keyboard back to the app. A `Job` node runs `command` with `args`
+gives the keyboard back to the app. A `Job` node runs its `command` line
 when its `run` pin fires or it is pressed; a failed run keeps its terminal
 for attaching, every run keeps `<state-dir>/runs/<id>/log`.
 
