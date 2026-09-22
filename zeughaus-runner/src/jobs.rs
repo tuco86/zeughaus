@@ -34,12 +34,19 @@ const POLL: Duration = Duration::from_millis(50);
 /// and the last ten thousand rows is where the error is.
 const RUN_SCROLLBACK_ROWS: usize = 10_000;
 
+/// Successful runs kept on disk beyond which older ones are deleted when a
+/// new run starts. Failed runs, and runs that never wrote an exit record
+/// (still live, or cut short with the runner), are never pruned: those are
+/// the ones someone comes back to.
+pub const DEFAULT_KEEP_RUNS: usize = 50;
+
 /// The runner's side of the job plugin's host trait.
 pub struct JobHost {
     mux: MuxService,
     state_dir: PathBuf,
     /// The next run id. Seeded past every run directory that already exists.
     next_run: AtomicU64,
+    keep_runs: usize,
     /// Held: start nothing new, let the live runs finish.
     held: AtomicBool,
     /// Runs started here that have not been waited to their end.
@@ -51,12 +58,13 @@ pub struct JobHost {
 }
 
 impl JobHost {
-    pub fn new(mux: MuxService, state_dir: PathBuf) -> JobHost {
+    pub fn new(mux: MuxService, state_dir: PathBuf, keep_runs: usize) -> JobHost {
         let next = highest_run(&state_dir.join("runs")) + 1;
         JobHost {
             mux,
             state_dir,
             next_run: AtomicU64::new(next),
+            keep_runs,
             held: AtomicBool::new(false),
             live: Arc::new(AtomicU32::new(0)),
         }
@@ -71,20 +79,50 @@ impl JobHost {
     }
 }
 
-/// The largest numeric run directory under `runs`, or 0 when there is none.
-///
-/// A name that is not a number is not a run of this process and is ignored;
-/// an unreadable directory means no runs are known, which is the same
-/// situation as a first start.
-fn highest_run(runs: &Path) -> u64 {
+/// The numeric run directories under `runs`, newest id first. A name that is
+/// not a number is not a run of this process and is ignored; an unreadable
+/// directory means no runs are known, which is the same situation as a first
+/// start.
+fn run_ids(runs: &Path) -> Vec<u64> {
     let Ok(entries) = std::fs::read_dir(runs) else {
-        return 0;
+        return Vec::new();
     };
-    entries
+    let mut ids: Vec<u64> = entries
         .flatten()
         .filter_map(|entry| entry.file_name().to_str()?.parse::<u64>().ok())
-        .max()
-        .unwrap_or(0)
+        .collect();
+    ids.sort_unstable_by(|a, b| b.cmp(a));
+    ids
+}
+
+fn highest_run(runs: &Path) -> u64 {
+    run_ids(runs).first().copied().unwrap_or(0)
+}
+
+/// Whether the run in `dir` recorded a clean exit. Anything else -- a
+/// failure, no record yet, an unreadable one -- is kept.
+fn exited_clean(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("exit")).is_ok_and(|record| record.starts_with("code=0\n"))
+}
+
+/// Deletes successful runs beyond the `keep` newest. Failures to delete are
+/// logged and otherwise ignored: retention is housekeeping, and a run that
+/// cannot be removed today is tried again on the next run.
+fn prune_runs(runs: &Path, keep: usize) {
+    let mut kept = 0usize;
+    for id in run_ids(runs) {
+        let dir = runs.join(id.to_string());
+        if !exited_clean(&dir) {
+            continue;
+        }
+        if kept < keep {
+            kept += 1;
+            continue;
+        }
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            eprintln!("[runner] cannot prune run {}: {e}", dir.display());
+        }
+    }
 }
 
 impl ProcessHost for JobHost {
@@ -94,9 +132,13 @@ impl ProcessHost for JobHost {
 
     fn new_run_dir(&self) -> Result<PathBuf, String> {
         let id = self.next_run.fetch_add(1, Ordering::SeqCst);
-        let dir = self.state_dir.join("runs").join(id.to_string());
+        let runs = self.state_dir.join("runs");
+        let dir = runs.join(id.to_string());
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        // Housekeeping rides on the start of a run rather than on a timer:
+        // the directory only grows when a run is added.
+        prune_runs(&runs, self.keep_runs);
         Ok(dir)
     }
 
@@ -342,7 +384,11 @@ mod tests {
     fn a_run_is_logged_and_only_a_failed_one_keeps_its_terminal() {
         let state_dir = fresh_state_dir("e2e");
         let mux = MuxService::new(crate::mux::incarnation(), Vec::new());
-        let host = Arc::new(JobHost::new(mux.clone(), state_dir.clone()));
+        let host = Arc::new(JobHost::new(
+            mux.clone(),
+            state_dir.clone(),
+            DEFAULT_KEEP_RUNS,
+        ));
         let plugin = JobPlugin::new(Arc::clone(&host) as Arc<dyn ProcessHost>);
 
         // First run: fails with 3. Its terminal is the first the mux hands
@@ -391,7 +437,7 @@ mod tests {
         assert!(dead.exit().is_some());
 
         // A restarted host continues the numbering past what is on disk.
-        let restarted = JobHost::new(mux, state_dir.clone());
+        let restarted = JobHost::new(mux, state_dir.clone(), DEFAULT_KEEP_RUNS);
         assert_eq!(
             restarted.new_run_dir().unwrap(),
             state_dir.join("runs").join("4")
@@ -404,7 +450,7 @@ mod tests {
     fn a_held_host_starts_nothing() {
         let state_dir = fresh_state_dir("held");
         let mux = MuxService::new(crate::mux::incarnation(), Vec::new());
-        let host = Arc::new(JobHost::new(mux, state_dir.clone()));
+        let host = Arc::new(JobHost::new(mux, state_dir.clone(), DEFAULT_KEEP_RUNS));
         host.hold(true);
         let plugin = JobPlugin::new(Arc::clone(&host) as Arc<dyn ProcessHost>);
         let mut node = plugin.create_node("job.run").unwrap();
@@ -417,5 +463,38 @@ mod tests {
         assert!(err.to_string().contains("held"), "was: {err}");
         assert!(ctx.take_deferred().is_none());
         assert!(!state_dir.join("runs").exists());
+    }
+
+    #[test]
+    fn only_successful_runs_beyond_the_newest_are_pruned() {
+        let state_dir = fresh_state_dir("prune");
+        let runs = state_dir.join("runs");
+        let record = |id: u64, exit: Option<&str>| {
+            let dir = runs.join(id.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            if let Some(exit) = exit {
+                std::fs::write(dir.join("exit"), exit).unwrap();
+            }
+        };
+        // Oldest to newest: green, red, green, no record (cut short), green,
+        // green.
+        record(1, Some("code=0\nkilled=false\n"));
+        record(2, Some("code=3\nkilled=false\n"));
+        record(3, Some("code=0\nkilled=false\n"));
+        record(4, None);
+        record(5, Some("code=0\nkilled=false\n"));
+        record(6, Some("code=0\nkilled=false\n"));
+
+        let mux = MuxService::new(crate::mux::incarnation(), Vec::new());
+        let host = JobHost::new(mux, state_dir.clone(), 2);
+        let fresh = host.new_run_dir().unwrap();
+        assert_eq!(fresh, runs.join("7"));
+
+        let left = run_ids(&runs);
+        // The two newest green runs stay, the older green ones go, and the
+        // failed one, the recordless one and the new one are untouched.
+        assert_eq!(left, vec![7, 6, 5, 4, 2]);
+
+        let _ = std::fs::remove_dir_all(&state_dir);
     }
 }

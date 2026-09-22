@@ -363,7 +363,7 @@ results keyed by (pin, tier, sequence).
 | capture backend | the portal is used when `WAYLAND_DISPLAY` is set |
 | paths inside nodes | `db.database` `path` and `record.writer` `dir` are settings, resolved against the runner's working directory |
 | LLM endpoint | the `base_url` setting on each conversation node (default `http://localhost:1234/v1`) |
-| runs | `<state-dir>/runs/<run-id>/` holds `log`, `exit` and `artifacts/` of every job run this runner executed; nothing deletes them yet |
+| runs | `<state-dir>/runs/<run-id>/` holds `log`, `exit`, `code` and `artifacts/` of every job run this runner executed; `--keep-runs <n>` (default 50) is how many successful runs stay, pruned when a run starts; failed runs and runs without an exit record are never pruned |
 
 ## 12. Testing strategy
 
@@ -476,7 +476,6 @@ Kept here so they are not mistaken for descriptions of the code:
     restart and is reattached by replaying the log into `wezterm-term`;
     today runs die with the runner, which is why it drains.
   - Reading run files in the editor; `/runs` is served, nothing calls it.
-  - Retention of run directories.
   - Webhooks (Gitea) land on the weida broker once it speaks HTTP and are
     relayed to `/triggers`.
   - `freeze` (SIGSTOP / cgroup freezer) as a per-node hold policy and

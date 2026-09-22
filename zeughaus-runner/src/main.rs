@@ -81,6 +81,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let keep_runs = match parse_keep_runs() {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("[runner] {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let state_dir = match parse_state_dir() {
         Ok(dir) => dir,
         Err(e) => {
@@ -206,7 +213,11 @@ fn main() -> ExitCode {
                 rt.spawn(service.clone().accept(replier));
                 // A run is a terminal this process owns, so the job host is
                 // the mux service plus the state directory its logs go in.
-                job_host = Some(Arc::new(JobHost::new(service, state_dir.clone())));
+                job_host = Some(Arc::new(JobHost::new(
+                    service,
+                    state_dir.clone(),
+                    keep_runs,
+                )));
             }
             Err(e) => eprintln!("[runner] no terminal mux: {e}"),
         }
@@ -457,4 +468,22 @@ fn parse_state_dir() -> Result<PathBuf, String> {
         }
     }
     Ok(credentials::state_dir())
+}
+
+/// How many successful job runs stay on disk, from `--keep-runs <n>`.
+///
+/// Failed runs are never pruned, so this is the only knob: the log of a
+/// green build is worth little once a newer green one exists, and a runner
+/// that builds on every push would otherwise fill its state directory.
+fn parse_keep_runs() -> Result<usize, String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--keep-runs" {
+            let text = args.next().ok_or("--keep-runs needs a number")?;
+            return text
+                .parse()
+                .map_err(|e| format!("--keep-runs {text:?} is not a number: {e}"));
+        }
+    }
+    Ok(jobs::DEFAULT_KEEP_RUNS)
 }
