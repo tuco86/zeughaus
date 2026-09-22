@@ -394,17 +394,21 @@ like a shell splits words -- quotes group, nothing expands, no shell runs),
 `env` (`KEY=VALUE` words, added to the runner's environment), `cwd` (empty:
 the runner's), `artifacts` (globs relative to `cwd`), `keep_on_failure`
 (default `true`); a malformed setting is `InvalidParameter`. Pins: `run`
-(trigger) in; `ok: Bool`, `failed: Int` (the
-exit code, `-1` for a signal or a kill) and `run: Str` (the run directory)
-out. `ok` and `failed` are separate pins so each can drive its own trigger
-wire. The node acts only on its own trigger or on a press (`fire`, which is
-how `/triggers` and the palette reach it), and refuses while a run is live
-("job busy"), while the runner is held, and in a process that does not
-execute. The mux stays argv-free: no `TopologyCommand` carries a command,
-the graph does. The plugin defines `ProcessHost` (`held`, `new_run_dir`,
-`spawn`); the runner implements it in `zeughaus-runner/src/jobs.rs` over its
-`MuxService`, the editor registers `JobPlugin::detached()`, which only
-contributes the catalog entry.
+(trigger) and `cwd: Str` (state; wired, it wins over the setting, which is
+how a checkout upstream hands its directory on) in; `ok: Bool`,
+`failed: Int` (the exit code, `-1` for a signal or a kill) and `dir: Str`
+(the run directory) out. `ok` and `failed` are separate pins so each can
+drive its own trigger wire. The node acts only on its own trigger or on a
+press (`fire`, which is how `/triggers` and the palette reach it), and
+refuses while a run is live ("job busy"), while the runner is held, and in
+a process that does not execute. The program sees `ZEUGHAUS_RUN_DIR` (its
+run directory, where it may write artifacts directly) and, when the trigger
+carried text -- a `trigger` payload, or a string on `run` --
+`ZEUGHAUS_PAYLOAD`. The mux stays argv-free: no `TopologyCommand` carries
+a command, the graph does. The plugin defines `ProcessHost` (`held`,
+`new_run_dir`, `spawn`); the runner implements it in
+`zeughaus-runner/src/jobs.rs` over its `MuxService`, the editor registers
+`JobPlugin::detached()`, which only contributes the catalog entry.
 
 **A run.** `JobHost::spawn` allocates `<state-dir>/runs/<id>/` (ids continue
 past whatever is on disk, so a restart never reuses one), opens `log`, and

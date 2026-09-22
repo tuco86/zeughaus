@@ -30,6 +30,8 @@ pub struct JobNode {
     keep_on_failure: bool,
     /// A press taken through the parameter channel, spent by the next execute.
     armed: bool,
+    /// The text the press carried, if any; spent with it.
+    payload: Option<String>,
     /// Whether a run started here is still going. Shared with its deferred
     /// work, which clears it however the run ended.
     live: Arc<AtomicBool>,
@@ -46,9 +48,13 @@ impl JobNode {
             artifacts: Vec::new(),
             keep_on_failure: true,
             armed: false,
+            payload: None,
             live: Arc::new(AtomicBool::new(false)),
             pins: vec![
                 PinDefinition::input("run", Ty::Any, PinKind::Trigger),
+                // State, not an event: where to run is read when the run
+                // starts, whatever produced it and whenever it did.
+                PinDefinition::input("cwd", Ty::Str, PinKind::Sample),
                 // `ok` and `failed` are two pins rather than one status value
                 // because what hangs off them is trigger wiring: the success
                 // path fires on `ok` and the recovery path on `failed`, and a
@@ -56,7 +62,9 @@ impl JobNode {
                 // downstream node to decide whether this one was for it.
                 PinDefinition::output("ok", Ty::Bool),
                 PinDefinition::output("failed", Ty::Int),
-                PinDefinition::output("run", Ty::Str),
+                // Not `run`: the editor addresses pins by name, and the
+                // trigger input already has that one.
+                PinDefinition::output("dir", Ty::Str),
             ],
         }
     }
@@ -67,9 +75,14 @@ impl ExecutableNode for JobNode {
         // The press is spent whether or not the run starts: a refusal is
         // reported once, not re-tried on the next unrelated pass.
         let pressed = std::mem::take(&mut self.armed);
+        let payload = std::mem::take(&mut self.payload);
         if !pressed && !inputs.changed("run") {
             return Ok(());
         }
+        // What fired the run reaches the program as `ZEUGHAUS_PAYLOAD`: the
+        // text an external trigger sent, or the string that arrived on
+        // `run`. A value of any other type is the event only.
+        let payload = payload.or_else(|| inputs.get::<String>("run"));
 
         let Some(host) = &self.host else {
             return Err(ZeughausError::ExecutionFailed(
@@ -96,10 +109,19 @@ impl ExecutableNode for JobNode {
         }
 
         let run_dir = host.new_run_dir().map_err(ZeughausError::ExecutionFailed)?;
-        let cwd = match self.cwd.trim() {
+        // A wired `cwd` wins over the setting: that is how a checkout
+        // upstream hands its directory to the job that builds in it.
+        let cwd_text = inputs
+            .get::<String>("cwd")
+            .unwrap_or_else(|| self.cwd.clone());
+        let cwd = match cwd_text.trim() {
             "" => None,
             dir => Some(PathBuf::from(dir)),
         };
+        let mut env = self.env.clone();
+        if let Some(payload) = payload {
+            env.push(("ZEUGHAUS_PAYLOAD".to_string(), payload));
+        }
         let label = Path::new(program)
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -110,7 +132,7 @@ impl ExecutableNode for JobNode {
                 label,
                 program: program.to_string(),
                 args: self.command[1..].to_vec(),
-                env: self.env.clone(),
+                env,
                 cwd: cwd.clone(),
                 run_dir: run_dir.clone(),
                 keep_on_failure: self.keep_on_failure,
@@ -144,10 +166,14 @@ impl ExecutableNode for JobNode {
     }
 
     fn set_parameter(&mut self, name: &str, value: Value) -> Result<()> {
-        // The press itself is the signal: the payload is carried for a node
-        // that reads it, and this one only has to start.
+        // The press itself is the signal; text that came with it is kept for
+        // the run it starts, and an empty press carries none.
         if name == "fire" {
             self.armed = true;
+            self.payload = value
+                .downcast_ref::<String>()
+                .filter(|text| !text.is_empty())
+                .cloned();
             return Ok(());
         }
         let Some(text) = value.downcast_ref::<String>() else {
@@ -282,7 +308,7 @@ impl AsyncWork for RunWork {
         // The directory is reported whatever happened: it is where both the
         // log and the failure are.
         outputs.insert(
-            "run".to_string(),
+            "dir".to_string(),
             Value::new(run_dir.to_string_lossy().into_owned()),
         );
         if exit.code == Some(0) {
@@ -514,6 +540,51 @@ mod tests {
     }
 
     #[test]
+    fn the_trigger_payload_and_a_wired_cwd_reach_the_run() {
+        let host = FakeHost::new(ok_exit());
+        let mut node = job(&host);
+        node.set_parameter("cwd", Value::new("/from/setting".to_string()))
+            .expect("cwd");
+        node.set_parameter("fire", Value::new("{\"ref\":\"main\"}".to_string()))
+            .expect("fire");
+        let mut inputs = InputSet::new();
+        inputs.insert("cwd", Value::new("/from/wire".to_string()));
+        let mut ctx = NodeContext::new(NodeId(1));
+        node.execute(&inputs, &mut ctx).expect("run");
+        let spec = host.spec();
+        assert_eq!(spec.cwd.as_deref(), Some(Path::new("/from/wire")));
+        assert_eq!(
+            spec.env,
+            vec![(
+                "ZEUGHAUS_PAYLOAD".to_string(),
+                "{\"ref\":\"main\"}".to_string()
+            )]
+        );
+
+        // The payload is spent with the press: a run started by the wire
+        // carries the wire's text instead, and none when it is not text.
+        ctx.take_deferred().expect("deferred").run().expect("wait");
+        let mut inputs = InputSet::new();
+        inputs.insert("run", Value::new("sha-123".to_string()));
+        inputs.mark_changed("run");
+        let mut ctx = NodeContext::new(NodeId(1));
+        node.execute(&inputs, &mut ctx).expect("run");
+        let spec = host.specs.lock().expect("specs")[1].clone();
+        assert_eq!(spec.cwd.as_deref(), Some(Path::new("/from/setting")));
+        assert_eq!(
+            spec.env,
+            vec![("ZEUGHAUS_PAYLOAD".to_string(), "sha-123".to_string())]
+        );
+        ctx.take_deferred().expect("deferred").run().expect("wait");
+        let mut inputs = InputSet::new();
+        inputs.insert("run", Value::new(true));
+        inputs.mark_changed("run");
+        let mut ctx = NodeContext::new(NodeId(1));
+        node.execute(&inputs, &mut ctx).expect("run");
+        assert!(host.specs.lock().expect("specs")[2].env.is_empty());
+    }
+
+    #[test]
     fn the_spec_comes_out_of_the_settings() {
         let host = FakeHost::new(ok_exit());
         let mut node = job(&host);
@@ -565,7 +636,7 @@ mod tests {
         );
         assert!(!outputs.contains_key("failed"));
         let run_dir = outputs
-            .get("run")
+            .get("dir")
             .and_then(|v| v.downcast_ref::<String>())
             .expect("run dir")
             .clone();
@@ -602,7 +673,7 @@ mod tests {
             Some(&-1)
         );
         let run_dir = outputs
-            .get("run")
+            .get("dir")
             .and_then(|v| v.downcast_ref::<String>())
             .expect("run dir")
             .clone();
@@ -627,7 +698,7 @@ mod tests {
 
         let run_dir = PathBuf::from(
             outputs
-                .get("run")
+                .get("dir")
                 .and_then(|v| v.downcast_ref::<String>())
                 .expect("run dir"),
         );

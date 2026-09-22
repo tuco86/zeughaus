@@ -370,7 +370,7 @@ mod tests {
             .unwrap();
         node.set_parameter("keep_on_failure", Value::new(keep.to_string()))
             .unwrap();
-        node.set_parameter("fire", Value::new(String::new()))
+        node.set_parameter("fire", Value::new("payload-text".to_string()))
             .unwrap();
         let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&InputSet::new(), &mut ctx).unwrap();
@@ -395,13 +395,24 @@ mod tests {
         // out and must still be there -- with a shell in it, since the run
         // keeps on failure: the child has not exited even though the run is
         // over and reported.
-        let outputs = run_script(&plugin, "echo marker-one; exit 3", true);
+        let outputs = run_script(
+            &plugin,
+            "echo marker-one got=$ZEUGHAUS_PAYLOAD in=$ZEUGHAUS_RUN_DIR; exit 3",
+            true,
+        );
         assert_eq!(outputs["failed"].downcast_ref::<i64>(), Some(&3));
         assert!(!outputs.contains_key("ok"));
-        let run_dir = PathBuf::from(outputs["run"].downcast_ref::<String>().unwrap());
+        let run_dir = PathBuf::from(outputs["dir"].downcast_ref::<String>().unwrap());
         assert_eq!(run_dir, state_dir.join("runs").join("1"));
         let log = std::fs::read_to_string(run_dir.join("log")).unwrap();
-        assert!(log.contains("marker-one"), "log was: {log:?}");
+        assert!(
+            log.contains("marker-one got=payload-text in="),
+            "log was: {log:?}"
+        );
+        assert!(
+            log.contains(&format!("in={}", run_dir.display())),
+            "log was: {log:?}"
+        );
         assert!(log.contains("a shell follows"), "log was: {log:?}");
         let exit = std::fs::read_to_string(run_dir.join("exit")).unwrap();
         assert!(
@@ -418,7 +429,7 @@ mod tests {
         // code file was written because the wrapper exited with the program.
         let outputs = run_script(&plugin, "echo marker-two", true);
         assert_eq!(outputs["ok"].downcast_ref::<bool>(), Some(&true));
-        let run_dir = PathBuf::from(outputs["run"].downcast_ref::<String>().unwrap());
+        let run_dir = PathBuf::from(outputs["dir"].downcast_ref::<String>().unwrap());
         assert_eq!(run_dir, state_dir.join("runs").join("2"));
         assert!(
             std::fs::read_to_string(run_dir.join("log"))
