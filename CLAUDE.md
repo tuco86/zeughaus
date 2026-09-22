@@ -81,6 +81,9 @@ someone else drives, `Ctrl+Shift+C`/`V` copy and paste, `Ctrl+Shift+Escape`
 gives the keyboard back to the app. A `Job` node runs its `command` line
 when its `run` pin fires or it is pressed; a failed run keeps its terminal
 for attaching, every run keeps `<state-dir>/runs/<id>/log`.
+`zeughaus-runner trigger <endpoint> <node-id> [payload]` and
+`zeughaus-runner hold <endpoint> on|off` do the same from a script, against
+the endpoint URL a runner prints at start.
 
 ## Development Workflow
 

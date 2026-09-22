@@ -445,6 +445,14 @@ at once.
 that becomes the node's `fire` parameter; a bare press sends none. They come
 through weida only: no HTTP listener and no polling in the runner.
 
+**The CLI** is the runner binary as a client (`zeughaus-runner/src/cli.rs`):
+`zeughaus-runner trigger <endpoint> <node-id> [payload]` pushes on
+`/triggers`, `zeughaus-runner hold <endpoint> on|off` asks `/hold` and
+prints the reply. `<endpoint>` is the pinned root URL a runner prints at
+start; the client identity comes from the state directory (`--state-dir`,
+`ZEUGHAUS_STATE_DIR`), so a script, a cron entry or a webhook relay is the
+same principal as an editor on that machine. No store is involved.
+
 ## 14. Not built
 
 Kept here so they are not mistaken for descriptions of the code:
@@ -469,10 +477,8 @@ Kept here so they are not mistaken for descriptions of the code:
     today runs die with the runner, which is why it drains.
   - Reading run files in the editor; `/runs` is served, nothing calls it.
   - Retention of run directories.
-  - A CLI (`zeughaus trigger <node> [payload]`, `zeughaus hold`) with the
-    client identity; the palette is the only client of `/triggers` and
-    `/hold` today. Webhooks (Gitea) land on the weida broker once it speaks
-    HTTP and are relayed.
+  - Webhooks (Gitea) land on the weida broker once it speaks HTTP and are
+    relayed to `/triggers`.
   - `freeze` (SIGSTOP / cgroup freezer) as a per-node hold policy and
     automatic host-state detection (game running, user idle, GPU busy).
   - Secrets through weida's wrapped-secret flow: one refreshable token per

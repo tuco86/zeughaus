@@ -11,6 +11,7 @@
 //! which is why nothing here negotiates ownership -- it is read back out of the
 //! store on every batch.
 
+mod cli;
 mod feed;
 mod jobs;
 mod mux;
@@ -87,6 +88,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // A subcommand makes this process a client of another runner and ends
+    // here; only the state directory is shared with the serving path, for
+    // the client identity it presents.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = cli::run(&args, &state_dir) {
+        return code;
+    }
     eprintln!("[runner] state dir {}", state_dir.display());
     let session = zeughaus_sync::Session::resolve(parse_join_arg().as_deref());
     let (uri, db) = (session.uri, session.database);
