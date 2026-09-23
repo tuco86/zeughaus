@@ -58,6 +58,14 @@ tokio = { version = "1", features = ["io-util", "time", "macros"] }
 # lease is bound to. Already in the tree under weida; a full `rand` would be a
 # generator this process has no other use for.
 getrandom = "0.4"
+# What the editor looks like: one theme type behind every widget, the node
+# graph, the tab bar and the terminals. The `terminal` feature is what turns a
+# scheme into a terminal palette, and only the native editor draws one.
+zeughaus-theme = { workspace = true, features = ["terminal"] }
+# `editor.toml` under the state directory: the theme and where the tab bar
+# sits. A browser tab has no state directory and therefore no preferences.
+toml = { workspace = true }
+serde = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # `#[tokio::test]` for the first-dial schedule, with a paused clock.
@@ -69,3 +77,6 @@ tokio = { version = "1", features = ["rt", "macros", "test-util"] }
 iced = { version = "0.14", features = ["advanced", "wgpu", "image"] }
 console_error_panic_hook = "0.1"
 spacetimedb-sdk = { workspace = true, features = ["browser"] }
+# The pack is the whole choice in the browser: no state directory, so no file
+# themes and nothing to persist.
+zeughaus-theme = { workspace = true }

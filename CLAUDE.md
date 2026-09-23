@@ -40,6 +40,7 @@ zeughaus-record/       # plugin: Recorder (frames + values to disk) and Player (
 zeughaus-job/          # plugin: Job (a process in a runner-owned terminal, log per run under the state dir) and the ProcessHost trait the runner implements
 iced_terminal/         # the terminal widget: one wgpu primitive per pane, bundled ComicShannsMono Nerd Font
 iced_tabs/             # the tab bar the workspace shell uses
+zeughaus-theme/        # the editor's theme: iced theme paired with a terminal colour scheme, catalogs for every widget, bundled pack, WezTerm scheme parser
 vm/win11/              # scripts: headless Windows 11 guest under QEMU/KVM, the reference for a VM-hosted runner (not wired)
 ```
 
@@ -73,12 +74,17 @@ remote editor needs `client.pem` copied into its own state directory. An
 editor without a store edits a local scratch graph and shows no values.
 
 In the editor: `Ctrl+Space` opens the command palette (spawn nodes, save/load
-a `.zgh` file, auto layout, copy the session token, attach or close a job's
-terminal, hold or release the runner). `+` opens a terminal tab, `H`/`V`
-split a pane with a terminal, `x` closes one and kills its child (a job's
-terminal is only detached); `Ctrl+Shift+T` takes control of a terminal
-someone else drives, `Ctrl+Shift+C`/`V` copy and paste, `Ctrl+Shift+Escape`
-gives the keyboard back to the app. A `Job` node runs its `command` line
+a `.zgh` file, auto layout, pick a theme, copy the session token, attach or
+close a job's terminal, hold or release the runner). The window draws its
+own titlebar; the button in its corner moves the tab bar between the top and
+the left edge. Theme and tab bar placement persist in
+`<state-dir>/editor.toml`; WezTerm colour schemes dropped into
+`<state-dir>/themes/` appear as themes. A container node's `open` opens its contents as a
+graph tab of this window. `+` opens a terminal tab, `H`/`V` split a pane
+with a terminal, `x` closes one and kills its child (a job's terminal is
+only detached); `Ctrl+Shift+T` takes control of a terminal someone else
+drives, `Ctrl+Shift+C`/`V` copy and paste, `Ctrl+Shift+Escape` gives the
+keyboard back to the app. A `Job` node runs its `command` line
 when its `run` pin fires or it is pressed; a failed run keeps its terminal
 for attaching, every run keeps `<state-dir>/runs/<id>/log`.
 `zeughaus-runner trigger <endpoint> <node-id> [payload]` and

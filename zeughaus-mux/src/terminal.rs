@@ -138,6 +138,63 @@ impl Default for Palette {
     }
 }
 
+impl Palette {
+    /// What a terminal reports before anything changed it: the colours the
+    /// runner's terminal core (`wezterm-term`'s `ColorPalette::default()`)
+    /// starts with. It is the marker for "this entry is still the default",
+    /// which is what [`Palette::themed`] needs in order to tell an untouched
+    /// slot from one an `OSC 4`/`10`/`11` deliberately set.
+    pub const RUNNER_DEFAULT: Palette = Palette {
+        ansi: [
+            [0x00, 0x00, 0x00],
+            [0xcc, 0x55, 0x55],
+            [0x55, 0xcc, 0x55],
+            [0xcd, 0xcd, 0x55],
+            [0x54, 0x55, 0xcb],
+            [0xcc, 0x55, 0xcc],
+            [0x7a, 0xca, 0xca],
+            [0xcc, 0xcc, 0xcc],
+            [0x55, 0x55, 0x55],
+            [0xff, 0x55, 0x55],
+            [0x55, 0xff, 0x55],
+            [0xff, 0xff, 0x55],
+            [0x55, 0x55, 0xff],
+            [0xff, 0x55, 0xff],
+            [0x55, 0xff, 0xff],
+            [0xff, 0xff, 0xff],
+        ],
+        // Grey70 out of the 24-step grey ramp, the core's foreground.
+        foreground: [0xb2, 0xb2, 0xb2],
+        background: [0x00, 0x00, 0x00],
+        cursor: [0x52, 0xad, 0x70],
+    };
+
+    /// This palette with every still-default entry taken from `theme`.
+    ///
+    /// The child owns its colours: once it set one through `OSC 4`/`10`/`11`
+    /// that colour is what it asked for and a theme must not override it.
+    /// Every entry still equal to [`Palette::RUNNER_DEFAULT`] was never set
+    /// and is the client's to choose.
+    pub fn themed(&self, theme: &Palette) -> Palette {
+        let mut out = self.clone();
+        for (index, slot) in out.ansi.iter_mut().enumerate() {
+            if *slot == Palette::RUNNER_DEFAULT.ansi[index] {
+                *slot = theme.ansi[index];
+            }
+        }
+        if out.foreground == Palette::RUNNER_DEFAULT.foreground {
+            out.foreground = theme.foreground;
+        }
+        if out.background == Palette::RUNNER_DEFAULT.background {
+            out.background = theme.background;
+        }
+        if out.cursor == Palette::RUNNER_DEFAULT.cursor {
+            out.cursor = theme.cursor;
+        }
+        out
+    }
+}
+
 /// Underline style, three bits of [`StyleFlags`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Underline {
@@ -406,5 +463,29 @@ mod tests {
             }
             .is_valid()
         );
+    }
+
+    #[test]
+    fn a_theme_fills_the_untouched_slots_only() {
+        let theme = Palette {
+            ansi: [[9, 9, 9]; 16],
+            foreground: [1, 1, 1],
+            background: [2, 2, 2],
+            cursor: [3, 3, 3],
+        };
+
+        let fresh = Palette::RUNNER_DEFAULT.themed(&theme);
+        assert_eq!(fresh, theme, "an untouched palette becomes the theme");
+
+        // What an OSC 4/10/11 left behind stays, in every kind of slot.
+        let mut changed = Palette::RUNNER_DEFAULT;
+        changed.ansi[1] = [200, 100, 50];
+        changed.background = [20, 20, 20];
+        let mixed = changed.themed(&theme);
+        assert_eq!(mixed.ansi[1], [200, 100, 50]);
+        assert_eq!(mixed.background, [20, 20, 20]);
+        assert_eq!(mixed.ansi[0], theme.ansi[0], "the rest still follows");
+        assert_eq!(mixed.foreground, theme.foreground);
+        assert_eq!(mixed.cursor, theme.cursor);
     }
 }

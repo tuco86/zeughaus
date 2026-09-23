@@ -220,3 +220,17 @@ pub(crate) fn cursor(pos: CursorPosition, cols: usize, rows: usize) -> Cursor {
         blinking,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A client decides which palette entries a theme may fill by comparing
+    /// them against `Palette::RUNNER_DEFAULT`. That comparison is only
+    /// meaningful while the constant is exactly what this runner reports for
+    /// a terminal no `OSC 4`/`10`/`11` has touched.
+    #[test]
+    fn an_untouched_palette_is_the_constant_clients_compare_against() {
+        assert_eq!(palette(&ColorPalette::default()), Palette::RUNNER_DEFAULT);
+    }
+}

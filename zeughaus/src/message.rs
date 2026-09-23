@@ -85,9 +85,9 @@ pub enum Message {
         from: PinRef<GraphIds>,
         to: PinRef<GraphIds>,
     },
-    // Show the contents of a container node, or the root graph for id 0. The
-    // one navigation the editor has: a subgraph is drawn nowhere else.
-    EnterGraph(u64),
+    // Open a container node as a graph tab, or bring its tab to the front.
+    // The one navigation the editor has: a subgraph is drawn nowhere else.
+    OpenGraph(u64),
     // Arrange the current graph's nodes in columns by depth. A layout is a
     // shared edit like any other move: it changes node positions.
     AutoLayout,
@@ -113,6 +113,11 @@ pub enum Message {
     SpawnNode {
         type_id: String,
     },
+    // Draw with this theme, by name: a pack entry or a file the user dropped
+    // into the state directory. The name travels rather than the theme
+    // itself, for the same reason `SpawnNode` carries a type id -- a palette
+    // command is data, and the window owns the list it is resolved against.
+    SetTheme(String),
     // In-node settings: one message per edited field, whatever the node does
     // with the text. `key` names the setting, matching the node's SettingDef
     // and set_parameter key.
@@ -149,10 +154,20 @@ pub enum Message {
     SyncPoll,
     // Copy the current collaboration session id to the clipboard (palette).
     CopySessionId,
-    // The window was asked to close. Handled rather than obeyed, because a
+    // The window was asked to close, by the system or by the close button
+    // in the editor's own titlebar. Handled rather than obeyed, because a
     // settings edit held back for the debounce would otherwise be lost from
     // the store: the editor flushes and then ends the runtime itself.
     CloseRequested,
+    // The undecorated window's own titlebar and edge grips: the moves a
+    // system titlebar would have made. The grips and the minimize button
+    // exist on native windows only; a browser tab has neither.
+    WindowDrag,
+    #[cfg(not(target_arch = "wasm32"))]
+    WindowResize(iced::window::Direction),
+    #[cfg(not(target_arch = "wasm32"))]
+    WindowMinimize,
+    WindowMaximize,
     // The transport is closed; now the process may end.
     #[cfg(not(target_arch = "wasm32"))]
     Exit,

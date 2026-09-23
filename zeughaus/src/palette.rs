@@ -1,8 +1,8 @@
 use iced::Element;
-use iced::Theme;
 use iced_palette::{Command, command, command_palette};
 use zeughaus_core::NodeDefinition;
 use zeughaus_mux::DetachedTerminal;
+use zeughaus_theme::Theme;
 
 use crate::message::Message;
 
@@ -17,6 +17,10 @@ const SPAWN_COMMAND_ID: &str = "node.spawn";
 /// so every entry shares one id and carries the terminal in its message.
 const ATTACH_COMMAND_ID: &str = "terminal.attach";
 const CLOSE_COMMAND_ID: &str = "terminal.close";
+/// Same again for a theme: which one is a name, the pack and the state
+/// directory decide how many there are, and the window resolves the name
+/// against the list it built at startup.
+const THEME_COMMAND_ID: &str = "editor.theme";
 
 /// What the palette offers about the runner this editor is attached to.
 ///
@@ -37,6 +41,7 @@ pub struct RunnerState<'a> {
 pub fn build_commands(
     catalog: &[NodeDefinition],
     runner: &RunnerState<'_>,
+    themes: &[Theme],
 ) -> Vec<Command<Message>> {
     let mut sorted: Vec<&NodeDefinition> = catalog.iter().collect();
     sorted.sort_by(|a, b| {
@@ -56,6 +61,11 @@ pub fn build_commands(
     ];
 
     commands.extend(runner_commands(runner));
+    commands.extend(themes.iter().map(|theme| {
+        command(THEME_COMMAND_ID, format!("Theme / {}", theme.name()))
+            .description("Draw the editor, the graph and the terminals with this scheme")
+            .action(Message::SetTheme(theme.name().to_owned()))
+    }));
 
     commands.extend(sorted.iter().map(|def| {
         command(
@@ -114,7 +124,7 @@ pub fn view<'a>(
     input: &str,
     commands: &[Command<Message>],
     selected_index: usize,
-) -> Element<'a, Message, Theme> {
+) -> Element<'a, Message, iced::Theme> {
     command_palette(
         input,
         commands,

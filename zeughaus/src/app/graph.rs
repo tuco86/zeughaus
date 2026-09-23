@@ -1172,29 +1172,6 @@ pub fn wire_refusal(wire: &Wire<'_>) -> Option<String> {
         .then(|| format!("nothing converts {} into {}", out.ty, into.ty))
 }
 
-/// The containers between the root graph and `graph`, outermost first.
-///
-/// `parent_of` answers what a node's parent is, or `None` for a node this
-/// window does not have. The walk is bounded by a visited set: `parent` is an
-/// arbitrary column of the store's `node` table, so a single hand-written row
-/// naming itself -- or a pair naming each other -- would otherwise make `view`
-/// loop forever pushing breadcrumb entries. A cycle stops the walk where it
-/// closes, and the trail shows the part of it that is a path.
-pub(super) fn ancestry(graph: NodeId, parent_of: impl Fn(NodeId) -> Option<NodeId>) -> Vec<NodeId> {
-    let mut trail = Vec::new();
-    let mut seen: HashSet<NodeId> = HashSet::new();
-    let mut current = graph;
-    while current != NodeId(0) && seen.insert(current) {
-        let Some(parent) = parent_of(current) else {
-            break;
-        };
-        trail.push(current);
-        current = parent;
-    }
-    trail.reverse();
-    trail
-}
-
 /// Whether an edge end is a relation the node has lost, given what each end's
 /// node declares for the pin the edge lands on.
 ///
@@ -1377,35 +1354,6 @@ mod tests {
         // vanished for a moment while a setting was half-typed must survive.
         assert!(!is_lost_relation(None, Some(&output)));
         assert!(!is_lost_relation(None, None));
-    }
-
-    /// The breadcrumb walk has to terminate on a `parent` relation the editor
-    /// did not build. `create_node` in the module takes an arbitrary parent,
-    /// so one row naming itself froze `view` in an endless walk.
-    #[test]
-    fn the_ancestry_walk_ends_on_a_parent_cycle() {
-        // 3 inside 2 inside 1 inside the root.
-        let tree = |id: NodeId| match id.0 {
-            3 => Some(NodeId(2)),
-            2 => Some(NodeId(1)),
-            1 => Some(NodeId(0)),
-            _ => None,
-        };
-        assert_eq!(
-            ancestry(NodeId(3), tree),
-            vec![NodeId(1), NodeId(2), NodeId(3)]
-        );
-        assert!(ancestry(NodeId(0), tree).is_empty());
-
-        // A node that is its own parent, and a pair that are each other's.
-        let itself = |id: NodeId| Some(id);
-        assert_eq!(ancestry(NodeId(7), itself), vec![NodeId(7)]);
-        let pair = |id: NodeId| Some(NodeId(if id.0 == 4 { 5 } else { 4 }));
-        assert_eq!(ancestry(NodeId(4), pair), vec![NodeId(5), NodeId(4)]);
-
-        // A parent this window does not have stops the walk rather than
-        // dropping the part of the trail that is known.
-        assert!(ancestry(NodeId(9), |_| None).is_empty());
     }
 
     /// A wire is refused exactly when its target already feeds its source. A

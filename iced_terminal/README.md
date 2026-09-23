@@ -16,6 +16,12 @@ Shannon Miwa (`fonts/LICENSE-ComicShanns.txt`), and the Nerd Fonts patch that
 adds the icon glyphs is SIL OFL 1.1, Copyright (c) 2014 Ryan L McIntyre
 (`fonts/LICENSE-NerdFonts.txt`).
 
+Colours are the host's: a theme implements `iced_terminal::Catalog` and hands
+the widget a `Style` -- the palette a terminal that changed nothing is drawn
+with, plus the selection highlight. Whatever the child set through
+`OSC 4`/`10`/`11` stays as it asked for it, so switching themes recolours the
+untouched slots and reshapes no row.
+
 ```
 cargo run -p iced_terminal --example demo
 ```

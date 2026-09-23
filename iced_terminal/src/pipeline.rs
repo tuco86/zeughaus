@@ -46,8 +46,6 @@ const KIND_DASHED: u32 = 3;
 
 const FLAG_COLOR_GLYPH: u32 = 1;
 
-/// How strongly a selection tints the cells under it.
-const SELECTION_ALPHA: f32 = 0.30;
 /// A block cursor is drawn over the glyph rather than swapping its colours,
 /// so it has to let the glyph through.
 const CURSOR_ALPHA: f32 = 0.65;
@@ -71,6 +69,11 @@ pub(crate) struct Frame {
     pub reverse_video: bool,
     pub lines: Vec<FrameRow>,
     pub selection: Vec<Highlight>,
+    /// What the cells under the selection are filled with. The host's theme
+    /// decides it: no terminal protocol names a selection colour, because the
+    /// selection is the client's. Drawn under the glyphs, so an opaque colour
+    /// replaces the cell's background and leaves its text readable.
+    pub selection_color: Color,
     pub cursor: Option<CursorSpec>,
 }
 
@@ -871,7 +874,7 @@ impl TerminalPipeline {
                     f32::from(highlight.to - highlight.from) * cell_width,
                     cell_height,
                 ],
-                color: shader_color(frame.palette.foreground, SELECTION_ALPHA),
+                color: packed_color(frame.selection_color),
                 kind: KIND_SOLID,
                 padding: [0; 3],
             })
@@ -1291,6 +1294,11 @@ fn shader_color(rgb: [u8; 3], alpha: f32) -> [f32; 4] {
     iced_graphics::color::pack(Color::from_rgba8(rgb[0], rgb[1], rgb[2], alpha)).components()
 }
 
+/// The same for a colour the host already stated, alpha and all.
+fn packed_color(color: Color) -> [f32; 4] {
+    iced_graphics::color::pack(color).components()
+}
+
 fn cursor_quads(frame: &Frame, cell_width: f32, cell_height: f32) -> Vec<QuadInstance> {
     let Some(cursor) = frame.cursor else {
         return Vec::new();
@@ -1464,6 +1472,7 @@ mod tests {
             reverse_video: false,
             lines: Vec::new(),
             selection: Vec::new(),
+            selection_color: Color::from_rgb(0.3, 0.3, 0.8),
             cursor: None,
         }
     }
@@ -1518,6 +1527,7 @@ mod tests {
                 from: 0,
                 to: 4,
             }],
+            selection_color: Color::from_rgb(0.3, 0.3, 0.8),
             cursor: Some(CursorSpec {
                 col: cursor_col,
                 row: 0,
@@ -1693,8 +1703,9 @@ mod tests {
 
         let terminal: crate::widget::Terminal<'_, ()> =
             crate::widget::Terminal::new(Arc::new(std::sync::Mutex::new(None)), 7);
+        let style = crate::style::default(&iced::Theme::Dark);
         let (width, height) = (96u32, 48u32);
-        let frame = terminal.empty_frame(iced::Size::new(width as f32, height as f32));
+        let frame = terminal.empty_frame(iced::Size::new(width as f32, height as f32), &style);
         assert!(frame.lines.is_empty(), "no view is no rows");
 
         let bounds = Rectangle {
@@ -1785,7 +1796,7 @@ mod tests {
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
         let pixels = readback.slice(..).get_mapped_range().to_vec();
 
-        let background = shader_color(Palette::default().background, 1.0);
+        let background = shader_color(style.palette.background, 1.0);
         let expected = [
             (background[0] * 255.0).round() as u8,
             (background[1] * 255.0).round() as u8,

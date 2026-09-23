@@ -628,13 +628,10 @@ impl App {
                 .rejection_seq
                 .retain(|(node, _), _| *node != id);
         }
-        // A removed boundary node is a pin its container loses; a removed
-        // container is a graph nobody can be looking at any more.
+        // A removed boundary node is a pin its container loses. A removed
+        // container's tab closes with it, once this update settles.
         if let Some(parent) = parent {
             self.refresh_container_pins(parent);
-        }
-        if self.current_graph == id {
-            self.current_graph = NodeId(0);
         }
         self.cameras.remove(&id);
     }
@@ -712,7 +709,7 @@ pub(super) fn observes_store(message: &Message) -> bool {
         message,
         Message::EdgeConnected { .. }
             | Message::EdgeDisconnected { .. }
-            | Message::EnterGraph(_)
+            | Message::OpenGraph(_)
             | Message::AutoLayout
             | Message::GroupMoved { .. }
             | Message::CloneNodes(_)

@@ -14,17 +14,24 @@
 //! # use zeughaus_mux::view::TerminalView;
 //! # fn demo<Message: Clone>(view: TerminalView, wrap: impl Fn(iced_terminal::Action) -> Message + 'static) {
 //! let view: iced_terminal::SharedView = Arc::new(Mutex::new(Some(view)));
-//! let terminal = iced_terminal::Terminal::new(view.clone(), 1)
-//!     .controlling(true)
-//!     .focused(true)
-//!     .next_serial(42)
-//!     .on_action(wrap);
+//! let terminal: iced_terminal::Terminal<'_, Message> =
+//!     iced_terminal::Terminal::new(view.clone(), 1)
+//!         .controlling(true)
+//!         .focused(true)
+//!         .next_serial(42)
+//!         .on_action(wrap);
 //! # }
 //! ```
 //!
 //! The application must register [`font_bytes`] with
 //! `iced::application(..).font(..)` for the bundled face to be available to
 //! the rest of the interface; the widget registers it for itself either way.
+//!
+//! Colours come from the host's theme through [`Catalog`]: a [`Style`] states
+//! the palette a terminal that changed nothing is drawn with, and the
+//! selection highlight. What the child set through `OSC 4`/`10`/`11` is left
+//! alone -- [`zeughaus_mux::Palette::themed`] merges the two -- so a theme
+//! switch recolours the untouched slots and reshapes no row.
 //!
 //! Two things this widget deliberately never does, both of them security
 //! decisions of the plan rather than omissions: it never opens a hyperlink
@@ -37,6 +44,7 @@ mod font;
 mod geometry;
 mod input;
 mod pipeline;
+mod style;
 mod widget;
 
 pub mod selection;
@@ -44,4 +52,9 @@ pub mod selection;
 pub use font::{FAMILY, FONT, FONT_BOLD, cell_geometry, font_bytes};
 pub use geometry::{CellMetrics, cell_at, grid_size};
 pub use input::{key_input, modifiers, mouse_button};
+pub use style::{Catalog, Style, StyleFn, default};
 pub use widget::{Action, SharedView, Terminal};
+
+/// The palette a terminal states its colours in. A host's theme builds one
+/// to fill what the child left at its defaults.
+pub use zeughaus_mux::Palette;

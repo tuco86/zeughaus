@@ -19,6 +19,7 @@ members = [
     "zeughaus-mux",
     "zeughaus-terminal",
     "zeughaus-job",
+    "zeughaus-theme",
 ]
 # zeughaus-module is a SpacetimeDB server module: it only builds for the
 # wasm32 module target via `spacetime build`, so it is kept out of the native
@@ -74,10 +75,15 @@ iced_tabs = { path = "iced_tabs" }
 # `zeughaus_mux::view::TerminalView`. Its own crate so the pipeline compiles
 # and tests apart from the editor.
 iced_terminal = { path = "iced_terminal" }
+# One theme for every surface: the iced widgets, the node graph, the terminal
+# panes and the tab bar. A terminal colour scheme is the source, the iced
+# palette is derived from it.
+zeughaus-theme = { path = "zeughaus-theme" }
 iced_palette = { git = "https://github.com/tuco86/iced_palette.git", branch = "main" }
 
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
+toml = "1.0"
 
 # SpacetimeDB client SDK. Native uses default (tokio) features; wasm enables the
 # `browser` feature in the per-target deps of the zeughaus binary.

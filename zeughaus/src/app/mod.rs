@@ -27,8 +27,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use iced::keyboard;
-use iced::widget::{button, column, container, pane_grid, row, stack, text};
-use iced::{Color, Element, Event, Length, Point, Subscription, Task, Theme, Vector};
+use iced::widget::{button, column, container, mouse_area, pane_grid, row, space, stack, text};
+use iced::{Element, Event, Length, Point, Subscription, Task, Vector};
 use iced_nodegraph::{
     EdgeStyle, NodeGraph, NodeStatus, NodeStyle, Pattern, PinInfo, PinRef, PinStyle,
     default_edge_style, default_node_style, default_pin_style, edge as ng_edge, input_not_occupied,
@@ -51,9 +51,10 @@ use zeughaus_graph::GraphPlugin;
 #[cfg(not(target_arch = "wasm32"))]
 use zeughaus_llm::LlmPlugin;
 use zeughaus_ml::MlPlugin;
+use zeughaus_theme::Theme;
 use zeughaus_transform::TransformPlugin;
 
-use graph::{EditorEdge, EditorNode, NodeEdges, Wire, ancestry, flow_reaches, wire_refusal};
+use graph::{EditorEdge, EditorNode, NodeEdges, Wire, flow_reaches, wire_refusal};
 use layout::auto_layout;
 pub use node_view::PinVisual;
 use node_view::{DisplayValue, NodeChrome, build_node_element, dim, is_display, pin_color};
@@ -67,7 +68,7 @@ use terminal::MuxState;
 use crate::feed;
 use crate::message::{GraphIds, Message};
 use crate::palette;
-use crate::workspace::{self, Surface, Workspace};
+use crate::workspace::{self, Surface, TabRef, Workspace};
 // The browser editor draws no terminal, so the pane says so by name rather
 // than by the title a terminal would have reported.
 #[cfg(target_arch = "wasm32")]
@@ -77,9 +78,22 @@ use crate::workspace::surface_title;
 /// the drop that produced it, short enough that it is gone before the next
 /// thing the user tries.
 const HINT_LIFETIME: std::time::Duration = std::time::Duration::from_secs(3);
+/// Height of the editor's own titlebar, which is also the tab strip's row
+/// while the bar sits on top.
+const TITLEBAR_HEIGHT: f32 = 30.0;
+/// Width of the tab sidebar while the bar sits at the left edge.
+const SIDEBAR_WIDTH: f32 = 180.0;
 
 pub struct App {
     workspace: Workspace,
+    /// What every widget, the graph, the tab bar and the terminals draw
+    /// with. Cloned on every frame by [`App::theme`], which is why it is an
+    /// `Arc` behind the scenes.
+    theme: Theme,
+    /// Every theme this window can switch to: the bundled pack, then the
+    /// files under the state directory. The palette lists it and
+    /// [`Message::SetTheme`] is resolved against it.
+    themes: Vec<Theme>,
     // Editor state
     nodes: HashMap<NodeId, EditorNode>,
     node_order: Vec<NodeId>,
@@ -287,8 +301,43 @@ impl App {
             }
         };
 
+        // The bundled pack first, then what the user dropped into the state
+        // directory: a file theme that takes a pack name loses, so a bundled
+        // name means one thing on every machine.
+        #[cfg(not(target_arch = "wasm32"))]
+        let prefs = crate::prefs::load();
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let mut themes: Vec<Theme> = Theme::pack().to_vec();
+        #[cfg(not(target_arch = "wasm32"))]
+        themes.extend(crate::prefs::themes());
+        // A remembered name nothing answers to -- a file theme deleted since,
+        // a typo in the file -- leaves the default in place rather than
+        // refusing to open the window.
+        #[cfg(not(target_arch = "wasm32"))]
+        let theme = themes
+            .iter()
+            .find(|theme| theme.name() == prefs.theme)
+            .cloned()
+            .unwrap_or_default();
+        #[cfg(target_arch = "wasm32")]
+        let theme = Theme::default();
+
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let mut workspace = Workspace::new();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            workspace.placement = prefs.tabs.into();
+        }
+
+        // Nothing is attached yet: the runner's half of the palette is
+        // filled in by the first workspace snapshot.
+        let palette_commands =
+            palette::build_commands(&catalog, &palette::RunnerState::default(), &themes);
+
         Self {
-            workspace: Workspace::new(),
+            workspace,
+            theme,
+            themes,
             nodes: HashMap::new(),
             node_order: Vec::new(),
             edges: Vec::new(),
@@ -300,9 +349,7 @@ impl App {
             current_graph: NodeId(0),
             cameras: HashMap::new(),
             plugins,
-            // Nothing is attached yet: the runner's half of the palette is
-            // filled in by the first workspace snapshot.
-            palette_commands: palette::build_commands(&catalog, &palette::RunnerState::default()),
+            palette_commands,
             catalog,
             converters,
             display_values: HashMap::new(),
@@ -496,11 +543,73 @@ impl App {
                 detached: self.workspace.detached(),
                 reachable: self.runtime.endpoint.is_some(),
             },
+            &self.themes,
         );
         self.palette_commands = commands;
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.apply(message);
+        self.sync_shown_graph();
+        task
+    }
+
+    /// Makes the canvas show what the tab in front names.
+    ///
+    /// Runs after every message, because the answer can change under any of
+    /// them: a tab activated or closed, a container deleted here or by a peer,
+    /// a loaded file replacing every node. Doing it once here instead of at
+    /// each of those sites is what keeps `current_graph` and the workspace
+    /// from ever disagreeing. A tab whose container is gone closes; the
+    /// camera of the graph left is kept for the way back, and a selection
+    /// from another graph is dropped because a delete would act on nodes the
+    /// user can no longer see.
+    fn sync_shown_graph(&mut self) {
+        let nodes = &self.nodes;
+        self.workspace
+            .retain_graphs(|graph| nodes.get(&graph).is_some_and(|node| node.is_container));
+        let target = self.workspace.shown_graph();
+        if target == self.current_graph {
+            return;
+        }
+        self.cameras
+            .insert(self.current_graph, (self.camera_position, self.camera_zoom));
+        self.current_graph = target;
+        let (position, zoom) = self
+            .cameras
+            .get(&target)
+            .copied()
+            .unwrap_or((Point::ORIGIN, 1.0));
+        self.camera_position = position;
+        self.camera_zoom = zoom;
+        self.selected.clear();
+    }
+
+    /// Keeps every node where it is on screen while the sidebar moves in or
+    /// out. The canvas origin shifts by the sidebar's width, so the camera
+    /// moves the other way: `screen = origin + (world + position) * zoom`
+    /// makes that `-dx / zoom` in camera units. The graphs behind the other
+    /// tabs get the same correction, or they would come back displaced.
+    fn pan_for_sidebar(&mut self) {
+        let dx = match self.workspace.placement {
+            iced_tabs::Placement::Left => SIDEBAR_WIDTH,
+            iced_tabs::Placement::Top => -SIDEBAR_WIDTH,
+        };
+        self.camera_position.x -= dx / self.camera_zoom;
+        for (position, zoom) in self.cameras.values_mut() {
+            position.x -= dx / *zoom;
+        }
+    }
+
+    /// Records what this window looks like under the state directory, so the
+    /// next one opens the same way. Best effort: a preference that cannot be
+    /// written is worth a line on stderr and nothing more.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn save_prefs(&self) {
+        crate::prefs::save(self.theme.name(), self.workspace.placement);
+    }
+
+    fn apply(&mut self, message: Message) -> Task<Message> {
         // Held-back settings edits reach the store before anything that reads
         // or changes the shared graph. A wire drawn onto a pin the store does
         // not know about yet, or a node deleted before its own text ever
@@ -512,7 +621,13 @@ impl App {
         }
         match message {
             Message::Workspace(message) => {
+                let placement = self.workspace.placement;
                 let update = self.workspace.update(message);
+                if self.workspace.placement != placement {
+                    self.pan_for_sidebar();
+                    #[cfg(not(target_arch = "wasm32"))]
+                    self.save_prefs();
+                }
                 if let Some(hint) = update.hint {
                     self.hint = Some((hint.to_owned(), iced::time::Instant::now()));
                 }
@@ -566,35 +681,17 @@ impl App {
                     self.hint = Some((reason, iced::time::Instant::now()));
                 }
             }
-            Message::EnterGraph(raw_id) => {
+            Message::OpenGraph(raw_id) => {
+                // Only a real container can be opened; a stale button of a
+                // deleted container must not open a tab with nothing in it.
                 let target = NodeId(raw_id);
-                if target == self.current_graph {
-                    return Task::none();
-                }
-                // Only the root graph and a real container can be entered; a
-                // stale breadcrumb of a deleted container must not strand the
-                // view in a graph with nothing in it.
-                let enterable = target == NodeId(0)
-                    || self
-                        .nodes
-                        .get(&target)
-                        .is_some_and(|node| node.is_container);
-                if !enterable {
-                    return Task::none();
-                }
-                self.cameras
-                    .insert(self.current_graph, (self.camera_position, self.camera_zoom));
-                self.current_graph = target;
-                let (position, zoom) = self
-                    .cameras
+                if self
+                    .nodes
                     .get(&target)
-                    .copied()
-                    .unwrap_or((Point::ORIGIN, 1.0));
-                self.camera_position = position;
-                self.camera_zoom = zoom;
-                // A selection from another graph is not visible here, and a
-                // delete would act on nodes the user can no longer see.
-                self.selected.clear();
+                    .is_some_and(|node| node.is_container)
+                {
+                    self.workspace.open_graph(target);
+                }
             }
             Message::AutoLayout => {
                 // Only this graph, and only by the wires it shows: an edge into
@@ -711,11 +808,6 @@ impl App {
                         self.runtime
                             .rejection_seq
                             .retain(|(node, _), _| *node != id);
-                        // Looking into a graph that no longer exists shows
-                        // nothing and offers no way out.
-                        if self.current_graph == id {
-                            self.current_graph = NodeId(0);
-                        }
                         self.cameras.remove(&id);
                     }
                     // A deleted boundary node is a pin its container loses.
@@ -771,6 +863,16 @@ impl App {
             Message::SpawnNode { type_id } => {
                 let pos = self.viewport_center();
                 self.spawn_node(&type_id, pos);
+            }
+            Message::SetTheme(name) => {
+                // A name nothing answers to is a palette entry from a list
+                // this window no longer holds, or a hand-written file: the
+                // theme on screen stays rather than snapping to a default.
+                if let Some(theme) = self.themes.iter().find(|theme| theme.name() == name) {
+                    self.theme = theme.clone();
+                    #[cfg(not(target_arch = "wasm32"))]
+                    self.save_prefs();
+                }
             }
             Message::NodeSettingChanged {
                 node_id,
@@ -873,6 +975,24 @@ impl App {
                 }
                 #[cfg(target_arch = "wasm32")]
                 return iced::exit();
+            }
+            // The window is undecorated, so the moves a system titlebar makes
+            // are asked for here. `latest` because this process has one
+            // window and never learns its id otherwise.
+            Message::WindowDrag => {
+                return iced::window::latest().and_then(iced::window::drag);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::WindowResize(direction) => {
+                return iced::window::latest()
+                    .and_then(move |id| iced::window::drag_resize(id, direction));
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::WindowMinimize => {
+                return iced::window::latest().and_then(|id| iced::window::minimize(id, true));
+            }
+            Message::WindowMaximize => {
+                return iced::window::latest().and_then(iced::window::toggle_maximize);
             }
             // Ends the runtime rather than closing the window: a closed
             // window leaves the event loop spinning with nothing to draw.
@@ -1018,14 +1138,53 @@ impl App {
         Task::none()
     }
 
-    pub fn view(&self) -> Element<'_, Message> {
+    pub fn view(&self) -> Element<'_, Message, Theme> {
+        // Borderless window: the edge grips restore the resize borders the
+        // system decorations would have provided. The browser has no window
+        // to resize.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            stack![self.workspace_view(), resize_frame()].into()
+        }
+        #[cfg(target_arch = "wasm32")]
         self.workspace_view()
     }
 
-    fn workspace_view(&self) -> Element<'_, Message> {
-        let tab_count = self.workspace.tabs().len();
-        let tabs = self.workspace.tabs().iter().map(|tab| {
-            let mut entry = iced_tabs::Tab::new(tab.id, tab.title.as_str()).closable(tab_count > 1);
+    /// The window: the titlebar with the tab strip in it or a sidebar under
+    /// it, the tab in front, the status line.
+    fn workspace_view(&self) -> Element<'_, Message, Theme> {
+        let strip = self.tab_strip();
+        let (in_titlebar, sidebar) = match self.workspace.placement {
+            iced_tabs::Placement::Top => (Some(strip), None),
+            iced_tabs::Placement::Left => (None, Some(strip)),
+        };
+
+        let front: Element<'_, Message, Theme> = match self.workspace.active_tab() {
+            TabRef::Graph(_) => self.graph_view(),
+            TabRef::Runner(_) => self.runner_tab_view(),
+        };
+        let body: Element<'_, Message, Theme> = match sidebar {
+            Some(sidebar) => row![sidebar, front]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+            None => front,
+        };
+
+        column![self.titlebar(in_titlebar), body, self.status_bar()]
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// The tab bar and the button that adds a terminal tab, laid out for
+    /// where the bar sits: a row to live in the titlebar, or a column at the
+    /// left edge.
+    fn tab_strip(&self) -> Element<'_, Message, Theme> {
+        let runner_tabs = self.workspace.tabs();
+        let tab_count = runner_tabs.len();
+        let runner_tabs = runner_tabs.iter().map(|tab| {
+            let mut entry = iced_tabs::Tab::new(TabRef::Runner(tab.id), tab.title.as_str())
+                .closable(tab_count > 1);
             if let Some(group) = tab.group.as_deref() {
                 entry = entry.group(group);
             }
@@ -1034,122 +1193,160 @@ impl App {
             }
             entry
         });
+        // A graph tab is titled by its container; one whose container is
+        // gone closes at the end of the update that removed it.
+        let graph_tabs = self.workspace.graph_tabs().iter().filter_map(|graph| {
+            self.nodes
+                .get(graph)
+                .map(|node| iced_tabs::Tab::new(TabRef::Graph(*graph), node.display_name.as_str()))
+        });
         let tab_bar = iced_tabs::view(
-            tabs,
+            runner_tabs.chain(graph_tabs),
             self.workspace.active_tab(),
             self.workspace.placement,
             |id| Message::Workspace(workspace::Message::ActivateTab(id)),
             |id| Message::Workspace(workspace::Message::CloseTab(id)),
         );
 
-        let panes: Element<'_, Message> = match self.workspace.active() {
-            // Only reachable between a snapshot and its rebuild, which does
-            // not happen: a workspace always has its active tab built.
-            None => container(text("No tab").size(14))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into(),
-            Some(tab) => {
-                let pane_count = tab.panes.len();
-                let focused = self.workspace.focused_pane();
-                pane_grid::PaneGrid::new(&tab.panes, move |pane, surface, _maximized| {
-                    let id = tab.pane_id(pane);
-                    let body: Element<'_, Message> = match surface {
-                        Surface::Graph => self.graph_view(),
-                        Surface::Empty => unavailable(
-                            "Empty pane",
-                            "Its surface could not be restored. Close it or split it again.",
-                        ),
-                        Surface::Terminal(terminal) => self.terminal_pane(id, *terminal),
-                    };
-
-                    // Structural changes are the runner's; with none
-                    // attached the buttons are dead rather than a click that
-                    // earns a refusal.
-                    let attached = self.workspace.attached();
-                    let mut controls = row![
-                        split_button("H", attached, pane, zeughaus_mux::Axis::Horizontal),
-                        split_button("V", attached, pane, zeughaus_mux::Axis::Vertical),
-                    ]
-                    .spacing(2);
-                    // The graph pane is unique and the runner refuses to
-                    // close it; offering the button would only earn a hint.
-                    if pane_count > 1 && *surface != Surface::Graph {
-                        let mut close = button(text("x").size(11)).padding([3, 6]);
-                        if attached {
-                            close = close
-                                .on_press(Message::Workspace(workspace::Message::ClosePane(pane)));
-                        }
-                        controls = controls.push(close);
-                    }
-                    let controls: Element<'_, Message> = controls.into();
-                    let title_color = if id.is_some() && id == focused {
-                        Color::from_rgb(0.45, 0.7, 1.0)
-                    } else {
-                        Color::from_rgb(0.65, 0.65, 0.68)
-                    };
-                    let title = self.pane_title(*surface);
-                    let title_bar =
-                        pane_grid::TitleBar::new(text(title).size(12).color(title_color))
-                            .controls(controls)
-                            .padding([3, 5]);
-
-                    pane_grid::Content::new(body).title_bar(title_bar)
-                })
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .spacing(2)
-                .on_click(|pane| Message::Workspace(workspace::Message::ActivatePane(pane)))
-                .on_resize(8, |event| {
-                    Message::Workspace(workspace::Message::Resize(event))
-                })
-                .into()
-            }
-        };
-
-        let mut add_tab = button(text("+").size(14)).padding([4, 8]);
+        let mut add_tab = button(text("+").size(14))
+            .padding([2, 8])
+            .style(|theme: &Theme, status| button::text(theme.base(), status));
         if self.workspace.attached() {
             add_tab = add_tab.on_press(Message::Workspace(workspace::Message::NewTab));
         }
-        let placement_label = match self.workspace.placement {
-            iced_tabs::Placement::Top => "Tabs left",
-            iced_tabs::Placement::Left => "Tabs top",
-        };
-        let toggle_placement = button(text(placement_label).size(11))
-            .padding([5, 8])
-            .on_press(Message::Workspace(workspace::Message::TogglePlacement));
 
-        let status_bar = self.status_bar();
         match self.workspace.placement {
-            iced_tabs::Placement::Top => column![
-                row![tab_bar, add_tab, toggle_placement]
-                    .spacing(4)
-                    .align_y(iced::Alignment::Center),
-                panes,
-                status_bar,
-            ]
-            .height(Length::Fill)
-            .into(),
-            iced_tabs::Placement::Left => column![
-                row![
-                    column![row![add_tab, toggle_placement].spacing(4), tab_bar]
-                        .width(180)
-                        .height(Length::Fill),
-                    panes,
-                ]
+            iced_tabs::Placement::Top => row![tab_bar, add_tab]
+                .spacing(4)
+                .align_y(iced::Alignment::Center)
+                .width(Length::Fill)
+                .into(),
+            iced_tabs::Placement::Left => column![add_tab, tab_bar]
+                .width(SIDEBAR_WIDTH)
+                .height(Length::Fill)
+                .into(),
+        }
+    }
+
+    /// The window's own titlebar, drawn because the system's is turned off:
+    /// the corner button that moves the tab bar between the top and the left
+    /// edge, the tab strip when it sits on top, and the window buttons.
+    /// Everything that is not a control drags the window; a double-click
+    /// there maximizes it.
+    fn titlebar<'a>(
+        &'a self,
+        tabs: Option<Element<'a, Message, Theme>>,
+    ) -> Element<'a, Message, Theme> {
+        let toggle = button(text("\u{2261}").size(14))
+            .padding([2, 8])
+            .style(|theme: &Theme, status| button::text(theme.base(), status))
+            .on_press(Message::Workspace(workspace::Message::TogglePlacement));
+        let mut controls = row![toggle]
+            .spacing(4)
+            .align_y(iced::Alignment::Center)
+            .width(Length::Fill)
+            .height(Length::Fill);
+        controls = match tabs {
+            Some(tabs) => controls.push(tabs),
+            None => controls.push(space().width(Length::Fill)),
+        };
+        // The browser's window is the tab it runs in; only native windows
+        // have anything to minimize.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            controls = controls
+                .push(window_button("\u{2013}", Message::WindowMinimize))
+                .push(window_button("\u{25A1}", Message::WindowMaximize))
+                .push(window_button("\u{00D7}", Message::CloseRequested));
+        }
+
+        // Text and spacers do not capture the mouse, so the drag region
+        // behind them stays reachable everywhere but on a control.
+        let drag = mouse_area(space().width(Length::Fill).height(Length::Fill))
+            .on_press(Message::WindowDrag)
+            .on_double_click(Message::WindowMaximize);
+        container(
+            stack![drag, controls]
                 .width(Length::Fill)
                 .height(Length::Fill),
-                status_bar,
+        )
+        .height(TITLEBAR_HEIGHT)
+        .padding([0, 4])
+        .style(|theme: &Theme| container::Style {
+            background: Some(theme.chrome().into()),
+            ..Default::default()
+        })
+        .into()
+    }
+
+    /// The runner tab in front: its split panes, each with a title bar.
+    fn runner_tab_view(&self) -> Element<'_, Message, Theme> {
+        // `None` is only reachable between a snapshot and its rebuild, which
+        // does not happen: a workspace always has its runner tab built.
+        let Some(tab) = self.workspace.active() else {
+            return container(text("No tab").size(14))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+        };
+        let pane_count = tab.panes.len();
+        let focused = self.workspace.focused_pane();
+        pane_grid::PaneGrid::new(&tab.panes, move |pane, surface, _maximized| {
+            let id = tab.pane_id(pane);
+            let body: Element<'_, Message, Theme> = match surface {
+                Surface::Graph => self.graph_view(),
+                Surface::Empty => unavailable(
+                    "Empty pane",
+                    "Its surface could not be restored. Close it or split it again.",
+                ),
+                Surface::Terminal(terminal) => self.terminal_pane(id, *terminal),
+            };
+
+            // Structural changes are the runner's; with none attached the
+            // buttons are dead rather than a click that earns a refusal.
+            let attached = self.workspace.attached();
+            let mut controls = row![
+                split_button("H", attached, pane, zeughaus_mux::Axis::Horizontal),
+                split_button("V", attached, pane, zeughaus_mux::Axis::Vertical),
             ]
-            .into(),
-        }
+            .spacing(2);
+            // The graph pane is unique and the runner refuses to close it;
+            // offering the button would only earn a hint.
+            if pane_count > 1 && *surface != Surface::Graph {
+                let mut close = button(text("x").size(11)).padding([3, 6]);
+                if attached {
+                    close = close.on_press(Message::Workspace(workspace::Message::ClosePane(pane)));
+                }
+                controls = controls.push(close);
+            }
+            let controls: Element<'_, Message, Theme> = controls.into();
+            let title_color = if id.is_some() && id == focused {
+                self.theme.accent()
+            } else {
+                self.theme.muted()
+            };
+            let title = self.pane_title(*surface);
+            let title_bar = pane_grid::TitleBar::new(text(title).size(12).color(title_color))
+                .controls(controls)
+                .padding([3, 5]);
+
+            pane_grid::Content::new(body).title_bar(title_bar)
+        })
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .spacing(2)
+        .on_click(|pane| Message::Workspace(workspace::Message::ActivatePane(pane)))
+        .on_resize(8, |event| {
+            Message::Workspace(workspace::Message::Resize(event))
+        })
+        .into()
     }
 
     /// The one line at the bottom of every tab: the graph's size, the
     /// runtime and mux state, and either a hint the user just earned or the
     /// worst error the runtime reports. Workspace-wide, because "reconnecting"
     /// is as true in a terminal tab as in the graph.
-    fn status_bar(&self) -> Element<'_, Message> {
+    fn status_bar(&self) -> Element<'_, Message, Theme> {
         // Node errors are not computed here -- they arrive with the
         // runtime's published state, like every other value.
         let error = {
@@ -1171,21 +1368,18 @@ impl App {
             self.runtime_text(),
         );
         let (status_text, error_color) = if let Some(hint) = hint {
-            (format!("{head} | {hint}"), Color::from_rgb(0.9, 0.75, 0.35))
+            (format!("{head} | {hint}"), self.theme.hint())
         } else if !error.is_empty() {
-            (
-                format!("{head} | ERROR: {error}"),
-                Color::from_rgb(0.9, 0.3, 0.3),
-            )
+            (format!("{head} | ERROR: {error}"), self.theme.error())
         } else {
-            (head, Color::from_rgb(0.5, 0.5, 0.5))
+            (head, self.theme.muted())
         };
 
         container(text(status_text).size(12).color(error_color))
             .width(Length::Fill)
             .padding(4.0)
-            .style(|_theme: &Theme| container::Style {
-                background: Some(Color::from_rgb(0.1, 0.1, 0.12).into()),
+            .style(|theme: &Theme| container::Style {
+                background: Some(theme.chrome().into()),
                 ..Default::default()
             })
             .into()
@@ -1204,17 +1398,17 @@ impl App {
         &self,
         _pane: Option<zeughaus_mux::PaneId>,
         _terminal: zeughaus_mux::TerminalId,
-    ) -> Element<'_, Message> {
+    ) -> Element<'_, Message, Theme> {
         unavailable(
             "Terminal",
             "Terminals run on the runner and are not shown in the browser editor.",
         )
     }
 
-    fn graph_view(&self) -> Element<'_, Message> {
+    fn graph_view(&self) -> Element<'_, Message, Theme> {
         // NodeGraph is generic over the id vocabulary declared by `GraphIds`;
-        // theme and renderer stay at their defaults.
-        let mut ng: NodeGraph<'_, GraphIds, Message> = NodeGraph::new();
+        // the renderer stays at its default.
+        let mut ng: NodeGraph<'_, GraphIds, Message, Theme> = NodeGraph::new();
 
         ng = ng
             .on_connect(|from, to| Message::EdgeConnected { from, to })
@@ -1272,6 +1466,7 @@ impl App {
                     continue;
                 }
                 let content = build_node_element(
+                    &self.theme,
                     node,
                     NodeChrome {
                         display: self.display_values.get(id),
@@ -1289,13 +1484,13 @@ impl App {
                 let errored = self.node_error(*id).is_some();
                 let node_widget = ng_node(node.id.0, node.position, content)
                     .resizable(is_display(&node.type_id))
-                    .style(move |theme, status| {
-                        let base = default_node_style(theme, status);
+                    .style(move |theme: &Theme, status| {
+                        let base = default_node_style(theme.base(), status);
                         if errored {
                             return NodeStyle {
                                 corner_radius: 8.0,
                                 opacity: 0.88,
-                                border_color: Color::from_rgb(0.9, 0.25, 0.25).into(),
+                                border_color: theme.error().into(),
                                 border_pattern: Pattern::dashed(2.0, 6.0, 4.0).flow(25.0),
                                 ..base
                             };
@@ -1304,7 +1499,7 @@ impl App {
                             NodeStatus::Selected => NodeStyle {
                                 corner_radius: 8.0,
                                 opacity: 0.88,
-                                border_color: Color::from_rgb(0.3, 0.6, 1.0).into(),
+                                border_color: theme.accent().into(),
                                 border_pattern: Pattern::solid(2.5),
                                 ..base
                             },
@@ -1316,10 +1511,10 @@ impl App {
                         }
                     })
                     .pin_style(
-                        |theme, pin: &PinInfo<'_, GraphIds>, _other, status| PinStyle {
+                        |theme: &Theme, pin: &PinInfo<'_, GraphIds>, _other, status| PinStyle {
                             color: pin.info().color.into(),
                             shape: pin.info().shape,
-                            ..default_pin_style(theme, status)
+                            ..default_pin_style(theme.base(), status)
                         },
                     );
                 ng = ng.push_node(node_widget);
@@ -1343,8 +1538,8 @@ impl App {
                 .nodes
                 .get(&from_node)
                 .and_then(|n| n.pin_defs.iter().find(|p| &*p.name == from_pin.as_str()))
-                .map(|p| pin_color(&p.ty))
-                .unwrap_or(Color::from_rgb(0.6, 0.6, 0.6));
+                .map(|p| pin_color(&self.theme, &p.ty))
+                .unwrap_or_else(|| self.theme.muted());
             // Read on the real source pin, not the mapped one: a container has
             // no outputs of its own, so the value lives on the boundary node.
             let edge_color = if self
@@ -1375,11 +1570,11 @@ impl App {
                 PinRef::new(from_node.0, from_pin),
                 PinRef::new(to_node.0, to_pin),
             )
-            .style(move |theme, status, _start, _end| {
+            .style(move |theme: &Theme, status, _start, _end| {
                 if src_error {
-                    return EdgeStyle::error(theme, status);
+                    return EdgeStyle::error(theme.base(), status);
                 }
-                let base = default_edge_style(theme, status);
+                let base = default_edge_style(theme.base(), status);
                 EdgeStyle {
                     stroke_color: edge_color.into(),
                     // Event edges flow; state edges stay solid.
@@ -1398,26 +1593,34 @@ impl App {
             let edge_widget = {
                 let born = self.runtime.particles.get(&edge.id).into_iter().flatten();
                 edge_widget.particles(born.map(move |born| {
-                    particle(*born, PARTICLE_SPEED).style(move |theme| ParticleStyle {
+                    particle(*born, PARTICLE_SPEED).style(move |theme: &Theme| ParticleStyle {
                         color: edge_color,
-                        ..default_particle_style(theme)
+                        ..default_particle_style(theme.base())
                     })
                 }))
             };
             ng = ng.push_edge(edge_widget);
         }
 
-        let graph_area: Element<'_, Message> = container(ng)
+        let graph_area: Element<'_, Message, Theme> = container(ng)
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
 
-        let graph_view = if self.palette_open {
-            let palette_view = palette::view(
-                &self.palette_input,
-                &self.palette_commands,
-                self.palette_selected,
-            );
+        if self.palette_open {
+            // The palette widget is written against iced's own theme type, so
+            // the overlay is handed the inner theme: one theme still decides
+            // what it looks like, through the bridge rather than through a
+            // second catalog.
+            let palette_view: Element<'_, Message, Theme> = iced::widget::themer(
+                Some(self.theme.base().clone()),
+                palette::view(
+                    &self.palette_input,
+                    &self.palette_commands,
+                    self.palette_selected,
+                ),
+            )
+            .into();
             let overlay = container(palette_view)
                 .width(Length::Fill)
                 .padding(80.0)
@@ -1425,58 +1628,7 @@ impl App {
             stack![graph_area, overlay].into()
         } else {
             graph_area
-        };
-
-        column![self.breadcrumb(), graph_view].into()
-    }
-
-    /// The path from the root graph to what is on screen, each step a way back.
-    ///
-    /// The only way out of a subgraph: the canvas shows one graph at a time, so
-    /// without this a container entered by mistake would be a dead end.
-    fn breadcrumb(&self) -> Element<'_, Message> {
-        let trail: Vec<(NodeId, String)> = ancestry(self.current_graph, |id| {
-            self.nodes.get(&id).map(|node| node.parent)
-        })
-        .into_iter()
-        .filter_map(|id| {
-            self.nodes
-                .get(&id)
-                .map(|node| (id, node.display_name.clone()))
-        })
-        .collect();
-
-        let mut row = row![].spacing(6.0).align_y(iced::Alignment::Center);
-        if self.current_graph == NodeId(0) {
-            row = row.push(text("root").size(12));
-        } else {
-            row = row.push(
-                button(text("root").size(12))
-                    .padding(2.0)
-                    .on_press(Message::EnterGraph(0)),
-            );
         }
-        for (index, (id, name)) in trail.iter().enumerate() {
-            row = row.push(text("/").size(12));
-            let last = index + 1 == trail.len();
-            row = if last {
-                row.push(text(name.clone()).size(12))
-            } else {
-                row.push(
-                    button(text(name.clone()).size(12))
-                        .padding(2.0)
-                        .on_press(Message::EnterGraph(id.0)),
-                )
-            };
-        }
-        container(row)
-            .width(Length::Fill)
-            .padding(4.0)
-            .style(|_theme: &Theme| container::Style {
-                background: Some(Color::from_rgb(0.1, 0.1, 0.12).into()),
-                ..Default::default()
-            })
-            .into()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -1560,8 +1712,10 @@ impl App {
         Subscription::batch(subs)
     }
 
+    /// What every surface draws with. Cloned per frame, which is one atomic
+    /// bump: the theme itself is shared.
     pub fn theme(&self) -> Theme {
-        Theme::Dark
+        self.theme.clone()
     }
 }
 
@@ -1591,4 +1745,136 @@ fn split_button<'a>(
     } else {
         split
     }
+}
+
+/// A titlebar button: minimize, maximize, close. Flat, so the bar reads as
+/// one strip and not as a row of boxes.
+#[cfg(not(target_arch = "wasm32"))]
+fn window_button(glyph: &'static str, message: Message) -> Element<'static, Message, Theme> {
+    button(text(glyph).size(13).center().width(TITLEBAR_HEIGHT))
+        .padding([2, 0])
+        .style(|theme: &Theme, status| button::text(theme.base(), status))
+        .on_press(message)
+        .into()
+}
+
+/// Invisible hit zones along the window edges and corners that start a
+/// native resize drag. An undecorated window has no system resize borders,
+/// so the editor draws its own on top of the whole view.
+#[cfg(not(target_arch = "wasm32"))]
+fn resize_frame() -> Element<'static, Message, Theme> {
+    use iced::mouse::Interaction;
+    use iced::window::Direction;
+
+    /// Thickness of the edge strips.
+    const EDGE: f32 = 5.0;
+    /// Reach of the corner grips along each edge.
+    const CORNER: f32 = 16.0;
+
+    fn grip(
+        width: impl Into<Length>,
+        height: impl Into<Length>,
+        direction: Direction,
+        cursor: Interaction,
+    ) -> Element<'static, Message, Theme> {
+        mouse_area(space().width(width).height(height))
+            .on_press(Message::WindowResize(direction))
+            .interaction(cursor)
+            .into()
+    }
+
+    column![
+        row![
+            grip(
+                CORNER,
+                EDGE,
+                Direction::NorthWest,
+                Interaction::ResizingDiagonallyDown
+            ),
+            grip(
+                Length::Fill,
+                EDGE,
+                Direction::North,
+                Interaction::ResizingVertically
+            ),
+            grip(
+                CORNER,
+                EDGE,
+                Direction::NorthEast,
+                Interaction::ResizingDiagonallyUp
+            ),
+        ]
+        .width(Length::Fill),
+        row![
+            column![
+                grip(
+                    EDGE,
+                    CORNER,
+                    Direction::NorthWest,
+                    Interaction::ResizingDiagonallyDown
+                ),
+                grip(
+                    EDGE,
+                    Length::Fill,
+                    Direction::West,
+                    Interaction::ResizingHorizontally
+                ),
+                grip(
+                    EDGE,
+                    CORNER,
+                    Direction::SouthWest,
+                    Interaction::ResizingDiagonallyUp
+                ),
+            ]
+            .height(Length::Fill),
+            space().width(Length::Fill),
+            column![
+                grip(
+                    EDGE,
+                    CORNER,
+                    Direction::NorthEast,
+                    Interaction::ResizingDiagonallyUp
+                ),
+                grip(
+                    EDGE,
+                    Length::Fill,
+                    Direction::East,
+                    Interaction::ResizingHorizontally
+                ),
+                grip(
+                    EDGE,
+                    CORNER,
+                    Direction::SouthEast,
+                    Interaction::ResizingDiagonallyDown
+                ),
+            ]
+            .height(Length::Fill),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill),
+        row![
+            grip(
+                CORNER,
+                EDGE,
+                Direction::SouthWest,
+                Interaction::ResizingDiagonallyUp
+            ),
+            grip(
+                Length::Fill,
+                EDGE,
+                Direction::South,
+                Interaction::ResizingVertically
+            ),
+            grip(
+                CORNER,
+                EDGE,
+                Direction::SouthEast,
+                Interaction::ResizingDiagonallyDown
+            ),
+        ]
+        .width(Length::Fill),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
 }

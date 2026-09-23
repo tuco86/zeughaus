@@ -86,6 +86,7 @@ the user's back.
 | `zeughaus` | the editor | native + wasm32 |
 | `iced_terminal` | terminal widget: one wgpu primitive per pane, input to `TerminalCommand`s, bundled font | native |
 | `iced_tabs` | the tab bar the workspace shell uses | yes |
+| `zeughaus-theme` | the editor's theme: an `iced::Theme` paired with a terminal colour scheme, the catalogs of every widget the editor draws, the bundled pack, the WezTerm scheme parser | yes |
 | `zeughaus-transform`, `-flow`, `-graph`, `-ml` | pure plugins | yes |
 | `zeughaus-job` | the `job.run` node and the `ProcessHost` trait it executes through; the runner implements the host, the editor registers the plugin detached | yes |
 | `zeughaus-capture`, `-db`, `-record`, `-llm` | plugins that touch the OS | native |
@@ -93,9 +94,12 @@ the user's back.
 
 Dependency direction: plugins depend on core only. The runtime depends on
 core. The runner depends on runtime, sync, link, mux, terminal and every
-plugin. The editor depends on core, sync, link, mux, the widget crates and the
-plugins it can link -- **not on the runtime**: it holds node instances for what
-a node knows about itself, and gets every value from the runner.
+plugin. The widget crates know nothing of the editor's theme: each implements
+its catalog for `iced::Theme`, and `zeughaus-theme` implements the same
+catalogs for its own type. The editor depends on core, sync, link, mux, the
+widget crates, the theme and the plugins it can link -- **not on the
+runtime**: it holds node instances for what a node knows about itself, and
+gets every value from the runner.
 
 ## 3. Type system (`zeughaus-core`)
 
@@ -235,17 +239,50 @@ direct `graph.input`/`graph.output` children, named by each child's title. An
 edge drawn onto a container's pin is stored against the boundary child, so
 the store and the executor see one flat graph of real nodes; only the editor
 knows about nesting. Deleting a container deletes its contents, recursively
-in the reducer and locally in every editor.
+in the reducer and locally in every editor. A container's `open` button
+opens its contents as a graph tab (below); the root graph is what the
+runner's graph pane shows.
 
 **Layout.** `AutoLayout` ranks nodes by longest path from a source and orders
 a rank by the barycentre of its placed predecessors; a cycle admits the lowest
 remaining id as if its incoming edges were not there. It is an ordinary move,
 shared through the store.
 
-**Workspace.** The window is tabs of split panes (`iced_tabs`,
-`pane_grid`). Exactly one pane shows the graph; every other pane is a
-terminal (section 9). Tab order, splits and pane ids come from the runner;
-active tab, focus, scroll, selection and blink are per window.
+**Workspace.** The window is undecorated and draws its own titlebar: the
+button in the corner moves the tab strip between the titlebar and a sidebar
+under it, and the window buttons and edge grips do what the system
+decorations would have.
+Below it are tabs of split panes (`iced_tabs`, `pane_grid`). The runner's
+tabs are the shared workspace: exactly one pane shows the root graph, every
+other pane is a terminal (section 9), and tab order, splits and pane ids
+come from the runner. A graph tab is the editor's own: one per opened
+container, one surface, no splits, listed after the runner's tabs and
+working without one. The canvas shows the graph of the tab in front; the
+camera is kept per graph and the selection is dropped on a switch. A
+deleted container closes its tab. Active tab, focus, scroll, selection,
+blink, graph tabs and the tab bar's placement are per window.
+
+**Themes** (`zeughaus-theme`). One theme type drives everything the window
+draws. A `Theme` is an `iced::Theme` -- the widgets' palette -- paired with a
+terminal colour scheme: sixteen ANSI colours plus foreground, background,
+cursor and selection. The scheme is the single source: a theme loaded from a
+file derives its iced palette from it (background, text = foreground,
+primary = blue, success = green, warning = yellow, danger = red), and the
+editor's own semantics are ANSI slots -- a `Float` pin is green, a `Str` pin
+yellow, a `Bool` pin blue, a constant's header the green tinted into the
+chrome. The chrome (titlebar, status line, pane titles) uses the extended
+palette's roles; the graph goes through `iced_nodegraph`'s catalog, whose
+defaults already derive from the extended palette; the terminal renders the
+theme's palette with any entry an OSC 4/10/11 changed laid over it (the
+runner's default palette is a constant both ends pin, so "unchanged" means
+the same thing on both). The widget crates implement their catalogs for
+`iced::Theme`; `zeughaus-theme` implements every catalog for its type by
+delegating to the inner iced theme, and `iced_palette`, which only knows
+`iced::Theme`, is bridged with `themer`. The bundled pack is every iced
+built-in paired with the scheme of the same name from iTerm2-Color-Schemes;
+`<state-dir>/themes/*.toml` in WezTerm's format add more. The chosen theme
+and the tab bar's placement are per window and persist in
+`<state-dir>/editor.toml`.
 
 ## 7. Plugins
 
@@ -360,6 +397,7 @@ results keyed by (pin, tier, sequence).
 | store to join | `zeughaus join <host[:port]/database>`, `zeughaus-runner join <...>`; without it the default session on `127.0.0.1:3000/zeughaus`, and the LAN token is printed for others to join (`Session::resolve` in `zeughaus-sync`) |
 | feed/listener bind | `zeughaus-runner --feed-addr <host:port>`; default loopback with an OS-chosen port, so two runners on one host do not collide |
 | credentials | `--state-dir <path>` on the runner, else `ZEUGHAUS_STATE_DIR`, else XDG state; a remote editor needs `client.pem` copied into its own state directory |
+| editor preferences | `<state-dir>/editor.toml` (`theme`, `tabs`), written by the editor when they change; `<state-dir>/themes/*.toml` are WezTerm colour schemes offered as themes by file name |
 | capture backend | the portal is used when `WAYLAND_DISPLAY` is set |
 | paths inside nodes | `db.database` `path` and `record.writer` `dir` are settings, resolved against the runner's working directory |
 | LLM endpoint | the `base_url` setting on each conversation node (default `http://localhost:1234/v1`) |

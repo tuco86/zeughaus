@@ -1,0 +1,27 @@
+[package]
+name = "zeughaus-theme"
+version.workspace = true
+edition.workspace = true
+description = "One theme for every surface of the editor: iced widgets, the node graph, the tab bar and the terminal panes, all derived from a terminal colour scheme"
+
+[dependencies]
+iced.workspace = true
+iced_nodegraph.workspace = true
+iced_tabs.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+# The bundled schemes and the ones a user drops into the state directory are
+# WezTerm colour TOML.
+toml.workspace = true
+
+# The terminal surface exists only where a PTY can: the editor enables this
+# feature natively and leaves it off for wasm.
+iced_terminal = { workspace = true, optional = true }
+zeughaus-mux = { workspace = true, optional = true }
+
+[features]
+terminal = ["dep:iced_terminal", "dep:zeughaus-mux"]
+# `iced::widget::svg` exists only when iced itself was built with its `svg`
+# feature, and a crate cannot ask a dependency whether it was: a host that
+# draws SVGs turns this on and gets the delegating catalog with it.
+svg = ["iced/svg"]

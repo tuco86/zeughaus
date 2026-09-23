@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use iced::{Element, Task};
+use zeughaus_theme::Theme;
 
 use super::{App, unavailable};
 use crate::message::Message;
@@ -544,7 +545,7 @@ impl App {
         &self,
         pane: Option<zeughaus_mux::PaneId>,
         terminal: zeughaus_mux::TerminalId,
-    ) -> Element<'_, Message> {
+    ) -> Element<'_, Message, Theme> {
         let Some((view, serials)) = self.terminal_view(terminal) else {
             return unavailable("Terminal", "Waiting for the runner's first screen.");
         };

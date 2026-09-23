@@ -4,12 +4,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use iced::theme::palette::mix;
 use iced::widget::{button, column, container, image, pick_list, row, text, text_input};
-use iced::{Color, ContentFit, Element, Length, Theme};
+use iced::{Color, ContentFit, Element, Length};
 use iced_nodegraph::{PinDirection as NgPinDirection, PinShape, PinSide, node_header, node_pin};
 use zeughaus_core::{
     Image, NodeId, PinDirection, PinKind, SettingDef, SettingKind, Ty, Value, field_rows,
 };
+use zeughaus_theme::{Ansi, Theme};
 
 use super::App;
 use super::graph::EditorNode;
@@ -203,6 +205,7 @@ fn is_dim(mask: u64, index: usize) -> bool {
 /// count has to stay the same between redraws, or iced's widget state is
 /// matched against the wrong element.
 fn setting_refusal<'a>(
+    theme: &Theme,
     errors: Option<&'a HashMap<String, String>>,
     def: &'a SettingDef,
 ) -> iced::widget::Text<'a, Theme> {
@@ -210,7 +213,7 @@ fn setting_refusal<'a>(
         .and_then(|e| e.get(&*def.name))
         .map(String::as_str)
         .unwrap_or("");
-    text(message).size(10).color(Color::from_rgb(0.9, 0.4, 0.4))
+    text(message).size(10).color(theme.error())
 }
 
 /// Everything the widget needs about one node besides the node itself: what it
@@ -228,6 +231,7 @@ pub(super) struct NodeChrome<'a> {
 }
 
 pub(super) fn build_node_element<'a>(
+    theme: &Theme,
     node: &'a EditorNode,
     chrome: NodeChrome<'a>,
 ) -> Element<'a, Message, Theme> {
@@ -245,13 +249,14 @@ pub(super) fn build_node_element<'a>(
 
     let mut items: Vec<Element<'_, Message, Theme>> = Vec::new();
 
-    // A container's body is a way in. Its pins come from the boundary nodes
-    // inside it, so without this the node would be a box with no purpose.
+    // A container's body is a way in: its contents open as a tab. Its pins
+    // come from the boundary nodes inside it, so without this the node would
+    // be a box with no purpose.
     if is_container {
         items.push(
             button(text("open").size(11))
                 .padding(2.0)
-                .on_press(Message::EnterGraph(node.id.0))
+                .on_press(Message::OpenGraph(node.id.0))
                 .into(),
         );
     }
@@ -261,7 +266,8 @@ pub(super) fn build_node_element<'a>(
         // exists to produce, so there is nothing else worth showing.
         let node_raw_id = node.id.0;
         let first_pin = node.pin_defs.first();
-        let tint = first_pin.map_or_else(|| pin_color(&Ty::Bool), |p| pin_color(&p.ty));
+        let tint =
+            first_pin.map_or_else(|| pin_color(theme, &Ty::Bool), |p| pin_color(theme, &p.ty));
         let color = if is_dim(dim_mask, 0) { dim(tint) } else { tint };
         let press = button(text("Trigger").size(13).center())
             .on_press(Message::NodeTriggered {
@@ -289,14 +295,14 @@ pub(super) fn build_node_element<'a>(
                 .into(),
             Some(DisplayValue::Text(val)) => text(val.as_str())
                 .size(14)
-                .color(Color::from_rgb(0.9, 0.9, 0.5))
+                .color(theme.ansi(Ansi::Yellow))
                 .into(),
             None => text("").size(14).into(),
         };
         let pin_def = node.pin_defs.first();
         let name = pin_def.map_or_else(|| Arc::from("input"), |p| p.name.clone());
         let visual = PinVisual {
-            color: pin_def.map_or_else(|| pin_color(&Ty::Any), |p| pin_color(&p.ty)),
+            color: pin_def.map_or_else(|| pin_color(theme, &Ty::Any), |p| pin_color(theme, &p.ty)),
             shape: pin_shape(pin_def.map(|p| p.pin_kind).unwrap_or(PinKind::Trigger)),
         };
         let pin: Element<'_, Message, Theme> = node_pin(
@@ -318,8 +324,13 @@ pub(super) fn build_node_element<'a>(
             if def.kind != SettingKind::Title {
                 continue;
             }
-            items.push(title_setting(node, def, setting_value(settings, def)));
-            items.push(setting_refusal(errors, def).into());
+            items.push(title_setting(
+                theme,
+                node,
+                def,
+                setting_value(settings, def),
+            ));
+            items.push(setting_refusal(theme, errors, def).into());
         }
         // A field-list setting draws its own pins: each row IS a pin spanning
         // the node, so the plain pin loop below must not draw them a second
@@ -331,8 +342,8 @@ pub(super) fn build_node_element<'a>(
             };
             let current = setting_value(settings, def);
             fields.extend(field_rows(current).into_iter().map(|(name, _)| name));
-            items.extend(field_setting(node, def, types, current, dim_mask));
-            items.push(setting_refusal(errors, def).into());
+            items.extend(field_setting(theme, node, def, types, current, dim_mask));
+            items.push(setting_refusal(theme, errors, def).into());
         }
 
         for (index, pin_def) in node.pin_defs.iter().enumerate() {
@@ -341,7 +352,7 @@ pub(super) fn build_node_element<'a>(
             }
             let (side, direction) = pin_geometry(pin_def.direction);
 
-            let tint = pin_color(&pin_def.ty);
+            let tint = pin_color(theme, &pin_def.ty);
             let visual = PinVisual {
                 color: if is_dim(dim_mask, index) {
                     dim(tint)
@@ -386,11 +397,9 @@ pub(super) fn build_node_element<'a>(
 
         items.push(
             column![
-                text(&*def.name)
-                    .size(11)
-                    .color(Color::from_rgb(0.6, 0.6, 0.6)),
+                text(&*def.name).size(11).color(theme.muted()),
                 field,
-                setting_refusal(errors, def)
+                setting_refusal(theme, errors, def)
             ]
             .spacing(1)
             .into(),
@@ -411,10 +420,8 @@ pub(super) fn build_node_element<'a>(
         let prefix = if value_text.is_empty() { "" } else { "= " };
         items.push(
             row![
-                text(prefix).size(12).color(Color::from_rgb(0.6, 0.6, 0.6)),
-                text(value_text)
-                    .size(13)
-                    .color(Color::from_rgb(0.9, 0.9, 0.5))
+                text(prefix).size(12).color(theme.muted()),
+                text(value_text).size(13).color(theme.ansi(Ansi::Yellow))
             ]
             .spacing(2)
             .into(),
@@ -428,7 +435,7 @@ pub(super) fn build_node_element<'a>(
     items.push(
         text(failure.unwrap_or(""))
             .size(10)
-            .color(Color::from_rgb(0.95, 0.45, 0.45))
+            .color(theme.error())
             .into(),
     );
 
@@ -436,8 +443,8 @@ pub(super) fn build_node_element<'a>(
     let header = node_header(
         text(node.display_name.as_str())
             .size(14)
-            .color(Color::from_rgb(0.92, 0.92, 0.95)),
-        header_color(&node.category),
+            .color(theme.extended().background.weak.text),
+        header_color(theme, &node.category),
         8.0,
     );
     let inner = column![header, container(body).padding(6.0)];
@@ -492,6 +499,7 @@ fn pin_geometry(direction: PinDirection) -> (PinSide, NgPinDirection) {
 /// header is the node type ("Table"), this is the table's own name. Without it
 /// the field read as a second, unexplained heading.
 fn title_setting<'a>(
+    theme: &Theme,
     node: &'a EditorNode,
     def: &'a SettingDef,
     current: &'a str,
@@ -506,14 +514,9 @@ fn title_setting<'a>(
         })
         .size(14)
         .width(Length::Fill);
-    column![
-        text(&*def.name)
-            .size(11)
-            .color(Color::from_rgb(0.6, 0.6, 0.6)),
-        field
-    ]
-    .spacing(1)
-    .into()
+    column![text(&*def.name).size(11).color(theme.muted()), field]
+        .spacing(1)
+        .into()
 }
 
 /// A [`SettingKind::Fields`] setting: one row per field, plus a way to add one.
@@ -528,6 +531,7 @@ fn title_setting<'a>(
 /// already speak, and this editor needs to know nothing about what the fields
 /// mean.
 fn field_setting<'a>(
+    theme: &Theme,
     node: &'a EditorNode,
     def: &'a SettingDef,
     types: &'a [String],
@@ -591,7 +595,10 @@ fn field_setting<'a>(
             .iter()
             .enumerate()
             .find(|(_, p)| &*p.name == name);
-        let tint = pin.map_or_else(|| pin_color(&Ty::Any), |(_, p)| pin_color(&p.ty));
+        let tint = pin.map_or_else(
+            || pin_color(theme, &Ty::Any),
+            |(_, p)| pin_color(theme, &p.ty),
+        );
         let visual = PinVisual {
             color: if pin.is_some_and(|(index, _)| is_dim(dim_mask, index)) {
                 dim(tint)
@@ -658,16 +665,17 @@ fn field_added(rows: &[(&str, &str)], types: &[&str]) -> String {
     field_edit(rows, rows.len(), Some((&name, ty)))
 }
 
-/// Header background color by the node's catalog category: green where values
-/// enter the graph, gold where they are read out, neutral for every step in
-/// between. Three colours rather than one per category, because the only
-/// distinction worth a glance across a whole graph is where the data comes
-/// from and where it ends up.
-fn header_color(category: &str) -> Color {
+/// Header background color by the node's catalog category: the theme's green
+/// where values enter the graph, its yellow where they are read out, its own
+/// weak background for every step in between. Three colours rather than one
+/// per category, because the only distinction worth a glance across a whole
+/// graph is where the data comes from and where it ends up.
+fn header_color(theme: &Theme, category: &str) -> Color {
+    let base = theme.extended().background.weak.color;
     match category {
-        "Const" => Color::from_rgb(0.16, 0.30, 0.20),
-        "Output" => Color::from_rgb(0.32, 0.26, 0.10),
-        _ => Color::from_rgb(0.18, 0.20, 0.26),
+        "Const" => mix(base, theme.ansi(Ansi::Green), 0.35),
+        "Output" => mix(base, theme.ansi(Ansi::Yellow), 0.35),
+        _ => base,
     }
 }
 
@@ -692,18 +700,19 @@ fn pin_shape(kind: PinKind) -> PinShape {
     }
 }
 
-/// Pin color per payload type. Scalars get a distinct hue; opaque and composite
-/// types share the neutral fallback rather than a generated palette.
-pub(super) fn pin_color(ty: &Ty) -> Color {
-    match ty {
-        Ty::Float => Color::from_rgb(0.3, 0.8, 0.4),
-        Ty::Str => Color::from_rgb(0.9, 0.7, 0.2),
-        Ty::Bool => Color::from_rgb(0.3, 0.5, 0.9),
-        Ty::Any => Color::from_rgb(0.7, 0.7, 0.7),
-        Ty::Int | Ty::List(_) | Ty::Option(_) | Ty::Record(_) | Ty::Opaque(_) => {
-            Color::from_rgb(0.6, 0.6, 0.6)
-        }
-    }
+/// Pin color per payload type, drawn from the theme's ANSI slots: the same
+/// sixteen colours the terminals in the other panes use, so a graph and a
+/// shell in one window are one palette. Opaque and composite types share the
+/// neutral white rather than a generated hue.
+pub(super) fn pin_color(theme: &Theme, ty: &Ty) -> Color {
+    theme.ansi(match ty {
+        Ty::Float => Ansi::Green,
+        Ty::Str => Ansi::Yellow,
+        Ty::Bool => Ansi::Blue,
+        Ty::Int => Ansi::Cyan,
+        Ty::Any => Ansi::BrightWhite,
+        Ty::List(_) | Ty::Option(_) | Ty::Record(_) | Ty::Opaque(_) => Ansi::White,
+    })
 }
 
 #[cfg(test)]

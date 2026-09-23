@@ -47,6 +47,7 @@ use crate::geometry::{cell_at, grid_size};
 use crate::input;
 use crate::pipeline::{CursorSpec, Frame, FrameRow, Highlight, TerminalPrimitive};
 use crate::selection::{self, GridPoint, Mode, Selection};
+use crate::style::{Catalog, Style, StyleFn};
 
 /// Default text size, in logical pixels.
 const DEFAULT_FONT_SIZE: f32 = 14.0;
@@ -86,7 +87,10 @@ pub enum Action {
 pub type SharedView = Arc<Mutex<Option<TerminalView>>>;
 
 /// A terminal surface.
-pub struct Terminal<'a, Message> {
+pub struct Terminal<'a, Message, Theme = iced::Theme>
+where
+    Theme: Catalog,
+{
     view: SharedView,
     id: u64,
     on_action: Option<Box<dyn Fn(Action) -> Message + 'a>>,
@@ -94,9 +98,13 @@ pub struct Terminal<'a, Message> {
     focused: bool,
     next_serial: u64,
     font_size: f32,
+    class: Theme::Class<'a>,
 }
 
-impl<'a, Message> Terminal<'a, Message> {
+impl<'a, Message, Theme> Terminal<'a, Message, Theme>
+where
+    Theme: Catalog,
+{
     /// A terminal drawing whatever `view` holds. `id` must be stable for the
     /// surface: the renderer keeps this pane's GPU buffers under it.
     pub fn new(view: SharedView, id: u64) -> Self {
@@ -108,6 +116,7 @@ impl<'a, Message> Terminal<'a, Message> {
             focused: false,
             next_serial: 1,
             font_size: DEFAULT_FONT_SIZE,
+            class: Theme::default(),
         }
     }
 
@@ -140,6 +149,21 @@ impl<'a, Message> Terminal<'a, Message> {
 
     pub fn font_size(mut self, font_size: f32) -> Self {
         self.font_size = font_size;
+        self
+    }
+
+    /// The colours this surface falls back to, as a function of the theme.
+    pub fn style(mut self, style: impl Fn(&Theme) -> Style + 'a) -> Self
+    where
+        Theme::Class<'a>: From<StyleFn<'a, Theme>>,
+    {
+        self.class = (Box::new(style) as StyleFn<'a, Theme>).into();
+        self
+    }
+
+    /// The style class of this surface.
+    pub fn class(mut self, class: impl Into<Theme::Class<'a>>) -> Self {
+        self.class = class.into();
         self
     }
 }
@@ -194,8 +218,9 @@ impl State {
     }
 }
 
-impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for Terminal<'_, Message>
+impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for Terminal<'_, Message, Theme>
 where
+    Theme: Catalog,
     Renderer: iced_wgpu::primitive::Renderer,
 {
     fn tag(&self) -> tree::Tag {
@@ -226,7 +251,7 @@ where
         &self,
         tree: &Tree,
         renderer: &mut Renderer,
-        _theme: &Theme,
+        theme: &Theme,
         _style: &renderer::Style,
         layout: Layout<'_>,
         _cursor: mouse::Cursor,
@@ -234,12 +259,13 @@ where
     ) {
         let state = tree.state.downcast_ref::<State>();
         let bounds = layout.bounds();
+        let style = theme.style(&self.class);
         // The snapshot is built while the lock is held and the guard is gone
         // before the primitive is handed over: from here on the frame is the
         // renderer's own data.
         let frame = self
-            .with_view(|view| self.frame(view, state, bounds.size()))
-            .unwrap_or_else(|| self.empty_frame(bounds.size()));
+            .with_view(|view| self.frame(view, state, bounds.size(), &style))
+            .unwrap_or_else(|| self.empty_frame(bounds.size(), &style));
         renderer.draw_primitive(
             bounds,
             TerminalPrimitive {
@@ -361,7 +387,10 @@ where
     }
 }
 
-impl<Message> Terminal<'_, Message> {
+impl<Message, Theme> Terminal<'_, Message, Theme>
+where
+    Theme: Catalog,
+{
     /// Reads the shared view under the shortest possible lock: the guard is
     /// dropped on the way out, so a caller can only ever publish, redraw or
     /// send after it let go. `None` means no head arrived yet.
@@ -871,7 +900,7 @@ impl<Message> Terminal<'_, Message> {
 
     // ----------------------------------------------------------- render ---
 
-    fn frame(&self, view: &TerminalView, state: &State, size: Size) -> Frame {
+    fn frame(&self, view: &TerminalView, state: &State, size: Size, style: &Style) -> Frame {
         let metrics = self.metrics();
         let grid = grid_size(size, metrics);
         let top = top_row(view);
@@ -918,26 +947,32 @@ impl<Message> Terminal<'_, Message> {
 
         let cursor = self.cursor_spec(view, state, grid, top, cursor_row);
 
+        // What the child set stands; the theme fills the rest. The generation
+        // covers the merged palette, so switching themes rebuilds instances
+        // without touching a single shaped row.
+        let palette = view.palette.themed(&style.palette);
+
         Frame {
             cols: grid.cols,
             rows: grid.rows,
             metrics,
             font_size: self.font_size,
-            palette: view.palette.clone(),
-            palette_generation: palette_generation(&view.palette),
+            palette_generation: palette_generation(&palette),
+            palette,
             reverse_video: view.modes.reverse_video,
             lines,
             selection,
+            selection_color: style.selection,
             cursor,
         }
     }
 
     /// The frame of a pane whose view has not arrived yet: the right size,
-    /// the default palette, and nothing on it.
-    pub(crate) fn empty_frame(&self, size: Size) -> Frame {
+    /// the theme's palette, and nothing on it.
+    pub(crate) fn empty_frame(&self, size: Size, style: &Style) -> Frame {
         let metrics = self.metrics();
         let grid = grid_size(size, metrics);
-        let palette = zeughaus_mux::Palette::default();
+        let palette = style.palette.clone();
         Frame {
             cols: grid.cols,
             rows: grid.rows,
@@ -948,6 +983,7 @@ impl<Message> Terminal<'_, Message> {
             reverse_video: false,
             lines: Vec::new(),
             selection: Vec::new(),
+            selection_color: style.selection,
             cursor: None,
         }
     }
@@ -1006,14 +1042,14 @@ fn overlay_preedit(spans: &mut Vec<CellSpan>, col: u16, preedit: &str, cols: u16
     spans.sort_by_key(|span| span.start_col);
 }
 
-impl<'a, Message, Theme, Renderer> From<Terminal<'a, Message>>
+impl<'a, Message, Theme, Renderer> From<Terminal<'a, Message, Theme>>
     for Element<'a, Message, Theme, Renderer>
 where
     Message: 'a,
-    Theme: 'a,
+    Theme: Catalog + 'a,
     Renderer: iced_wgpu::primitive::Renderer + 'a,
 {
-    fn from(terminal: Terminal<'a, Message>) -> Self {
+    fn from(terminal: Terminal<'a, Message, Theme>) -> Self {
         Element::new(terminal)
     }
 }

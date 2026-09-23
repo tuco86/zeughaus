@@ -9,12 +9,18 @@
 //! leaving this process. The maps in [`TabView`] are the whole translation,
 //! and they are rebuilt with the grid so a stale one cannot exist.
 //!
-//! What is local stays local: which tab is active, which pane has focus and
-//! where the tab bar sits are this window's business and travel nowhere.
+//! What is local stays local: which tab is active, which pane has focus,
+//! where the tab bar sits, and which containers this window has opened as
+//! graph tabs are this window's business and travel nowhere.
 //! Everything that changes the shared structure leaves as a
 //! [`TopologyCommand`] and comes back as the next [`WorkspaceSnapshot`] -- the
 //! editor never edits the tree it draws, so two editors cannot disagree about
 //! it.
+//!
+//! A graph tab is the one kind of tab the runner does not know: it shows the
+//! contents of a container node, and what a window looks at is not shared
+//! state. It has one surface and no splits, works without a runner, and is
+//! listed after the runner's tabs.
 //!
 //! With no runner attached the workspace is one tab showing the graph, and
 //! every structural command is refused with a sentence rather than applied
@@ -28,11 +34,21 @@ use iced::Color;
 use iced::time::Instant;
 use iced::widget::pane_grid::{self, Configuration, Node, Pane, ResizeEvent, Split};
 use iced_tabs::Placement;
+use zeughaus_core::NodeId;
 use zeughaus_mux::workspace::ProfileId;
 use zeughaus_mux::{
     Axis, DetachedTerminal, PaneId, PaneNode, RunnerIncarnation, SplitId, TabId, TabSnapshot,
     TopologyCommand, WorkspaceSnapshot,
 };
+
+/// A tab the bar shows: one of the runner's, or this window's view into a
+/// container node. Two id spaces, kept apart by the type: a [`TabId`] is
+/// minted by the runner and a [`NodeId`] by the document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabRef {
+    Runner(TabId),
+    Graph(NodeId),
+}
 
 /// What a pane shows. The wire type itself: a mirrored copy would only add a
 /// conversion that can disagree with the snapshot it came from.
@@ -164,7 +180,8 @@ fn iced_axis(axis: Axis) -> pane_grid::Axis {
     }
 }
 
-/// What this window shows of the shared workspace.
+/// What this window shows of the shared workspace, plus the graph tabs that
+/// are its own.
 #[derive(Debug)]
 pub struct Workspace {
     snapshot: WorkspaceSnapshot,
@@ -172,7 +189,13 @@ pub struct Workspace {
     /// graph-only default and no structural command may be sent.
     attached: bool,
     tabs: Vec<TabView>,
-    active_tab: Option<TabId>,
+    /// The runner tab in front, or behind the graph tab in front: where a
+    /// closed graph tab falls back to.
+    runner_tab: Option<TabId>,
+    /// Containers this window opened as tabs, in opening order.
+    graph_tabs: Vec<NodeId>,
+    /// The graph tab in front, if one is; otherwise `runner_tab` is shown.
+    graph_tab: Option<NodeId>,
     focused_pane: Option<PaneId>,
     pub placement: Placement,
     resize: Coalescer,
@@ -185,7 +208,9 @@ impl Workspace {
             snapshot: local_snapshot(),
             attached: false,
             tabs: Vec::new(),
-            active_tab: None,
+            runner_tab: None,
+            graph_tabs: Vec::new(),
+            graph_tab: None,
             focused_pane: None,
             placement: Placement::Top,
             resize: Coalescer::default(),
@@ -241,21 +266,78 @@ impl Workspace {
         &self.snapshot.detached
     }
 
-    /// The active tab's id, or the first tab's: a workspace always has one
-    /// tab, and the tab bar needs an id to mark.
-    pub fn active_tab(&self) -> TabId {
-        self.active_tab
+    /// The tab the bar marks: the graph tab in front, else the runner tab.
+    pub fn active_tab(&self) -> TabRef {
+        match self.graph_tab {
+            Some(graph) => TabRef::Graph(graph),
+            None => TabRef::Runner(self.runner_tab()),
+        }
+    }
+
+    /// The runner tab in front or behind the graph tab in front, or the
+    /// first tab's id: a workspace always has one tab.
+    fn runner_tab(&self) -> TabId {
+        self.runner_tab
             .or_else(|| self.snapshot.tabs.first().map(|tab| tab.id))
             .unwrap_or(LOCAL_TAB)
     }
 
+    /// The runner tab's grid, shown or behind the graph tab in front.
     pub fn active(&self) -> Option<&TabView> {
-        let active = self.active_tab();
+        let active = self.runner_tab();
         self.tabs.iter().find(|tab| tab.id == active)
     }
 
     pub fn focused_pane(&self) -> Option<PaneId> {
         self.focused_pane
+    }
+
+    /// The containers this window has opened as tabs, in bar order.
+    pub fn graph_tabs(&self) -> &[NodeId] {
+        &self.graph_tabs
+    }
+
+    /// Which graph the canvas shows: the container of the graph tab in front,
+    /// or the root graph behind the runner's graph pane.
+    pub fn shown_graph(&self) -> NodeId {
+        self.graph_tab.unwrap_or(NodeId(0))
+    }
+
+    /// Brings a container's tab to the front, opening it if this window has
+    /// none for it yet.
+    pub fn open_graph(&mut self, graph: NodeId) {
+        if !self.graph_tabs.contains(&graph) {
+            self.graph_tabs.push(graph);
+        }
+        self.graph_tab = Some(graph);
+    }
+
+    /// Closes the graph tabs `keep` refuses -- the containers that no longer
+    /// exist -- the way a click on their close button would.
+    pub fn retain_graphs(&mut self, keep: impl Fn(NodeId) -> bool) {
+        // Collected first: `close_graph` reorders what is being walked. An
+        // empty collect allocates nothing, and this runs after every message.
+        let gone: Vec<NodeId> = self
+            .graph_tabs
+            .iter()
+            .copied()
+            .filter(|graph| !keep(*graph))
+            .collect();
+        for graph in gone {
+            self.close_graph(graph);
+        }
+    }
+
+    /// A tab in front falls back to the one opened before it, which is
+    /// usually the graph it was opened from, and otherwise to the runner tab.
+    fn close_graph(&mut self, graph: NodeId) {
+        let Some(index) = self.graph_tabs.iter().position(|open| *open == graph) else {
+            return;
+        };
+        self.graph_tabs.remove(index);
+        if self.graph_tab == Some(graph) {
+            self.graph_tab = index.checked_sub(1).map(|before| self.graph_tabs[before]);
+        }
     }
 
     /// What a pane shows, in any tab.
@@ -287,10 +369,17 @@ impl Workspace {
 
     pub fn update(&mut self, message: Message) -> Update {
         match message {
-            Message::ActivateTab(id) => {
+            Message::ActivateTab(TabRef::Runner(id)) => {
                 if self.snapshot.tabs.iter().any(|tab| tab.id == id) {
-                    self.active_tab = Some(id);
+                    self.runner_tab = Some(id);
+                    self.graph_tab = None;
                     self.focused_pane = self.default_pane(id);
+                }
+                Update::none()
+            }
+            Message::ActivateTab(TabRef::Graph(graph)) => {
+                if self.graph_tabs.contains(&graph) {
+                    self.graph_tab = Some(graph);
                 }
                 Update::none()
             }
@@ -325,7 +414,13 @@ impl Workspace {
                 None => Update::none(),
                 Some(pane) => self.remote(TopologyCommand::ClosePane { pane }),
             },
-            Message::CloseTab(tab) => self.remote(TopologyCommand::CloseTab { tab }),
+            Message::CloseTab(TabRef::Runner(tab)) => {
+                self.remote(TopologyCommand::CloseTab { tab })
+            }
+            Message::CloseTab(TabRef::Graph(graph)) => {
+                self.close_graph(graph);
+                Update::none()
+            }
             Message::Resize(event) => self.resized(event),
             Message::FlushResize => Update {
                 commands: self.resize.take_if_due(Instant::now()),
@@ -379,20 +474,21 @@ impl Workspace {
     }
 
     fn active_mut(&mut self) -> Option<&mut TabView> {
-        let active = self.active_tab();
+        let active = self.runner_tab();
         self.tabs.iter_mut().find(|tab| tab.id == active)
     }
 
     /// Rebuilds every tab's grid from the snapshot and repairs the local
-    /// selection.
+    /// selection. The graph tabs are untouched: they name nodes, not anything
+    /// the runner owns.
     fn rebuild(&mut self) {
         self.tabs = self.snapshot.tabs.iter().map(TabView::build).collect();
         let active = self
-            .active_tab
+            .runner_tab
             .filter(|id| self.snapshot.tabs.iter().any(|tab| tab.id == *id))
-            .or_else(|| self.graph_tab())
+            .or_else(|| self.graph_pane_tab())
             .or_else(|| self.snapshot.tabs.first().map(|tab| tab.id));
-        self.active_tab = active;
+        self.runner_tab = active;
         let focus_survived = self
             .focused_pane
             .is_some_and(|pane| self.surface_of(pane).is_some());
@@ -403,7 +499,7 @@ impl Workspace {
 
     /// The tab holding the graph pane: where a lost selection lands, because
     /// it is the one surface that always exists.
-    fn graph_tab(&self) -> Option<TabId> {
+    fn graph_pane_tab(&self) -> Option<TabId> {
         self.snapshot
             .tabs
             .iter()
@@ -519,16 +615,18 @@ impl Update {
 
 /// What the workspace chrome reports.
 ///
-/// The first three are this window's own presentation and are applied here.
-/// The rest change the shared structure: they become [`TopologyCommand`]s and
-/// take effect when the runner's next snapshot says so.
+/// The presentation ones -- which tab is in front, which pane has focus, where
+/// the tab bar is and whether it shows, a graph tab closing -- are applied
+/// here. The rest change the shared structure: they become
+/// [`TopologyCommand`]s and take effect when the runner's next snapshot says
+/// so.
 ///
 /// A pane is named the way the widget named it -- an iced `Pane` -- because
 /// that is all a click knows; the translation to the runner's [`PaneId`]
 /// happens where the maps are.
 #[derive(Debug, Clone)]
 pub enum Message {
-    ActivateTab(TabId),
+    ActivateTab(TabRef),
     ActivatePane(Pane),
     TogglePlacement,
     NewTab,
@@ -537,7 +635,7 @@ pub enum Message {
         axis: Axis,
     },
     ClosePane(Pane),
-    CloseTab(TabId),
+    CloseTab(TabRef),
     Resize(ResizeEvent),
     /// The coalescing clock: sends whatever a drag left behind. Emitted by
     /// a timer subscription the browser editor does not have.
@@ -673,6 +771,53 @@ mod tests {
         let update = workspace.update(Message::NewTab);
         assert!(update.commands.is_empty());
         assert!(update.hint.is_some());
+    }
+
+    /// A graph tab needs no runner, opens once per container, and closing
+    /// the one in front lands on the one opened before it -- usually the
+    /// graph it was opened from -- and on the runner tab when there is none.
+    #[test]
+    fn graph_tabs_open_once_and_close_towards_their_opener() {
+        let mut workspace = Workspace::new();
+        let outer = NodeId(5);
+        let inner = NodeId(6);
+
+        workspace.open_graph(outer);
+        workspace.open_graph(inner);
+        workspace.open_graph(outer);
+        assert_eq!(workspace.graph_tabs(), &[outer, inner]);
+        assert_eq!(workspace.shown_graph(), outer);
+
+        workspace.update(Message::ActivateTab(TabRef::Graph(inner)));
+        assert_eq!(workspace.active_tab(), TabRef::Graph(inner));
+
+        let update = workspace.update(Message::CloseTab(TabRef::Graph(inner)));
+        assert!(update.commands.is_empty() && update.hint.is_none());
+        assert_eq!(workspace.shown_graph(), outer);
+
+        workspace.update(Message::CloseTab(TabRef::Graph(outer)));
+        assert_eq!(workspace.active_tab(), TabRef::Runner(LOCAL_TAB));
+        assert_eq!(workspace.shown_graph(), NodeId(0));
+    }
+
+    /// A deleted container takes its tab with it, whether or not it is in
+    /// front; a runner snapshot leaves graph tabs alone.
+    #[test]
+    fn a_graph_tab_outlives_a_snapshot_but_not_its_container() {
+        let mut workspace = Workspace::new();
+        workspace.open_graph(NodeId(5));
+        workspace.open_graph(NodeId(6));
+
+        workspace.apply_snapshot(snapshot(leaf(10, SurfaceRef::Graph)));
+        assert_eq!(workspace.active_tab(), TabRef::Graph(NodeId(6)));
+
+        workspace.retain_graphs(|graph| graph != NodeId(6));
+        assert_eq!(workspace.graph_tabs(), &[NodeId(5)]);
+        assert_eq!(workspace.active_tab(), TabRef::Graph(NodeId(5)));
+
+        workspace.retain_graphs(|_| false);
+        assert!(workspace.graph_tabs().is_empty());
+        assert_eq!(workspace.active_tab(), TabRef::Runner(TabId(9)));
     }
 
     #[test]

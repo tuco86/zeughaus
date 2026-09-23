@@ -13,6 +13,10 @@ mod palette;
 // there is nothing to hold them back from.
 #[cfg(not(target_arch = "wasm32"))]
 mod pending;
+// What this window looks like and where it keeps that. Native-only: the
+// browser editor has no state directory.
+#[cfg(not(target_arch = "wasm32"))]
+mod prefs;
 // The weida client under the feed: the runtime, the trust, the first dial.
 #[cfg(not(target_arch = "wasm32"))]
 mod transport;
@@ -57,7 +61,11 @@ fn main() -> iced::Result {
     let app = iced_terminal::font_bytes().fold(app, |app, bytes| app.font(bytes));
     app.window(iced::window::Settings {
         size: WINDOW_SIZE,
+        min_size: Some(iced::Size::new(640.0, 400.0)),
         position: iced::window::Position::Centered,
+        // Borderless: the editor draws its own titlebar with the tab strip
+        // and the window controls, and its own resize grips along the edges.
+        decorations: false,
         // The close is handled rather than obeyed: a settings edit is held
         // back for 400 ms after the last keystroke, and closing the window
         // in that window has to flush it to the store rather than drop it.
