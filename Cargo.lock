@@ -2491,7 +2491,9 @@ dependencies = [
 
 [[package]]
 name = "iced_nodegraph"
-version = "0.5.0-dev"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "975ce41b204dadc01276de378ae8e23f6bb58828db1747890a4a5582f1a01830"
 dependencies = [
  "euclid",
  "iced_nodegraph_sdf",
@@ -2503,7 +2505,9 @@ dependencies = [
 
 [[package]]
 name = "iced_nodegraph_sdf"
-version = "0.5.0-dev"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5023c53a202008253f12817db08ec18a2e5debea024ac8f00fcb01378c6efb24"
 dependencies = [
  "encase",
  "glam 0.33.6",

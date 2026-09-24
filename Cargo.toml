@@ -69,7 +69,7 @@ termwiz = { git = "https://github.com/wezterm/wezterm", rev = "2658f629cd7251ce6
 postcard = { version = "1.1", features = ["use-std"] }
 
 iced = { version = "0.14", features = ["advanced", "wgpu", "tokio"] }
-iced_nodegraph = { path = "../iced_nodegraph/iced_nodegraph" }
+iced_nodegraph = "0.5"
 iced_tabs = { path = "iced_tabs" }
 # The terminal surface: one widget, one wgpu primitive per pane, drawing a
 # `zeughaus_mux::view::TerminalView`. Its own crate so the pipeline compiles
@@ -90,7 +90,7 @@ toml = "1.0"
 spacetimedb-sdk = "2.10"
 
 # Profiles apply from the top-level workspace being built, so iced_nodegraph's
-# own `profile.dev` is ignored when it is a path dependency here. Without this,
+# own `profile.dev` never applies here. Without this,
 # `cargo run` builds iced/wgpu/lyon/nodegraph at opt-level 0 and large graphs
 # (500+ nodes) stutter. Optimize dependencies while keeping our own crates cheap
 # to recompile.

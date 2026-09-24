@@ -44,8 +44,8 @@ zeughaus-theme/        # the editor's theme: iced theme paired with a terminal c
 vm/win11/              # scripts: headless Windows 11 guest under QEMU/KVM, the reference for a VM-hosted runner (not wired)
 ```
 
-Sibling checkouts this workspace depends on by path: `../iced_nodegraph`
-(the node graph widget) and `../weida` (the QUIC transport).
+Sibling checkout this workspace depends on by path: `../weida` (the QUIC
+transport). The node graph widget is `iced_nodegraph` from crates.io.
 
 ## Running it
 
