@@ -31,6 +31,10 @@ weida.workspace = true
 # shares, `zeughaus-terminal` the PTYs and screens only this process holds.
 zeughaus-mux.workspace = true
 zeughaus-terminal.workspace = true
+# `workspace.json`: the tabs, splits and terminals a restarted runner
+# brings back.
+serde.workspace = true
+serde_json = "1"
 # Blocking node work (LLM requests, screen capture) runs on tokio's blocking
 # pool so the event loop keeps draining the store. Multi-threaded because the
 # feed server's tasks live here too: they park on QUIC flow control and scale
@@ -47,3 +51,7 @@ tokio = { version = "1", features = [
     # and waits for the live runs.
     "signal",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+# The restart signal's handler: an atomic flag the event loop reads.
+libc = "0.2"

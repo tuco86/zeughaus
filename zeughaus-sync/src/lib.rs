@@ -35,8 +35,8 @@ use zeughaus_core::{EdgeData, NodeData};
 
 use crate::module_bindings::{
     DbConnection, Edge, EdgeTableAccess, Node, NodeTableAccess, RuntimeTableAccess,
-    announce_endpoint, connect_edge, create_node, delete_node, disconnect_edge, join_runtime,
-    move_node, set_node_params,
+    adopt_root_nodes, announce_endpoint, connect_edge, create_node, delete_node, disconnect_edge,
+    join_runtime, move_node, rename_node, set_node_params,
 };
 
 pub const DEFAULT_PORT: u16 = 3000;
@@ -78,6 +78,7 @@ fn to_node_data(n: &Node) -> NodeData {
         // params are stored as a JSON array of [name, value] pairs.
         params: serde_json::from_str(&n.params).unwrap_or_default(),
         parent: n.parent,
+        runner: n.runner.clone(),
     }
 }
 
@@ -449,18 +450,13 @@ fn params_json(params: &[(String, String)]) -> String {
     serde_json::to_string(params).unwrap_or_else(|_| "[]".to_string())
 }
 
-/// Whether this client owns execution: the runtime with the lowest `seq` runs
-/// the graph, a second one is a standby. Only meaningful for a
-/// [`Role::Runtime`] client.
+/// Whether this client is the runtime with the lowest `seq`. Only meaningful
+/// for a [`Role::Runtime`] client, and only used to pick the one runner that
+/// adopts root-level nodes from before graphs had owners: execution itself
+/// follows the `runner` column of each top-level graph.
 ///
 /// Compared by CONNECTION, not by identity: two runners on one machine share
-/// the saved token and are therefore one identity, and by identity both of them
-/// would believe they own the graph.
-///
-/// Read from the client cache rather than remembered, so a runtime leaving
-/// hands ownership over without any handshake. While the cache is still empty
-/// (before the first subscription applies) nobody owns anything, which keeps a
-/// starting runner from executing a graph it has not seen yet.
+/// the saved token and are therefore one identity.
 pub fn is_owner(conn: &DbConnection) -> bool {
     let Some(me) = conn.try_connection_id() else {
         return false;
@@ -472,6 +468,16 @@ pub fn is_owner(conn: &DbConnection) -> bool {
         .is_some_and(|r| r.connection_id == me)
 }
 
+/// Whether this client's own `runtime` row has reached its cache, so that
+/// [`is_owner`] answers for a registered runtime rather than for one whose
+/// `join_runtime` is still in flight.
+pub fn runtime_joined(conn: &DbConnection) -> bool {
+    let Some(me) = conn.try_connection_id() else {
+        return false;
+    };
+    conn.db.runtime().iter().any(|r| r.connection_id == me)
+}
+
 /// How many runtimes are connected. An editor uses this to say whether anything
 /// is executing at all: with no runtime, a graph is drawn but nothing runs, and
 /// silence is the one thing a user must not have to guess about.
@@ -479,14 +485,54 @@ pub fn runtime_count(conn: &DbConnection) -> usize {
     conn.db.runtime().count() as usize
 }
 
-/// The pinned URL the executing runtime is reachable at. `None` while no
-/// runtime is connected or the owning one serves nothing.
-///
-/// Reads the OWNING runtime specifically: an editor watching a runtime has to
-/// watch the process that is producing values, and a standby produces nothing.
-pub fn owner_endpoint(conn: &DbConnection) -> Option<String> {
-    let owner = conn.db.runtime().iter().min_by_key(|r| r.seq)?;
-    (!owner.addr.is_empty()).then_some(owner.addr)
+/// One connected runtime that announced where it is reachable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeRow {
+    pub seq: u64,
+    /// The pinned endpoint URL, which names the runner's fingerprint.
+    pub addr: String,
+}
+
+/// Every runtime that serves an endpoint, oldest first. A runtime that has
+/// not announced yet is left out: nobody can reach it, and its graphs show as
+/// not running until it does.
+pub fn runtimes(conn: &DbConnection) -> Vec<RuntimeRow> {
+    let mut rows: Vec<RuntimeRow> = conn
+        .db
+        .runtime()
+        .iter()
+        .filter(|r| !r.addr.is_empty())
+        .map(|r| RuntimeRow {
+            seq: r.seq,
+            addr: r.addr,
+        })
+        .collect();
+    rows.sort_by_key(|r| r.seq);
+    rows
+}
+
+/// How many root-level nodes belong to no runner, read from the client
+/// cache. The cache is filled before any row callback runs, and the SDK
+/// reports a subscription as applied before the callbacks for its rows, so a
+/// count of the rows those callbacks delivered can still be zero here.
+pub fn root_orphans(conn: &DbConnection) -> usize {
+    conn.db
+        .node()
+        .iter()
+        .filter(|n| n.parent == 0 && n.runner.is_empty())
+        .count()
+}
+
+/// Asks the store to move every root-level node without a runner into a new
+/// top-level graph `graph_id` owned by `runner`.
+pub fn send_adopt_root_nodes(
+    conn: &DbConnection,
+    graph_id: u64,
+    runner: &str,
+) -> Result<(), String> {
+    conn.reducers
+        .adopt_root_nodes(graph_id, runner.to_owned())
+        .map_err(|e| format!("adopt_root_nodes failed: {e}"))
 }
 
 /// Announces this runtime's endpoint. The store rejects nothing here -- a
@@ -515,6 +561,7 @@ pub fn send_create_node(conn: &DbConnection, n: &NodeData) -> Result<(), String>
             n.y,
             params_json(&n.params),
             n.parent,
+            n.runner.clone(),
         )
         .map_err(|e| format!("create_node failed: {e}"))
 }
@@ -533,6 +580,12 @@ pub fn send_set_params(
     conn.reducers
         .set_node_params(id, params_json(params))
         .map_err(|e| format!("set_node_params failed: {e}"))
+}
+
+pub fn send_rename_node(conn: &DbConnection, id: u64, display_name: &str) -> Result<(), String> {
+    conn.reducers
+        .rename_node(id, display_name.to_owned())
+        .map_err(|e| format!("rename_node failed: {e}"))
 }
 
 pub fn send_delete_node(conn: &DbConnection, id: u64) -> Result<(), String> {

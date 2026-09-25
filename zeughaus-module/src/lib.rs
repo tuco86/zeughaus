@@ -8,11 +8,12 @@
 //! resulting row changes through their subscriptions.
 //!
 //! Beyond the graph itself, the store decides WHO runs it and WHERE that
-//! runtime is reachable: every runner registers in `runtime`, the one with the
-//! lowest `seq` owns execution, and its row carries the pinned URL editors
-//! dial. What a pass produces does not travel through here at all -- values,
-//! edge traffic, frames and trigger presses go over weida, straight between
-//! the process that computed them and the windows that draw them.
+//! runtime is reachable: every runner registers in `runtime`, its row carries
+//! the pinned URL editors dial, and every top-level graph names the runner
+//! that executes it. What a pass produces does not travel through here at
+//! all -- values, edge traffic, frames and trigger presses go over weida,
+//! straight between the process that computed them and the windows that draw
+//! them.
 //!
 //! Built for the wasm32 module target with `spacetime build` (this crate is
 //! excluded from the native workspace build).
@@ -66,6 +67,10 @@ pub struct Node {
     #[default(0)]
     #[index(btree)]
     pub parent: u64,
+    /// The runner that executes this graph (`sha256:<hex>` fingerprint from
+    /// its endpoint URL). Set on top-level graphs only; empty everywhere else.
+    #[default("")]
+    pub runner: String,
 }
 
 /// A directed edge between two node pins.
@@ -89,6 +94,7 @@ pub fn create_node(
     y: f32,
     params: String,
     parent: u64,
+    runner: String,
 ) {
     ctx.db.node().insert(Node {
         id,
@@ -98,7 +104,48 @@ pub fn create_node(
         y,
         params,
         parent,
+        runner,
     });
+}
+
+/// Moves every root-level node that belongs to no runner into a new top-level
+/// graph owned by `runner`.
+///
+/// Sessions from before graphs had owners keep their nodes at the root; a node
+/// there is executed by nobody, so the first runner to see them adopts them
+/// as one graph. Does nothing when there is nothing to adopt, which makes a
+/// second call (another runner racing the first) harmless.
+#[reducer]
+pub fn adopt_root_nodes(ctx: &ReducerContext, graph_id: u64, runner: String) {
+    let orphans: Vec<Node> = ctx
+        .db
+        .node()
+        .parent()
+        .filter(0u64)
+        .filter(|n| n.runner.is_empty())
+        .collect();
+    if orphans.is_empty() {
+        return;
+    }
+    ctx.db.node().insert(Node {
+        id: graph_id,
+        type_id: "graph.sub".to_string(),
+        display_name: "Graph".to_string(),
+        x: 0.0,
+        y: 0.0,
+        params: "[]".to_string(),
+        parent: 0,
+        runner,
+    });
+    let n = orphans.len();
+    for mut node in orphans {
+        if node.id == graph_id {
+            continue;
+        }
+        node.parent = graph_id;
+        ctx.db.node().id().update(node);
+    }
+    log::info!("adopt_root_nodes {n} into {graph_id} by {}", ctx.sender());
 }
 
 #[reducer]
@@ -114,6 +161,14 @@ pub fn move_node(ctx: &ReducerContext, id: u64, x: f32, y: f32) {
 pub fn set_node_params(ctx: &ReducerContext, id: u64, params: String) {
     if let Some(mut n) = ctx.db.node().id().find(id) {
         n.params = params;
+        ctx.db.node().id().update(n);
+    }
+}
+
+#[reducer]
+pub fn rename_node(ctx: &ReducerContext, id: u64, display_name: String) {
+    if let Some(mut n) = ctx.db.node().id().find(id) {
+        n.display_name = display_name;
         ctx.db.node().id().update(n);
     }
 }

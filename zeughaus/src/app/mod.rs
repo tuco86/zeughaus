@@ -12,6 +12,9 @@ mod graph;
 mod layout;
 /// What one node draws.
 mod node_view;
+/// What a restarting editor leaves for the process that replaces it.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod restore;
 /// What the runtime reported: values, failures, feeds, particles.
 mod runtime;
 /// The shared store: rows in, edits out.
@@ -21,6 +24,8 @@ mod store;
 #[cfg(not(target_arch = "wasm32"))]
 mod terminal;
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
@@ -68,11 +73,7 @@ use terminal::MuxState;
 use crate::feed;
 use crate::message::{GraphIds, Message};
 use crate::palette;
-use crate::workspace::{self, Surface, TabRef, Workspace};
-// The browser editor draws no terminal, so the pane says so by name rather
-// than by the title a terminal would have reported.
-#[cfg(target_arch = "wasm32")]
-use crate::workspace::surface_title;
+use crate::workspace::{self, DropTarget, PaneRef, RunnerKey, Surface, TabRef, Workspace};
 
 /// How long a status-bar hint stays. Long enough to read one sentence after
 /// the drop that produced it, short enough that it is gone before the next
@@ -81,8 +82,27 @@ const HINT_LIFETIME: std::time::Duration = std::time::Duration::from_secs(3);
 /// Height of the editor's own titlebar, which is also the tab strip's row
 /// while the bar sits on top.
 const TITLEBAR_HEIGHT: f32 = 30.0;
+/// How far the pointer moves with the button held on the titlebar before
+/// the press becomes a window drag. A click, or the second click of a
+/// double-click, never moves the window.
+const TITLEBAR_DRAG_THRESHOLD: f32 = 4.0;
 /// Width of the tab sidebar while the bar sits at the left edge.
 const SIDEBAR_WIDTH: f32 = 180.0;
+
+/// A node rename in progress: which node, and what has been typed so far.
+struct Rename {
+    node: NodeId,
+    draft: String,
+}
+
+/// The one rename field; only one node is renamed at a time.
+const RENAME_INPUT: iced::widget::Id = iced::widget::Id::new("node-rename");
+/// The group rename field; only one group is renamed at a time.
+const GROUP_RENAME_INPUT: iced::widget::Id = iced::widget::Id::new("group-rename");
+/// The tab rename field; only one tab is renamed at a time.
+const TAB_RENAME_INPUT: iced::widget::Id = iced::widget::Id::new("tab-rename");
+/// Height of the strip a pane is dragged by.
+const PANE_GRIP_HEIGHT: f32 = 18.0;
 
 pub struct App {
     workspace: Workspace,
@@ -111,14 +131,19 @@ pub struct App {
     /// and everything on screen is what it reported.
     instances: HashMap<NodeId, Box<dyn ExecutableNode>>,
     selected: HashSet<NodeId>,
-    camera_position: Point,
-    camera_zoom: f32,
-    /// Which container's contents are on screen; `NodeId(0)` is the root
-    /// graph. Editor-local: what one window looks at is not shared state.
+    /// The graph of the focused pane: where the palette spawns nodes and
+    /// what an auto layout arranges. `NodeId(0)` while no graph pane has the
+    /// focus. Editor-local: what one window looks at is not shared state.
     current_graph: NodeId,
-    /// Camera per graph, so stepping out of a subgraph returns to the view it
-    /// was entered from instead of resetting.
+    /// Camera per graph, shared by every pane showing it. A missing entry is
+    /// the origin at zoom 1.
     cameras: HashMap<NodeId, (Point, f32)>,
+    /// A graph this window just created or asked to open, focused as soon as
+    /// a pane shows it: a runner answers with a snapshot, not at once.
+    pending_graph_focus: Option<NodeId>,
+    /// Nested containers opened as view tabs in a section no runner stands
+    /// behind, where there is nobody to ask for a tab.
+    local_views: Vec<NodeId>,
 
     plugins: Vec<Box<dyn DomainPlugin>>,
     catalog: Vec<NodeDefinition>,
@@ -152,10 +177,16 @@ pub struct App {
     // In-node settings (node_id -> setting name -> the text the user sees)
     node_settings: HashMap<NodeId, HashMap<String, String>>,
 
-    /// What the window is showing, in logical pixels. Reported on every
-    /// resize; the initial value is the size `main` asks for, because no
-    /// `Resized` event arrives until the window changes.
+    /// What the window is showing, in logical pixels. Reported on opening
+    /// and resizing; before the first window event, use the size `main`
+    /// requests so palette placement has a valid viewport.
     window_size: iced::Size,
+    #[cfg(not(target_arch = "wasm32"))]
+    window_maximized: bool,
+    /// Where the pointer last was over the titlebar's drag region, and where
+    /// a press there that has not become a window drag yet happened.
+    titlebar_cursor: Point,
+    titlebar_press: Option<Point>,
 
     // Status bar
     last_error: String,
@@ -169,6 +200,8 @@ pub struct App {
     palette_open: bool,
     palette_input: String,
     palette_selected: usize,
+    /// The node whose header currently shows a name field, if any.
+    renaming: Option<Rename>,
 
     // The store connection, which rebuilds itself when the host goes away.
     // Held rather than a bare `DbConnection` because there is no such thing as
@@ -218,15 +251,19 @@ pub struct App {
     /// Settings edits the store has not seen yet. See [`crate::pending`].
     #[cfg(not(target_arch = "wasm32"))]
     pending: crate::pending::PendingEdits,
-    /// The runner's terminal multiplexer, while one is reachable. `None`
-    /// leaves the workspace graph-only and every terminal action refused.
+    /// Each connected runner's terminal multiplexer, while one is reachable.
+    /// A runner without one has an empty section and refuses every terminal
+    /// action.
     #[cfg(not(target_arch = "wasm32"))]
-    mux: Option<MuxState>,
-    /// Which attachment the events on screen came from. Bumped whenever the
-    /// control task is replaced, so a message the old one queued is
-    /// recognizable -- the same guard as `RuntimeView::traffic_epoch`.
+    mux: BTreeMap<RunnerKey, MuxState>,
+    /// Running without a window (`zeughaus --headless`): nobody sits in front
+    /// of a file dialog, and rfd would open one on the desktop of whoever
+    /// started the process.
+    #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+    headless: bool,
+    /// The parts of a restore file that wait for their tabs and panes.
     #[cfg(not(target_arch = "wasm32"))]
-    mux_epoch: u64,
+    pending_restore: Option<restore::PendingRestore>,
 }
 
 impl App {
@@ -334,7 +371,7 @@ impl App {
         let palette_commands =
             palette::build_commands(&catalog, &palette::RunnerState::default(), &themes);
 
-        Self {
+        let mut app = Self {
             workspace,
             theme,
             themes,
@@ -344,10 +381,10 @@ impl App {
             edge_index: HashMap::new(),
             instances: HashMap::new(),
             selected: HashSet::new(),
-            camera_position: Point::ORIGIN,
-            camera_zoom: 1.0,
             current_graph: NodeId(0),
             cameras: HashMap::new(),
+            pending_graph_focus: None,
+            local_views: Vec::new(),
             plugins,
             palette_commands,
             catalog,
@@ -358,9 +395,14 @@ impl App {
             pending_edges: Vec::new(),
             node_settings: HashMap::new(),
             window_size: crate::WINDOW_SIZE,
+            #[cfg(not(target_arch = "wasm32"))]
+            window_maximized: false,
+            titlebar_cursor: Point::ORIGIN,
+            titlebar_press: None,
             last_error: String::new(),
             hint: None,
             palette_open: false,
+            renaming: None,
             palette_input: String::new(),
             palette_selected: 0,
             #[cfg(not(target_arch = "wasm32"))]
@@ -385,13 +427,42 @@ impl App {
             setting_errors: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             pending: crate::pending::PendingEdits::new(),
-            // No mux until a runtime announces where it serves; the
-            // workspace stays graph-only until one attaches.
+            // No mux until a runtime announces where it serves.
             #[cfg(not(target_arch = "wasm32"))]
-            mux: None,
+            mux: BTreeMap::new(),
+            #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+            headless: false,
             #[cfg(not(target_arch = "wasm32"))]
-            mux_epoch: 0,
+            pending_restore: None,
+        };
+        // Without a store this window edits a scratch document, and a fresh
+        // one opens on a canvas rather than on an empty tab bar. A restore
+        // or a loaded file replaces it.
+        #[cfg(not(target_arch = "wasm32"))]
+        let scratch = app.stdb.is_none();
+        #[cfg(target_arch = "wasm32")]
+        let scratch = true;
+        if scratch && let Some(graph) = app.create_graph("") {
+            app.pending_graph_focus = Some(graph);
         }
+        app.sync_workspace();
+        app
+    }
+
+    /// Marks this editor as windowless. See the `headless` field.
+    #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+    pub fn set_headless(&mut self) {
+        self.headless = true;
+    }
+
+    /// What a save or load does without a window: one sentence, no dialog.
+    #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+    fn refuse_file_dialog(&mut self) -> Task<Message> {
+        self.hint = Some((
+            "file dialogs are off in headless mode".to_owned(),
+            iced::time::Instant::now(),
+        ));
+        Task::none()
     }
 
     /// No store, nothing to hold back.
@@ -413,7 +484,7 @@ impl App {
     /// change has nowhere to go. Unreachable while the chrome disables the
     /// buttons, and the honest answer if it ever is reached.
     #[cfg(target_arch = "wasm32")]
-    fn send_topology(&mut self, _command: zeughaus_mux::TopologyCommand) {
+    fn send_topology(&mut self, _key: &RunnerKey, _command: zeughaus_mux::TopologyCommand) {
         self.hint = Some((
             "the browser editor cannot change the shared workspace".to_owned(),
             iced::time::Instant::now(),
@@ -444,19 +515,25 @@ impl App {
         }
         let mut text = match self.runtimes {
             0 => " | no runtime".to_string(),
-            1 => " | runtime connected".to_string(),
-            // The store elects the lowest `seq`; the spares are standby.
-            n => format!(" | runtime connected (1 of {n} executing)"),
+            1 => " | 1 runner".to_string(),
+            n => format!(" | {n} runners"),
         };
         // Whether values are arriving, not just whether a runner exists: the
-        // event subscription is what carries them, and a dropped one leaves
-        // every number on screen a leftover.
-        if self.runtimes > 0 {
-            text.push_str(if self.runtime.traffic_live {
-                " | live"
+        // event subscriptions are what carry them, and a dropped one leaves
+        // every number of that runner's graphs a leftover.
+        let links = self.runtime.links.len();
+        if links > 0 {
+            let live = self
+                .runtime
+                .links
+                .values()
+                .filter(|link| link.traffic_live)
+                .count();
+            if live == links {
+                text.push_str(" | live");
             } else {
-                " | reconnecting"
-            });
+                text.push_str(&format!(" | reconnecting ({live} of {links} live)"));
+            }
         }
         if !self.runtime.feeds.is_empty() {
             let feeds = self.runtime.feeds.len();
@@ -468,11 +545,13 @@ impl App {
         }
         // Whether a shell is reachable, said in its own words: a terminal
         // pane showing a last-known screen looks exactly like a live one.
-        match self.mux.as_ref() {
-            Some(mux) if mux.attached => text.push_str(" | mux: attached"),
-            Some(_) => text.push_str(" | mux: reconnecting"),
-            None if self.runtimes > 0 => text.push_str(" | no mux"),
-            None => {}
+        if links > 0 {
+            let attached = self.mux.values().filter(|mux| mux.attached).count();
+            if attached == links {
+                text.push_str(" | mux: attached");
+            } else {
+                text.push_str(&format!(" | mux: {attached} of {links} attached"));
+            }
         }
         text
     }
@@ -490,10 +569,19 @@ impl App {
     /// puts every new node in the upper-left quadrant of a maximised window,
     /// far from the middle it is supposed to be at.
     fn viewport_center(&self) -> Point {
+        let (position, zoom) = self.camera(self.current_graph);
         Point::new(
-            self.window_size.width * 0.5 / self.camera_zoom - self.camera_position.x,
-            self.window_size.height * 0.5 / self.camera_zoom - self.camera_position.y,
+            self.window_size.width * 0.5 / zoom - position.x,
+            self.window_size.height * 0.5 / zoom - position.y,
         )
+    }
+
+    /// A graph's camera: where its panes look and how close.
+    fn camera(&self, graph: NodeId) -> (Point, f32) {
+        self.cameras
+            .get(&graph)
+            .copied()
+            .unwrap_or((Point::ORIGIN, 1.0))
     }
 
     fn palette_confirm(&mut self) -> Option<Message> {
@@ -537,11 +625,26 @@ impl App {
         if self.palette_open {
             return;
         }
+        let runners = self
+            .runtime
+            .links
+            .iter()
+            .map(|(key, link)| palette::RunnerPalette {
+                key: key.clone(),
+                label: link.label.as_str(),
+                detached: self.workspace.detached(key),
+                reachable: true,
+            })
+            .collect();
+        let pane_commands = self
+            .workspace
+            .focused_pane()
+            .is_some_and(|pane| self.workspace.attached(&pane.runner));
         let commands = palette::build_commands(
             &self.catalog,
             &palette::RunnerState {
-                detached: self.workspace.detached(),
-                reachable: self.runtime.endpoint.is_some(),
+                runners,
+                pane_commands,
             },
             &self.themes,
         );
@@ -550,55 +653,198 @@ impl App {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.apply(message);
-        self.sync_shown_graph();
+        self.sync_workspace();
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.pending_restore.is_some() {
+            let restored = self.finish_restore();
+            self.sync_workspace();
+            return Task::batch([task, restored]);
+        }
         task
     }
 
-    /// Makes the canvas show what the tab in front names.
+    /// Brings the synthetic sections, a pending graph focus and
+    /// `current_graph` in line with the document and the workspace.
     ///
     /// Runs after every message, because the answer can change under any of
-    /// them: a tab activated or closed, a container deleted here or by a peer,
-    /// a loaded file replacing every node. Doing it once here instead of at
-    /// each of those sites is what keeps `current_graph` and the workspace
-    /// from ever disagreeing. A tab whose container is gone closes; the
-    /// camera of the graph left is kept for the way back, and a selection
-    /// from another graph is dropped because a delete would act on nodes the
-    /// user can no longer see.
-    fn sync_shown_graph(&mut self) {
-        let nodes = &self.nodes;
-        self.workspace
-            .retain_graphs(|graph| nodes.get(&graph).is_some_and(|node| node.is_container));
-        let target = self.workspace.shown_graph();
+    /// them: a graph created or deleted here or by a peer, a runner coming
+    /// or going, a pane focused, a loaded file replacing every node. Doing
+    /// it once here instead of at each of those sites is what keeps them
+    /// from ever disagreeing. A selection from another graph is dropped
+    /// because a delete would act on nodes the user can no longer see.
+    fn sync_workspace(&mut self) {
+        self.sync_synthetic_sections();
+        if let Some(graph) = self.pending_graph_focus
+            && ((self.workspace.show_graph(graph) && !self.awaits_runner_tab(graph))
+                || !self.nodes.contains_key(&graph))
+        {
+            self.pending_graph_focus = None;
+        }
+        let target = self.workspace.focused_graph().unwrap_or(NodeId(0));
         if target == self.current_graph {
             return;
         }
-        self.cameras
-            .insert(self.current_graph, (self.camera_position, self.camera_zoom));
         self.current_graph = target;
-        let (position, zoom) = self
-            .cameras
-            .get(&target)
-            .copied()
-            .unwrap_or((Point::ORIGIN, 1.0));
-        self.camera_position = position;
-        self.camera_zoom = zoom;
         self.selected.clear();
     }
 
+    /// The sections no runner stands behind: without a store every graph is
+    /// local; with one, the graphs no runner's workspace shows are listed as
+    /// not running, and the section is gone when there are none.
+    fn sync_synthetic_sections(&mut self) {
+        let nodes = &self.nodes;
+        self.local_views
+            .retain(|graph| nodes.get(graph).is_some_and(|node| node.is_container));
+        #[cfg(not(target_arch = "wasm32"))]
+        let store = self.stdb.is_some();
+        #[cfg(target_arch = "wasm32")]
+        let store = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        if store {
+            self.hand_over_views();
+        }
+        // A graph leaves this section only once a runner's tab shows it, or
+        // while its runner's mux is still attaching (which would otherwise
+        // flash it here); a graph its runner does not show stays reachable.
+        let shown_elsewhere = |graph: NodeId| -> bool {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                if self.workspace.runner_shows(graph) {
+                    return true;
+                }
+                self.runner_of(graph)
+                    .map(RunnerKey::new)
+                    .is_some_and(|key| {
+                        self.runtime.links.contains_key(&key) && !self.workspace.attached(&key)
+                    })
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = graph;
+                false
+            }
+        };
+        let graphs: Vec<(NodeId, String)> = self
+            .top_level_graphs()
+            .filter(|node| node.is_container)
+            .map(|node| node.id)
+            .chain(self.local_views.iter().copied())
+            .filter(|graph| !store || !shown_elsewhere(*graph))
+            .filter_map(|graph| Some((graph, self.nodes.get(&graph)?.display_name.clone())))
+            .collect();
+        let (shown, hidden, label) = if store {
+            (RunnerKey::offline(), RunnerKey::local(), "Not running")
+        } else {
+            (RunnerKey::local(), RunnerKey::offline(), "Local")
+        };
+        self.workspace.set_synthetic(hidden, "", None);
+        let snapshot = (!store || !graphs.is_empty()).then(|| workspace::graph_snapshot(graphs));
+        self.workspace.set_synthetic(shown, label, snapshot);
+    }
+
+    /// Whether `graph`'s runner is attached but its tab has not arrived yet:
+    /// until it does, the graph is listed as not running, and a focus meant
+    /// for it must wait for the runner's tab rather than settle there.
+    fn awaits_runner_tab(&self, graph: NodeId) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.runner_of(graph)
+                .is_some_and(|runner| self.workspace.attached(&RunnerKey::new(runner)))
+                && !self.workspace.runner_shows(graph)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = graph;
+            false
+        }
+    }
+
+    /// Hands every nested view this window keeps to its graph's runner once
+    /// that runner's workspace is attached: from then on the view is the
+    /// runner's tab, shared with every editor. A view in front stays in
+    /// front through the hand-over.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn hand_over_views(&mut self) {
+        let offline = RunnerKey::offline();
+        let mut index = 0;
+        while let Some(&view) = self.local_views.get(index) {
+            let Some(key) = self
+                .runner_of(view)
+                .map(RunnerKey::new)
+                .filter(|key| self.workspace.attached(key))
+            else {
+                index += 1;
+                continue;
+            };
+            self.local_views.remove(index);
+            let in_front = self.workspace.active_tab()
+                == Some(&TabRef {
+                    runner: offline.clone(),
+                    tab: zeughaus_mux::TabId(view.0),
+                });
+            if in_front {
+                self.pending_graph_focus = Some(view);
+            }
+            if !self.workspace.runner_shows(view) {
+                self.send_topology(
+                    &key,
+                    zeughaus_mux::TopologyCommand::OpenGraph { graph: view.0 },
+                );
+            }
+        }
+    }
+
     /// Keeps every node where it is on screen while the sidebar moves in or
-    /// out. The canvas origin shifts by the sidebar's width, so the camera
+    /// out. The canvas origin shifts by the sidebar's width, so every camera
     /// moves the other way: `screen = origin + (world + position) * zoom`
-    /// makes that `-dx / zoom` in camera units. The graphs behind the other
-    /// tabs get the same correction, or they would come back displaced.
+    /// makes that `-dx / zoom` in camera units.
     fn pan_for_sidebar(&mut self) {
         let dx = match self.workspace.placement {
             iced_tabs::Placement::Left => SIDEBAR_WIDTH,
             iced_tabs::Placement::Top => -SIDEBAR_WIDTH,
         };
-        self.camera_position.x -= dx / self.camera_zoom;
         for (position, zoom) in self.cameras.values_mut() {
             position.x -= dx / *zoom;
         }
+    }
+
+    /// The graphs among `panes`' surfaces, split into top-level ones (which
+    /// closing deletes) and nested views (which closing only hides).
+    fn graph_leaves(&self, surfaces: impl IntoIterator<Item = Surface>) -> (Vec<u64>, Vec<NodeId>) {
+        let mut top = Vec::new();
+        let mut nested = Vec::new();
+        for surface in surfaces {
+            let Surface::Graph(graph) = surface else {
+                continue;
+            };
+            match self.nodes.get(&NodeId(graph)) {
+                Some(node) if node.parent == NodeId(0) => top.push(graph),
+                Some(_) => nested.push(NodeId(graph)),
+                None => {}
+            }
+        }
+        (top, nested)
+    }
+
+    /// What closing a tab or a pane does to the graphs it shows: a top-level
+    /// graph is deleted, the way closing a shell ends it; a nested view in a
+    /// section without a runner is only hidden. Returns whether the close
+    /// still has to reach a runner.
+    fn close_graphs(
+        &mut self,
+        runner: &RunnerKey,
+        surfaces: Vec<Surface>,
+    ) -> (bool, Task<Message>) {
+        let (top, nested) = self.graph_leaves(surfaces);
+        if runner.is_synthetic() {
+            self.local_views.retain(|view| !nested.contains(view));
+        }
+        let task = if top.is_empty() {
+            Task::none()
+        } else {
+            self.apply(Message::DeleteNodes(top))
+        };
+        (!runner.is_synthetic(), task)
     }
 
     /// Records what this window looks like under the state directory, so the
@@ -621,6 +867,65 @@ impl App {
         }
         match message {
             Message::Workspace(message) => {
+                // Closing what shows a top-level graph deletes the graph; a
+                // synthetic section has no runner to tell.
+                let mut closed = Task::none();
+                match &message {
+                    workspace::Message::CloseTab(tab) => {
+                        let surfaces: Vec<Surface> = self
+                            .workspace
+                            .section(&tab.runner)
+                            .and_then(|s| s.snapshot.tabs().find(|t| t.id == tab.tab))
+                            .map(|t| t.root.leaves().into_iter().map(|(_, s)| s).collect())
+                            .unwrap_or_default();
+                        let (remote, task) = self.close_graphs(&tab.runner.clone(), surfaces);
+                        if !remote {
+                            return task;
+                        }
+                        closed = task;
+                    }
+                    workspace::Message::CloseFocused => {
+                        if let Some(pane) = self.workspace.focused_pane().cloned() {
+                            let surfaces = self.workspace.surface_of(&pane).into_iter().collect();
+                            let (remote, task) = self.close_graphs(&pane.runner, surfaces);
+                            if !remote {
+                                return task;
+                            }
+                            closed = task;
+                        }
+                    }
+                    // A tab that is one graph is named by the graph: the
+                    // node's name reaches every editor and the runner's
+                    // title follows it.
+                    workspace::Message::RenameTabCommit => {
+                        let graph = self
+                            .workspace
+                            .renaming_tab
+                            .as_ref()
+                            .and_then(|(tab, _)| self.workspace.single_graph(tab))
+                            .filter(|graph| self.nodes.contains_key(graph));
+                        if let Some(graph) = graph
+                            && let Some((_, draft)) = self.workspace.renaming_tab.take()
+                        {
+                            let name = draft.trim();
+                            if let Some(node) = self.nodes.get_mut(&graph)
+                                && !name.is_empty()
+                                && node.display_name != name
+                            {
+                                name.clone_into(&mut node.display_name);
+                                #[cfg(not(target_arch = "wasm32"))]
+                                self.push_rename(graph, name.to_owned());
+                            }
+                            return Task::none();
+                        }
+                    }
+                    _ => {}
+                }
+                let focus_rename = match message {
+                    workspace::Message::RenameGroupStart(..) => Some(GROUP_RENAME_INPUT),
+                    workspace::Message::RenameTabStart(..) => Some(TAB_RENAME_INPUT),
+                    _ => None,
+                };
                 let placement = self.workspace.placement;
                 let update = self.workspace.update(message);
                 if self.workspace.placement != placement {
@@ -631,9 +936,29 @@ impl App {
                 if let Some(hint) = update.hint {
                     self.hint = Some((hint.to_owned(), iced::time::Instant::now()));
                 }
-                // Structural changes are the runner's to make.
-                for command in update.commands {
-                    self.send_topology(command);
+                // Structural changes are the runners' to make.
+                for (key, command) in update.commands {
+                    self.send_topology(&key, command);
+                }
+                let renaming = self.workspace.renaming_group.is_some()
+                    || self.workspace.renaming_tab.is_some();
+                if let Some(input) = focus_rename
+                    && renaming
+                {
+                    return Task::batch([
+                        closed,
+                        iced::widget::operation::focus(input.clone()),
+                        iced::widget::operation::select_all(input),
+                    ]);
+                }
+                return closed;
+            }
+            Message::NewGraph(key) => {
+                // The offline section offers no control: a graph for a
+                // runner that is not there would not run either.
+                let runner = if key.is_synthetic() { "" } else { key.as_str() };
+                if let Some(graph) = self.create_graph(runner) {
+                    self.pending_graph_focus = Some(graph);
                 }
             }
             Message::EdgeConnected { from, to } => {
@@ -685,13 +1010,30 @@ impl App {
                 // Only a real container can be opened; a stale button of a
                 // deleted container must not open a tab with nothing in it.
                 let target = NodeId(raw_id);
-                if self
+                if !self
                     .nodes
                     .get(&target)
                     .is_some_and(|node| node.is_container)
                 {
-                    self.workspace.open_graph(target);
+                    return Task::none();
                 }
+                if self.workspace.show_graph(target) {
+                    return Task::none();
+                }
+                self.pending_graph_focus = Some(target);
+                // A running graph's views are its runner's tabs, shared with
+                // every editor; without one, this window keeps its own.
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(key) = self.runner_of(target).map(RunnerKey::new)
+                    && self.workspace.attached(&key)
+                {
+                    self.send_topology(
+                        &key,
+                        zeughaus_mux::TopologyCommand::OpenGraph { graph: raw_id },
+                    );
+                    return Task::none();
+                }
+                self.local_views.push(target);
             }
             Message::AutoLayout => {
                 // Only this graph, and only by the wires it shows: an edge into
@@ -711,8 +1053,18 @@ impl App {
                     .edges
                     .iter()
                     .filter_map(|edge| {
-                        let (from, _) = self.view_endpoint(edge.from_node, &edge.from_pin, true)?;
-                        let (to, _) = self.view_endpoint(edge.to_node, &edge.to_pin, false)?;
+                        let (from, _) = self.view_endpoint(
+                            self.current_graph,
+                            edge.from_node,
+                            &edge.from_pin,
+                            true,
+                        )?;
+                        let (to, _) = self.view_endpoint(
+                            self.current_graph,
+                            edge.to_node,
+                            &edge.to_pin,
+                            false,
+                        )?;
                         Some((from, to))
                     })
                     .collect();
@@ -788,6 +1140,9 @@ impl App {
                     let mut doomed = self.descendants(id);
                     doomed.push(id);
                     for id in doomed {
+                        if self.renaming.as_ref().is_some_and(|r| r.node == id) {
+                            self.renaming = None;
+                        }
                         self.nodes.remove(&id);
                         self.node_order.retain(|n| *n != id);
                         // Before the edges go: every wire that touched this
@@ -823,9 +1178,12 @@ impl App {
                 #[cfg(not(target_arch = "wasm32"))]
                 return self.reconcile_runtime();
             }
-            Message::CameraChanged { position, zoom } => {
-                self.camera_position = position;
-                self.camera_zoom = zoom;
+            Message::CameraChanged {
+                graph,
+                position,
+                zoom,
+            } => {
+                self.cameras.insert(NodeId(graph), (position, zoom));
             }
             // Palette
             Message::TogglePalette => {
@@ -861,6 +1219,13 @@ impl App {
                 self.palette_selected = idx;
             }
             Message::SpawnNode { type_id } => {
+                if self.current_graph == NodeId(0) {
+                    self.hint = Some((
+                        "focus a graph pane to add nodes".to_owned(),
+                        iced::time::Instant::now(),
+                    ));
+                    return Task::none();
+                }
                 let pos = self.viewport_center();
                 self.spawn_node(&type_id, pos);
             }
@@ -896,22 +1261,79 @@ impl App {
                 #[cfg(target_arch = "wasm32")]
                 self.settle_relations(id, &key, &was);
             }
+            Message::RenameStart(raw) => {
+                let id = NodeId(raw);
+                if let Some(node) = self.nodes.get(&id) {
+                    // A rename open on another node loses its draft: there is
+                    // one field, and it follows the latest press.
+                    self.renaming = Some(Rename {
+                        node: id,
+                        draft: node.display_name.clone(),
+                    });
+                    return Task::batch([
+                        iced::widget::operation::focus(RENAME_INPUT),
+                        iced::widget::operation::select_all(RENAME_INPUT),
+                    ]);
+                }
+            }
+            Message::RenameInput(input) => {
+                if let Some(rename) = &mut self.renaming {
+                    rename.draft = input;
+                }
+            }
+            Message::RenameCommit => {
+                let Some(Rename { node: id, draft }) = self.renaming.take() else {
+                    return Task::none();
+                };
+                // A node deleted meanwhile, locally or by another window, takes
+                // its rename with it.
+                let Some(type_id) = self.nodes.get(&id).map(|node| node.type_id.clone()) else {
+                    return Task::none();
+                };
+                // Nothing typed means the name the node was born with.
+                let trimmed = draft.trim();
+                let name = if trimmed.is_empty() {
+                    self.catalog_name(&type_id)
+                } else {
+                    trimmed.to_owned()
+                };
+                if let Some(node) = self.nodes.get_mut(&id)
+                    && node.display_name != name
+                {
+                    node.display_name.clone_from(&name);
+                    #[cfg(not(target_arch = "wasm32"))]
+                    self.push_rename(id, name);
+                }
+            }
+            Message::Escape => {
+                self.palette_close();
+                self.renaming = None;
+                self.workspace.renaming_group = None;
+                self.workspace.renaming_tab = None;
+                self.workspace.drag = None;
+            }
             Message::NodeTriggered { node_id } => {
-                // The press has to reach the one process that executes, which
-                // is never this one. Pushed straight to that runtime, so it
-                // works from any window, local or remote.
+                // The press has to reach the one process that executes this
+                // node's graph, which is never this one. Pushed straight to
+                // that runner, so it works from any window, local or remote.
                 #[cfg(not(target_arch = "wasm32"))]
-                if let Some(endpoint) = self.runtime.endpoint.clone() {
+                {
+                    let Some(endpoint) = self
+                        .link_of(NodeId(node_id))
+                        .map(|(_, link)| link.endpoint.clone())
+                    else {
+                        self.hint = Some((
+                            "no runner executes this graph".to_owned(),
+                            iced::time::Instant::now(),
+                        ));
+                        return Task::none();
+                    };
                     return Task::perform(feed::trigger(endpoint, node_id), |result| {
                         if let Err(e) = result {
                             eprintln!("[trigger] {e}");
                         }
                         Message::Tick
                     });
-                } else {
-                    // The status bar already says "no runtime"; this names the
-                    // press that went nowhere.
-                    eprintln!("[trigger] no runtime");
                 }
                 // The wasm editor has no sync layer, so it has nobody to ask.
                 #[cfg(target_arch = "wasm32")]
@@ -929,6 +1351,10 @@ impl App {
             Message::WindowResized { size } => {
                 // Only the palette reads it, and only when it spawns a node.
                 self.window_size = size;
+                #[cfg(not(target_arch = "wasm32"))]
+                return iced::window::latest()
+                    .and_then(iced::window::is_maximized)
+                    .map(Message::WindowMaximized);
             }
             Message::Tick => {
                 // Re-rendering advances the widget's animation clock; the one
@@ -979,8 +1405,25 @@ impl App {
             // The window is undecorated, so the moves a system titlebar makes
             // are asked for here. `latest` because this process has one
             // window and never learns its id otherwise.
-            Message::WindowDrag => {
-                return iced::window::latest().and_then(iced::window::drag);
+            Message::TitlebarPress => {
+                self.titlebar_press = Some(self.titlebar_cursor);
+            }
+            Message::TitlebarMove(position) => {
+                self.titlebar_cursor = position;
+                if let Some(origin) = self.titlebar_press
+                    && origin.distance(position) >= TITLEBAR_DRAG_THRESHOLD
+                {
+                    self.titlebar_press = None;
+                    return iced::window::latest().and_then(iced::window::drag);
+                }
+            }
+            Message::TitlebarRelease => self.titlebar_press = None,
+            // A pointer that leaves the bar with the button still held is a
+            // fast drag, not a click.
+            Message::TitlebarExit => {
+                if self.titlebar_press.take().is_some() {
+                    return iced::window::latest().and_then(iced::window::drag);
+                }
             }
             #[cfg(not(target_arch = "wasm32"))]
             Message::WindowResize(direction) => {
@@ -992,12 +1435,42 @@ impl App {
                 return iced::window::latest().and_then(|id| iced::window::minimize(id, true));
             }
             Message::WindowMaximize => {
+                // The second click of a double-click is also a press: it must
+                // not become a drag once the window is maximized.
+                self.titlebar_press = None;
                 return iced::window::latest().and_then(iced::window::toggle_maximize);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::WindowMaximized(maximized) => {
+                self.window_maximized = maximized;
             }
             // Ends the runtime rather than closing the window: a closed
             // window leaves the event loop spinning with nothing to draw.
             #[cfg(not(target_arch = "wasm32"))]
             Message::Exit => return iced::exit(),
+            // The same clean close as `CloseRequested`, with a restore file
+            // written first and an `exec` instead of the exit.
+            #[cfg(unix)]
+            Message::Restart => {
+                self.flush_pending();
+                let path = restore::path();
+                match restore::write(&path, &self.restore_state()) {
+                    Ok(()) => {
+                        return Task::perform(crate::transport::shutdown(), move |()| {
+                            Message::RestartExec(path)
+                        });
+                    }
+                    Err(e) => {
+                        self.last_error =
+                            format!("restart failed: cannot write {}: {e}", path.display());
+                    }
+                }
+            }
+            #[cfg(unix)]
+            Message::RestartExec(path) => {
+                let e = crate::restart::exec(&path);
+                self.last_error = format!("restart failed: {e}");
+            }
             Message::CopySessionId => {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
@@ -1009,35 +1482,45 @@ impl App {
                         "no session (start `spacetime start` to host one)".to_string();
                 }
             }
-            // One of the runner's own terminals, shown in a tab or killed.
+            // One of a runner's own terminals, shown in a tab or killed.
             // The answer is the next workspace snapshot, so nothing about the
             // structure is applied here.
-            Message::AttachTerminal(terminal) => {
-                #[cfg(not(target_arch = "wasm32"))]
-                self.send_topology(zeughaus_mux::TopologyCommand::AttachTerminal {
-                    terminal,
-                    target: zeughaus_mux::AttachTarget::NewTab,
-                });
-                #[cfg(target_arch = "wasm32")]
-                let _ = terminal;
-            }
-            Message::CloseTerminal(terminal) => {
-                #[cfg(not(target_arch = "wasm32"))]
-                self.send_topology(zeughaus_mux::TopologyCommand::CloseTerminal { terminal });
-                #[cfg(target_arch = "wasm32")]
-                let _ = terminal;
-            }
-            Message::HoldRunner(held) => {
+            Message::AttachTerminal(key, terminal) => {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    let Some(endpoint) = self.runtime.endpoint.clone() else {
-                        self.last_error = "no runner to hold".to_string();
+                    self.workspace.expect_new_tab(&key);
+                    self.send_topology(
+                        &key,
+                        zeughaus_mux::TopologyCommand::AttachTerminal {
+                            terminal,
+                            target: zeughaus_mux::AttachTarget::NewTab,
+                        },
+                    );
+                }
+                #[cfg(target_arch = "wasm32")]
+                let _ = (key, terminal);
+            }
+            Message::CloseTerminal(key, terminal) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                self.send_topology(
+                    &key,
+                    zeughaus_mux::TopologyCommand::CloseTerminal { terminal },
+                );
+                #[cfg(target_arch = "wasm32")]
+                let _ = (key, terminal);
+            }
+            Message::HoldRunner(key, held) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let Some(endpoint) = self.runtime.links.get(&key).map(|l| l.endpoint.clone())
+                    else {
+                        self.last_error = "no such runner to hold".to_string();
                         return Task::none();
                     };
                     return Task::perform(feed::hold(endpoint, held), Message::HoldReplied);
                 }
                 #[cfg(target_arch = "wasm32")]
-                let _ = held;
+                let _ = (key, held);
             }
             // Said where the palette says everything else it did: a hold is
             // worth one line, and the run count is what the next one changes.
@@ -1054,6 +1537,10 @@ impl App {
             // File dialogs are native-only (rfd). On wasm these are no-ops;
             // persistence goes through the SpacetimeDB store instead.
             Message::SaveGraph => {
+                #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+                if self.headless {
+                    return self.refuse_file_dialog();
+                }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     let doc = self.to_document();
@@ -1075,6 +1562,10 @@ impl App {
                 }
             }
             Message::LoadGraph => {
+                #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+                if self.headless {
+                    return self.refuse_file_dialog();
+                }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     return Task::perform(
@@ -1144,14 +1635,25 @@ impl App {
         // to resize.
         #[cfg(not(target_arch = "wasm32"))]
         {
+            if self.window_maximized {
+                return self.workspace_view();
+            }
             stack![self.workspace_view(), resize_frame()].into()
         }
         #[cfg(target_arch = "wasm32")]
         self.workspace_view()
     }
 
+    fn window_radius(&self) -> f32 {
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.window_maximized {
+            return 10.0;
+        }
+        0.0
+    }
+
     /// The window: the titlebar with the tab strip in it or a sidebar under
-    /// it, the tab in front, the status line.
+    /// it, the tab in front, the status line, and what a drag carries.
     fn workspace_view(&self) -> Element<'_, Message, Theme> {
         let strip = self.tab_strip();
         let (in_titlebar, sidebar) = match self.workspace.placement {
@@ -1159,10 +1661,7 @@ impl App {
             iced_tabs::Placement::Left => (None, Some(strip)),
         };
 
-        let front: Element<'_, Message, Theme> = match self.workspace.active_tab() {
-            TabRef::Graph(_) => self.graph_view(),
-            TabRef::Runner(_) => self.runner_tab_view(),
-        };
+        let front = self.runner_tab_view();
         let body: Element<'_, Message, Theme> = match sidebar {
             Some(sidebar) => row![sidebar, front]
                 .width(Length::Fill)
@@ -1170,60 +1669,236 @@ impl App {
                 .into(),
             None => front,
         };
-
-        column![self.titlebar(in_titlebar), body, self.status_bar()]
+        let body = container(body)
+            .width(Length::Fill)
             .height(Length::Fill)
-            .into()
+            .style(|theme: &Theme| container::Style {
+                background: Some(theme.extended().background.base.color.into()),
+                ..Default::default()
+            });
+        let body: Element<'_, Message, Theme> = if self.palette_open {
+            stack![body, self.palette_overlay()].into()
+        } else {
+            body.into()
+        };
+
+        let window =
+            column![self.titlebar(in_titlebar), body, self.status_bar()].height(Length::Fill);
+        // A chip at the pointer naming what is being dragged.
+        match self.workspace.drag.as_ref().filter(|drag| drag.active) {
+            Some(drag) => {
+                let chip = container(text(self.drag_label(&drag.source)).size(12))
+                    .padding([2, 8])
+                    .style(|theme: &Theme| container::Style {
+                        background: Some(theme.chrome().into()),
+                        border: iced::Border {
+                            color: theme.extended().primary.base.color,
+                            width: 1.0,
+                            radius: 4.0.into(),
+                        },
+                        text_color: Some(theme.extended().background.base.text),
+                        ..Default::default()
+                    });
+                stack![
+                    window,
+                    iced::widget::pin(chip)
+                        .x(drag.cursor.x + 12.0)
+                        .y(drag.cursor.y + 8.0)
+                ]
+                .into()
+            }
+            None => window.into(),
+        }
     }
 
-    /// The tab bar and the button that adds a terminal tab, laid out for
-    /// where the bar sits: a row to live in the titlebar, or a column at the
-    /// left edge.
-    fn tab_strip(&self) -> Element<'_, Message, Theme> {
-        let runner_tabs = self.workspace.tabs();
-        let tab_count = runner_tabs.len();
-        let runner_tabs = runner_tabs.iter().map(|tab| {
-            let mut entry = iced_tabs::Tab::new(TabRef::Runner(tab.id), tab.title.as_str())
-                .closable(tab_count > 1);
-            if let Some(group) = tab.group.as_deref() {
-                entry = entry.group(group);
-            }
-            if let Some(accent) = workspace::accent(tab) {
-                entry = entry.accent(accent);
-            }
-            entry
-        });
-        // A graph tab is titled by its container; one whose container is
-        // gone closes at the end of the update that removed it.
-        let graph_tabs = self.workspace.graph_tabs().iter().filter_map(|graph| {
-            self.nodes
-                .get(graph)
-                .map(|node| iced_tabs::Tab::new(TabRef::Graph(*graph), node.display_name.as_str()))
-        });
-        let tab_bar = iced_tabs::view(
-            runner_tabs.chain(graph_tabs),
-            self.workspace.active_tab(),
-            self.workspace.placement,
-            |id| Message::Workspace(workspace::Message::ActivateTab(id)),
-            |id| Message::Workspace(workspace::Message::CloseTab(id)),
-        );
-
-        let mut add_tab = button(text("+").size(14))
-            .padding([2, 8])
-            .style(|theme: &Theme, status| button::text(theme.base(), status));
-        if self.workspace.attached() {
-            add_tab = add_tab.on_press(Message::Workspace(workspace::Message::NewTab));
+    /// What a drag chip says: the dragged tab's, group's or pane's title.
+    fn drag_label(&self, source: &workspace::DragSource) -> String {
+        let snapshot = |key: &RunnerKey| self.workspace.section(key).map(|s| &s.snapshot);
+        match source {
+            workspace::DragSource::Tab(tab) => snapshot(&tab.runner)
+                .and_then(|s| s.tabs().find(|t| t.id == tab.tab))
+                .map(|t| t.title.clone()),
+            workspace::DragSource::Group(key, group) => snapshot(key)
+                .and_then(|s| s.groups().find(|g| g.id == *group))
+                .map(|g| g.name.clone()),
+            workspace::DragSource::Pane(pane) => self
+                .workspace
+                .surface_of(pane)
+                .map(|surface| self.pane_title(&pane.runner, surface)),
         }
+        .unwrap_or_default()
+    }
 
-        match self.workspace.placement {
-            iced_tabs::Placement::Top => row![tab_bar, add_tab]
-                .spacing(4)
-                .align_y(iced::Alignment::Center)
+    /// What a pane is called in its grip: its graph's or terminal's title.
+    fn pane_title(&self, key: &RunnerKey, surface: Surface) -> String {
+        match surface {
+            Surface::Graph(graph) => self
+                .nodes
+                .get(&NodeId(graph))
+                .map_or_else(|| "Graph".to_owned(), |node| node.display_name.clone()),
+            Surface::Empty => "Empty".to_owned(),
+            Surface::Terminal(terminal) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some((view, _)) = self.terminal_view(key, terminal) {
+                    let guard = view.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(title) = guard.as_ref().map(|v| v.title.clone())
+                        && !title.is_empty()
+                    {
+                        return title;
+                    }
+                }
+                let _ = key;
+                format!("terminal {}", terminal.0)
+            }
+        }
+    }
+
+    /// The tab tree: one section per runner, laid out for where the bar
+    /// sits -- a row to live in the titlebar, or a column at the left edge.
+    fn tab_strip(&self) -> Element<'_, Message, Theme> {
+        use std::borrow::Cow;
+        use workspace::{CollapseKey, Message as W};
+        use zeughaus_mux::WorkspaceItem;
+
+        let placement = self.workspace.placement;
+        let left = placement == iced_tabs::Placement::Left;
+        // A text field shrinks to nothing in a row that does not fill.
+        let name_width = if left {
+            Length::Fill
+        } else {
+            Length::Fixed(120.0)
+        };
+        let sections = self
+            .workspace
+            .sections()
+            .iter()
+            .map(|section| {
+                let key = &section.key;
+                let mut controls: Vec<(&'static str, Cow<'_, str>)> = Vec::new();
+                if !section.synthetic() {
+                    controls.push(("shell", Cow::Borrowed("+ Shell")));
+                    controls.push(("graph", Cow::Borrowed("+ Graph")));
+                    controls.push(("group", Cow::Borrowed("+ Group")));
+                } else if key.as_str() == RunnerKey::LOCAL {
+                    controls.push(("graph", Cow::Borrowed("+ Graph")));
+                }
+                let tab = |t| tab_entry(key, t);
+                let items = section
+                    .snapshot
+                    .items
+                    .iter()
+                    .map(|item| match item {
+                        WorkspaceItem::Tab(t) => iced_tabs::Item::Tab(tab(t)),
+                        WorkspaceItem::Group(group) => {
+                            let editor = self
+                                .workspace
+                                .renaming_group
+                                .as_ref()
+                                .filter(|(k, g, _)| k == key && *g == group.id)
+                                .map(|(_, _, draft)| {
+                                    iced::widget::text_input("Group name", draft)
+                                        .id(GROUP_RENAME_INPUT)
+                                        .size(12)
+                                        .padding([1, 4])
+                                        .width(name_width)
+                                        .on_input(|text| {
+                                            Message::Workspace(W::RenameGroupInput(text))
+                                        })
+                                        .on_submit(Message::Workspace(W::RenameGroupCommit))
+                                        .into()
+                                });
+                            iced_tabs::Item::Group(iced_tabs::Group {
+                                id: group.id,
+                                label: Cow::Borrowed(group.name.as_str()),
+                                color: workspace::rgba(group.color_rgba),
+                                locked: group.locked,
+                                collapsed: self
+                                    .workspace
+                                    .collapsed
+                                    .contains(&CollapseKey::Group(key.clone(), group.id)),
+                                tabs: group.tabs.iter().map(tab).collect(),
+                                editor,
+                            })
+                        }
+                    })
+                    .collect();
+                iced_tabs::Section {
+                    id: key.clone(),
+                    label: Cow::Borrowed(section.label.as_str()),
+                    collapsed: self
+                        .workspace
+                        .collapsed
+                        .contains(&CollapseKey::Section(key.clone())),
+                    controls,
+                    items,
+                }
+            })
+            .collect();
+        let marker = self
+            .workspace
+            .drag
+            .as_ref()
+            .filter(|drag| drag.active)
+            .and_then(|drag| drag.marker.clone());
+        let handlers = iced_tabs::Handlers {
+            on_close: Box::new(|tab| Message::Workspace(W::CloseTab(tab))),
+            on_toggle_section: Box::new(|key| Message::Workspace(W::ToggleSection(key))),
+            on_toggle_group: Box::new(|key, group| Message::Workspace(W::ToggleGroup(key, group))),
+            on_control: Box::new(|key, control| match control {
+                "graph" => Message::NewGraph(key),
+                "group" => Message::Workspace(W::NewGroup(key)),
+                _ => Message::Workspace(W::NewShell(key)),
+            }),
+            on_press_tab: Box::new(|tab| Message::Workspace(W::PressTab(tab))),
+            on_press_group: Box::new(|key, group| Message::Workspace(W::PressGroup(key, group))),
+            on_hover: Box::new(|target| Message::Workspace(W::Hover(target))),
+            on_rename_group: Box::new(|key, group| {
+                Message::Workspace(W::RenameGroupStart(key, group))
+            }),
+            on_rename_tab: Box::new(|tab| Message::Workspace(W::RenameTabStart(tab))),
+            on_cycle_color: Box::new(|key, group| {
+                Message::Workspace(W::CycleGroupColor(key, group))
+            }),
+            on_dissolve_group: Box::new(|key, group| {
+                Message::Workspace(W::DissolveGroup(key, group))
+            }),
+        };
+        let renaming = self.workspace.renaming_tab.as_ref().map(|(tab, draft)| {
+            let field: Element<'_, Message, Theme> = iced::widget::text_input("Tab name", draft)
+                .id(TAB_RENAME_INPUT)
+                .size(12)
+                .padding([1, 4])
+                .width(name_width)
+                .on_input(|text| Message::Workspace(W::RenameTabInput(text)))
+                .on_submit(Message::Workspace(W::RenameTabCommit))
+                .into();
+            (tab.clone(), field)
+        });
+        let tree = iced_tabs::tree(
+            sections,
+            self.workspace.active_tab().cloned(),
+            placement,
+            marker,
+            renaming,
+            handlers,
+        );
+        // Leaving the bar in the middle of a drag leaves no target in it.
+        let tree = mouse_area(tree).on_exit(Message::Workspace(W::LeftBar));
+
+        match placement {
+            iced_tabs::Placement::Top => container(tree)
                 .width(Length::Fill)
+                .height(Length::Fill)
                 .into(),
-            iced_tabs::Placement::Left => column![add_tab, tab_bar]
+            // The same chrome the titlebar has, so a selected tab reads as the
+            // content reaching into the bar, as it does on top.
+            iced_tabs::Placement::Left => container(tree)
                 .width(SIDEBAR_WIDTH)
                 .height(Length::Fill)
+                .style(|theme: &Theme| container::Style {
+                    background: Some(theme.chrome().into()),
+                    ..Default::default()
+                })
                 .into(),
         }
     }
@@ -1254,16 +1929,43 @@ impl App {
         // have anything to minimize.
         #[cfg(not(target_arch = "wasm32"))]
         {
+            let corner = self.window_radius();
             controls = controls
-                .push(window_button("\u{2013}", Message::WindowMinimize))
-                .push(window_button("\u{25A1}", Message::WindowMaximize))
-                .push(window_button("\u{00D7}", Message::CloseRequested));
+                .push(window_button(
+                    "\u{2013}",
+                    Message::WindowMinimize,
+                    |theme, status| button::text(theme.base(), status),
+                ))
+                .push(window_button(
+                    "\u{25A1}",
+                    Message::WindowMaximize,
+                    |theme, status| button::text(theme.base(), status),
+                ))
+                .push(window_button(
+                    "\u{00D7}",
+                    Message::CloseRequested,
+                    move |theme, status| {
+                        let style = danger_on_hover(theme.base(), status, button::text);
+                        // It sits in the window's corner, flush with both
+                        // edges, so its hover is rounded where the window is.
+                        button::Style {
+                            border: iced::Border {
+                                radius: iced::border::top_right(corner),
+                                ..style.border
+                            },
+                            ..style
+                        }
+                    },
+                ));
         }
 
         // Text and spacers do not capture the mouse, so the drag region
         // behind them stays reachable everywhere but on a control.
         let drag = mouse_area(space().width(Length::Fill).height(Length::Fill))
-            .on_press(Message::WindowDrag)
+            .on_press(Message::TitlebarPress)
+            .on_release(Message::TitlebarRelease)
+            .on_move(Message::TitlebarMove)
+            .on_exit(Message::TitlebarExit)
             .on_double_click(Message::WindowMaximize);
         container(
             stack![drag, controls]
@@ -1271,66 +1973,73 @@ impl App {
                 .height(Length::Fill),
         )
         .height(TITLEBAR_HEIGHT)
-        .padding([0, 4])
+        // Nothing on the right: the close button reaches the window's edge.
+        .padding(iced::Padding {
+            left: 4.0,
+            ..iced::Padding::ZERO
+        })
         .style(|theme: &Theme| container::Style {
             background: Some(theme.chrome().into()),
+            border: iced::Border {
+                radius: iced::border::top(self.window_radius()),
+                ..Default::default()
+            },
             ..Default::default()
         })
         .into()
     }
 
-    /// The runner tab in front: its split panes, each with a title bar.
+    /// The tab in front: its split panes, bare. Splitting and closing are
+    /// palette commands on the focused pane.
+    ///
+    /// In the sidebar layout, a tab with more than one pane gives each a
+    /// grip to drag it by; while a drag is on, every pane is a drop target
+    /// whose side under the pointer lights up.
     fn runner_tab_view(&self) -> Element<'_, Message, Theme> {
-        // `None` is only reachable between a snapshot and its rebuild, which
-        // does not happen: a workspace always has its runner tab built.
-        let Some(tab) = self.workspace.active() else {
-            return container(text("No tab").size(14))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
+        let Some((section, tab)) = self.workspace.active() else {
+            return unavailable(
+                "No tab",
+                "Open a shell or a graph from a section of the tab bar.",
+            );
         };
-        let pane_count = tab.panes.len();
-        let focused = self.workspace.focused_pane();
+        let key = section.key.clone();
+        let grips = tab.pane_count() > 1 && !section.synthetic();
+        let drag = self.workspace.drag.as_ref().filter(|drag| drag.active);
+        let lit = drag.and_then(|drag| match &drag.target {
+            Some(DropTarget::Pane(pane, side)) => Some((pane.pane, *side)),
+            _ => None,
+        });
         pane_grid::PaneGrid::new(&tab.panes, move |pane, surface, _maximized| {
-            let id = tab.pane_id(pane);
+            let pane_ref = tab.pane_id(pane).map(|pane| PaneRef {
+                runner: key.clone(),
+                pane,
+            });
             let body: Element<'_, Message, Theme> = match surface {
-                Surface::Graph => self.graph_view(),
+                Surface::Graph(graph) => self.graph_view(NodeId(*graph)),
                 Surface::Empty => unavailable(
                     "Empty pane",
                     "Its surface could not be restored. Close it or split it again.",
                 ),
-                Surface::Terminal(terminal) => self.terminal_pane(id, *terminal),
-            };
-
-            // Structural changes are the runner's; with none attached the
-            // buttons are dead rather than a click that earns a refusal.
-            let attached = self.workspace.attached();
-            let mut controls = row![
-                split_button("H", attached, pane, zeughaus_mux::Axis::Horizontal),
-                split_button("V", attached, pane, zeughaus_mux::Axis::Vertical),
-            ]
-            .spacing(2);
-            // The graph pane is unique and the runner refuses to close it;
-            // offering the button would only earn a hint.
-            if pane_count > 1 && *surface != Surface::Graph {
-                let mut close = button(text("x").size(11)).padding([3, 6]);
-                if attached {
-                    close = close.on_press(Message::Workspace(workspace::Message::ClosePane(pane)));
+                Surface::Terminal(terminal) => {
+                    self.terminal_pane(pane_ref.clone(), &key, *terminal)
                 }
-                controls = controls.push(close);
-            }
-            let controls: Element<'_, Message, Theme> = controls.into();
-            let title_color = if id.is_some() && id == focused {
-                self.theme.accent()
-            } else {
-                self.theme.muted()
             };
-            let title = self.pane_title(*surface);
-            let title_bar = pane_grid::TitleBar::new(text(title).size(12).color(title_color))
-                .controls(controls)
-                .padding([3, 5]);
-
-            pane_grid::Content::new(body).title_bar(title_bar)
+            // Always a stack with the body first: iced keeps a child's state
+            // by its index, so the overlay coming and going with a drag
+            // leaves the terminal selection and the graph's state alone.
+            let mut layers = iced::widget::Stack::new().push(body);
+            if let (Some(pane_ref), Some(_)) = (&pane_ref, drag) {
+                let side = lit.filter(|(p, _)| *p == pane_ref.pane).map(|(_, s)| s);
+                layers = layers.push(drop_overlay(pane_ref.clone(), side));
+            }
+            let body: Element<'_, Message, Theme> = layers.into();
+            let content = pane_grid::Content::new(body);
+            match pane_ref.filter(|_| grips) {
+                Some(pane_ref) => {
+                    content.title_bar(pane_grip(self.pane_title(&key, *surface), pane_ref))
+                }
+                None => content,
+            }
         })
         .width(Length::Fill)
         .height(Length::Fill)
@@ -1380,14 +2089,13 @@ impl App {
             .padding(4.0)
             .style(|theme: &Theme| container::Style {
                 background: Some(theme.chrome().into()),
+                border: iced::Border {
+                    radius: iced::border::bottom(self.window_radius()),
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .into()
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn pane_title(&self, surface: Surface) -> String {
-        surface_title(surface).to_owned()
     }
 
     /// A terminal pane in the browser editor: the topology is the same, the
@@ -1396,7 +2104,8 @@ impl App {
     #[cfg(target_arch = "wasm32")]
     fn terminal_pane(
         &self,
-        _pane: Option<zeughaus_mux::PaneId>,
+        _pane: Option<PaneRef>,
+        _key: &RunnerKey,
         _terminal: zeughaus_mux::TerminalId,
     ) -> Element<'_, Message, Theme> {
         unavailable(
@@ -1405,10 +2114,11 @@ impl App {
         )
     }
 
-    fn graph_view(&self) -> Element<'_, Message, Theme> {
+    fn graph_view(&self, graph: NodeId) -> Element<'_, Message, Theme> {
         // NodeGraph is generic over the id vocabulary declared by `GraphIds`;
         // the renderer stays at its default.
         let mut ng: NodeGraph<'_, GraphIds, Message, Theme> = NodeGraph::new();
+        let (position, zoom) = self.camera(graph);
 
         ng = ng
             .on_connect(|from, to| Message::EdgeConnected { from, to })
@@ -1417,9 +2127,13 @@ impl App {
             .on_select(Message::SelectionChanged)
             .on_clone(Message::CloneNodes)
             .on_delete(Message::DeleteNodes)
-            .on_camera(|position, zoom| Message::CameraChanged { position, zoom })
+            .on_camera(move |position, zoom| Message::CameraChanged {
+                graph: graph.0,
+                position,
+                zoom,
+            })
             .on_resize(|node_id, size| Message::NodeResized { node_id, size })
-            .camera(self.camera_position, self.camera_zoom)
+            .camera(position, zoom)
             .can_connect({
                 // With a custom can_connect, iced_nodegraph stops enforcing pin
                 // direction itself, so every rule lives here -- and in
@@ -1460,9 +2174,10 @@ impl App {
 
         for id in &self.node_order {
             if let Some(node) = self.nodes.get(id) {
-                // One graph at a time: a node of another one is not drawn here,
-                // and its wires are mapped onto the container that holds it.
-                if node.parent != self.current_graph {
+                // One graph per pane: a node of another one is not drawn
+                // here, and its wires are mapped onto the container that
+                // holds it.
+                if node.parent != graph {
                     continue;
                 }
                 let content = build_node_element(
@@ -1476,6 +2191,11 @@ impl App {
                         dim_mask: self.dim_mask(*id, node),
                         size: self.node_sizes.get(id).copied(),
                         is_container: node.is_container,
+                        rename: self
+                            .renaming
+                            .as_ref()
+                            .filter(|r| r.node == *id)
+                            .map(|r| r.draft.as_str()),
                     },
                 );
                 // Per-node activity feedback: red marching-ants on error. There
@@ -1483,6 +2203,9 @@ impl App {
                 // execute, so a node is never mid-run here.
                 let errored = self.node_error(*id).is_some();
                 let node_widget = ng_node(node.id.0, node.position, content)
+                    // The editor's selection is the one that counts: it is
+                    // what a restart restores and what delete and clone act on.
+                    .selected(self.selected.contains(id))
                     .resizable(is_display(&node.type_id))
                     .style(move |theme: &Theme, status| {
                         let base = default_node_style(theme.base(), status);
@@ -1526,8 +2249,8 @@ impl App {
             // drawn on the container's pin, and one that touches neither this
             // graph nor its containers is not drawn at all.
             let (Some((from_node, from_pin)), Some((to_node, to_pin))) = (
-                self.view_endpoint(edge.from_node, &edge.from_pin, true),
-                self.view_endpoint(edge.to_node, &edge.to_pin, false),
+                self.view_endpoint(graph, edge.from_node, &edge.from_pin, true),
+                self.view_endpoint(graph, edge.to_node, &edge.to_pin, false),
             ) else {
                 continue;
             };
@@ -1602,38 +2325,42 @@ impl App {
             ng = ng.push_edge(edge_widget);
         }
 
-        let graph_area: Element<'_, Message, Theme> = container(ng)
+        container(ng)
             .width(Length::Fill)
             .height(Length::Fill)
-            .into();
+            .into()
+    }
 
-        if self.palette_open {
-            // The palette widget is written against iced's own theme type, so
-            // the overlay is handed the inner theme: one theme still decides
-            // what it looks like, through the bridge rather than through a
-            // second catalog.
-            let palette_view: Element<'_, Message, Theme> = iced::widget::themer(
-                Some(self.theme.base().clone()),
-                palette::view(
-                    &self.palette_input,
-                    &self.palette_commands,
-                    self.palette_selected,
-                ),
-            )
-            .into();
-            let overlay = container(palette_view)
-                .width(Length::Fill)
-                .padding(80.0)
-                .align_x(iced::Alignment::Center);
-            stack![graph_area, overlay].into()
-        } else {
-            graph_area
-        }
+    /// The command palette over whatever the window shows: it acts on the
+    /// whole editor (tabs, panes, terminals, the graph), so it belongs to no
+    /// single surface.
+    fn palette_overlay(&self) -> Element<'_, Message, Theme> {
+        // The palette widget is written against iced's own theme type, so
+        // the overlay is handed the inner theme: one theme still decides
+        // what it looks like, through the bridge rather than through a
+        // second catalog.
+        let palette_view: Element<'_, Message, Theme> = iced::widget::themer(
+            Some(self.theme.base().clone()),
+            palette::view(
+                &self.palette_input,
+                &self.palette_commands,
+                self.palette_selected,
+            ),
+        )
+        .into();
+        container(palette_view)
+            .width(Length::Fill)
+            .padding(80.0)
+            .align_x(iced::Alignment::Center)
+            .into()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
         let events = iced::event::listen_with(|event, _status, _id| {
-            if let Event::Window(iced::window::Event::Resized(size)) = event {
+            if let Event::Window(
+                iced::window::Event::Resized(size) | iced::window::Event::Opened { size, .. },
+            ) = event
+            {
                 return Some(Message::WindowResized { size });
             }
             if let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event {
@@ -1654,7 +2381,7 @@ impl App {
 
                 match key {
                     keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                        return Some(Message::PaletteCancel);
+                        return Some(Message::Escape);
                     }
                     keyboard::Key::Named(keyboard::key::Named::Enter) => {
                         return Some(Message::PaletteConfirm);
@@ -1668,6 +2395,11 @@ impl App {
         #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let mut subs = vec![events];
         subs.push(iced::window::close_requests().map(|_| Message::CloseRequested));
+
+        // Always subscribed, in a window and headless alike: without the
+        // handler, SIGUSR1's default action ends the process.
+        #[cfg(unix)]
+        subs.push(Subscription::run(crate::restart::sigusr1).map(|()| Message::Restart));
 
         // The library only auto-redraws for animated edges, not node borders.
         // While any node is in error, drive ~30fps redraws so its marching-ants
@@ -1709,6 +2441,40 @@ impl App {
             );
         }
 
+        // The release of a press on a tab, a group header or a pane grip is
+        // followed wherever it happens, over widgets that capture it too.
+        // Always listened for: a fast click delivers the press and its
+        // release in one batch, before the press has made any subscription
+        // that depends on it. Without a press the release changes nothing.
+        subs.push(iced::event::listen_with(
+            |event, _status, _id| match event {
+                Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left))
+                | Event::Touch(iced::touch::Event::FingerLifted { .. }) => {
+                    Some(Message::Workspace(workspace::Message::DragReleased))
+                }
+                Event::Touch(iced::touch::Event::FingerLost { .. }) => {
+                    Some(Message::Workspace(workspace::Message::DragCancelled))
+                }
+                _ => None,
+            },
+        ));
+        // The pointer is followed only while a press is held.
+        if self.workspace.drag.is_some() {
+            subs.push(iced::event::listen_with(
+                |event, _status, _id| match event {
+                    Event::Mouse(iced::mouse::Event::CursorMoved { position })
+                    | Event::Touch(iced::touch::Event::FingerMoved { position, .. }) => {
+                        Some(Message::Workspace(workspace::Message::DragMoved(position)))
+                    }
+                    Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                        ..
+                    }) => Some(Message::Workspace(workspace::Message::DragCancelled)),
+                    _ => None,
+                },
+            ));
+        }
+
         Subscription::batch(subs)
     }
 
@@ -1731,31 +2497,132 @@ fn unavailable<'a>(what: &'a str, why: &'a str) -> Element<'a, Message, Theme> {
         .into()
 }
 
-/// One of a pane's split buttons, pressable only while a runner is attached:
-/// splitting creates a terminal, and there is no terminal without a runner.
-fn split_button<'a>(
-    label: &'a str,
-    attached: bool,
-    pane: pane_grid::Pane,
-    axis: zeughaus_mux::Axis,
-) -> iced::widget::Button<'a, Message, Theme> {
-    let split = button(text(label).size(11)).padding([3, 6]);
-    if attached {
-        split.on_press(Message::Workspace(workspace::Message::Split { pane, axis }))
-    } else {
-        split
+/// One tab of a section as the tab tree shows it.
+fn tab_entry<'a>(
+    key: &RunnerKey,
+    tab: &'a zeughaus_mux::TabSnapshot,
+) -> iced_tabs::Tab<'a, TabRef> {
+    let mut entry = iced_tabs::Tab::new(
+        TabRef {
+            runner: key.clone(),
+            tab: tab.id,
+        },
+        tab.title.as_str(),
+    );
+    if let Some(accent) = workspace::accent(tab) {
+        entry = entry.accent(accent);
     }
+    entry
+}
+
+/// The strip above a pane of a split tab: its title, and a grip that starts
+/// dragging the pane.
+fn pane_grip<'a>(title: String, pane: PaneRef) -> pane_grid::TitleBar<'a, Message, Theme> {
+    let grip = mouse_area(text("\u{283F}").size(12))
+        .on_press(Message::Workspace(workspace::Message::PressPane(pane)))
+        .interaction(iced::mouse::Interaction::Grab);
+    let strip = row![grip, text(title).size(11)]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+    pane_grid::TitleBar::new(
+        container(strip)
+            .height(PANE_GRIP_HEIGHT)
+            .padding([0, 6])
+            .align_y(iced::Alignment::Center),
+    )
+    .style(|theme: &Theme| container::Style {
+        background: Some(theme.chrome().into()),
+        text_color: Some(theme.muted()),
+        ..Default::default()
+    })
+}
+
+/// What covers a pane while something is dragged: it reports which side of
+/// the pane the pointer is near, and lights that half up.
+fn drop_overlay<'a>(
+    pane: PaneRef,
+    side: Option<zeughaus_mux::Side>,
+) -> Element<'a, Message, Theme> {
+    use zeughaus_mux::Side;
+    iced::widget::responsive(move |size| {
+        let lit: Element<'a, Message, Theme> = match side {
+            None => space().into(),
+            Some(side) => {
+                let (width, height) = match side {
+                    Side::Left | Side::Right => (Length::FillPortion(1), Length::Fill),
+                    Side::Top | Side::Bottom => (Length::Fill, Length::FillPortion(1)),
+                };
+                let block =
+                    container(space())
+                        .width(width)
+                        .height(height)
+                        .style(|theme: &Theme| container::Style {
+                            background: Some(
+                                theme.extended().primary.base.color.scale_alpha(0.35).into(),
+                            ),
+                            ..Default::default()
+                        });
+                // Half of the pane: the lit block beside an empty one.
+                match side {
+                    Side::Left => row![block, space().width(Length::FillPortion(1))].into(),
+                    Side::Right => row![space().width(Length::FillPortion(1)), block].into(),
+                    Side::Top => column![block, space().height(Length::FillPortion(1))].into(),
+                    Side::Bottom => column![space().height(Length::FillPortion(1)), block].into(),
+                }
+            }
+        };
+        let hover = pane.clone();
+        mouse_area(container(lit).width(Length::Fill).height(Length::Fill))
+            .on_move(move |at| {
+                Message::Workspace(workspace::Message::HoverPane(
+                    hover.clone(),
+                    workspace::side_at(at, size),
+                ))
+            })
+            .on_exit(Message::Workspace(workspace::Message::LeftPane(
+                pane.clone(),
+            )))
+            .into()
+    })
+    .into()
 }
 
 /// A titlebar button: minimize, maximize, close. Flat, so the bar reads as
-/// one strip and not as a row of boxes.
+/// one strip and not as a row of boxes; as tall as the bar, so a hover fills
+/// it from edge to edge.
 #[cfg(not(target_arch = "wasm32"))]
-fn window_button(glyph: &'static str, message: Message) -> Element<'static, Message, Theme> {
-    button(text(glyph).size(13).center().width(TITLEBAR_HEIGHT))
-        .padding([2, 0])
-        .style(|theme: &Theme, status| button::text(theme.base(), status))
-        .on_press(message)
-        .into()
+fn window_button(
+    glyph: &'static str,
+    message: Message,
+    style: impl Fn(&Theme, button::Status) -> button::Style + 'static,
+) -> Element<'static, Message, Theme> {
+    button(
+        text(glyph)
+            .size(13)
+            .center()
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .width(TITLEBAR_HEIGHT)
+    .height(Length::Fill)
+    .padding(0)
+    .style(style)
+    .on_press(message)
+    .into()
+}
+
+/// The style of a button that closes or deletes something: `rest` until the
+/// pointer is on it, iced's danger style while hovered or pressed. Red at rest
+/// would shout from every node and every titlebar.
+fn danger_on_hover(
+    theme: &iced::Theme,
+    status: button::Status,
+    rest: fn(&iced::Theme, button::Status) -> button::Style,
+) -> button::Style {
+    match status {
+        button::Status::Hovered | button::Status::Pressed => button::danger(theme, status),
+        button::Status::Active | button::Status::Disabled => rest(theme, status),
+    }
 }
 
 /// Invisible hit zones along the window edges and corners that start a

@@ -367,6 +367,7 @@ mod tests {
         TriggerRequest {
             node_id,
             payload: None,
+            external: false,
         }
     }
 

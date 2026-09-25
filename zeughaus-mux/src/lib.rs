@@ -35,7 +35,8 @@ pub mod workspace;
 
 pub use codec::{CodecError, FrameHeader, Kind, MAJOR, MINOR};
 pub use id::{
-    ClientInstanceId, PaneId, RequestId, RunnerIncarnation, SplitId, TabId, TerminalId, WorkspaceId,
+    ClientInstanceId, GroupId, PaneId, RequestId, RunnerIncarnation, SplitId, TabId, TerminalId,
+    WorkspaceId,
 };
 pub use input::{
     KeyInput, Modifiers, MouseButton, MouseInput, MouseKind, NamedKey, TerminalCommand,
@@ -51,6 +52,6 @@ pub use terminal::{
     WireColor,
 };
 pub use workspace::{
-    AttachTarget, Axis, DetachedTerminal, PaneNode, SurfaceRef, TabSnapshot, TopologyCommand,
-    WorkspaceSnapshot,
+    AttachTarget, Axis, DetachedTerminal, GroupSnapshot, PaneNode, PaneTarget, Side, SurfaceRef,
+    TabSlot, TabSnapshot, TopologyCommand, WorkspaceItem, WorkspaceSnapshot,
 };

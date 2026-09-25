@@ -2,19 +2,21 @@
 //! frame it shows.
 
 use std::collections::{HashMap, HashSet};
+use std::f32::consts::FRAC_1_SQRT_2;
 use std::sync::Arc;
 
 use iced::theme::palette::mix;
-use iced::widget::{button, column, container, image, pick_list, row, text, text_input};
-use iced::{Color, ContentFit, Element, Length};
+use iced::widget::text::Wrapping;
+use iced::widget::{button, canvas, column, container, image, pick_list, row, text, text_input};
+use iced::{Alignment, Color, ContentFit, Element, Length, Padding, Rectangle, Vector, mouse};
 use iced_nodegraph::{PinDirection as NgPinDirection, PinShape, PinSide, node_header, node_pin};
 use zeughaus_core::{
     Image, NodeId, PinDirection, PinKind, SettingDef, SettingKind, Ty, Value, field_rows,
 };
 use zeughaus_theme::{Ansi, Theme};
 
-use super::App;
 use super::graph::EditorNode;
+use super::{App, RENAME_INPUT, danger_on_hover};
 use crate::message::{Message, PinLabel};
 
 /// What a node shows inline: either the value rendered as text, or a decoded
@@ -228,6 +230,8 @@ pub(super) struct NodeChrome<'a> {
     pub dim_mask: u64,
     pub size: Option<iced::Size>,
     pub is_container: bool,
+    /// The draft name while this node is being renamed; `None` shows the name.
+    pub rename: Option<&'a str>,
 }
 
 pub(super) fn build_node_element<'a>(
@@ -243,6 +247,7 @@ pub(super) fn build_node_element<'a>(
         dim_mask,
         size,
         is_container,
+        rename,
     } = chrome;
     let is_button = node.type_id == "flow.button";
     let is_display = is_display(&node.type_id);
@@ -440,13 +445,56 @@ pub(super) fn build_node_element<'a>(
     );
 
     let body = column(items).spacing(4);
-    let header = node_header(
-        text(node.display_name.as_str())
+    let title: Element<'_, Message, Theme> = match rename {
+        Some(draft) => text_input("", draft)
+            .id(RENAME_INPUT)
+            .on_input(Message::RenameInput)
+            .on_submit(Message::RenameCommit)
             .size(14)
-            .color(theme.extended().background.weak.text),
+            .padding([1, 4])
+            .width(Length::Fill)
+            .into(),
+        None => container(
+            text(node.display_name.as_str())
+                .size(14)
+                .color(theme.extended().background.weak.text)
+                .wrapping(Wrapping::None),
+        )
+        .width(Length::Fill)
+        .clip(true)
+        .into(),
+    };
+    // The pencil commits an open rename rather than restarting it, so the
+    // button that opened the field is also the one that closes it.
+    let edit = round_button(
+        Icon::Pencil,
+        if rename.is_some() {
+            Message::RenameCommit
+        } else {
+            Message::RenameStart(node.id.0)
+        },
+        button::secondary,
+    );
+    // This node alone, not the selection: the button sits on one node.
+    let delete = round_button(
+        Icon::Close,
+        Message::DeleteNodes(vec![node.id.0]),
+        |theme, status| danger_on_hover(theme, status, button::secondary),
+    );
+    // Left padding clears the 8 px corner the header is rounded with.
+    let header = node_header(
+        row![title, edit, delete]
+            .spacing(4)
+            .align_y(Alignment::Center),
         header_color(theme, &node.category),
         8.0,
-    );
+    )
+    .padding(Padding {
+        top: 3.0,
+        bottom: 3.0,
+        left: 10.0,
+        right: 5.0,
+    });
     let inner = column![header, container(body).padding(6.0)];
     if is_display {
         let size = size.unwrap_or(DISPLAY_SIZE);
@@ -713,6 +761,112 @@ pub(super) fn pin_color(theme: &Theme, ty: &Ty) -> Color {
         Ty::Any => Ansi::BrightWhite,
         Ty::List(_) | Ty::Option(_) | Ty::Record(_) | Ty::Opaque(_) => Ansi::White,
     })
+}
+
+/// A round header button: 18 px across, its symbol centred, the given iced
+/// button style with the corners rounded to a circle.
+fn round_button(
+    icon: Icon,
+    message: Message,
+    style: fn(&iced::Theme, button::Status) -> button::Style,
+) -> Element<'static, Message, Theme> {
+    button(
+        canvas(IconProgram { icon, style })
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .width(18)
+    .height(18)
+    .padding(0)
+    .on_press(message)
+    .style(move |theme: &Theme, status| button::Style {
+        border: iced::border::rounded(9),
+        ..style(theme.base(), status)
+    })
+    .into()
+}
+
+/// What a round header button shows.
+#[derive(Clone, Copy)]
+enum Icon {
+    Pencil,
+    Close,
+}
+
+/// A header button's symbol, drawn as paths around the centre of its button.
+/// A glyph sits where its font's metrics put it, which in an 18 px circle is
+/// visibly off centre, and off by a different amount in every font.
+struct IconProgram {
+    icon: Icon,
+    /// The style of the button around the symbol, which decides its colour.
+    style: fn(&iced::Theme, button::Status) -> button::Style,
+}
+
+impl canvas::Program<Message, Theme> for IconProgram {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &iced::Renderer,
+        theme: &Theme,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        // The button's status does not reach its content; the cursor does.
+        // Hovering is the only status whose colours differ here, and a press
+        // happens under the cursor.
+        let status = if cursor.is_over(bounds) {
+            button::Status::Hovered
+        } else {
+            button::Status::Active
+        };
+        let color = (self.style)(theme.base(), status).text_color;
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let c = frame.center();
+        match self.icon {
+            Icon::Close => {
+                const ARM: f32 = 3.5;
+                let cross = canvas::Path::new(|p| {
+                    p.move_to(c + Vector::new(-ARM, -ARM));
+                    p.line_to(c + Vector::new(ARM, ARM));
+                    p.move_to(c + Vector::new(-ARM, ARM));
+                    p.line_to(c + Vector::new(ARM, -ARM));
+                });
+                frame.stroke(
+                    &cross,
+                    canvas::Stroke::default()
+                        .with_color(color)
+                        .with_width(1.6)
+                        .with_line_cap(canvas::LineCap::Round),
+                );
+            }
+            Icon::Pencil => {
+                // A point `along` the pencil, which points to the top right,
+                // and `across` it. The area's centroid sits on the centre, not
+                // the bounding box: the body outweighs the tip, and a solid
+                // shape centred by its box looks pushed towards its body.
+                // Body 6.4 x 2.8 around 0.8, tip 2.4 long around -4.0.
+                let at = |along: f32, across: f32| {
+                    c + Vector::new(along + across, across - along) * FRAC_1_SQRT_2
+                };
+                let pencil = canvas::Path::new(|p| {
+                    p.move_to(at(-2.4, -1.4));
+                    p.line_to(at(4.0, -1.4));
+                    p.line_to(at(4.0, 1.4));
+                    p.line_to(at(-2.4, 1.4));
+                    p.close();
+                    // The tip, set off from the body by a hairline gap.
+                    p.move_to(at(-3.2, -1.4));
+                    p.line_to(at(-5.6, 0.0));
+                    p.line_to(at(-3.2, 1.4));
+                    p.close();
+                });
+                frame.fill(&pencil, color);
+            }
+        }
+        vec![frame.into_geometry()]
+    }
 }
 
 #[cfg(test)]

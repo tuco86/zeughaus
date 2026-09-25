@@ -15,7 +15,7 @@
 //! from the sequence number it last sent -- a slow client gets fewer,
 //! larger deltas, never a queue of them.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -30,10 +30,12 @@ use zeughaus_mux::{
     ServerHello, TerminalAttach, TerminalAttached, TerminalCommand, TerminalId, TopologyCommand,
     WireError, WorkspaceSnapshot,
 };
-use zeughaus_terminal::{Profile, Session};
+use zeughaus_terminal::{Profile, Session, TerminalHost};
 
 use super::frames::{ReadError, read_frame, write_frame};
+use super::persist::{self, SavedRun, SavedTerminal};
 use super::workspace::Workspace;
+use super::{GraphSync, OwnedPlacement};
 
 /// Scrollback rows sent with a head, above the visible ones: enough that a
 /// wheel notch or two needs no fetch, bounded so an attach stays small.
@@ -87,16 +89,57 @@ struct ClientState {
     replies: BTreeMap<RequestId, CommandOutcome>,
 }
 
+/// What a restarted runner needs to reattach a terminal besides its id,
+/// and what it needs to finish a job run that outlived its starter.
+struct TerminalMeta {
+    label: String,
+    scrollback_rows: usize,
+    run: Option<SavedRun>,
+}
+
+/// The store's graphs as far as the panes that show them care.
+#[derive(Default)]
+struct Graphs {
+    /// This runner's top-level graphs that already had their chance at a
+    /// tab in this process. Not saved: after a restart every graph of this
+    /// runner's that no pane shows gets a tab again.
+    seen: BTreeSet<u64>,
+    /// Every node's display name, for tabs named after a graph.
+    names: HashMap<u64, String>,
+    /// Every node id in the store; `None` until the first sync.
+    exists: Option<HashSet<u64>>,
+}
+
 struct Inner {
     incarnation: RunnerIncarnation,
     profiles: Vec<Profile>,
+    host: TerminalHost,
     workspace: Mutex<Workspace>,
     sessions: Mutex<HashMap<TerminalId, Session>>,
+    /// Taken after `sessions` and `workspace` when all three are needed.
+    meta: Mutex<HashMap<TerminalId, TerminalMeta>>,
+    /// Taken after `workspace`.
+    graphs: Mutex<Graphs>,
     leases: Mutex<HashMap<TerminalId, Lease>>,
     clients: Mutex<HashMap<ClientInstanceId, ClientState>>,
     next_terminal: AtomicU64,
     /// The workspace revision, for control exchanges to wake on.
     revision: watch::Sender<u64>,
+}
+
+impl Inner {
+    fn publish_revision(&self, revision: u64) {
+        // PTY readers and topology commands publish concurrently, after
+        // releasing the workspace lock. A late publisher must not rewind it.
+        self.revision.send_if_modified(|current| {
+            if revision > *current {
+                *current = revision;
+                true
+            } else {
+                false
+            }
+        });
+    }
 }
 
 /// The service handle. Cheap to clone; one per runner.
@@ -106,42 +149,217 @@ pub struct MuxService {
 }
 
 impl MuxService {
-    pub fn new(incarnation: RunnerIncarnation, profiles: Vec<Profile>) -> MuxService {
+    /// The service over `host`. With shims, the terminals a previous runner
+    /// left in them are reattached and the workspace that showed them is
+    /// restored around the ones that came back.
+    pub fn new(
+        incarnation: RunnerIncarnation,
+        profiles: Vec<Profile>,
+        host: TerminalHost,
+    ) -> MuxService {
         let profiles = if profiles.is_empty() {
             vec![Profile::default_shell()]
         } else {
             profiles
         };
         let (revision, _) = watch::channel(1);
-        MuxService {
+        let service = MuxService {
             inner: Arc::new(Inner {
                 incarnation,
                 profiles,
+                host,
                 workspace: Mutex::new(Workspace::new(incarnation)),
                 sessions: Mutex::new(HashMap::new()),
+                meta: Mutex::new(HashMap::new()),
+                graphs: Mutex::new(Graphs::default()),
                 leases: Mutex::new(HashMap::new()),
                 clients: Mutex::new(HashMap::new()),
                 next_terminal: AtomicU64::new(1),
                 revision,
             }),
+        };
+        #[cfg(unix)]
+        if let TerminalHost::Shim(shim) = &service.inner.host {
+            service.restore(shim);
+        }
+        service
+    }
+
+    /// Where the workspace is saved: beside the shims' root. `None` when
+    /// terminals die with this process and there is nothing to restore.
+    fn state_file(&self) -> Option<std::path::PathBuf> {
+        match &self.inner.host {
+            TerminalHost::Local => None,
+            #[cfg(unix)]
+            TerminalHost::Shim(shim) => Some(shim.root.with_file_name("workspace.json")),
         }
     }
 
+    #[cfg(unix)]
+    fn restore(&self, shim: &zeughaus_terminal::ShimHost) {
+        let saved = self.state_file().and_then(|path| persist::load(&path));
+        let mut restored: HashMap<TerminalId, Session> = HashMap::new();
+        let mut meta: HashMap<TerminalId, TerminalMeta> = HashMap::new();
+        for terminal in saved.iter().flat_map(|saved| &saved.terminals) {
+            match Session::reattach(
+                terminal.id,
+                shim,
+                &terminal.label,
+                terminal.scrollback_rows,
+                terminal.size,
+            ) {
+                Ok(session) => {
+                    self.follow_title(&session);
+                    restored.insert(terminal.id, session);
+                    meta.insert(
+                        terminal.id,
+                        TerminalMeta {
+                            label: terminal.label.clone(),
+                            scrollback_rows: terminal.scrollback_rows,
+                            run: terminal.run.clone(),
+                        },
+                    );
+                }
+                Err(e) => eprintln!("[mux] terminal {} not restored: {e}", terminal.id.0),
+            }
+        }
+        let workspace = match &saved {
+            Some(saved) => Workspace::restore(self.inner.incarnation, saved, |id| {
+                restored.contains_key(&id)
+            }),
+            None => Workspace::new(self.inner.incarnation),
+        };
+        // A terminal no pane shows and the runner does not own would be a
+        // shell nobody can ever reach again.
+        restored.retain(|id, session| {
+            let known = workspace.knows(*id);
+            if !known {
+                session.kill();
+                meta.remove(id);
+            }
+            known
+        });
+        // Shims nothing refers to any more: a terminal that did not
+        // reattach, or one whose workspace entry was lost with the file.
+        let mut highest_dir = 0;
+        if let Ok(entries) = std::fs::read_dir(&shim.root) {
+            for entry in entries.flatten() {
+                let Some(id) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|n| n.parse::<u64>().ok())
+                else {
+                    continue;
+                };
+                highest_dir = highest_dir.max(id);
+                if !restored.contains_key(&TerminalId(id)) {
+                    zeughaus_terminal::shim::close_dir(&entry.path());
+                }
+            }
+        }
+        let highest_restored = restored.keys().map(|id| id.0).max().unwrap_or(0);
+        let next = saved
+            .as_ref()
+            .map_or(1, |saved| saved.next_terminal)
+            .max(highest_dir + 1)
+            .max(highest_restored + 1);
+        self.inner.next_terminal.store(next, Ordering::Relaxed);
+        if !restored.is_empty() {
+            eprintln!("[mux] restored {} terminals", restored.len());
+        }
+        *self
+            .inner
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = restored;
+        *self
+            .inner
+            .workspace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = workspace;
+        *self.inner.meta.lock().unwrap_or_else(|e| e.into_inner()) = meta;
+        self.persist();
+    }
+
+    /// Saves the workspace and its terminals for the next runner. Nothing
+    /// to do when terminals end with this process.
+    pub fn persist(&self) {
+        let Some(path) = self.state_file() else {
+            return;
+        };
+        let saved = {
+            // The lock order `snapshot` takes, and `meta` last.
+            let sessions = self
+                .inner
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let workspace = self
+                .inner
+                .workspace
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let meta = self.inner.meta.lock().unwrap_or_else(|e| e.into_inner());
+            let mut terminals: Vec<SavedTerminal> = sessions
+                .iter()
+                .filter_map(|(id, session)| {
+                    let meta = meta.get(id)?;
+                    Some(SavedTerminal {
+                        id: *id,
+                        label: meta.label.clone(),
+                        scrollback_rows: meta.scrollback_rows,
+                        size: session.size(),
+                        run: meta.run.clone(),
+                    })
+                })
+                .collect();
+            terminals.sort_by_key(|t| t.id);
+            workspace.to_saved(self.inner.next_terminal.load(Ordering::Relaxed), terminals)
+        };
+        if let Err(e) = persist::store(&path, &saved) {
+            eprintln!("[mux] cannot save {}: {e}", path.display());
+        }
+    }
+
+    /// The job runs among the terminals this process reattached: runs a
+    /// previous runner started and never saw end.
+    pub fn restored_runs(&self) -> Vec<(TerminalId, SavedRun)> {
+        let meta = self.inner.meta.lock().unwrap_or_else(|e| e.into_inner());
+        let mut runs: Vec<(TerminalId, SavedRun)> = meta
+            .iter()
+            .filter_map(|(id, meta)| Some((*id, meta.run.clone()?)))
+            .collect();
+        runs.sort_by_key(|(id, _)| *id);
+        runs
+    }
+
     /// Starts a terminal the runner owns: a job's process, not a pane's
-    /// shell. No pane shows it until a client attaches it, and closing that
-    /// pane detaches it again instead of ending the child; only
-    /// [`MuxService::close_terminal`] and the runner's exit do that.
+    /// shell. `placement` says whether a pane shows it from the start; a
+    /// detached one waits for a client to attach it. Closing a pane that
+    /// shows it detaches it again instead of ending the child; only
+    /// [`MuxService::close_terminal`], closing its tab in the locked group
+    /// and the runner's exit do that.
     ///
-    /// `tee` receives a copy of every byte the program writes, which is how
-    /// a run's log is recorded.
+    /// `log` is appended every byte the program writes, which is how a
+    /// run's log is recorded; `run` is what a restarted runner needs to
+    /// finish the run's record.
     pub fn spawn_owned(
         &self,
         profile: Profile,
-        tee: Option<Box<dyn std::io::Write + Send>>,
+        log: Option<std::path::PathBuf>,
+        run: Option<SavedRun>,
+        placement: OwnedPlacement,
     ) -> Result<TerminalId, String> {
         let id = TerminalId(self.inner.next_terminal.fetch_add(1, Ordering::Relaxed));
-        let session = Session::spawn_teed(id, &profile, Dimensions { cols: 80, rows: 24 }, tee)
-            .map_err(|e| format!("cannot start {}: {e}", profile.label))?;
+        let session = Session::spawn(
+            id,
+            &profile,
+            Dimensions { cols: 80, rows: 24 },
+            log.as_deref(),
+            &self.inner.host,
+        )
+        .map_err(|e| format!("cannot start {}: {e}", profile.label))?;
+        self.follow_title(&session);
         let revision = {
             // The lock order is the one `snapshot` takes: sessions, then
             // the workspace.
@@ -156,11 +374,47 @@ impl MuxService {
                 .workspace
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            workspace.add_owned(id);
+            workspace.add_owned(id, placement);
+            self.inner
+                .meta
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    id,
+                    TerminalMeta {
+                        label: profile.label,
+                        scrollback_rows: profile.scrollback_rows,
+                        run,
+                    },
+                );
             workspace.revision()
         };
-        self.inner.revision.send_replace(revision);
+        self.inner.publish_revision(revision);
+        self.persist();
         Ok(id)
+    }
+
+    /// Brings the graph panes in line with the store, as
+    /// [`Workspace::sync_graphs`] describes, and keeps the names tabs are
+    /// titled with and the ids `OpenGraph` is checked against.
+    pub fn sync_graphs(&self, update: GraphSync) {
+        let revision = {
+            let mut workspace = self
+                .inner
+                .workspace
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut graphs = self.inner.graphs.lock().unwrap_or_else(|e| e.into_inner());
+            let graphs = &mut *graphs;
+            let changed = workspace.sync_graphs(&update, &graphs.names, &mut graphs.seen);
+            graphs.names = update.names;
+            graphs.exists = Some(update.exists);
+            changed.then(|| workspace.revision())
+        };
+        if let Some(revision) = revision {
+            self.inner.publish_revision(revision);
+            self.persist();
+        }
     }
 
     /// Ends a terminal the runner owns and forgets it, whether a pane shows
@@ -254,11 +508,12 @@ impl MuxService {
         let client = hello.client;
         self.register(client, &principal)?;
         let mut revision = self.inner.revision.subscribe();
+        revision.borrow_and_update();
         let attached = self.attached(&hello, &principal);
+        let mut sent_revision = attached.workspace.revision;
         write_frame(reply, &Message::ControlAttached(attached), 0)
             .await
             .map_err(|e| gone(&e))?;
-        let mut sent_revision = *revision.borrow_and_update();
 
         let mut canceled = std::pin::pin!(canceled);
         let result = loop {
@@ -269,9 +524,9 @@ impl MuxService {
                         break Ok(());
                     }
                     let current = *revision.borrow_and_update();
-                    if current != sent_revision {
-                        sent_revision = current;
+                    if current > sent_revision {
                         let snapshot = self.snapshot();
+                        sent_revision = snapshot.revision;
                         if let Err(e) = write_frame(reply, &Message::WorkspaceSnapshot(snapshot), 0).await {
                             break Err(gone(&e));
                         }
@@ -592,11 +847,37 @@ impl MuxService {
             .workspace
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let mut snapshot = workspace.snapshot(&|t| sessions.get(&t).map(|s| s.title()));
+        let graphs = self.inner.graphs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut snapshot = workspace.snapshot(&|t| sessions.get(&t).map(|s| s.title()), &|g| {
+            graphs.names.get(&g).cloned()
+        });
         // Heads may carry a controller the workspace does not know; the
         // snapshot is structure only. Nothing to merge.
         snapshot.incarnation = self.inner.incarnation;
         snapshot
+    }
+
+    /// Makes `session`'s title changes workspace revisions, so a tab named
+    /// after the terminal is renamed for every client without any of them
+    /// streaming the terminal. Registered before the session is published,
+    /// so no title set after the snapshot that first shows it is lost.
+    fn follow_title(&self, session: &Session) {
+        // Weak: the service owns the session, which owns this listener.
+        let inner = Arc::downgrade(&self.inner);
+        let terminal = session.id();
+        session.on_title_change(move || {
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
+            let revision = {
+                let mut workspace = inner.workspace.lock().unwrap_or_else(|e| e.into_inner());
+                if !workspace.title_changed(terminal) {
+                    return;
+                }
+                workspace.revision()
+            };
+            inner.publish_revision(revision);
+        });
     }
 
     /// The session behind a terminal id, if it still exists.
@@ -726,7 +1007,7 @@ impl MuxService {
     }
 
     fn structural(&self, command: &TopologyCommand) -> CommandOutcome {
-        let mut spawned: Vec<(TerminalId, Session)> = Vec::new();
+        let mut spawned: Vec<(TerminalId, Session, TerminalMeta)> = Vec::new();
         let mut spawn = |profile: ProfileId| -> Result<TerminalId, String> {
             let profile = self
                 .inner
@@ -734,9 +1015,20 @@ impl MuxService {
                 .get(profile.0 as usize)
                 .ok_or_else(|| format!("no profile {}", profile.0))?;
             let id = TerminalId(self.inner.next_terminal.fetch_add(1, Ordering::Relaxed));
-            let session = Session::spawn(id, profile, Dimensions { cols: 80, rows: 24 })
-                .map_err(|e| format!("cannot start {}: {e}", profile.label))?;
-            spawned.push((id, session));
+            let session = Session::spawn(
+                id,
+                profile,
+                Dimensions { cols: 80, rows: 24 },
+                None,
+                &self.inner.host,
+            )
+            .map_err(|e| format!("cannot start {}: {e}", profile.label))?;
+            let meta = TerminalMeta {
+                label: profile.label.clone(),
+                scrollback_rows: profile.scrollback_rows,
+                run: None,
+            };
+            spawned.push((id, session, meta));
             Ok(id)
         };
         let result = {
@@ -745,9 +1037,11 @@ impl MuxService {
                 .workspace
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            workspace
-                .apply(command, &mut spawn)
-                .map(|applied| (workspace.revision(), applied))
+            self.known_graph(command).and_then(|()| {
+                workspace
+                    .apply(command, &mut spawn)
+                    .map(|applied| (workspace.revision(), applied))
+            })
         };
         match result {
             Ok((revision, applied)) => {
@@ -757,29 +1051,55 @@ impl MuxService {
                         .sessions
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    for (id, session) in spawned {
+                    let mut metas = self.inner.meta.lock().unwrap_or_else(|e| e.into_inner());
+                    for (id, session, meta) in spawned {
+                        self.follow_title(&session);
                         sessions.insert(id, session);
+                        metas.insert(id, meta);
                     }
                     let mut leases = self.inner.leases.lock().unwrap_or_else(|e| e.into_inner());
                     for id in &applied.killed {
                         leases.remove(id);
+                        metas.remove(id);
                         if let Some(session) = sessions.remove(id) {
                             session.kill();
                         }
                     }
                 }
-                self.inner.revision.send_replace(revision);
+                self.inner.publish_revision(revision);
+                self.persist();
                 CommandOutcome::Applied { revision }
             }
             Err(reason) => {
                 // A spawn that succeeded before the command failed is a
                 // child nobody shows: end it.
-                for (_, session) in spawned {
+                for (_, session, _) in spawned {
                     session.kill();
                 }
                 CommandOutcome::Refused { reason }
             }
         }
+    }
+
+    /// Refuses to open a graph the store does not hold, which would be a
+    /// pane with nothing to show. Before the first sync nothing is known and
+    /// everything is let through; a sync removes the pane if the graph turns
+    /// out to be gone. Called with the workspace locked, as the lock order
+    /// asks.
+    fn known_graph(&self, command: &TopologyCommand) -> Result<(), String> {
+        if let TopologyCommand::OpenGraph { graph } = command
+            && self
+                .inner
+                .graphs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .exists
+                .as_ref()
+                .is_some_and(|ids| !ids.contains(graph))
+        {
+            return Err(format!("no graph {graph}"));
+        }
+        Ok(())
     }
 }
 
@@ -811,8 +1131,7 @@ mod tests {
     use weida::{ClientTls, EndpointAddr, Identity, Runtime, RuntimeConfig, ServerTls, Trust};
     use zeughaus_mux::input::Key;
     use zeughaus_mux::{
-        AttachTarget, Axis, KeyInput, Modifiers, NamedKey, PaneId, PaneNode, SurfaceRef,
-        TerminalEvent,
+        AttachTarget, Axis, KeyInput, Modifiers, NamedKey, SurfaceRef, TerminalEvent,
     };
 
     struct Client {
@@ -874,7 +1193,11 @@ mod tests {
             env: vec![("PS1".into(), "$ ".into())],
             scrollback_rows: 100,
         };
-        let service = MuxService::new(RunnerIncarnation::from_bytes([7; 16]), vec![shell]);
+        let service = MuxService::new(
+            RunnerIncarnation::from_bytes([7; 16]),
+            vec![shell],
+            TerminalHost::Local,
+        );
         tokio::spawn(service.clone().accept(replier));
         let url = EndpointAddr {
             host: "127.0.0.1".into(),
@@ -946,7 +1269,7 @@ mod tests {
         let Message::ControlAttached(attached) = control.next().await else {
             panic!("expected ControlAttached");
         };
-        assert_eq!(attached.workspace.tabs.len(), 1);
+        assert_eq!(attached.workspace.tabs().count(), 0);
         assert!(attached.heads.is_empty());
         assert_eq!(
             attached.hello.principal,
@@ -1258,8 +1581,8 @@ mod tests {
         assert!(service.controls(terminal, carol.id));
         drop(carol_term);
 
-        // Closing the pane kills the child and answers with the graph alone.
-        let pane = attached.workspace.tabs[1].root.leaves()[0].0;
+        // Closing the pane kills the child and leaves no tab behind.
+        let pane = attached.workspace.tabs().next().unwrap().root.leaves()[0].0;
         control
             .send(
                 Message::Command(Command {
@@ -1275,14 +1598,7 @@ mod tests {
                     assert!(matches!(reply.outcome, CommandOutcome::Applied { .. }));
                 }
                 Message::WorkspaceSnapshot(snapshot) => {
-                    assert_eq!(snapshot.tabs.len(), 1);
-                    assert!(matches!(
-                        snapshot.tabs[0].root,
-                        PaneNode::Leaf {
-                            surface: SurfaceRef::Graph,
-                            ..
-                        }
-                    ));
+                    assert_eq!(snapshot.tabs().count(), 0);
                 }
                 other => panic!("unexpected {:?}", other.kind()),
             }
@@ -1326,24 +1642,44 @@ mod tests {
             "the exchange is finished"
         );
 
-        // Splitting the graph pane still works on the reconnected control.
+        // A graph opened on the reconnected control is a pane like any other.
         control
             .send(
                 Message::Command(Command {
                     request: RequestId(2),
+                    command: TopologyCommand::OpenGraph { graph: 7 },
+                }),
+                2,
+            )
+            .await;
+        let mut graph_pane = None;
+        for _ in 0..2 {
+            if let Message::WorkspaceSnapshot(s) = control.next().await {
+                graph_pane = s
+                    .tabs()
+                    .flat_map(|tab| tab.root.leaves())
+                    .find(|(_, surface)| *surface == SurfaceRef::Graph(7))
+                    .map(|(pane, _)| pane);
+            }
+        }
+        let graph_pane = graph_pane.expect("the snapshot shows the graph");
+        control
+            .send(
+                Message::Command(Command {
+                    request: RequestId(3),
                     command: TopologyCommand::SplitWithTerminal {
-                        pane: PaneId(1),
+                        pane: graph_pane,
                         axis: Axis::Horizontal,
                         profile: ProfileId::DEFAULT,
                     },
                 }),
-                2,
+                3,
             )
             .await;
         let mut split_seen = false;
         for _ in 0..2 {
             if let Message::WorkspaceSnapshot(s) = control.next().await {
-                split_seen = s.tabs[0].root.leaf_count() == 2;
+                split_seen = s.tabs().next().unwrap().root.leaf_count() == 2;
             }
         }
         assert!(split_seen);
@@ -1500,6 +1836,8 @@ mod tests {
                     scrollback_rows: 100,
                 },
                 None,
+                None,
+                OwnedPlacement::Detached,
             )
             .expect("start the job's process");
 
@@ -1554,5 +1892,97 @@ mod tests {
             "a closed terminal is forgotten"
         );
         assert!(service.close_terminal(job).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_title_the_child_sets_renames_its_tab_without_a_terminal_stream() {
+        let (service, runtime, _binding, url, identity) = setup().await;
+        let alice = client(&runtime, &url, &identity, 1).await;
+        let mut control = open(&alice, hello(&alice)).await;
+        let Message::ControlAttached(_) = control.next().await else {
+            panic!("expected ControlAttached");
+        };
+        control
+            .send(
+                Message::Command(Command {
+                    request: RequestId(1),
+                    command: TopologyCommand::NewTerminalTab {
+                        profile: ProfileId::DEFAULT,
+                    },
+                }),
+                1,
+            )
+            .await;
+        let mut terminal = None;
+        for _ in 0..2 {
+            if let Message::WorkspaceSnapshot(snapshot) = control.next().await {
+                terminal = snapshot.terminals().next();
+            }
+        }
+        let terminal = terminal.expect("the snapshot names the terminal");
+
+        // Nobody attaches to the terminal: the title has to arrive on the
+        // control exchange alone.
+        service
+            .session(terminal)
+            .expect("session")
+            .apply(&TerminalCommand::Text {
+                serial: 1,
+                text: "printf '\\033]0;renamed\\007'\n".into(),
+            })
+            .expect("type");
+        for _ in 0..20 {
+            match control.next().await {
+                Message::WorkspaceSnapshot(snapshot)
+                    if snapshot
+                        .tabs()
+                        .next()
+                        .is_some_and(|tab| tab.title == "renamed") =>
+                {
+                    let tab = snapshot.tabs().next().unwrap().id;
+                    assert!(matches!(
+                        service.structural(&TopologyCommand::CloseTab { tab }),
+                        CommandOutcome::Applied { .. }
+                    ));
+                    return;
+                }
+                Message::WorkspaceSnapshot(_) => {}
+                other => panic!("unexpected {:?}", other.kind()),
+            }
+        }
+        panic!("no snapshot carried the new title");
+    }
+
+    #[test]
+    fn a_graph_tab_is_named_after_its_node_and_only_a_known_graph_opens() {
+        let service = MuxService::new(
+            RunnerIncarnation::from_bytes([7; 16]),
+            Vec::new(),
+            TerminalHost::Local,
+        );
+        // Before the first sync nothing is known, so nothing is refused.
+        assert!(matches!(
+            service.structural(&TopologyCommand::OpenGraph { graph: 5 }),
+            CommandOutcome::Applied { .. }
+        ));
+        service.sync_graphs(GraphSync {
+            owned: vec![1],
+            names: HashMap::from([(1, "Pipeline".to_owned())]),
+            exists: HashSet::from([1]),
+        });
+        let snapshot = service.snapshot();
+        assert_eq!(
+            snapshot
+                .tabs()
+                .map(|t| t.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Pipeline"],
+            "the missing graph's tab went, the runner's own came"
+        );
+        assert_eq!(*service.inner.revision.borrow(), snapshot.revision);
+        assert!(matches!(
+            service.structural(&TopologyCommand::OpenGraph { graph: 5 }),
+            CommandOutcome::Refused { .. }
+        ));
     }
 }

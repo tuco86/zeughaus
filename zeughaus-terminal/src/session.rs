@@ -20,8 +20,10 @@
 //! GUI detached; only [`Session::kill`] and the runner's process exit end a
 //! child (`TERMINAL_MUX_ARCHITECTURE_PLAN.md`, "Authority and lifetime").
 
+use std::ffi::OsString;
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -87,7 +89,9 @@ impl Profile {
         }
     }
 
-    fn command(&self) -> CommandBuilder {
+    /// The one place a profile becomes a command line, for a local PTY and
+    /// a shim's alike.
+    pub(crate) fn command(&self) -> CommandBuilder {
         let mut cmd = match &self.program {
             Some(program) => {
                 let mut cmd = CommandBuilder::new(program);
@@ -111,8 +115,38 @@ impl Profile {
         cmd
     }
 
-    fn scrollback(&self) -> usize {
+    pub(crate) fn scrollback(&self) -> usize {
         self.scrollback_rows.min(MAX_SCROLLBACK_ROWS)
+    }
+}
+
+/// Where a terminal's PTY and child live.
+#[derive(Debug, Clone)]
+pub enum TerminalHost {
+    /// In this process: the child ends when the process does.
+    Local,
+    /// In a shim process per terminal, which outlives this one.
+    #[cfg(unix)]
+    Shim(ShimHost),
+}
+
+/// How to start a shim, and where shims keep their directories.
+///
+/// The shim is started as `program args... <root>/<terminal-id>`; for the
+/// runner that is its own executable with the `shim` subcommand.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub struct ShimHost {
+    pub program: PathBuf,
+    pub args: Vec<OsString>,
+    pub root: PathBuf,
+}
+
+#[cfg(unix)]
+impl ShimHost {
+    /// The directory of terminal `id`'s shim.
+    pub fn dir(&self, id: TerminalId) -> PathBuf {
+        self.root.join(id.0.to_string())
     }
 }
 
@@ -138,17 +172,26 @@ impl std::fmt::Display for SpawnError {
 
 impl std::error::Error for SpawnError {}
 
+/// What drives the child: the PTY in this process, or a shim's socket.
+enum Io {
+    Local {
+        master: Mutex<Box<dyn MasterPty + Send>>,
+        killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    },
+    #[cfg(unix)]
+    Shim { sender: crate::shim::ShimSender },
+}
+
 struct Inner {
     id: TerminalId,
     model: Mutex<Model>,
     /// Filled by the alert handler while the terminal is borrowed, drained by
     /// the reader under the model lock.
     alerts: Arc<Mutex<Vec<Alert>>>,
-    /// The one writer the PTY gives out, shared by the terminal (key and
-    /// mouse encodings, answerbacks) and by committed text.
+    /// The one writer the child's input goes through, shared by the terminal
+    /// (key and mouse encodings, answerbacks) and by committed text.
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    master: Mutex<Box<dyn MasterPty + Send>>,
-    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    io: Io,
     /// Set before the signal, read after the wait: it is what turns whatever
     /// status the kill produced into [`ExitState::Killed`].
     killed: AtomicBool,
@@ -157,9 +200,62 @@ struct Inner {
     /// it. A job's log is this sink; a write error ends the tee and leaves
     /// the terminal running.
     tee: Mutex<Option<Box<dyn Write + Send>>>,
+    /// Called by the reader after the child changed the terminal's title.
+    /// The title reaches places no subscriber streams to (a workspace's tab
+    /// bar), so it has its own notice besides `changes`.
+    on_title: Mutex<Option<TitleListener>>,
 }
 
+/// What [`Session::on_title_change`] registers.
+type TitleListener = Arc<dyn Fn() + Send + Sync>;
+
 impl Inner {
+    /// The shared state of a session whose child `io` drives. `writer` is
+    /// where the child's input goes; the terminal writes through it only
+    /// while `muted` is clear.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        id: TerminalId,
+        size: Dimensions,
+        scrollback: usize,
+        label: &str,
+        writer: Box<dyn Write + Send>,
+        io: Io,
+        tee: Option<Box<dyn Write + Send>>,
+        muted: Arc<AtomicBool>,
+    ) -> Arc<Inner> {
+        let writer = Arc::new(Mutex::new(writer));
+        let alerts: Arc<Mutex<Vec<Alert>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut model = Model::new(
+            size,
+            scrollback,
+            label,
+            Box::new(SharedWriter {
+                writer: Arc::clone(&writer),
+                muted,
+            }),
+        );
+        // ConPTY reports a resize and moves the cursor differently enough
+        // that the terminal has a mode for it.
+        #[cfg(windows)]
+        model.terminal_mut().enable_conpty_quirks();
+        model
+            .terminal_mut()
+            .set_notification_handler(Box::new(Alerts(Arc::clone(&alerts))));
+        let (changes, _) = watch::channel(model.seq());
+        Arc::new(Inner {
+            id,
+            model: Mutex::new(model),
+            alerts,
+            writer,
+            io,
+            killed: AtomicBool::new(false),
+            changes,
+            tee: Mutex::new(tee),
+            on_title: Mutex::new(None),
+        })
+    }
+
     fn model(&self) -> MutexGuard<'_, Model> {
         // A panic under the lock must not take the whole mux down with it:
         // the terminal's state is a screen, not an invariant a client can
@@ -181,30 +277,22 @@ pub struct Session {
 }
 
 impl Session {
-    /// Open a PTY, start the profile's program in it, and begin parsing its
-    /// output.
+    /// Starts the profile's program in a PTY on `host`, and begins parsing
+    /// its output.
     ///
-    /// Returns as soon as the child exists; output arrives on the reader
+    /// `log`, when given, is appended every byte the child writes before it
+    /// is parsed: the raw PTY stream, escape sequences included, which is a
+    /// recording of what the program produced rather than of what the screen
+    /// shows. A write error ends the log and the terminal carries on.
+    ///
+    /// Returns as soon as the child exists; output arrives on a reader
     /// thread and is announced through [`Session::changes`].
     pub fn spawn(
         id: TerminalId,
         profile: &Profile,
         size: Dimensions,
-    ) -> Result<Session, SpawnError> {
-        Session::spawn_teed(id, profile, size, None)
-    }
-
-    /// Like [`Session::spawn`], additionally copying every byte the child
-    /// writes to `tee` before it is parsed.
-    ///
-    /// The tee sees the raw PTY stream, escape sequences included: it is a
-    /// recording of what the program produced, not of what the screen shows.
-    /// A write error drops the sink and the terminal carries on.
-    pub fn spawn_teed(
-        id: TerminalId,
-        profile: &Profile,
-        size: Dimensions,
-        tee: Option<Box<dyn Write + Send>>,
+        log: Option<&Path>,
+        host: &TerminalHost,
     ) -> Result<Session, SpawnError> {
         if !size.is_valid() {
             return Err(SpawnError::Pty(format!(
@@ -212,6 +300,29 @@ impl Session {
                 size.cols, size.rows
             )));
         }
+        match host {
+            TerminalHost::Local => Session::spawn_local(id, profile, size, log),
+            #[cfg(unix)]
+            TerminalHost::Shim(shim) => Session::spawn_shim(id, profile, size, log, shim),
+        }
+    }
+
+    fn spawn_local(
+        id: TerminalId,
+        profile: &Profile,
+        size: Dimensions,
+        log: Option<&Path>,
+    ) -> Result<Session, SpawnError> {
+        let tee: Option<Box<dyn Write + Send>> = match log {
+            Some(path) => Some(Box::new(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .map_err(|e| SpawnError::Spawn(format!("{}: {e}", path.display())))?,
+            )),
+            None => None,
+        };
         let pty = native_pty_system()
             .openpty(pty_size(size))
             .map_err(|e| SpawnError::Pty(e.to_string()))?;
@@ -228,46 +339,203 @@ impl Session {
         // failure now must take it with us rather than leave a shell running
         // in a PTY no one will ever read.
         let mut killer = child.clone_killer();
-        let writer = Arc::new(Mutex::new(
-            master
-                .take_writer()
-                .map_err(|e| orphan(killer.as_mut(), &e))?,
-        ));
+        let writer = master
+            .take_writer()
+            .map_err(|e| orphan(killer.as_mut(), &e))?;
         let reader = master
             .try_clone_reader()
             .map_err(|e| orphan(killer.as_mut(), &e))?;
 
-        let alerts: Arc<Mutex<Vec<Alert>>> = Arc::new(Mutex::new(Vec::new()));
-        let mut model = Model::new(
+        let inner = Inner::new(
+            id,
             size,
             profile.scrollback(),
             &profile.label,
-            Box::new(SharedWriter(Arc::clone(&writer))),
-        );
-        // ConPTY reports a resize and moves the cursor differently enough
-        // that the terminal has a mode for it.
-        #[cfg(windows)]
-        model.terminal_mut().enable_conpty_quirks();
-        model
-            .terminal_mut()
-            .set_notification_handler(Box::new(Alerts(Arc::clone(&alerts))));
-        let (changes, _) = watch::channel(model.seq());
-
-        let inner = Arc::new(Inner {
-            id,
-            model: Mutex::new(model),
-            alerts,
             writer,
-            master: Mutex::new(master),
-            killer: Mutex::new(killer),
-            killed: AtomicBool::new(false),
-            changes,
-            tee: Mutex::new(tee),
-        });
-
+            Io::Local {
+                master: Mutex::new(master),
+                killer: Mutex::new(killer),
+            },
+            tee,
+            Arc::new(AtomicBool::new(false)),
+        );
         let session = Session { inner };
         session.start_threads(reader, child)?;
         Ok(session)
+    }
+
+    /// Writes the shim's spec, starts it, and attaches to it once its socket
+    /// answers.
+    #[cfg(unix)]
+    fn spawn_shim(
+        id: TerminalId,
+        profile: &Profile,
+        size: Dimensions,
+        log: Option<&Path>,
+        host: &ShimHost,
+    ) -> Result<Session, SpawnError> {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let dir = host.dir(id);
+        let failed = |e: &dyn std::fmt::Display| {
+            let _ = std::fs::remove_dir_all(&dir);
+            SpawnError::Spawn(format!("shim {}: {e}", dir.display()))
+        };
+        // Owner-only: whoever can connect to `sock` can type into the shell.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|e| failed(&e))?;
+        let spec = crate::shim::ShimSpec {
+            label: profile.label.clone(),
+            program: profile.program.clone(),
+            args: profile.args.clone(),
+            cwd: profile.cwd.clone(),
+            env: profile.env.clone(),
+            scrollback_rows: profile.scrollback_rows,
+            cols: size.cols,
+            rows: size.rows,
+            log: log.map(Path::to_path_buf),
+        };
+        let json = serde_json::to_vec_pretty(&spec).map_err(|e| failed(&e))?;
+        std::fs::write(dir.join("spec.json"), json).map_err(|e| failed(&e))?;
+        let shim_log = dir.join("shim.log");
+        let stderr = std::fs::File::create(&shim_log).map_err(|e| failed(&e))?;
+        // The shim forks away from this child at once; waiting for it is
+        // what keeps it from lingering as a zombie.
+        let status = Command::new(&host.program)
+            .args(&host.args)
+            .arg(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr)
+            .status()
+            .map_err(|e| failed(&e))?;
+        if !status.success() {
+            return Err(failed(&format!("exited with {status}")));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match crate::shim::ShimConn::connect(&dir) {
+                Ok(conn) => {
+                    return Session::attach_shim(
+                        id,
+                        &profile.label,
+                        profile.scrollback(),
+                        size,
+                        conn,
+                        false,
+                    );
+                }
+                Err(e) => {
+                    // A shim that could not start its program says why on
+                    // its stderr and exits before it ever binds the socket.
+                    let said = std::fs::read_to_string(&shim_log).unwrap_or_default();
+                    if !said.trim().is_empty() && !dir.join("sock").exists() {
+                        return Err(failed(&said.trim()));
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(failed(&e));
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Attaches to the shim of a terminal a previous runner started, and
+    /// rebuilds its screen from the shim's replay.
+    ///
+    /// `size` is the grid the terminal last had: the replay is parsed at
+    /// it, and the child is asked to redraw afterwards, because whatever
+    /// scrolled out of the replay is gone.
+    #[cfg(unix)]
+    pub fn reattach(
+        id: TerminalId,
+        host: &ShimHost,
+        label: &str,
+        scrollback_rows: usize,
+        size: Dimensions,
+    ) -> Result<Session, SpawnError> {
+        if !size.is_valid() {
+            return Err(SpawnError::Pty(format!(
+                "refusing a {}x{} grid",
+                size.cols, size.rows
+            )));
+        }
+        let conn = crate::shim::ShimConn::connect(&host.dir(id))?;
+        Session::attach_shim(
+            id,
+            label,
+            scrollback_rows.min(MAX_SCROLLBACK_ROWS),
+            size,
+            conn,
+            true,
+        )
+    }
+
+    #[cfg(unix)]
+    fn attach_shim(
+        id: TerminalId,
+        label: &str,
+        scrollback: usize,
+        size: Dimensions,
+        (conn, welcome, replay): (crate::shim::ShimConn, crate::shim::Welcome, Vec<u8>),
+        redraw: bool,
+    ) -> Result<Session, SpawnError> {
+        use crate::shim::proto::ToShim;
+
+        let sender = conn.sender();
+        // Muted while the replay is parsed: the queries in it (device
+        // attributes, cursor position) were answered when they were live,
+        // and answering them again would type the answers into the shell.
+        let muted = Arc::new(AtomicBool::new(true));
+        let inner = Inner::new(
+            id,
+            size,
+            scrollback,
+            label,
+            Box::new(ShimInput(sender.clone())),
+            Io::Shim {
+                sender: sender.clone(),
+            },
+            None,
+            Arc::clone(&muted),
+        );
+        {
+            let mut model = inner.model();
+            model.advance(&replay);
+            // Bells in the replay rang long ago; a title it set is still the
+            // terminal's title.
+            for alert in take_alerts(&inner.alerts) {
+                if matches!(
+                    alert,
+                    Alert::WindowTitleChanged(_) | Alert::IconTitleChanged(_)
+                ) {
+                    model.note_title();
+                }
+            }
+            if let Some(exit) = welcome.exit {
+                model.set_exit(shim_exit(&inner, exit));
+            }
+        }
+        muted.store(false, Ordering::SeqCst);
+        inner.publish();
+        if redraw {
+            // Best effort: a shim that is already gone shows up as the
+            // reader's end of stream.
+            let _ = sender.send(&ToShim::Redraw);
+        }
+        let reading = Arc::clone(&inner);
+        std::thread::Builder::new()
+            .name(format!("zh-shim-read-{}", id.0))
+            .spawn(move || shim_loop(reading, conn))
+            .map_err(|e| SpawnError::Spawn(e.to_string()))?;
+        Ok(Session { inner })
     }
 
     fn start_threads(
@@ -295,6 +563,11 @@ impl Session {
                 SpawnError::Spawn(e.to_string())
             })?;
         Ok(())
+    }
+
+    /// The grid the terminal currently has.
+    pub fn size(&self) -> Dimensions {
+        self.inner.model().size()
     }
 
     pub fn id(&self) -> TerminalId {
@@ -332,6 +605,18 @@ impl Session {
 
     pub fn title(&self) -> String {
         self.inner.model().title()
+    }
+
+    /// Registers `listener` to be called whenever [`Session::title`] changes,
+    /// replacing any earlier one. It runs on the PTY reader thread with no
+    /// lock of this session held, so it may call back into the session; it
+    /// must not block, because output waits for it.
+    pub fn on_title_change(&self, listener: impl Fn() + Send + Sync + 'static) {
+        *self
+            .inner
+            .on_title
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(listener));
     }
 
     /// Record who holds the control lease. The engine does not enforce it --
@@ -402,8 +687,20 @@ impl Session {
                     pixel_height: 0,
                     dpi: 0,
                 });
-                let master = self.inner.master.lock().unwrap_or_else(|e| e.into_inner());
-                master.resize(pty_size(*size)).map_err(|e| e.to_string())?;
+                match &self.inner.io {
+                    Io::Local { master, .. } => master
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .resize(pty_size(*size))
+                        .map_err(|e| e.to_string())?,
+                    #[cfg(unix)]
+                    Io::Shim { sender } => sender
+                        .send(&crate::shim::proto::ToShim::Resize {
+                            cols: size.cols,
+                            rows: size.rows,
+                        })
+                        .map_err(|e| e.to_string())?,
+                }
             }
             TerminalCommand::Focus(focused) => {
                 self.inner.model().terminal_mut().focus_changed(*focused);
@@ -416,11 +713,19 @@ impl Session {
 
     /// Kill the child. The exit is recorded as [`ExitState::Killed`] whatever
     /// signal or status it produced, because what a closing pane wants to
-    /// know is that this was deliberate.
+    /// know is that this was deliberate. A shim is told to close, which also
+    /// ends the shim and removes its directory.
     pub fn kill(&self) {
         self.inner.killed.store(true, Ordering::SeqCst);
-        let mut killer = self.inner.killer.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = killer.kill();
+        match &self.inner.io {
+            Io::Local { killer, .. } => {
+                let _ = killer.lock().unwrap_or_else(|e| e.into_inner()).kill();
+            }
+            #[cfg(unix)]
+            Io::Shim { sender } => {
+                let _ = sender.send(&crate::shim::proto::ToShim::Close);
+            }
+        }
     }
 
     fn write(&self, bytes: &[u8]) -> Result<(), String> {
@@ -438,7 +743,7 @@ impl std::fmt::Debug for Session {
     }
 }
 
-fn pty_size(size: Dimensions) -> PtySize {
+pub(crate) fn pty_size(size: Dimensions) -> PtySize {
     PtySize {
         rows: size.rows,
         cols: size.cols,
@@ -460,6 +765,10 @@ fn orphan(killer: &mut dyn ChildKiller, error: &dyn std::fmt::Display) -> SpawnE
 /// the exit status stay readable until the pane is closed.
 fn read_loop(inner: Arc<Inner>, mut reader: Box<dyn Read + Send>) {
     let mut buf = vec![0u8; READ_CHUNK];
+    // What the listener was last told, compared only in chunks that carry a
+    // title alert: a shell that re-sends the same title per prompt is not a
+    // change.
+    let mut title = inner.model().title();
     loop {
         let read = match reader.read(&mut buf) {
             Ok(0) => break,
@@ -470,44 +779,116 @@ fn read_loop(inner: Arc<Inner>, mut reader: Box<dyn Read + Send>) {
             // back as EOF.
             Err(_) => break,
         };
-        // The tee copies the raw stream first: what a job's log records is
-        // what the program wrote, whatever the parser then makes of it.
-        {
-            let mut tee = inner.tee.lock().unwrap_or_else(|e| e.into_inner());
-            let failed = match tee.as_mut() {
-                Some(sink) => sink
-                    .write_all(&buf[..read])
-                    .and_then(|()| sink.flush())
-                    .is_err(),
-                None => false,
-            };
-            if failed {
-                *tee = None;
-            }
+        consume(&inner, &buf[..read], &mut title);
+    }
+}
+
+/// One chunk of the child's output: teed, parsed, published.
+fn consume(inner: &Inner, chunk: &[u8], title: &mut String) {
+    // The tee copies the raw stream first: what a job's log records is
+    // what the program wrote, whatever the parser then makes of it.
+    {
+        let mut tee = inner.tee.lock().unwrap_or_else(|e| e.into_inner());
+        let failed = match tee.as_mut() {
+            Some(sink) => sink.write_all(chunk).and_then(|()| sink.flush()).is_err(),
+            None => false,
+        };
+        if failed {
+            *tee = None;
         }
-        {
-            let mut model = inner.model();
-            model.advance(&buf[..read]);
-            for alert in take_alerts(&inner.alerts) {
-                match alert {
-                    // A bell is ordered: it is the one alert a client must
-                    // see even if it never looks at the rows that caused it.
-                    Alert::Bell => {
-                        model.record(TerminalEvent::Bell);
-                    }
-                    // The title itself is read from the terminal; what the
-                    // alert adds is that the child has named itself at all,
-                    // and the profile's label stops standing in for it.
-                    Alert::WindowTitleChanged(_) | Alert::IconTitleChanged(_) => {
-                        model.note_title();
-                    }
-                    // Everything else is state the next head or delta
-                    // carries anyway (palette, working directory, progress).
-                    _ => {}
+    }
+    let mut retitled = false;
+    {
+        let mut model = inner.model();
+        model.advance(chunk);
+        for alert in take_alerts(&inner.alerts) {
+            match alert {
+                // A bell is ordered: it is the one alert a client must
+                // see even if it never looks at the rows that caused it.
+                Alert::Bell => {
+                    model.record(TerminalEvent::Bell);
                 }
+                // The title itself is read from the terminal; what the
+                // alert adds is that the child has named itself at all,
+                // and the profile's label stops standing in for it.
+                Alert::WindowTitleChanged(_) | Alert::IconTitleChanged(_) => {
+                    model.note_title();
+                    retitled = true;
+                }
+                // Everything else is state the next head or delta
+                // carries anyway (palette, working directory, progress).
+                _ => {}
             }
         }
-        inner.publish();
+        if retitled {
+            let now = model.title();
+            retitled = now != *title;
+            *title = now;
+        }
+    }
+    inner.publish();
+    if retitled {
+        // Cloned out so the listener runs with no lock held, the slot's
+        // own included.
+        let listener = inner
+            .on_title
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(listener) = listener {
+            listener();
+        }
+    }
+}
+
+/// The shim backend's reader and waiter in one: output is parsed like a
+/// local PTY's, the child's exit arrives as a frame, and the end of the
+/// connection is the end of the shim.
+#[cfg(unix)]
+fn shim_loop(inner: Arc<Inner>, mut conn: crate::shim::ShimConn) {
+    use crate::shim::proto::FromShim;
+
+    let mut title = inner.model().title();
+    loop {
+        match conn.recv() {
+            Ok(Some(FromShim::Output(chunk))) => consume(&inner, chunk, &mut title),
+            Ok(Some(FromShim::Exited(exit))) => {
+                let exit = shim_exit(&inner, exit);
+                inner.model().set_exit(exit);
+                inner.publish();
+            }
+            Ok(Some(FromShim::Welcome(_))) => {}
+            Ok(None) | Err(_) => {
+                // A shim ends by being closed, or by dying. The first is the
+                // kill this session asked for; the second leaves a child
+                // nobody can reach, which is over as far as a pane can tell.
+                let exit = if inner.killed.load(Ordering::SeqCst) {
+                    ExitState::Killed
+                } else {
+                    ExitState::SpawnFailed {
+                        reason: "the terminal's shim is gone".to_owned(),
+                    }
+                };
+                inner.model().set_exit(exit);
+                inner.publish();
+                return;
+            }
+        }
+    }
+}
+
+/// A shim's report of its child's end, as the session records it.
+#[cfg(unix)]
+fn shim_exit(inner: &Inner, exit: crate::shim::ShimExit) -> ExitState {
+    if exit.killed || inner.killed.load(Ordering::SeqCst) {
+        return ExitState::Killed;
+    }
+    match (exit.signal, exit.code) {
+        (Some(signal), _) => ExitState::Signaled { signal },
+        (None, Some(code)) => ExitState::Exited { code },
+        (None, None) => ExitState::SpawnFailed {
+            reason: "the shim could not reap its child".to_owned(),
+        },
     }
 }
 
@@ -547,16 +928,24 @@ fn wait_loop(inner: Arc<Inner>, mut child: Box<dyn Child + Send + Sync>) {
     inner.publish();
 }
 
-/// The PTY's single writer, shared by the terminal and by committed text.
+/// The child's single input, shared by the terminal and by committed text.
 ///
 /// `take_writer` may be called once, and `Terminal` wants to own what it is
 /// given, so the terminal gets this shim and everything else goes through the
 /// same mutex behind it. One writer, two users, no interleaved half-writes.
-struct SharedWriter(Arc<Mutex<Box<dyn Write + Send>>>);
+/// While `muted`, what the terminal writes is dropped: its answers to a
+/// replay's queries are not input.
+struct SharedWriter {
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    muted: Arc<AtomicBool>,
+}
 
 impl Write for SharedWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0
+        if self.muted.load(Ordering::SeqCst) {
+            return Ok(buf.len());
+        }
+        self.writer
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .write_all(buf)
@@ -564,7 +953,28 @@ impl Write for SharedWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).flush()
+        self.writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .flush()
+    }
+}
+
+/// Input to a shim's child, framed.
+#[cfg(unix)]
+struct ShimInput(crate::shim::ShimSender);
+
+#[cfg(unix)]
+impl Write for ShimInput {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Bounded per frame; `write_all` sends the rest in the next ones.
+        let n = buf.len().min(crate::shim::proto::OUTPUT_CHUNK);
+        self.0.send(&crate::shim::proto::ToShim::Input(&buf[..n]))?;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -634,6 +1044,8 @@ mod tests {
             TerminalId(7),
             &shell("printf hello; exit 3"),
             Dimensions { cols: 40, rows: 6 },
+            None,
+            &TerminalHost::Local,
         )
         .expect("spawn /bin/sh");
 
@@ -655,6 +1067,8 @@ mod tests {
             TerminalId(8),
             &shell("sleep 30"),
             Dimensions { cols: 40, rows: 6 },
+            None,
+            &TerminalHost::Local,
         )
         .expect("spawn /bin/sh");
 
@@ -669,39 +1083,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_teed_child_is_copied_byte_for_byte() {
-        struct Sink(Arc<Mutex<Vec<u8>>>);
-
-        impl Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.0
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .extend_from_slice(buf);
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let log: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let session = Session::spawn_teed(
+    async fn a_logged_child_is_appended_byte_for_byte() {
+        let log = std::env::temp_dir().join(format!("zh-session-log-{}", std::process::id()));
+        std::fs::write(&log, "earlier\n").expect("seed the log");
+        let session = Session::spawn(
             TerminalId(9),
             &shell("printf teed-hello; exit 0"),
             Dimensions { cols: 40, rows: 6 },
-            Some(Box::new(Sink(Arc::clone(&log)))),
+            Some(&log),
+            &TerminalHost::Local,
         )
         .expect("spawn /bin/sh");
 
-        let logged =
-            || String::from_utf8_lossy(&log.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
+        let logged = || std::fs::read_to_string(&log).unwrap_or_default();
         let finished = settle(&session, Duration::from_secs(10), |session| {
             session.exit().is_some() && logged().contains("teed-hello")
         })
         .await;
 
-        assert!(finished, "the tee never saw the output: {:?}", logged());
+        let text = logged();
+        let _ = std::fs::remove_file(&log);
+        assert!(finished, "the log never saw the output: {text:?}");
+        assert!(
+            text.starts_with("earlier\n"),
+            "the log was truncated: {text:?}"
+        );
     }
 }

@@ -39,7 +39,7 @@ zeughaus-db/           # plugin: Database container, Table, Insert, Query, SQL; 
 zeughaus-record/       # plugin: Recorder (frames + values to disk) and Player (the same dataset as a source)
 zeughaus-job/          # plugin: Job (a process in a runner-owned terminal, log per run under the state dir) and the ProcessHost trait the runner implements
 iced_terminal/         # the terminal widget: one wgpu primitive per pane, bundled ComicShannsMono Nerd Font
-iced_tabs/             # the tab bar the workspace shell uses
+iced_tabs/             # the tab tree the workspace shell uses: runner sections, groups, drop markers
 zeughaus-theme/        # the editor's theme: iced theme paired with a terminal colour scheme, catalogs for every widget, bundled pack, WezTerm scheme parser
 vm/win11/              # scripts: headless Windows 11 guest under QEMU/KVM, the reference for a VM-hosted runner (not wired)
 ```
@@ -73,23 +73,92 @@ keeps `runner.pem` and `client.pem` under the state directory
 remote editor needs `client.pem` copied into its own state directory. An
 editor without a store edits a local scratch graph and shows no values.
 
-In the editor: `Ctrl+Space` opens the command palette (spawn nodes, save/load
-a `.zgh` file, auto layout, pick a theme, copy the session token, attach or
-close a job's terminal, hold or release the runner). The window draws its
+In the editor: `Ctrl+Space` opens the command palette (spawn nodes into the
+focused graph pane, save/load a `.zgh` file, auto layout, pick a theme, copy
+the session token, split or close the focused pane, attach or close a job's
+terminal, hold or release a runner). The window draws its
 own titlebar; the button in its corner moves the tab bar between the top and
 the left edge. Theme and tab bar placement persist in
 `<state-dir>/editor.toml`; WezTerm colour schemes dropped into
-`<state-dir>/themes/` appear as themes. A container node's `open` opens its contents as a
-graph tab of this window. `+` opens a terminal tab, `H`/`V` split a pane
-with a terminal, `x` closes one and kills its child (a job's terminal is
-only detached); `Ctrl+Shift+T` takes control of a terminal someone else
-drives, `Ctrl+Shift+C`/`V` copy and paste, `Ctrl+Shift+Escape` gives the
-keyboard back to the app. A `Job` node runs its `command` line
-when its `run` pin fires or it is pressed; a failed run keeps its terminal
-for attaching, every run keeps `<state-dir>/runs/<id>/log`.
+`<state-dir>/themes/` appear as themes. The tab bar has one section per
+connected runner (plus `Local` without a store, or `Not running` for graphs
+no runner's workspace shows); a section's `+ Shell`, `+ Graph` and `+ Group`
+add a terminal tab, a graph that runner executes, or a
+coloured group. Closing a graph's tab deletes the graph. Double-clicking a
+tab or a group's name renames it; a tab that shows one graph renames the
+graph. A container node's `open` opens its contents in a tab. With the bar
+on top or at the left, tabs are dragged into and
+out of groups, onto another tab's content to split it, and a pane of a split
+tab is dragged by its grip back into the bar; a tab dropped on a tab lands
+before or after it by the half under the pointer, and the bar's empty rest
+is the end of the last section. "Pane / Split Horizontal|Vertical" in the palette splits
+the focused pane with a terminal, "Pane / Close" closes it and kills its
+child (a job's terminal is only detached); `Ctrl+Shift+T` takes control of a
+terminal someone else drives, `Ctrl+Shift+C`/`V` copy and paste,
+`Ctrl+Shift+Escape` gives the keyboard back to the app. A `Job` node runs its
+`command` line when its `run` pin fires or it is pressed; a failed run keeps
+its terminal for attaching, every run keeps `<state-dir>/runs/<id>/log`.
 `zeughaus-runner trigger <endpoint> <node-id> [payload]` and
 `zeughaus-runner hold <endpoint> on|off` do the same from a script, against
-the endpoint URL a runner prints at start.
+the endpoint URL a runner prints at start; a triggered run's terminal lands
+in that runner's locked `Triggered` group.
+
+Every terminal lives in a shim process (`zeughaus-runner shim <dir>`, one
+per terminal under `<state-dir>/terminals/`), so shells and job runs
+survive the runner. `SIGUSR1` makes the runner save
+`<state-dir>/workspace.json` and `exec` its binary again; the new process
+reattaches every shim and restores tabs and splits. The editor answers
+`SIGUSR1` the same way: it saves its window size, tabs, cameras, selection,
+node sizes, palette, rename and terminal scroll-back to a restore file and
+reopens as it was (not where it was: Wayland does not let a client place
+its window).
+
+### Agent stack and reload
+
+An agent never drives the user's desktop. It builds its own binaries with
+the `remote` feature into a separate target directory (so it neither
+replaces the user's binaries nor holds their build lock), runs them against
+its own database and state directory, and drives a headless editor over a
+control socket:
+
+```
+spacetime publish --server local zeughaus-agent --module-path zeughaus-module -y
+CARGO_TARGET_DIR=target/agent cargo build -p zeughaus --features remote -p zeughaus-runner
+ZEUGHAUS_STATE_DIR=/tmp/zh-agent target/agent/debug/zeughaus-runner join 127.0.0.1:3000/zeughaus-agent
+ZEUGHAUS_STATE_DIR=/tmp/zh-agent target/agent/debug/zeughaus --headless --control /tmp/zh-agent.sock join 127.0.0.1:3000/zeughaus-agent
+target/agent/debug/zeughaus ctl /tmp/zh-agent.sock key ctrl+space
+target/agent/debug/zeughaus ctl /tmp/zh-agent.sock screenshot /tmp/shot.png
+```
+
+The control commands are `size`, `move X Y [MS]`, `down`, `up`,
+`click`, `dblclick`, `drag X1 Y1 X2 Y2 [STEPS] [MS]`, `scroll`, `key`,
+`type`, `find`, `screenshot`, `record PATH`, `record-stop`, `resize`,
+`scale`, `clip`, `clip-set`, `wait-idle`, `restart`, `quit` (coordinates in
+logical pixels; `MS` paces a move or drag). `ctl` resolves a relative
+`screenshot`/`record` path against its own working directory. `record`
+writes an MP4 through `ffmpeg` with the pointer drawn in, for attaching to
+an issue or PR by hand; screenshots and videos are never committed.
+Signals to the agent's processes go by PID, never by name.
+
+When a change is finished and its gate passed, the agent integrates it into
+the user's running stack; that is the point of the reload. In order:
+
+1. `cargo build -p zeughaus -p zeughaus-runner` (the user's binaries in
+   `target/debug`).
+2. If `zeughaus-module` changed: `spacetime publish --server local zeughaus
+   --module-path zeughaus-module` without `-c`/`-y`. A migration that needs
+   the data cleared is the user's call, never the agent's.
+3. `kill -USR1 <pid>` for the user's runner and editor, found with `pgrep -af
+   'target/debug/zeughaus'` (the agent's own processes run from
+   `target/agent` and are not signalled). Confirm the reload: `readlink
+   /proc/<pid>/exe` no longer ends in `(deleted)`.
+
+Before signalling a process, check it has a restart handler: bit 9
+(`0x200`, SIGUSR1) in `SigCgt` of `/proc/<pid>/status`. A process built
+before the reload existed dies from SIGUSR1 instead, and a runner that old
+also keeps its shells in-process -- the agent's own session may be one of
+them (`ps --ppid <runner-pid>`). That one switch is the user's to make, by
+restarting the process by hand.
 
 ## Development Workflow
 

@@ -1,7 +1,13 @@
-//! What the editor knows about the runtime executing its graph: the values and
-//! failures it reported, the video feeds it serves, and the particles those
-//! deliveries leave on the wires.
+//! What the editor knows about the runtimes executing its graphs: the values
+//! and failures they reported, the video feeds they serve, and the particles
+//! those deliveries leave on the wires.
+//!
+//! Every connected runner is one [`RunnerLink`]. A node's values come from
+//! the runner of its top-level graph, and a runner that moved or left takes
+//! only its own graphs' values with it.
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
@@ -21,6 +27,8 @@ use crate::feed::{self, FeedKey, FeedSpec, FrameOrder};
 use crate::message::Message;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::transport::Endpoint;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::workspace::RunnerKey;
 
 /// How fast a particle travels along its cable, in world units per second.
 /// Fast enough to read as a message in flight, slow enough to be seen on a
@@ -52,6 +60,8 @@ pub(super) struct LiveFeed {
     /// ladder tier leaves it unchanged, which is what keeps a drag from
     /// restarting a video stream.
     tier: u32,
+    /// The runner serving it: a runner that moved or left ends its feeds.
+    runner: RunnerKey,
     /// Which generation of this feed the task belongs to.
     epoch: u64,
     /// Newest frame accepted, with the order it arrived in.
@@ -59,10 +69,27 @@ pub(super) struct LiveFeed {
     _task: iced::task::Handle,
 }
 
-/// Everything this editor knows about the runtime executing its graph.
+/// One connected runner as this editor talks to it.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) struct RunnerLink {
+    /// Where it serves. A different one means every address dialled is stale.
+    pub endpoint: Endpoint,
+    /// What its section is called: host and the start of its fingerprint.
+    pub label: String,
+    /// The task subscribed to its events. Aborts on drop.
+    pub traffic: Option<iced::task::Handle>,
+    /// Whether that subscription is live. Values on screen are last-known
+    /// while it is not, which the status bar says.
+    pub traffic_live: bool,
+    /// Which subscription the traffic on screen came from, drawn from the
+    /// editor-wide counter so a message names exactly one link.
+    pub traffic_epoch: u64,
+}
+
+/// Everything this editor knows about the runtimes executing its graphs.
 ///
 /// One struct rather than a dozen fields on [`App`], because it is one
-/// subject: a runtime that moved invalidates all of it at once. A value, a
+/// subject: a runtime that moved invalidates what it reported. A value, a
 /// failure, a particle and a frame from a runner that is gone say nothing
 /// about the one that replaced it.
 ///
@@ -80,11 +107,13 @@ pub(super) struct RuntimeView {
     /// path a failure has to this window: the process that ran the node is not
     /// the one drawing it.
     pub remote_errors: HashMap<NodeId, String>,
-    /// Where the executing runtime last said it is reachable. Kept so a runner
-    /// that restarted on another port, or vanished, is detectable: every live
-    /// feed dialled the old address and has to be redialled.
+    /// Every connected runner that serves an endpoint, by fingerprint.
     #[cfg(not(target_arch = "wasm32"))]
-    pub endpoint: Option<Endpoint>,
+    pub links: BTreeMap<RunnerKey, RunnerLink>,
+    /// Hands out the epochs of event subscriptions and mux attachments, one
+    /// counter for both so a queued message names exactly one of them.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub next_epoch: u64,
     /// Live video feeds, keyed by the source pin they carry rather than by the
     /// Display node drawing it: two nodes watching one pin need the same
     /// frame, so they share one feed.
@@ -99,19 +128,6 @@ pub(super) struct RuntimeView {
     /// cannot be told from a stall; a number that climbs can.
     #[cfg(not(target_arch = "wasm32"))]
     pub frames_received: u64,
-    /// The task subscribed to the runtime's events. Aborts on drop, so
-    /// replacing it is how the editor stops listening to a runtime that moved.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub traffic: Option<iced::task::Handle>,
-    /// Whether the event subscription is live. Values on screen are last-known
-    /// while it is not, which the status bar says rather than leaving the user
-    /// to guess.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub traffic_live: bool,
-    /// Which subscription the traffic on screen came from. Bumped whenever the
-    /// task is replaced, so a message queued by the old one is recognizable.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub traffic_epoch: u64,
     /// The newest sequence applied per (node, pin). See
     /// [`App::accept_output_seq`].
     #[cfg(not(target_arch = "wasm32"))]
@@ -130,6 +146,14 @@ pub(super) struct RuntimeView {
     /// late report must not silence another's.
     #[cfg(not(target_arch = "wasm32"))]
     pub rejection_seq: HashMap<(NodeId, String), u64>,
+    /// Which runner last reported something about a node. A report can
+    /// arrive before the node's row or its graph's row, so the node's graph
+    /// cannot say whose report it was; this can, when that runner goes.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub reported_by: HashMap<NodeId, RunnerKey>,
+    /// Which runner last reported a delivery on an edge, for the same reason.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub edge_reported_by: HashMap<EdgeId, RunnerKey>,
 }
 
 impl App {
@@ -145,35 +169,32 @@ impl App {
 
         // A task that has been replaced may still have messages queued: its
         // snapshot would clear the values the current runtime just delivered.
-        // The epoch is which subscription asked for them.
-        if epoch != self.runtime.traffic_epoch {
+        // The epoch is which subscription asked for them, and so which runner.
+        let Some(key) = self
+            .runtime
+            .links
+            .iter()
+            .find(|(_, link)| link.traffic_epoch == epoch)
+            .map(|(key, _)| key.clone())
+        else {
             return;
-        }
+        };
         match traffic {
             Traffic::Snapshot(snapshot) => {
-                // The whole set replaces the whole set: a pin the snapshot does
-                // not name produced nothing, which is what the editor dims.
-                self.runtime.remote_outputs.clear();
-                self.runtime.output_seq.clear();
-                // The failing nodes replace the failing nodes, for the same
-                // reason: a node the snapshot does not name is not failing.
-                self.runtime.remote_errors = snapshot
-                    .errors
-                    .into_iter()
-                    .map(|row| (NodeId(row.node_id), row.message))
-                    .collect();
-                self.runtime.error_seq = self
-                    .runtime
-                    .remote_errors
-                    .keys()
-                    .map(|id| (*id, snapshot.seq))
-                    .collect();
-                // And the refused settings replace the refused settings: what
-                // the runtime holds is the whole truth about what it refused.
-                self.setting_errors.clear();
-                self.runtime.rejection_seq.clear();
+                // The whole set replaces the whole set this runner reported:
+                // a pin the snapshot does not name produced nothing, which is
+                // what the editor dims, and a node it does not name is not
+                // failing. Another runner's graphs are not its to clear.
+                self.forget_runner_values(&key, false);
+                for row in snapshot.errors {
+                    let node = NodeId(row.node_id);
+                    self.runtime.reported_by.insert(node, key.clone());
+                    self.runtime.error_seq.insert(node, snapshot.seq);
+                    self.runtime.remote_errors.insert(node, row.message);
+                }
                 for row in snapshot.rejections {
                     let node = NodeId(row.node_id);
+                    self.runtime.reported_by.insert(node, key.clone());
                     self.runtime
                         .rejection_seq
                         .insert((node, row.key.clone()), snapshot.seq);
@@ -187,6 +208,7 @@ impl App {
                         continue;
                     };
                     let node = NodeId(row.node_id);
+                    self.runtime.reported_by.insert(node, key.clone());
                     self.runtime
                         .output_seq
                         .insert((node, row.pin.clone()), snapshot.seq);
@@ -196,7 +218,9 @@ impl App {
                         .or_default()
                         .insert(row.pin, value);
                 }
-                self.runtime.traffic_live = true;
+                if let Some(link) = self.runtime.links.get_mut(&key) {
+                    link.traffic_live = true;
+                }
                 self.update_display_values();
             }
             Traffic::Event(RuntimeEvent::Output {
@@ -213,6 +237,7 @@ impl App {
                 let Some(value) = zeughaus_core::decode_scalar(&ty, &value) else {
                     return;
                 };
+                self.runtime.reported_by.insert(node, key.clone());
                 self.runtime
                     .remote_outputs
                     .entry(node)
@@ -225,6 +250,7 @@ impl App {
                 if !self.accept_output_seq(node, &pin, seq) {
                     return;
                 }
+                self.runtime.reported_by.insert(node, key.clone());
                 if let Some(pins) = self.runtime.remote_outputs.get_mut(&node) {
                     pins.remove(&pin);
                 }
@@ -232,6 +258,9 @@ impl App {
             }
             Traffic::Event(RuntimeEvent::Edge { edge_id, .. }) => {
                 let now = iced::time::Instant::now();
+                self.runtime
+                    .edge_reported_by
+                    .insert(EdgeId(edge_id), key.clone());
                 let particles = self.runtime.particles.entry(EdgeId(edge_id)).or_default();
                 // A 30 Hz source would otherwise smear into a solid line, which
                 // says less than a countable dot does.
@@ -252,12 +281,14 @@ impl App {
             }) => {
                 let node = NodeId(node_id);
                 if self.accept_error_seq(node, seq) {
+                    self.runtime.reported_by.insert(node, key.clone());
                     self.runtime.remote_errors.insert(node, message);
                 }
             }
             Traffic::Event(RuntimeEvent::NodeErrorCleared { seq, node_id }) => {
                 let node = NodeId(node_id);
                 if self.accept_error_seq(node, seq) {
+                    self.runtime.reported_by.insert(node, key.clone());
                     self.runtime.remote_errors.remove(&node);
                 }
             }
@@ -267,39 +298,86 @@ impl App {
             Traffic::Event(RuntimeEvent::SettingRejected {
                 seq,
                 node_id,
-                key,
+                key: setting,
                 message,
             }) => {
                 let node = NodeId(node_id);
-                if self.accept_rejection_seq(node, &key, seq) {
+                if self.accept_rejection_seq(node, &setting, seq) {
+                    self.runtime.reported_by.insert(node, key.clone());
                     self.setting_errors
                         .entry(node)
                         .or_default()
-                        .insert(key, message);
+                        .insert(setting, message);
                 }
             }
-            Traffic::Event(RuntimeEvent::SettingAccepted { seq, node_id, key }) => {
+            Traffic::Event(RuntimeEvent::SettingAccepted {
+                seq,
+                node_id,
+                key: setting,
+            }) => {
                 let node = NodeId(node_id);
-                if self.accept_rejection_seq(node, &key, seq) {
-                    self.record_setting_error(node, &key, None);
+                if self.accept_rejection_seq(node, &setting, seq) {
+                    self.runtime.reported_by.insert(node, key.clone());
+                    self.record_setting_error(node, &setting, None);
                 }
             }
             Traffic::Lost => {
-                self.runtime.traffic_live = false;
+                if let Some(link) = self.runtime.links.get_mut(&key) {
+                    link.traffic_live = false;
+                }
                 // Values stay on screen as last-known, because the status bar
                 // says so and a number nobody claims is still the last one
                 // anybody claimed. An error is not like that: it is a claim
                 // about a run, made by a process that is no longer there to
                 // make it, and a red border with nothing behind it is worse
-                // than none.
-                self.runtime.remote_errors.clear();
-                self.runtime.error_seq.clear();
-                // Same for a refusal: it is a claim about what the runtime
-                // holds, and there is no runtime holding it any more.
-                self.setting_errors.clear();
-                self.runtime.rejection_seq.clear();
+                // than none. Same for a refusal.
+                self.forget_runner_values(&key, true);
             }
         }
+    }
+
+    /// Forgets what `runner` reported about the nodes of its graphs, and
+    /// about any node it reported on before that node's graph was known:
+    /// their failures and refused settings, and unless `claims_only`, their
+    /// values, sequences and the particles on their wires too.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn forget_runner_values(&mut self, runner: &RunnerKey, claims_only: bool) {
+        let mut owned: std::collections::HashSet<NodeId> = self
+            .nodes
+            .keys()
+            .copied()
+            .filter(|id| self.runner_of(*id) == Some(runner.as_str()))
+            .collect();
+        owned.extend(
+            self.runtime
+                .reported_by
+                .iter()
+                .filter(|(_, by)| *by == runner)
+                .map(|(id, _)| *id),
+        );
+        let runtime = &mut self.runtime;
+        runtime.remote_errors.retain(|id, _| !owned.contains(id));
+        runtime.error_seq.retain(|id, _| !owned.contains(id));
+        runtime
+            .rejection_seq
+            .retain(|(id, _), _| !owned.contains(id));
+        self.setting_errors.retain(|id, _| !owned.contains(id));
+        if claims_only {
+            return;
+        }
+        runtime.remote_outputs.retain(|id, _| !owned.contains(id));
+        runtime.output_seq.retain(|(id, _), _| !owned.contains(id));
+        for edge in self.edges.iter().filter(|e| owned.contains(&e.from_node)) {
+            runtime.particles.remove(&edge.id);
+        }
+        runtime.edge_reported_by.retain(|edge, by| {
+            let reported = by == runner;
+            if reported {
+                runtime.particles.remove(edge);
+            }
+            !reported
+        });
+        runtime.reported_by.retain(|id, _| !owned.contains(id));
     }
 
     /// Whether this report is newer than what was already applied for that pin.
@@ -390,90 +468,114 @@ impl App {
         self.update_displays_from(node);
     }
 
-    /// Brings the event subscription and the live feeds in line with what the
-    /// graph and the store now say.
+    /// Brings the runner links, their event subscriptions and muxes, and the
+    /// live feeds in line with what the graph and the store now say.
     ///
     /// The one place anything is dialled, called after everything that can
     /// change the answer: a Display node's wire, its size, its existence, a
-    /// graph reload, or where the runtime serves. A feed that is still wanted
-    /// with the same request is left running -- restarting a video stream
-    /// because the editor redrew would be a stutter the user can see.
+    /// graph reload, or which runners serve where. A feed that is still
+    /// wanted with the same request is left running -- restarting a video
+    /// stream because the editor redrew would be a stutter the user can see.
     ///
     /// Stopping is by removal: every task handle aborts on drop.
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn reconcile_runtime(&mut self) -> Task<Message> {
-        let announced = self
-            .store_conn()
-            .and_then(zeughaus_sync::owner_endpoint)
-            .map(Endpoint);
-        // A runtime that moved, restarted or regenerated its identity
-        // invalidates every address already dialled, so nothing survives it.
-        let moved = announced != self.runtime.endpoint;
-        if moved {
-            self.runtime.endpoint = announced;
-        }
+        let announced = announced_runners(
+            &self
+                .store_conn()
+                .map(zeughaus_sync::runtimes)
+                .unwrap_or_default(),
+        );
         let mut tasks = Vec::new();
-        // Also restarted when the endpoint is unchanged but no task is running:
-        // the subscription is what carries every value, so a missing one is not
-        // something to wait out.
-        if moved || (self.runtime.traffic.is_none() && self.runtime.endpoint.is_some()) {
-            self.runtime.traffic = None;
-            self.runtime.traffic_live = false;
-            // Anything the aborted task still has queued belongs to the
-            // subscription that is being replaced.
-            self.runtime.traffic_epoch += 1;
-            self.runtime.remote_outputs.clear();
-            self.runtime.output_seq.clear();
-            // A failure belongs to the runtime that reported it; a different
-            // one has not run anything yet.
-            self.runtime.remote_errors.clear();
-            self.runtime.error_seq.clear();
-            // A particle in flight belongs to the runtime that sent it; the new
-            // one has not delivered anything yet.
-            self.runtime.particles.clear();
-            // Whatever is on screen came from a runtime that is not there any
-            // more, and the next snapshot is what replaces it.
-            self.update_display_values();
-            if let Some(endpoint) = self.runtime.endpoint.clone() {
-                let epoch = self.runtime.traffic_epoch;
-                let (task, handle) = Task::run(feed::events(endpoint), move |traffic| {
-                    Message::Traffic(epoch, traffic)
-                })
-                .abortable();
-                self.runtime.traffic = Some(handle.abort_on_drop());
-                tasks.push(task);
+        // A runner that left takes its values, its terminals and its section
+        // with it; its graphs show as not running.
+        let gone: Vec<RunnerKey> = self
+            .runtime
+            .links
+            .keys()
+            .filter(|key| !announced.iter().any(|a| &a.key == *key))
+            .cloned()
+            .collect();
+        for key in &gone {
+            self.runtime.links.remove(key);
+            self.forget_runner_values(key, false);
+            self.mux.remove(key);
+            self.workspace.remove_section(key);
+        }
+        // Runners that moved, restarted or regenerated their identity: every
+        // address already dialled there is stale.
+        let mut moved: Vec<RunnerKey> = Vec::new();
+        for runner in announced {
+            self.workspace
+                .ensure_runner(runner.key.clone(), runner.label.clone());
+            let (restart_traffic, endpoint_changed) = match self.runtime.links.get_mut(&runner.key)
+            {
+                Some(link) => {
+                    link.label = runner.label;
+                    let changed = link.endpoint != runner.endpoint;
+                    if changed {
+                        link.endpoint = runner.endpoint;
+                    }
+                    // Also restarted when the endpoint is unchanged but no
+                    // task is running: the subscription is what carries every
+                    // value, so a missing one is not something to wait out.
+                    (changed || link.traffic.is_none(), changed)
+                }
+                None => {
+                    self.runtime.links.insert(
+                        runner.key.clone(),
+                        RunnerLink {
+                            endpoint: runner.endpoint,
+                            label: runner.label,
+                            traffic: None,
+                            traffic_live: false,
+                            traffic_epoch: 0,
+                        },
+                    );
+                    (true, true)
+                }
+            };
+            if endpoint_changed {
+                moved.push(runner.key.clone());
+            }
+            if restart_traffic {
+                tasks.push(self.restart_traffic(&runner.key));
+            }
+            // The mux hangs off the same address and is replaced by the same
+            // rule: a runner that moved owns different terminals, and one
+            // that has no control task is not attached to anything.
+            if endpoint_changed || !self.mux.contains_key(&runner.key) {
+                tasks.push(self.restart_mux(&runner.key));
             }
         }
-        // The mux hangs off the same address and is replaced by the same
-        // rule: a runner that moved owns different terminals, and one that
-        // has no control task is not attached to anything.
-        if moved || (self.mux.is_none() && self.runtime.endpoint.is_some()) {
-            tasks.push(self.restart_mux());
+        if !gone.is_empty() || !moved.is_empty() {
+            self.update_display_values();
+            self.rebuild_palette();
         }
-        // With nothing serving frames, a live feed would be reading a dead
-        // stream and the frame it left behind is not what the graph shows.
-        let wanted = match self.runtime.endpoint {
-            None => HashMap::new(),
-            Some(_) => self.wanted_feeds(),
-        };
+        let wanted = self.wanted_feeds();
         // A feed's request is fixed for its lifetime, so a new tier is a new
-        // feed rather than a renegotiation.
-        let lost = self.retain_feeds(|key, live| !moved && wanted.get(key) == Some(&live.tier));
+        // feed rather than a renegotiation; and a feed from a runner that
+        // moved reads a dead stream.
+        let lost = self.retain_feeds(|key, live| {
+            !moved.contains(&live.runner)
+                && wanted
+                    .get(key)
+                    .is_some_and(|(tier, runner)| *tier == live.tier && *runner == live.runner)
+        });
         if lost {
             self.update_display_values();
         }
-        let Some(endpoint) = self.runtime.endpoint.clone() else {
-            return Task::batch(tasks);
-        };
-
-        for (key, tier) in wanted {
+        for (key, (tier, runner)) in wanted {
             if self.runtime.feeds.contains_key(&key) {
                 continue;
             }
+            let Some(endpoint) = self.runtime.links.get(&runner).map(|l| l.endpoint.clone()) else {
+                continue;
+            };
             self.runtime.feed_epoch += 1;
             let epoch = self.runtime.feed_epoch;
             let spec = FeedSpec {
-                endpoint: endpoint.clone(),
+                endpoint,
                 key: key.clone(),
                 epoch,
                 tier,
@@ -483,6 +585,7 @@ impl App {
                 key,
                 LiveFeed {
                     tier,
+                    runner,
                     epoch,
                     latest: None,
                     _task: handle.abort_on_drop(),
@@ -493,15 +596,51 @@ impl App {
         Task::batch(tasks)
     }
 
+    /// Replaces one runner's event subscription. Whatever it reported is
+    /// forgotten: the next snapshot is what replaces it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn restart_traffic(&mut self, key: &RunnerKey) -> Task<Message> {
+        self.runtime.next_epoch += 1;
+        let epoch = self.runtime.next_epoch;
+        let Some(link) = self.runtime.links.get_mut(key) else {
+            return Task::none();
+        };
+        // Anything the aborted task still has queued belongs to the
+        // subscription that is being replaced.
+        link.traffic = None;
+        link.traffic_live = false;
+        link.traffic_epoch = epoch;
+        let endpoint = link.endpoint.clone();
+        let (task, handle) = Task::run(feed::events(endpoint), move |traffic| {
+            Message::Traffic(epoch, traffic)
+        })
+        .abortable();
+        if let Some(link) = self.runtime.links.get_mut(key) {
+            link.traffic = Some(handle.abort_on_drop());
+        }
+        self.forget_runner_values(key, false);
+        self.update_display_values();
+        task
+    }
+
+    /// The link a node's values, presses and feeds go through: its graph's
+    /// runner, while that runner is connected.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn link_of(&self, node: NodeId) -> Option<(RunnerKey, &RunnerLink)> {
+        let key = RunnerKey::new(self.runner_of(node)?);
+        let link = self.runtime.links.get(&key)?;
+        Some((key, link))
+    }
+
     /// Which feeds the graph asks for, and at what ladder tier.
     ///
     /// Only image-typed source pins: a scalar already arrives as a runtime
     /// event, and streaming it as frames as well would be a second, slower
     /// path to the same number.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(super) fn wanted_feeds(&self) -> HashMap<FeedKey, u32> {
+    pub(super) fn wanted_feeds(&self) -> HashMap<FeedKey, (u32, RunnerKey)> {
         let frame_ty = Ty::of::<Image>();
-        let mut wanted: HashMap<FeedKey, u32> = HashMap::new();
+        let mut wanted: HashMap<FeedKey, (u32, RunnerKey)> = HashMap::new();
         for (id, node) in &self.nodes {
             if !is_display(&node.type_id) {
                 continue;
@@ -519,6 +658,11 @@ impl App {
             if !carries_frame {
                 continue;
             }
+            // Served by the runner of the source's graph, and by nobody while
+            // that runner is not connected.
+            let Some((runner, _)) = self.link_of(edge.from_node) else {
+                continue;
+            };
             // Sized by what the node body draws, not by the frame's native size:
             // the runtime holds the frame, so it is the side that can cheaply
             // produce the half megabyte a preview needs instead of shipping
@@ -531,8 +675,8 @@ impl App {
             };
             wanted
                 .entry(key)
-                .and_modify(|shared| *shared = feed::widen(*shared, tier))
-                .or_insert(tier);
+                .and_modify(|(shared, _)| *shared = feed::widen(*shared, tier))
+                .or_insert((tier, runner));
         }
         wanted
     }
@@ -630,4 +774,41 @@ impl App {
             more => format!("{name}: {message} (+{more} more)"),
         }
     }
+}
+
+/// One runner as the store announces it.
+#[cfg(not(target_arch = "wasm32"))]
+struct Announced {
+    key: RunnerKey,
+    endpoint: Endpoint,
+    label: String,
+}
+
+/// The runners the store's runtime rows announce, oldest first, keyed by the
+/// fingerprint their URL pins. A row without a pinned fingerprint cannot be
+/// told apart from another runner and is skipped; two rows with one
+/// fingerprint (one `runner.pem`, two processes) are one runner, the older.
+#[cfg(not(target_arch = "wasm32"))]
+fn announced_runners(rows: &[zeughaus_sync::RuntimeRow]) -> Vec<Announced> {
+    let mut out: Vec<Announced> = Vec::new();
+    for row in rows {
+        let Ok(addr) = weida::EndpointAddr::parse(&row.addr) else {
+            continue;
+        };
+        let Some(fingerprint) = addr.peer.map(|fp| fp.to_string()) else {
+            continue;
+        };
+        if out.iter().any(|a| a.key.as_str() == fingerprint) {
+            continue;
+        }
+        // The host and the first eight hex digits after `sha256:`: enough to
+        // tell two runners on one host apart at a glance.
+        let short = fingerprint.get(7..15).unwrap_or(&fingerprint);
+        out.push(Announced {
+            key: RunnerKey::new(&fingerprint),
+            endpoint: Endpoint(row.addr.clone()),
+            label: format!("{} {short}", addr.host),
+        });
+    }
+    out
 }

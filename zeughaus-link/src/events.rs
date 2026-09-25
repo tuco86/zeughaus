@@ -147,6 +147,11 @@ pub struct TriggerRequest {
     pub node_id: u64,
     #[serde(default)]
     pub payload: Option<String>,
+    /// Whether the press came from outside an editor (the `zeughaus-runner
+    /// trigger` CLI, a hook). A job run started that way shows up in the
+    /// runner's locked "Triggered" group instead of staying detached.
+    #[serde(default)]
+    pub external: bool,
 }
 
 impl TriggerRequest {
@@ -282,6 +287,7 @@ mod tests {
             let request = TriggerRequest {
                 node_id: 99,
                 payload,
+                external: true,
             };
             assert_eq!(TriggerRequest::decode(&request.encode()), Some(request));
         }

@@ -364,6 +364,7 @@ pub async fn trigger(endpoint: Endpoint, node_id: u64) -> Result<(), String> {
             &TriggerRequest {
                 node_id,
                 payload: None,
+                external: false,
             }
             .encode(),
         )

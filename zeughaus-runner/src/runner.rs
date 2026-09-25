@@ -5,10 +5,11 @@
 //! new one, what type a stored parameter string becomes -- can be tested
 //! without a server.
 //!
-//! The graph itself is the only node bookkeeping here. The editor keeps a
-//! second representation because it has to draw one; this process has nothing
-//! to draw, so type ids and pins are read back out of
-//! [`GraphExecutor::graph`] rather than mirrored beside it.
+//! Two representations of the graph live here. Every store row is mirrored,
+//! because which graph a node belongs to -- and so whether this runner
+//! executes it -- is decided by walking its parents, which may be anyone's.
+//! Only the nodes in this runner's scope reach the [`GraphExecutor`], and
+//! type ids and pins are read back out of it rather than mirrored beside it.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -16,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use weida::Publisher;
 use zeughaus_core::{
-    DomainPlugin, EdgeData, EdgeId, Image, NodeData, NodeId, PinDirection, Ty, TypeConverters,
-    Value, encode_scalar, occupancy_winner,
+    DomainPlugin, EdgeData, EdgeId, Image, NodeData, NodeId, PinDirection, Press, Ty,
+    TypeConverters, Value, encode_scalar, occupancy_winner,
 };
 use zeughaus_link::{
     ErrorRow, OutputRow, RejectionRow, RuntimeEvent, Snapshot, TOPIC_EDGE, TOPIC_ERROR,
@@ -28,6 +29,7 @@ use zeughaus_sync::{Store, SyncEvent};
 
 use crate::feed::FrameRegistry;
 use crate::jobs::JobHost;
+use crate::mux::GraphSync;
 
 /// Outcome of one node's deferred work, as reported back by the host loop.
 pub type AsyncResult = Result<HashMap<String, Value>, String>;
@@ -39,19 +41,46 @@ pub struct Runner {
     store: Store,
     plugins: Vec<Box<dyn DomainPlugin>>,
     executor: GraphExecutor,
-    /// Whether this process currently owns execution. Read back from the store
-    /// on every batch rather than remembered, because ownership changes by
-    /// another runner disappearing, not by a handshake.
-    is_owner: bool,
-    /// Which generation of ownership this process is on. Bumped every time
-    /// ownership is gained, so deferred work dispatched under a previous one is
+    /// Whether this process executes its graphs: the store is connected and
+    /// this runner has an endpoint, whose fingerprint is what a graph's
+    /// `runner` column names. Read back on every batch, because a store outage
+    /// ends it without a handshake.
+    executing: bool,
+    /// Which generation of execution this process is on. Bumped every time
+    /// execution starts, so deferred work dispatched under a previous one is
     /// recognizable when its result comes back. See [`Runner::deliver`].
     owner_epoch: u64,
-    /// Role and runner count as last reported. A headless standby that logged
+    /// Role and runner count as last reported. A headless runner that logged
     /// nothing would be indistinguishable from one that is stuck, so the role is
     /// stated as soon as it is known and again whenever it or the number of
     /// connected runners changes.
     logged_role: Option<(bool, usize)>,
+    /// This runner's own fingerprint (`sha256:<hex>`), taken from its endpoint
+    /// URL. A top-level graph whose `runner` names it is executed here; `None`
+    /// (no transport) executes nothing.
+    fingerprint: Option<String>,
+    /// Every node row in the store, in scope or not. Scope is decided by
+    /// walking parents to the top-level graph, and that walk needs the nodes
+    /// this process does not execute as much as the ones it does.
+    nodes: HashMap<NodeId, NodeData>,
+    /// Every edge row in the store. An edge between nodes that leave scope is
+    /// dropped from the executor with them, and this is what brings it back
+    /// when they return.
+    edges: HashMap<EdgeId, EdgeData>,
+    /// Whether a node row changed since the last [`Runner::rescope`].
+    scope_dirty: bool,
+    /// Whether the first subscription has applied, so the node mirror is the
+    /// store's content and not a part of it.
+    synced: bool,
+    /// Whether the adoption of root-level nodes without a runner is still to
+    /// be checked. Set by the first subscription, cleared once checked, so a
+    /// legacy session is migrated at most once per process.
+    adopt_pending: bool,
+    /// Whether the adoption check already ran in this process.
+    adopt_checked: bool,
+    /// Whether the set of top-level graphs or any node name or id changed
+    /// since [`Runner::graphs_changed`] was last asked.
+    graphs_changed: bool,
     /// What editors have been told: the diff baseline and the snapshot derived
     /// from it. Only what changed is sent, because a capture graph runs at
     /// frame rate and an unchanged value must cost nothing.
@@ -105,6 +134,7 @@ impl Runner {
         publisher: Option<Publisher>,
         snapshot: Arc<Mutex<Snapshot>>,
         host: Option<Arc<JobHost>>,
+        fingerprint: Option<String>,
     ) -> Self {
         // The same plugin set the native editor registers. Both sides must agree
         // on what exists and what may connect: the editor validates a drag
@@ -147,9 +177,17 @@ impl Runner {
             store,
             plugins,
             executor,
-            is_owner: false,
+            executing: false,
             owner_epoch: 0,
             logged_role: None,
+            fingerprint,
+            nodes: HashMap::new(),
+            edges: HashMap::new(),
+            scope_dirty: false,
+            synced: false,
+            adopt_pending: false,
+            adopt_checked: false,
+            graphs_changed: false,
             published: Published::default(),
             publisher,
             seq: 0,
@@ -175,76 +213,67 @@ impl Runner {
         self.store.poll();
     }
 
-    /// Re-reads who owns execution, and reports the role a human debugging this
-    /// process needs before anything else.
+    /// Re-reads whether this process executes, and reports the role a human
+    /// debugging this process needs before anything else.
     pub fn refresh_ownership(&mut self) {
         let Some(conn) = self.store.conn() else {
-            // Without the store this process cannot learn that another runner
-            // took over -- and one has: the module drops a runtime's row when
-            // its client disconnects, so the graph belongs to somebody else by
-            // now. Executing on would be two owners with one graph.
+            // Without the store this process cannot see its graphs change hands
+            // or be deleted, so it must not run them on a picture that may be
+            // stale.
             self.lose_ownership();
             return;
         };
         let runners = zeughaus_sync::runtime_count(conn);
         if runners == 0 {
-            // The runtime table has not reached this client yet, so the store
-            // has said nothing about who executes. Staying a non-owner is the
-            // safe reading: a runner that assumed ownership here would
-            // double-execute a graph another one is already running.
+            // The runtime table has not reached this client yet: the
+            // subscription is not applied, and nothing is known about which
+            // graphs exist.
             return;
         }
-        let owner = self.store.conn().is_some_and(zeughaus_sync::is_owner);
-        if self.logged_role != Some((owner, runners)) {
-            self.logged_role = Some((owner, runners));
-            if owner {
-                eprintln!("[runner] executing this session ({runners} runner(s) connected)");
+        let executing = self.fingerprint.is_some();
+        if self.logged_role != Some((executing, runners)) {
+            self.logged_role = Some((executing, runners));
+            if executing {
+                eprintln!("[runner] executing its graphs ({runners} runner(s) connected)");
             } else {
-                eprintln!("[runner] standby ({runners} runners connected): another one executes");
+                eprintln!("[runner] not executing: no endpoint, so no graph is this runner's");
             }
         }
-        if owner == self.is_owner {
+        if executing == self.executing {
             return;
         }
-        if !owner {
+        if !executing {
             self.lose_ownership();
             return;
         }
-        self.is_owner = true;
-        // Ownership decides where editors are pointed: `owner_endpoint`
-        // resolves the *owning* runtime's row, so a standby inheriting
-        // execution becomes the row every editor reads and has to be sure its
-        // address is in it.
+        self.executing = true;
         self.announce_endpoint();
-        // A new generation of ownership: work this process dispatched under the
-        // previous one belongs to a graph another runner has been executing
-        // since, so its result is no longer this owner's to apply.
+        // A new generation: work this process dispatched before it stopped
+        // executing belongs to a pass nobody waits for any more.
         self.owner_epoch += 1;
-        // Ownership was just inherited, so this process has never run this
-        // graph: every node is stale.
+        // Execution just (re)started, so nothing this process holds has been
+        // run under it: every node is stale.
         for id in self.executor.graph().node_ids().collect::<Vec<_>>() {
             self.executor.mark_dirty(id);
         }
-        // Nothing was published by this process, so its first pass republishes
-        // everything. Values do not live in the store any more, so there is no
-        // predecessor's row left behind to diff against and nothing to clear.
+        // Nothing was published under this generation, so its first pass
+        // republishes everything.
         self.published.clear();
         self.published.flush(self.seq, &self.snapshot);
     }
 
-    /// Stops executing: another runtime has the graph, or this process can no
-    /// longer tell that it does not.
+    /// Stops executing: the store is gone, so this process can no longer tell
+    /// whether its graphs still exist or still belong to it.
     ///
-    /// One path for both, because what has to happen is the same. The frames
-    /// this process holds are the last ones it produced and another runtime is
-    /// producing the real ones now, so its viewers are sent away rather than
-    /// shown a still picture; and nothing it published is current, so the
-    /// snapshot it serves must not answer with values it no longer produces.
+    /// The frames this process holds are the last ones it produced, so its
+    /// viewers are sent away rather than shown a still picture; and nothing it
+    /// published is current, so the snapshot it serves must not answer with
+    /// values it no longer produces.
     fn lose_ownership(&mut self) {
-        if !self.is_owner {
+        if !self.executing {
             return;
         }
-        self.is_owner = false;
+        self.executing = false;
         self.frames.clear();
         self.published.clear();
         self.published.flush(self.seq, &self.snapshot);
@@ -256,41 +285,97 @@ impl Runner {
             SyncEvent::NodeRemove(id) => self.apply_node_remove(NodeId(id)),
             SyncEvent::EdgeInsert(ed) => self.apply_edge_insert(ed),
             SyncEvent::EdgeRemove(id) => self.apply_edge_remove(EdgeId(id)),
-            // Ownership is read from the client cache, not from the event.
+            // Connectivity is read from the client cache, not from the event.
             SyncEvent::RuntimesChanged => {}
-            // Values travel over weida now, so nothing in the store reports
-            // them and nothing here has to be adopted.
             SyncEvent::SubscriptionApplied => {
+                self.synced = true;
+                if !self.adopt_checked {
+                    self.adopt_pending = true;
+                }
                 // The subscription is the first look this process gets at its
                 // own `runtime` row, and a reconnect recreates that row without
                 // the endpoint. Re-announcing here is what keeps an editor from
-                // resolving an owning runtime with an empty address.
+                // resolving a runtime with an empty address.
                 self.announce_endpoint();
             }
             // A reconnect is a new client to the store: a new `runtime` row
-            // with no address in it, and a new position in the ownership
-            // order. Announcing again is what keeps an editor from resolving
-            // an owning runtime it cannot dial.
+            // with no address in it. Announcing again is what keeps an editor
+            // from resolving a runtime it cannot dial.
             SyncEvent::Connected => self.announce_endpoint(),
-            // The store is gone, so the module has already dropped this
-            // process's `runtime` row and handed the graph to the next runner.
-            // Executing on would be two owners with one graph.
+            // The store is gone: see `lose_ownership`.
             SyncEvent::Disconnected => self.lose_ownership(),
         }
+    }
+
+    /// Whether the first subscription has applied, so the graphs this process
+    /// knows are the store's and not a part of them.
+    pub fn synced(&self) -> bool {
+        self.synced
+    }
+
+    /// Moves root-level nodes that belong to no runner into a graph of this
+    /// runner's, once per process.
+    ///
+    /// Sessions from before graphs had owners keep their nodes at the root,
+    /// where no runner executes them. Only the longest-connected runner asks,
+    /// so two runners starting together do not create two graphs; the reducer
+    /// does nothing when there is nothing left to adopt. While another runner
+    /// is older the check stays pending: that runner may predate adoption, and
+    /// a runtime leaving is a store event, so the next pass asks again.
+    fn adopt_root_nodes(&mut self) {
+        if !self.adopt_pending {
+            return;
+        }
+        let Some(conn) = self.store.conn() else {
+            return;
+        };
+        // The subscription can apply before this process's own `runtime` row
+        // arrives; until it has, "not the oldest runner" is not an answer.
+        if !zeughaus_sync::runtime_joined(conn) {
+            return;
+        }
+        let Some(fingerprint) = self.fingerprint.as_deref() else {
+            self.adopt_pending = false;
+            self.adopt_checked = true;
+            return;
+        };
+        // From the cache, not from `self.nodes`: the subscription is reported
+        // applied before its rows' events, which may not have arrived yet.
+        let orphans = zeughaus_sync::root_orphans(conn);
+        if orphans == 0 {
+            self.adopt_pending = false;
+            self.adopt_checked = true;
+            return;
+        }
+        if !zeughaus_sync::is_owner(conn) {
+            return;
+        }
+        let graph = NodeId::next();
+        eprintln!("[runner] adopting {orphans} root-level node(s) into graph {graph}");
+        if let Err(e) = zeughaus_sync::send_adopt_root_nodes(conn, graph.0, fingerprint) {
+            eprintln!("[runner] {e}");
+        }
+        self.adopt_pending = false;
+        self.adopt_checked = true;
+    }
+
+    /// Brings the scope and the edges in line with the store events applied
+    /// so far. Cheap when nothing changed, so it may run more than once a turn.
+    pub fn reconcile(&mut self) {
+        self.adopt_root_nodes();
+        self.rescope();
+        self.resolve_pending_edges();
     }
 
     /// Runs one pass: execute the dirty nodes and publish what changed.
     /// Returns the work that has to run off-thread.
     ///
-    /// A standby does nothing at all. Executing "just the cheap nodes" would
-    /// double-run every side effect in the graph, which is the split brain the
-    /// single-owner rule exists to remove.
+    /// A runner that does not execute does nothing at all: it cannot tell
+    /// whether its graphs still exist.
     pub fn pass(&mut self) -> DeferredWork {
-        self.resolve_pending_edges();
-        // Logged for a standby too: it tracks the graph so a takeover is
-        // immediate, and a silent process is impossible to tell from a stuck one.
+        self.reconcile();
         self.log_size();
-        if !self.is_owner {
+        if !self.executing {
             return DeferredWork::new();
         }
         let deferred = match self.executor.execute_dirty() {
@@ -310,10 +395,10 @@ impl Runner {
     /// any did. This is what turns a screen capture into a video source: nothing
     /// upstream wakes it, so the clock does.
     ///
-    /// A standby holds no schedule at all. It must not run the graph, and a
-    /// deadline it kept while idle would fire a burst the moment it took over.
+    /// A runner that does not execute holds no schedule at all: a deadline it
+    /// kept while idle would fire a burst the moment it started.
     pub fn mark_due_ticks(&mut self) -> bool {
-        if !self.is_owner {
+        if !self.executing {
             self.due.clear();
             return false;
         }
@@ -372,10 +457,10 @@ impl Runner {
     /// anyway, so if this process owns the graph again the node is retried
     /// rather than left waiting for a result that has been thrown away.
     pub fn deliver(&mut self, node_id: NodeId, epoch: u64, result: AsyncResult) -> DeferredWork {
-        if !accepts_async_result(self.is_owner, self.owner_epoch, epoch) {
+        if !accepts_async_result(self.executing, self.owner_epoch, epoch) {
             eprintln!(
-                "[runner] dropping {node_id}'s result from epoch {epoch} (now {}, owner: {})",
-                self.owner_epoch, self.is_owner
+                "[runner] dropping {node_id}'s result from epoch {epoch} (now {}, executing: {})",
+                self.owner_epoch, self.executing
             );
             self.executor.clear_pending(node_id);
             return DeferredWork::new();
@@ -409,7 +494,7 @@ impl Runner {
         // Traffic, after the values it carried: an editor that draws a particle
         // has to have the value the particle stands for.
         let delivered = self.executor.take_delivered();
-        if self.is_owner {
+        if self.executing {
             let mut seen = HashSet::new();
             for edge in delivered {
                 // Two writes to one edge in one pass are two messages, but one
@@ -433,29 +518,30 @@ impl Runner {
     /// Fires one node once, on an editor's request.
     ///
     /// Returns whether the graph changed, so the host loop knows to run a pass.
-    /// A standby ignores the request: the owner received the same push and is
-    /// firing it, and a press this process replayed after a takeover would fire
-    /// twice.
+    /// A runner ignores a press for a node it does not execute: another runner
+    /// owns that graph, and a press this process fired would run it twice.
     ///
     /// `payload` is free text the pressing side attached -- a webhook body, a
-    /// branch name -- handed to the node as the value of its `fire` parameter.
-    /// A node that only wants the event ignores it, which is why a bare press
-    /// (`None`) is the empty string rather than a second parameter nobody
-    /// reads.
-    pub fn trigger(&mut self, node_id: u64, payload: Option<String>) -> bool {
+    /// branch name -- and `external` whether it pressed from outside an
+    /// editor; both reach the node as the [`Press`] value of its `fire`
+    /// parameter. A node that only wants the event ignores them, which is why
+    /// a bare press (`None`) is an empty payload rather than a second
+    /// parameter nobody reads.
+    pub fn trigger(&mut self, node_id: u64, payload: Option<String>, external: bool) -> bool {
         let id = NodeId(node_id);
-        if !self.is_owner || self.executor.graph().node(id).is_none() {
+        if !self.executing || !self.in_scope(id) || self.executor.graph().node(id).is_none() {
             eprintln!("[runner] ignoring trigger for {id}");
             return false;
         }
         eprintln!("[runner] firing {id}");
+        let press = Press {
+            payload: payload.unwrap_or_default(),
+            external,
+        };
         // A node that refuses the press did not fire, so asking for a pass
         // would report a press that never happened -- and the editor that
         // pressed has to be told, which is what the node error is for.
-        if let Err(e) =
-            self.executor
-                .set_parameter(id, "fire", Value::new(payload.unwrap_or_default()))
-        {
+        if let Err(e) = self.executor.set_parameter(id, "fire", Value::new(press)) {
             let message = format!("the trigger was refused: {e}");
             eprintln!("[runner] {id}: {message}");
             self.executor.report_error(id, message);
@@ -488,6 +574,27 @@ impl Runner {
 
     fn apply_node_upsert(&mut self, nd: NodeData) {
         let id = NodeId(nd.id);
+        let previous = self.nodes.insert(id, nd.clone());
+        let graph_shape_changed = previous.as_ref().is_none_or(|p| {
+            p.parent != nd.parent || p.runner != nd.runner || p.display_name != nd.display_name
+        });
+        if graph_shape_changed {
+            self.graphs_changed = true;
+            // A parent or owner change can move a whole subtree in or out of
+            // this runner's scope, which only a full walk finds.
+            self.scope_dirty = true;
+        }
+        if self.in_scope(id) {
+            self.add_to_executor(nd);
+        } else if self.executor.graph().node(id).is_some() {
+            self.drop_from_executor(id);
+        }
+    }
+
+    /// Adds a node row to the executor, or applies its parameters if the node
+    /// is already there.
+    fn add_to_executor(&mut self, nd: NodeData) {
+        let id = NodeId(nd.id);
         if self.executor.graph().node(id).is_some() {
             // A row is rewritten for reasons execution does not care about --
             // a drag writes coordinates -- so only the parameters are applied.
@@ -510,6 +617,80 @@ impl Runner {
         // The node instance already holds its own setting defaults; the stored
         // params are the user's deviations from them.
         self.apply_params(id, &nd.type_id, &nd.params);
+        // Edges touching this node were dropped when it left scope, or never
+        // added; the mirror is what brings them back.
+        for ed in self.edges.values() {
+            let touches = ed.from_node == id.0 || ed.to_node == id.0;
+            if touches && !self.pending_edges.iter().any(|p| p.id == ed.id) {
+                self.pending_edges.push(ed.clone());
+            }
+        }
+    }
+
+    /// Whether `id` belongs to a top-level graph this runner executes.
+    fn in_scope(&self, id: NodeId) -> bool {
+        in_scope_of(&self.nodes, self.fingerprint.as_deref(), id)
+    }
+
+    /// Brings the executor in line with the scope after node rows changed:
+    /// nodes that entered scope are added, nodes that left it are removed.
+    ///
+    /// A full walk rather than per-row bookkeeping because one row decides the
+    /// scope of a whole subtree (a graph's owner, a container's parent), and
+    /// rows of one subscription arrive in no particular order.
+    fn rescope(&mut self) {
+        if !self.scope_dirty {
+            return;
+        }
+        self.scope_dirty = false;
+        let ids: Vec<NodeId> = self.nodes.keys().copied().collect();
+        for id in ids {
+            let inside = self.in_scope(id);
+            let present = self.executor.graph().node(id).is_some();
+            if inside && !present && !self.unknown_types.contains(&id.0) {
+                let nd = self.nodes[&id].clone();
+                self.add_to_executor(nd);
+            } else if !inside && present {
+                self.drop_from_executor(id);
+            }
+        }
+        let stale: Vec<NodeId> = self
+            .executor
+            .graph()
+            .node_ids()
+            .filter(|id| !self.nodes.contains_key(id))
+            .collect();
+        for id in stale {
+            self.drop_from_executor(id);
+        }
+    }
+
+    /// Whether the set of top-level graphs, a node name or a node id changed
+    /// since the last call. Asking clears it.
+    pub fn graphs_changed(&mut self) -> bool {
+        std::mem::take(&mut self.graphs_changed)
+    }
+
+    /// What the terminal mux needs to keep its graph panes in line with the
+    /// store: this runner's top-level graphs, every node's name and id.
+    pub fn graph_sync(&self) -> GraphSync {
+        let me = self.fingerprint.as_deref().filter(|me| !me.is_empty());
+        let mut owned: Vec<u64> = self
+            .nodes
+            .values()
+            .filter(|node| node.parent == 0 && me == Some(node.runner.as_str()))
+            .map(|node| node.id)
+            .collect();
+        owned.sort_unstable();
+        GraphSync {
+            owned,
+            names: self
+                .nodes
+                .values()
+                .map(|node| (node.id, node.display_name.clone()))
+                .collect(),
+            exists: self.nodes.keys().map(|id| id.0).collect(),
+        }
     }
 
     /// Hands the node the parameters that actually changed.
@@ -550,7 +731,7 @@ impl Runner {
             match refusal {
                 Some(message) => {
                     eprintln!("[runner] {id} ({type_id}) refused {name}={text:?}: {message}");
-                    if self.published.reject(id, &name, message.clone()) && self.is_owner {
+                    if self.published.reject(id, &name, message.clone()) && self.executing {
                         let seq = self.next_seq();
                         let event = RuntimeEvent::SettingRejected {
                             seq,
@@ -566,7 +747,7 @@ impl Runner {
                 // a node that runs cleanly with a setting it once refused
                 // never mentions that setting again.
                 None => {
-                    if self.published.accept(id, &name) && self.is_owner {
+                    if self.published.accept(id, &name) && self.executing {
                         let seq = self.next_seq();
                         let event = RuntimeEvent::SettingAccepted {
                             seq,
@@ -587,6 +768,16 @@ impl Runner {
     }
 
     fn apply_node_remove(&mut self, id: NodeId) {
+        if self.nodes.remove(&id).is_some() {
+            self.graphs_changed = true;
+            self.scope_dirty = true;
+        }
+        self.drop_from_executor(id);
+    }
+
+    /// Removes a node from execution: it was deleted, or it left this runner's
+    /// scope.
+    fn drop_from_executor(&mut self, id: NodeId) {
         self.executor.remove_node(id);
         // The next `publish` only walks the nodes the graph still has, so it
         // has no reason to say anything about this one. Flushing here is what
@@ -598,21 +789,35 @@ impl Runner {
         self.logged_errors.remove(&id);
         self.applied_params.forget(id);
         self.unknown_types.remove(&id.0);
+        self.due.remove(&id);
     }
 
     /// Retries the edges whose endpoints were missing when they arrived. An
     /// edge that is still unresolvable stays queued, because the node row it
-    /// names may simply be in a later batch.
+    /// names may simply be in a later batch -- unless both of its nodes are
+    /// known and one of them belongs to another runner, which no later batch
+    /// changes without a node row that requeues it.
     fn resolve_pending_edges(&mut self) {
         if self.pending_edges.is_empty() {
             return;
         }
         for ed in std::mem::take(&mut self.pending_edges) {
-            self.apply_edge_insert(ed);
+            let (from, to) = (NodeId(ed.from_node), NodeId(ed.to_node));
+            let known = self.nodes.contains_key(&from) && self.nodes.contains_key(&to);
+            if known && !(self.in_scope(from) && self.in_scope(to)) {
+                continue;
+            }
+            self.connect(ed);
         }
     }
 
     fn apply_edge_insert(&mut self, ed: EdgeData) {
+        self.edges.insert(EdgeId(ed.id), ed.clone());
+        self.connect(ed);
+    }
+
+    /// Adds an edge to the executor, or queues it until its nodes are there.
+    fn connect(&mut self, ed: EdgeData) {
         let edge_id = EdgeId(ed.id);
         if self.executor.graph().edge(edge_id).is_some() {
             return;
@@ -623,11 +828,16 @@ impl Runner {
         // between tables, so an edge routinely arrives before the nodes it
         // names. Dropping it would lose that wire for the life of the process --
         // the row never changes again, so no second event would ever bring it
-        // back -- hence it waits for its endpoints instead.
+        // back -- hence it waits for its endpoints instead. An edge between
+        // known nodes of which one is another runner's has nothing to wait
+        // for: the mirror requeues it if that node ever enters scope.
         if self.executor.graph().node(from_node).is_none()
             || self.executor.graph().node(to_node).is_none()
         {
-            self.pending_edges.push(ed);
+            let known = self.nodes.contains_key(&from_node) && self.nodes.contains_key(&to_node);
+            if !known || (self.in_scope(from_node) && self.in_scope(to_node)) {
+                self.pending_edges.push(ed);
+            }
             return;
         }
         let from_pin: Arc<str> = Arc::from(ed.from_pin.as_str());
@@ -677,6 +887,7 @@ impl Runner {
     }
 
     fn apply_edge_remove(&mut self, id: EdgeId) {
+        self.edges.remove(&id);
         self.pending_edges.retain(|ed| ed.id != id.0);
         let to_node = self.executor.graph().edge(id).map(|e| e.to_node);
         self.executor.disconnect_edge(id);
@@ -695,7 +906,7 @@ impl Runner {
     /// The snapshot follows the same baseline, so an editor that joins between
     /// two passes sees the set the live events describe.
     fn publish(&mut self) {
-        if !self.is_owner {
+        if !self.executing {
             return;
         }
         for id in self.executor.graph().node_ids().collect::<Vec<_>>() {
@@ -770,7 +981,7 @@ impl Runner {
     /// failing for the same reason costs nothing per pass, and the snapshot a
     /// late editor is served says exactly what the live events said.
     fn publish_errors(&mut self) {
-        if !self.is_owner {
+        if !self.executing {
             return;
         }
         let current: HashMap<NodeId, String> = self
@@ -837,7 +1048,7 @@ impl Runner {
     /// authoritative: a pin missing from it is a pin whose node is gone, which
     /// is both how its frame is released and how its viewers learn to stop.
     fn refresh_frames(&self) {
-        if !self.is_owner {
+        if !self.executing {
             return;
         }
         let frame_ty = Ty::of::<Image>();
@@ -897,16 +1108,47 @@ impl Runner {
 /// Whether an async result dispatched under `dispatched` may still be applied.
 ///
 /// Applying one runs every node downstream of it, so it takes the two facts
-/// that make that safe: this process owns the graph, and it is the same
-/// ownership it dispatched the work under. A standby fails the first, and an
-/// owner that lost and regained ownership in between fails the second -- in
-/// that gap another runner ran the graph, so the result describes a pass
-/// nobody is waiting for any more.
+/// that make that safe: this process executes, and it is the same generation
+/// of execution it dispatched the work under. A runner that lost the store
+/// fails the first, and one that lost and regained it in between fails the
+/// second -- in that gap its graphs may have changed hands, so the result
+/// describes a pass nobody is waiting for any more.
 ///
 /// Pure so it can be tested: [`Runner`] needs a live store connection, and
 /// this decision must not.
-fn accepts_async_result(is_owner: bool, current: u64, dispatched: u64) -> bool {
-    is_owner && current == dispatched
+fn accepts_async_result(executing: bool, current: u64, dispatched: u64) -> bool {
+    executing && current == dispatched
+}
+
+/// How deep a parent chain may be before it is taken for a loop. No graph is
+/// nested this deep by hand, and a store row pointing back at its own subtree
+/// must not hang the loop.
+const MAX_DEPTH: usize = 64;
+
+/// Whether `id` belongs to a top-level graph whose `runner` is `me`. A runner
+/// without a fingerprint, and a graph that names none, own nothing.
+fn in_scope_of(nodes: &HashMap<NodeId, NodeData>, me: Option<&str>, id: NodeId) -> bool {
+    let Some(me) = me.filter(|me| !me.is_empty()) else {
+        return false;
+    };
+    top_level(nodes, id).is_some_and(|g| nodes.get(&g).is_some_and(|n| n.runner == me))
+}
+
+/// The top-level graph `id` lives in: the ancestor whose parent is `0`.
+///
+/// `None` while the chain is broken (an ancestor's row has not arrived yet)
+/// or loops. Either way the node is in nobody's scope for now, which is the
+/// safe answer: executing it could run another runner's graph.
+fn top_level(nodes: &HashMap<NodeId, NodeData>, id: NodeId) -> Option<NodeId> {
+    let mut current = id;
+    for _ in 0..MAX_DEPTH {
+        let node = nodes.get(&current)?;
+        if node.parent == 0 {
+            return Some(current);
+        }
+        current = NodeId(node.parent);
+    }
+    None
 }
 
 /// The parameter text last handed to each node, and the answer to "what in this
@@ -1133,6 +1375,71 @@ impl Published {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(id: u64, parent: u64, runner: &str) -> (NodeId, NodeData) {
+        (
+            NodeId(id),
+            NodeData {
+                id,
+                type_id: "graph.sub".to_string(),
+                display_name: String::new(),
+                x: 0.0,
+                y: 0.0,
+                parent,
+                params: Vec::new(),
+                runner: runner.to_string(),
+            },
+        )
+    }
+
+    /// A node's graph is found through any depth of containers; a parent that
+    /// has not arrived and a chain that loops both leave it in no graph.
+    #[test]
+    fn top_level_walks_parents_and_refuses_broken_chains() {
+        let nodes = HashMap::from([
+            row(1, 0, "sha256:aa"),
+            row(2, 1, ""),
+            row(3, 2, ""),
+            row(10, 99, ""),
+            row(20, 21, ""),
+            row(21, 20, ""),
+        ]);
+        assert_eq!(top_level(&nodes, NodeId(1)), Some(NodeId(1)));
+        assert_eq!(top_level(&nodes, NodeId(3)), Some(NodeId(1)));
+        assert_eq!(top_level(&nodes, NodeId(10)), None, "unknown parent");
+        assert_eq!(top_level(&nodes, NodeId(20)), None, "loop");
+        assert_eq!(top_level(&nodes, NodeId(404)), None, "unknown node");
+    }
+
+    /// Two runners see the same rows and each executes only the subtree of
+    /// the graph that names it; a runner without a fingerprint executes
+    /// nothing, and a root-level node without a runner belongs to nobody.
+    #[test]
+    fn scope_follows_the_graph_owner() {
+        let nodes = HashMap::from([
+            row(1, 0, "sha256:aa"),
+            row(2, 1, ""),
+            row(5, 0, "sha256:bb"),
+            row(6, 5, ""),
+            row(7, 6, ""),
+            row(9, 0, ""),
+        ]);
+        let a: Vec<u64> = [1, 2, 5, 6, 7, 9]
+            .into_iter()
+            .filter(|id| in_scope_of(&nodes, Some("sha256:aa"), NodeId(*id)))
+            .collect();
+        let b: Vec<u64> = [1, 2, 5, 6, 7, 9]
+            .into_iter()
+            .filter(|id| in_scope_of(&nodes, Some("sha256:bb"), NodeId(*id)))
+            .collect();
+        assert_eq!(a, vec![1, 2]);
+        assert_eq!(b, vec![5, 6, 7]);
+        assert!(!in_scope_of(&nodes, None, NodeId(9)));
+        assert!(
+            !in_scope_of(&nodes, Some(""), NodeId(9)),
+            "no runner is nobody's"
+        );
+    }
 
     fn pins(pin: &str, value: &str) -> HashMap<String, (String, String)> {
         HashMap::from([(pin.to_string(), ("float".to_string(), value.to_string()))])

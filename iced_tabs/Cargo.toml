@@ -4,4 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-iced = { version = "0.14", default-features = false }
+# `advanced`: a tab body is a small custom widget that reports the press
+# itself and draws the hover look.
+iced = { version = "0.14", default-features = false, features = ["advanced"] }

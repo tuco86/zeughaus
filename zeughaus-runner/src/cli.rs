@@ -93,9 +93,15 @@ fn parse_trigger(args: &[String]) -> Result<Command, String> {
         [payload] => Some(payload.clone()),
         _ => return Err("trigger takes at most one payload argument".to_owned()),
     };
+    // A press from a script or a hook: nobody in an editor asked for the
+    // run, so it is shown where every editor sees it.
     Ok(Command::Trigger {
         endpoint: endpoint.clone(),
-        request: TriggerRequest { node_id, payload },
+        request: TriggerRequest {
+            node_id,
+            payload,
+            external: true,
+        },
     })
 }
 
@@ -242,7 +248,8 @@ mod tests {
             received,
             TriggerRequest {
                 node_id: 42,
-                payload: Some("payload".to_string())
+                payload: Some("payload".to_string()),
+                external: true,
             }
         );
         let _ = std::fs::remove_dir_all(&state);
@@ -257,7 +264,8 @@ mod tests {
                 endpoint: "weida://x/".into(),
                 request: TriggerRequest {
                     node_id: 7,
-                    payload: None
+                    payload: None,
+                    external: true,
                 }
             }
         );
@@ -268,7 +276,8 @@ mod tests {
                 endpoint: "weida://x/".into(),
                 request: TriggerRequest {
                     node_id: 7,
-                    payload: Some("{\"ref\":\"main\"}".into())
+                    payload: Some("{\"ref\":\"main\"}".into()),
+                    external: true,
                 }
             }
         );

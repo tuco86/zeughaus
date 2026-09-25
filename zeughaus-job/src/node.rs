@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use zeughaus_core::*;
 
-use crate::{JobSpec, ProcessHost, RunHandle};
+use crate::{JobSpec, ProcessHost, RunExit, RunHandle};
 
 /// One process with a beginning and an end.
 ///
@@ -32,6 +32,9 @@ pub struct JobNode {
     armed: bool,
     /// The text the press carried, if any; spent with it.
     payload: Option<String>,
+    /// Whether the press came from outside an editor; spent with it, so a
+    /// run the `run` pin starts is never external.
+    external: bool,
     /// Whether a run started here is still going. Shared with its deferred
     /// work, which clears it however the run ended.
     live: Arc<AtomicBool>,
@@ -49,6 +52,7 @@ impl JobNode {
             keep_on_failure: true,
             armed: false,
             payload: None,
+            external: false,
             live: Arc::new(AtomicBool::new(false)),
             pins: vec![
                 PinDefinition::input("run", Ty::Any, PinKind::Trigger),
@@ -76,6 +80,7 @@ impl ExecutableNode for JobNode {
         // reported once, not re-tried on the next unrelated pass.
         let pressed = std::mem::take(&mut self.armed);
         let payload = std::mem::take(&mut self.payload);
+        let external = std::mem::take(&mut self.external);
         if !pressed && !inputs.changed("run") {
             return Ok(());
         }
@@ -127,6 +132,7 @@ impl ExecutableNode for JobNode {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| program.to_string());
 
+        let started = unix_secs();
         let handle = host
             .spawn(JobSpec {
                 label,
@@ -136,6 +142,9 @@ impl ExecutableNode for JobNode {
                 cwd: cwd.clone(),
                 run_dir: run_dir.clone(),
                 keep_on_failure: self.keep_on_failure,
+                started,
+                artifacts: self.artifacts.clone(),
+                external,
             })
             .map_err(ZeughausError::ExecutionFailed)?;
 
@@ -146,7 +155,7 @@ impl ExecutableNode for JobNode {
             run_dir,
             cwd,
             artifacts: self.artifacts.clone(),
-            started: unix_secs(),
+            started,
         }));
         Ok(())
     }
@@ -169,11 +178,12 @@ impl ExecutableNode for JobNode {
         // The press itself is the signal; text that came with it is kept for
         // the run it starts, and an empty press carries none.
         if name == "fire" {
+            let press = value.downcast_ref::<Press>();
             self.armed = true;
-            self.payload = value
-                .downcast_ref::<String>()
-                .filter(|text| !text.is_empty())
-                .cloned();
+            self.payload = press
+                .map(|press| press.payload.clone())
+                .filter(|text| !text.is_empty());
+            self.external = press.is_some_and(|press| press.external);
             return Ok(());
         }
         let Some(text) = value.downcast_ref::<String>() else {
@@ -282,27 +292,7 @@ impl AsyncWork for RunWork {
         let _guard = LiveGuard(live);
 
         let exit = handle.wait();
-        let finished = unix_secs();
-
-        // The run's own record, beside its log: what a later reader needs to
-        // say whether this run succeeded without parsing terminal output.
-        let record = format!(
-            "code={}\nkilled={}\nstarted={started}\nfinished={finished}\n",
-            match exit.code {
-                Some(code) => code.to_string(),
-                None => "none".to_string(),
-            },
-            exit.killed
-        );
-        let exit_path = run_dir.join("exit");
-        std::fs::write(&exit_path, record).map_err(|e| {
-            ZeughausError::ExecutionFailed(format!(
-                "job: cannot write {}: {e}",
-                exit_path.display()
-            ))
-        })?;
-
-        copy_artifacts(&run_dir, cwd.as_deref(), &artifacts)?;
+        record_run_end(&run_dir, exit, started, cwd.as_deref(), &artifacts)?;
 
         let mut outputs: HashMap<String, Value> = HashMap::new();
         // The directory is reported whatever happened: it is where both the
@@ -323,6 +313,35 @@ impl AsyncWork for RunWork {
         }
         Ok(outputs)
     }
+}
+
+/// Writes a finished run's exit record beside its log and keeps what it
+/// declared as artifacts: what a later reader needs to say whether the run
+/// succeeded without parsing terminal output.
+///
+/// The node calls it when its wait ends; a runner that adopted a run from a
+/// previous process calls it for runs no node waits for any more.
+pub fn record_run_end(
+    run_dir: &Path,
+    exit: RunExit,
+    started: u64,
+    cwd: Option<&Path>,
+    artifacts: &[String],
+) -> Result<()> {
+    let finished = unix_secs();
+    let record = format!(
+        "code={}\nkilled={}\nstarted={started}\nfinished={finished}\n",
+        match exit.code {
+            Some(code) => code.to_string(),
+            None => "none".to_string(),
+        },
+        exit.killed
+    );
+    let exit_path = run_dir.join("exit");
+    std::fs::write(&exit_path, record).map_err(|e| {
+        ZeughausError::ExecutionFailed(format!("job: cannot write {}: {e}", exit_path.display()))
+    })?;
+    copy_artifacts(run_dir, cwd, artifacts)
 }
 
 /// Copies every file a declared glob matches into `<run_dir>/artifacts/`,
@@ -468,7 +487,7 @@ mod tests {
 
     /// Fires the node once as a press does, returning the deferred wait.
     fn fire(node: &mut JobNode) -> Result<Option<Box<dyn AsyncWork>>> {
-        node.set_parameter("fire", Value::new(String::new()))
+        node.set_parameter("fire", Value::new(Press::default()))
             .expect("fire");
         let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&InputSet::new(), &mut ctx)?;
@@ -545,8 +564,14 @@ mod tests {
         let mut node = job(&host);
         node.set_parameter("cwd", Value::new("/from/setting".to_string()))
             .expect("cwd");
-        node.set_parameter("fire", Value::new("{\"ref\":\"main\"}".to_string()))
-            .expect("fire");
+        node.set_parameter(
+            "fire",
+            Value::new(Press {
+                payload: "{\"ref\":\"main\"}".to_string(),
+                external: false,
+            }),
+        )
+        .expect("fire");
         let mut inputs = InputSet::new();
         inputs.insert("cwd", Value::new("/from/wire".to_string()));
         let mut ctx = NodeContext::new(NodeId(1));
@@ -582,6 +607,39 @@ mod tests {
         let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&inputs, &mut ctx).expect("run");
         assert!(host.specs.lock().expect("specs")[2].env.is_empty());
+    }
+
+    #[test]
+    fn only_an_external_press_starts_an_external_run() {
+        let host = FakeHost::new(ok_exit());
+        let mut node = job(&host);
+        node.set_parameter(
+            "fire",
+            Value::new(Press {
+                payload: String::new(),
+                external: true,
+            }),
+        )
+        .expect("fire");
+        let mut ctx = NodeContext::new(NodeId(1));
+        node.execute(&InputSet::new(), &mut ctx).expect("run");
+        assert!(host.spec().external);
+        ctx.take_deferred().expect("deferred").run().expect("wait");
+
+        // The flag is spent with the press: the `run` pin starts a run of
+        // its own, and so does an editor's press.
+        let mut inputs = InputSet::new();
+        inputs.insert("run", Value::new(true));
+        inputs.mark_changed("run");
+        let mut ctx = NodeContext::new(NodeId(1));
+        node.execute(&inputs, &mut ctx).expect("run");
+        ctx.take_deferred().expect("deferred").run().expect("wait");
+        assert!(fire(&mut node).expect("run").is_some());
+        let specs = host.specs.lock().expect("specs");
+        assert_eq!(
+            specs.iter().map(|spec| spec.external).collect::<Vec<_>>(),
+            [true, false, false]
+        );
     }
 
     #[test]

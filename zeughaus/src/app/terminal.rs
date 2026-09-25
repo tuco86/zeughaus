@@ -1,7 +1,7 @@
-//! The runner's terminal multiplexer as this editor holds it: one attachment,
-//! one view per terminal, and the pane that draws it.
+//! The runners' terminal multiplexers as this editor holds them: one
+//! attachment per runner, one view per terminal, and the pane that draws it.
 //!
-//! Native only: a terminal is a PTY on the runner reached over QUIC, and the
+//! Native only: a terminal is a PTY on a runner reached over QUIC, and the
 //! browser editor has neither.
 
 use std::collections::HashMap;
@@ -13,7 +13,7 @@ use zeughaus_theme::Theme;
 use super::{App, unavailable};
 use crate::message::Message;
 use crate::mux::{self, MuxEvent, TerminalAction};
-use crate::workspace::{Surface, surface_title};
+use crate::workspace::{PaneRef, RunnerKey, Surface};
 
 /// The terminal's font size in logical pixels: 12 pt at 96 dpi, what a
 /// desktop terminal defaults to. One size for every pane: the cell grid is
@@ -23,11 +23,15 @@ const TERMINAL_FONT_SIZE: f32 = 16.0;
 
 /// Everything this editor holds about one runner's terminal multiplexer.
 ///
-/// Replaced wholesale when the runner endpoint changes: a different runner is
-/// a different set of terminals, and nothing cached about the old one means
-/// anything to the new one. The control task's handle aborts on drop, so
-/// dropping this is also how the attachment is given up.
+/// Replaced wholesale when the runner's endpoint changes: a different runner
+/// is a different set of terminals, and nothing cached about the old one
+/// means anything to the new one. The control task's handle aborts on drop,
+/// so dropping this is also how the attachment is given up.
 pub(super) struct MuxState {
+    /// Which attachment the events on screen came from, drawn from the
+    /// editor-wide epoch counter: a message the replaced task queued names
+    /// no live mux.
+    epoch: u64,
     /// This editor process, as the runner names it when it hands out a
     /// control lease.
     client: zeughaus_mux::ClientInstanceId,
@@ -91,52 +95,61 @@ impl LiveTerminal {
 }
 
 impl App {
-    /// Replaces the control task with one for the current endpoint.
+    /// Replaces `key`'s control task with one for its current endpoint.
     ///
-    /// The epoch is bumped first: whatever the old task still has queued
-    /// describes a runner this editor no longer talks to. Terminal views are
-    /// dropped with it -- a terminal id is the old runner's, and the new one
-    /// will hand out its own.
-    pub(super) fn restart_mux(&mut self) -> Task<Message> {
-        self.mux = None;
-        self.mux_epoch += 1;
-        let Some(endpoint) = self.runtime.endpoint.clone() else {
-            // Nothing serves a shell: back to the workspace an editor has on
-            // its own, which is the graph and nothing else.
-            self.workspace.detach();
+    /// Terminal views are dropped with the old one -- a terminal id is the
+    /// old runner's, and the new one will hand out its own.
+    pub(super) fn restart_mux(&mut self, key: &RunnerKey) -> Task<Message> {
+        self.mux.remove(key);
+        let Some(endpoint) = self.runtime.links.get(key).map(|l| l.endpoint.clone()) else {
+            // Nothing serves a shell: the section keeps no tabs.
+            self.workspace.detach(key);
             self.rebuild_palette();
             return Task::none();
         };
-        let epoch = self.mux_epoch;
+        self.runtime.next_epoch += 1;
+        let epoch = self.runtime.next_epoch;
         let (task, handle) = Task::run(mux::control(endpoint), move |event| {
             Message::Mux(epoch, event)
         })
         .abortable();
-        self.mux = Some(MuxState {
-            client: mux::client_instance(),
-            commands: None,
-            incarnation: None,
-            principal: None,
-            attached: false,
-            workspace: None,
-            terminals: HashMap::new(),
-            pending: HashMap::new(),
-            next_request: 0,
-            _control: handle.abort_on_drop(),
-        });
+        self.mux.insert(
+            key.clone(),
+            MuxState {
+                epoch,
+                client: mux::client_instance(),
+                commands: None,
+                incarnation: None,
+                principal: None,
+                attached: false,
+                workspace: None,
+                terminals: HashMap::new(),
+                pending: HashMap::new(),
+                next_request: 0,
+                _control: handle.abort_on_drop(),
+            },
+        );
         // What the palette offers about a runner depends on there being one.
         self.rebuild_palette();
         task
     }
 
-    /// What the control task said.
+    /// The runner whose mux attachment `epoch` names, if it is still live.
+    fn mux_key(&self, epoch: u64) -> Option<RunnerKey> {
+        self.mux
+            .iter()
+            .find(|(_, mux)| mux.epoch == epoch)
+            .map(|(key, _)| key.clone())
+    }
+
+    /// What a control task said.
     pub(super) fn apply_mux(&mut self, epoch: u64, event: MuxEvent) -> Task<Message> {
-        if epoch != self.mux_epoch {
+        let Some(key) = self.mux_key(epoch) else {
             return Task::none();
-        }
+        };
         match event {
             MuxEvent::Ready(sender) => {
-                if let Some(mux) = self.mux.as_mut() {
+                if let Some(mux) = self.mux.get_mut(&key) {
                     mux.commands = Some(sender);
                 }
                 Task::none()
@@ -146,7 +159,7 @@ impl App {
                 workspace,
                 heads,
             } => {
-                let Some(mux) = self.mux.as_mut() else {
+                let Some(mux) = self.mux.get_mut(&key) else {
                     return Task::none();
                 };
                 // A different runner process owns different terminals: every
@@ -183,31 +196,35 @@ impl App {
                         let _ = sender.try_send(command);
                     }
                 }
-                self.workspace.apply_snapshot(*workspace);
+                self.workspace.apply_snapshot(&key, *workspace);
                 self.rebuild_palette();
-                self.reconcile_terminals()
+                self.reconcile_terminals(&key)
             }
             MuxEvent::Workspace(snapshot) => {
-                let Some(mux) = self.mux.as_mut() else {
+                let Some(mux) = self.mux.get_mut(&key) else {
                     return Task::none();
                 };
                 mux.workspace = Some((*snapshot).clone());
-                self.workspace.apply_snapshot(*snapshot);
+                self.workspace.apply_snapshot(&key, *snapshot);
                 self.rebuild_palette();
-                self.reconcile_terminals()
+                self.reconcile_terminals(&key)
             }
             MuxEvent::Reply(reply) => {
-                let Some(mux) = self.mux.as_mut() else {
+                let Some(mux) = self.mux.get_mut(&key) else {
                     return Task::none();
                 };
                 mux.pending.remove(&reply.request);
                 if let zeughaus_mux::CommandOutcome::Refused { reason } = reply.outcome {
                     self.hint = Some((reason, iced::time::Instant::now()));
+                    // What this window waited for is not coming; a stale
+                    // wait would pull a later, unrelated tab to the front.
+                    self.pending_graph_focus = None;
+                    self.workspace.forget_expected(&key);
                 }
                 Task::none()
             }
             MuxEvent::Lost => {
-                let Some(mux) = self.mux.as_mut() else {
+                let Some(mux) = self.mux.get_mut(&key) else {
                     return Task::none();
                 };
                 mux.attached = false;
@@ -222,28 +239,28 @@ impl App {
             MuxEvent::GaveUp => {
                 // This address names a peer that is gone for good. The store
                 // announces the replacement, and reconciliation dials it.
-                self.mux = None;
-                self.workspace.detach();
+                self.mux.remove(&key);
+                self.workspace.detach(&key);
                 self.rebuild_palette();
                 Task::none()
             }
         }
     }
 
-    /// Brings the terminal streams in line with what the workspace shows.
+    /// Brings `key`'s terminal streams in line with what its workspace shows.
     ///
     /// One task per terminal any tab references; nothing for a terminal that
     /// was closed, and no second task for one already streaming. A terminal
     /// whose view survived a blink reattaches at the sequence it holds, so
     /// the runner continues with deltas instead of resending the screen.
-    pub(super) fn reconcile_terminals(&mut self) -> Task<Message> {
-        let epoch = self.mux_epoch;
-        let Some(endpoint) = self.runtime.endpoint.clone() else {
+    pub(super) fn reconcile_terminals(&mut self, key: &RunnerKey) -> Task<Message> {
+        let Some(endpoint) = self.runtime.links.get(key).map(|l| l.endpoint.clone()) else {
             return Task::none();
         };
-        let Some(mux) = self.mux.as_mut() else {
+        let Some(mux) = self.mux.get_mut(key) else {
             return Task::none();
         };
+        let epoch = mux.epoch;
         let wanted: Vec<zeughaus_mux::TerminalId> = mux
             .workspace
             .iter()
@@ -291,13 +308,14 @@ impl App {
     ) -> Task<Message> {
         use crate::mux::TerminalEvent;
 
-        if epoch != self.mux_epoch {
-            return Task::none();
-        }
-        let Some(mux) = self.mux.as_mut() else {
+        let Some(key) = self.mux_key(epoch) else {
             return Task::none();
         };
-        let Some(live) = mux.terminals.get_mut(&terminal) else {
+        let Some(live) = self
+            .mux
+            .get_mut(&key)
+            .and_then(|mux| mux.terminals.get_mut(&terminal))
+        else {
             return Task::none();
         };
         match event {
@@ -308,7 +326,7 @@ impl App {
             TerminalEvent::Desynced => {
                 live.commands = None;
                 live.task = None;
-                return self.reconcile_terminals();
+                return self.reconcile_terminals(&key);
             }
             TerminalEvent::Error(error) => {
                 eprintln!("[mux] {terminal}: {}", error.message);
@@ -331,9 +349,9 @@ impl App {
         terminal: zeughaus_mux::TerminalId,
         page: Result<zeughaus_mux::RowPage, String>,
     ) {
-        if epoch != self.mux_epoch {
+        let Some(key) = self.mux_key(epoch) else {
             return;
-        }
+        };
         let page = match page {
             Ok(page) => page,
             Err(e) => {
@@ -343,7 +361,7 @@ impl App {
         };
         if let Some(live) = self
             .mux
-            .as_mut()
+            .get_mut(&key)
             .and_then(|mux| mux.terminals.get_mut(&terminal))
             && let Some(view) = live.view.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
         {
@@ -354,18 +372,19 @@ impl App {
     /// What a terminal pane reported the user did.
     pub(super) fn apply_terminal_action(
         &mut self,
-        pane: zeughaus_mux::PaneId,
+        pane: PaneRef,
         action: TerminalAction,
     ) -> Task<Message> {
-        let Some(Surface::Terminal(terminal)) = self.workspace.surface_of(pane) else {
+        let Some(Surface::Terminal(terminal)) = self.workspace.surface_of(&pane) else {
             return Task::none();
         };
+        let key = pane.runner.clone();
         match action {
             TerminalAction::Command(command) => {
-                self.send_input(terminal, command);
+                self.send_input(&key, terminal, command);
                 Task::none()
             }
-            TerminalAction::ScrollBy(lines) => self.scroll_terminal(terminal, lines),
+            TerminalAction::ScrollBy(lines) => self.scroll_terminal(&key, terminal, lines),
             TerminalAction::Copy(text) => iced::clipboard::write(text),
             TerminalAction::OpenLink(url) => {
                 // Opening is an explicit, separate action and not this cut's:
@@ -376,7 +395,10 @@ impl App {
                 Task::none()
             }
             TerminalAction::TakeControl => {
-                self.send_topology(zeughaus_mux::TopologyCommand::TakeControl { terminal });
+                self.send_topology(
+                    &key,
+                    zeughaus_mux::TopologyCommand::TakeControl { terminal },
+                );
                 Task::none()
             }
             TerminalAction::Focused(focused) => {
@@ -391,12 +413,13 @@ impl App {
     /// Sends one input command, remembering the serial it went out with.
     pub(super) fn send_input(
         &mut self,
+        key: &RunnerKey,
         terminal: zeughaus_mux::TerminalId,
         command: zeughaus_mux::TerminalCommand,
     ) {
         let Some(live) = self
             .mux
-            .as_mut()
+            .get_mut(key)
             .and_then(|mux| mux.terminals.get_mut(&terminal))
         else {
             return;
@@ -420,18 +443,18 @@ impl App {
     /// client now watches, fetching the ones it does not hold.
     pub(super) fn scroll_terminal(
         &mut self,
+        key: &RunnerKey,
         terminal: zeughaus_mux::TerminalId,
         lines: i64,
     ) -> Task<Message> {
-        let epoch = self.mux_epoch;
-        let Some(endpoint) = self.runtime.endpoint.clone() else {
+        let Some(endpoint) = self.runtime.links.get(key).map(|l| l.endpoint.clone()) else {
             return Task::none();
         };
-        let Some(live) = self
-            .mux
-            .as_mut()
-            .and_then(|mux| mux.terminals.get_mut(&terminal))
-        else {
+        let Some(mux) = self.mux.get_mut(key) else {
+            return Task::none();
+        };
+        let epoch = mux.epoch;
+        let Some(live) = mux.terminals.get_mut(&terminal) else {
             return Task::none();
         };
         // The lock covers the scroll and the bookkeeping, not the fetch
@@ -475,10 +498,15 @@ impl App {
         Task::batch(tasks)
     }
 
-    /// Sends a structural change to the runner, or says why it cannot.
-    pub(super) fn send_topology(&mut self, command: zeughaus_mux::TopologyCommand) {
-        let refusal = match self.mux.as_mut() {
-            None => Some("no runner: the shared workspace cannot be changed"),
+    /// Sends a structural change to `key`'s runner, or says why it cannot.
+    pub(super) fn send_topology(
+        &mut self,
+        key: &RunnerKey,
+        command: zeughaus_mux::TopologyCommand,
+    ) {
+        let refusal = match self.mux.get_mut(key) {
+            None if key.is_synthetic() => Some("no runner executes these graphs"),
+            None => Some("no mux on this runner: its workspace cannot be changed"),
             Some(mux) if !mux.attached => Some("reconnecting: the change was not sent"),
             Some(mux) => {
                 mux.next_request += 1;
@@ -505,9 +533,10 @@ impl App {
     /// its input carries. `None` while no head has arrived.
     pub(super) fn terminal_view(
         &self,
+        key: &RunnerKey,
         terminal: zeughaus_mux::TerminalId,
     ) -> Option<(&mux::SharedView, mux::Serials)> {
-        let live = self.mux.as_ref()?.terminals.get(&terminal)?;
+        let live = self.mux.get(key)?.terminals.get(&terminal)?;
         let present = live
             .view
             .lock()
@@ -516,22 +545,32 @@ impl App {
         present.then_some((&live.view, live.serials))
     }
 
-    /// What the pane's title bar calls a surface: a terminal's own title
-    /// when one has arrived, the surface's word otherwise.
-    pub(super) fn pane_title(&self, surface: Surface) -> String {
-        match surface {
-            Surface::Terminal(terminal) => self
-                .terminal_view(terminal)
-                .and_then(|(view, _)| {
-                    let guard = view.lock().unwrap_or_else(|e| e.into_inner());
-                    guard
-                        .as_ref()
-                        .map(|view| view.title.clone())
-                        .filter(|title| !title.is_empty())
+    /// Terminals this window has scrolled back, with how many rows above the
+    /// live screen their viewport starts: what a restart hands on.
+    pub(super) fn terminal_scrolls(&self) -> Vec<(RunnerKey, zeughaus_mux::TerminalId, i64)> {
+        let mut scrolls: Vec<_> = self
+            .mux
+            .iter()
+            .flat_map(|(key, mux)| {
+                mux.terminals.iter().filter_map(move |(terminal, live)| {
+                    let guard = live.view.lock().unwrap_or_else(|e| e.into_inner());
+                    let view = guard.as_ref()?;
+                    let top = view.scroll_top?;
+                    Some((key.clone(), *terminal, view.visible.start - top))
                 })
-                .unwrap_or_else(|| surface_title(surface).to_owned()),
-            other => surface_title(other).to_owned(),
-        }
+            })
+            .collect();
+        scrolls.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+        scrolls
+    }
+
+    /// Whether `terminal`'s first screen has arrived, so it can scroll.
+    pub(super) fn terminal_has_screen(
+        &self,
+        key: &RunnerKey,
+        terminal: zeughaus_mux::TerminalId,
+    ) -> bool {
+        self.terminal_view(key, terminal).is_some()
     }
 
     /// One terminal pane.
@@ -543,32 +582,40 @@ impl App {
     /// rows and gets the take-control shortcut instead of the keys.
     pub(super) fn terminal_pane(
         &self,
-        pane: Option<zeughaus_mux::PaneId>,
+        pane: Option<PaneRef>,
+        key: &RunnerKey,
         terminal: zeughaus_mux::TerminalId,
     ) -> Element<'_, Message, Theme> {
-        let Some((view, serials)) = self.terminal_view(terminal) else {
+        let Some((view, serials)) = self.terminal_view(key, terminal) else {
             return unavailable("Terminal", "Waiting for the runner's first screen.");
         };
+        let principal = self.mux.get(key).and_then(|mux| mux.principal.as_deref());
         let controlling = {
             let guard = view.lock().unwrap_or_else(|e| e.into_inner());
             guard.as_ref().is_none_or(|view| {
                 view.controller.as_ref().is_none_or(|controller| {
                     controller.client == mux::client_instance()
-                        || self.mux.as_ref().and_then(|mux| mux.principal.as_deref())
-                            == Some(controller.principal.as_str())
+                        || principal == Some(controller.principal.as_str())
                 })
             })
         };
-        let focused = pane.is_some() && pane == self.workspace.focused_pane();
+        // The palette or a name field takes the keyboard while it is open; a
+        // shell that kept it would receive everything typed there.
+        let focused = !self.palette_open
+            && self.workspace.renaming_group.is_none()
+            && self.workspace.renaming_tab.is_none()
+            && pane.is_some()
+            && pane.as_ref() == self.workspace.focused_pane();
         let widget = iced_terminal::Terminal::new(Arc::clone(view), terminal.0)
             .controlling(controlling)
             .focused(focused)
+            .reserved(iced_palette::is_toggle_shortcut)
             .next_serial(serials.next())
             .font_size(TERMINAL_FONT_SIZE);
         match pane {
             None => widget.into(),
             Some(pane) => widget
-                .on_action(move |action| Message::TerminalAction(pane, action))
+                .on_action(move |action| Message::TerminalAction(pane.clone(), action))
                 .into(),
         }
     }

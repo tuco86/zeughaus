@@ -110,6 +110,14 @@ impl Model {
         self.terminal.current_seqno() as u64
     }
 
+    pub(crate) fn size(&self) -> Dimensions {
+        let size = self.terminal.get_size();
+        Dimensions {
+            cols: size.cols.min(u16::MAX as usize) as u16,
+            rows: size.rows.min(u16::MAX as usize) as u16,
+        }
+    }
+
     pub(crate) fn advance(&mut self, bytes: &[u8]) {
         self.terminal.advance_bytes(bytes);
     }

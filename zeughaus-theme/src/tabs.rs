@@ -1,11 +1,12 @@
-//! The tab bar's catalog.
+//! The tab tree's catalog.
 //!
-//! A tab is a button in disguise, so the look is the tab crate's own default
-//! resolved against the inner iced theme: the selected tab wears the primary
-//! pair, the others are transparent with the theme's text, and a tab with an
-//! accent (a job, a terminal that reported one) borders itself in it.
+//! The look is the tab crate's default resolved against the inner iced
+//! theme: the bar sits on the chrome, a selected tab joins the content
+//! background, an optional accent is drawn as a dot, a group's tabs sit on
+//! its colour and the drop marker is the primary colour.
 
-use iced_tabs::{Catalog, Status, Style, StyleFn};
+use iced::Color;
+use iced_tabs::{Catalog, Placement, Status, Style, StyleFn};
 
 use crate::Theme;
 
@@ -18,5 +19,21 @@ impl Catalog for Theme {
 
     fn style(&self, class: &Self::Class<'_>, status: Status) -> Style {
         class(self, status)
+    }
+
+    fn section_header(&self, placement: Placement) -> Style {
+        iced_tabs::section_header(self.base(), placement)
+    }
+
+    fn group_header(&self, color: Color, marked: bool, placement: Placement) -> Style {
+        iced_tabs::group_header(self.base(), color, marked, placement)
+    }
+
+    fn group_background(&self, color: Color, placement: Placement) -> Style {
+        iced_tabs::group_background(self.base(), color, placement)
+    }
+
+    fn marker(&self) -> Color {
+        iced_tabs::marker(self.base())
     }
 }

@@ -88,6 +88,8 @@ pub enum Message {
     // Open a container node as a graph tab, or bring its tab to the front.
     // The one navigation the editor has: a subgraph is drawn nowhere else.
     OpenGraph(u64),
+    // A new top-level graph executed by this section's runner (or local).
+    NewGraph(crate::workspace::RunnerKey),
     // Arrange the current graph's nodes in columns by depth. A layout is a
     // shared edit like any other move: it changes node positions.
     AutoLayout,
@@ -98,7 +100,9 @@ pub enum Message {
     SelectionChanged(Vec<u64>),
     CloneNodes(Vec<u64>),
     DeleteNodes(Vec<u64>),
+    // One graph pane's camera moved. Every pane showing that graph shares it.
     CameraChanged {
+        graph: u64,
         position: Point,
         zoom: f32,
     },
@@ -126,6 +130,14 @@ pub enum Message {
         key: String,
         value: String,
     },
+    // Renaming a node from its header: the edit button starts it with the
+    // current name, the header's text field edits the draft, Enter or the edit
+    // button again commits it.
+    RenameStart(u64),
+    RenameInput(String),
+    RenameCommit,
+    // Escape anywhere: closes the palette and abandons a rename.
+    Escape,
     // A manual trigger node was pressed. Recorded in the shared store so the
     // one process that executes the graph fires the node once -- the
     // hand-driven counterpart to a timer, and it works from any window.
@@ -162,15 +174,34 @@ pub enum Message {
     // The undecorated window's own titlebar and edge grips: the moves a
     // system titlebar would have made. The grips and the minimize button
     // exist on native windows only; a browser tab has neither.
-    WindowDrag,
+    //
+    // A press on the titlebar only arms a drag; the drag starts once the
+    // pointer moves away with the button held. Starting it on the press
+    // would put the second click of a double-click inside a compositor move,
+    // and a maximize that arrives during a move keeps the moved position.
+    TitlebarPress,
+    TitlebarMove(iced::Point),
+    TitlebarRelease,
+    TitlebarExit,
     #[cfg(not(target_arch = "wasm32"))]
     WindowResize(iced::window::Direction),
     #[cfg(not(target_arch = "wasm32"))]
     WindowMinimize,
     WindowMaximize,
+    // Read from the window manager after opening or resizing, including
+    // maximize/restore actions performed outside our titlebar.
+    #[cfg(not(target_arch = "wasm32"))]
+    WindowMaximized(bool),
     // The transport is closed; now the process may end.
     #[cfg(not(target_arch = "wasm32"))]
     Exit,
+    // SIGUSR1: save what the window shows and replace the process with a
+    // fresh build of itself.
+    #[cfg(unix)]
+    Restart,
+    // The transport is closed and the restore file written; `exec` now.
+    #[cfg(unix)]
+    RestartExec(std::path::PathBuf),
     // File operations
     SaveGraph,
     LoadGraph,
@@ -209,17 +240,17 @@ pub enum Message {
     // rather than the terminal: focus is a property of the pane, and the
     // terminal it shows is one lookup away in the workspace.
     #[cfg(not(target_arch = "wasm32"))]
-    TerminalAction(zeughaus_mux::PaneId, iced_terminal::Action),
-    // Show one of the runner's own terminals -- a job's -- in a new tab, or
-    // kill it. Offered by the palette from the detached list of the last
-    // workspace snapshot; the runner answers with the next snapshot. The
-    // browser editor never has a runner, so its detached list is empty and
-    // nothing emits these.
-    AttachTerminal(zeughaus_mux::TerminalId),
-    CloseTerminal(zeughaus_mux::TerminalId),
-    // Hold the runner, which starts no new run and lets the live ones
-    // finish, or release it again.
-    HoldRunner(bool),
+    TerminalAction(crate::workspace::PaneRef, iced_terminal::Action),
+    // Show one of a runner's own terminals -- a job's -- in a new tab, or
+    // kill it. Offered by the palette from the detached list of that
+    // runner's last workspace snapshot; the runner answers with the next
+    // snapshot. The browser editor never has a runner, so nothing emits
+    // these there.
+    AttachTerminal(crate::workspace::RunnerKey, zeughaus_mux::TerminalId),
+    CloseTerminal(crate::workspace::RunnerKey, zeughaus_mux::TerminalId),
+    // Hold a runner, which starts no new run and lets the live ones finish,
+    // or release it again.
+    HoldRunner(crate::workspace::RunnerKey, bool),
     // What the runner answered: the state it is in now and how many runs are
     // still alive.
     #[cfg(not(target_arch = "wasm32"))]

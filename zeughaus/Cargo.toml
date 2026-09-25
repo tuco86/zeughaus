@@ -3,6 +3,13 @@ name = "zeughaus"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# The headless editor: `zeughaus --headless --control <socket>` runs the real
+# app without a window, takes input over a Unix socket, writes screenshots and
+# records video through an external `ffmpeg`, and `zeughaus ctl <socket> ...`
+# drives it. Native only; off by default.
+remote = ["dep:iced_runtime", "dep:iced_futures", "dep:iced_selector", "dep:png"]
+
 [dependencies]
 zeughaus-core.workspace = true
 zeughaus-transform.workspace = true
@@ -39,7 +46,8 @@ zeughaus-record.workspace = true
 zeughaus-llm.workspace = true
 rfd = "0.15"
 # `image` decodes/uploads raw RGBA frames (screen capture -> Display node).
-iced = { version = "0.14", features = ["advanced", "wgpu", "tokio", "image"] }
+# `canvas` draws the node header's button symbols as paths.
+iced = { version = "0.14", features = ["advanced", "wgpu", "tokio", "image", "canvas"] }
 spacetimedb-sdk.workspace = true
 zeughaus-sync.workspace = true
 # Frames do not fit through a state store (33 MB for a 4K frame), so the video
@@ -52,8 +60,9 @@ weida.workspace = true
 # pane and bundles the font the grid is measured from.
 iced_terminal.workspace = true
 # `io-util` reads a frame off the QUIC stream, `time` paces the first dial of a
-# runtime, `macros` is `select!` between a subscription and its peer events.
-tokio = { version = "1", features = ["io-util", "time", "macros"] }
+# runtime, `macros` is `select!` between a subscription and its peer events,
+# `signal` is the SIGUSR1 that restarts the editor.
+tokio = { version = "1", features = ["io-util", "time", "macros", "signal"] }
 # Sixteen random bytes, once per process, for the `ClientInstanceId` a control
 # lease is bound to. Already in the tree under weida; a full `rand` would be a
 # generator this process has no other use for.
@@ -66,6 +75,13 @@ zeughaus-theme = { workspace = true, features = ["terminal"] }
 # sits. A browser tab has no state directory and therefore no preferences.
 toml = { workspace = true }
 serde = { workspace = true }
+# The headless host (feature `remote`). Direct dependencies because `iced`
+# keeps its runtime private, and the host drives `UserInterface` and the
+# subscription `Runtime` itself. `png` writes the screenshots.
+iced_runtime = { version = "0.14", optional = true }
+iced_futures = { version = "0.14", features = ["tokio"], optional = true }
+iced_selector = { version = "0.14", optional = true }
+png = { version = "0.18", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # `#[tokio::test]` for the first-dial schedule, with a paused clock.
@@ -74,7 +90,7 @@ tokio = { version = "1", features = ["rt", "macros", "test-util"] }
 # wasm: iced without the tokio executor (iced uses the wasm-bindgen executor).
 # iced_nodegraph is WebGPU-only, so the browser editor needs a WebGPU context.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-iced = { version = "0.14", features = ["advanced", "wgpu", "image"] }
+iced = { version = "0.14", features = ["advanced", "wgpu", "image", "canvas"] }
 console_error_panic_hook = "0.1"
 spacetimedb-sdk = { workspace = true, features = ["browser"] }
 # The pack is the whole choice in the browser: no state directory, so no file

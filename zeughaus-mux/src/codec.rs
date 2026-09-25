@@ -37,7 +37,7 @@ use crate::workspace::{
 
 /// Protocol version. A major mismatch refuses the attach; a minor is the
 /// lower of the two sides'.
-pub const MAJOR: u8 = 1;
+pub const MAJOR: u8 = 2;
 pub const MINOR: u8 = 0;
 
 const MAGIC: [u8; 2] = *b"ZM";
@@ -49,9 +49,12 @@ pub const MAX_BODY: u32 = 16 * 1024 * 1024;
 /// capability is offered.
 pub const FLAG_COMPRESSED: u8 = 1;
 
-/// Most tabs in a snapshot, and most leaves in a tree.
+/// Most tabs in a snapshot (grouped ones included), and most leaves in a
+/// tree.
 pub const MAX_TABS: usize = 256;
 pub const MAX_LEAVES: usize = 256;
+/// Most groups in a snapshot.
+pub const MAX_GROUPS: usize = 64;
 /// Most owned terminals a snapshot may list as detached.
 pub const MAX_DETACHED: usize = 256;
 /// Most rows in one head, delta or page.
@@ -407,27 +410,24 @@ fn validate_attached(m: &ControlAttached) -> Result<(), CodecError> {
 }
 
 fn validate_workspace(w: &WorkspaceSnapshot) -> Result<(), CodecError> {
-    if w.tabs.len() > MAX_TABS {
+    if w.tabs().count() > MAX_TABS {
         return Err(CodecError::Invalid("too many tabs"));
     }
+    if w.groups().count() > MAX_GROUPS {
+        return Err(CodecError::Invalid("too many groups"));
+    }
+    if w.groups().any(|g| g.name.len() > MAX_TITLE_BYTES) {
+        return Err(CodecError::Invalid("group name too long"));
+    }
     let mut leaves = 0;
-    let mut graphs = 0;
-    for tab in &w.tabs {
-        if tab.title.len() > MAX_TITLE_BYTES
-            || tab
-                .group
-                .as_ref()
-                .is_some_and(|g| g.len() > MAX_TITLE_BYTES)
-        {
+    for tab in w.tabs() {
+        if tab.title.len() > MAX_TITLE_BYTES {
             return Err(CodecError::Invalid("tab title too long"));
         }
-        validate_tree(&tab.root, &mut leaves, &mut graphs)?;
+        validate_tree(&tab.root, &mut leaves)?;
     }
     if leaves > MAX_LEAVES {
         return Err(CodecError::Invalid("too many panes"));
-    }
-    if graphs > 1 {
-        return Err(CodecError::Invalid("more than one graph pane"));
     }
     if w.detached.len() > MAX_DETACHED {
         return Err(CodecError::Invalid("too many detached terminals"));
@@ -440,20 +440,11 @@ fn validate_workspace(w: &WorkspaceSnapshot) -> Result<(), CodecError> {
     Ok(())
 }
 
-fn validate_tree(
-    node: &PaneNode,
-    leaves: &mut usize,
-    graphs: &mut usize,
-) -> Result<(), CodecError> {
+fn validate_tree(node: &PaneNode, leaves: &mut usize) -> Result<(), CodecError> {
     if node.depth() > MAX_TREE_DEPTH {
         return Err(CodecError::Invalid("pane tree too deep"));
     }
-    for (_, surface) in node.leaves() {
-        *leaves += 1;
-        if surface == crate::workspace::SurfaceRef::Graph {
-            *graphs += 1;
-        }
-    }
+    *leaves += node.leaf_count();
     validate_ratios(node)
 }
 
@@ -483,7 +474,8 @@ fn validate_command(c: &TopologyCommand) -> Result<(), CodecError> {
             Err(CodecError::Invalid("split ratio out of range"))
         }
         TopologyCommand::RenameTab { title: Some(t), .. }
-        | TopologyCommand::SetTabGroup { group: Some(t), .. }
+        | TopologyCommand::NewGroup { name: t, .. }
+        | TopologyCommand::RenameGroup { name: t, .. }
             if t.len() > MAX_TITLE_BYTES =>
         {
             Err(CodecError::Invalid("title too long"))
@@ -615,7 +607,7 @@ mod tests {
         assert_eq!(
             bytes,
             [
-                b'Z', b'M', 1, 0, 0x12, 0x00, 0, 0, 0x04, 0x03, 0x02, 0x00, 0x88, 0x77, 0x66, 0x55,
+                b'Z', b'M', 2, 0, 0x12, 0x00, 0, 0, 0x04, 0x03, 0x02, 0x00, 0x88, 0x77, 0x66, 0x55,
                 0x44, 0x33, 0x22, 0x11
             ]
         );
@@ -656,8 +648,11 @@ mod tests {
         assert_eq!(FrameHeader::decode(&bad), Err(CodecError::Magic));
 
         let mut major = FrameHeader::new(Kind::Command, 0, 0).encode();
-        major[2] = 2;
-        assert_eq!(FrameHeader::decode(&major), Err(CodecError::Major(2)));
+        major[2] = MAJOR + 1;
+        assert_eq!(
+            FrameHeader::decode(&major),
+            Err(CodecError::Major(MAJOR + 1))
+        );
 
         let mut kind = FrameHeader::new(Kind::Command, 0, 0).encode();
         kind[4] = 0x77;
@@ -728,25 +723,41 @@ mod tests {
         WorkspaceSnapshot {
             incarnation: RunnerIncarnation::from_bytes([1; 16]),
             revision: 4,
-            tabs: vec![TabSnapshot {
-                id: TabId(1),
-                title: "main".into(),
-                group: Some("g".into()),
-                accent_rgba: Some([1, 2, 3, 255]),
-                root: PaneNode::Split {
-                    id: SplitId(1),
-                    axis: Axis::Horizontal,
-                    ratio: 0.4,
-                    first: Box::new(PaneNode::Leaf {
-                        pane_id: PaneId(1),
-                        surface: SurfaceRef::Graph,
-                    }),
-                    second: Box::new(PaneNode::Leaf {
-                        pane_id: PaneId(2),
-                        surface: SurfaceRef::Terminal(TerminalId(3)),
-                    }),
-                },
-            }],
+            items: vec![
+                WorkspaceItem::Tab(TabSnapshot {
+                    id: TabId(1),
+                    title: "main".into(),
+                    accent_rgba: Some([1, 2, 3, 255]),
+                    root: PaneNode::Split {
+                        id: SplitId(1),
+                        axis: Axis::Horizontal,
+                        ratio: 0.4,
+                        first: Box::new(PaneNode::Leaf {
+                            pane_id: PaneId(1),
+                            surface: SurfaceRef::Graph(77),
+                        }),
+                        second: Box::new(PaneNode::Leaf {
+                            pane_id: PaneId(2),
+                            surface: SurfaceRef::Terminal(TerminalId(3)),
+                        }),
+                    },
+                }),
+                WorkspaceItem::Group(GroupSnapshot {
+                    id: GroupId(5),
+                    name: "Triggered".into(),
+                    color_rgba: [128, 128, 128, 64],
+                    locked: true,
+                    tabs: vec![TabSnapshot {
+                        id: TabId(2),
+                        title: "run".into(),
+                        accent_rgba: None,
+                        root: PaneNode::Leaf {
+                            pane_id: PaneId(3),
+                            surface: SurfaceRef::Terminal(TerminalId(5)),
+                        },
+                    }],
+                }),
+            ],
             detached: vec![DetachedTerminal {
                 terminal: TerminalId(4),
                 title: "cargo test".into(),
@@ -819,6 +830,37 @@ mod tests {
                 terminal: TerminalId(4),
             },
         }));
+        for command in [
+            TopologyCommand::OpenGraph { graph: 9 },
+            TopologyCommand::NewGroup {
+                name: "Group 1".into(),
+                color_rgba: [1, 2, 3, 4],
+            },
+            TopologyCommand::MoveTab {
+                tab: TabId(1),
+                to: TabSlot {
+                    group: Some(GroupId(2)),
+                    index: u32::MAX,
+                },
+            },
+            TopologyCommand::MergeTab {
+                tab: TabId(1),
+                pane: PaneId(4),
+                side: Side::Top,
+            },
+            TopologyCommand::MovePane {
+                pane: PaneId(4),
+                to: PaneTarget::Beside {
+                    pane: PaneId(5),
+                    side: Side::Right,
+                },
+            },
+        ] {
+            round_trip(Message::Command(Command {
+                request: RequestId(13),
+                command,
+            }));
+        }
         round_trip(Message::CommandReply(CommandReply {
             request: RequestId(9),
             outcome: CommandOutcome::Refused {
@@ -914,7 +956,7 @@ mod tests {
         let mut deep = workspace();
         let mut node = PaneNode::Leaf {
             pane_id: PaneId(1),
-            surface: SurfaceRef::Graph,
+            surface: SurfaceRef::Graph(1),
         };
         for i in 0..MAX_TREE_DEPTH as u64 + 1 {
             node = PaneNode::Split {
@@ -928,31 +970,40 @@ mod tests {
                 }),
             };
         }
-        deep.tabs[0].root = node;
+        let WorkspaceItem::Tab(tab) = &mut deep.items[0] else {
+            unreachable!("the fixture starts with a tab")
+        };
+        tab.root = node;
         let bytes = postcard::to_stdvec(&deep).unwrap();
         assert_eq!(
             Message::decode(Kind::WorkspaceSnapshot, &bytes),
             Err(CodecError::Invalid("pane tree too deep"))
         );
 
-        let mut two_graphs = workspace();
-        two_graphs.tabs[0].root = PaneNode::Split {
-            id: SplitId(1),
-            axis: Axis::Horizontal,
-            ratio: 0.5,
-            first: Box::new(PaneNode::Leaf {
-                pane_id: PaneId(1),
-                surface: SurfaceRef::Graph,
-            }),
-            second: Box::new(PaneNode::Leaf {
-                pane_id: PaneId(2),
-                surface: SurfaceRef::Graph,
-            }),
-        };
-        let bytes = postcard::to_stdvec(&two_graphs).unwrap();
+        let mut many_groups = workspace();
+        for i in 0..MAX_GROUPS as u64 {
+            many_groups.items.push(WorkspaceItem::Group(GroupSnapshot {
+                id: GroupId(100 + i),
+                name: String::new(),
+                color_rgba: [0; 4],
+                locked: false,
+                tabs: Vec::new(),
+            }));
+        }
+        let bytes = postcard::to_stdvec(&many_groups).unwrap();
         assert_eq!(
             Message::decode(Kind::WorkspaceSnapshot, &bytes),
-            Err(CodecError::Invalid("more than one graph pane"))
+            Err(CodecError::Invalid("too many groups"))
+        );
+
+        let mut long_name = workspace();
+        if let WorkspaceItem::Group(group) = &mut long_name.items[1] {
+            group.name = "x".repeat(MAX_TITLE_BYTES + 1);
+        }
+        let bytes = postcard::to_stdvec(&long_name).unwrap();
+        assert_eq!(
+            Message::decode(Kind::WorkspaceSnapshot, &bytes),
+            Err(CodecError::Invalid("group name too long"))
         );
 
         let mut overlap = head();

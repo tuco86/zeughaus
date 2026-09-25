@@ -53,10 +53,16 @@ They meet in two places:
   (`zeughaus-core/src/wire.rs`); frames have their own path; everything else
   stays in the runner.
 
-**Who executes** is decided by the store, not negotiated: every runner calls
-`join_runtime`, the lowest `seq` owns execution, the others are hot standbys
-that take over when it disconnects. The owner announces the pinned URL
-(`weida://sha256:<fp>@host:port/`) in its `runtime` row; editors dial that.
+**Who executes** is decided by the store, not negotiated: every top-level
+graph (`graph.sub` with `parent == 0`) names its runner in the node's
+`runner` column (the `sha256:<hex>` fingerprint of that runner's endpoint),
+and each runner executes exactly the subtrees of the graphs that name it
+(`zeughaus-runner/src/runner.rs`, `in_scope_of`). Every runner calls
+`join_runtime` and announces its pinned URL
+(`weida://sha256:<fp>@host:port/`) in its `runtime` row; an editor dials
+every runner it finds there. Root-level nodes of a session from before
+graphs had owners are adopted once into a new graph by the runner with the
+lowest `seq` (`adopt_root_nodes`).
 
 **Redial is weida's, resync is ours.** An editor dials each runtime address
 once (`zeughaus/src/transport.rs`, `first_dial`) under a `ReconnectPolicy`
@@ -85,7 +91,7 @@ the user's back.
 | `zeughaus-runner` | the executing process: store loop, executor, weida listener, feed server, mux service, job host | native |
 | `zeughaus` | the editor | native + wasm32 |
 | `iced_terminal` | terminal widget: one wgpu primitive per pane, input to `TerminalCommand`s, bundled font | native |
-| `iced_tabs` | the tab bar the workspace shell uses | yes |
+| `iced_tabs` | the tab tree the workspace shell uses: sections, one level of groups, drop targets and markers | yes |
 | `zeughaus-theme` | the editor's theme: an `iced::Theme` paired with a terminal colour scheme, the catalogs of every widget the editor draws, the bundled pack, the WezTerm scheme parser | yes |
 | `zeughaus-transform`, `-flow`, `-graph`, `-ml` | pure plugins | yes |
 | `zeughaus-job` | the `job.run` node and the `ProcessHost` trait it executes through; the runner implements the host, the editor registers the plugin detached | yes |
@@ -239,9 +245,10 @@ direct `graph.input`/`graph.output` children, named by each child's title. An
 edge drawn onto a container's pin is stored against the boundary child, so
 the store and the executor see one flat graph of real nodes; only the editor
 knows about nesting. Deleting a container deletes its contents, recursively
-in the reducer and locally in every editor. A container's `open` button
-opens its contents as a graph tab (below); the root graph is what the
-runner's graph pane shows.
+in the reducer and locally in every editor. A top-level graph is a
+container too: it is what a graph tab shows, and closing its last tab with
+its close button deletes it. A nested container's `open` button opens its
+contents in a tab of its own.
 
 **Layout.** `AutoLayout` ranks nodes by longest path from a source and orders
 a rank by the barycentre of its placed predecessors; a cycle admits the lowest
@@ -251,16 +258,33 @@ shared through the store.
 **Workspace.** The window is undecorated and draws its own titlebar: the
 button in the corner moves the tab strip between the titlebar and a sidebar
 under it, and the window buttons and edge grips do what the system
-decorations would have.
-Below it are tabs of split panes (`iced_tabs`, `pane_grid`). The runner's
-tabs are the shared workspace: exactly one pane shows the root graph, every
-other pane is a terminal (section 9), and tab order, splits and pane ids
-come from the runner. A graph tab is the editor's own: one per opened
-container, one surface, no splits, listed after the runner's tabs and
-working without one. The canvas shows the graph of the tab in front; the
-camera is kept per graph and the selection is dropped on a switch. A
-deleted container closes its tab. Active tab, focus, scroll, selection,
-blink, graph tabs and the tab bar's placement are per window.
+decorations would have. Native windows have 10-logical-pixel rounded corners
+with a transparent exterior and an opaque workspace. Maximizing removes
+the rounding and resize grips; restoring the window brings them back.
+The browser canvas stays rectangular.
+Below it are tabs of split panes (`iced_tabs::tree`, `pane_grid`). The tab
+bar has one section per connected runner, labelled with its host and the
+start of its fingerprint, plus `Local` (no store: the scratch graphs) or
+`Not running` (graphs whose runner is not connected). A runner section is
+that runner's shared workspace: loose tabs and one level of coloured,
+collapsible groups, each tab a split tree whose leaves are terminals
+(section 9) or graphs, and order, groups, splits and ids come from the
+runner. Tabs never move between sections. Section controls add a shell, a
+graph (created for that runner) or a group. In both bar placements tabs are
+dragged into and out of groups (collapsed ones too), onto another tab's
+content to split it, and a pane is dragged by its grip back into the bar to
+become a tab (`zeughaus/src/workspace.rs`, `drop_allowed`). A tab dropped on
+another tab lands before or after it by the half the pointer is over; the
+bar's empty rest after the last section is that section's end, and a drop
+onto the place an item already has sends nothing (`drop_command`). Each
+pane draws its own graph; the camera is kept per graph, the focused pane's
+graph is where the palette spawns nodes, and the selection is dropped when
+the focus moves to another graph. Active tab, focus, collapsed sections and
+groups, scroll, selection, blink and the tab bar's placement are per window.
+Top tabs join the content background, with the close control inside each
+tab. The sidebar has the titlebar's chrome and its tabs the same look,
+rounded on the left instead of on top. Long labels are shortened; overflow
+scrolls.
 
 **Themes** (`zeughaus-theme`). One theme type drives everything the window
 draws. A `Theme` is an `iced::Theme` -- the widgets' palette -- paired with a
@@ -270,7 +294,7 @@ file derives its iced palette from it (background, text = foreground,
 primary = blue, success = green, warning = yellow, danger = red), and the
 editor's own semantics are ANSI slots -- a `Float` pin is green, a `Str` pin
 yellow, a `Bool` pin blue, a constant's header the green tinted into the
-chrome. The chrome (titlebar, status line, pane titles) uses the extended
+chrome. The chrome (titlebar, status line) uses the extended
 palette's roles; the graph goes through `iced_nodegraph`'s catalog, whose
 defaults already derive from the extended palette; the terminal renders the
 theme's palette with any entry an OSC 4/10/11 changed laid over it (the
@@ -349,14 +373,43 @@ never a queue; output is coalesced at a 12 ms cadence. The client
 their exact base, pages into holes, and keeps its row store bounded around
 the viewport.
 
+**Tab titles.** The terminal engine reports changed OSC titles to the
+runner's mux service independently of screen subscribers. If the title
+names a tab or a detached terminal, the runner advances the workspace
+revision and publishes a snapshot on the control exchange. No terminal
+stream is needed to keep an inactive tab's title current. A user-supplied
+tab name takes precedence; otherwise the first non-empty surface names the
+tab. Repeated identical OSC titles do not publish another revision.
+
 **Ownership.** The runner owns tab order, splits, ratios, pane and terminal
 ids; each editor owns its presentation state. Any client may view a terminal;
 exactly one holds its **lease** and may type, resize and move the mouse in
 it. The first client that types acquires an unowned terminal, another takes
 it with `TakeControl` (`Ctrl+Shift+T`), and a lease survives a network blink
 for ten seconds so a redial does not turn a shell read-only. Closing a pane
-kills its child; closing an editor window does not. A runner restart is a new
-incarnation with an empty workspace: terminals do not migrate.
+kills its child; closing an editor window does not.
+
+**Shims and restart.** On unix every terminal's PTY and child live in a shim
+process, the runner binary started as `zeughaus-runner shim
+<state-dir>/terminals/<id>` (`zeughaus-terminal/src/shim`). It detaches into
+a session of its own, starts the profile from `spec.json`, tees a job's log,
+keeps the last 4 MiB of output, and serves one session at a time on `sock`
+with length-prefixed postcard frames (`Hello`/`Welcome`, `Input`, `Resize`,
+`Redraw`, `Close`; `Output`, `Exited`). A new session gets the replay first,
+parsed with the terminal's answerbacks muted, then live output, with no gap
+between them. Dropping a session leaves the shim running; only `Close` (a
+closed pane, `CloseTerminal`) ends it. The mux writes
+`<state-dir>/workspace.json` (tabs, groups, splits, id counters, per
+terminal its label, grid and job run) after every structural change; a
+version 1 file is migrated, its graph panes dropped. A starting runner
+reattaches every saved terminal, rebuilds the workspace around the ones that
+came back (dead panes removed), gives every graph it owns and no pane shows
+a tab, closes shims nothing refers to, and continues the id counters.
+`SIGUSR1` saves and `exec`s the
+runner's binary again with the same arguments; the incarnation is new, the
+terminal and tab ids are the old ones, so an editor keeps its active tab and
+focus. SIGINT/SIGTERM still drain and exit, leaving shells in their shims
+for the next runner. Windows keeps terminals in the runner process.
 
 **Security.** The runner's identity (`runner.pem`) and one client identity
 (`client.pem`) live under the state directory (`ZEUGHAUS_STATE_DIR`, else
@@ -376,7 +429,10 @@ are shaped once per content and instanced once per palette, a changed row
 replaces only its arena ranges, a cursor move touches no row, an idle
 terminal schedules no redraw. The font is bundled so the cell grid is the
 same on every host. Keys: `Ctrl+Shift+C`/`V` copy and paste,
-`Ctrl+Shift+Escape` gives the keyboard back to the app.
+`Ctrl+Shift+Escape` gives the keyboard back to the app. `Ctrl+Space` never
+reaches the shell: the command palette acts on the whole window (tabs,
+panes, terminals, the graph), is drawn over whichever tab is in front, and
+holds the keyboard while it is open.
 
 ## 10. The sample feed
 
@@ -402,6 +458,8 @@ results keyed by (pin, tier, sequence).
 | paths inside nodes | `db.database` `path` and `record.writer` `dir` are settings, resolved against the runner's working directory |
 | LLM endpoint | the `base_url` setting on each conversation node (default `http://localhost:1234/v1`) |
 | runs | `<state-dir>/runs/<run-id>/` holds `log`, `exit`, `code` and `artifacts/` of every job run this runner executed; `--keep-runs <n>` (default 50) is how many successful runs stay, pruned when a run starts; failed runs and runs without an exit record are never pruned |
+| terminals | `<state-dir>/terminals/<id>/` (`spec.json`, `sock`, `shim.log`) per live terminal, `<state-dir>/workspace.json` for the tabs a restarted runner restores |
+| editor restart | `SIGUSR1` writes `<state-dir>/restore-<pid>.json` (window size and maximized state, active tab, focused pane and collapsed sections and groups by runner, cameras, node sizes, selection, an open palette with its input, a rename in progress, terminal scroll-back, nested views open in a section without a runner, the scratch document without a store) and `exec`s the editor, which reads and deletes it through `ZEUGHAUS_RESTORE`. The window's position is not restored: a Wayland client can neither read nor set it |
 
 ## 12. Testing strategy
 
@@ -413,7 +471,18 @@ results keyed by (pin, tier, sequence).
   malformed and oversized input, golden bytes for the mux header and kinds.
 - Editor: pure functions (layout, wire refusal, relation rules, field
   editing, pending edits, first-dial schedule) are unit-tested; the widget
-  tree is verified against the running application.
+  tree is verified against the running application. With the `remote`
+  feature, `zeughaus --headless --control <socket>` runs the real `App`
+  without a window on a hardware wgpu renderer, takes mouse and keyboard
+  events from `zeughaus ctl <socket> ...` and writes PNG screenshots with
+  the cursor's hover state (`zeughaus/src/remote`), so a check never drives
+  the user's desktop. Pointer commands run the loop between their events,
+  paced over an optional duration, so a one-command `drag` behaves like a
+  hand; `record`/`record-stop` pipe frames at 30 fps through `ffmpeg` into
+  an MP4 with the pointer painted in, for showing a change in a PR.
+- Shims: `zeughaus-runner/tests/shim.rs` starts real shims through the
+  runner binary: a shell survives its session and is reattached with its
+  screen, and the replay is bounded to the newest 4 MiB.
 - Terminal: engine tests (`zeughaus-terminal`) for styles, Unicode, alternate
   screen, resize, deltas, eviction, exit; the pipeline's CPU side
   (`iced_terminal`) for shaping and instance caches.
@@ -449,10 +518,10 @@ a command, the graph does. The plugin defines `ProcessHost` (`held`,
 `JobPlugin::detached()`, which only contributes the catalog entry.
 
 **A run.** `JobHost::spawn` allocates `<state-dir>/runs/<id>/` (ids continue
-past whatever is on disk, so a restart never reuses one), opens `log`, and
+past whatever is on disk, so a restart never reuses one), creates `log`, and
 starts the process through `MuxService::spawn_owned`: a terminal with no
-pane whose PTY bytes are teed to the log before they are parsed
-(`Session::spawn_teed`). The node defers the wait to the blocking pool; when
+pane whose PTY bytes are appended to the log before they are parsed, by the
+shim that holds the PTY. The node defers the wait to the blocking pool; when
 the child exits, `exit` is written (`code`, `killed`, `started`, `finished`),
 declared artifacts are copied under `artifacts/`, and the outputs are
 delivered like any async result. A run that exited 0 closes its terminal;
@@ -483,13 +552,24 @@ live_runs }`) flips the host's flag; the palette offers "Runner / Hold" and
 run is live, logging what it is draining; a runner with no live runs exits
 at once.
 
+**Runs across a restart.** A run's terminal carries its run directory,
+start time, `cwd` and artifact globs in `workspace.json`. A restarted runner
+adopts every reattached run without an `exit` record (`JobHost::adopt_runs`):
+it waits for it like the node would have, then writes `exit` and copies the
+artifacts (`zeughaus_job::record_run_end`). The node that started it is gone
+with the old process, so its `ok`/`failed` pins do not fire for an adopted
+run; adopted runs count as live for a drain.
+
 **Triggers** carry an optional payload (`TriggerRequest { node_id, payload }`)
 that becomes the node's `fire` parameter; a bare press sends none. They come
 through weida only: no HTTP listener and no polling in the runner.
 
 **The CLI** is the runner binary as a client (`zeughaus-runner/src/cli.rs`):
 `zeughaus-runner trigger <endpoint> <node-id> [payload]` pushes on
-`/triggers`, `zeughaus-runner hold <endpoint> on|off` asks `/hold` and
+`/triggers` marked `external`: the run it starts gets a tab in the runner's
+locked `Triggered` group, which only the runner fills and from which no tab
+is dragged; a press from an editor leaves its run detached.
+`zeughaus-runner hold <endpoint> on|off` asks `/hold` and
 prints the reply. `<endpoint>` is the pinned root URL a runner prints at
 start; the client identity comes from the state directory (`--state-dir`,
 `ZEUGHAUS_STATE_DIR`), so a script, a cron entry or a webhook relay is the
@@ -500,10 +580,10 @@ same principal as an editor on that machine. No store is involved.
 Kept here so they are not mistaken for descriptions of the code:
 
 - Staged deployment of graph versions (draft / staged / deployed).
-- Placement of nodes across several runners; today the owner runs everything.
-  The shape it will take: one runner per machine, each keeping the logs and
-  artifacts of the runs it executed and serving them itself; routing between
-  runners and editors goes over the weida broker, not the store.
+- Placement of nodes across several runners within one graph: a graph runs
+  on the runner it names, whole. Edges between graphs of different runners
+  are not carried; routing between runners would go over the weida broker,
+  not the store.
 - Opt-in per-node capture of results into a database; the recorder plugin
   writes datasets to disk instead.
 - Queue semantics on edges; every edge is last-value. For jobs that means
@@ -514,9 +594,6 @@ Kept here so they are not mistaken for descriptions of the code:
 - A browser editor that syncs with the store; the wasm build edits locally.
 - Terminal image protocols; the wire model reserves kinds for them.
 - Jobs, decided but not built:
-  - A shim process per run that owns the PTY and the log, survives a runner
-    restart and is reattached by replaying the log into `wezterm-term`;
-    today runs die with the runner, which is why it drains.
   - Reading run files in the editor; `/runs` is served, nothing calls it.
   - Webhooks (Gitea) land on the weida broker once it speaks HTTP and are
     relayed to `/triggers`.

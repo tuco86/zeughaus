@@ -6,10 +6,10 @@
 //! run a node. That is what keeps a node with side effects (a screen capture, an
 //! LLM request) firing once per session instead of once per open window.
 //!
-//! Several runners may join the same session. The store orders them and only the
-//! first executes; the others are hot standbys that take over when it leaves,
-//! which is why nothing here negotiates ownership -- it is read back out of the
-//! store on every batch.
+//! Several runners may join the same session. Every top-level graph names the
+//! runner that executes it, and each runner executes only its own graphs; the
+//! store is read back on every batch, so a graph created for this runner by
+//! any editor starts running here without a handshake.
 
 mod cli;
 mod feed;
@@ -69,6 +69,25 @@ const TRIGGER_BACKLOG: usize = 32;
 const MAX_PRESSES_PER_TURN: usize = 8;
 
 fn main() -> ExitCode {
+    // A terminal's shim is this binary too, started by the mux with the
+    // terminal's directory. It must be the first thing that happens: the
+    // shim forks, and nothing may have started a thread before that.
+    #[cfg(unix)]
+    {
+        let mut args = std::env::args_os().skip(1);
+        if args.next().as_deref() == Some(std::ffi::OsStr::new("shim")) {
+            let Some(dir) = args.next() else {
+                eprintln!("[shim] usage: zeughaus-runner shim <terminal-dir>");
+                return ExitCode::FAILURE;
+            };
+            return zeughaus_terminal::shim::run(std::path::Path::new(&dir));
+        }
+    }
+    // Resolved once, now: after a rebuild replaced the file, the running
+    // image is "(deleted)" and only this path still names the new binary,
+    // which is what a restart executes and what new shims are started from.
+    let exe = std::env::current_exe();
+
     // A unique id range per process, so a runner that creates ids (none today,
     // but nodes may spawn nodes) can never collide with a live editor's.
     zeughaus_core::NodeId::seed_unique();
@@ -180,6 +199,8 @@ fn main() -> ExitCode {
     let mut publisher = None;
     // Jobs run in the mux, so a process without one has no host to offer them.
     let mut job_host: Option<Arc<JobHost>> = None;
+    // Kept for the restart, which saves the workspace before it `exec`s.
+    let mut mux_service: Option<MuxService> = None;
     if let Some(transport) = &transport {
         let listener = transport.listener();
         match listener.replier(FEED_PATH) {
@@ -209,15 +230,18 @@ fn main() -> ExitCode {
         // that a restarted runner's terminals are not the ones it cached.
         match listener.replier(MUX_PATH) {
             Ok(replier) => {
-                let service = MuxService::new(mux::incarnation(), Vec::new());
+                let service = MuxService::new(
+                    mux::incarnation(),
+                    Vec::new(),
+                    terminal_host(exe.as_ref().ok(), &state_dir),
+                );
                 rt.spawn(service.clone().accept(replier));
                 // A run is a terminal this process owns, so the job host is
                 // the mux service plus the state directory its logs go in.
-                job_host = Some(Arc::new(JobHost::new(
-                    service,
-                    state_dir.clone(),
-                    keep_runs,
-                )));
+                let host = Arc::new(JobHost::new(service.clone(), state_dir.clone(), keep_runs));
+                host.adopt_runs();
+                job_host = Some(host);
+                mux_service = Some(service);
             }
             Err(e) => eprintln!("[runner] no terminal mux: {e}"),
         }
@@ -239,12 +263,25 @@ fn main() -> ExitCode {
         }
     }
 
+    // The fingerprint pinned in this runner's own URL is what a graph's
+    // `runner` column names. Without an endpoint no editor could reach this
+    // process, and no graph can name it.
+    let fingerprint = transport.as_ref().and_then(|t| {
+        weida::EndpointAddr::parse(t.url())
+            .ok()
+            .and_then(|addr| addr.peer)
+            .map(|fp| fp.to_string())
+    });
+    if fingerprint.is_none() {
+        eprintln!("[runner] no endpoint, so no graph is this runner's");
+    }
     let mut runner = Runner::new(
         store,
         Arc::clone(&frames),
         publisher,
         Arc::clone(&snapshot),
         job_host.clone(),
+        fingerprint,
     );
     if let Some(transport) = &transport {
         runner.set_endpoint(transport.url().to_string());
@@ -271,10 +308,23 @@ fn main() -> ExitCode {
             stopping.store(true, Ordering::SeqCst);
         });
     }
+    // A restart replaces this process with the binary at `exe`, same PID,
+    // same arguments. Nothing drains: shells and runs live in their shims,
+    // and the next process reattaches them from the saved workspace.
+    #[cfg(unix)]
+    restart_signal::install();
     // Whether the draining line has been written: the loop turns twenty times
     // a second and the reason for waiting is worth saying once.
     let mut draining = false;
+    // Whether the mux has seen the store's graphs since the subscription
+    // applied. The first look is taken even when nothing changed, so a pane
+    // of a graph deleted while this process was down goes too.
+    let mut graphs_synced = false;
     loop {
+        #[cfg(unix)]
+        if restart_signal::take() {
+            restart(exe.as_ref().ok(), mux_service.as_ref());
+        }
         if stopping.load(Ordering::SeqCst) {
             let live = job_host.as_ref().map_or(0, |host| host.live_runs());
             if live == 0 {
@@ -331,6 +381,17 @@ fn main() -> ExitCode {
         // ownership this process no longer has.
         runner.refresh_ownership();
 
+        // The store's events before any result or press: a result delivered
+        // against a stale scope would still run the downstream nodes of a
+        // node this batch deleted or moved out of this runner's graphs.
+        let had_events = !events.is_empty();
+        for event in events {
+            runner.apply(event);
+        }
+        if had_events {
+            runner.reconcile();
+        }
+
         // Clocked nodes are what make a source a source: nothing upstream ever
         // wakes a screen capture, so without this the graph produces one frame
         // and stops.
@@ -342,15 +403,20 @@ fn main() -> ExitCode {
         }
 
         for press in presses {
-            fired |= runner.trigger(press.node_id, press.payload);
+            fired |= runner.trigger(press.node_id, press.payload, press.external);
         }
 
-        if !events.is_empty() || ticked || fired {
-            for event in events {
-                runner.apply(event);
-            }
+        if had_events || ticked || fired {
             let deferred = runner.pass();
             dispatch(&rt, &async_tx, runner.owner_epoch(), deferred);
+            // Only once the store's content is here: a partial picture would
+            // close the panes of graphs that simply have not arrived yet.
+            if runner.synced() && (runner.graphs_changed() || !graphs_synced) {
+                graphs_synced = true;
+                if let Some(mux) = &mux_service {
+                    mux.sync_graphs(runner.graph_sync());
+                }
+            }
         }
     }
 }
@@ -412,6 +478,94 @@ async fn wait_for_stop() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Where this runner's terminals live: in shims under
+/// `<state-dir>/terminals` on unix, so they survive a restart, and in this
+/// process otherwise. Without its own path the runner cannot start a shim.
+fn terminal_host(
+    exe: Option<&PathBuf>,
+    state_dir: &std::path::Path,
+) -> zeughaus_terminal::TerminalHost {
+    #[cfg(unix)]
+    match exe {
+        Some(exe) => zeughaus_terminal::TerminalHost::Shim(zeughaus_terminal::ShimHost {
+            program: exe.clone(),
+            args: vec!["shim".into()],
+            root: state_dir.join("terminals"),
+        }),
+        None => {
+            eprintln!("[runner] cannot locate this executable; terminals end with the runner");
+            zeughaus_terminal::TerminalHost::Local
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (exe, state_dir);
+        zeughaus_terminal::TerminalHost::Local
+    }
+}
+
+/// Saves the workspace and replaces this process with `exe`, same PID and
+/// arguments. Returns only when that failed; the runner then carries on as
+/// it was.
+#[cfg(unix)]
+fn restart(exe: Option<&PathBuf>, mux: Option<&MuxService>) {
+    use std::os::unix::process::CommandExt;
+
+    let Some(exe) = exe else {
+        eprintln!("[runner] restart failed: this executable cannot be located");
+        return;
+    };
+    if let Some(mux) = mux {
+        mux.persist();
+    }
+    eprintln!("[runner] restarting");
+    let e = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    eprintln!("[runner] restart failed: {e}");
+}
+
+/// `SIGUSR1` as a flag the loop reads every turn.
+///
+/// The restart has to happen on the loop's thread, between two turns, and
+/// the loop already wakes at least every `TICK`: a handler that sets an
+/// atomic is the whole mechanism, with no task, channel or runtime between
+/// the signal and the `exec`.
+#[cfg(unix)]
+mod restart_signal {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static REQUESTED: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn on_usr1(_: libc::c_int) {
+        // An atomic store is async-signal-safe; nothing else happens here.
+        REQUESTED.store(true, Ordering::SeqCst);
+    }
+
+    pub fn install() {
+        // SAFETY: `on_usr1` only stores to an atomic, and `SA_RESTART` keeps
+        // the signal from failing blocking calls elsewhere in the process.
+        let installed = unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_usr1 as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()) == 0
+        };
+        if !installed {
+            eprintln!(
+                "[runner] no restart signal: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    /// Whether a restart was asked for since the last call.
+    pub fn take() -> bool {
+        REQUESTED.swap(false, Ordering::SeqCst)
     }
 }
 

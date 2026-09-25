@@ -89,6 +89,11 @@ counter_id! {
 }
 
 counter_id! {
+    /// A group of tabs in the shared workspace.
+    GroupId
+}
+
+counter_id! {
     /// A split in a tab's pane tree, so a ratio change can name it.
     SplitId
 }

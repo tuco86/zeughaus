@@ -37,6 +37,9 @@ pub struct EditorNode {
     /// drawn node per frame -- each answer a linear scan of the whole plugin
     /// catalog comparing strings.
     pub is_container: bool,
+    /// The runner that executes this graph (its fingerprint text). Set on
+    /// top-level graphs only; empty everywhere else.
+    pub runner: String,
 }
 
 pub struct EditorEdge {
@@ -205,20 +208,21 @@ impl App {
         Some((child.id, PinLabel::from(inner_pin)))
     }
 
-    /// Where an edge endpoint is drawn in the current graph.
+    /// Where an edge endpoint is drawn in `graph`.
     ///
-    /// Identity for a node of this graph; a boundary node one level down is
+    /// Identity for a node of that graph; a boundary node one level down is
     /// drawn on its container's pin instead, so a wire that crosses into a
     /// subgraph is one visible wire rather than a stub on each side. `None`
-    /// means the endpoint is not visible here, and the edge is not drawn.
+    /// means the endpoint is not visible there, and the edge is not drawn.
     pub(super) fn view_endpoint(
         &self,
+        graph: NodeId,
         node: NodeId,
         pin: &PinLabel,
         is_source: bool,
     ) -> Option<(NodeId, PinLabel)> {
         let editor_node = self.nodes.get(&node)?;
-        if editor_node.parent == self.current_graph {
+        if editor_node.parent == graph {
             return Some((node, pin.clone()));
         }
         let crosses = match editor_node.type_id.as_str() {
@@ -230,10 +234,40 @@ impl App {
             return None;
         }
         let container = editor_node.parent;
-        if self.nodes.get(&container)?.parent != self.current_graph {
+        if self.nodes.get(&container)?.parent != graph {
             return None;
         }
         Some((container, PinLabel::from(self.boundary_name(node).as_str())))
+    }
+
+    /// The top-level graph `id` lives in: the ancestor whose parent is the
+    /// root. `None` while an ancestor is unknown or the chain loops, the same
+    /// walk the runner makes to decide what it executes.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(super) fn top_level(&self, id: NodeId) -> Option<NodeId> {
+        /// No graph is nested this deep by hand; a loop must not hang the view.
+        const MAX_DEPTH: usize = 64;
+        let mut current = id;
+        for _ in 0..MAX_DEPTH {
+            let node = self.nodes.get(&current)?;
+            if node.parent == NodeId(0) {
+                return Some(current);
+            }
+            current = node.parent;
+        }
+        None
+    }
+
+    /// The runner that executes `id`'s graph, if its graph names one.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(super) fn runner_of(&self, id: NodeId) -> Option<&str> {
+        let graph = self.nodes.get(&self.top_level(id)?)?;
+        (!graph.runner.is_empty()).then_some(graph.runner.as_str())
+    }
+
+    /// Every top-level graph with its title, in creation order.
+    pub(super) fn top_level_graphs(&self) -> impl Iterator<Item = &EditorNode> {
+        self.children(NodeId(0))
     }
 
     /// Rebuilds the pins of the container a boundary node belongs to. Called
@@ -254,7 +288,13 @@ impl App {
     /// to drag the top one away.
     pub(super) fn spawn_node(&mut self, type_id: &str, position: Point) {
         let position = self.clear_spot(position);
-        self.spawn_node_into(type_id, position, self.current_graph);
+        self.spawn_node_into(type_id, position, self.current_graph, "");
+    }
+
+    /// Creates a top-level graph executed by `runner` (empty for the local
+    /// section), and returns its id.
+    pub(super) fn create_graph(&mut self, runner: &str) -> Option<NodeId> {
+        self.spawn_node_into("graph.sub", Point::ORIGIN, NodeId(0), runner)
     }
 
     /// `position`, or the first spot down-right of it that no node of the
@@ -294,11 +334,15 @@ impl App {
     /// Separate from [`Self::spawn_node`] because a clone decides both the
     /// parent and the exact position: a copied subtree's children belong to
     /// the copied container, and staggering them would move them inside it.
+    ///
+    /// `runner` is stored on top-level nodes only, which are graphs: a node
+    /// at the root is named "Graph" rather than after its catalog entry.
     pub(super) fn spawn_node_into(
         &mut self,
         type_id: &str,
         position: Point,
         parent: NodeId,
+        runner: &str,
     ) -> Option<NodeId> {
         let instance = self.plugins.iter().find_map(|p| p.create_node(type_id))?;
 
@@ -309,12 +353,11 @@ impl App {
             .map(|def| (Arc::clone(&def.name), def.default.to_string()))
             .collect();
         let id = NodeId::next();
-        let display_name = self
-            .catalog
-            .iter()
-            .find(|d| &*d.type_id == type_id)
-            .map(|d| d.display_name.to_string())
-            .unwrap_or_else(|| type_id.to_string());
+        let (display_name, runner) = if parent == NodeId(0) {
+            ("Graph".to_owned(), runner.to_owned())
+        } else {
+            (self.catalog_name(type_id), String::new())
+        };
         self.instances.insert(id, instance);
 
         self.nodes.insert(
@@ -329,6 +372,7 @@ impl App {
                 settings: setting_defs,
                 parent,
                 is_container: self.is_container(type_id),
+                runner,
             },
         );
         self.node_order.push(id);
@@ -356,6 +400,16 @@ impl App {
             .iter()
             .find(|d| &*d.type_id == type_id)
             .map_or_else(|| Arc::from(""), |d| Arc::clone(&d.category))
+    }
+
+    /// The name the catalog gives a node type: what a new node is called, and
+    /// what a node falls back to when renamed to nothing. The type id itself
+    /// for a type this build has no entry for.
+    pub(super) fn catalog_name(&self, type_id: &str) -> String {
+        self.catalog
+            .iter()
+            .find(|d| &*d.type_id == type_id)
+            .map_or_else(|| type_id.to_string(), |d| d.display_name.to_string())
     }
 
     /// Copies a node, what has been typed into it, and -- for a container --
@@ -399,7 +453,7 @@ impl App {
                     None => continue,
                 }
             };
-            let Some(copy) = self.spawn_node_into(&type_id, position, into) else {
+            let Some(copy) = self.spawn_node_into(&type_id, position, into, "") else {
                 continue;
             };
             copy_of.insert(original, copy);
@@ -935,6 +989,7 @@ impl App {
                     y: node.position.y,
                     params,
                     parent: node.parent.0,
+                    runner: node.runner.clone(),
                 })
             })
             .collect();
@@ -982,6 +1037,7 @@ impl App {
                 settings: setting_defs,
                 parent: NodeId(node_data.parent),
                 is_container: self.is_container(type_id),
+                runner: node_data.runner.clone(),
             },
         );
         self.node_order.push(id);
@@ -994,7 +1050,7 @@ impl App {
         }
     }
 
-    pub(super) fn load_document(&mut self, doc: GraphDocument) {
+    pub(super) fn load_document(&mut self, mut doc: GraphDocument) {
         // Everything the outgoing document owned: the nodes, their instances,
         // what was typed into them and what they said about it.
         self.nodes.clear();
@@ -1021,6 +1077,9 @@ impl App {
             EdgeId::bump_above(max_edge);
         }
 
+        // A document from before graphs were top-level containers keeps its
+        // nodes at the root, where no pane can show them.
+        adopt_orphans(&mut doc, NodeId::next());
         // Rebuild from document
         for node_data in &doc.nodes {
             self.insert_node_from_data(node_data);
@@ -1059,6 +1118,29 @@ impl App {
         // runtime publishes them.
         self.update_display_values();
     }
+}
+
+/// Moves every root-level node that is not a graph into a new graph `graph`,
+/// the way the store's `adopt_root_nodes` migrates a legacy session. Does
+/// nothing when there is nothing to move.
+fn adopt_orphans(doc: &mut GraphDocument, graph: NodeId) {
+    let orphans = |n: &NodeData| n.parent == 0 && n.type_id != "graph.sub";
+    if !doc.nodes.iter().any(orphans) {
+        return;
+    }
+    for node in doc.nodes.iter_mut().filter(|n| orphans(n)) {
+        node.parent = graph.0;
+    }
+    doc.nodes.push(NodeData {
+        id: graph.0,
+        type_id: "graph.sub".to_owned(),
+        display_name: "Graph".to_owned(),
+        x: 0.0,
+        y: 0.0,
+        parent: 0,
+        params: Vec::new(),
+        runner: String::new(),
+    });
 }
 
 /// Whether `start` can reach `goal` by following dataflow edges of `index`.

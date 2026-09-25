@@ -18,12 +18,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use weida::{Replier, TransferMeta};
-use zeughaus_job::{JobSpec, ProcessHost, RunExit, RunHandle};
+use zeughaus_job::{JobSpec, ProcessHost, RunExit, RunHandle, record_run_end};
 use zeughaus_link::{HoldReply, HoldRequest, MAX_HOLD_BYTES};
 use zeughaus_mux::{ExitState, TerminalId};
 use zeughaus_terminal::Profile;
 
-use crate::mux::MuxService;
+use crate::mux::{MuxService, OwnedPlacement, SavedRun};
 
 /// How often a waiting run looks at its terminal. A job is measured in
 /// seconds at best, so this is latency nobody can perceive and a thread that
@@ -76,6 +76,41 @@ impl JobHost {
 
     pub fn live_runs(&self) -> u32 {
         self.live.load(Ordering::SeqCst)
+    }
+
+    /// Takes over the runs a previous runner started and did not see end:
+    /// their terminals came back with the mux, and when they end, their
+    /// exit record and artifacts are written here. The node that started
+    /// them is gone with that runner, so its `ok`/`failed` pins do not fire
+    /// for them. They count as live, so a draining stop waits for them too.
+    pub fn adopt_runs(&self) {
+        for (terminal, run) in self.mux.restored_runs() {
+            // Recorded already: it ended under the previous runner, which
+            // kept the terminal of a failure to look at.
+            if run.run_dir.join("exit").exists() {
+                continue;
+            }
+            self.live.fetch_add(1, Ordering::SeqCst);
+            let handle = Box::new(Run {
+                mux: self.mux.clone(),
+                terminal,
+                code_file: run.run_dir.join("code"),
+                live: Arc::clone(&self.live),
+            });
+            eprintln!("[runner] adopted run {}", run.run_dir.display());
+            std::thread::spawn(move || {
+                let exit = handle.wait();
+                if let Err(e) = record_run_end(
+                    &run.run_dir,
+                    exit,
+                    run.started,
+                    run.cwd.as_deref(),
+                    &run.artifacts,
+                ) {
+                    eprintln!("[runner] adopted run {}: {e}", run.run_dir.display());
+                }
+            });
+        }
     }
 }
 
@@ -143,12 +178,27 @@ impl ProcessHost for JobHost {
     }
 
     fn spawn(&self, spec: JobSpec) -> Result<Box<dyn RunHandle>, String> {
-        // Opened before the child, because a run whose log cannot be written
-        // is a run nobody can read afterwards -- and that is worth refusing
-        // rather than discovering when it fails.
+        // Created before the child, because a run whose log cannot be
+        // written is a run nobody can read afterwards -- and that is worth
+        // refusing rather than discovering when it fails. The terminal
+        // appends to it from here on, in whichever process holds the PTY.
         let log_path = spec.run_dir.join("log");
-        let log = File::create(&log_path)
+        File::create(&log_path)
             .map_err(|e| format!("cannot create {}: {e}", log_path.display()))?;
+        let run = SavedRun {
+            run_dir: spec.run_dir.clone(),
+            started: spec.started,
+            cwd: spec.cwd.clone(),
+            artifacts: spec.artifacts.clone(),
+        };
+        // A run nobody in an editor started would otherwise sit unseen among
+        // the detached terminals; one an editor pressed is attached from
+        // there by whoever wants to look.
+        let placement = if spec.external {
+            OwnedPlacement::Triggered
+        } else {
+            OwnedPlacement::Detached
+        };
 
         let (program, args, mut env) = if spec.keep_on_failure && cfg!(unix) {
             // The wrapper runs the program, and on failure records the code
@@ -178,7 +228,9 @@ impl ProcessHost for JobHost {
             env,
             scrollback_rows: RUN_SCROLLBACK_ROWS,
         };
-        let terminal = self.mux.spawn_owned(profile, Some(Box::new(log)))?;
+        let terminal = self
+            .mux
+            .spawn_owned(profile, Some(log_path), Some(run), placement)?;
         self.live.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(Run {
             mux: self.mux.clone(),
@@ -349,7 +401,7 @@ pub async fn serve_hold(replier: Replier, host: Arc<JobHost>) {
 mod tests {
     use std::collections::HashMap;
 
-    use zeughaus_core::{DomainPlugin, InputSet, NodeContext, NodeId, Value};
+    use zeughaus_core::{DomainPlugin, InputSet, NodeContext, NodeId, Press, Value};
     use zeughaus_job::JobPlugin;
 
     use super::*;
@@ -370,8 +422,14 @@ mod tests {
             .unwrap();
         node.set_parameter("keep_on_failure", Value::new(keep.to_string()))
             .unwrap();
-        node.set_parameter("fire", Value::new("payload-text".to_string()))
-            .unwrap();
+        node.set_parameter(
+            "fire",
+            Value::new(Press {
+                payload: "payload-text".to_string(),
+                external: false,
+            }),
+        )
+        .unwrap();
         let mut ctx = NodeContext::new(NodeId(1));
         node.execute(&InputSet::new(), &mut ctx).unwrap();
         ctx.take_deferred()
@@ -383,7 +441,11 @@ mod tests {
     #[test]
     fn a_run_is_logged_and_only_a_failed_one_keeps_its_terminal() {
         let state_dir = fresh_state_dir("e2e");
-        let mux = MuxService::new(crate::mux::incarnation(), Vec::new());
+        let mux = MuxService::new(
+            crate::mux::incarnation(),
+            Vec::new(),
+            zeughaus_terminal::TerminalHost::Local,
+        );
         let host = Arc::new(JobHost::new(
             mux.clone(),
             state_dir.clone(),
@@ -460,14 +522,18 @@ mod tests {
     #[test]
     fn a_held_host_starts_nothing() {
         let state_dir = fresh_state_dir("held");
-        let mux = MuxService::new(crate::mux::incarnation(), Vec::new());
+        let mux = MuxService::new(
+            crate::mux::incarnation(),
+            Vec::new(),
+            zeughaus_terminal::TerminalHost::Local,
+        );
         let host = Arc::new(JobHost::new(mux, state_dir.clone(), DEFAULT_KEEP_RUNS));
         host.hold(true);
         let plugin = JobPlugin::new(Arc::clone(&host) as Arc<dyn ProcessHost>);
         let mut node = plugin.create_node("job.run").unwrap();
         node.set_parameter("command", Value::new("/bin/true".to_string()))
             .unwrap();
-        node.set_parameter("fire", Value::new(String::new()))
+        node.set_parameter("fire", Value::new(Press::default()))
             .unwrap();
         let mut ctx = NodeContext::new(NodeId(1));
         let err = node.execute(&InputSet::new(), &mut ctx).unwrap_err();
@@ -496,7 +562,11 @@ mod tests {
         record(5, Some("code=0\nkilled=false\n"));
         record(6, Some("code=0\nkilled=false\n"));
 
-        let mux = MuxService::new(crate::mux::incarnation(), Vec::new());
+        let mux = MuxService::new(
+            crate::mux::incarnation(),
+            Vec::new(),
+            zeughaus_terminal::TerminalHost::Local,
+        );
         let host = JobHost::new(mux, state_dir.clone(), 2);
         let fresh = host.new_run_dir().unwrap();
         assert_eq!(fresh, runs.join("7"));

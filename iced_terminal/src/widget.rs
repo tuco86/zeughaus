@@ -96,6 +96,8 @@ where
     on_action: Option<Box<dyn Fn(Action) -> Message + 'a>>,
     controlling: bool,
     focused: bool,
+    /// Keys the application keeps even while this pane has the keyboard.
+    reserved: Option<fn(&keyboard::Key, keyboard::Modifiers) -> bool>,
     next_serial: u64,
     font_size: f32,
     class: Theme::Class<'a>,
@@ -114,6 +116,7 @@ where
             on_action: None,
             controlling: false,
             focused: false,
+            reserved: None,
             next_serial: 1,
             font_size: DEFAULT_FONT_SIZE,
             class: Theme::default(),
@@ -136,6 +139,14 @@ where
     /// the widget: a terminal must not steal it from a command palette.
     pub fn focused(mut self, focused: bool) -> Self {
         self.focused = focused;
+        self
+    }
+
+    /// Keys that stay the application's while this pane has the keyboard:
+    /// they neither reach the child nor are captured, so a shortcut such as
+    /// the command palette's works from inside a shell too.
+    pub fn reserved(mut self, reserved: fn(&keyboard::Key, keyboard::Modifiers) -> bool) -> Self {
+        self.reserved = Some(reserved);
         self
     }
 
@@ -319,13 +330,19 @@ where
                 state.modifiers = *modifiers;
             }
             Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
                 modified_key,
                 modifiers,
                 text,
                 ..
             }) => {
                 state.modifiers = *modifiers;
-                if self.focused {
+                // The same key the application's shortcut matches: the one
+                // before modifiers were applied.
+                let reserved = self
+                    .reserved
+                    .is_some_and(|reserved| reserved(key, *modifiers));
+                if self.focused && !reserved {
                     self.on_key(
                         state,
                         modified_key,

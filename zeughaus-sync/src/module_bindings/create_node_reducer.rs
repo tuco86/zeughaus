@@ -14,6 +14,7 @@ pub(super) struct CreateNodeArgs {
     pub y: f32,
     pub params: String,
     pub parent: u64,
+    pub runner: String,
 }
 
 impl From<CreateNodeArgs> for super::Reducer {
@@ -26,6 +27,7 @@ impl From<CreateNodeArgs> for super::Reducer {
             y: args.y,
             params: args.params,
             parent: args.parent,
+            runner: args.runner,
         }
     }
 }
@@ -54,8 +56,19 @@ pub trait create_node {
         y: f32,
         params: String,
         parent: u64,
+        runner: String,
     ) -> __sdk::Result<()> {
-        self.create_node_then(id, type_id, display_name, x, y, params, parent, |_, _| {})
+        self.create_node_then(
+            id,
+            type_id,
+            display_name,
+            x,
+            y,
+            params,
+            parent,
+            runner,
+            |_, _| {},
+        )
     }
 
     /// Request that the remote module invoke the reducer `create_node` to run as soon as possible,
@@ -73,6 +86,7 @@ pub trait create_node {
         y: f32,
         params: String,
         parent: u64,
+        runner: String,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -92,6 +106,7 @@ impl create_node for super::RemoteReducers {
         y: f32,
         params: String,
         parent: u64,
+        runner: String,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -108,6 +123,7 @@ impl create_node for super::RemoteReducers {
                 y,
                 params,
                 parent,
+                runner,
             },
             callback,
         )

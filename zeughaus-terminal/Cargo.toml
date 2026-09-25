@@ -10,6 +10,14 @@ portable-pty.workspace = true
 wezterm-term.workspace = true
 termwiz.workspace = true
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
+# The shim's frames and its spec file.
+serde.workspace = true
+postcard.workspace = true
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+# fork/setsid for the shim, SIGWINCH to a PTY's foreground group.
+libc = "0.2"
 
 [dev-dependencies]
 # `time` only for the two PTY tests: they bound how long they wait on a real

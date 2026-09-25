@@ -33,6 +33,10 @@ pub struct NodeData {
     /// Setting values as the user typed them, by setting key.
     #[serde(default)]
     pub params: Vec<(String, String)>,
+    /// The runner that executes this graph, as the `sha256:<hex>` fingerprint
+    /// of its endpoint. Set on top-level graphs only; empty everywhere else.
+    #[serde(default)]
+    pub runner: String,
 }
 
 /// One edge as the store holds it.
@@ -75,6 +79,7 @@ mod tests {
                 y: 200.0,
                 params: vec![("value".to_string(), "42".to_string())],
                 parent: 0,
+                runner: String::new(),
             }],
             edges: vec![EdgeData {
                 id: 10,

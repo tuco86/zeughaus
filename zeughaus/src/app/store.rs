@@ -26,6 +26,7 @@ pub(super) enum Outbound {
     Node(NodeData),
     Params(NodeId, Vec<(String, String)>),
     Move(NodeId, f32, f32),
+    Rename(NodeId, String),
     Delete(NodeId),
     Connect(EdgeData),
     Disconnect(EdgeId),
@@ -40,6 +41,7 @@ fn send_outbound(
         Outbound::Node(nd) => zeughaus_sync::send_create_node(conn, nd),
         Outbound::Params(id, params) => zeughaus_sync::send_set_params(conn, id.0, params),
         Outbound::Move(id, x, y) => zeughaus_sync::send_move_node(conn, id.0, *x, *y),
+        Outbound::Rename(id, name) => zeughaus_sync::send_rename_node(conn, id.0, name),
         Outbound::Delete(id) => zeughaus_sync::send_delete_node(conn, id.0),
         Outbound::Connect(e) => zeughaus_sync::send_connect_edge(conn, e),
         Outbound::Disconnect(id) => zeughaus_sync::send_disconnect_edge(conn, id.0),
@@ -179,6 +181,7 @@ impl App {
             y: node.position.y,
             params,
             parent: node.parent.0,
+            runner: node.runner.clone(),
         })
     }
 
@@ -203,6 +206,10 @@ impl App {
 
     pub(super) fn push_move(&mut self, id: NodeId, x: f32, y: f32) {
         self.dispatch(Outbound::Move(id, x, y));
+    }
+
+    pub(super) fn push_rename(&mut self, id: NodeId, name: String) {
+        self.dispatch(Outbound::Rename(id, name));
     }
 
     pub(super) fn push_delete(&mut self, id: NodeId) {
@@ -391,9 +398,18 @@ impl App {
 
     pub(super) fn apply_node_upsert(&mut self, nd: NodeData) {
         let id = NodeId(nd.id);
+        let mut moved_from = None;
         if self.nodes.contains_key(&id) {
             if let Some(en) = self.nodes.get_mut(&id) {
                 en.position = Point::new(nd.x, nd.y);
+                en.display_name.clone_from(&nd.display_name);
+                // A legacy session's root nodes are adopted into a graph by
+                // a runner, which reparents rows this window already holds.
+                if en.parent != NodeId(nd.parent) {
+                    moved_from = Some(en.parent);
+                    en.parent = NodeId(nd.parent);
+                }
+                en.runner.clone_from(&nd.runner);
             }
             self.apply_params(id, &nd.params);
         } else {
@@ -405,6 +421,9 @@ impl App {
         // A boundary node arriving from another window is a pin its container
         // gains here, and a renamed one is a pin that changed name.
         self.refresh_container_pins(NodeId(nd.parent));
+        if let Some(old) = moved_from {
+            self.refresh_container_pins(old);
+        }
         // The database parameters this node needs are derived once the whole
         // batch has been applied (`derive_all_db_params`): they have to reach
         // the store, and `push_params` is silent while a remote change is
@@ -624,6 +643,7 @@ impl App {
             self.runtime.output_seq.retain(|(node, _), _| *node != id);
             self.runtime.remote_errors.remove(&id);
             self.runtime.error_seq.remove(&id);
+            self.runtime.reported_by.remove(&id);
             self.runtime
                 .rejection_seq
                 .retain(|(node, _), _| *node != id);

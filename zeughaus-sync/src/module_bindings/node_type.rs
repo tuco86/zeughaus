@@ -14,6 +14,7 @@ pub struct Node {
     pub y: f32,
     pub params: String,
     pub parent: u64,
+    pub runner: String,
 }
 
 impl __sdk::InModule for Node {
@@ -31,6 +32,7 @@ pub struct NodeCols {
     pub y: __sdk::__query_builder::Col<Node, f32>,
     pub params: __sdk::__query_builder::Col<Node, String>,
     pub parent: __sdk::__query_builder::Col<Node, u64>,
+    pub runner: __sdk::__query_builder::Col<Node, String>,
 }
 
 impl __sdk::__query_builder::HasCols for Node {
@@ -44,6 +46,7 @@ impl __sdk::__query_builder::HasCols for Node {
             y: __sdk::__query_builder::Col::new(table_name, "y"),
             params: __sdk::__query_builder::Col::new(table_name, "params"),
             parent: __sdk::__query_builder::Col::new(table_name, "parent"),
+            runner: __sdk::__query_builder::Col::new(table_name, "runner"),
         }
     }
 }

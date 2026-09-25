@@ -17,7 +17,7 @@
 
 mod node;
 
-pub use node::JobNode;
+pub use node::{JobNode, record_run_end};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,6 +43,16 @@ pub struct JobSpec {
     /// same working directory and environment, so the failure can be looked
     /// at where it happened. A host that cannot do that ignores it.
     pub keep_on_failure: bool,
+    /// When the run started, in unix seconds: what its exit record says,
+    /// whichever process ends up writing it.
+    pub started: u64,
+    /// The artifact globs, relative to `cwd`, copied when the run ends.
+    /// Carried so a host that outlives the node's wait can finish the run.
+    pub artifacts: Vec<String>,
+    /// Whether the press that started this run came from outside an editor.
+    /// The host shows such a run where nobody has to go looking for it; a
+    /// run started by the `run` pin never is one.
+    pub external: bool,
 }
 
 /// How a run ended.

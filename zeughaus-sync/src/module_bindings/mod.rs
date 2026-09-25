@@ -6,6 +6,7 @@
 #![allow(unused, clippy::all)]
 use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
+pub mod adopt_root_nodes_reducer;
 pub mod announce_endpoint_reducer;
 pub mod connect_edge_reducer;
 pub mod create_node_reducer;
@@ -17,10 +18,12 @@ pub mod join_runtime_reducer;
 pub mod move_node_reducer;
 pub mod node_table;
 pub mod node_type;
+pub mod rename_node_reducer;
 pub mod runtime_table;
 pub mod runtime_type;
 pub mod set_node_params_reducer;
 
+pub use adopt_root_nodes_reducer::adopt_root_nodes;
 pub use announce_endpoint_reducer::announce_endpoint;
 pub use connect_edge_reducer::connect_edge;
 pub use create_node_reducer::create_node;
@@ -32,6 +35,7 @@ pub use join_runtime_reducer::join_runtime;
 pub use move_node_reducer::move_node;
 pub use node_table::*;
 pub use node_type::Node;
+pub use rename_node_reducer::rename_node;
 pub use runtime_table::*;
 pub use runtime_type::Runtime;
 pub use set_node_params_reducer::set_node_params;
@@ -44,6 +48,10 @@ pub use set_node_params_reducer::set_node_params;
 /// to indicate which reducer caused the event.
 
 pub enum Reducer {
+    AdoptRootNodes {
+        graph_id: u64,
+        runner: String,
+    },
     AnnounceEndpoint {
         addr: String,
     },
@@ -62,6 +70,7 @@ pub enum Reducer {
         y: f32,
         params: String,
         parent: u64,
+        runner: String,
     },
     DeleteNode {
         id: u64,
@@ -74,6 +83,10 @@ pub enum Reducer {
         id: u64,
         x: f32,
         y: f32,
+    },
+    RenameNode {
+        id: u64,
+        display_name: String,
     },
     SetNodeParams {
         id: u64,
@@ -88,6 +101,7 @@ impl __sdk::InModule for Reducer {
 impl __sdk::Reducer for Reducer {
     fn reducer_name(&self) -> &'static str {
         match self {
+            Reducer::AdoptRootNodes { .. } => "adopt_root_nodes",
             Reducer::AnnounceEndpoint { .. } => "announce_endpoint",
             Reducer::ConnectEdge { .. } => "connect_edge",
             Reducer::CreateNode { .. } => "create_node",
@@ -95,6 +109,7 @@ impl __sdk::Reducer for Reducer {
             Reducer::DisconnectEdge { .. } => "disconnect_edge",
             Reducer::JoinRuntime => "join_runtime",
             Reducer::MoveNode { .. } => "move_node",
+            Reducer::RenameNode { .. } => "rename_node",
             Reducer::SetNodeParams { .. } => "set_node_params",
             _ => unreachable!(),
         }
@@ -102,6 +117,12 @@ impl __sdk::Reducer for Reducer {
     #[allow(clippy::clone_on_copy)]
     fn args_bsatn(&self) -> Result<Vec<u8>, __sats::bsatn::EncodeError> {
         match self {
+            Reducer::AdoptRootNodes { graph_id, runner } => {
+                __sats::bsatn::to_vec(&adopt_root_nodes_reducer::AdoptRootNodesArgs {
+                    graph_id: graph_id.clone(),
+                    runner: runner.clone(),
+                })
+            }
             Reducer::AnnounceEndpoint { addr } => {
                 __sats::bsatn::to_vec(&announce_endpoint_reducer::AnnounceEndpointArgs {
                     addr: addr.clone(),
@@ -128,6 +149,7 @@ impl __sdk::Reducer for Reducer {
                 y,
                 params,
                 parent,
+                runner,
             } => __sats::bsatn::to_vec(&create_node_reducer::CreateNodeArgs {
                 id: id.clone(),
                 type_id: type_id.clone(),
@@ -136,6 +158,7 @@ impl __sdk::Reducer for Reducer {
                 y: y.clone(),
                 params: params.clone(),
                 parent: parent.clone(),
+                runner: runner.clone(),
             }),
             Reducer::DeleteNode { id } => {
                 __sats::bsatn::to_vec(&delete_node_reducer::DeleteNodeArgs { id: id.clone() })
@@ -153,6 +176,12 @@ impl __sdk::Reducer for Reducer {
                     id: id.clone(),
                     x: x.clone(),
                     y: y.clone(),
+                })
+            }
+            Reducer::RenameNode { id, display_name } => {
+                __sats::bsatn::to_vec(&rename_node_reducer::RenameNodeArgs {
+                    id: id.clone(),
+                    display_name: display_name.clone(),
                 })
             }
             Reducer::SetNodeParams { id, params } => {
