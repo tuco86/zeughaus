@@ -116,9 +116,65 @@ fn main() -> iced::Result {
         // than through `exit_on_close_request`, which `window` would
         // overwrite.
         exit_on_close_request: false,
+        icon: window_icon(),
+        platform_specific: platform_specific(),
         ..Default::default()
     })
     .run()
+}
+
+/// The application id is the window's identity to a window manager: X11's
+/// `WM_CLASS`, Wayland's `app_id`. It is not what puts an icon on the
+/// window -- see [`window_icon`].
+#[cfg(target_os = "linux")]
+fn platform_specific() -> iced::window::settings::PlatformSpecific {
+    iced::window::settings::PlatformSpecific {
+        application_id: APP_ID.to_owned(),
+        ..Default::default()
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn platform_specific() -> iced::window::settings::PlatformSpecific {
+    iced::window::settings::PlatformSpecific::default()
+}
+
+/// The application id this window reports.
+#[cfg(target_os = "linux")]
+pub(crate) const APP_ID: &str = "net.doodleshnookie.Zeughaus";
+
+/// The bundled icon, decoded once at startup: 256 px, which every window
+/// manager that shows it smaller scales down itself.
+///
+/// This reaches X11 and Windows. It does not reach Wayland: winit 0.30 makes
+/// `set_window_icon` a no-op there, and the protocol that would carry it
+/// (`xdg_toplevel_icon_v1`, which KWin implements) arrived in winit 0.31.
+/// Until iced pins that, a Wayland window shows whatever the compositor uses
+/// for an application it cannot identify. The editor ships one binary and
+/// installs nothing to work around it.
+#[cfg(not(target_arch = "wasm32"))]
+fn window_icon() -> Option<iced::window::Icon> {
+    const DATA: &[u8] = include_bytes!("../../assets/icon/zeughaus-256.png");
+
+    let mut reader = png::Decoder::new(std::io::Cursor::new(DATA))
+        .read_info()
+        .ok()?;
+    let mut pixels = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut pixels).ok()?;
+    // The generator writes 8-bit RGBA, which is what `from_rgba` wants; any
+    // other encoding would have to be converted, so refuse instead.
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    pixels.truncate(info.buffer_size());
+    iced::window::icon::from_rgba(pixels, info.width, info.height).ok()
+}
+
+/// The browser tab's icon is a `<link rel="icon">` in `index.html`, not a
+/// buffer the window carries.
+#[cfg(target_arch = "wasm32")]
+fn window_icon() -> Option<iced::window::Icon> {
+    None
 }
 
 /// Parses `join <sessionid>` from the CLI args. Returns the session token to
