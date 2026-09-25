@@ -42,6 +42,7 @@ iced_terminal/         # the terminal widget: one wgpu primitive per pane, bundl
 iced_tabs/             # the tab tree the workspace shell uses: runner sections, groups, drop markers
 zeughaus-theme/        # the editor's theme: iced theme paired with a terminal colour scheme, catalogs for every widget, bundled pack, WezTerm scheme parser
 vm/win11/              # scripts: headless Windows 11 guest under QEMU/KVM, the reference for a VM-hosted runner (not wired)
+deploy/                # install.sh, systemd user units for store and runner, desktop entry template
 ```
 
 Sibling checkout this workspace depends on by path: `../weida` (the QUIC
@@ -49,13 +50,26 @@ transport). The node graph widget is `iced_nodegraph` from crates.io.
 
 ## Running it
 
-Three processes, in this order:
+The user's stack is installed, not run from the checkout: `deploy/install.sh`
+`cargo install`s the editor and runner into `~/.cargo/bin`, installs two
+systemd user units -- `zeughaus-store` (`spacetime start`, 0.0.0.0:3000)
+and `zeughaus-runner` (requires the store, `KillMode=process` so the shims
+and their shells outlive a stop, `reload` = SIGUSR1) -- plus a desktop entry
+and icon matching the editor's Wayland app id, publishes the module, then
+starts or reloads the runner and restarts running editors. The editor is
+started from the application menu (`Zeughaus`). Logs: `journalctl --user -u
+zeughaus-runner` / `-u zeughaus-store`.
+
+By hand, three processes, in this order:
 
 ```
-spacetime start                 # store, 127.0.0.1:3000
+spacetime start                 # store, 0.0.0.0:3000
 cargo run -p zeughaus-runner    # executes the graph and owns the terminals
 cargo run -p zeughaus           # editor; start as many as you like
 ```
+
+Never next to the installed units: a second store fails on the port, and a
+second runner on the same state directory fights the first over its shims.
 
 Publish the module once per schema change, and regenerate the checked-in
 bindings:
@@ -140,18 +154,17 @@ writes an MP4 through `ffmpeg` with the pointer drawn in, for attaching to
 an issue or PR by hand; screenshots and videos are never committed.
 Signals to the agent's processes go by PID, never by name.
 
-When a change is finished and its gate passed, the agent integrates it into
-the user's running stack; that is the point of the reload. In order:
-
-1. `cargo build -p zeughaus -p zeughaus-runner` (the user's binaries in
-   `target/debug`).
-2. If `zeughaus-module` changed: `spacetime publish --server local zeughaus
-   --module-path zeughaus-module` without `-c`/`-y`. A migration that needs
-   the data cleared is the user's call, never the agent's.
-3. `kill -USR1 <pid>` for the user's runner and editor, found with `pgrep -af
-   'target/debug/zeughaus'` (the agent's own processes run from
-   `target/agent` and are not signalled). Confirm the reload: `readlink
-   /proc/<pid>/exe` no longer ends in `(deleted)`.
+When a change is finished, its gate passed and it is committed, the agent
+integrates it into the user's running stack; that is the point of the
+reload. `deploy/install.sh` does it in order: `cargo install` of both
+binaries (the running ones keep serving meanwhile), units, desktop entry,
+store start, `spacetime publish --server local zeughaus` without `-c`/`-y`
+(a migration that needs the data cleared stops the script and is the
+user's call, never the agent's), `systemctl --user reload zeughaus-runner`,
+and SIGUSR1 to every editor whose `/proc/<pid>/exe` is the installed
+binary and whose `SigCgt` has the handler. Confirm the reload: `readlink
+/proc/<pid>/exe` no longer ends in `(deleted)`. The agent's own processes
+run from `target/agent` and are never signalled.
 
 Before signalling a process, check it has a restart handler: bit 9
 (`0x200`, SIGUSR1) in `SigCgt` of `/proc/<pid>/status`. A process built

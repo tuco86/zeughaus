@@ -473,6 +473,7 @@ results keyed by (pin, tier, sequence).
 | runs | `<state-dir>/runs/<run-id>/` holds `log`, `exit`, `code` and `artifacts/` of every job run this runner executed; `--keep-runs <n>` (default 50) is how many successful runs stay, pruned when a run starts; failed runs and runs without an exit record are never pruned |
 | terminals | `<state-dir>/terminals/<id>/` (`spec.json`, `sock`, `shim.log`) per live terminal, `<state-dir>/workspace.json` for the tabs a restarted runner restores |
 | editor restart | `SIGUSR1` writes `<state-dir>/restore-<pid>.json` (window size and maximized state, active tab, focused pane and collapsed sections and groups by runner, cameras, node sizes, selection, an open palette with its input, a rename in progress, terminal scroll-back, nested views open in a section without a runner, the scratch document without a store) and `exec`s the editor, which reads and deletes it through `ZEUGHAUS_RESTORE`. The window's position is not restored: a Wayland client can neither read nor set it |
+| deployment | `deploy/install.sh`: binaries in `~/.cargo/bin`, systemd user units `zeughaus-store` and `zeughaus-runner` (`KillMode=process`: the shims outlive the runner process; `reload` is `SIGUSR1`), and `~/.local/share/applications/net.doodleshnookie.Zeughaus.desktop` with its icon, which is how a Wayland compositor shows the editor's icon |
 
 ## 12. Testing strategy
 

@@ -149,9 +149,8 @@ pub(crate) const APP_ID: &str = "net.doodleshnookie.Zeughaus";
 /// This reaches X11 and Windows. It does not reach Wayland: winit 0.30 makes
 /// `set_window_icon` a no-op there, and the protocol that would carry it
 /// (`xdg_toplevel_icon_v1`, which KWin implements) arrived in winit 0.31.
-/// Until iced pins that, a Wayland window shows whatever the compositor uses
-/// for an application it cannot identify. The editor ships one binary and
-/// installs nothing to work around it.
+/// Until iced pins that, a Wayland compositor finds the icon through the
+/// desktop entry named after [`APP_ID`], which `deploy/install.sh` installs.
 #[cfg(not(target_arch = "wasm32"))]
 fn window_icon() -> Option<iced::window::Icon> {
     const DATA: &[u8] = include_bytes!("../../assets/icon/zeughaus-256.png");

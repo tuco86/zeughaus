@@ -1,0 +1,27 @@
+[Unit]
+Description=Zeughaus runner (executes graphs, owns the terminals)
+Documentation=file://%h/work/git.doodleshnookie.net/tuco86/zeughaus/DESIGN.md
+Requires=zeughaus-store.service
+After=zeughaus-store.service
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/zeughaus-runner
+# SIGUSR1 saves the workspace and execs the binary at the same path: a
+# `cargo install` over it is picked up without touching a terminal.
+ExecReload=/bin/kill -USR1 $MAINPID
+# Every terminal lives in a shim this process forked. The shims share the
+# unit's cgroup, and the default KillMode would take every shell down with
+# a stop or restart; the next runner reattaches them instead.
+KillMode=process
+# The store may still be starting after a boot: the runner exits when it
+# cannot connect, and is started again.
+Restart=on-failure
+RestartSec=3s
+
+# Shells are spawned as login shells and build their own PATH. This one only
+# has to find what the runner itself runs (spacetime, sh).
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

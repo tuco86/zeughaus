@@ -1,0 +1,13 @@
+[Desktop Entry]
+Name=Zeughaus
+Comment=Dataflow workbench and terminal
+Keywords=shell;prompt;command;commandline;terminal;graph;
+# The file name and StartupWMClass match the window's Wayland app_id: that is
+# how KWin finds this entry and its icon, since the window cannot send one.
+Icon=net.doodleshnookie.Zeughaus
+StartupWMClass=net.doodleshnookie.Zeughaus
+TryExec=@BINDIR@/zeughaus
+Exec=@BINDIR@/zeughaus
+Type=Application
+Categories=System;TerminalEmulator;Utility;
+Terminal=false
