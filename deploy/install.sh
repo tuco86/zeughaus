@@ -33,6 +33,12 @@ sed "s|@BINDIR@|$bindir|g" "$root/deploy/net.doodleshnookie.Zeughaus.desktop" \
     >"$data/applications/net.doodleshnookie.Zeughaus.desktop"
 install -Dm644 "$root/assets/icon/zeughaus.svg" \
     "$data/icons/hicolor/scalable/apps/net.doodleshnookie.Zeughaus.svg"
+# A cache some other installer left in the user's hicolor theme is trusted
+# by Qt as long as it is valid, and it does not list this icon: the menu and
+# the task bar then show a blank one. Refresh it; never create one.
+if [ -f "$data/icons/hicolor/icon-theme.cache" ] && command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t -q "$data/icons/hicolor" || say "gtk-update-icon-cache failed"
+fi
 if command -v kbuildsycoca6 >/dev/null 2>&1; then
     kbuildsycoca6 >/dev/null 2>&1 || say "kbuildsycoca6 failed; the menu updates on next login"
 fi
