@@ -34,6 +34,8 @@
 
 mod config;
 mod convert;
+#[cfg(unix)]
+pub mod locale;
 mod model;
 mod session;
 #[cfg(unix)]

@@ -83,6 +83,28 @@ fn main() -> ExitCode {
             return zeughaus_terminal::shim::run(std::path::Path::new(&dir));
         }
     }
+    // Every shell and job inherits the runner's environment, which may name
+    // no locale at all (ssh, launchd, a stripped service).
+    #[cfg(unix)]
+    {
+        let locale = zeughaus_terminal::locale::resolve();
+        // SAFETY: nothing has started a thread yet; the shim branch above returned
+        // and the store, runtime and transport are created further down.
+        unsafe { locale.apply() };
+        let vars: Vec<String> = locale
+            .effective
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        eprintln!(
+            "[runner] terminal locale ({}): {}",
+            locale.source,
+            vars.join(" ")
+        );
+        for (key, value, reason) in &locale.refused {
+            eprintln!("[runner] terminal locale: ignoring {key}={value} ({reason})");
+        }
+    }
     // Resolved once, now: after a rebuild replaced the file, the running
     // image is "(deleted)" and only this path still names the new binary,
     // which is what a restart executes and what new shims are started from.

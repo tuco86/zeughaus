@@ -424,6 +424,17 @@ terminal and tab ids are the old ones, so an editor keeps its active tab and
 focus. SIGINT/SIGTERM still drain and exit, leaving shells in their shims
 for the next runner. Windows keeps terminals in the runner process.
 
+**Locale.** Shells and jobs inherit the runner's environment, and the runner
+fixes its locale before any thread exists
+(`zeughaus-terminal/src/locale.rs`): the locale variables of its own
+environment when it has any, else the first readable `locale.conf`
+(`$XDG_CONFIG_HOME`, `~/.config`, `/etc/locale.conf`, `/etc/default/locale`)
+or on macOS the `AppleLocale` default mapped onto `locale -a` (language to
+`LANG`, region to `LC_NUMERIC`/`LC_TIME`/`LC_MONETARY`). A value `locale -a`
+does not list is dropped, a non-UTF-8 `LC_ALL` becomes `LANG`, and a
+non-UTF-8 character type gets a UTF-8 `LC_CTYPE`. The editor's locale plays
+no part; shims already running keep theirs.
+
 **Security.** The runner's identity (`runner.pem`) and one client identity
 (`client.pem`) live under the state directory (`ZEUGHAUS_STATE_DIR`, else
 `$XDG_STATE_HOME/zeughaus`, else `~/.local/state/zeughaus`), owner-only,
