@@ -1,0 +1,26 @@
+[package]
+name = "zeughaus-filedescriptor"
+version = "0.8.3"
+authors = ["Wez Furlong"]
+edition = "2018"
+repository = "https://github.com/tuco86/zeughaus"
+description = "filedescriptor from wezterm at 2658f629, published for zeughaus. More ergonomic wrappers around RawFd and RawHandle"
+license = "MIT"
+readme = "README.md"
+keywords = ["socketpair", "pipe", "poll", "filedescriptor"]
+
+[dependencies]
+thiserror.workspace = true
+libc.workspace = true
+
+[target."cfg(windows)".dependencies]
+windows-sys = { workspace=true, features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+]}

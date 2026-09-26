@@ -2,6 +2,11 @@
 name = "zeughaus-runtime"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "The zeughaus graph executor: topology, node instances, edge cache, dirty set, async work and node errors"
 
 [dependencies]
 zeughaus-core.workspace = true

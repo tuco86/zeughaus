@@ -2,6 +2,11 @@
 name = "zeughaus-runner"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "The headless zeughaus process that executes the node graph and owns the terminals"
 
 [dependencies]
 zeughaus-core.workspace = true

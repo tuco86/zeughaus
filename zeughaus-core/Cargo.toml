@@ -2,6 +2,11 @@
 name = "zeughaus-core"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Core types of zeughaus: values, pins, the node and plugin traits, settings, scalar wire encoding and store rows"
 
 [dependencies]
 serde.workspace = true

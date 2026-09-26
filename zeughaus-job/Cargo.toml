@@ -2,6 +2,11 @@
 name = "zeughaus-job"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "zeughaus plugin: Job runs a process in a runner-owned terminal and keeps a log per run"
 
 [dependencies]
 zeughaus-core.workspace = true

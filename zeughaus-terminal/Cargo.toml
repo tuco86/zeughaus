@@ -2,6 +2,10 @@
 name = "zeughaus-terminal"
 edition.workspace = true
 version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "The runner's terminal engine: a PTY, a parser and a canonical screen per session, delivered as mux rows and deltas"
 
 [dependencies]

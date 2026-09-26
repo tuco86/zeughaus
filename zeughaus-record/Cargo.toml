@@ -2,6 +2,11 @@
 name = "zeughaus-record"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "zeughaus plugin: Recorder writes frames and values to disk, Player replays the dataset as a source"
 
 [dependencies]
 zeughaus-core.workspace = true

@@ -43,10 +43,18 @@ iced_tabs/             # the tab tree the workspace shell uses: runner sections,
 zeughaus-theme/        # the editor's theme: iced theme paired with a terminal colour scheme, catalogs for every widget, bundled pack, WezTerm scheme parser
 vm/win11/              # scripts: headless Windows 11 guest under QEMU/KVM, the reference for a VM-hosted runner (not wired)
 deploy/                # install.sh, systemd user units for store and runner, desktop entry template
+third_party/           # its own workspace: wezterm's terminal crates at the pinned revision, published as zeughaus-* packages
 ```
 
 Sibling checkout this workspace depends on by path: `../weida` (the QUIC
-transport). The node graph widget is `iced_nodegraph` from crates.io.
+transport), with the version of a published weida release next to the path.
+The node graph widget is `iced_nodegraph` from crates.io.
+
+Every crate of the workspace is on crates.io under the workspace version;
+`main` carries the next version with a `-dev` suffix. `RELEASING.md` is the
+release checklist, `CHANGELOG.md` the notes. `third_party/` keeps upstream
+code apart from this gate; its header in `third_party/Cargo.toml` lists the
+only changes made to it.
 
 ## Running it
 
@@ -185,6 +193,9 @@ push only after the gate:
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace`
 - `cargo check --target wasm32-unknown-unknown -p zeughaus`
+
+A change to a crate's manifest or to what it includes also passes
+`cargo publish --workspace --dry-run`.
 
 Iterate with `cargo check -q --message-format short -p <crate>`. One cargo
 invocation per workspace at a time; long runs get a generous timeout.

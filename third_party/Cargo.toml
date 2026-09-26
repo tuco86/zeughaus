@@ -1,0 +1,113 @@
+# The terminal core of zeughaus-terminal: wezterm's `wezterm-term` and every
+# crate it pulls from the wezterm repository, copied from wezterm at
+# 2658f629cd7251ce63a1698f238da2585676aa4e, and wez's `finl_unicode` fork
+# (branch `no_std`) at a1892f26245529f2ef3877a9ebd610c96cec07a6. The crates.io
+# releases of these crates lag that revision (the no_std rework, a larger
+# vtparse parameter limit), and `wezterm-term`, `wezterm-cell`,
+# `wezterm-surface`, `wezterm-escape-parser` and `wezterm-char-props` are not on
+# crates.io at all, so they are published as `zeughaus-*` packages.
+#
+# Changes against upstream, and nothing else:
+# - package names carry the `zeughaus-` prefix; every dependency key keeps the
+#   upstream name and renames the package, so the sources compile unchanged;
+# - repository and description name this fork, `documentation`/`homepage`
+#   links to upstream are dropped, a `LICENSE.md` is copied where a crate had
+#   none, and `wezterm-char-props` loses a `readme` that never existed;
+# - `wezterm-term` embeds its terminfo from its own `data/wezterm` (a copy of
+#   termwiz's) instead of reaching into the termwiz directory, which a
+#   published package cannot do;
+# - files outside each crate's published package (test data, generators) are
+#   left out.
+#
+# Its own workspace, excluded from zeughaus's: upstream code keeps upstream
+# formatting and lints and is not held to zeughaus's gate. Updating the pin
+# means copying the crates again and reapplying the list above.
+[workspace]
+resolver = "2"
+members = [
+    "wezterm/filedescriptor",
+    "wezterm/vtparse",
+    "wezterm/bidi",
+    "wezterm/wezterm-blob-leases",
+    "wezterm/color-types",
+    "wezterm/wezterm-dynamic",
+    "wezterm/wezterm-dynamic/derive",
+    "wezterm/wezterm-input-types",
+    "wezterm/wezterm-char-props",
+    "wezterm/wezterm-escape-parser",
+    "wezterm/wezterm-cell",
+    "wezterm/wezterm-surface",
+    "wezterm/termwiz",
+    "wezterm/term",
+    "finl_unicode",
+]
+
+# Copied from wezterm's root manifest at the pin; the in-tree crates point at
+# their `zeughaus-*` packages.
+[workspace.dependencies]
+anyhow = "1.0"
+base64 = { version = "0.22", default-features = false }
+bitflags = "1.3"
+cassowary = "0.3"
+criterion = "0.5"
+csscolorparser = "0.6"
+deltae = "0.3"
+downcast-rs = "1.0"
+env_logger = "0.11"
+euclid = { version = "0.22", default-features = false }
+fancy-regex = { version = "0.14", default-features = false, features = [] }
+filedescriptor = { package = "zeughaus-filedescriptor", version = "0.8.3", path = "wezterm/filedescriptor" }
+finl_unicode = { package = "zeughaus-finl-unicode", version = "1.3.0", path = "finl_unicode", default-features = false, features = ["categories", "grapheme_clusters"] }
+fixedbitset = { version = "0.4", default-features = false }
+fnv = "1.0"
+getrandom = "0.3.1"
+heapless = "0.8"
+hex = { version = "0.4", default-features = false }
+humansize = "2.1"
+image = "0.25"
+k9 = "0.12.0"
+lazy_static = "1.4"
+libc = "0.2"
+log = "0.4"
+lru = "0.16"
+maplit = "1.0"
+memmem = "0.1"
+miniz_oxide = "0.7"
+nix = "0.29"
+num-derive = "0.4"
+num-traits = { version = "0.2", default-features = false }
+ordered-float = { version = "4.1", default-features = false }
+pest = "2.7"
+pest_derive = "2.7"
+phf = { version = "0.11", default-features = false }
+proc-macro2 = "1.0"
+quote = "1.0.2"
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+sha2 = "0.10"
+signal-hook = "0.3"
+siphasher = "1.0.1"
+strsim = "0.11"
+syn = "1.0"
+tempfile = "3.20"
+terminfo = "0.9"
+termios = "0.3"
+termwiz = { package = "zeughaus-termwiz", version = "0.24.0", path = "wezterm/termwiz" }
+thiserror = "2.0"
+ucd-trie = { version = "0.1", default-features = false }
+unicode-normalization = "0.1.24"
+unicode-segmentation = "1.12"
+url = "2"
+utf8parse = "0.2"
+uuid = "1.13"
+vtparse = { package = "zeughaus-vtparse", version = "0.7.0", path = "wezterm/vtparse", default-features = false }
+wezterm-bidi = { package = "zeughaus-wezterm-bidi", version = "0.2.3", path = "wezterm/bidi", default-features = false }
+wezterm-blob-leases = { package = "zeughaus-wezterm-blob-leases", version = "0.1.1", path = "wezterm/wezterm-blob-leases" }
+wezterm-cell = { package = "zeughaus-wezterm-cell", version = "0.1.0", path = "wezterm/wezterm-cell" }
+wezterm-char-props = { package = "zeughaus-wezterm-char-props", version = "0.1.3", path = "wezterm/wezterm-char-props", default-features = false }
+wezterm-color-types = { package = "zeughaus-wezterm-color-types", version = "0.3.0", path = "wezterm/color-types", default-features = false }
+wezterm-dynamic = { package = "zeughaus-wezterm-dynamic", version = "0.2.1", path = "wezterm/wezterm-dynamic", default-features = false }
+wezterm-dynamic-derive = { package = "zeughaus-wezterm-dynamic-derive", version = "0.1.1", path = "wezterm/wezterm-dynamic/derive" }
+wezterm-escape-parser = { package = "zeughaus-wezterm-escape-parser", version = "0.1.0", path = "wezterm/wezterm-escape-parser" }
+wezterm-input-types = { package = "zeughaus-wezterm-input-types", version = "0.1.0", path = "wezterm/wezterm-input-types", default-features = false }
+wezterm-surface = { package = "zeughaus-wezterm-surface", version = "0.1.0", path = "wezterm/wezterm-surface" }
+windows-sys = { version = "0.61.2", default-features = false }

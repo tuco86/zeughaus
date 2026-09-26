@@ -1,0 +1,23 @@
+[package]
+authors = ["Wez Furlong <wez@wezfurlong.org>"]
+name = "zeughaus-vtparse"
+version = "0.7.0"
+edition = "2018"
+repository = "https://github.com/tuco86/zeughaus"
+description = "vtparse from wezterm at 2658f629, published for zeughaus. Low level escape sequence parser"
+license = "MIT"
+keywords = ["terminal", "escape", "ansi", "sequence", "parser"]
+readme = "README.md"
+
+[features]
+default = ["std"]
+alloc = []
+std = []
+no_std = ["dep:heapless"]
+
+[dependencies]
+heapless = {workspace = true, optional = true }
+utf8parse.workspace = true
+
+[dev-dependencies]
+k9.workspace = true

@@ -1707,25 +1707,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "filedescriptor"
-version = "0.8.3"
-source = "git+https://github.com/wezterm/wezterm?rev=2658f629cd7251ce63a1698f238da2585676aa4e#2658f629cd7251ce63a1698f238da2585676aa4e"
-dependencies = [
- "libc",
- "thiserror 2.0.20",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
-
-[[package]]
-name = "finl_unicode"
-version = "1.3.0"
-source = "git+https://github.com/wez/finl_unicode.git?branch=no_std#a1892f26245529f2ef3877a9ebd610c96cec07a6"
 
 [[package]]
 name = "fixedbitset"
@@ -2526,7 +2511,8 @@ dependencies = [
 [[package]]
 name = "iced_palette"
 version = "0.1.1"
-source = "git+https://github.com/tuco86/iced_palette.git?branch=main#dd70e2b39bed5d11cfcd6560490f51810b57e9fe"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4411d589b9bda5a30cd016ec9936910a7a70db281d131fd01fee91d5018f73fe"
 dependencies = [
  "iced_runtime",
  "iced_widget",
@@ -2579,14 +2565,14 @@ dependencies = [
 
 [[package]]
 name = "iced_tabs"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
- "iced",
+ "iced_widget",
 ]
 
 [[package]]
 name = "iced_terminal"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "bytemuck",
  "iced",
@@ -4490,7 +4476,7 @@ dependencies = [
  "anyhow",
  "bitflags 1.3.2",
  "downcast-rs",
- "filedescriptor 0.8.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "filedescriptor",
  "lazy_static",
  "libc",
  "log",
@@ -6191,49 +6177,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "termwiz"
-version = "0.24.0"
-source = "git+https://github.com/wezterm/wezterm?rev=2658f629cd7251ce63a1698f238da2585676aa4e#2658f629cd7251ce63a1698f238da2585676aa4e"
-dependencies = [
- "anyhow",
- "bitflags 2.13.1",
- "fancy-regex",
- "filedescriptor 0.8.3 (git+https://github.com/wezterm/wezterm?rev=2658f629cd7251ce63a1698f238da2585676aa4e)",
- "finl_unicode",
- "fixedbitset",
- "image",
- "libc",
- "log",
- "memmem",
- "nix 0.29.0",
- "num-derive",
- "num-traits",
- "ordered-float 4.6.0",
- "pest",
- "pest_derive",
- "phf",
- "sha2",
- "signal-hook",
- "siphasher",
- "terminfo",
- "termios",
- "thiserror 2.0.20",
- "ucd-trie",
- "unicode-segmentation",
- "vtparse",
- "wezterm-bidi",
- "wezterm-blob-leases",
- "wezterm-cell",
- "wezterm-char-props",
- "wezterm-color-types",
- "wezterm-dynamic",
- "wezterm-escape-parser",
- "wezterm-input-types",
- "wezterm-surface",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6821,14 +6764,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
-name = "vtparse"
-version = "0.7.0"
-source = "git+https://github.com/wezterm/wezterm?rev=2658f629cd7251ce63a1698f238da2585676aa4e#2658f629cd7251ce63a1698f238da2585676aa4e"
-dependencies = [
- "utf8parse",
-]
-
-[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7112,7 +7047,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "weida"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "bytes",
  "futures-io",
@@ -7131,11 +7066,11 @@ dependencies = [
 
 [[package]]
 name = "weida-core"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 
 [[package]]
 name = "weida-protocol"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "minicbor",
  "weida-core",
@@ -7143,7 +7078,7 @@ dependencies = [
 
 [[package]]
 name = "weida-runtime"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "tokio",
  "weida-core",
@@ -7152,182 +7087,10 @@ dependencies = [
 
 [[package]]
 name = "weida-winpipe"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "tokio",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "wezterm-bidi"
-version = "0.2.3"
-source = "git+https://github.com/wezterm/wezterm?rev=2658f629cd7251ce63a1698f238da2585676aa4e#2658f629cd7251ce63a1698f238da2585676aa4e"
-dependencies = [
- "log",
- "wezterm-dynamic",
-]
-
-[[package]]
-name = "wezterm-blob-leases"
-version = "0.1.1"
-source = "git+https://github.com/wezterm/wezterm?rev=2658f629cd7251ce63a1698f238da2585676aa4e#2658f629cd7251ce63a1698f238da2585676aa4e"
-dependencies = [
- "getrandom 0.3.4",
- "sha2",
- "thiserror 2.0.20",
- "uuid",
-]
-
-[[package]]
-name = "wezterm-cell"
-version = "0.1.0"
-source = "git+https://github.com/wezterm/wezterm?rev=2658f629cd7251ce63a1698f238da2585676aa4e#2658f629cd7251ce63a1698f238da2585676aa4e"
-dependencies = [
- "finl_unicode",
- "image",
- "log",
- "ordered-float 4.6.0",
- "serde",
- "sha2",
- "thiserror 2.0.20",
- "wezterm-blob-leases",
- "wezterm-char-props",
- "wezterm-color-types",
- "wezterm-dynamic",
- "wezterm-escape-parser",
-]
-
-[[package]]
-name = "wezterm-char-props"
-version = "0.1.3"
-source = "git+https://github.com/wezterm/wezterm?rev=2658f629cd7251ce63a1698f238da2585676aa4e#2658f629cd7251ce63a1698f238da2585676aa4e"
-dependencies = [
- "phf",
- "serde",
- "ucd-trie",
-]
-
-[[package]]
-name = "wezterm-color-types"
-version = "0.3.0"
-source = "git+https://github.com/wezterm/wezterm?rev=2658f629cd7251ce63a1698f238da2585676aa4e#2658f629cd7251ce63a1698f238da2585676aa4e"
-dependencies = [
- "csscolorparser",
- "deltae",
- "num-traits",
- "serde",
- "wezterm-dynamic",
-]
-
-[[package]]
-name = "wezterm-dynamic"
-version = "0.2.1"
-source = "git+https://github.com/wezterm/wezterm?rev=2658f629cd7251ce63a1698f238da2585676aa4e#2658f629cd7251ce63a1698f238da2585676aa4e"
-dependencies = [
- "log",
- "ordered-float 4.6.0",
- "strsim",
- "thiserror 2.0.20",
- "wezterm-dynamic-derive",
-]
-
-[[package]]
-name = "wezterm-dynamic-derive"
-version = "0.1.1"
-source = "git+https://github.com/wezterm/wezterm?rev=2658f629cd7251ce63a1698f238da2585676aa4e#2658f629cd7251ce63a1698f238da2585676aa4e"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 1.0.109",
-]
-
-[[package]]
-name = "wezterm-escape-parser"
-version = "0.1.0"
-source = "git+https://github.com/wezterm/wezterm?rev=2658f629cd7251ce63a1698f238da2585676aa4e#2658f629cd7251ce63a1698f238da2585676aa4e"
-dependencies = [
- "base64 0.22.1",
- "bitflags 2.13.1",
- "hex",
- "image",
- "log",
- "nix 0.29.0",
- "num-derive",
- "num-traits",
- "ordered-float 4.6.0",
- "pest",
- "pest_derive",
- "sha2",
- "thiserror 2.0.20",
- "vtparse",
- "wezterm-blob-leases",
- "wezterm-color-types",
- "wezterm-dynamic",
- "wezterm-input-types",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "wezterm-input-types"
-version = "0.1.0"
-source = "git+https://github.com/wezterm/wezterm?rev=2658f629cd7251ce63a1698f238da2585676aa4e#2658f629cd7251ce63a1698f238da2585676aa4e"
-dependencies = [
- "bitflags 1.3.2",
- "euclid",
- "serde",
- "wezterm-dynamic",
-]
-
-[[package]]
-name = "wezterm-surface"
-version = "0.1.0"
-source = "git+https://github.com/wezterm/wezterm?rev=2658f629cd7251ce63a1698f238da2585676aa4e#2658f629cd7251ce63a1698f238da2585676aa4e"
-dependencies = [
- "bitflags 2.13.1",
- "fancy-regex",
- "finl_unicode",
- "fixedbitset",
- "ordered-float 4.6.0",
- "siphasher",
- "unicode-segmentation",
- "wezterm-bidi",
- "wezterm-cell",
- "wezterm-char-props",
- "wezterm-color-types",
- "wezterm-dynamic",
- "wezterm-escape-parser",
- "wezterm-input-types",
-]
-
-[[package]]
-name = "wezterm-term"
-version = "0.1.0"
-source = "git+https://github.com/wezterm/wezterm?rev=2658f629cd7251ce63a1698f238da2585676aa4e#2658f629cd7251ce63a1698f238da2585676aa4e"
-dependencies = [
- "anyhow",
- "bitflags 1.3.2",
- "csscolorparser",
- "downcast-rs",
- "finl_unicode",
- "hex",
- "humansize",
- "image",
- "lazy_static",
- "log",
- "lru",
- "miniz_oxide 0.7.4",
- "num-traits",
- "ordered-float 4.6.0",
- "serde",
- "terminfo",
- "termwiz",
- "unicode-normalization",
- "url",
- "wezterm-bidi",
- "wezterm-cell",
- "wezterm-dynamic",
- "wezterm-escape-parser",
- "wezterm-surface",
 ]
 
 [[package]]
@@ -8170,7 +7933,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "console_error_panic_hook",
  "getrandom 0.4.3",
@@ -8208,7 +7971,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-capture"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "ashpd 0.13.13",
  "image",
@@ -8221,7 +7984,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-core"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -8230,7 +7993,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-db"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -8238,22 +8001,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeughaus-filedescriptor"
+version = "0.8.3"
+dependencies = [
+ "libc",
+ "thiserror 2.0.20",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "zeughaus-finl-unicode"
+version = "1.3.0"
+
+[[package]]
 name = "zeughaus-flow"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "zeughaus-core",
 ]
 
 [[package]]
 name = "zeughaus-graph"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "zeughaus-core",
 ]
 
 [[package]]
 name = "zeughaus-job"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "glob",
  "shlex 1.3.0",
@@ -8262,7 +8038,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-link"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -8272,7 +8048,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-llm"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -8282,7 +8058,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-ml"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde",
  "zeughaus-core",
@@ -8290,7 +8066,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-mux"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "postcard",
  "serde",
@@ -8299,7 +8075,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-record"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "image",
  "serde_json",
@@ -8308,7 +8084,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-runner"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "libc",
  "serde",
@@ -8334,7 +8110,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-runtime"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "zeughaus-core",
  "zeughaus-transform",
@@ -8342,7 +8118,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-sync"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde_json",
  "spacetimedb-sdk",
@@ -8351,22 +8127,64 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-terminal"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "libc",
  "portable-pty",
  "postcard",
  "serde",
  "serde_json",
- "termwiz",
  "tokio",
- "wezterm-term",
  "zeughaus-mux",
+ "zeughaus-termwiz",
+ "zeughaus-wezterm-term",
+]
+
+[[package]]
+name = "zeughaus-termwiz"
+version = "0.24.0"
+dependencies = [
+ "anyhow",
+ "bitflags 2.13.1",
+ "fancy-regex",
+ "fixedbitset",
+ "image",
+ "libc",
+ "log",
+ "memmem",
+ "nix 0.29.0",
+ "num-derive",
+ "num-traits",
+ "ordered-float 4.6.0",
+ "pest",
+ "pest_derive",
+ "phf",
+ "sha2",
+ "signal-hook",
+ "siphasher",
+ "terminfo",
+ "termios",
+ "thiserror 2.0.20",
+ "ucd-trie",
+ "unicode-segmentation",
+ "windows-sys 0.61.2",
+ "zeughaus-filedescriptor",
+ "zeughaus-finl-unicode",
+ "zeughaus-vtparse",
+ "zeughaus-wezterm-bidi",
+ "zeughaus-wezterm-blob-leases",
+ "zeughaus-wezterm-cell",
+ "zeughaus-wezterm-char-props",
+ "zeughaus-wezterm-color-types",
+ "zeughaus-wezterm-dynamic",
+ "zeughaus-wezterm-escape-parser",
+ "zeughaus-wezterm-input-types",
+ "zeughaus-wezterm-surface",
 ]
 
 [[package]]
 name = "zeughaus-theme"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "iced",
  "iced_nodegraph",
@@ -8380,9 +8198,177 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-transform"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "zeughaus-core",
+]
+
+[[package]]
+name = "zeughaus-vtparse"
+version = "0.7.0"
+dependencies = [
+ "utf8parse",
+]
+
+[[package]]
+name = "zeughaus-wezterm-bidi"
+version = "0.2.3"
+dependencies = [
+ "log",
+ "zeughaus-wezterm-dynamic",
+]
+
+[[package]]
+name = "zeughaus-wezterm-blob-leases"
+version = "0.1.1"
+dependencies = [
+ "getrandom 0.3.4",
+ "sha2",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
+name = "zeughaus-wezterm-cell"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "log",
+ "ordered-float 4.6.0",
+ "serde",
+ "sha2",
+ "thiserror 2.0.20",
+ "zeughaus-finl-unicode",
+ "zeughaus-wezterm-blob-leases",
+ "zeughaus-wezterm-char-props",
+ "zeughaus-wezterm-color-types",
+ "zeughaus-wezterm-dynamic",
+ "zeughaus-wezterm-escape-parser",
+]
+
+[[package]]
+name = "zeughaus-wezterm-char-props"
+version = "0.1.3"
+dependencies = [
+ "phf",
+ "serde",
+ "ucd-trie",
+]
+
+[[package]]
+name = "zeughaus-wezterm-color-types"
+version = "0.3.0"
+dependencies = [
+ "csscolorparser",
+ "deltae",
+ "num-traits",
+ "serde",
+ "zeughaus-wezterm-dynamic",
+]
+
+[[package]]
+name = "zeughaus-wezterm-dynamic"
+version = "0.2.1"
+dependencies = [
+ "log",
+ "ordered-float 4.6.0",
+ "strsim",
+ "thiserror 2.0.20",
+ "zeughaus-wezterm-dynamic-derive",
+]
+
+[[package]]
+name = "zeughaus-wezterm-dynamic-derive"
+version = "0.1.1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
+
+[[package]]
+name = "zeughaus-wezterm-escape-parser"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bitflags 2.13.1",
+ "hex",
+ "image",
+ "log",
+ "nix 0.29.0",
+ "num-derive",
+ "num-traits",
+ "ordered-float 4.6.0",
+ "pest",
+ "pest_derive",
+ "sha2",
+ "thiserror 2.0.20",
+ "windows-sys 0.61.2",
+ "zeughaus-vtparse",
+ "zeughaus-wezterm-blob-leases",
+ "zeughaus-wezterm-color-types",
+ "zeughaus-wezterm-dynamic",
+ "zeughaus-wezterm-input-types",
+]
+
+[[package]]
+name = "zeughaus-wezterm-input-types"
+version = "0.1.0"
+dependencies = [
+ "bitflags 1.3.2",
+ "euclid",
+ "serde",
+ "zeughaus-wezterm-dynamic",
+]
+
+[[package]]
+name = "zeughaus-wezterm-surface"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.1",
+ "fancy-regex",
+ "fixedbitset",
+ "ordered-float 4.6.0",
+ "siphasher",
+ "unicode-segmentation",
+ "zeughaus-finl-unicode",
+ "zeughaus-wezterm-bidi",
+ "zeughaus-wezterm-cell",
+ "zeughaus-wezterm-char-props",
+ "zeughaus-wezterm-color-types",
+ "zeughaus-wezterm-dynamic",
+ "zeughaus-wezterm-escape-parser",
+ "zeughaus-wezterm-input-types",
+]
+
+[[package]]
+name = "zeughaus-wezterm-term"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bitflags 1.3.2",
+ "csscolorparser",
+ "downcast-rs",
+ "hex",
+ "humansize",
+ "image",
+ "lazy_static",
+ "log",
+ "lru",
+ "miniz_oxide 0.7.4",
+ "num-traits",
+ "ordered-float 4.6.0",
+ "serde",
+ "terminfo",
+ "unicode-normalization",
+ "url",
+ "zeughaus-finl-unicode",
+ "zeughaus-termwiz",
+ "zeughaus-wezterm-bidi",
+ "zeughaus-wezterm-cell",
+ "zeughaus-wezterm-dynamic",
+ "zeughaus-wezterm-escape-parser",
+ "zeughaus-wezterm-surface",
 ]
 
 [[package]]

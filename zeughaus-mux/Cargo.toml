@@ -2,6 +2,10 @@
 name = "zeughaus-mux"
 edition.workspace = true
 version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Wire model of the terminal multiplexer: stable ids, workspace topology, terminal rows and deltas, bounded frames"
 
 [dependencies]

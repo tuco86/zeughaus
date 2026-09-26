@@ -2,6 +2,11 @@
 name = "zeughaus-capture"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "zeughaus plugin: screen capture through xdg-desktop-portal on Wayland and scrap elsewhere"
 
 [dependencies]
 zeughaus-core.workspace = true

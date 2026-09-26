@@ -2,6 +2,11 @@
 name = "zeughaus-graph"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "zeughaus plugin: the Subgraph container and its Input and Output boundary nodes"
 
 [dependencies]
 zeughaus-core.workspace = true

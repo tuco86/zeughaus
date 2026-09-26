@@ -2,8 +2,15 @@
 name = "iced_tabs"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "The tab tree of the zeughaus editor for iced: sections, coloured groups, drag and drop with drop markers"
 
 [dependencies]
-# `advanced`: a tab body is a small custom widget that reports the press
-# itself and draws the hover look.
-iced = { version = "0.14", default-features = false, features = ["advanced"] }
+# `iced_widget`, not the `iced` umbrella: the umbrella pulls the windowing shell
+# (winit), which does not compile without a platform feature and which a widget
+# never touches. A tab body is a small custom widget (`iced_widget::core`) that
+# reports the press itself and draws the hover look.
+iced_widget = "0.14"

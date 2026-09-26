@@ -12,15 +12,21 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::marker::PhantomData;
 
-use iced::advanced::layout::{self, Layout};
-use iced::advanced::widget::{self, Tree, Widget, tree};
-use iced::advanced::{Clipboard, Shell, mouse, overlay, renderer};
-use iced::widget::text::Wrapping;
-use iced::widget::{Button, Column, Row, button, container, mouse_area, scrollable, space, text};
-use iced::{
-    Alignment, Background, Border, Color, Element, Event, Length, Padding, Point, Rectangle, Size,
-    Vector, border, touch, window,
+use iced_widget::core::layout::{self, Layout};
+use iced_widget::core::widget::{self, Tree, Widget, tree};
+use iced_widget::core::{
+    Alignment, Background, Border, Color, Event, Length, Padding, Point, Rectangle, Size, Vector,
+    border, touch, window,
 };
+use iced_widget::core::{Clipboard, Shell, mouse, overlay, renderer};
+use iced_widget::text::Wrapping;
+use iced_widget::{
+    Button, Column, Row, Theme, button, container, mouse_area, scrollable, space, text,
+};
+
+/// An element whose renderer defaults to iced's, as `iced::Element` does.
+type Element<'a, Message, Theme, Renderer = iced_widget::Renderer> =
+    iced_widget::core::Element<'a, Message, Theme, Renderer>;
 
 /// Where a tab bar is placed relative to its content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -210,7 +216,7 @@ pub trait Catalog {
     fn marker(&self) -> Color;
 }
 
-impl Catalog for iced::Theme {
+impl Catalog for Theme {
     type Class<'a> = StyleFn<'a, Self>;
 
     fn default<'a>() -> Self::Class<'a> {
@@ -242,7 +248,7 @@ impl Catalog for iced::Theme {
 /// the bar sits on the chrome, and the tab is the part of the content that
 /// reaches into it. Only the corners away from the content are rounded.
 /// Inactive tabs are dimmed, with a subtle background on hover.
-pub fn default(theme: &iced::Theme, status: Status) -> Style {
+pub fn default(theme: &Theme, status: Status) -> Style {
     let content = theme.extended_palette().background.base;
     let background = if status.selected {
         Some(content.color)
@@ -274,7 +280,7 @@ pub fn default(theme: &iced::Theme, status: Status) -> Style {
 
 /// A section header is plain text on the chrome, a little dimmer than an
 /// active tab.
-pub fn section_header(theme: &iced::Theme, _placement: Placement) -> Style {
+pub fn section_header(theme: &Theme, _placement: Placement) -> Style {
     let content = theme.extended_palette().background.base;
     Style {
         background: None,
@@ -288,12 +294,7 @@ pub fn section_header(theme: &iced::Theme, _placement: Placement) -> Style {
 
 /// A group header sits on its group's background; while a drop would
 /// append to the group it is filled with the marker colour.
-pub fn group_header(
-    theme: &iced::Theme,
-    _color: Color,
-    marked: bool,
-    _placement: Placement,
-) -> Style {
+pub fn group_header(theme: &Theme, _color: Color, marked: bool, _placement: Placement) -> Style {
     Style {
         background: marked.then(|| {
             Background::Color(Color {
@@ -308,7 +309,7 @@ pub fn group_header(
 
 /// The group colour at a quarter of full opacity, whatever alpha the colour
 /// carries, rounded like the tabs it holds.
-pub fn group_background(theme: &iced::Theme, color: Color, placement: Placement) -> Style {
+pub fn group_background(theme: &Theme, color: Color, placement: Placement) -> Style {
     Style {
         background: Some(Background::Color(Color { a: 0.25, ..color })),
         text: theme.extended_palette().background.base.text,
@@ -320,7 +321,7 @@ pub fn group_background(theme: &iced::Theme, color: Color, placement: Placement)
 }
 
 /// The drop marker is the theme's primary colour.
-pub fn marker(theme: &iced::Theme) -> Color {
+pub fn marker(theme: &Theme) -> Color {
     theme.extended_palette().primary.base.color
 }
 

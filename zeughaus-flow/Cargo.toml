@@ -2,6 +2,11 @@
 name = "zeughaus-flow"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "zeughaus plugin: Hold, Button, Timer and All, the nodes that turn events into state and clocks into events"
 
 [dependencies]
 zeughaus-core.workspace = true

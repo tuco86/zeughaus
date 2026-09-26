@@ -2,6 +2,11 @@
 name = "zeughaus-llm"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "zeughaus plugin: conversation nodes against an LM Studio endpoint"
 
 [dependencies]
 zeughaus-core.workspace = true

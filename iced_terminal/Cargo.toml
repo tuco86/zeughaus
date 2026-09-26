@@ -2,6 +2,10 @@
 name = "iced_terminal"
 edition.workspace = true
 version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "An iced widget that draws a zeughaus_mux TerminalView with one wgpu primitive per surface and turns input into TerminalCommands"
 
 [dependencies]

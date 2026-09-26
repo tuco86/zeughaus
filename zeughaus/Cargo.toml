@@ -2,6 +2,13 @@
 name = "zeughaus"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Visual dataflow workbench on iced: the editor, which edits the node graph and shows what a runner reports"
+keywords = ["dataflow", "node-graph", "iced", "workbench", "visual-programming"]
+categories = ["gui", "visualization", "development-tools"]
 
 [features]
 # The headless editor: `zeughaus --headless --control <socket>` runs the real

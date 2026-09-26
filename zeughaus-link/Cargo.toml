@@ -2,6 +2,11 @@
 name = "zeughaus-link"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "The zeughaus runner-to-editor protocol over weida: sample feed, events, snapshot, triggers and credentials"
 
 [dependencies]
 zeughaus-core.workspace = true
