@@ -51,7 +51,7 @@ pub mod selection;
 
 pub use font::{FAMILY, FONT, FONT_BOLD, cell_geometry, font_bytes};
 pub use geometry::{CellMetrics, cell_at, grid_size};
-pub use input::{key_input, modifiers, mouse_button};
+pub use input::{AltSide, Platform, key_input, modifiers, mouse_button};
 pub use style::{Catalog, Style, StyleFn, default};
 pub use widget::{Action, SharedView, Terminal};
 

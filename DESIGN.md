@@ -453,10 +453,12 @@ are shaped once per content and instanced once per palette, a changed row
 replaces only its arena ranges, a cursor move touches no row, an idle
 terminal schedules no redraw. The font is bundled so the cell grid is the
 same on every host. Keys: `Ctrl+Shift+C`/`V` copy and paste,
-`Ctrl+Shift+Escape` gives the keyboard back to the app. `Ctrl+Space` never
-reaches the shell: the command palette acts on the whole window (tabs,
-panes, terminals, the graph), is drawn over whichever tab is in front, and
-holds the keyboard while it is open.
+`Ctrl+Shift+Escape` gives the keyboard back to the app; on macOS `Cmd+C`/
+`V`/`T`/`Escape` do the same, Command never reaches the child, the left
+Option is Meta and the right Option composes like AltGr. `Ctrl+Space`
+(and `Cmd+Shift+P` on macOS) never reaches the shell: the command palette
+acts on the whole window (tabs, panes, terminals, the graph), is drawn over
+whichever tab is in front, and holds the keyboard while it is open.
 
 ## 10. The sample feed
 

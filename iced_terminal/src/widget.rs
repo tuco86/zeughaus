@@ -44,7 +44,7 @@ use zeughaus_mux::{
 use crate::cache::{palette_generation, row_key};
 use crate::font;
 use crate::geometry::{cell_at, grid_size};
-use crate::input;
+use crate::input::{self, Chord, Platform};
 use crate::pipeline::{CursorSpec, Frame, FrameRow, Highlight, TerminalPrimitive};
 use crate::selection::{self, GridPoint, Mode, Selection};
 use crate::style::{Catalog, Style, StyleFn};
@@ -189,6 +189,7 @@ struct State {
     selection: Option<Selection>,
     dragging: bool,
     modifiers: keyboard::Modifiers,
+    alt: input::AltSide,
     pointer: Option<Point>,
     held: Option<mouse::Button>,
     hovered_link: Option<String>,
@@ -209,6 +210,7 @@ impl Default for State {
             selection: None,
             dragging: false,
             modifiers: keyboard::Modifiers::empty(),
+            alt: input::AltSide::default(),
             pointer: None,
             held: None,
             hovered_link: None,
@@ -328,29 +330,46 @@ where
         match event {
             Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                 state.modifiers = *modifiers;
+                // A release that never arrived, because the window lost focus
+                // while Alt was down, must not leave a side stuck.
+                if !modifiers.alt() {
+                    state.alt = input::AltSide::default();
+                }
             }
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key,
                 modified_key,
                 modifiers,
                 text,
+                location,
                 ..
             }) => {
                 state.modifiers = *modifiers;
+                if let keyboard::Key::Named(keyboard::key::Named::Alt) = modified_key {
+                    if *location == keyboard::Location::Right {
+                        state.alt.right = true;
+                    } else {
+                        state.alt.left = true;
+                    }
+                }
                 // The same key the application's shortcut matches: the one
                 // before modifiers were applied.
                 let reserved = self
                     .reserved
                     .is_some_and(|reserved| reserved(key, *modifiers));
                 if self.focused && !reserved {
-                    self.on_key(
-                        state,
-                        modified_key,
-                        *modifiers,
-                        text.as_deref(),
-                        clipboard,
-                        shell,
-                    );
+                    self.on_key(state, modified_key, key, text.as_deref(), clipboard, shell);
+                }
+            }
+            Event::Keyboard(keyboard::Event::KeyReleased {
+                key: keyboard::Key::Named(keyboard::key::Named::Alt),
+                location,
+                ..
+            }) => {
+                if *location == keyboard::Location::Right {
+                    state.alt.right = false;
+                } else {
+                    state.alt.left = false;
                 }
             }
             Event::Mouse(mouse::Event::ButtonPressed(button)) => {
@@ -437,25 +456,33 @@ where
 
     // ------------------------------------------------------------ input ---
 
+    /// A key press; `state.modifiers` already holds the modifiers it came with.
     fn on_key(
         &self,
         state: &mut State,
         key: &keyboard::Key,
-        modifiers: keyboard::Modifiers,
+        bare: &keyboard::Key,
         text: Option<&str>,
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
     ) {
+        let modifiers = state.modifiers;
         // The application's own shortcuts must not fire while a shell has the
         // keyboard, so every key a focused terminal understands is captured
-        // and `Ctrl+Shift+Escape` is the way out.
-        if modifiers.control()
-            && modifiers.shift()
-            && let Some(action) = self.chord(state, key, clipboard)
+        // and `Ctrl+Shift+Escape` (`Cmd+Escape` on macOS) is the way out.
+        if let Some(chord) = input::chord(key, modifiers, Platform::CURRENT)
+            && let Some(action) = self.chord(state, chord, clipboard)
         {
             self.publish(shell, action);
             shell.capture_event();
             shell.request_redraw();
+            return;
+        }
+
+        // Command belongs to the application on macOS and never reaches the
+        // child; without this the text fallback below would type `c` for
+        // Cmd+C.
+        if Platform::CURRENT == Platform::Mac && modifiers.logo() {
             return;
         }
 
@@ -489,7 +516,7 @@ where
             return;
         }
 
-        if let Some(input) = input::key_input(key, modifiers) {
+        if let Some(input) = input::key_input(key, bare, modifiers, state.alt, Platform::CURRENT) {
             let serial = state.next_serial();
             self.publish(
                 shell,
@@ -516,39 +543,33 @@ where
         }
     }
 
-    /// `Ctrl+Shift+...`: the shortcuts that are the widget's, not the child's.
+    /// `Ctrl+Shift+...`, and `Cmd+...` on macOS: the shortcuts that are the
+    /// widget's, not the child's.
     fn chord(
         &self,
         state: &mut State,
-        key: &keyboard::Key,
+        chord: Chord,
         clipboard: &mut dyn Clipboard,
     ) -> Option<Action> {
-        match key {
-            keyboard::Key::Named(keyboard::key::Named::Escape) => Some(Action::Focused(false)),
-            keyboard::Key::Character(character) => {
-                let character = character.chars().next()?.to_ascii_lowercase();
-                match character {
-                    'c' => {
-                        let selection = state.selection.as_ref()?;
-                        let text = self.with_view(|view| selection::extract(view, selection))?;
-                        (!text.is_empty()).then_some(Action::Copy(text))
-                    }
-                    'v' => {
-                        if !self.controlling {
-                            return None;
-                        }
-                        let text = clipboard.read(iced::advanced::clipboard::Kind::Standard)?;
-                        if text.is_empty() || text.len() > MAX_TEXT_BYTES {
-                            return None;
-                        }
-                        let serial = state.next_serial();
-                        Some(Action::Command(TerminalCommand::Paste { serial, text }))
-                    }
-                    't' => Some(Action::TakeControl),
-                    _ => None,
-                }
+        match chord {
+            Chord::Release => Some(Action::Focused(false)),
+            Chord::Copy => {
+                let selection = state.selection.as_ref()?;
+                let text = self.with_view(|view| selection::extract(view, selection))?;
+                (!text.is_empty()).then_some(Action::Copy(text))
             }
-            _ => None,
+            Chord::Paste => {
+                if !self.controlling {
+                    return None;
+                }
+                let text = clipboard.read(iced::advanced::clipboard::Kind::Standard)?;
+                if text.is_empty() || text.len() > MAX_TEXT_BYTES {
+                    return None;
+                }
+                let serial = state.next_serial();
+                Some(Action::Command(TerminalCommand::Paste { serial, text }))
+            }
+            Chord::TakeControl => Some(Action::TakeControl),
         }
     }
 

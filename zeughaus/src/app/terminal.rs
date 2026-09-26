@@ -609,7 +609,7 @@ impl App {
         let widget = iced_terminal::Terminal::new(Arc::clone(view), terminal.0)
             .controlling(controlling)
             .focused(focused)
-            .reserved(iced_palette::is_toggle_shortcut)
+            .reserved(super::is_palette_shortcut)
             .next_serial(serials.next())
             .font_size(TERMINAL_FONT_SIZE);
         match pane {

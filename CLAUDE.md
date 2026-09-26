@@ -87,7 +87,8 @@ keeps `runner.pem` and `client.pem` under the state directory
 remote editor needs `client.pem` copied into its own state directory. An
 editor without a store edits a local scratch graph and shows no values.
 
-In the editor: `Ctrl+Space` opens the command palette (spawn nodes into the
+In the editor: `Ctrl+Space` (on macOS also `Cmd+Shift+P`) opens the command
+palette (spawn nodes into the
 focused graph pane, save/load a `.zgh` file, auto layout, pick a theme, copy
 the session token, split or close the focused pane, attach or close a job's
 terminal, hold or release a runner). The window draws its
@@ -109,7 +110,9 @@ is the end of the last section. "Pane / Split Horizontal|Vertical" in the palett
 the focused pane with a terminal, "Pane / Close" closes it and kills its
 child (a job's terminal is only detached); `Ctrl+Shift+T` takes control of a
 terminal someone else drives, `Ctrl+Shift+C`/`V` copy and paste,
-`Ctrl+Shift+Escape` gives the keyboard back to the app. A `Job` node runs its
+`Ctrl+Shift+Escape` gives the keyboard back to the app (on macOS also
+`Cmd+T`/`C`/`V`/`Escape`; left Option is Meta, right Option composes). A
+`Job` node runs its
 `command` line when its `run` pin fires or it is pressed; a failed run keeps
 its terminal for attaching, every run keeps `<state-dir>/runs/<id>/log`.
 `zeughaus-runner trigger <endpoint> <node-id> [payload]` and

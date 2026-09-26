@@ -9,6 +9,10 @@
 //! is `'A'`, an AltGr layout produces whatever it produces -- except `Ctrl`
 //! and `Alt`, which stay as flags because `Ctrl+c` is `0x03` to one terminal
 //! and a `modifyOtherKeys` sequence to another.
+//!
+//! macOS has no AltGr: Option both composes characters and is the only Alt.
+//! There the left Option is Meta, like the left Alt elsewhere, and the right
+//! Option composes, like AltGr: right `Option+L` on a German layout types `@`.
 
 use iced::keyboard::key::Named;
 use iced::keyboard::{Key, Modifiers as IcedModifiers};
@@ -34,28 +38,117 @@ pub fn modifiers(from: IcedModifiers) -> Modifiers {
     out
 }
 
+/// The platform whose keyboard conventions apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    Mac,
+    Other,
+}
+
+impl Platform {
+    pub const CURRENT: Platform = if cfg!(target_os = "macos") {
+        Platform::Mac
+    } else {
+        Platform::Other
+    };
+}
+
+/// Which Alt/Option keys are down, tracked from their own press and release events.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AltSide {
+    pub left: bool,
+    pub right: bool,
+}
+
+/// The shortcuts that are the terminal widget's, not the child's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Chord {
+    Copy,
+    Paste,
+    TakeControl,
+    Release,
+}
+
+/// The widget shortcut `key` is, if any: `Ctrl+Shift+C/V/T/Escape` on every
+/// platform, and on macOS also `Cmd+C/V/T/Escape` (with or without Shift),
+/// since Command belongs to the application there and never to the child.
+pub(crate) fn chord(key: &Key, from: IcedModifiers, platform: Platform) -> Option<Chord> {
+    let held = (from.control() && from.shift())
+        || (platform == Platform::Mac && from.logo() && !from.control());
+    if !held {
+        return None;
+    }
+    match key {
+        Key::Named(Named::Escape) => Some(Chord::Release),
+        Key::Character(text) => match text.chars().next()?.to_ascii_lowercase() {
+            'c' => Some(Chord::Copy),
+            'v' => Some(Chord::Paste),
+            't' => Some(Chord::TakeControl),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// One keystroke, or `None` for a key the terminal has no meaning for
 /// (a bare modifier, a media key, a multi-scalar composition result -- the
 /// last of those reaches the child as committed text instead).
 ///
 /// `key` should be iced's `modified_key`: the layout's result for the physical
-/// key with Shift and AltGr applied.
-pub fn key_input(key: &Key, from: IcedModifiers) -> Option<KeyInput> {
+/// key with Shift and AltGr applied. `bare` is iced's `key`, the same key
+/// without modifiers, and `alt` which Alt/Option keys are down.
+///
+/// On macOS a character typed with Option is Meta plus the bare character
+/// unless only the right Option is down, which composes and sends the
+/// layout's result without Alt. Meta+Shift+letter sends the uppercase letter;
+/// Meta+Shift+symbol sends the unshifted symbol with Shift and Alt, because
+/// iced reports no character with Shift applied but Option not.
+pub fn key_input(
+    key: &Key,
+    bare: &Key,
+    from: IcedModifiers,
+    alt: AltSide,
+    platform: Platform,
+) -> Option<KeyInput> {
+    if platform == Platform::Mac
+        && from.alt()
+        && let Key::Character(text) = key
+    {
+        if alt.right && !alt.left {
+            return Some(KeyInput {
+                key: MuxKey::Char(single_char(text)?),
+                modifiers: modifiers(from.difference(IcedModifiers::ALT)),
+            });
+        }
+        if let Key::Character(bare_text) = bare {
+            let mut c = single_char(bare_text)?;
+            if from.shift() {
+                let mut upper = c.to_uppercase();
+                if let (Some(u), None) = (upper.next(), upper.next()) {
+                    c = u;
+                }
+            }
+            return Some(KeyInput {
+                key: MuxKey::Char(c),
+                modifiers: modifiers(from),
+            });
+        }
+    }
     let modifiers = modifiers(from);
     let key = match key {
-        Key::Character(text) => {
-            let mut chars = text.chars();
-            let first = chars.next()?;
-            if chars.next().is_some() {
-                return None;
-            }
-            MuxKey::Char(first)
-        }
+        Key::Character(text) => MuxKey::Char(single_char(text)?),
         Key::Named(Named::Space) => MuxKey::Char(' '),
         Key::Named(named) => MuxKey::Named(named_key(*named)?),
         Key::Unidentified => return None,
     };
     Some(KeyInput { key, modifiers })
+}
+
+/// The one scalar of `text`, or `None` for an empty or multi-scalar text.
+fn single_char(text: &str) -> Option<char> {
+    let mut chars = text.chars();
+    let first = chars.next()?;
+    chars.next().is_none().then_some(first)
 }
 
 fn named_key(named: Named) -> Option<NamedKey> {
@@ -118,7 +211,99 @@ mod tests {
     use super::*;
 
     fn press(key: Key, from: IcedModifiers) -> Option<KeyInput> {
-        key_input(&key, from)
+        key_input(&key, &key, from, AltSide::default(), Platform::Other)
+    }
+
+    fn mac(key: &str, bare: &str, from: IcedModifiers, alt: AltSide) -> Option<KeyInput> {
+        key_input(
+            &Key::Character(key.into()),
+            &Key::Character(bare.into()),
+            from,
+            alt,
+            Platform::Mac,
+        )
+    }
+
+    const LEFT: AltSide = AltSide {
+        left: true,
+        right: false,
+    };
+    const RIGHT: AltSide = AltSide {
+        left: false,
+        right: true,
+    };
+
+    #[test]
+    fn right_option_composes_without_alt() {
+        assert_eq!(
+            mac("@", "l", IcedModifiers::ALT, RIGHT),
+            Some(KeyInput {
+                key: MuxKey::Char('@'),
+                modifiers: Modifiers::default(),
+            })
+        );
+    }
+
+    #[test]
+    fn left_option_is_meta_with_the_bare_character() {
+        assert_eq!(
+            mac("@", "l", IcedModifiers::ALT, LEFT),
+            Some(KeyInput {
+                key: MuxKey::Char('l'),
+                modifiers: Modifiers::default().with(Modifiers::ALT),
+            })
+        );
+        let input = mac("ı", "b", IcedModifiers::ALT | IcedModifiers::SHIFT, LEFT)
+            .expect("meta+shift+b is a keystroke");
+        assert_eq!(input.key, MuxKey::Char('B'));
+        assert!(input.modifiers.has(Modifiers::ALT));
+    }
+
+    #[test]
+    fn named_keys_keep_alt_on_either_option() {
+        let arrow = Key::Named(Named::ArrowLeft);
+        let input = key_input(&arrow, &arrow, IcedModifiers::ALT, RIGHT, Platform::Mac)
+            .expect("option+left is a keystroke");
+        assert_eq!(input.key, MuxKey::Named(NamedKey::Left));
+        assert!(input.modifiers.has(Modifiers::ALT));
+    }
+
+    #[test]
+    fn alt_elsewhere_sends_the_layouts_character_with_alt() {
+        assert_eq!(
+            press(Key::Character("b".into()), IcedModifiers::ALT),
+            Some(KeyInput {
+                key: MuxKey::Char('b'),
+                modifiers: Modifiers::default().with(Modifiers::ALT),
+            })
+        );
+    }
+
+    #[test]
+    fn chords_are_ctrl_shift_everywhere_and_cmd_on_mac() {
+        let ctrl_shift = IcedModifiers::CTRL | IcedModifiers::SHIFT;
+        let c = Key::Character("c".into());
+        for platform in [Platform::Mac, Platform::Other] {
+            assert_eq!(
+                chord(&Key::Character("C".into()), ctrl_shift, platform),
+                Some(Chord::Copy)
+            );
+        }
+        assert_eq!(
+            chord(&c, IcedModifiers::LOGO, Platform::Mac),
+            Some(Chord::Copy)
+        );
+        assert_eq!(chord(&c, IcedModifiers::LOGO, Platform::Other), None);
+        assert_eq!(
+            chord(
+                &Key::Named(Named::Escape),
+                IcedModifiers::LOGO,
+                Platform::Mac
+            ),
+            Some(Chord::Release)
+        );
+        assert_eq!(chord(&c, IcedModifiers::CTRL, Platform::Other), None);
+        assert_eq!(chord(&c, IcedModifiers::CTRL, Platform::Mac), None);
     }
 
     #[test]

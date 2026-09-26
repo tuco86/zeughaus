@@ -2364,7 +2364,7 @@ impl App {
                 return Some(Message::WindowResized { size });
             }
             if let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event {
-                if is_toggle_shortcut(&key, modifiers) {
+                if is_palette_shortcut(&key, modifiers) {
                     return Some(Message::TogglePalette);
                 }
 
@@ -2483,6 +2483,17 @@ impl App {
     pub fn theme(&self) -> Theme {
         self.theme.clone()
     }
+}
+
+/// Ctrl+Space everywhere; on macOS also Cmd+Shift+P, because Ctrl+Space
+/// switches the input source there by default.
+pub(crate) fn is_palette_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> bool {
+    is_toggle_shortcut(key, modifiers)
+        || (cfg!(target_os = "macos")
+            && modifiers.logo()
+            && modifiers.shift()
+            && !modifiers.control()
+            && matches!(key, keyboard::Key::Character(c) if c.eq_ignore_ascii_case("p")))
 }
 
 /// A pane with nothing to draw: what it should hold, and why it does not.
