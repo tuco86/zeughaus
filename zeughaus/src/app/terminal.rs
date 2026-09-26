@@ -616,7 +616,8 @@ impl App {
             .reserved(super::is_palette_shortcut)
             .next_serial(serials.next())
             .font_size(TERMINAL_FONT_SIZE)
-            .padding(TERMINAL_PADDING);
+            .padding(TERMINAL_PADDING)
+            .scale_factor(self.scale_factor);
         match pane {
             None => widget.into(),
             Some(pane) => widget

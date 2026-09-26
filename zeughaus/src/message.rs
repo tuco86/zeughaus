@@ -156,6 +156,14 @@ pub enum Message {
     WindowResized {
         size: iced::Size,
     },
+    // The window opened: its size, and the id to ask for its scale factor.
+    WindowOpened {
+        id: iced::window::Id,
+        size: iced::Size,
+    },
+    // Device pixels per logical pixel of the window. Terminal panes count
+    // their grid with cells rounded to whole device pixels at this scale.
+    WindowRescaled(f32),
     // Periodic redraw tick while a node is in error, to animate its border. The
     // wasm editor has no timer subscription, so nothing emits it there.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]

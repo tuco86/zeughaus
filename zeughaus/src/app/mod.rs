@@ -183,6 +183,9 @@ pub struct App {
     window_size: iced::Size,
     #[cfg(not(target_arch = "wasm32"))]
     window_maximized: bool,
+    /// Device pixels per logical pixel, asked for when the window opens and
+    /// updated when it changes; terminal panes draw whole device pixels.
+    scale_factor: f32,
     /// Where the pointer last was over the titlebar's drag region, and where
     /// a press there that has not become a window drag yet happened.
     titlebar_cursor: Point,
@@ -397,6 +400,7 @@ impl App {
             window_size: crate::WINDOW_SIZE,
             #[cfg(not(target_arch = "wasm32"))]
             window_maximized: false,
+            scale_factor: 1.0,
             titlebar_cursor: Point::ORIGIN,
             titlebar_press: None,
             last_error: String::new(),
@@ -1356,6 +1360,11 @@ impl App {
                     .and_then(iced::window::is_maximized)
                     .map(Message::WindowMaximized);
             }
+            Message::WindowOpened { id, size } => {
+                let scale = iced::window::scale_factor(id).map(Message::WindowRescaled);
+                return Task::batch([self.update(Message::WindowResized { size }), scale]);
+            }
+            Message::WindowRescaled(scale_factor) => self.scale_factor = scale_factor,
             Message::Tick => {
                 // Re-rendering advances the widget's animation clock; the one
                 // piece of state that ages on its own is the hint.
@@ -2356,12 +2365,18 @@ impl App {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        let events = iced::event::listen_with(|event, _status, _id| {
-            if let Event::Window(
-                iced::window::Event::Resized(size) | iced::window::Event::Opened { size, .. },
-            ) = event
-            {
-                return Some(Message::WindowResized { size });
+        let events = iced::event::listen_with(|event, _status, id| {
+            match event {
+                Event::Window(iced::window::Event::Opened { size, .. }) => {
+                    return Some(Message::WindowOpened { id, size });
+                }
+                Event::Window(iced::window::Event::Resized(size)) => {
+                    return Some(Message::WindowResized { size });
+                }
+                Event::Window(iced::window::Event::Rescaled(scale_factor)) => {
+                    return Some(Message::WindowRescaled(scale_factor));
+                }
+                _ => {}
             }
             if let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event {
                 if is_palette_shortcut(&key, modifiers) {

@@ -102,6 +102,8 @@ where
     font_size: f32,
     /// Logical pixels between the grid and the left and right edges.
     padding: f32,
+    /// Device pixels per logical pixel of the window this surface is drawn in.
+    scale_factor: f32,
     class: Theme::Class<'a>,
 }
 
@@ -122,6 +124,7 @@ where
             next_serial: 1,
             font_size: DEFAULT_FONT_SIZE,
             padding: 0.0,
+            scale_factor: 1.0,
             class: Theme::default(),
         }
     }
@@ -174,6 +177,15 @@ where
         } else {
             0.0
         };
+        self
+    }
+
+    /// The scale factor of the window this surface is drawn in. Cells are
+    /// drawn in whole device pixels; the grid is counted, and the pointer
+    /// mapped, with the cell rounded at this scale, so a wrong value shows as
+    /// columns drawn past the edge or clicks landing a few columns off.
+    pub fn scale_factor(mut self, scale_factor: f32) -> Self {
+        self.scale_factor = scale_factor;
         self
     }
 
@@ -474,7 +486,7 @@ where
     }
 
     fn metrics(&self) -> crate::geometry::CellMetrics {
-        font::cell_metrics(self.font_size)
+        font::cell_metrics(self.font_size).snapped(self.scale_factor)
     }
 
     /// The part of `bounds` the grid occupies: `bounds` less the padding,

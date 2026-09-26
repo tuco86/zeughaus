@@ -605,7 +605,10 @@ impl Host {
             }
             Command::Scale(scale) => {
                 self.scale = scale;
-                self.input([Event::Window(window::Event::Resized(self.size))])
+                self.input([
+                    Event::Window(window::Event::Rescaled(scale)),
+                    Event::Window(window::Event::Resized(self.size)),
+                ])
             }
             Command::Clip => match self.clipboard.read(clipboard::Kind::Standard) {
                 Some(text) => format!("ok {text}"),

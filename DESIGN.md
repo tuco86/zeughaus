@@ -452,7 +452,11 @@ opened, by a click.
 are shaped once per content and instanced once per palette, a changed row
 replaces only its arena ranges, a cursor move touches no row, an idle
 terminal schedules no redraw. The font is bundled so the cell grid is the
-same on every host. Keys: `Ctrl+Shift+C`/`V` copy and paste,
+same on every host at one scale. A cell is drawn in whole device pixels, so
+the editor hands each pane its window's scale factor (asked for when the
+window opens, updated on `Rescaled`) and the pane counts its columns with
+the cell rounded at that scale; a pane keeps its grid a logical pixel off
+its side edges. Keys: `Ctrl+Shift+C`/`V` copy and paste,
 `Ctrl+Shift+Escape` gives the keyboard back to the app; on macOS `Cmd+C`/
 `V`/`T`/`Escape` do the same, Command never reaches the child, the left
 Option is Meta and the right Option composes like AltGr. `Ctrl+Space`

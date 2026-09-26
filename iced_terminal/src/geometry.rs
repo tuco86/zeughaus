@@ -1,9 +1,11 @@
 //! The grid: how many cells fit into a rectangle, and where a point lands.
 //!
-//! Everything here is logical pixels, the unit iced hands a widget. The
-//! pipeline converts to physical pixels once, with the viewport's scale
-//! factor, and rounds there -- a cell that is 8.4 px wide logically must be a
-//! whole number of device pixels or the columns drift apart across a row.
+//! Everything here is logical pixels, the unit iced hands a widget. A cell is
+//! drawn a whole number of device pixels wide and high -- a cell that is 8.4 px
+//! wide logically would otherwise put its columns at fractional positions --
+//! so the grid is counted with [`CellMetrics::snapped`] at the same scale the
+//! pipeline draws with; counted with the unrounded cell, the last columns of
+//! a wide pane would be drawn past its edge.
 //!
 //! Column and row counts are always floored and never zero: a pane one pixel
 //! high still has a 1x1 grid, because a [`Dimensions`] of zero is not a size a
@@ -34,6 +36,22 @@ impl CellMetrics {
     /// The cell as a size, which is all the layout needs.
     pub fn size(self) -> Size {
         Size::new(self.width, self.height)
+    }
+
+    /// The cell as the pipeline draws it at `scale` device pixels per logical
+    /// pixel: width and height rounded to whole device pixels, expressed in
+    /// logical pixels again. The pipeline rounds the same way, so a grid
+    /// counted with this cell ends where the drawn one does.
+    pub fn snapped(self, scale: f32) -> Self {
+        if !scale.is_finite() || scale <= 0.0 {
+            return self;
+        }
+        let snap = |length: f32| (length * scale).round().max(1.0) / scale;
+        CellMetrics {
+            width: snap(self.width),
+            height: snap(self.height),
+            ..self
+        }
     }
 }
 
@@ -122,6 +140,34 @@ mod tests {
         assert_eq!(huge.cols, MAX_COLS);
         assert_eq!(huge.rows, MAX_ROWS);
         assert!(huge.is_valid());
+    }
+
+    #[test]
+    fn a_snapped_grid_fits_the_pane_as_drawn() {
+        // 8.8 px wide: at scale 2 a column is drawn 18 device pixels wide,
+        // which counted as 8.8 logical pixels overran a 1000 px pane by 22.
+        let cell = CellMetrics {
+            width: 8.8,
+            height: 19.2,
+            ..CELL
+        };
+        let pane = Size::new(1000.0, 700.0);
+        for scale in [1.0, 1.25, 1.5, 2.0, 2.5, 3.0] {
+            let grid = grid_size(pane, cell.snapped(scale));
+            let drawn_width = f32::from(grid.cols) * (cell.width * scale).round();
+            let drawn_height = f32::from(grid.rows) * (cell.height * scale).round();
+            assert!(drawn_width <= pane.width * scale, "{scale}: {grid:?}");
+            assert!(drawn_height <= pane.height * scale, "{scale}: {grid:?}");
+            // And no whole drawn column is left unused.
+            assert!(drawn_width + (cell.width * scale).round() > pane.width * scale);
+        }
+    }
+
+    #[test]
+    fn a_nonsense_scale_leaves_the_cell_alone() {
+        for scale in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(CELL.snapped(scale), CELL);
+        }
     }
 
     #[test]
