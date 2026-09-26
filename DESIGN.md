@@ -287,8 +287,8 @@ rounded on the left instead of on top. Long labels are shortened; overflow
 scrolls.
 
 The icon is one mark: a stencilled Z, cut like the marking on a depot crate.
-`assets/icon/render.py` is its geometry and writes `zeughaus.svg` and the two
-PNGs anything reads: 256 px compiled into the editor and handed to
+`zeughaus/assets/icon/render.py` is its geometry and writes `zeughaus.svg`
+and the two PNGs anything reads: 256 px compiled into the editor and handed to
 `window::Settings::icon`, 64 px as the browser tab's favicon
 (`<link rel="icon">` in `index.html`). Below 32 px the generator would have to
 drop the stencil bridges, which are then thinner than a pixel; no such size is

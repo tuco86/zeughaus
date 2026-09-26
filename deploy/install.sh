@@ -31,7 +31,7 @@ install -Dm644 "$root/deploy/zeughaus-runner.service" "$units/zeughaus-runner.se
 mkdir -p "$data/applications"
 sed "s|@BINDIR@|$bindir|g" "$root/deploy/net.doodleshnookie.Zeughaus.desktop" \
     >"$data/applications/net.doodleshnookie.Zeughaus.desktop"
-install -Dm644 "$root/assets/icon/zeughaus.svg" \
+install -Dm644 "$root/zeughaus/assets/icon/zeughaus.svg" \
     "$data/icons/hicolor/scalable/apps/net.doodleshnookie.Zeughaus.svg"
 # A cache some other installer left in the user's hicolor theme is trusted
 # by Qt as long as it is valid, and it does not list this icon: the menu and

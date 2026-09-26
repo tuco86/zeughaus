@@ -153,7 +153,7 @@ pub(crate) const APP_ID: &str = "net.doodleshnookie.Zeughaus";
 /// desktop entry named after [`APP_ID`], which `deploy/install.sh` installs.
 #[cfg(not(target_arch = "wasm32"))]
 fn window_icon() -> Option<iced::window::Icon> {
-    const DATA: &[u8] = include_bytes!("../../assets/icon/zeughaus-256.png");
+    const DATA: &[u8] = include_bytes!("../assets/icon/zeughaus-256.png");
 
     let mut reader = png::Decoder::new(std::io::Cursor::new(DATA))
         .read_info()

@@ -5,7 +5,7 @@ The mark is a stencilled Z, the way a depot crate is marked: one geometric
 letter, two bridges cut through the bars. Everything here is polygons, so the
 same numbers produce the SVG and the PNG set without an external rasterizer.
 
-    python3 assets/icon/render.py
+    python3 zeughaus/assets/icon/render.py
 
 writes zeughaus.svg and zeughaus-<size>.png next to this file.
 """
