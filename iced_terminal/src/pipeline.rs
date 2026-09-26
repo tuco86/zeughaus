@@ -1221,7 +1221,7 @@ fn attrs_for(style: &CellStyle) -> cosmic_text::Attrs<'static> {
 
 // ---------------------------------------------------------------- colour ---
 
-fn default_colors(frame: &Frame) -> ([u8; 3], [u8; 3]) {
+pub(crate) fn default_colors(frame: &Frame) -> ([u8; 3], [u8; 3]) {
     if frame.reverse_video {
         (frame.palette.background, frame.palette.foreground)
     } else {

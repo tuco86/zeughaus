@@ -33,7 +33,7 @@ use iced::advanced::renderer;
 use iced::advanced::widget::{Tree, tree};
 use iced::advanced::{Clipboard, Shell, Widget};
 use iced::event::Event;
-use iced::{Element, Length, Point, Rectangle, Size, keyboard, window};
+use iced::{Color, Element, Length, Point, Rectangle, Size, keyboard, window};
 
 use zeughaus_mux::input::MAX_TEXT_BYTES;
 use zeughaus_mux::view::TerminalView;
@@ -45,7 +45,7 @@ use crate::cache::{palette_generation, row_key};
 use crate::font;
 use crate::geometry::{cell_at, grid_size};
 use crate::input::{self, Chord, Platform};
-use crate::pipeline::{CursorSpec, Frame, FrameRow, Highlight, TerminalPrimitive};
+use crate::pipeline::{CursorSpec, Frame, FrameRow, Highlight, TerminalPrimitive, default_colors};
 use crate::selection::{self, GridPoint, Mode, Selection};
 use crate::style::{Catalog, Style, StyleFn};
 
@@ -100,6 +100,8 @@ where
     reserved: Option<fn(&keyboard::Key, keyboard::Modifiers) -> bool>,
     next_serial: u64,
     font_size: f32,
+    /// Logical pixels between the grid and the left and right edges.
+    padding: f32,
     class: Theme::Class<'a>,
 }
 
@@ -119,6 +121,7 @@ where
             reserved: None,
             next_serial: 1,
             font_size: DEFAULT_FONT_SIZE,
+            padding: 0.0,
             class: Theme::default(),
         }
     }
@@ -160,6 +163,17 @@ where
 
     pub fn font_size(mut self, font_size: f32) -> Self {
         self.font_size = font_size;
+        self
+    }
+
+    /// Keeps the grid `padding` logical pixels off the left and right edges.
+    /// The strips show the terminal's background; the grid gets what is left.
+    pub fn padding(mut self, padding: f32) -> Self {
+        self.padding = if padding.is_finite() {
+            padding.max(0.0)
+        } else {
+            0.0
+        };
         self
     }
 
@@ -272,15 +286,28 @@ where
     ) {
         let state = tree.state.downcast_ref::<State>();
         let bounds = layout.bounds();
+        let content = self.content(bounds);
         let style = theme.style(&self.class);
         // The snapshot is built while the lock is held and the guard is gone
         // before the primitive is handed over: from here on the frame is the
         // renderer's own data.
         let frame = self
-            .with_view(|view| self.frame(view, state, bounds.size(), &style))
-            .unwrap_or_else(|| self.empty_frame(bounds.size(), &style));
+            .with_view(|view| self.frame(view, state, content.size(), &style))
+            .unwrap_or_else(|| self.empty_frame(content.size(), &style));
+        if content != bounds {
+            // Quads render before primitives within a layer, so this only
+            // shows in the padding the primitive leaves uncovered.
+            let (_, [r, g, b]) = default_colors(&frame);
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds,
+                    ..renderer::Quad::default()
+                },
+                Color::from_rgb8(r, g, b),
+            );
+        }
         renderer.draw_primitive(
-            bounds,
+            content,
             TerminalPrimitive {
                 id: self.id,
                 frame: Arc::new(frame),
@@ -373,8 +400,8 @@ where
                 }
             }
             Event::Mouse(mouse::Event::ButtonPressed(button)) => {
-                if let Some(local) = cursor.position_in(bounds) {
-                    self.on_press(state, *button, local, bounds.size(), shell);
+                if let Some(local) = self.local(cursor, bounds) {
+                    self.on_press(state, *button, local, bounds, shell);
                 }
             }
             Event::Mouse(mouse::Event::ButtonReleased(button)) => {
@@ -450,8 +477,29 @@ where
         font::cell_metrics(self.font_size)
     }
 
-    fn grid(&self, size: Size) -> Dimensions {
-        grid_size(size, self.metrics())
+    /// The part of `bounds` the grid occupies: `bounds` less the padding,
+    /// which never takes more than the whole width.
+    fn content(&self, bounds: Rectangle) -> Rectangle {
+        let inset = self.padding.min(bounds.width / 2.0);
+        Rectangle {
+            x: bounds.x + inset,
+            width: bounds.width - 2.0 * inset,
+            ..bounds
+        }
+    }
+
+    /// The pointer relative to the grid's top-left corner, while it is over
+    /// the widget. Over the padding it is left of column 0 or right of the
+    /// last one, which [`cell_at`] clamps to the edge column.
+    fn local(&self, cursor: mouse::Cursor, bounds: Rectangle) -> Option<Point> {
+        let content = self.content(bounds);
+        cursor
+            .position_in(bounds)
+            .map(|local| Point::new(local.x - (content.x - bounds.x), local.y))
+    }
+
+    fn grid(&self, bounds: Rectangle) -> Dimensions {
+        grid_size(self.content(bounds).size(), self.metrics())
     }
 
     // ------------------------------------------------------------ input ---
@@ -578,7 +626,7 @@ where
         state: &mut State,
         button: mouse::Button,
         local: Point,
-        size: Size,
+        bounds: Rectangle,
         shell: &mut Shell<'_, Message>,
     ) {
         state.held = Some(button);
@@ -586,7 +634,7 @@ where
             self.publish(shell, Action::Focused(true));
         }
 
-        let grid = self.grid(size);
+        let grid = self.grid(bounds);
         let (col, row) = cell_at(local, self.metrics(), grid);
 
         // One lock for everything this press needs from the view. The link
@@ -664,13 +712,13 @@ where
         bounds: Rectangle,
         shell: &mut Shell<'_, Message>,
     ) {
-        let Some(local) = cursor.position_in(bounds) else {
+        let Some(local) = self.local(cursor, bounds) else {
             state.pointer = None;
             return;
         };
         state.pointer = Some(local);
 
-        let grid = self.grid(bounds.size());
+        let grid = self.grid(bounds);
         let (col, row) = cell_at(local, self.metrics(), grid);
         let Some((mouse_reporting, stable, link)) = self.with_view(|view| {
             let stable = top_row(view) + i64::from(row);
@@ -742,10 +790,10 @@ where
             .with_view(|view| view.modes.mouse_reporting)
             .unwrap_or(false)
             && self.controlling
-            && let Some(local) = cursor.position_in(bounds)
+            && let Some(local) = self.local(cursor, bounds)
             && let Some(button) = input::mouse_button(button)
         {
-            let grid = self.grid(bounds.size());
+            let grid = self.grid(bounds);
             let (col, row) = cell_at(local, self.metrics(), grid);
             let serial = state.next_serial();
             self.publish(
@@ -787,10 +835,10 @@ where
         };
 
         if mouse_reporting && self.controlling {
-            let Some(local) = cursor.position_in(bounds) else {
+            let Some(local) = self.local(cursor, bounds) else {
                 return;
             };
-            let grid = self.grid(bounds.size());
+            let grid = self.grid(bounds);
             let (col, row) = cell_at(local, metrics, grid);
             let button = if notches > 0.0 {
                 zeughaus_mux::MouseButton::WheelUp
@@ -836,7 +884,7 @@ where
         bounds: Rectangle,
         shell: &mut Shell<'_, Message>,
     ) {
-        self.resize(state, now, bounds.size(), shell);
+        self.resize(state, now, bounds, shell);
 
         // One lock for the two things a redraw asks the view: whether the
         // cursor blinks at all, and where it sits for the input method.
@@ -856,8 +904,9 @@ where
             && let Some((_, col, row)) = cursor_cell
         {
             let metrics = self.metrics();
+            let content = self.content(bounds);
             let cursor = Rectangle {
-                x: bounds.x + f32::from(col) * metrics.width,
+                x: content.x + f32::from(col) * metrics.width,
                 y: bounds.y + f32::from(row) * metrics.height,
                 width: metrics.width,
                 height: metrics.height,
@@ -876,12 +925,18 @@ where
 
     /// Emits a resize once the geometry stopped moving. A drag over a split
     /// changes the pane every frame; the child only wants the answer.
-    fn resize(&self, state: &mut State, now: Instant, size: Size, shell: &mut Shell<'_, Message>) {
+    fn resize(
+        &self,
+        state: &mut State,
+        now: Instant,
+        bounds: Rectangle,
+        shell: &mut Shell<'_, Message>,
+    ) {
         if !self.controlling {
             state.pending_grid = None;
             return;
         }
-        let grid = self.grid(size);
+        let grid = self.grid(bounds);
         if grid == state.sent_grid {
             state.pending_grid = None;
             return;

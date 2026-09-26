@@ -21,6 +21,10 @@ use crate::workspace::{PaneRef, RunnerKey, Surface};
 /// different geometries for the same terminal.
 const TERMINAL_FONT_SIZE: f32 = 16.0;
 
+/// Logical pixels between a terminal's grid and the pane's left and right
+/// edges, so the first and last column do not touch the pane border.
+const TERMINAL_PADDING: f32 = 1.0;
+
 /// Everything this editor holds about one runner's terminal multiplexer.
 ///
 /// Replaced wholesale when the runner's endpoint changes: a different runner
@@ -611,7 +615,8 @@ impl App {
             .focused(focused)
             .reserved(super::is_palette_shortcut)
             .next_serial(serials.next())
-            .font_size(TERMINAL_FONT_SIZE);
+            .font_size(TERMINAL_FONT_SIZE)
+            .padding(TERMINAL_PADDING);
         match pane {
             None => widget.into(),
             Some(pane) => widget
