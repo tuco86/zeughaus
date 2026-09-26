@@ -30,7 +30,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0-alpha.1"
+version = "0.1.0-dev"
 authors = ["tuco86"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tuco86/zeughaus"
@@ -39,37 +39,37 @@ homepage = "https://zeughaus.doodleshnookie.net"
 # Every in-tree dependency carries the workspace version next to its path:
 # crates.io strips the path on publish and keeps only the version.
 [workspace.dependencies]
-zeughaus-core = { path = "zeughaus-core", version = "0.1.0-alpha.1" }
-zeughaus-runtime = { path = "zeughaus-runtime", version = "0.1.0-alpha.1" }
-zeughaus-transform = { path = "zeughaus-transform", version = "0.1.0-alpha.1" }
-zeughaus-capture = { path = "zeughaus-capture", version = "0.1.0-alpha.1" }
-zeughaus-llm = { path = "zeughaus-llm", version = "0.1.0-alpha.1" }
-zeughaus-ml = { path = "zeughaus-ml", version = "0.1.0-alpha.1" }
-zeughaus-flow = { path = "zeughaus-flow", version = "0.1.0-alpha.1" }
-zeughaus-graph = { path = "zeughaus-graph", version = "0.1.0-alpha.1" }
-zeughaus-db = { path = "zeughaus-db", version = "0.1.0-alpha.1" }
-zeughaus-record = { path = "zeughaus-record", version = "0.1.0-alpha.1" }
+zeughaus-core = { path = "zeughaus-core", version = "0.1.0-dev" }
+zeughaus-runtime = { path = "zeughaus-runtime", version = "0.1.0-dev" }
+zeughaus-transform = { path = "zeughaus-transform", version = "0.1.0-dev" }
+zeughaus-capture = { path = "zeughaus-capture", version = "0.1.0-dev" }
+zeughaus-llm = { path = "zeughaus-llm", version = "0.1.0-dev" }
+zeughaus-ml = { path = "zeughaus-ml", version = "0.1.0-dev" }
+zeughaus-flow = { path = "zeughaus-flow", version = "0.1.0-dev" }
+zeughaus-graph = { path = "zeughaus-graph", version = "0.1.0-dev" }
+zeughaus-db = { path = "zeughaus-db", version = "0.1.0-dev" }
+zeughaus-record = { path = "zeughaus-record", version = "0.1.0-dev" }
 # Processes with a beginning and an end as graph nodes: the argv, environment
 # and artifact globs live in a node's settings, so the mux never carries a
 # command line. The editor registers it detached; only a runner executes.
-zeughaus-job = { path = "zeughaus-job", version = "0.1.0-alpha.1" }
-zeughaus-sync = { path = "zeughaus-sync", version = "0.1.0-alpha.1" }
+zeughaus-job = { path = "zeughaus-job", version = "0.1.0-dev" }
+zeughaus-sync = { path = "zeughaus-sync", version = "0.1.0-dev" }
 # What travels between a runner and its editors over weida, and the identities
 # both ends present: the sample feed, runtime events, path constants and the
 # credentials on disk. Frames are streams, and a state store is the wrong pipe
 # for 33 MB per frame, so this is its own transport. The QUIC transport itself
 # lives in a sibling checkout.
-zeughaus-link = { path = "zeughaus-link", version = "0.1.0-alpha.1" }
+zeughaus-link = { path = "zeughaus-link", version = "0.1.0-dev" }
 weida = { path = "../weida/crates/weida", version = "0.1.0-alpha.2" }
-zeughaus-runner = { path = "zeughaus-runner", version = "0.1.0-alpha.1" }
+zeughaus-runner = { path = "zeughaus-runner", version = "0.1.0-dev" }
 # The terminal multiplexer's wire model, shared by runner and editor (wasm
 # included): pure types and a bounded codec, nothing that opens a PTY or draws.
-zeughaus-mux = { path = "zeughaus-mux", version = "0.1.0-alpha.1" }
+zeughaus-mux = { path = "zeughaus-mux", version = "0.1.0-dev" }
 # The runner's terminal engine: PTYs from `portable-pty`, escape parsing and
 # the canonical screen from wezterm's `wezterm-term` -- the parts of WezTerm
 # that are a terminal, without its mux, client, GUI, Lua or configuration
 # stack.
-zeughaus-terminal = { path = "zeughaus-terminal", version = "0.1.0-alpha.1" }
+zeughaus-terminal = { path = "zeughaus-terminal", version = "0.1.0-dev" }
 portable-pty = "0.9.0"
 # Pinned wezterm sources, published as `zeughaus-*` packages because their
 # crates.io releases lag the pin or do not exist (third_party/Cargo.toml).
@@ -80,15 +80,15 @@ postcard = { version = "1.1", features = ["use-std"] }
 
 iced = { version = "0.14", features = ["advanced", "wgpu", "tokio"] }
 iced_nodegraph = "0.5"
-iced_tabs = { path = "iced_tabs", version = "0.1.0-alpha.1" }
+iced_tabs = { path = "iced_tabs", version = "0.1.0-dev" }
 # The terminal surface: one widget, one wgpu primitive per pane, drawing a
 # `zeughaus_mux::view::TerminalView`. Its own crate so the pipeline compiles
 # and tests apart from the editor.
-iced_terminal = { path = "iced_terminal", version = "0.1.0-alpha.1" }
+iced_terminal = { path = "iced_terminal", version = "0.1.0-dev" }
 # One theme for every surface: the iced widgets, the node graph, the terminal
 # panes and the tab bar. A terminal colour scheme is the source, the iced
 # palette is derived from it.
-zeughaus-theme = { path = "zeughaus-theme", version = "0.1.0-alpha.1" }
+zeughaus-theme = { path = "zeughaus-theme", version = "0.1.0-dev" }
 iced_palette = "0.1.1"
 
 serde = { version = "1.0", features = ["derive"] }
