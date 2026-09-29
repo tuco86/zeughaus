@@ -578,8 +578,9 @@ impl MuxService {
         })?;
         let mut changes = session.changes();
         let current = *changes.borrow_and_update();
+        let epoch = session.epoch();
         let mut head = match attach.known {
-            Some((1, seq)) if seq == current => None,
+            Some(known) if known == (epoch, current) => None,
             _ => Some(session.head(HEAD_ROWS_ABOVE)),
         };
         // Serials are per client and per exchange: a fresh attach starts
@@ -589,6 +590,7 @@ impl MuxService {
         }
         let mut acked_serial = 0u64;
         let mut sent_seq = head.as_ref().map_or(current, |h| h.seq);
+        let mut sent_epoch = head.as_ref().map_or(epoch, |h| h.epoch);
         write_frame(
             reply,
             &Message::TerminalAttached(TerminalAttached { head }),
@@ -624,10 +626,23 @@ impl MuxService {
                     }
                     changes.borrow_and_update();
                     last_sent = Instant::now();
-                    let mut delta = session.delta_since(sent_seq);
-                    delta.input_serial_ack = acked_serial;
-                    sent_seq = delta.to_seq;
-                    if let Err(e) = write_frame(reply, &Message::TerminalDelta(delta), 0).await {
+                    let delta = session.delta_since(sent_seq);
+                    // A screen switch renumbers the rows: what the client
+                    // holds is of the other screen, and only a head replaces
+                    // it.
+                    let message = if delta.epoch == sent_epoch {
+                        let mut delta = delta;
+                        delta.input_serial_ack = acked_serial;
+                        sent_seq = delta.to_seq;
+                        Message::TerminalDelta(delta)
+                    } else {
+                        let mut head = session.head(HEAD_ROWS_ABOVE);
+                        head.input_serial_ack = acked_serial;
+                        sent_seq = head.seq;
+                        sent_epoch = head.epoch;
+                        Message::TerminalHead(head)
+                    };
+                    if let Err(e) = write_frame(reply, &message, 0).await {
                         break Err(gone(&e));
                     }
                     if !self.exists(terminal) {
@@ -692,16 +707,15 @@ impl MuxService {
             code: ErrorCode::UnknownTerminal,
             message: format!("no {}", fetch.terminal),
         })?;
-        if fetch.epoch != 1 {
+        let Some((seq, first_retained, rows)) = session.rows(fetch.epoch, fetch.range) else {
             return Err(WireError {
                 code: ErrorCode::Stale,
                 message: "unknown epoch".to_owned(),
             });
-        }
-        let (seq, first_retained, rows) = session.rows(fetch.range);
+        };
         let page = RowPage {
             terminal: fetch.terminal,
-            epoch: 1,
+            epoch: fetch.epoch,
             generation: fetch.generation,
             first_retained,
             seq,

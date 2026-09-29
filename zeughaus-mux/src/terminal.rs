@@ -340,14 +340,15 @@ pub struct Controller {
 }
 
 /// A terminal's whole current state as far as a client needs it: sent on
-/// attach, and again whenever a delta cannot be applied.
+/// attach, whenever a delta cannot be applied, and in place of a delta when
+/// the epoch changed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TerminalHead {
     pub terminal: TerminalId,
-    /// Bumped by the runner when the terminal's history is discontinuous
-    /// with what any client may hold (a session restart on the same id
-    /// never happens, so today this is always the first epoch; the field
-    /// exists so that stays a rule of the runner and not of the wire).
+    /// Bumped by the runner when the terminal's stable rows are no longer
+    /// numbered the way any client may hold them: the child switched between
+    /// the primary and the alternate screen, which count their rows
+    /// independently. Rows, fetches and pages of different epochs never mix.
     pub epoch: u64,
     /// The sequence number this head is current at. Deltas continue from
     /// here.

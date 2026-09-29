@@ -42,7 +42,7 @@ mod session;
 pub mod shim;
 
 pub use config::MAX_SCROLLBACK_ROWS;
-pub use model::{EPOCH, MAX_FETCH_ROWS, MAX_ROWS_ABOVE};
+pub use model::{FIRST_EPOCH, MAX_FETCH_ROWS, MAX_ROWS_ABOVE};
 #[cfg(unix)]
 pub use session::ShimHost;
 pub use session::{Profile, Session, SpawnError, TerminalHost};

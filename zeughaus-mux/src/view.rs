@@ -264,7 +264,7 @@ impl TerminalView {
     /// Returns whether it moved.
     pub fn scroll_by(&mut self, lines: i64) -> bool {
         let current = self.viewport().start;
-        let top = (current + lines).clamp(self.first_retained, self.visible.start);
+        let top = self.clamp_top(current + lines);
         let next = if top >= self.visible.start {
             None
         } else {
@@ -343,7 +343,7 @@ impl TerminalView {
         let Some(top) = self.scroll_top else {
             return false;
         };
-        let clamped = top.clamp(self.first_retained, self.visible.start);
+        let clamped = self.clamp_top(top);
         let next = if clamped >= self.visible.start {
             None
         } else {
@@ -355,6 +355,15 @@ impl TerminalView {
         } else {
             false
         }
+    }
+
+    /// `top` bounded to where a scrolled viewport may start: no earlier than
+    /// the oldest retained row, no later than the screen. The bounds come
+    /// from different messages -- a page can report an eviction that already
+    /// passed the screen the last delta named -- so the lower may exceed the
+    /// upper for a moment; the screen wins, which follows it.
+    fn clamp_top(&self, top: i64) -> i64 {
+        top.max(self.first_retained).min(self.visible.start)
     }
 
     /// Drops rows farthest from the viewport until `capacity` holds.
@@ -509,6 +518,33 @@ mod tests {
         assert!(view.row(4).is_some());
         assert!(view.row(2).is_none(), "below first_retained is dropped");
         assert_eq!(view.first_retained, 3);
+    }
+
+    #[test]
+    fn an_eviction_past_the_screen_follows_the_screen() {
+        let mut view = TerminalView::from_head(
+            head(vec![row(4, 1, "d"), row(8, 9, "a"), row(9, 9, "b")]),
+            100,
+        );
+        view.scroll_by(-4);
+        assert_eq!(view.scroll_top, Some(4));
+        // A burst evicted beyond the screen the last delta named; the page
+        // saying so arrives before the delta that moves the screen.
+        let page = RowPage {
+            terminal: TerminalId(1),
+            epoch: 1,
+            generation: 1,
+            first_retained: 20,
+            seq: 30,
+            rows: vec![],
+        };
+        view.apply_page(page);
+        // The delta after it still names the old screen.
+        let mut d = delta(10, 11);
+        d.evicted_before = Some(20);
+        view.apply_delta(d).unwrap();
+        assert!(view.follows_screen());
+        assert!(!view.scroll_by(-1), "nothing retained above the screen");
     }
 
     #[test]

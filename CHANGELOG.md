@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The editor no longer panics when a terminal switches between the primary
+  and the alternate screen while scrolled back, or is scrolled or resized on
+  the alternate screen after scrollback was evicted: the two screens number
+  their rows independently, so each switch now starts a new terminal epoch
+  and the runner sends a fresh head instead of a delta.
+
 ## [0.1.0-alpha.1] - 2026-09-26
 
 First release on crates.io, licensed MIT OR Apache-2.0.

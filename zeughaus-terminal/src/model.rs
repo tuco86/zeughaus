@@ -31,12 +31,13 @@ use zeughaus_mux::{
 use crate::config::Config;
 use crate::convert;
 
-/// A terminal's history is never discontinuous within a runner process: a
-/// session keeps its id for its whole life and is dropped with it, so no
-/// client ever has to be told that what it holds is from another terminal
-/// wearing the same id. The field exists on the wire so that stays a rule of
-/// the runner rather than an assumption of the protocol.
-pub const EPOCH: u64 = 1;
+/// The epoch a terminal starts in. A session keeps its id for its whole life,
+/// but its stable rows are not one history: the primary and the alternate
+/// screen number their rows independently (the alternate one from zero, and
+/// it never scrolls), so each switch between them starts a new epoch. A
+/// client holding rows of the other screen has to take a fresh head instead
+/// of mixing the two.
+pub const FIRST_EPOCH: u64 = 1;
 
 /// Most scrollback rows a head carries above the screen. A first paint needs
 /// the screen plus enough history that a small scroll does not round-trip;
@@ -73,6 +74,10 @@ pub(crate) struct Model {
     /// to this flag would be shipping someone else's product name to every
     /// client until the first OSC 0.
     titled: bool,
+    /// Bumped on every switch between the primary and the alternate screen.
+    epoch: u64,
+    /// The screen `epoch` numbers the rows of.
+    alt_screen: bool,
 }
 
 impl Model {
@@ -97,6 +102,8 @@ impl Model {
             input_serial_ack: 0,
             label: label.to_string(),
             titled: false,
+            epoch: FIRST_EPOCH,
+            alt_screen: false,
         }
     }
 
@@ -118,8 +125,20 @@ impl Model {
         }
     }
 
+    /// The stable-row space heads, deltas and pages are in.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Feeds child output. Output is the only thing that switches screens
+    /// (`?1049h`/`?47h` and their resets), so the epoch is kept here.
     pub(crate) fn advance(&mut self, bytes: &[u8]) {
         self.terminal.advance_bytes(bytes);
+        let alt_screen = self.terminal.is_alt_screen_active();
+        if alt_screen != self.alt_screen {
+            self.alt_screen = alt_screen;
+            self.epoch += 1;
+        }
     }
 
     /// Record an ordered event at a fresh sequence number, so that a
@@ -205,7 +224,7 @@ impl Model {
         );
         TerminalHead {
             terminal,
-            epoch: EPOCH,
+            epoch: self.epoch,
             seq: self.seq(),
             dimensions: self.dimensions(),
             visible,
@@ -245,7 +264,7 @@ impl Model {
         }
         TerminalDelta {
             terminal,
-            epoch: EPOCH,
+            epoch: self.epoch,
             from_seq: seq,
             to_seq: self.seq(),
             input_serial_ack: self.input_serial_ack,
@@ -269,7 +288,12 @@ impl Model {
     /// The rows of `range` that are still retained, with the sequence number
     /// they were read at and the oldest row that still exists -- a client
     /// whose request was partly evicted learns how far back it may ask.
-    pub(crate) fn rows(&self, range: StableRange) -> (u64, i64, Vec<RowData>) {
+    /// `None` when the model is no longer in `epoch`: the range names rows of
+    /// the other screen.
+    pub(crate) fn rows(&self, epoch: u64, range: StableRange) -> Option<(u64, i64, Vec<RowData>)> {
+        if epoch != self.epoch {
+            return None;
+        }
         let screen = self.terminal.screen();
         let end = range
             .start
@@ -285,7 +309,7 @@ impl Model {
             None,
             &mut rows,
         );
-        (self.seq(), retained(screen).start, rows)
+        Some((self.seq(), retained(screen).start, rows))
     }
 
     fn cursor(&self) -> Cursor {
@@ -620,6 +644,36 @@ mod tests {
     }
 
     #[test]
+    fn switching_screens_starts_a_new_epoch() {
+        let mut fixture = Fixture::new(20, 3, 5);
+        for line in 0..20 {
+            fixture.feed(&format!("line {line}\r\n"));
+        }
+        let primary = fixture.head();
+        assert_eq!(primary.epoch, FIRST_EPOCH);
+        assert!(primary.first_retained > 0, "the scrollback evicted rows");
+
+        fixture.feed("\x1b[?1049h");
+        let alternate = fixture.head();
+        assert_ne!(alternate.epoch, primary.epoch);
+        // The alternate screen numbers its rows from zero: below what the
+        // primary one has already evicted, so the two cannot share an epoch.
+        assert!(alternate.visible.start < primary.first_retained);
+        let delta = fixture.model.delta_since(TerminalId(1), primary.seq);
+        assert!(!delta.applies_to(primary.epoch, primary.seq));
+        let range = StableRange {
+            start: primary.first_retained,
+            end: primary.visible.end,
+        };
+        assert!(fixture.model.rows(primary.epoch, range).is_none());
+
+        fixture.feed("\x1b[?1049l");
+        let back = fixture.head();
+        assert_ne!(back.epoch, alternate.epoch);
+        assert!(fixture.model.rows(back.epoch, range).is_some());
+    }
+
+    #[test]
     fn narrowing_the_grid_rewraps_and_reports_the_rows_it_changed() {
         let mut fixture = Fixture::new(10, 3, 20);
         fixture.feed("aaaaaaaaaa\r\nbbb\r\nccc");
@@ -677,7 +731,7 @@ mod tests {
             delta.row_replacements
         );
         assert_eq!(text_of(&delta.row_replacements[0]), "second");
-        assert!(delta.applies_to(EPOCH, seq));
+        assert!(delta.applies_to(FIRST_EPOCH, seq));
 
         // Nothing happened since: a client at `to_seq` gets no rows at all.
         let idle = fixture.model.delta_since(TerminalId(1), delta.to_seq);
@@ -715,10 +769,16 @@ mod tests {
 
         // A range fetch that runs off both ends answers with what exists and
         // says where that starts.
-        let (_, first_retained, rows) = fixture.model.rows(StableRange {
-            start: -5,
-            end: 1_000,
-        });
+        let (_, first_retained, rows) = fixture
+            .model
+            .rows(
+                FIRST_EPOCH,
+                StableRange {
+                    start: -5,
+                    end: 1_000,
+                },
+            )
+            .expect("still the primary screen");
         assert_eq!(first_retained, head.first_retained);
         assert_eq!(rows.len(), 3 + 5);
         assert_eq!(rows[0].stable_row, first_retained);

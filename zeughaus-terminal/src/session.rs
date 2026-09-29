@@ -593,10 +593,18 @@ impl Session {
         self.inner.model().delta_since(self.inner.id, seq)
     }
 
+    /// The stable-row space this terminal's heads, deltas and pages are in;
+    /// it changes when the child switches between the primary and the
+    /// alternate screen.
+    pub fn epoch(&self) -> u64 {
+        self.inner.model().epoch()
+    }
+
     /// The still-retained rows of `range`, the sequence number they were read
-    /// at, and the oldest row that still exists.
-    pub fn rows(&self, range: StableRange) -> (u64, i64, Vec<RowData>) {
-        self.inner.model().rows(range)
+    /// at, and the oldest row that still exists; `None` when the terminal is
+    /// no longer in `epoch`.
+    pub fn rows(&self, epoch: u64, range: StableRange) -> Option<(u64, i64, Vec<RowData>)> {
+        self.inner.model().rows(epoch, range)
     }
 
     pub fn exit(&self) -> Option<ExitState> {
