@@ -115,7 +115,8 @@ enum Command {
     },
     Down(mouse::Button),
     Up(mouse::Button),
-    Click(Point, mouse::Button),
+    /// Modifiers held across the click, like a Ctrl+click on a link.
+    Click(Point, mouse::Button, Modifiers),
     DoubleClick(Point),
     /// `over` spreads the path across that time; zero delivers it as fast
     /// as the interface settles after each step.
@@ -189,8 +190,12 @@ impl Command {
                 }
             }
             "click" => {
-                arity(2, 3)?;
-                Command::Click(point(words[0], words[1])?, button(words.get(2).copied())?)
+                arity(2, 4)?;
+                Command::Click(
+                    point(words[0], words[1])?,
+                    button(words.get(2).copied())?,
+                    held(words.get(3).copied())?,
+                )
             }
             "dblclick" => {
                 arity(2, 2)?;
@@ -300,6 +305,21 @@ fn button(name: Option<&str>) -> Result<mouse::Button, String> {
         Some("middle") => Ok(mouse::Button::Middle),
         Some(other) => Err(format!("unknown button {other:?}")),
     }
+}
+
+/// `ctrl`, `shift+alt`, ...: the modifiers a click is made with.
+fn held(spec: Option<&str>) -> Result<Modifiers, String> {
+    let mut modifiers = Modifiers::empty();
+    for name in spec.into_iter().flat_map(|spec| spec.split('+')) {
+        modifiers |= match name.to_ascii_lowercase().as_str() {
+            "ctrl" => Modifiers::CTRL,
+            "shift" => Modifiers::SHIFT,
+            "alt" => Modifiers::ALT,
+            "super" => Modifiers::LOGO,
+            other => return Err(format!("unknown modifier {other:?}")),
+        };
+    }
+    Ok(modifiers)
 }
 
 impl Keystroke {

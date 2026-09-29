@@ -69,10 +69,21 @@ pub enum Key {
     Named(NamedKey),
 }
 
+/// Whether a key went down or came back up. A held key's auto-repeat is
+/// another `Press`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum KeyKind {
+    Press,
+    /// Only a child that asked for event types (kitty's keyboard protocol)
+    /// hears it; the runner drops it for everything else.
+    Release,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct KeyInput {
     pub key: Key,
     pub modifiers: Modifiers,
+    pub kind: KeyKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -94,9 +105,11 @@ pub enum MouseKind {
     Move,
 }
 
-/// A mouse event in grid coordinates of the visible screen. Sent only while
-/// the terminal reports the mouse ([`crate::Modes::mouse_reporting`]);
-/// otherwise the mouse selects text locally and nothing travels.
+/// A mouse event in grid coordinates of the visible screen. Sent while the
+/// terminal reports the mouse ([`crate::Modes::mouse_reporting`]), and for
+/// the wheel also on the alternate screen, where the runner turns it into
+/// cursor keys for a child that does not read the mouse; otherwise the mouse
+/// selects text locally and nothing travels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MouseInput {
     pub kind: MouseKind,

@@ -183,6 +183,10 @@ pub struct App {
     window_size: iced::Size,
     #[cfg(not(target_arch = "wasm32"))]
     window_maximized: bool,
+    /// Whether the window has the keyboard focus. Starts true: a window that
+    /// just opened is the one the user opened.
+    #[cfg(not(target_arch = "wasm32"))]
+    window_focused: bool,
     /// Device pixels per logical pixel, asked for when the window opens and
     /// updated when it changes; terminal panes draw whole device pixels.
     scale_factor: f32,
@@ -400,6 +404,8 @@ impl App {
             window_size: crate::WINDOW_SIZE,
             #[cfg(not(target_arch = "wasm32"))]
             window_maximized: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            window_focused: true,
             scale_factor: 1.0,
             titlebar_cursor: Point::ORIGIN,
             titlebar_press: None,
@@ -1453,6 +1459,10 @@ impl App {
             Message::WindowMaximized(maximized) => {
                 self.window_maximized = maximized;
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::WindowFocused(focused) => {
+                self.window_focused = focused;
+            }
             // Ends the runtime rather than closing the window: a closed
             // window leaves the event loop spinning with nothing to draw.
             #[cfg(not(target_arch = "wasm32"))]
@@ -2375,6 +2385,14 @@ impl App {
                 }
                 Event::Window(iced::window::Event::Rescaled(scale_factor)) => {
                     return Some(Message::WindowRescaled(scale_factor));
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                Event::Window(iced::window::Event::Focused) => {
+                    return Some(Message::WindowFocused(true));
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                Event::Window(iced::window::Event::Unfocused) => {
+                    return Some(Message::WindowFocused(false));
                 }
                 _ => {}
             }

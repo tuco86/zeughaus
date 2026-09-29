@@ -39,7 +39,7 @@ pub use id::{
     WorkspaceId,
 };
 pub use input::{
-    KeyInput, Modifiers, MouseButton, MouseInput, MouseKind, NamedKey, TerminalCommand,
+    KeyInput, KeyKind, Modifiers, MouseButton, MouseInput, MouseKind, NamedKey, TerminalCommand,
 };
 pub use message::{
     Capability, ClientHello, Command, CommandOutcome, CommandReply, ControlAttach, ControlAttached,

@@ -200,6 +200,11 @@ pub enum Message {
     // maximize/restore actions performed outside our titlebar.
     #[cfg(not(target_arch = "wasm32"))]
     WindowMaximized(bool),
+    // The window gained or lost the keyboard focus. A terminal's
+    // notification is shown on the desktop unless its pane is what the user
+    // is looking at, and that needs both.
+    #[cfg(not(target_arch = "wasm32"))]
+    WindowFocused(bool),
     // The transport is closed; now the process may end.
     #[cfg(not(target_arch = "wasm32"))]
     Exit,

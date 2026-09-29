@@ -1145,7 +1145,7 @@ mod tests {
     use weida::{ClientTls, EndpointAddr, Identity, Runtime, RuntimeConfig, ServerTls, Trust};
     use zeughaus_mux::input::Key;
     use zeughaus_mux::{
-        AttachTarget, Axis, KeyInput, Modifiers, NamedKey, SurfaceRef, TerminalEvent,
+        AttachTarget, Axis, KeyInput, KeyKind, Modifiers, NamedKey, SurfaceRef, TerminalEvent,
     };
 
     struct Client {
@@ -1452,6 +1452,7 @@ mod tests {
                     input: KeyInput {
                         key: Key::Char(ch),
                         modifiers: Modifiers::default(),
+                        kind: KeyKind::Press,
                     },
                 }),
                 0,
@@ -1465,6 +1466,7 @@ mod tests {
                 input: KeyInput {
                     key: Key::Named(NamedKey::Enter),
                     modifiers: Modifiers::default(),
+                    kind: KeyKind::Press,
                 },
             }),
             0,
@@ -1638,6 +1640,7 @@ mod tests {
                 input: KeyInput {
                     key: Key::Named(NamedKey::Enter),
                     modifiers: Modifiers::default(),
+                    kind: KeyKind::Press,
                 },
             }),
         )
@@ -1801,6 +1804,7 @@ mod tests {
                     input: KeyInput {
                         key: Key::Char(ch),
                         modifiers: Modifiers::default(),
+                        kind: KeyKind::Press,
                     },
                 }),
                 0,

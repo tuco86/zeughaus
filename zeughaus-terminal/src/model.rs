@@ -21,11 +21,12 @@
 use std::collections::VecDeque;
 use std::io::Write;
 
+use termwiz::input::KeyboardEncoding;
 use wezterm_term::{CellAttributes, CellRef, Line, Screen, Terminal, TerminalSize};
-use zeughaus_mux::terminal::{MAX_COLS, MAX_LINK_BYTES, MAX_SPAN_BYTES};
+use zeughaus_mux::terminal::{MAX_COLS, MAX_LINK_BYTES, MAX_NOTIFICATION_BYTES, MAX_SPAN_BYTES};
 use zeughaus_mux::{
-    CellSpan, CellStyle, Controller, Cursor, Dimensions, ExitState, Modes, Palette, RowData,
-    StableRange, TerminalDelta, TerminalEvent, TerminalHead, TerminalId,
+    CellSpan, CellStyle, Controller, Cursor, Dimensions, ExitState, KeyInput, Modes, Palette,
+    RowData, StableRange, TerminalDelta, TerminalEvent, TerminalHead, TerminalId,
 };
 
 use crate::config::Config;
@@ -141,6 +142,24 @@ impl Model {
         }
     }
 
+    /// One keystroke. The legacy encodings are the terminal's own and reach
+    /// the child through its writer; kitty's protocol is not something
+    /// `wezterm-term` encodes, so while the child has pushed its flags the
+    /// bytes come back here for the caller to write. `Ok(None)` means the
+    /// terminal took care of it (or there was nothing to send).
+    pub(crate) fn key(&mut self, input: KeyInput) -> Result<Option<String>, String> {
+        if let KeyboardEncoding::Kitty(flags) = self.terminal.get_keyboard_encoding() {
+            let bytes = convert::kitty(input, flags);
+            return Ok((!bytes.is_empty()).then_some(bytes));
+        }
+        if let Some((code, mods)) = convert::key(input) {
+            self.terminal
+                .key_down(code, mods)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(None)
+    }
+
     /// Record an ordered event at a fresh sequence number, so that a
     /// subscriber parked on the watch wakes for it even when nothing on the
     /// screen changed.
@@ -167,6 +186,20 @@ impl Model {
 
     pub(crate) fn exit(&self) -> Option<ExitState> {
         self.exit.clone()
+    }
+
+    /// A notification the child asked for (OSC 9 / OSC 777), each text cut
+    /// to what the wire carries. An empty body with no title says nothing
+    /// and is dropped.
+    pub(crate) fn notify(&mut self, title: Option<String>, body: String) {
+        let title = title
+            .map(|t| bounded(t, MAX_NOTIFICATION_BYTES))
+            .filter(|t| !t.is_empty());
+        let body = bounded(body, MAX_NOTIFICATION_BYTES);
+        if title.is_none() && body.is_empty() {
+            return;
+        }
+        self.record(TerminalEvent::Notification { title, body });
     }
 
     pub(crate) fn set_controller(&mut self, controller: Option<Controller>) {
@@ -342,6 +375,18 @@ fn terminal_size(size: Dimensions) -> TerminalSize {
     }
 }
 
+/// `text` cut to at most `max` bytes, at a character boundary.
+fn bounded(mut text: String, max: usize) -> String {
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}
+
 /// The stable rows currently on screen.
 fn visible_range(screen: &Screen) -> StableRange {
     let start = screen.visible_row_to_stable_row(0) as i64;
@@ -488,7 +533,6 @@ mod tests {
     use std::sync::mpsc::{Receiver, Sender, channel};
     use std::time::{Duration, Instant};
 
-    use wezterm_term::{KeyCode, KeyModifiers};
     use zeughaus_mux::{StyleFlags, WireColor};
 
     use super::*;
@@ -806,40 +850,90 @@ mod tests {
         );
     }
 
+    fn press(key: zeughaus_mux::input::Key, modifiers: u8) -> KeyInput {
+        KeyInput {
+            key,
+            modifiers: zeughaus_mux::Modifiers(modifiers),
+            kind: zeughaus_mux::KeyKind::Press,
+        }
+    }
+
+    const SHIFT: u8 = zeughaus_mux::Modifiers::SHIFT;
+    const CTRL: u8 = zeughaus_mux::Modifiers::CTRL;
+
+    fn named(key: zeughaus_mux::NamedKey) -> zeughaus_mux::input::Key {
+        zeughaus_mux::input::Key::Named(key)
+    }
+
     #[test]
     fn keys_are_encoded_where_the_modes_are_known() {
+        use zeughaus_mux::NamedKey::{Enter, Up};
+        use zeughaus_mux::input::Key::Char;
         let mut fixture = Fixture::new(20, 3, 10);
-
-        let up = || zeughaus_mux::KeyInput {
-            key: zeughaus_mux::input::Key::Named(zeughaus_mux::NamedKey::Up),
-            modifiers: zeughaus_mux::Modifiers::default(),
+        let legacy = |fixture: &mut Fixture, input: KeyInput, expected: &[u8]| {
+            assert_eq!(fixture.model.key(input), Ok(None));
+            fixture.expect_sent(expected);
         };
-        let (code, mods) = convert::key(up());
-        fixture.model.terminal_mut().key_down(code, mods).unwrap();
-        fixture.expect_sent(b"\x1b[A");
 
+        legacy(&mut fixture, press(named(Up), 0), b"\x1b[A");
         // DECCKM: the same key, a different sequence, and the client never
         // had to know.
         fixture.feed("\x1b[?1h");
-        let (code, mods) = convert::key(up());
-        fixture.model.terminal_mut().key_down(code, mods).unwrap();
-        fixture.expect_sent(b"\x1bOA");
+        legacy(&mut fixture, press(named(Up), 0), b"\x1bOA");
+        legacy(&mut fixture, press(Char('c'), CTRL), b"\x03");
+        legacy(&mut fixture, press(named(Enter), 0), b"\r");
+        // xterm cannot tell Shift+Enter from Enter; a line feed can.
+        legacy(&mut fixture, press(named(Enter), SHIFT), b"\n");
+        let release = KeyInput {
+            kind: zeughaus_mux::KeyKind::Release,
+            ..press(Char('a'), 0)
+        };
+        assert_eq!(fixture.model.key(release), Ok(None));
+        legacy(&mut fixture, press(Char('x'), 0), b"x");
+    }
 
-        let (code, mods) = convert::key(zeughaus_mux::KeyInput {
-            key: zeughaus_mux::input::Key::Char('c'),
-            modifiers: zeughaus_mux::Modifiers::default().with(zeughaus_mux::Modifiers::CTRL),
-        });
-        assert_eq!(code, KeyCode::Char('c'));
-        assert!(mods.contains(KeyModifiers::CTRL));
-        fixture.model.terminal_mut().key_down(code, mods).unwrap();
-        fixture.expect_sent(b"\x03");
+    #[test]
+    fn a_child_that_pushes_kitty_flags_gets_kitty_keys() {
+        use zeughaus_mux::NamedKey::Enter;
+        use zeughaus_mux::input::Key::Char;
+        let mut fixture = Fixture::new(20, 3, 10);
+        // Support is advertised: the query is answered with the flags in
+        // force, none yet.
+        fixture.feed("\x1b[?u");
+        fixture.expect_sent(b"\x1b[?0u");
 
-        let (code, mods) = convert::key(zeughaus_mux::KeyInput {
-            key: zeughaus_mux::input::Key::Named(zeughaus_mux::NamedKey::Enter),
-            modifiers: zeughaus_mux::Modifiers::default(),
-        });
-        fixture.model.terminal_mut().key_down(code, mods).unwrap();
-        fixture.expect_sent(b"\r");
+        // Disambiguate escape codes.
+        fixture.feed("\x1b[>1u");
+        let kitty = |fixture: &mut Fixture, input: KeyInput| fixture.model.key(input).unwrap();
+        assert_eq!(
+            kitty(&mut fixture, press(named(Enter), SHIFT)).as_deref(),
+            Some("\x1b[13;2u")
+        );
+        assert_eq!(
+            kitty(&mut fixture, press(Char('c'), CTRL)).as_deref(),
+            Some("\x1b[99;5u")
+        );
+        assert_eq!(
+            kitty(&mut fixture, press(Char('a'), 0)).as_deref(),
+            Some("a")
+        );
+        let release = KeyInput {
+            kind: zeughaus_mux::KeyKind::Release,
+            ..press(Char('a'), 0)
+        };
+        assert_eq!(kitty(&mut fixture, release), None, "no event types asked");
+
+        // Disambiguate plus event types: releases are reported.
+        fixture.feed("\x1b[>3u");
+        assert_eq!(
+            kitty(&mut fixture, release).as_deref(),
+            Some("\x1b[97;1:3u")
+        );
+
+        // Popping both pushes is the legacy encoding again.
+        fixture.feed("\x1b[<2u");
+        assert_eq!(kitty(&mut fixture, press(named(Enter), SHIFT)), None);
+        fixture.expect_sent(b"\n");
     }
 
     #[test]
@@ -861,6 +955,23 @@ mod tests {
         // A second exit does not rewrite the first.
         fixture.model.set_exit(ExitState::Killed);
         assert_eq!(fixture.model.exit(), Some(ExitState::Exited { code: 3 }));
+    }
+
+    #[test]
+    fn a_notification_is_cut_to_what_the_wire_carries() {
+        let mut fixture = Fixture::new(20, 3, 10);
+        let seq = fixture.model.seq();
+        fixture.model.notify(None, String::new());
+        // Two bytes per character: the limit falls inside one.
+        fixture.model.notify(Some(String::new()), "ä".repeat(600));
+
+        let delta = fixture.model.delta_since(TerminalId(1), seq);
+        let [TerminalEvent::Notification { title, body }] = delta.ordered_events.as_slice() else {
+            panic!("one notification: {:?}", delta.ordered_events);
+        };
+        assert_eq!(*title, None, "an empty title is no title");
+        assert_eq!(body.len(), MAX_NOTIFICATION_BYTES);
+        assert!(body.chars().all(|c| c == 'ä'));
     }
 
     #[test]

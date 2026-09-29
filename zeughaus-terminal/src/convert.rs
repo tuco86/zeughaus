@@ -9,10 +9,11 @@
 //!
 //! The direction matters. Keys travel in as *semantics* (`Ctrl` plus the
 //! character `c`) and are encoded where the terminal's modes are known --
-//! application cursor keys, `modifyOtherKeys`, newline mode -- which is
-//! exactly what `key_down` does. Cells travel out as *appearance* and are
-//! resolved against the palette on the client, so an OSC 4 repaints without
-//! resending a single row.
+//! application cursor keys, `modifyOtherKeys`, newline mode, kitty's
+//! keyboard flags -- which is what `key_down` does for the legacy encodings
+//! and [`kitty`] for the one `wezterm-term` leaves to its embedder. Cells
+//! travel out as *appearance* and are resolved against the palette on the
+//! client, so an OSC 4 repaints without resending a single row.
 
 use termwiz::surface::{CursorShape as WezCursorShape, CursorVisibility};
 use wezterm_term::color::{ColorAttribute, ColorPalette};
@@ -22,19 +23,32 @@ use wezterm_term::{
 };
 use wezterm_term::{Underline as WezUnderline, color::SrgbaTuple};
 
-use zeughaus_mux::input::{Key, MouseButton as WireMouseButton, NamedKey};
+use wezterm_input_types::{KeyCode as KittyCode, KeyEvent, KeyboardLedStatus, KittyKeyboardFlags};
+use zeughaus_mux::input::{Key, KeyKind, MouseButton as WireMouseButton, NamedKey};
 use zeughaus_mux::{
     CellStyle, Cursor, CursorShape, KeyInput, Modes, Modifiers, MouseInput, MouseKind, Palette,
     StyleFlags, Underline, WireColor,
 };
 
-/// A semantic keystroke as the terminal core wants it.
+/// A semantic keystroke as the terminal core wants it, for the legacy
+/// encodings; `None` for a release, which only kitty's protocol reports.
 ///
 /// The named keys that WezTerm deliberately has no variant for (it documents
 /// each of them in `KeyCode`) are their control characters: `Enter` is a
 /// carriage return and newline mode decides whether that becomes CRLF,
 /// `Backspace` is `0x08`, `Delete` is `0x7f`.
-pub(crate) fn key(input: KeyInput) -> (KeyCode, KeyModifiers) {
+///
+/// `Shift+Enter` is a line feed. xterm has no encoding for it and would send
+/// the carriage return plain `Enter` sends, which submits a prompt instead of
+/// breaking the line; line-oriented programs read LF as CR, and editors that
+/// tell them apart (Claude Code, omp: `Ctrl+J`) insert a newline.
+pub(crate) fn key(input: KeyInput) -> Option<(KeyCode, KeyModifiers)> {
+    if input.kind == KeyKind::Release {
+        return None;
+    }
+    if input.key == Key::Named(NamedKey::Enter) && input.modifiers == Modifiers(Modifiers::SHIFT) {
+        return Some((KeyCode::Char('\n'), KeyModifiers::NONE));
+    }
     let code = match input.key {
         Key::Char(c) => KeyCode::Char(c),
         Key::Named(named) => match named {
@@ -55,7 +69,49 @@ pub(crate) fn key(input: KeyInput) -> (KeyCode, KeyModifiers) {
             NamedKey::F(n) => KeyCode::Function(n),
         },
     };
-    (code, modifiers(input.modifiers))
+    Some((code, modifiers(input.modifiers)))
+}
+
+/// A keystroke in kitty's keyboard protocol, for a child that pushed
+/// `flags`: the encoder WezTerm's own GUI uses, fed the same semantics as the
+/// legacy path (control characters for the keys it names that way). Empty
+/// when the flags ask for nothing, such as a release without event types.
+///
+/// There is no raw key event behind a wire key, so what needs one is not
+/// reported: a bare modifier key, and the base-layout key of
+/// `REPORT_ALTERNATE_KEYS` (the shifted key is, from the character itself).
+pub(crate) fn kitty(input: KeyInput, flags: KittyKeyboardFlags) -> String {
+    let key = match input.key {
+        Key::Char(c) => KittyCode::Char(c),
+        Key::Named(named) => match named {
+            NamedKey::Enter => KittyCode::Char('\r'),
+            NamedKey::Tab => KittyCode::Char('\t'),
+            NamedKey::Backspace => KittyCode::Char('\u{8}'),
+            NamedKey::Escape => KittyCode::Char('\u{1b}'),
+            NamedKey::Delete => KittyCode::Char('\u{7f}'),
+            NamedKey::Insert => KittyCode::Insert,
+            NamedKey::Home => KittyCode::Home,
+            NamedKey::End => KittyCode::End,
+            NamedKey::PageUp => KittyCode::PageUp,
+            NamedKey::PageDown => KittyCode::PageDown,
+            NamedKey::Up => KittyCode::UpArrow,
+            NamedKey::Down => KittyCode::DownArrow,
+            NamedKey::Left => KittyCode::LeftArrow,
+            NamedKey::Right => KittyCode::RightArrow,
+            NamedKey::F(n) => KittyCode::Function(n),
+        },
+    };
+    KeyEvent {
+        key,
+        modifiers: modifiers(input.modifiers),
+        leds: KeyboardLedStatus::empty(),
+        repeat_count: 1,
+        key_is_down: input.kind == KeyKind::Press,
+        raw: None,
+        #[cfg(windows)]
+        win32_uni_char: None,
+    }
+    .encode_kitty(flags)
 }
 
 pub(crate) fn modifiers(mods: Modifiers) -> KeyModifiers {

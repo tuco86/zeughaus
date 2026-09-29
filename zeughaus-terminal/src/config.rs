@@ -9,9 +9,10 @@
 //! runner's).
 //!
 //! Everything not answered here keeps the trait's default, and the defaults
-//! that matter are deliberate: no kitty graphics, no kitty keyboard, no title
-//! reporting (a program that can read the title back can exfiltrate it), no
-//! CSI-u encoding.
+//! that matter are deliberate: no kitty graphics (the renderer draws no
+//! images), no title reporting (a program that can read the title back can
+//! exfiltrate it), no CSI-u as the default encoding (it would reach every
+//! program, whether it asked or not).
 
 use std::sync::Arc;
 
@@ -46,6 +47,14 @@ impl Config {
 impl TerminalConfiguration for Config {
     fn scrollback_size(&self) -> usize {
         self.scrollback
+    }
+
+    /// A child may push kitty's keyboard flags; the keys it then gets are
+    /// encoded by `convert::kitty`, since the terminal's own encoder only
+    /// knows xterm and CSI-u. Negotiated in-band, so it survives ssh and
+    /// never reaches a program that did not ask.
+    fn enable_kitty_keyboard(&self) -> bool {
+        true
     }
 
     /// The palette a session starts with. The client resolves indexed colours

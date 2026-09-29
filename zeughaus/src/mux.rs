@@ -102,14 +102,20 @@ pub enum MuxEvent {
 /// Elm loop only learns that something changed, never what.
 pub type SharedView = iced_terminal::SharedView;
 
-/// What one terminal's task reports. No payload beyond the first event: the
-/// rows go straight into the [`SharedView`], and `Changed` is a wake.
+/// What one terminal's task reports. The rows go straight into the
+/// [`SharedView`] and `Changed` is a wake; only what the app acts on beyond
+/// a redraw travels as an event.
 #[derive(Debug, Clone)]
 pub enum TerminalEvent {
     /// The first event: how to send input to this terminal.
     Ready(TerminalSender),
     /// The shared view moved; redraw.
     Changed,
+    /// The child asked for a desktop notification.
+    Notification {
+        title: Option<String>,
+        body: String,
+    },
     /// A delta did not fit the view's sequence. The view was cleared and
     /// the stream ended; attaching again asks for a fresh head, which is
     /// the only correct resync.
@@ -130,10 +136,12 @@ pub fn apply_head(view: &SharedView, head: zeughaus_mux::TerminalHead) {
     }
 }
 
-/// How much of a terminal's scrollback one client keeps in rows. Ten screens
-/// of a large terminal: enough that scrolling back a page is instant, bounded
-/// so a hundred terminals cannot be a hundred unbounded caches.
-pub const ROW_CAPACITY: usize = 4096;
+/// How many rows of a terminal one client keeps. The history is the
+/// runner's; this is the window around the viewport that a page of
+/// scrolling reads without a fetch, and a hundred terminals stay a hundred
+/// small caches. Rows farther away are dropped first and fetched again when
+/// scrolled to.
+pub const ROW_CAPACITY: usize = 1000;
 
 /// The grid a terminal is attached at before anything has been laid out.
 /// Replaced by the widget's measured geometry as soon as it draws.
@@ -518,7 +526,7 @@ pub fn terminal(
                     // The guard lives in this block and never across an
                     // await: a `MutexGuard` is not `Send`, and this stream
                     // runs on iced's executor.
-                    let rejected = {
+                    let (rejected, notifications) = {
                         let mut guard = view.lock().unwrap_or_else(|e| e.into_inner());
                         // No head yet: the runner is about to send one, and
                         // a delta with nothing to apply it to is not an error.
@@ -526,16 +534,36 @@ pub fn terminal(
                             Some(view) => view.apply_delta(delta).err(),
                             None => None,
                         };
+                        // Drained here, the one reader: the exit and the
+                        // lease are state the view keeps, and nothing else
+                        // but a notification needs acting on.
+                        let notifications: Vec<TerminalEvent> = guard
+                            .as_mut()
+                            .map(|view| view.take_events())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter_map(|event| match event {
+                                zeughaus_mux::TerminalEvent::Notification { title, body } => {
+                                    Some(TerminalEvent::Notification { title, body })
+                                }
+                                _ => None,
+                            })
+                            .collect();
                         if rejected.is_some() {
                             *guard = None;
                         }
-                        rejected
+                        (rejected, notifications)
                     };
                     if let Some(rejected) = rejected {
                         eprintln!("[mux] {terminal}: delta rejected ({rejected:?}), resyncing");
                         drop(writer);
                         let _ = out.send(TerminalEvent::Desynced).await;
                         return;
+                    }
+                    for notification in notifications {
+                        if out.send(notification).await.is_err() {
+                            return;
+                        }
                     }
                 }
                 Wire::Error(error) => {
@@ -666,6 +694,7 @@ mod tests {
             input: KeyInput {
                 key: Key::Char('a'),
                 modifiers: Modifiers::default(),
+                kind: zeughaus_mux::KeyKind::Press,
             },
         };
         assert_eq!(command.serial(), Some(1));

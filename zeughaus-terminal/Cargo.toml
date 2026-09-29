@@ -13,6 +13,7 @@ zeughaus-mux.workspace = true
 portable-pty.workspace = true
 wezterm-term.workspace = true
 termwiz.workspace = true
+wezterm-input-types.workspace = true
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
 # The shim's frames and its spec file.
 serde.workspace = true

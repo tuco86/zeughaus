@@ -75,6 +75,8 @@ portable-pty = "0.9.0"
 # crates.io releases lag the pin or do not exist (third_party/Cargo.toml).
 wezterm-term = { package = "zeughaus-wezterm-term", path = "third_party/wezterm/term", version = "0.1.0", default-features = false }
 termwiz = { package = "zeughaus-termwiz", path = "third_party/wezterm/termwiz", version = "0.24.0", default-features = false }
+# kitty's keyboard encoder: `wezterm-term` leaves that protocol to its embedder.
+wezterm-input-types = { package = "zeughaus-wezterm-input-types", path = "third_party/wezterm/wezterm-input-types", version = "0.1.0", default-features = false }
 # Compact self-describing serde bytes for the mux frames.
 postcard = { version = "1.1", features = ["use-std"] }
 

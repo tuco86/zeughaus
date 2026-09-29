@@ -18,7 +18,7 @@ use iced::keyboard::key::Named;
 use iced::keyboard::{Key, Modifiers as IcedModifiers};
 use iced::mouse;
 use zeughaus_mux::input::Key as MuxKey;
-use zeughaus_mux::{KeyInput, Modifiers, MouseButton, NamedKey};
+use zeughaus_mux::{KeyInput, KeyKind, Modifiers, MouseButton, NamedKey};
 
 /// The modifier flags, as the wire states them.
 pub fn modifiers(from: IcedModifiers) -> Modifiers {
@@ -90,10 +90,10 @@ pub(crate) fn chord(key: &Key, from: IcedModifiers, platform: Platform) -> Optio
     }
 }
 
-/// One keystroke, or `None` for a key the terminal has no meaning for
+/// One key press, or `None` for a key the terminal has no meaning for
 /// (a bare modifier, a media key, a multi-scalar composition result -- the
-/// last of those reaches the child as committed text instead).
-///
+/// last of those reaches the child as committed text instead). Its release
+/// is the same input with [`KeyKind::Release`].
 /// `key` should be iced's `modified_key`: the layout's result for the physical
 /// key with Shift and AltGr applied. `bare` is iced's `key`, the same key
 /// without modifiers, and `alt` which Alt/Option keys are down.
@@ -118,6 +118,7 @@ pub fn key_input(
             return Some(KeyInput {
                 key: MuxKey::Char(single_char(text)?),
                 modifiers: modifiers(from.difference(IcedModifiers::ALT)),
+                kind: KeyKind::Press,
             });
         }
         if let Key::Character(bare_text) = bare {
@@ -131,6 +132,7 @@ pub fn key_input(
             return Some(KeyInput {
                 key: MuxKey::Char(c),
                 modifiers: modifiers(from),
+                kind: KeyKind::Press,
             });
         }
     }
@@ -141,7 +143,11 @@ pub fn key_input(
         Key::Named(named) => MuxKey::Named(named_key(*named)?),
         Key::Unidentified => return None,
     };
-    Some(KeyInput { key, modifiers })
+    Some(KeyInput {
+        key,
+        modifiers,
+        kind: KeyKind::Press,
+    })
 }
 
 /// The one scalar of `text`, or `None` for an empty or multi-scalar text.
@@ -240,6 +246,7 @@ mod tests {
             Some(KeyInput {
                 key: MuxKey::Char('@'),
                 modifiers: Modifiers::default(),
+                kind: KeyKind::Press,
             })
         );
     }
@@ -251,6 +258,7 @@ mod tests {
             Some(KeyInput {
                 key: MuxKey::Char('l'),
                 modifiers: Modifiers::default().with(Modifiers::ALT),
+                kind: KeyKind::Press,
             })
         );
         let input = mac("ı", "b", IcedModifiers::ALT | IcedModifiers::SHIFT, LEFT)
@@ -275,6 +283,7 @@ mod tests {
             Some(KeyInput {
                 key: MuxKey::Char('b'),
                 modifiers: Modifiers::default().with(Modifiers::ALT),
+                kind: KeyKind::Press,
             })
         );
     }
@@ -313,6 +322,7 @@ mod tests {
             Some(KeyInput {
                 key: MuxKey::Named(NamedKey::Enter),
                 modifiers: Modifiers::default(),
+                kind: KeyKind::Press,
             })
         );
         for (named, expected) in [
@@ -326,6 +336,7 @@ mod tests {
                 Some(KeyInput {
                     key: MuxKey::Named(expected),
                     modifiers: Modifiers::default(),
+                    kind: KeyKind::Press,
                 })
             );
         }
@@ -334,6 +345,7 @@ mod tests {
             Some(KeyInput {
                 key: MuxKey::Named(NamedKey::F(5)),
                 modifiers: Modifiers::default(),
+                kind: KeyKind::Press,
             })
         );
     }

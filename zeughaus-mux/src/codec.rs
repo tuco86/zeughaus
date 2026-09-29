@@ -28,8 +28,8 @@ use serde::de::DeserializeOwned;
 use crate::input::{MAX_TEXT_BYTES, TerminalCommand};
 use crate::message::{ControlAttached, MAX_FETCH_ROWS, Message, RowFetch, RowPage};
 use crate::terminal::{
-    Dimensions, MAX_COLS, MAX_LINK_BYTES, MAX_ROWS, MAX_SPAN_BYTES, RowData, TerminalDelta,
-    TerminalHead,
+    Dimensions, MAX_COLS, MAX_LINK_BYTES, MAX_NOTIFICATION_BYTES, MAX_ROWS, MAX_SPAN_BYTES,
+    RowData, TerminalDelta, TerminalEvent, TerminalHead,
 };
 use crate::workspace::{
     MAX_TITLE_BYTES, MAX_TREE_DEPTH, MIN_RATIO, PaneNode, TopologyCommand, WorkspaceSnapshot,
@@ -37,7 +37,7 @@ use crate::workspace::{
 
 /// Protocol version. A major mismatch refuses the attach; a minor is the
 /// lower of the two sides'.
-pub const MAJOR: u8 = 2;
+pub const MAJOR: u8 = 3;
 pub const MINOR: u8 = 0;
 
 const MAGIC: [u8; 2] = *b"ZM";
@@ -552,6 +552,13 @@ fn validate_delta(d: &TerminalDelta) -> Result<(), CodecError> {
     if d.ordered_events.len() > MAX_EVENTS {
         return Err(CodecError::Invalid("too many events"));
     }
+    let too_long = |text: &str| text.len() > MAX_NOTIFICATION_BYTES;
+    if d.ordered_events.iter().any(|event| {
+        matches!(event, TerminalEvent::Notification { title, body }
+            if too_long(body) || title.as_deref().is_some_and(too_long))
+    }) {
+        return Err(CodecError::Invalid("notification too long"));
+    }
     validate_rows(&d.row_replacements)
 }
 
@@ -607,7 +614,7 @@ mod tests {
         assert_eq!(
             bytes,
             [
-                b'Z', b'M', 2, 0, 0x12, 0x00, 0, 0, 0x04, 0x03, 0x02, 0x00, 0x88, 0x77, 0x66, 0x55,
+                b'Z', b'M', 3, 0, 0x12, 0x00, 0, 0, 0x04, 0x03, 0x02, 0x00, 0x88, 0x77, 0x66, 0x55,
                 0x44, 0x33, 0x22, 0x11
             ]
         );
@@ -904,6 +911,10 @@ mod tests {
             ordered_events: vec![
                 TerminalEvent::Bell,
                 TerminalEvent::Exited(ExitState::Exited { code: 0 }),
+                TerminalEvent::Notification {
+                    title: Some("build".into()),
+                    body: "done".into(),
+                },
             ],
         }));
         round_trip(Message::TerminalCommand(TerminalCommand::Key {
@@ -911,6 +922,7 @@ mod tests {
             input: KeyInput {
                 key: crate::input::Key::Named(NamedKey::F(5)),
                 modifiers: Modifiers::default().with(Modifiers::CTRL),
+                kind: crate::input::KeyKind::Release,
             },
         }));
         round_trip(Message::TerminalCommand(TerminalCommand::Mouse {

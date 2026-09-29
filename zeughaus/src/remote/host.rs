@@ -533,10 +533,19 @@ impl Host {
             }
             Command::Down(button) => self.pointer(vec![pressed(button)], Duration::ZERO),
             Command::Up(button) => self.pointer(vec![released(button)], Duration::ZERO),
-            Command::Click(at, button) => self.pointer(
-                vec![moved(at), pressed(button), released(button)],
-                Duration::ZERO,
-            ),
+            Command::Click(at, button, modifiers) => {
+                let mut events = vec![moved(at), pressed(button), released(button)];
+                if !modifiers.is_empty() {
+                    events.insert(
+                        0,
+                        Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)),
+                    );
+                    events.push(Event::Keyboard(keyboard::Event::ModifiersChanged(
+                        Modifiers::empty(),
+                    )));
+                }
+                self.pointer(events, Duration::ZERO)
+            }
             Command::DoubleClick(at) => self.pointer(
                 vec![
                     moved(at),

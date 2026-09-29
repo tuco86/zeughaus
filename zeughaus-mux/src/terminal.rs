@@ -373,13 +373,23 @@ pub struct TerminalHead {
 }
 
 /// Something that happened in order and must not be coalesced away: an exit,
-/// a bell, a lease change.
+/// a bell, a lease change, a notification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerminalEvent {
     Exited(ExitState),
     Bell,
     ControllerChanged(Option<Controller>),
+    /// The child asked for a desktop notification (OSC 9 or OSC 777). Each
+    /// text is at most [`MAX_NOTIFICATION_BYTES`]; the runner cuts longer
+    /// ones at a character boundary.
+    Notification {
+        title: Option<String>,
+        body: String,
+    },
 }
+
+/// Longest notification title or body on the wire.
+pub const MAX_NOTIFICATION_BYTES: usize = 1024;
 
 /// The change between two sequence numbers of one terminal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

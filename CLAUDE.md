@@ -119,7 +119,8 @@ the focused pane with a terminal, "Pane / Close" closes it and kills its
 child (a job's terminal is only detached); `Ctrl+Shift+T` takes control of a
 terminal someone else drives, `Ctrl+Shift+C`/`V` copy and paste,
 `Ctrl+Shift+Escape` gives the keyboard back to the app (on macOS also
-`Cmd+T`/`C`/`V`/`Escape`; left Option is Meta, right Option composes). A
+`Cmd+T`/`C`/`V`/`Escape`; left Option is Meta, right Option composes), and
+`Ctrl`+click opens a terminal's hyperlink. A
 `Job` node runs its
 `command` line when its `run` pin fires or it is pressed; a failed run keeps
 its terminal for attaching, every run keeps `<state-dir>/runs/<id>/log`.
@@ -156,7 +157,8 @@ target/agent/debug/zeughaus ctl /tmp/zh-agent.sock screenshot /tmp/shot.png
 ```
 
 The control commands are `size`, `move X Y [MS]`, `down`, `up`,
-`click`, `dblclick`, `drag X1 Y1 X2 Y2 [STEPS] [MS]`, `scroll`, `key`,
+`click X Y [BUTTON] [MODS]`, `dblclick`, `drag X1 Y1 X2 Y2 [STEPS] [MS]`,
+`scroll X Y DY [DX]`, `key`,
 `type`, `find`, `screenshot`, `record PATH`, `record-stop`, `resize`,
 `scale`, `clip`, `clip-set`, `wait-idle`, `restart`, `quit` (coordinates in
 logical pixels; `MS` paces a move or drag). `ctl` resolves a relative

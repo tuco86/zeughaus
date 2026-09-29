@@ -77,7 +77,9 @@ pub struct Profile {
 
 impl Profile {
     /// The default profile: the runner user's login shell, the runner's
-    /// working directory, and 10 000 rows of history.
+    /// working directory, and 20 000 rows of history. The history lives
+    /// here and only here: a client holds a bounded window of it and fetches
+    /// the rest when it scrolls there.
     pub fn default_shell() -> Profile {
         Profile {
             label: "Shell".to_string(),
@@ -85,7 +87,7 @@ impl Profile {
             args: Vec::new(),
             cwd: None,
             env: Vec::new(),
-            scrollback_rows: 10_000,
+            scrollback_rows: 20_000,
         }
     }
 
@@ -645,13 +647,14 @@ impl Session {
     pub fn apply(&self, command: &TerminalCommand) -> Result<(), String> {
         match command {
             TerminalCommand::Key { serial, input } => {
-                let (code, mods) = convert::key(*input);
-                let mut model = self.inner.model();
-                model
-                    .terminal_mut()
-                    .key_down(code, mods)
-                    .map_err(|e| e.to_string())?;
-                model.note_serial(*serial);
+                // Encoded under the model's lock, written after it: the
+                // writer is the PTY's, and output parsing must not wait on
+                // a full input pipe.
+                let kitty = self.inner.model().key(*input)?;
+                if let Some(bytes) = kitty {
+                    self.write(bytes.as_bytes())?;
+                }
+                self.inner.model().note_serial(*serial);
             }
             TerminalCommand::Text { serial, text } => {
                 if text.len() > MAX_TEXT_BYTES {
@@ -823,8 +826,14 @@ fn consume(inner: &Inner, chunk: &[u8], title: &mut String) {
                     model.note_title();
                     retitled = true;
                 }
-                // Everything else is state the next head or delta
-                // carries anyway (palette, working directory, progress).
+                // Ordered like a bell: a client shows it once, whatever it
+                // is scrolled to.
+                Alert::ToastNotification { title, body, .. } => {
+                    model.notify(title, body);
+                }
+                // The palette is state the next head or delta carries; the
+                // working directory, progress and user variables are not
+                // forwarded.
                 _ => {}
             }
         }

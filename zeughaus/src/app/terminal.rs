@@ -325,6 +325,27 @@ impl App {
         match event {
             TerminalEvent::Ready(sender) => live.commands = Some(sender),
             TerminalEvent::Changed => {}
+            TerminalEvent::Notification { title, body } => {
+                // The user is looking at it: the terminal already shows
+                // whatever the child wanted to say.
+                let watched = self.window_focused
+                    && self.workspace.focused_pane().is_some_and(|pane| {
+                        pane.runner == key
+                            && self.workspace.surface_of(pane) == Some(Surface::Terminal(terminal))
+                    });
+                if !watched {
+                    let summary = title
+                        .or_else(|| {
+                            let guard = live.view.lock().unwrap_or_else(|e| e.into_inner());
+                            guard
+                                .as_ref()
+                                .map(|view| view.title.clone())
+                                .filter(|t| !t.is_empty())
+                        })
+                        .unwrap_or_else(|| "Zeughaus".to_owned());
+                    return notify_desktop(summary, body);
+                }
+            }
             // The task cleared the view and ended; attaching again asks for
             // a fresh head.
             TerminalEvent::Desynced => {
@@ -391,11 +412,20 @@ impl App {
             TerminalAction::ScrollBy(lines) => self.scroll_terminal(&key, terminal, lines),
             TerminalAction::Copy(text) => iced::clipboard::write(text),
             TerminalAction::OpenLink(url) => {
-                // Opening is an explicit, separate action and not this cut's:
-                // a terminal-supplied target must never reach a launcher by
-                // way of a click the user did not mean as one.
-                eprintln!("[mux] link: {url}");
-                self.hint = Some((format!("link: {url}"), iced::time::Instant::now()));
+                // Only a Ctrl+click on the link gets here, and only schemes
+                // that name something to show: a terminal-supplied target
+                // must not become an arbitrary launcher invocation.
+                let scheme = url.split_once(':').map(|(scheme, _)| scheme);
+                let result = match scheme.map(str::to_ascii_lowercase).as_deref() {
+                    Some("http" | "https" | "file") => {
+                        open::that_detached(&url).map_err(|e| e.to_string())
+                    }
+                    _ => Err("only http, https and file links are opened".to_owned()),
+                };
+                if let Err(e) = result {
+                    eprintln!("[mux] link {url}: {e}");
+                    self.hint = Some((format!("{url}: {e}"), iced::time::Instant::now()));
+                }
                 Task::none()
             }
             TerminalAction::TakeControl => {
@@ -624,5 +654,46 @@ impl App {
                 .on_action(move |action| Message::TerminalAction(pane.clone(), action))
                 .into(),
         }
+    }
+}
+
+/// A terminal's notification on the desktop, off the UI thread: the call is
+/// a round trip to the notification service, and one that hangs must not
+/// freeze the window. Normal urgency, so the desktop expires it like any
+/// other.
+fn notify_desktop(summary: String, body: String) -> Task<Message> {
+    let mut notification = notify_rust::Notification::new();
+    notification
+        .appname("Zeughaus")
+        .summary(&summary)
+        .body(&body);
+    // The freedesktop service over zbus, whose blocking API does not run
+    // outside a tokio runtime in this build: the async call runs on iced's.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        #[cfg(target_os = "linux")]
+        notification
+            .hint(notify_rust::Hint::DesktopEntry(crate::APP_ID.to_owned()))
+            .urgency(notify_rust::Urgency::Normal);
+        Task::future(async move {
+            if let Err(e) = notification.show_async().await {
+                eprintln!("[mux] notification not shown: {e}");
+            }
+        })
+        .discard()
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        let spawned = std::thread::Builder::new()
+            .name("zh-notify".into())
+            .spawn(move || {
+                if let Err(e) = notification.show() {
+                    eprintln!("[mux] notification not shown: {e}");
+                }
+            });
+        if let Err(e) = spawned {
+            eprintln!("[mux] notification not shown: {e}");
+        }
+        Task::none()
     }
 }

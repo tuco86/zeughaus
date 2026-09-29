@@ -386,6 +386,28 @@ never a queue; output is coalesced at a 12 ms cadence. The client
 their exact base, pages into holes, and keeps its row store bounded around
 the viewport.
 
+**History is the runner's.** A shell keeps 20 000 rows of scrollback in the
+runner's `wezterm-term` model; an editor holds at most 1 000 rows per
+terminal around its viewport (`ROW_CAPACITY`), gets 128 rows above the
+screen with a head, and fetches the rest when it scrolls there. Stable row
+numbers belong to one screen: the primary and the alternate screen count
+theirs independently, so every switch between them starts a new epoch, and
+the runner answers it with a fresh head instead of a delta. Fetches and
+pages name their epoch; a stale one is refused.
+
+**Keys and alerts.** A key travels as semantics (key, modifiers, press or
+release) and is encoded in the runner, where the modes are known:
+`wezterm-term` encodes the legacy xterm forms itself (Shift+Enter becomes a
+line feed, which xterm cannot tell from Enter otherwise), and kitty's
+keyboard protocol, which a child negotiates in-band, is encoded with
+wezterm's own encoder in `zeughaus-terminal/src/convert.rs`. On the
+alternate screen the wheel goes to the runner too and becomes cursor keys
+for a child that does not read the mouse. OSC 9 and OSC 777 notifications
+are ordered events like the bell; the editor shows them on the desktop
+unless the window has the focus and its focused pane is that terminal. An
+OSC 8 link is opened by the platform's handler on an explicit Ctrl+click,
+for `http`, `https` and `file` only.
+
 **Tab titles.** The terminal engine reports changed OSC titles to the
 runner's mux service independently of screen subscribers. If the title
 names a tab or a detached terminal, the runner advances the workspace

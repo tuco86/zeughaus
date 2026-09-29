@@ -91,6 +91,13 @@ iced_selector = { version = "0.14", optional = true }
 # Decodes the bundled window icon, and writes the screenshots the headless
 # host takes. Already in the tree under iced's `image` feature.
 png = "0.18"
+# A terminal's OSC 9/777 notification as a desktop notification (the
+# freedesktop service over zbus, which the tree already has with tokio;
+# the platform's own API on macOS and Windows).
+notify-rust = { version = "4.18", default-features = false, features = ["z-with-tokio"] }
+# A terminal hyperlink the user explicitly activated, opened by the
+# platform's handler (`xdg-open`, `open`, `start`).
+open = "5.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # `#[tokio::test]` for the first-dial schedule, with a paused clock.

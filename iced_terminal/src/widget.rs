@@ -38,7 +38,8 @@ use iced::{Color, Element, Length, Point, Rectangle, Size, keyboard, window};
 use zeughaus_mux::input::MAX_TEXT_BYTES;
 use zeughaus_mux::view::TerminalView;
 use zeughaus_mux::{
-    CellSpan, CellStyle, Dimensions, MouseInput, MouseKind, StyleFlags, TerminalCommand, Underline,
+    CellSpan, CellStyle, Dimensions, KeyInput, KeyKind, MouseInput, MouseKind, StyleFlags,
+    TerminalCommand, Underline,
 };
 
 use crate::cache::{palette_generation, row_key};
@@ -216,6 +217,10 @@ struct State {
     dragging: bool,
     modifiers: keyboard::Modifiers,
     alt: input::AltSide,
+    /// Keys whose press went to the child, by physical key, so that exactly
+    /// those get a release: not a chord's, not a scroll's, not one pressed
+    /// before this pane had the keyboard.
+    keys_down: Vec<(keyboard::key::Physical, KeyInput)>,
     pointer: Option<Point>,
     held: Option<mouse::Button>,
     hovered_link: Option<String>,
@@ -237,6 +242,7 @@ impl Default for State {
             dragging: false,
             modifiers: keyboard::Modifiers::empty(),
             alt: input::AltSide::default(),
+            keys_down: Vec::new(),
             pointer: None,
             held: None,
             hovered_link: None,
@@ -378,6 +384,7 @@ where
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key,
                 modified_key,
+                physical_key,
                 modifiers,
                 text,
                 location,
@@ -396,20 +403,30 @@ where
                 let reserved = self
                     .reserved
                     .is_some_and(|reserved| reserved(key, *modifiers));
-                if self.focused && !reserved {
-                    self.on_key(state, modified_key, key, text.as_deref(), clipboard, shell);
+                if self.focused
+                    && !reserved
+                    && let Some(input) =
+                        self.on_key(state, modified_key, key, text.as_deref(), clipboard, shell)
+                {
+                    // A repeat replaces its own entry.
+                    state.keys_down.retain(|(held, _)| held != physical_key);
+                    state.keys_down.push((*physical_key, input));
                 }
             }
             Event::Keyboard(keyboard::Event::KeyReleased {
-                key: keyboard::Key::Named(keyboard::key::Named::Alt),
+                key,
+                physical_key,
                 location,
                 ..
             }) => {
-                if *location == keyboard::Location::Right {
-                    state.alt.right = false;
-                } else {
-                    state.alt.left = false;
+                if let keyboard::Key::Named(keyboard::key::Named::Alt) = key {
+                    if *location == keyboard::Location::Right {
+                        state.alt.right = false;
+                    } else {
+                        state.alt.left = false;
+                    }
                 }
+                self.on_key_release(state, *physical_key, shell);
             }
             Event::Mouse(mouse::Event::ButtonPressed(button)) => {
                 if let Some(local) = self.local(cursor, bounds) {
@@ -517,6 +534,7 @@ where
     // ------------------------------------------------------------ input ---
 
     /// A key press; `state.modifiers` already holds the modifiers it came with.
+    /// Returns the key input it sent the child, whose release is owed.
     fn on_key(
         &self,
         state: &mut State,
@@ -525,7 +543,7 @@ where
         text: Option<&str>,
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
-    ) {
+    ) -> Option<KeyInput> {
         let modifiers = state.modifiers;
         // The application's own shortcuts must not fire while a shell has the
         // keyboard, so every key a focused terminal understands is captured
@@ -536,14 +554,14 @@ where
             self.publish(shell, action);
             shell.capture_event();
             shell.request_redraw();
-            return;
+            return None;
         }
 
         // Command belongs to the application on macOS and never reaches the
         // child; without this the text fallback below would type `c` for
         // Cmd+C.
         if Platform::CURRENT == Platform::Mac && modifiers.logo() {
-            return;
+            return None;
         }
 
         // Everything below this point needs a live view: before the first
@@ -551,7 +569,7 @@ where
         // keys are still swallowed so the application's shortcuts stay quiet.
         let Some(rows) = self.with_view(|view| view.dimensions.rows.max(1)) else {
             shell.capture_event();
-            return;
+            return None;
         };
 
         if modifiers.shift()
@@ -566,14 +584,14 @@ where
             if let Some(lines) = lines {
                 self.publish(shell, Action::ScrollBy(lines));
                 shell.capture_event();
-                return;
+                return None;
             }
         }
 
         if !self.controlling {
             // A viewer's keystrokes are dropped, not queued and not sent.
             shell.capture_event();
-            return;
+            return None;
         }
 
         if let Some(input) = input::key_input(key, bare, modifiers, state.alt, Platform::CURRENT) {
@@ -583,7 +601,7 @@ where
                 Action::Command(TerminalCommand::Key { serial, input }),
             );
             shell.capture_event();
-            return;
+            return Some(input);
         }
 
         // A composition or a layout the key model has no name for still has
@@ -601,6 +619,41 @@ where
             );
             shell.capture_event();
         }
+        None
+    }
+
+    /// A key release. Only a key whose press reached the child is released
+    /// to it, with the modifiers held now; the runner forwards it only to a
+    /// child that asked for event types. A pane that lost the keyboard or the
+    /// lease in between drops the release.
+    fn on_key_release(
+        &self,
+        state: &mut State,
+        physical: keyboard::key::Physical,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        let Some(index) = state
+            .keys_down
+            .iter()
+            .position(|(held, _)| *held == physical)
+        else {
+            return;
+        };
+        let (_, pressed) = state.keys_down.swap_remove(index);
+        if !self.focused || !self.controlling {
+            return;
+        }
+        let serial = state.next_serial();
+        let input = KeyInput {
+            modifiers: input::modifiers(state.modifiers),
+            kind: KeyKind::Release,
+            ..pressed
+        };
+        self.publish(
+            shell,
+            Action::Command(TerminalCommand::Key { serial, input }),
+        );
+        shell.capture_event();
     }
 
     /// `Ctrl+Shift+...`, and `Cmd+...` on macOS: the shortcuts that are the
@@ -662,6 +715,17 @@ where
             return;
         };
 
+        // A Ctrl+click on a link is the user's, not the child's, even while
+        // the child reads the mouse. It is only reported: nothing here opens
+        // anything.
+        if let Some(link) = link {
+            // Its release is not reported either.
+            state.held = None;
+            self.publish(shell, Action::OpenLink(link));
+            shell.capture_event();
+            return;
+        }
+
         if mouse_reporting && self.controlling {
             if let Some(button) = input::mouse_button(button) {
                 let serial = state.next_serial();
@@ -684,14 +748,6 @@ where
         }
 
         if button != mouse::Button::Left {
-            return;
-        }
-
-        // A link is only ever followed on an explicit modified click, and
-        // only reported: nothing here opens anything.
-        if let Some(link) = link {
-            self.publish(shell, Action::OpenLink(link));
-            shell.capture_event();
             return;
         }
 
@@ -784,7 +840,7 @@ where
         bounds: Rectangle,
         shell: &mut Shell<'_, Message>,
     ) {
-        state.held = None;
+        let pressed = state.held.take().is_some();
         let was_dragging = std::mem::take(&mut state.dragging);
         // A click that never moved selected nothing: a single-cell highlight
         // left behind every click would read as a stray cursor. Word and
@@ -798,9 +854,10 @@ where
             shell.request_redraw();
         }
 
-        if self
-            .with_view(|view| view.modes.mouse_reporting)
-            .unwrap_or(false)
+        if pressed
+            && self
+                .with_view(|view| view.modes.mouse_reporting)
+                .unwrap_or(false)
             && self.controlling
             && let Some(local) = self.local(cursor, bounds)
             && let Some(button) = input::mouse_button(button)
@@ -842,11 +899,17 @@ where
         }
 
         // No view is no viewport either: there is nothing to scroll yet.
-        let Some(mouse_reporting) = self.with_view(|view| view.modes.mouse_reporting) else {
+        let Some((mouse_reporting, alt_screen)) =
+            self.with_view(|view| (view.modes.mouse_reporting, view.modes.alt_screen))
+        else {
             return;
         };
 
-        if mouse_reporting && self.controlling {
+        // The alternate screen has no history to scroll. A wheel there goes
+        // to the runner like a reported one, and the terminal core turns it
+        // into cursor keys when the child does not read the mouse (xterm's
+        // alternate scroll), which is how `less` and `man` scroll.
+        if (mouse_reporting || alt_screen) && self.controlling {
             let Some(local) = self.local(cursor, bounds) else {
                 return;
             };
