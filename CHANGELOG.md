@@ -23,7 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   click.
 - `Ctrl+PageDown` and `Ctrl+PageUp` switch to the next and the previous tab
   across every runner's section, wrapping at the ends, also while a
-  terminal has the keyboard.
+  terminal has the keyboard; its child (vim, tmux) no longer receives them.
+  Not while the palette or a rename field is open.
 
 ### Changed
 

@@ -99,7 +99,9 @@ In the editor: `Ctrl+Space` (on macOS also `Cmd+Shift+P`) opens the command
 palette (spawn nodes into the
 focused graph pane, save/load a `.zgh` file, auto layout, pick a theme, copy
 the session token, split or close the focused pane, attach or close a job's
-terminal, hold or release a runner). The window draws its
+terminal, hold or release a runner), and `Ctrl+PageDown`/`Ctrl+PageUp`
+switch to the next or previous tab, also from a terminal, whose child no
+longer receives them. The window draws its
 own titlebar; the button in its corner moves the tab bar between the top and
 the left edge. Theme and tab bar placement persist in
 `<state-dir>/editor.toml`; WezTerm colour schemes dropped into

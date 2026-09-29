@@ -877,6 +877,15 @@ impl App {
         }
         match message {
             Message::Workspace(message) => {
+                // The palette or a name field has the keyboard: the tab
+                // behind it must not change under the user's typing.
+                if matches!(message, workspace::Message::CycleTab(_))
+                    && (self.palette_open
+                        || self.workspace.renaming_tab.is_some()
+                        || self.workspace.renaming_group.is_some())
+                {
+                    return Task::none();
+                }
                 // Closing what shows a top-level graph deletes the graph; a
                 // synthetic section has no runner to tell.
                 let mut closed = Task::none();
