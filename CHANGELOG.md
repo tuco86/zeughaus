@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mouse (`less`, `man`), by turning into cursor keys as in xterm.
 - `zeughaus ctl ... click X Y [BUTTON] [MODS]` holds modifiers across a
   click.
+- `Ctrl+PageDown` and `Ctrl+PageUp` switch to the next and the previous tab
+  across every runner's section, wrapping at the ends, also while a
+  terminal has the keyboard.
 
 ### Changed
 

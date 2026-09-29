@@ -670,6 +670,36 @@ impl Workspace {
         self.active = Some(tab);
     }
 
+    /// Brings the tab `step` places after the one in front to the front, in
+    /// the bar's order across every section and wrapping at either end;
+    /// `-1` is the previous tab. With no tab in front, the first or the last.
+    pub fn cycle_tab(&mut self, step: isize) {
+        let order: Vec<TabRef> = self
+            .sections
+            .iter()
+            .flat_map(|section| {
+                section.snapshot.tabs().map(|tab| TabRef {
+                    runner: section.key.clone(),
+                    tab: tab.id,
+                })
+            })
+            .collect();
+        if order.is_empty() {
+            return;
+        }
+        let len = order.len() as isize;
+        let next = match self
+            .active
+            .as_ref()
+            .and_then(|active| order.iter().position(|tab| tab == active))
+        {
+            Some(index) => (index as isize + step).rem_euclid(len),
+            None if step < 0 => len - 1,
+            None => 0,
+        };
+        self.activate(order[next as usize].clone());
+    }
+
     /// The tab showing `graph`, preferring the one in front.
     pub fn tab_of_graph(&self, graph: NodeId) -> Option<TabRef> {
         let shows = |tab: &TabSnapshot| {
@@ -732,6 +762,10 @@ impl Workspace {
                 if let Some(pane) = self.stable(pane) {
                     self.focus(pane);
                 }
+                Update::none()
+            }
+            Message::CycleTab(step) => {
+                self.cycle_tab(step);
                 Update::none()
             }
             Message::TogglePlacement => {
@@ -1511,6 +1545,8 @@ impl Update {
 #[derive(Debug, Clone)]
 pub enum Message {
     ActivatePane(Pane),
+    /// The next (`1`) or previous (`-1`) tab in the bar's order.
+    CycleTab(isize),
     TogglePlacement,
     /// Split the focused pane, the new half a terminal.
     SplitFocused(Axis),
@@ -2142,6 +2178,23 @@ mod tests {
         let four = WorkspaceItem::Tab(tab(4, term(40)));
         workspace.apply_snapshot(&key(), revision(3, vec![one(), two(), three(), four]));
         assert_eq!(workspace.active_tab(), Some(&tab_ref(3)));
+    }
+
+    #[test]
+    fn cycling_walks_the_bar_through_groups_and_wraps() {
+        let mut workspace = attached(tree());
+        workspace.activate(tab_ref(1));
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            workspace.update(Message::CycleTab(1));
+            seen.push(workspace.active_tab().map(|t| t.tab.0));
+        }
+        assert_eq!(seen, [2, 3, 4, 7, 1, 2].map(Some));
+        workspace.update(Message::CycleTab(-1));
+        workspace.update(Message::CycleTab(-1));
+        assert_eq!(workspace.active_tab(), Some(&tab_ref(7)));
+        // The front tab's default pane takes the keyboard with it.
+        assert_eq!(workspace.focused_pane().map(|p| p.pane), Some(PaneId(70)));
     }
 
     #[test]

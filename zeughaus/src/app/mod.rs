@@ -2400,6 +2400,9 @@ impl App {
                 if is_palette_shortcut(&key, modifiers) {
                     return Some(Message::TogglePalette);
                 }
+                if let Some(step) = tab_step(&key, modifiers) {
+                    return Some(Message::Workspace(workspace::Message::CycleTab(step)));
+                }
 
                 // Ctrl+S = Save, Ctrl+O = Load
                 if (modifiers.control() || modifiers.command())
@@ -2527,6 +2530,26 @@ pub(crate) fn is_palette_shortcut(key: &keyboard::Key, modifiers: keyboard::Modi
             && modifiers.shift()
             && !modifiers.control()
             && matches!(key, keyboard::Key::Character(c) if c.eq_ignore_ascii_case("p")))
+}
+
+/// Ctrl+PageDown and Ctrl+PageUp: the next and the previous tab, as in a
+/// browser.
+fn tab_step(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Option<isize> {
+    if !modifiers.control() || modifiers.shift() || modifiers.alt() || modifiers.logo() {
+        return None;
+    }
+    match key {
+        keyboard::Key::Named(keyboard::key::Named::PageDown) => Some(1),
+        keyboard::Key::Named(keyboard::key::Named::PageUp) => Some(-1),
+        _ => None,
+    }
+}
+
+/// The keys that belong to the window even while a terminal has the
+/// keyboard: they never reach the child.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn is_app_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> bool {
+    is_palette_shortcut(key, modifiers) || tab_step(key, modifiers).is_some()
 }
 
 /// A pane with nothing to draw: what it should hold, and why it does not.

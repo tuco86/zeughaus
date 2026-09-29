@@ -643,7 +643,7 @@ impl App {
         let widget = iced_terminal::Terminal::new(Arc::clone(view), terminal.0)
             .controlling(controlling)
             .focused(focused)
-            .reserved(super::is_palette_shortcut)
+            .reserved(super::is_app_shortcut)
             .next_serial(serials.next())
             .font_size(TERMINAL_FONT_SIZE)
             .padding(TERMINAL_PADDING)
