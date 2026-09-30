@@ -44,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shift+Enter in a terminal sends a line feed instead of the carriage
   return of Enter, so a prompt such as omp's or Claude Code's breaks the
   line instead of submitting.
+- A terminal pane that grows because a split was dissolved (a pane dragged
+  out into the tab bar) or because its tab came to the front now resizes
+  the terminal at once, instead of only at the next window resize: the pane
+  compares its grid with the size the runner reports, not with a memory
+  iced may have handed over from another pane.
 
 ## [0.1.0-alpha.1] - 2026-09-26
 

@@ -209,8 +209,11 @@ where
 /// Everything the widget remembers between events.
 #[derive(Debug)]
 struct State {
-    /// The cell geometry the runner was last told about.
-    sent_grid: Dimensions,
+    /// The terminal and grid this widget asked the runner for and has not
+    /// seen applied yet, so it asks once while the answer is on its way.
+    /// Keyed by terminal because the state may outlive the widget it was
+    /// made for.
+    sent_grid: Option<(u64, Dimensions)>,
     /// A geometry waiting out the debounce.
     pending_grid: Option<(Dimensions, Instant)>,
     selection: Option<Selection>,
@@ -234,9 +237,7 @@ struct State {
 impl Default for State {
     fn default() -> Self {
         State {
-            // Zero is not a grid the wire accepts, so the first layout always
-            // looks like a change and the runner learns the real size.
-            sent_grid: Dimensions { cols: 0, rows: 0 },
+            sent_grid: None,
             pending_grid: None,
             selection: None,
             dragging: false,
@@ -1000,6 +1001,12 @@ where
 
     /// Emits a resize once the geometry stopped moving. A drag over a split
     /// changes the pane every frame; the child only wants the answer.
+    ///
+    /// Whether a resize is owed is decided against the grid the runner
+    /// reports, not against what this widget remembers sending: iced keeps
+    /// widget state by position in the tree, so a pane that moves (a split
+    /// dissolved, another tab in front) can inherit the memory of a
+    /// different terminal and would otherwise never ask.
     fn resize(
         &self,
         state: &mut State,
@@ -1012,14 +1019,23 @@ where
             return;
         }
         let grid = self.grid(bounds);
-        if grid == state.sent_grid {
+        let Some(current) = self.with_view(|view| view.dimensions) else {
+            return;
+        };
+        if grid == current {
+            state.sent_grid = None;
+            state.pending_grid = None;
+            return;
+        }
+        // Asked for and not answered yet.
+        if state.sent_grid == Some((self.id, grid)) {
             state.pending_grid = None;
             return;
         }
         match state.pending_grid {
             Some((pending, at)) if pending == grid => {
                 if now >= at {
-                    state.sent_grid = grid;
+                    state.sent_grid = Some((self.id, grid));
                     state.pending_grid = None;
                     self.publish(shell, Action::Command(TerminalCommand::Resize(grid)));
                 } else {
