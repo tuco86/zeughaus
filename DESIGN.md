@@ -299,8 +299,13 @@ needed. The window icon reaches X11 and Windows. It does not reach Wayland:
 winit 0.30, which iced 0.14 pins, makes `set_window_icon` a no-op there, and
 `xdg_toplevel_icon_v1` -- the protocol that carries an icon per toplevel, and
 which KWin implements -- is supported from winit 0.31. Until iced moves, a
-Wayland window has no icon, and that stays that way: the editor is one binary
-and installs no desktop entry to work around it.
+Wayland compositor finds the icon through the desktop entry
+`deploy/install.sh` installs, named after the window's `app_id`. macOS has no
+window icon at all: the icon of an app is the Dock's, and it is read from the
+`Info.plist` of the bundle the binary runs in. The editor is a plain binary,
+so it hands AppKit the same 256 px PNG itself, through
+`NSApplication::setApplicationIconImage:` before the window opens; `ctl` and
+the headless host run before that and never ask AppKit for anything.
 
 **Themes** (`zeughaus-theme`). One theme type drives everything the window
 draws. A `Theme` is an `iced::Theme` -- the widgets' palette -- paired with a

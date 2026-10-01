@@ -60,6 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the alternate screen after scrollback was evicted: the two screens number
   their rows independently, so each switch now starts a new terminal epoch
   and the runner sends a fresh head instead of a delta.
+- The editor shows its icon on macOS: a binary outside an `.app` bundle has
+  none, so it hands the bundled mark to AppKit as the application icon
+  before the window opens.
 - Shift+Enter in a terminal sends a line feed instead of the carriage
   return of Enter, so a prompt such as omp's or Claude Code's breaks the
   line instead of submitting.

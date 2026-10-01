@@ -59,6 +59,12 @@ fn main() -> iced::Result {
         std::process::exit(code)
     }
 
+    // The icon this process shows, set before the window: on macOS it belongs
+    // to the application, not to a window. After `dispatch`, so that neither
+    // `ctl` nor the headless host ever asks AppKit for an application object.
+    #[cfg(target_os = "macos")]
+    dock_icon();
+
     // `zeughaus`            -> edits a local scratch graph unless a store is
     //                          reachable, then that store is the document
     // `zeughaus join <id>`  -> join collaboration session <id>
@@ -143,19 +149,19 @@ fn platform_specific() -> iced::window::settings::PlatformSpecific {
 #[cfg(target_os = "linux")]
 pub(crate) const APP_ID: &str = "net.doodleshnookie.Zeughaus";
 
-/// The bundled icon, decoded once at startup: 256 px, which every window
-/// manager that shows it smaller scales down itself.
+/// The icon a window carries: the bundled 256 px mark, decoded once at
+/// startup. Every window manager that shows it smaller scales it down itself.
 ///
-/// This reaches X11 and Windows. It does not reach Wayland: winit 0.30 makes
-/// `set_window_icon` a no-op there, and the protocol that would carry it
-/// (`xdg_toplevel_icon_v1`, which KWin implements) arrived in winit 0.31.
-/// Until iced pins that, a Wayland compositor finds the icon through the
-/// desktop entry named after [`APP_ID`], which `deploy/install.sh` installs.
+/// This reaches X11 and Windows. It reaches neither Wayland nor macOS: winit
+/// 0.30 makes `set_window_icon` a no-op on both, and on macOS there is
+/// nothing for it to reach -- the icon of an app there is the Dock's, which
+/// [`dock_icon`] sets. On Wayland the protocol that would carry one
+/// (`xdg_toplevel_icon_v1`, which KWin implements) arrived in winit 0.31;
+/// until iced pins that, a compositor finds the icon through the desktop
+/// entry named after [`APP_ID`], which `deploy/install.sh` installs.
 #[cfg(not(target_arch = "wasm32"))]
 fn window_icon() -> Option<iced::window::Icon> {
-    const DATA: &[u8] = include_bytes!("../assets/icon/zeughaus-256.png");
-
-    let mut reader = png::Decoder::new(std::io::Cursor::new(DATA))
+    let mut reader = png::Decoder::new(std::io::Cursor::new(ICON_PNG))
         .read_info()
         .ok()?;
     let mut pixels = vec![0; reader.output_buffer_size()?];
@@ -167,6 +173,41 @@ fn window_icon() -> Option<iced::window::Icon> {
     }
     pixels.truncate(info.buffer_size());
     iced::window::icon::from_rgba(pixels, info.width, info.height).ok()
+}
+
+/// The stencilled Z, compiled in: `zeughaus/assets/icon/render.py` writes it.
+#[cfg(not(target_arch = "wasm32"))]
+const ICON_PNG: &[u8] = include_bytes!("../assets/icon/zeughaus-256.png");
+
+/// Gives this process the icon the Dock, the app switcher and the menu bar
+/// show. A macOS app reads its icon from the `Info.plist` of the bundle it
+/// runs in; this editor is a plain binary, so it hands AppKit the image
+/// itself. Setting it before the window means the Dock never shows the
+/// generic executable icon first.
+///
+/// The shared application object is created here if winit has not asked for
+/// it yet; winit 0.30 takes that same one and swizzles its `sendEvent:`
+/// rather than subclassing it, so asking early is safe.
+#[cfg(target_os = "macos")]
+fn dock_icon() {
+    use objc2::AllocAnyThread;
+    use objc2_app_kit::{NSApplication, NSImage};
+
+    // Off the main thread there is no application object to talk to. `main`
+    // is the main thread, so this is a check, not a fallback.
+    let Some(mtm) = objc2::MainThreadMarker::new() else {
+        return;
+    };
+    // AppKit decodes the PNG itself: it keeps the file's resolution, which a
+    // raw RGBA bitmap would have to be told about.
+    let data = objc2_foundation::NSData::with_bytes(ICON_PNG);
+    let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else {
+        return;
+    };
+    // SAFETY: `setApplicationIconImage:` is generated as unsafe only because
+    // the generator cannot tell whether `None` is allowed; this passes an
+    // image.
+    unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image)) };
 }
 
 /// The browser tab's icon is a `<link rel="icon">` in `index.html`, not a
