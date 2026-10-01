@@ -301,11 +301,17 @@ winit 0.30, which iced 0.14 pins, makes `set_window_icon` a no-op there, and
 which KWin implements -- is supported from winit 0.31. Until iced moves, a
 Wayland compositor finds the icon through the desktop entry
 `deploy/install.sh` installs, named after the window's `app_id`. macOS has no
-window icon at all: the icon of an app is the Dock's, and it is read from the
-`Info.plist` of the bundle the binary runs in. The editor is a plain binary,
-so it hands AppKit the same 256 px PNG itself, through
-`NSApplication::setApplicationIconImage:` before the window opens; `ctl` and
-the headless host run before that and never ask AppKit for anything.
+window icon at all: the icon of an app is the Dock's, and macOS reads it from
+the `Info.plist` of the bundle the app runs in. `deploy/macos-app.sh` is that
+bundle -- `deploy/macos/Info.plist` and an icns `render.py` draws at the ten
+sizes `iconutil` wants, around a release build of the editor -- and it is the
+way the editor has an icon on macOS, as it is for every other terminal there.
+A binary run outside a bundle (`cargo run`, `~/.cargo/bin/zeughaus`) has
+nowhere to read one from, so it hands AppKit the 256 px PNG itself through
+`NSApplication::setApplicationIconImage:`, once the window is open: the Dock
+makes the tile for a process while AppKit launches, and an image handed over
+earlier is gone by the time the tile appears. Inside a bundle that call is
+skipped, since the icns is the better icon.
 
 **Themes** (`zeughaus-theme`). One theme type drives everything the window
 draws. A `Theme` is an `iced::Theme` -- the widgets' palette -- paired with a

@@ -1376,6 +1376,10 @@ impl App {
                     .map(Message::WindowMaximized);
             }
             Message::WindowOpened { id, size } => {
+                // The Dock has the process's tile by now; an icon handed to
+                // AppKit any earlier does not reach it. See `crate::dock_icon`.
+                #[cfg(target_os = "macos")]
+                crate::dock_icon();
                 let scale = iced::window::scale_factor(id).map(Message::WindowRescaled);
                 return Task::batch([self.update(Message::WindowResized { size }), scale]);
             }

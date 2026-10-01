@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The editor's bundle. macOS reads an app's icon and its name from here,
+     and from nowhere else: a plain binary has neither. @VERSION@ is filled in
+     by deploy/macos-app.sh from the workspace version. -->
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>Zeughaus</string>
+  <key>CFBundleDisplayName</key>
+  <string>Zeughaus</string>
+  <key>CFBundleIdentifier</key>
+  <string>net.doodleshnookie.Zeughaus</string>
+  <key>CFBundleExecutable</key>
+  <string>zeughaus</string>
+  <!-- Resources/zeughaus.icns, the ten sizes render.py draws. -->
+  <key>CFBundleIconFile</key>
+  <string>zeughaus</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>@VERSION@</string>
+  <key>CFBundleVersion</key>
+  <string>@VERSION@</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.developer-tools</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>11.0</string>
+  <!-- Without this the window is drawn at 1x and scaled up, which is a blurry
+       grid in every terminal pane. -->
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>

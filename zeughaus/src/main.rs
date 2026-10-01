@@ -59,12 +59,6 @@ fn main() -> iced::Result {
         std::process::exit(code)
     }
 
-    // The icon this process shows, set before the window: on macOS it belongs
-    // to the application, not to a window. After `dispatch`, so that neither
-    // `ctl` nor the headless host ever asks AppKit for an application object.
-    #[cfg(target_os = "macos")]
-    dock_icon();
-
     // `zeughaus`            -> edits a local scratch graph unless a store is
     //                          reachable, then that store is the document
     // `zeughaus join <id>`  -> join collaboration session <id>
@@ -179,25 +173,35 @@ fn window_icon() -> Option<iced::window::Icon> {
 #[cfg(not(target_arch = "wasm32"))]
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon/zeughaus-256.png");
 
-/// Gives this process the icon the Dock, the app switcher and the menu bar
-/// show. A macOS app reads its icon from the `Info.plist` of the bundle it
-/// runs in; this editor is a plain binary, so it hands AppKit the image
-/// itself. Setting it before the window means the Dock never shows the
-/// generic executable icon first.
+/// Gives a plain binary the icon the Dock and the app switcher show. A macOS
+/// app reads its icon from the `Info.plist` of the bundle it runs in, and the
+/// editor is a binary first: run from `cargo run` or from `~/.cargo/bin` it
+/// has no bundle, so it hands AppKit the image itself.
 ///
-/// The shared application object is created here if winit has not asked for
-/// it yet; winit 0.30 takes that same one and swizzles its `sendEvent:`
-/// rather than subclassing it, so asking early is safe.
+/// Called once the window is open, never before: the Dock creates the tile
+/// for a process while AppKit finishes launching, and an image handed over
+/// before that is the tile's own icon again by the time it appears.
+///
+/// `deploy/macos-app.sh` builds the bundle, which is the better icon -- an
+/// icns carries every size the Dock, the switcher and Finder ask for, this
+/// is one 256 px image -- so inside one this does nothing.
 #[cfg(target_os = "macos")]
-fn dock_icon() {
+pub(crate) fn dock_icon() {
     use objc2::AllocAnyThread;
     use objc2_app_kit::{NSApplication, NSImage};
 
-    // Off the main thread there is no application object to talk to. `main`
-    // is the main thread, so this is a check, not a fallback.
+    // Off the main thread there is no application object to talk to. The
+    // window's events arrive on it, so this is a check, not a fallback.
     let Some(mtm) = objc2::MainThreadMarker::new() else {
         return;
     };
+    // Only a bundle has an identifier, and only its icns is worth keeping.
+    if objc2_foundation::NSBundle::mainBundle()
+        .bundleIdentifier()
+        .is_some()
+    {
+        return;
+    }
     // AppKit decodes the PNG itself: it keeps the file's resolution, which a
     // raw RGBA bitmap would have to be told about.
     let data = objc2_foundation::NSData::with_bytes(ICON_PNG);
