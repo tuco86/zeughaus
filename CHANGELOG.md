@@ -66,6 +66,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the terminal at once, instead of only at the next window resize: the pane
   compares its grid with the size the runner reports, not with a memory
   iced may have handed over from another pane.
+- A runner whose endpoint cannot be bound (a `--feed-addr` on WireGuard
+  before `wg0` is up at boot) exits and is restarted by its unit until the
+  address exists, instead of running on without an endpoint: it showed as
+  connected in the editor while owning no graph and no tab section.
 
 ## [0.1.0-alpha.1] - 2026-09-26
 

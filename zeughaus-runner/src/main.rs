@@ -203,14 +203,16 @@ fn main() -> ExitCode {
             for fingerprint in transport.trusted_clients() {
                 eprintln!("[runner] trusted client {fingerprint}");
             }
-            Some(transport)
+            transport
         }
-        // Not fatal. The graph still executes; an editor simply sees no values
-        // and says so, exactly as it does with no runner at all. Exiting here
-        // would take the graph's execution away too.
+        // Fatal: without an endpoint no graph names this runner, no editor
+        // reaches its terminals and no job runs, so a process left running
+        // would only look alive. The service manager retries instead, which
+        // is what a `--feed-addr` on an interface that is not up yet (WireGuard
+        // at boot) needs.
         Err(e) => {
             eprintln!("[runner] no weida endpoint: {e}");
-            None
+            return ExitCode::FAILURE;
         }
     };
 
@@ -229,7 +231,7 @@ fn main() -> ExitCode {
     let mut job_host: Option<Arc<JobHost>> = None;
     // Kept for the restart, which saves the workspace before it `exec`s.
     let mut mux_service: Option<MuxService> = None;
-    if let Some(transport) = &transport {
+    {
         let listener = transport.listener();
         match listener.replier(FEED_PATH) {
             Ok(replier) => {
@@ -299,14 +301,12 @@ fn main() -> ExitCode {
     // The fingerprint pinned in this runner's own URL is what a graph's
     // `runner` column names. Without an endpoint no editor could reach this
     // process, and no graph can name it.
-    let fingerprint = transport.as_ref().and_then(|t| {
-        weida::EndpointAddr::parse(t.url())
-            .ok()
-            .and_then(|addr| addr.peer)
-            .map(|fp| fp.to_string())
-    });
+    let fingerprint = weida::EndpointAddr::parse(transport.url())
+        .ok()
+        .and_then(|addr| addr.peer)
+        .map(|fp| fp.to_string());
     if fingerprint.is_none() {
-        eprintln!("[runner] no endpoint, so no graph is this runner's");
+        eprintln!("[runner] the endpoint names no key, so no graph is this runner's");
     }
     let mut runner = Runner::new(
         store,
@@ -316,9 +316,7 @@ fn main() -> ExitCode {
         job_host.clone(),
         fingerprint,
     );
-    if let Some(transport) = &transport {
-        runner.set_endpoint(transport.url().to_string());
-    }
+    runner.set_endpoint(transport.url().to_string());
     // The epoch travels with the work: a result that comes back after ownership
     // moved must not be applied, and the sender is the only place that knows
     // which ownership it was dispatched under.

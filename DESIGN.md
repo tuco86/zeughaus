@@ -71,7 +71,10 @@ editor does on `PeerEvent::Connected`: a fresh `/snapshot`, reopened feed
 exchanges, a fresh mux attach. A runner that restarted is a new peer; the new
 address in its `runtime` row is what replaces the tasks.
 
-**Without a store**, the runner refuses to start. The editor starts anyway and
+**Without a store or without its endpoint**, the runner refuses to start: a
+runner no editor can reach owns no graph and runs nothing, and a refused
+start lets the service manager retry (a `--feed-addr` on the WireGuard
+address fails until `wg0` is up at boot). The editor starts anyway and
 edits a local scratch graph: nothing computes it, the status bar says so, and
 the graph is gone on close unless saved as a file (`.zgh`, the JSON
 `GraphDocument` in `zeughaus-core/src/document.rs`). Save/Load is an explicit
