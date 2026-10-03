@@ -199,25 +199,31 @@ pub fn guest_workspace(repo: &str, job: &str) -> String {
 }
 
 /// `inner.ps1`: the checkout from the run's bundle, then the job.
+///
+/// Its exit code is also written to `<guest run>\rc`: Windows OpenSSH
+/// reports 0 for a session with a terminal (`ssh -tt`) whatever the remote
+/// command exited with, so the launcher reads the file instead.
 pub fn inner_ps1(job: &JobDef, run_id: &str, pipeline: u64) -> String {
     let run = guest_run_dir(run_id);
     let excludes = clean_excludes(job, ps_quote);
     format!(
         "$ErrorActionPreference = 'Stop'\r\n\
+         function Finish([int]$code) {{ Set-Content -Path {rc} -Value $code -Encoding ascii; exit $code }}\r\n\
          . {env}\r\n\
          New-Item -ItemType Directory -Force $env:CI_WORKSPACE, $env:CI_OUTPUT | Out-Null\r\n\
          Set-Location $env:CI_WORKSPACE\r\n\
          $ErrorActionPreference = 'Continue'\r\n\
-         if (-not (Test-Path .git)) {{ git init -q; if ($LASTEXITCODE -ne 0) {{ exit 70 }} }}\r\n\
+         if (-not (Test-Path .git)) {{ git init -q; if ($LASTEXITCODE -ne 0) {{ Finish 70 }} }}\r\n\
          git fetch -q {bundle} '+refs/ci/{pipeline}:refs/ci/head'\r\n\
-         if ($LASTEXITCODE -ne 0) {{ Write-Host '[zeughaus-ci] checkout failed'; exit 70 }}\r\n\
+         if ($LASTEXITCODE -ne 0) {{ Write-Host '[zeughaus-ci] checkout failed'; Finish 70 }}\r\n\
          git checkout -q --force --detach refs/ci/head\r\n\
-         if ($LASTEXITCODE -ne 0) {{ Write-Host '[zeughaus-ci] checkout failed'; exit 70 }}\r\n\
+         if ($LASTEXITCODE -ne 0) {{ Write-Host '[zeughaus-ci] checkout failed'; Finish 70 }}\r\n\
          git clean -ffdxq{excludes}\r\n\
-         if ($LASTEXITCODE -ne 0) {{ Write-Host '[zeughaus-ci] checkout failed'; exit 70 }}\r\n\
+         if ($LASTEXITCODE -ne 0) {{ Write-Host '[zeughaus-ci] checkout failed'; Finish 70 }}\r\n\
          New-Item .git\\zci-last-used -ItemType File -Force | Out-Null\r\n\
          & powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File {file}\r\n\
-         exit $LASTEXITCODE\r\n",
+         Finish $LASTEXITCODE\r\n",
+        rc = ps_quote(&format!(r"{run}\rc")),
         env = ps_quote(&format!(r"{run}\env.ps1")),
         bundle = ps_quote(&format!(r"{run}\src.bundle")),
         file = ps_quote(&format!(r".ci\{}", job.file)),
@@ -251,7 +257,7 @@ fn launch_sh_machine(launch: &Launch<'_>) -> String {
     let _ = write!(
         out,
         "run={run}\n\
-         ssh {host} {mkdir} || exit 75\n\
+         ssh {host} {mkdir} </dev/null || exit 75\n\
          scp -q \"$run/vm/inner.ps1\" \"$run/vm/debug.ps1\" \"$run/src.bundle\" \"$secret_dir/env.ps1\" {host}:{dest} || exit 75\n\
          scp -q -r \"$run/inputs\" {host}:{dest_in} || exit 75\n\
          exec 3<&0\n\
@@ -260,6 +266,8 @@ fn launch_sh_machine(launch: &Launch<'_>) -> String {
          wait $!\n\
          rc=$?\n\
          rm -f \"$run/ssh.pid\"\n\
+         guest_rc=$(ssh {host} {read_rc} </dev/null 2>/dev/null | tr -dc 0-9)\n\
+         if [ -n \"$guest_rc\" ]; then rc=$guest_rc; elif [ \"$rc\" -eq 0 ]; then rc=75; fi\n\
          [ -e \"$run/timeout\" ] && rc=124\n\
          if [ \"$rc\" -eq 0 ]; then\n\
          \tscp -q -r {host}:{dest_out} \"$run/artifacts\" || rc=74\n\
@@ -273,6 +281,9 @@ fn launch_sh_machine(launch: &Launch<'_>) -> String {
         run = sh_path(run),
         mkdir = sh_quote(&format!(
             "New-Item -ItemType Directory -Force {guest} | Out-Null"
+        )),
+        read_rc = sh_quote(&format!(
+            r"Get-Content -Raw {guest}\rc -ErrorAction SilentlyContinue"
         )),
         dest = sh_quote(&format!("{scp_dir}/")),
         dest_in = sh_quote(&format!("{scp_dir}/in")),
