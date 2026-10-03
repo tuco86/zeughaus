@@ -84,3 +84,9 @@ for pid in $(pgrep -x zeughaus || true); do
     fi
 done
 say "done"
+
+# The CI runner (deploy/install-ci.sh) is a separate install; once it exists,
+# bring its binary and units up to date. Never waits for a sudo password.
+if id zeughaus-ci >/dev/null 2>&1; then
+    sh "$root/deploy/install-ci.sh" --update
+fi

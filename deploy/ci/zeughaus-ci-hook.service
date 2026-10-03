@@ -1,0 +1,15 @@
+[Unit]
+Description=Zeughaus CI webhook intake (GitHub and Forgejo pushes relayed over WireGuard)
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/zeughaus-ci/bin/zeughaus-runner --state-dir %h/state ci hook --listen 10.8.0.10:8686
+# The address is on wg0, which may not be up yet at boot: bind fails, and the
+# unit is started again until it is.
+Restart=always
+RestartSec=10s
+
+Environment=PATH=/usr/local/lib/zeughaus-ci/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

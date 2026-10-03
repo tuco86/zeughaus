@@ -1,0 +1,10 @@
+# The Windows guest of the CI runner: user-mode networking forwards 2222.
+Host win11-ci
+    HostName 127.0.0.1
+    Port 2222
+    User zeughaus
+    UserKnownHostsFile ~/.ssh/known_hosts.win11-ci
+    StrictHostKeyChecking accept-new
+    ConnectTimeout 5
+    ServerAliveInterval 0
+    LogLevel ERROR

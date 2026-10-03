@@ -1,0 +1,43 @@
+# <state-dir>/ci.toml of the CI runner. Without this file CI is off.
+# Secrets are files <state-dir>/secrets/<NAME> (mode 0600), never listed here.
+
+budget_gb = 50                     # host workspaces under ci/work; LRU deletion beyond this
+
+[busy]
+gpu_percent = 50                   # nvidia-smi utilization.gpu threshold
+busy_after_seconds = 60            # mean over this window >= threshold -> busy
+free_after_seconds = 300           # mean over this window < threshold -> free
+
+[containers]
+cpus = 12
+memory = "24g"
+
+[machines.win11]
+script = "/usr/local/lib/zeughaus-ci/vm/win11/vm.sh"
+dir = "/var/lib/zeughaus-ci/vm/win11"
+ssh_host = "win11-ci"
+cpus = 8
+memory = "12G"
+cache_disk = "100G"
+idle_minutes = 20
+
+[repos.griasdi]
+url = "https://github.com/Griasdi/Griasdi.git"
+forge = "github"                   # github | forgejo | none
+slug = "Griasdi/Griasdi"
+api = "https://api.github.com"     # forgejo: https://git.doodleshnookie.net
+default_branch = "main"
+fetch_token = "GITHUB_TOKEN"       # secret name; omitted for public/local repos
+fetch_user = "x-access-token"
+status_token = "GITHUB_TOKEN"
+webhook_secret = "GRIASDI_WEBHOOK_SECRET"
+
+[repos.griasdi.grants]             # secret -> event patterns it is released to
+GITHUB_TOKEN = ["tag v*", "cron *"]
+
+[repos.smoke]
+url = "/var/lib/zeughaus-ci/smoke.git"
+forge = "none"
+slug = "local/smoke"
+api = ""
+default_branch = "main"
