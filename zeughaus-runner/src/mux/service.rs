@@ -426,6 +426,23 @@ impl MuxService {
         }
     }
 
+    /// Moves a terminal out of the locked group into the detached list, as
+    /// [`Workspace::hide_owned`] describes.
+    pub fn hide_terminal(&self, terminal: TerminalId) {
+        let revision = {
+            let mut workspace = self
+                .inner
+                .workspace
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            workspace.hide_owned(terminal).then(|| workspace.revision())
+        };
+        if let Some(revision) = revision {
+            self.inner.publish_revision(revision);
+            self.persist();
+        }
+    }
+
     /// Accepts exchanges until the replier goes away, which for this process
     /// means never.
     pub async fn accept(self, replier: Replier) {

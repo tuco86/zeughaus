@@ -140,6 +140,31 @@ impl Workspace {
         self.revision += 1;
     }
 
+    /// Moves an owned terminal out of the locked group into the detached
+    /// list: a run that failed is no longer the news the group is for, and
+    /// a shell left behind in it stays reachable through the detached list.
+    /// A terminal a client attached elsewhere stays where it is. Returns
+    /// whether anything moved.
+    pub fn hide_owned(&mut self, terminal: TerminalId) -> bool {
+        if !self.owned.contains(&terminal) {
+            return false;
+        }
+        let Some(pos) = self
+            .pane_of(terminal)
+            .and_then(|pane| self.pane_pos(pane).ok())
+        else {
+            return false;
+        };
+        if !self.locked(pos.group) {
+            return false;
+        }
+        // A locked group's tab is one run's and is never split.
+        self.take_tab(pos);
+        self.detached.insert(terminal);
+        self.revision += 1;
+        true
+    }
+
     /// The runner's locked group, created at the end of the top level the
     /// first time a run needs it.
     fn locked_group(&mut self) -> &mut Group {
@@ -1797,6 +1822,33 @@ mod tests {
         assert!(!ws.knows(TerminalId(500)));
         assert!(detached_ids(&ws).is_empty());
         assert_eq!(layout(&ws), ["T101", "G[T501]"]);
+    }
+
+    #[test]
+    fn a_hidden_run_leaves_the_locked_group_for_the_detached_list() {
+        let (mut ws, mut spawn) = with_tabs(1);
+        ws.add_owned(TerminalId(500), OwnedPlacement::Triggered);
+        ws.add_owned(TerminalId(501), OwnedPlacement::Triggered);
+        let before = ws.revision();
+        assert!(ws.hide_owned(TerminalId(500)));
+        assert!(ws.revision() > before);
+        assert_eq!(layout(&ws), ["T101", "G[T501]"]);
+        assert_eq!(detached_ids(&ws), vec![TerminalId(500)]);
+        assert!(!ws.hide_owned(TerminalId(500)), "already hidden");
+
+        // Attached somewhere by hand, it stays where the client put it; a
+        // terminal the runner does not own is never touched.
+        apply(
+            &mut ws,
+            &mut spawn,
+            TopologyCommand::AttachTerminal {
+                terminal: TerminalId(500),
+                target: AttachTarget::NewTab,
+            },
+        );
+        assert!(!ws.hide_owned(TerminalId(500)));
+        assert!(!ws.hide_owned(TerminalId(101)));
+        assert_eq!(layout(&ws), ["T101", "G[T501]", "T500"]);
     }
 
     #[test]

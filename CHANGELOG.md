@@ -87,9 +87,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their terminals from it and left them unreachable when it exited.
 - `zeughaus-runner --help` and unknown arguments print the usage instead
   of starting a runner.
-- A failed run's terminal closes when the shell that followed the failure
-  ends, also for runs a previous runner recorded; CI debug terminals no
-  longer pile up in the `Triggered` group.
+- A failed run's terminal leaves the `Triggered` group for the detached
+  list (attach it from the palette to look) and closes when the shell that
+  followed the failure ends, also for runs a previous runner recorded; CI
+  debug shells no longer sit in the tab bar.
 
 ## [0.1.0-alpha.1] - 2026-09-26
 

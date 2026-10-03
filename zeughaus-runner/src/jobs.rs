@@ -86,9 +86,12 @@ impl JobHost {
     pub fn adopt_runs(&self) {
         for (terminal, run) in self.mux.restored_runs() {
             // Recorded already: it ended under the previous runner. A failure
-            // that a shell followed still has that shell's terminal, which
-            // closes when the shell ends, as it would have there.
+            // goes out of sight as it would have there, and a shell that
+            // followed it closes its terminal when it ends.
             if run.run_dir.join("exit").exists() {
+                if !exited_clean(&run.run_dir) {
+                    self.mux.hide_terminal(terminal);
+                }
                 if run.run_dir.join("code").exists() {
                     close_after_shell(self.mux.clone(), terminal);
                 }
@@ -299,6 +302,7 @@ impl RunHandle for Run {
                 .ok()
                 .and_then(|text| text.trim().parse::<i32>().ok())
             {
+                mux.hide_terminal(terminal);
                 close_after_shell(mux, terminal);
                 return RunExit {
                     code: Some(code),
@@ -329,12 +333,15 @@ impl RunHandle for Run {
                 // A run that succeeded has nothing left to look at: its log
                 // is on disk, and its terminal would otherwise sit among the
                 // detached ones for the life of the runner. A failed one
-                // keeps its screen -- that is the terminal someone attaches
-                // to.
-                if run.code == Some(0)
-                    && let Err(e) = mux.close_terminal(terminal)
-                {
-                    eprintln!("[runner] cannot close a finished run's terminal: {e}");
+                // keeps its screen among the detached terminals, where
+                // someone attaches it to look; the `Triggered` group is for
+                // runs that are still going.
+                if run.code == Some(0) {
+                    if let Err(e) = mux.close_terminal(terminal) {
+                        eprintln!("[runner] cannot close a finished run's terminal: {e}");
+                    }
+                } else {
+                    mux.hide_terminal(terminal);
                 }
                 return run;
             }

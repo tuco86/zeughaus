@@ -635,7 +635,10 @@ through weida only: no HTTP listener and no polling in the runner.
 `zeughaus-runner trigger <endpoint> <node-id> [payload]` pushes on
 `/triggers` marked `external`: the run it starts gets a tab in the runner's
 locked `Triggered` group, which only the runner fills and from which no tab
-is dragged; a press from an editor leaves its run detached.
+is dragged; a press from an editor leaves its run detached. The group shows
+runs that are still going: a failed run's terminal moves to the detached
+list ("Terminal / Attach" in the palette), shell and all, unless a client
+attached it somewhere else.
 `zeughaus-runner hold <endpoint> on|off` asks `/hold` and
 prints the reply. `<endpoint>` is the pinned root URL a runner prints at
 start; the client identity comes from the state directory (`--state-dir`,
@@ -695,9 +698,10 @@ except the `cache` paths) and starts the job:
 On failure, `inner.sh`/`launch.sh` writes `<run>/code`, which ends the
 host's wait, and execs a shell where the job ran. For a machine job that is
 an ssh session in the guest. The failed run's terminal is the debug
-session and closes when that shell ends. A run that fails before its shell
-(a checkout, an image build, the copy into the guest) keeps its terminal
-with the final screen.
+session, detached and attachable from the palette, and closes when that
+shell ends. A run that fails before its shell (a checkout, an image build,
+the copy into the guest) keeps its terminal with the final screen, detached
+as well.
 
 Artifacts go through `CI_OUTPUT` into `ci/pipelines/<repo>/<n>.artifacts/<job>/`
 and arrive hard-linked as `CI_INPUTS/<need>/` in the jobs that need them.
