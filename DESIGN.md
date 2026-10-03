@@ -586,9 +586,11 @@ every other outcome keeps it until someone closes it. With
 wrapper that, on a non-zero exit, writes the code to `<run_dir>/code` and
 `exec`s `$SHELL` in the same directory and environment: the run is reported
 from the code file while the shell lives on in the terminal, which is what
-makes a failed job a place to look rather than a screen to read. The
-`flow.all` node is the fan-in: it fires once every wired input has fired
-since it last fired, so a job starts when both of its predecessors' `ok`
+makes a failed job a place to look rather than a screen to read. When that
+shell ends, the terminal closes; the log holds what it showed. A restarted
+runner does the same for the terminals of recorded runs with a code file.
+The `flow.all` node is the fan-in: it fires once every wired input has
+fired since it last fired, so a job starts when both of its predecessors' `ok`
 pins have. The store holds nothing about runs; `/runs` on the runner serves
 any run file by range (`RunFileRequest` -> `RunFileReply`,
 `zeughaus-link/src/runs.rs`), so logs and artifacts stay on the machine that
@@ -615,6 +617,15 @@ it waits for it like the node would have, then writes `exit` and copies the
 artifacts (`zeughaus_job::record_run_end`). The node that started it is gone
 with the old process, so its `ok`/`failed` pins do not fire for an adopted
 run; adopted runs count as live for a drain.
+
+**One runner per state directory.** A serving runner holds an exclusive
+`flock` on `<state-dir>/runner.lock` (with its pid in it) and refuses to
+start when another holds it: both would reattach the same shims, a shim
+serves only the newest connection, and the second runner would take the
+first one's terminals and leave them unreachable when it exits. The file
+is close-on-exec, so a restart's `exec` releases it to the new image.
+Arguments the serving mode does not know, `--help` included, never reach
+it: the binary prints its usage instead.
 
 **Triggers** carry an optional payload (`TriggerRequest { node_id, payload }`)
 that becomes the node's `fire` parameter; a bare press sends none. They come
@@ -683,8 +694,10 @@ except the `cache` paths) and starts the job:
 
 On failure, `inner.sh`/`launch.sh` writes `<run>/code`, which ends the
 host's wait, and execs a shell where the job ran. For a machine job that is
-an ssh session in the guest. The failed run's terminal stays and is the
-debug session.
+an ssh session in the guest. The failed run's terminal is the debug
+session and closes when that shell ends. A run that fails before its shell
+(a checkout, an image build, the copy into the guest) keeps its terminal
+with the final screen.
 
 Artifacts go through `CI_OUTPUT` into `ci/pipelines/<repo>/<n>.artifacts/<job>/`
 and arrive hard-linked as `CI_INPUTS/<need>/` in the jobs that need them.

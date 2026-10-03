@@ -77,7 +77,8 @@ cargo run -p zeughaus           # editor; start as many as you like
 ```
 
 Never next to the installed units: a second store fails on the port, and a
-second runner on the same state directory fights the first over its shims.
+second runner on the same state directory refuses to start (it holds
+`<state-dir>/runner.lock`).
 
 Publish the module once per schema change, and regenerate the checked-in
 bindings:

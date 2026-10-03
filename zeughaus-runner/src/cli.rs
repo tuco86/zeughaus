@@ -19,6 +19,16 @@ use zeughaus_link::{
     HOLD_PATH, HoldReply, HoldRequest, MAX_HOLD_BYTES, TRIGGERS_PATH, TriggerRequest, credentials,
 };
 
+/// What the binary accepts. A runner serves on whatever state directory it
+/// is given, so an argument it does not know must never fall through to
+/// serving: a second runner on the same state directory takes the first
+/// one's terminals.
+const USAGE: &str = "\
+usage: zeughaus-runner [--state-dir <dir>] [--feed-addr <host:port>] [--keep-runs <n>] [join <host[:port]/database>]
+       zeughaus-runner trigger <endpoint> <node-id> [payload]
+       zeughaus-runner hold <endpoint> on|off
+       zeughaus-runner ci check|plan|run|status|forge-check|hook ...";
+
 /// Runs a subcommand if the first argument names one. `None` means the
 /// arguments are the runner's own and the process should serve.
 ///
@@ -40,7 +50,19 @@ pub fn run(args: &[String], state_dir: &Path) -> Option<ExitCode> {
         Some("ci") => return Some(crate::ci::cli::run(&positional[1..], state_dir)),
         Some("trigger") => parse_trigger(&positional[1..]),
         Some("hold") => parse_hold(&positional[1..]),
-        _ => return None,
+        _ => {
+            return match check_serve_args(&positional) {
+                Ok(ServeArgs::Serve) => None,
+                Ok(ServeArgs::Help) => {
+                    println!("{USAGE}");
+                    Some(ExitCode::SUCCESS)
+                }
+                Err(e) => {
+                    eprintln!("[runner] {e}\n{USAGE}");
+                    Some(ExitCode::FAILURE)
+                }
+            };
+        }
     };
     let command = match command {
         Ok(command) => command,
@@ -70,6 +92,31 @@ pub fn run(args: &[String], state_dir: &Path) -> Option<ExitCode> {
             ExitCode::FAILURE
         }
     })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ServeArgs {
+    Serve,
+    Help,
+}
+
+/// Whether `args` (without `--state-dir`) are the serving mode's own. The
+/// values are parsed where they are used; this only refuses what no mode
+/// reads.
+fn check_serve_args(args: &[String]) -> Result<ServeArgs, String> {
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "-h" | "--help" | "help" => return Ok(ServeArgs::Help),
+            "--feed-addr" | "--keep-runs" | "join" => {
+                if rest.next().is_none() {
+                    return Err(format!("{arg} needs a value"));
+                }
+            }
+            other => return Err(format!("unknown argument {other:?}")),
+        }
+    }
+    Ok(ServeArgs::Serve)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -307,5 +354,25 @@ mod tests {
         );
         assert!(parse_hold(&args(&["weida://x/", "maybe"])).is_err());
         assert!(parse_hold(&args(&["weida://x/"])).is_err());
+    }
+
+    #[test]
+    fn only_the_serving_flags_serve() {
+        // The shapes the installed units start the runner with.
+        for serve in [
+            &[][..],
+            &["--feed-addr", "10.8.0.10:7443"][..],
+            &["--keep-runs", "20", "join", "127.0.0.1:3000/zeughaus"][..],
+        ] {
+            assert_eq!(check_serve_args(&args(serve)), Ok(ServeArgs::Serve));
+        }
+        assert_eq!(check_serve_args(&args(&["--help"])), Ok(ServeArgs::Help));
+        assert_eq!(
+            check_serve_args(&args(&["join", "x", "-h"])),
+            Ok(ServeArgs::Help)
+        );
+        assert!(check_serve_args(&args(&["--version"])).is_err());
+        assert!(check_serve_args(&args(&["status"])).is_err());
+        assert!(check_serve_args(&args(&["join"])).is_err());
     }
 }

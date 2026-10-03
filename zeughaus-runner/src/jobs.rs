@@ -85,9 +85,13 @@ impl JobHost {
     /// for them. They count as live, so a draining stop waits for them too.
     pub fn adopt_runs(&self) {
         for (terminal, run) in self.mux.restored_runs() {
-            // Recorded already: it ended under the previous runner, which
-            // kept the terminal of a failure to look at.
+            // Recorded already: it ended under the previous runner. A failure
+            // that a shell followed still has that shell's terminal, which
+            // closes when the shell ends, as it would have there.
             if run.run_dir.join("exit").exists() {
+                if run.run_dir.join("code").exists() {
+                    close_after_shell(self.mux.clone(), terminal);
+                }
                 continue;
             }
             self.live.fetch_add(1, Ordering::SeqCst);
@@ -295,6 +299,7 @@ impl RunHandle for Run {
                 .ok()
                 .and_then(|text| text.trim().parse::<i32>().ok())
             {
+                close_after_shell(mux, terminal);
                 return RunExit {
                     code: Some(code),
                     killed: false,
@@ -325,7 +330,7 @@ impl RunHandle for Run {
                 // is on disk, and its terminal would otherwise sit among the
                 // detached ones for the life of the runner. A failed one
                 // keeps its screen -- that is the terminal someone attaches
-                // to, and it stays until the run is deleted.
+                // to.
                 if run.code == Some(0)
                     && let Err(e) = mux.close_terminal(terminal)
                 {
@@ -335,6 +340,36 @@ impl RunHandle for Run {
             }
             std::thread::sleep(POLL);
         }
+    }
+}
+
+/// Closes `terminal` once the shell that followed a failed run has ended.
+///
+/// The shell is there to look around in the run's environment; once it is
+/// gone, the screen shows nothing the log under the run directory does not,
+/// and a terminal left behind for every red build piles up in the
+/// `Triggered` group for the life of the runner and across its restarts.
+/// A terminal someone closed first, or a mux shutting down, ends the wait.
+fn close_after_shell(mux: MuxService, terminal: TerminalId) {
+    let spawned = std::thread::Builder::new()
+        .name(format!("zh-run-close-{}", terminal.0))
+        .spawn(move || {
+            loop {
+                let Some(session) = mux.session(terminal) else {
+                    return;
+                };
+                if session.exit().is_some() {
+                    break;
+                }
+                drop(session);
+                std::thread::sleep(POLL);
+            }
+            if let Err(e) = mux.close_terminal(terminal) {
+                eprintln!("[runner] cannot close a failed run's terminal: {e}");
+            }
+        });
+    if let Err(e) = spawned {
+        eprintln!("[runner] no thread to close a failed run's terminal: {e}");
     }
 }
 
@@ -508,6 +543,24 @@ mod tests {
         assert_eq!(outputs["failed"].downcast_ref::<i64>(), Some(&7));
         let dead = mux.session(TerminalId(3)).expect("the terminal is kept");
         assert!(dead.exit().is_some());
+
+        // Ending the shell that followed the first failure closes its
+        // terminal: the log holds everything it showed.
+        kept.apply(&zeughaus_mux::TerminalCommand::Text {
+            serial: 1,
+            text: "exit\r".to_string(),
+        })
+        .unwrap();
+        drop(kept);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while mux.session(TerminalId(1)).is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the failed run's terminal outlived its shell"
+            );
+            std::thread::sleep(POLL);
+        }
+        assert!(mux.session(TerminalId(3)).is_some());
 
         // A restarted host continues the numbering past what is on disk.
         let restarted = JobHost::new(mux, state_dir.clone(), DEFAULT_KEEP_RUNS);

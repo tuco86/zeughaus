@@ -132,6 +132,16 @@ fn main() -> ExitCode {
     if let Some(code) = cli::run(&args, &state_dir) {
         return code;
     }
+    // Held for the life of the process, released by `exec` (the file is
+    // close-on-exec) and taken again by the image that replaces it.
+    #[cfg(unix)]
+    let _state_lock = match lock_state_dir(&state_dir) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("[runner] {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     // Said only when serving: a subcommand's output is read by scripts.
     #[cfg(unix)]
     {
@@ -557,6 +567,46 @@ fn restart(exe: Option<&PathBuf>, mux: Option<&MuxService>) {
         .args(std::env::args_os().skip(1))
         .exec();
     eprintln!("[runner] restart failed: {e}");
+}
+
+/// Takes `<state-dir>/runner.lock`, or says which process holds it.
+///
+/// Two runners on one state directory reattach the same shims, and a shim
+/// serves only the newest connection: the second runner silently takes the
+/// first one's terminals, and leaves them unreachable when it exits.
+#[cfg(unix)]
+fn lock_state_dir(state_dir: &std::path::Path) -> Result<std::fs::File, String> {
+    use std::io::{Read, Seek, Write};
+    use std::os::fd::AsRawFd;
+
+    std::fs::create_dir_all(state_dir)
+        .map_err(|e| format!("cannot create {}: {e}", state_dir.display()))?;
+    let path = state_dir.join("runner.lock");
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    // SAFETY: flock on a descriptor this function owns.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(format!("cannot lock {}: {err}", path.display()));
+        }
+        let mut holder = String::new();
+        let _ = file.read_to_string(&mut holder);
+        return Err(format!(
+            "another runner (pid {}) serves {}; refusing to take its terminals",
+            holder.trim(),
+            state_dir.display()
+        ));
+    }
+    let _ = file.set_len(0);
+    let _ = file.rewind();
+    let _ = writeln!(file, "{}", std::process::id());
+    Ok(file)
 }
 
 /// `SIGUSR1` as a flag the loop reads every turn.
