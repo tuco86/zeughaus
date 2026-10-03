@@ -554,8 +554,8 @@ where
     }
 
     /// Chevron, label and one button per control. In the sidebar the
-    /// controls get a row of their own: next to the label they would leave
-    /// it no width at all.
+    /// controls get a row of their own, wrapping when they outgrow it: next
+    /// to the label they would leave it no width at all.
     fn section_header(
         &self,
         id: &S,
@@ -592,10 +592,12 @@ where
             Placement::Top => title.push(buttons).into(),
             Placement::Left => Column::new()
                 .push(title)
-                .push(container(buttons).padding(Padding {
-                    left: 18.0,
-                    ..Padding::ZERO
-                }))
+                .push(
+                    container(buttons.wrap().vertical_spacing(2.0)).padding(Padding {
+                        left: 18.0,
+                        ..Padding::ZERO
+                    }),
+                )
                 .spacing(2)
                 .into(),
         };

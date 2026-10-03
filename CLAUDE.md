@@ -110,7 +110,9 @@ the left edge. Theme and tab bar placement persist in
 connected runner (plus `Local` without a store, or `Not running` for graphs
 no runner's workspace shows); a section's `+ Shell`, `+ Graph` and `+ Group`
 add a terminal tab, a graph that runner executes, or a
-coloured group. Closing a graph's tab deletes the graph. Double-clicking a
+coloured group, and a CI runner's `CI: busy|free` cycles its busy mode
+through auto (the GPU measurement), busy and free. Closing a graph's tab
+deletes the graph. Double-clicking a
 tab or a group's name renames it; a tab that shows one graph renames the
 graph. A container node's `open` opens its contents in a tab. With the bar
 on top or at the left, tabs are dragged into and

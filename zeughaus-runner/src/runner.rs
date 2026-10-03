@@ -21,8 +21,8 @@ use zeughaus_core::{
     TypeConverters, Value, encode_scalar, occupancy_winner,
 };
 use zeughaus_link::{
-    ErrorRow, OutputRow, RejectionRow, RuntimeEvent, Snapshot, TOPIC_EDGE, TOPIC_ERROR,
-    TOPIC_OUTPUT,
+    ErrorRow, MachineState, OutputRow, RejectionRow, RuntimeEvent, Snapshot, TOPIC_EDGE,
+    TOPIC_ERROR, TOPIC_MACHINE, TOPIC_OUTPUT,
 };
 use zeughaus_runtime::{DeferredWork, GraphExecutor};
 use zeughaus_sync::{Store, SyncEvent};
@@ -554,6 +554,24 @@ impl Runner {
     fn next_seq(&mut self) -> u64 {
         self.seq += 1;
         self.seq
+    }
+
+    /// Tells editors the CI machine's busy state when it changed. Cheap to
+    /// call every turn: an unchanged state publishes nothing.
+    pub fn report_machine(&mut self, state: MachineState) {
+        if !self.published.set_machine(state) {
+            return;
+        }
+        let seq = self.next_seq();
+        self.emit(
+            TOPIC_MACHINE,
+            RuntimeEvent::Machine {
+                seq,
+                mode: state.mode,
+                busy: state.busy,
+            },
+        );
+        self.published.flush(self.seq, &self.snapshot);
     }
 
     /// Publishes one event on `topic`. A failure is reported once per distinct
@@ -1249,6 +1267,9 @@ pub struct Published {
     /// editor has to learn both from the one snapshot, and kept apart from
     /// them because a refused setting is not a failed run.
     rejections: HashMap<(NodeId, String), String>,
+    /// The CI machine's busy state, as editors were last told. Not about the
+    /// graph, so [`Published::clear`] keeps it.
+    machine: Option<MachineState>,
     /// Whether the snapshot still matches the baseline. Rebuilding is deferred
     /// because one pass touches many nodes and the snapshot only has to be
     /// current when it is read.
@@ -1314,7 +1335,18 @@ impl Published {
         self.errors = errors;
     }
 
-    /// Forgets everything, as when this process stops owning execution.
+    /// Records the CI machine's state. `true` when that is news.
+    pub fn set_machine(&mut self, state: MachineState) -> bool {
+        if self.machine == Some(state) {
+            return false;
+        }
+        self.machine = Some(state);
+        self.stale = true;
+        true
+    }
+
+    /// Forgets everything about the graphs, as when this process stops
+    /// owning execution. The machine is not the graphs'.
     pub fn clear(&mut self) {
         if !self.baseline.is_empty() || !self.errors.is_empty() || !self.rejections.is_empty() {
             self.stale = true;
@@ -1367,6 +1399,7 @@ impl Published {
             outputs,
             errors,
             rejections,
+            machine: self.machine,
         };
         self.stale = false;
     }

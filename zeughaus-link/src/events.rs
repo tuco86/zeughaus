@@ -15,6 +15,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::machine::{BusyMode, MachineState};
+
 /// Something that happened during one pass.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -66,6 +68,13 @@ pub enum RuntimeEvent {
     /// for that key. The counterpart of [`RuntimeEvent::SettingRejected`], for
     /// the same reason [`RuntimeEvent::OutputCleared`] exists.
     SettingAccepted { seq: u64, node_id: u64, key: String },
+    /// The CI machine's busy state changed: its mode, or under
+    /// [`BusyMode::Auto`] the measurement. Only a runner that runs CI sends it.
+    Machine {
+        seq: u64,
+        mode: BusyMode,
+        busy: bool,
+    },
 }
 
 impl RuntimeEvent {
@@ -123,6 +132,9 @@ pub struct Snapshot {
     /// means "accepted", the same way an absent error means "not failing".
     #[serde(default)]
     pub rejections: Vec<RejectionRow>,
+    /// The CI machine's busy state; `None` from a runner without CI.
+    #[serde(default)]
+    pub machine: Option<MachineState>,
 }
 
 impl Snapshot {
@@ -176,6 +188,9 @@ pub const TOPIC_EDGE: &str = "edge";
 /// [`RuntimeEvent::SettingAccepted`]). One subscription, because a viewer
 /// wants both or neither.
 pub const TOPIC_ERROR: &str = "error";
+
+/// Topic of [`RuntimeEvent::Machine`].
+pub const TOPIC_MACHINE: &str = "machine";
 
 /// Largest event payload a subscriber reads. An event is a few identifiers and
 /// a scalar rendered as text; the cap is what stops a peer from making a viewer
@@ -233,6 +248,11 @@ mod tests {
                 node_id: 5,
                 key: "limit".to_owned(),
             },
+            RuntimeEvent::Machine {
+                seq: 14,
+                mode: BusyMode::Busy,
+                busy: true,
+            },
         ];
         for event in events {
             assert_eq!(RuntimeEvent::decode(&event.encode()), Some(event));
@@ -266,6 +286,10 @@ mod tests {
                 key: "name".to_owned(),
                 message: "a table needs a name".to_owned(),
             }],
+            machine: Some(MachineState {
+                mode: BusyMode::Auto,
+                busy: false,
+            }),
         };
         assert_eq!(Snapshot::decode(&snapshot.encode()), Some(snapshot));
     }
@@ -279,6 +303,7 @@ mod tests {
         assert_eq!(decoded.seq, 3);
         assert!(decoded.errors.is_empty());
         assert!(decoded.rejections.is_empty());
+        assert_eq!(decoded.machine, None);
     }
 
     #[test]

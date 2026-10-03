@@ -261,17 +261,19 @@ struct Scheduler {
     freeze_warned: HashSet<(String, u64, String)>,
 }
 
-/// Starts the CI scheduler thread, unless there is no `ci.toml`.
-pub fn start(host: Arc<JobHost>, state_dir: PathBuf) {
+/// Starts the CI scheduler thread, unless there is no `ci.toml`. Returns
+/// the machine's busy state, which `/busy` overrides and editors are told
+/// about.
+pub fn start(host: Arc<JobHost>, state_dir: PathBuf) -> Option<Arc<Busy>> {
     let config = match CiConfig::load(&state_dir) {
         Ok(Some(config)) => config,
         Ok(None) => {
             eprintln!("[ci] no ci.toml; CI is off");
-            return;
+            return None;
         }
         Err(e) => {
             eprintln!("[ci] {e}; CI is off");
-            return;
+            return None;
         }
     };
     eprintln!(
@@ -279,10 +281,12 @@ pub fn start(host: Arc<JobHost>, state_dir: PathBuf) {
         config.repos.len(),
         config.machines.len()
     );
+    let busy = busy::start(config.busy.clone(), &state_dir);
+    let shared = Arc::clone(&busy);
     let spawned = std::thread::Builder::new()
         .name("zeughaus-ci".into())
         .spawn(move || {
-            let mut scheduler = Scheduler::new(host, state_dir, config);
+            let mut scheduler = Scheduler::new(host, state_dir, config, shared);
             scheduler.recover();
             loop {
                 scheduler.tick();
@@ -291,11 +295,13 @@ pub fn start(host: Arc<JobHost>, state_dir: PathBuf) {
         });
     if let Err(e) = spawned {
         eprintln!("[ci] cannot start the scheduler: {e}");
+        return None;
     }
+    Some(busy)
 }
 
 impl Scheduler {
-    fn new(host: Arc<JobHost>, state_dir: PathBuf, config: CiConfig) -> Scheduler {
+    fn new(host: Arc<JobHost>, state_dir: PathBuf, config: CiConfig, busy: Arc<Busy>) -> Scheduler {
         let (tx, rx) = std::sync::mpsc::channel();
         let machines = config
             .machines
@@ -316,7 +322,7 @@ impl Scheduler {
             })
             .collect();
         Scheduler {
-            busy: busy::start(config.busy.clone()),
+            busy,
             statuses: forge::poster(state_dir.clone()),
             host,
             state_dir,

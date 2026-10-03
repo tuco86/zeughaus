@@ -268,6 +268,15 @@ pub enum Message {
     // still alive.
     #[cfg(not(target_arch = "wasm32"))]
     HoldReplied(Result<zeughaus_link::HoldReply, String>),
+    // Move a CI runner's busy mode to the next one: auto, busy, free. The
+    // toggle next to its section header.
+    CycleBusy(crate::workspace::RunnerKey),
+    // What the runner answered: the machine's state after the change.
+    #[cfg(not(target_arch = "wasm32"))]
+    BusyReplied(
+        crate::workspace::RunnerKey,
+        Result<zeughaus_link::MachineState, String>,
+    ),
 }
 
 #[cfg(test)]

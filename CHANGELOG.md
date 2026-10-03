@@ -44,6 +44,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   image, and a persistent cache disk is attached as `W:`.
 - The workspace gate runs on the CI for every push (`.ci/gate.sh`) and
   reports `zeughaus/gate` on the commit in Forgejo.
+- A CI runner's section in the tab bar shows whether its machine counts as
+  busy (`CI: busy (auto)`) and cycles the busy mode on click: `auto`
+  follows the GPU measurement, `busy` and `free` override it until set
+  back. The mode survives a restart (`<state-dir>/ci/busy-mode`). New
+  `/busy` endpoint and `machine` event; editor and runner must be updated
+  together for the control to appear.
 
 ### Changed
 

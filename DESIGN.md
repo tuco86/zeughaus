@@ -716,6 +716,16 @@ below it. While busy, only `when_busy = "run"` jobs start. Running
 `stop` on the VM's `monitor.sock` for a machine, and resumed when the
 machine is free.
 
+The measurement can be overridden. `Busy` holds the GPU's verdict and a
+mode (`auto`, `busy`, `free`; `<state-dir>/ci/busy-mode`, so a restart
+keeps it); the scheduler acts on the mode, or under `auto` on the
+measurement. `/busy` (`BusyRequest { mode }` -> `MachineState { mode, busy
+}`, `zeughaus-link/src/machine.rs`) sets the mode. The runner publishes
+every change as `RuntimeEvent::Machine` on the `machine` topic and carries
+the current state in the snapshot, so a CI runner's section in the editor
+shows a `CI: busy|free` control that cycles auto, busy, free. A runner
+without CI reports no machine and has no control.
+
 **Machines** (`machine.rs`): a VM is booted on the first job that needs it
 (`vm.sh run`, then `prepare.ps1` in the guest). It runs one job at a time,
 and `vm.sh stop` shuts it down after `idle_minutes` without a job. A guest

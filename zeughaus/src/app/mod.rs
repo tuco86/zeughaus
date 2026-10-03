@@ -1562,6 +1562,36 @@ impl App {
                     Err(e) => e,
                 };
             }
+            Message::CycleBusy(key) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let Some((endpoint, mode)) = self
+                        .runtime
+                        .links
+                        .get(&key)
+                        .and_then(|link| Some((link.endpoint.clone(), link.machine?.mode)))
+                    else {
+                        self.last_error = "that runner reports no CI machine".to_string();
+                        return Task::none();
+                    };
+                    return Task::perform(feed::set_busy(endpoint, mode.next()), move |reply| {
+                        Message::BusyReplied(key.clone(), reply)
+                    });
+                }
+                #[cfg(target_arch = "wasm32")]
+                let _ = key;
+            }
+            // The runner's event says the same a moment later; taking the
+            // reply now is what makes the toggle answer the click at once.
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::BusyReplied(key, reply) => match reply {
+                Ok(state) => {
+                    if let Some(link) = self.runtime.links.get_mut(&key) {
+                        link.machine = Some(state);
+                    }
+                }
+                Err(e) => self.last_error = e,
+            },
             // File dialogs are native-only (rfd). On wasm these are no-ops;
             // persistence goes through the SpacetimeDB store instead.
             Message::SaveGraph => {
@@ -1810,6 +1840,10 @@ impl App {
                 } else if key.as_str() == RunnerKey::LOCAL {
                     controls.push(("graph", Cow::Borrowed("+ Graph")));
                 }
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(machine) = self.runtime.links.get(key).and_then(|link| link.machine) {
+                    controls.push(("busy", Cow::Owned(busy_label(machine))));
+                }
                 let tab = |t| tab_entry(key, t);
                 let items = section
                     .snapshot
@@ -1875,6 +1909,7 @@ impl App {
             on_control: Box::new(|key, control| match control {
                 "graph" => Message::NewGraph(key),
                 "group" => Message::Workspace(W::NewGroup(key)),
+                "busy" => Message::CycleBusy(key),
                 _ => Message::Workspace(W::NewShell(key)),
             }),
             on_press_tab: Box::new(|tab| Message::Workspace(W::PressTab(tab))),
@@ -2571,6 +2606,17 @@ fn unavailable<'a>(what: &'a str, why: &'a str) -> Element<'a, Message, Theme> {
         .align_x(iced::Alignment::Center)
         .align_y(iced::Alignment::Center)
         .into()
+}
+
+/// The busy toggle's text: what the machine is, and whether that is the
+/// measurement or an override.
+#[cfg(not(target_arch = "wasm32"))]
+fn busy_label(machine: zeughaus_link::MachineState) -> String {
+    let state = if machine.busy { "busy" } else { "free" };
+    match machine.mode {
+        zeughaus_link::BusyMode::Auto => format!("CI: {state} (auto)"),
+        _ => format!("CI: {state}"),
+    }
 }
 
 /// One tab of a section as the tab tree shows it.
