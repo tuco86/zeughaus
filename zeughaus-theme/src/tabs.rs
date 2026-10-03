@@ -36,4 +36,8 @@ impl Catalog for Theme {
     fn marker(&self) -> Color {
         iced_tabs::marker(self.base())
     }
+
+    fn tooltip(&self) -> Style {
+        iced_tabs::tooltip_style(self.base())
+    }
 }

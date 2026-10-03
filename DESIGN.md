@@ -723,7 +723,8 @@ measurement. `/busy` (`BusyRequest { mode }` -> `MachineState { mode, busy
 }`, `zeughaus-link/src/machine.rs`) sets the mode. The runner publishes
 every change as `RuntimeEvent::Machine` on the `machine` topic and carries
 the current state in the snapshot, so a CI runner's section in the editor
-shows a `CI: busy|free` control that cycles auto, busy, free. A runner
+shows a control that cycles auto, busy, free: a play circle while free, a
+pause circle while busy, filled when the mode is set by hand. A runner
 without CI reports no machine and has no control.
 
 **Machines** (`machine.rs`): a VM is booted on the first job that needs it

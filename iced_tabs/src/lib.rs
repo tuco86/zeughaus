@@ -15,13 +15,13 @@ use std::marker::PhantomData;
 use iced_widget::core::layout::{self, Layout};
 use iced_widget::core::widget::{self, Tree, Widget, tree};
 use iced_widget::core::{
-    Alignment, Background, Border, Color, Event, Length, Padding, Point, Rectangle, Size, Vector,
-    border, touch, window,
+    Alignment, Background, Border, Color, Event, Font, Length, Padding, Point, Rectangle, Size,
+    Vector, border, touch, window,
 };
 use iced_widget::core::{Clipboard, Shell, mouse, overlay, renderer};
 use iced_widget::text::Wrapping;
 use iced_widget::{
-    Button, Column, Row, Theme, button, container, mouse_area, scrollable, space, text,
+    Button, Column, Row, Theme, button, container, mouse_area, scrollable, space, text, tooltip,
 };
 
 /// An element whose renderer defaults to iced's, as `iced::Element` does.
@@ -105,15 +105,50 @@ pub enum Item<'a, Id, G, Message, Theme> {
     Group(Group<'a, Id, G, Message, Theme>),
 }
 
+/// A button in a section header: a key handed back through
+/// [`Handlers::on_control`], the text shown, the font it is drawn in (an
+/// icon font for a glyph) and what a hover over it says.
+#[derive(Debug, Clone)]
+pub struct Control<'a> {
+    pub key: &'static str,
+    pub label: Cow<'a, str>,
+    pub font: Option<Font>,
+    pub tooltip: Option<Cow<'a, str>>,
+}
+
+impl<'a> Control<'a> {
+    pub fn new(key: &'static str, label: impl Into<Cow<'a, str>>) -> Self {
+        Self {
+            key,
+            label: label.into(),
+            font: None,
+            tooltip: None,
+        }
+    }
+
+    /// Draws the label in `font`: a glyph from an icon font instead of a
+    /// word.
+    pub fn font(mut self, font: Font) -> Self {
+        self.font = Some(font);
+        self
+    }
+
+    /// What the control does, shown while the pointer rests on it. An icon
+    /// without one is a guess.
+    pub fn tooltip(mut self, tooltip: impl Into<Cow<'a, str>>) -> Self {
+        self.tooltip = Some(tooltip.into());
+        self
+    }
+}
+
 /// The outer level of the tree: a header with controls and its items.
 pub struct Section<'a, Id, G, S, Message, Theme> {
     pub id: S,
     pub label: Cow<'a, str>,
     /// A collapsed section shows only its header.
     pub collapsed: bool,
-    /// Buttons in the header: a key handed back through
-    /// [`Handlers::on_control`] and the label shown.
-    pub controls: Vec<(&'static str, Cow<'a, str>)>,
+    /// Buttons in the header.
+    pub controls: Vec<Control<'a>>,
     pub items: Vec<Item<'a, Id, G, Message, Theme>>,
 }
 
@@ -214,6 +249,9 @@ pub trait Catalog {
 
     /// The colour of the drop marker.
     fn marker(&self) -> Color;
+
+    /// The box a control's tooltip is shown in.
+    fn tooltip(&self) -> Style;
 }
 
 impl Catalog for Theme {
@@ -241,6 +279,10 @@ impl Catalog for Theme {
 
     fn marker(&self) -> Color {
         marker(self)
+    }
+
+    fn tooltip(&self) -> Style {
+        tooltip_style(self)
     }
 }
 
@@ -323,6 +365,21 @@ pub fn group_background(theme: &Theme, color: Color, placement: Placement) -> St
 /// The drop marker is the theme's primary colour.
 pub fn marker(theme: &Theme) -> Color {
     theme.extended_palette().primary.base.color
+}
+
+/// A tooltip is the strong background tone with its text, a hairline border
+/// and the tabs' rounding, so it reads as a layer above the bar.
+pub fn tooltip_style(theme: &Theme) -> Style {
+    let palette = theme.extended_palette();
+    Style {
+        background: Some(Background::Color(palette.background.strong.color)),
+        text: palette.background.strong.text,
+        border: Border {
+            color: palette.background.weak.color,
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+    }
 }
 
 /// Rounds only the corners away from the content the bar borders.
@@ -561,7 +618,7 @@ where
         id: &S,
         label: Cow<'a, str>,
         collapsed: bool,
-        controls: Vec<(&'static str, Cow<'a, str>)>,
+        controls: Vec<Control<'a>>,
     ) -> Element<'a, Message, Theme> {
         let placement = self.placement;
         let text_color = move |theme: &Theme| Catalog::section_header(theme, placement).text;
@@ -581,12 +638,8 @@ where
                 .clip(true),
         );
         let mut buttons = Row::new().spacing(4).align_y(Alignment::Center);
-        for (key, label) in controls {
-            buttons = buttons.push(
-                flat_button(text(label).size(11).wrapping(Wrapping::None), text_color)
-                    .padding([1, 5])
-                    .on_press((self.handlers.on_control)(id.clone(), key)),
-            );
+        for control in controls {
+            buttons = buttons.push(self.control(id, control, text_color));
         }
         let content: Element<'a, Message, Theme> = match placement {
             Placement::Top => title.push(buttons).into(),
@@ -605,6 +658,50 @@ where
         self.header(content)
             .style(move |theme: &Theme| container_style(Catalog::section_header(theme, placement)))
             .into()
+    }
+
+    /// One header control: its label as a flat button, in its font if it
+    /// has one (a glyph is drawn larger than a word: an icon font's glyphs
+    /// fill a narrow cell, and at word size they read as specks), and its
+    /// tooltip beside it on hover -- below the bar on top, to the right of
+    /// it at the left.
+    fn control(
+        &self,
+        id: &S,
+        control: Control<'a>,
+        text_color: impl Fn(&Theme) -> Color + Copy + 'a,
+    ) -> Element<'a, Message, Theme> {
+        let Control {
+            key,
+            label,
+            font,
+            tooltip: tip,
+        } = control;
+        let mut label = text(label).wrapping(Wrapping::None);
+        let padding = match font {
+            Some(font) => {
+                label = label.font(font).size(22).line_height(1.0);
+                [2, 4]
+            }
+            None => {
+                label = label.size(11);
+                [1, 5]
+            }
+        };
+        let button = flat_button(label, text_color)
+            .padding(padding)
+            .on_press((self.handlers.on_control)(id.clone(), key));
+        let Some(tip) = tip else {
+            return button.into();
+        };
+        let position = match self.placement {
+            Placement::Top => tooltip::Position::Bottom,
+            Placement::Left => tooltip::Position::Right,
+        };
+        let bubble = container(text(tip).size(12))
+            .padding([3, 6])
+            .style(|theme: &Theme| container_style(Catalog::tooltip(theme)));
+        tooltip(button, bubble, position).gap(4).into()
     }
 
     /// Header and, unless collapsed, the tabs and the end zone, all on the

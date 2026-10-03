@@ -45,11 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The workspace gate runs on the CI for every push (`.ci/gate.sh`) and
   reports `zeughaus/gate` on the commit in Forgejo.
 - A CI runner's section in the tab bar shows whether its machine counts as
-  busy (`CI: busy (auto)`) and cycles the busy mode on click: `auto`
-  follows the GPU measurement, `busy` and `free` override it until set
-  back. The mode survives a restart (`<state-dir>/ci/busy-mode`). New
-  `/busy` endpoint and `machine` event; editor and runner must be updated
-  together for the control to appear.
+  busy (a play or pause circle, filled when overridden) and cycles the busy
+  mode on click: `auto` follows the GPU measurement, `busy` and `free`
+  override it until set back. The mode survives a restart
+  (`<state-dir>/ci/busy-mode`). New `/busy` endpoint and `machine` event;
+  editor and runner must be updated together for the control to appear.
 
 ### Changed
 
@@ -58,6 +58,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   together.
 - A shell keeps 20 000 rows of history in the runner; an editor caches 1 000
   rows per terminal around its viewport and fetches the rest on scroll.
+- A section header's `+ Shell`, `+ Graph` and `+ Group` are glyphs from the
+  bundled Nerd Font with tooltips; the browser editor, which does not
+  bundle the font, keeps the words. `iced_tabs` header controls are
+  `Control`s with an optional font and tooltip.
 
 ### Fixed
 

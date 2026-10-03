@@ -1832,17 +1832,17 @@ impl App {
             .iter()
             .map(|section| {
                 let key = &section.key;
-                let mut controls: Vec<(&'static str, Cow<'_, str>)> = Vec::new();
+                let mut controls: Vec<iced_tabs::Control<'_>> = Vec::new();
                 if !section.synthetic() {
-                    controls.push(("shell", Cow::Borrowed("+ Shell")));
-                    controls.push(("graph", Cow::Borrowed("+ Graph")));
-                    controls.push(("group", Cow::Borrowed("+ Group")));
+                    controls.push(header_control("shell", GLYPH_SHELL, "+ Shell", "New shell"));
+                    controls.push(header_control("graph", GLYPH_GRAPH, "+ Graph", "New graph"));
+                    controls.push(header_control("group", GLYPH_GROUP, "+ Group", "New group"));
                 } else if key.as_str() == RunnerKey::LOCAL {
-                    controls.push(("graph", Cow::Borrowed("+ Graph")));
+                    controls.push(header_control("graph", GLYPH_GRAPH, "+ Graph", "New graph"));
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some(machine) = self.runtime.links.get(key).and_then(|link| link.machine) {
-                    controls.push(("busy", Cow::Owned(busy_label(machine))));
+                    controls.push(busy_control(machine));
                 }
                 let tab = |t| tab_entry(key, t);
                 let items = section
@@ -2608,15 +2608,68 @@ fn unavailable<'a>(what: &'a str, why: &'a str) -> Element<'a, Message, Theme> {
         .into()
 }
 
-/// The busy toggle's text: what the machine is, and whether that is the
-/// measurement or an override.
+/// Header glyphs from the bundled Nerd Font: codicons for terminal, type
+/// hierarchy (a node graph) and new folder (a group); for the CI machine
+/// Material Design's play circle (free, jobs start) and pause circle (busy,
+/// jobs wait), outlined while measured and filled while set by hand.
+const GLYPH_SHELL: char = '\u{ea85}';
+const GLYPH_GRAPH: char = '\u{ebb9}';
+const GLYPH_GROUP: char = '\u{ea80}';
 #[cfg(not(target_arch = "wasm32"))]
-fn busy_label(machine: zeughaus_link::MachineState) -> String {
-    let state = if machine.busy { "busy" } else { "free" };
-    match machine.mode {
-        zeughaus_link::BusyMode::Auto => format!("CI: {state} (auto)"),
-        _ => format!("CI: {state}"),
+const GLYPH_FREE_MEASURED: char = '\u{f040d}';
+#[cfg(not(target_arch = "wasm32"))]
+const GLYPH_BUSY_MEASURED: char = '\u{f03e6}';
+#[cfg(not(target_arch = "wasm32"))]
+const GLYPH_FREE_SET: char = '\u{f040c}';
+#[cfg(not(target_arch = "wasm32"))]
+const GLYPH_BUSY_SET: char = '\u{f03e5}';
+
+/// A section header control: a glyph with a tooltip that says what it does.
+/// The browser editor does not bundle the icon font and shows the word.
+fn header_control(
+    key: &'static str,
+    glyph: char,
+    word: &'static str,
+    tip: &'static str,
+) -> iced_tabs::Control<'static> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = word;
+        iced_tabs::Control::new(key, glyph.to_string())
+            .font(iced_terminal::FONT)
+            .tooltip(tip)
     }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = glyph;
+        iced_tabs::Control::new(key, word).tooltip(tip)
+    }
+}
+
+/// The busy toggle: what the machine is, filled when set by hand, and in
+/// the tooltip what a click changes it to.
+#[cfg(not(target_arch = "wasm32"))]
+fn busy_control(machine: zeughaus_link::MachineState) -> iced_tabs::Control<'static> {
+    use zeughaus_link::BusyMode;
+
+    let (glyph, tip) = match (machine.mode, machine.busy) {
+        (BusyMode::Auto, true) => (
+            GLYPH_BUSY_MEASURED,
+            "CI machine busy, measured from the GPU. Click: force busy",
+        ),
+        (BusyMode::Auto, false) => (
+            GLYPH_FREE_MEASURED,
+            "CI machine free, measured from the GPU. Click: force busy",
+        ),
+        (BusyMode::Busy, _) => (GLYPH_BUSY_SET, "CI machine forced busy. Click: force free"),
+        (BusyMode::Free, _) => (
+            GLYPH_FREE_SET,
+            "CI machine forced free. Click: back to the GPU measurement",
+        ),
+    };
+    iced_tabs::Control::new("busy", glyph.to_string())
+        .font(iced_terminal::FONT)
+        .tooltip(tip)
 }
 
 /// One tab of a section as the tab tree shows it.
