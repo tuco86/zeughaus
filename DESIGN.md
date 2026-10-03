@@ -628,7 +628,95 @@ start; the client identity comes from the state directory (`--state-dir`,
 `ZEUGHAUS_STATE_DIR`), so a script, a cron entry or a webhook relay is the
 same principal as an editor on that machine. No store is involved.
 
-## 14. Not built
+## 14. CI: pipelines from a repository's `.ci/` folder
+
+A runner with `<state-dir>/ci.toml` also runs CI (`zeughaus-runner/src/ci/`).
+Without the file nothing of it starts. On the workstation a second runner does
+this as the Unix user `zeughaus-ci` (`deploy/install-ci.sh`, units under
+`deploy/ci/`). It joins the user's store like any runner, so its terminals
+appear as a section of their own in every editor.
+
+**Jobs are scripts.** Every `.sh`/`.ps1` file in `.ci/` with a TOML header
+between `# /// ci` and `# ///` is a job named after its file. The header
+holds these keys:
+
+- `on`: `push <glob>`, `tag <glob>`, or `cron <5 fields>`;
+- `needs`: exactly one of `on` and `needs` is set;
+- `image` (a `.ci/<image>.Containerfile`) or `machine` (a VM from
+  `ci.toml`); neither means the host;
+- `cache`, `secrets`, `when_busy` (`wait`/`freeze`/`run`), `env`,
+  `timeout_minutes`.
+
+Files without a header are helpers. `ci check` validates a folder and
+`ci plan` shows what an event selects (`header.rs`, `pipeline.rs`). The
+selection is the jobs whose `on` matches the event, plus every job whose
+`needs` are all selected.
+
+**Events are files.** A webhook (`ci hook`, a separate process behind
+Caddy on sadala, HMAC-checked), `ci run` and the cron schedules all write
+`ci/inbox/*.json`. The scheduler moves each inbox file to
+`ci/queue/<repo>.<kind>.<hash(ref, cron)>.json`, overwriting what waits
+there. A newer push to a ref therefore replaces the one queued behind a
+running pipeline and never cancels the running one. The runner itself still
+has no HTTP listener.
+
+**Pipelines** (`scheduler.rs`, one thread):
+
+1. Fetch into a bare mirror `ci/mirrors/<repo>.git`, with the token in the
+   environment and never in argv.
+2. Pin the commit as `refs/ci/<n>`.
+3. Read `.ci/` at that commit.
+4. Record every decision in `ci/pipelines/<repo>/<n>.json` before acting
+   on it.
+
+A job is one `JobHost` run marked `external`, so it shows up in the
+`Triggered` group. Its terminal runs `<run>/launch.sh`, which checks the
+commit out into a persistent workspace `ci/work/<repo>/<job>` (cleaned
+except the `cache` paths) and starts the job:
+
+- **Host:** directly.
+- **Container:** `podman run --rm -it` with the workspace at `/work`.
+- **Machine:** over ssh, from a git bundle, in `W:\work\<repo>\<job>`.
+
+On failure, `inner.sh`/`launch.sh` writes `<run>/code`, which ends the
+host's wait, and execs a shell where the job ran. For a machine job that is
+an ssh session in the guest. The failed run's terminal stays and is the
+debug session.
+
+Artifacts go through `CI_OUTPUT` into `ci/pipelines/<repo>/<n>.artifacts/<job>/`
+and arrive hard-linked as `CI_INPUTS/<need>/` in the jobs that need them.
+Commit statuses (`zeughaus/<job>`) go to GitHub or Forgejo through `curl`,
+with the token on stdin.
+
+A restarted runner reloads the running pipelines from disk. It waits for
+the `exit` record that `adopt_runs` writes for each live run, and thaws
+whatever a previous process froze.
+
+**Busy and freeze.** `busy.rs` samples `nvidia-smi` every 10 s. The machine
+counts as busy once the mean over `busy_after_seconds` reaches
+`gpu_percent`, and as free again once the mean over `free_after_seconds` is
+below it. While busy, only `when_busy = "run"` jobs start. Running
+`freeze` jobs are paused, with `podman pause` for a container and HMP
+`stop` on the VM's `monitor.sock` for a machine, and resumed when the
+machine is free.
+
+**Machines** (`machine.rs`): a VM is booted on the first job that needs it
+(`vm.sh run`, then `prepare.ps1` in the guest). It runs one job at a time,
+and `vm.sh stop` shuts it down after `idle_minutes` without a job. A guest
+shell opened within the last 24 hours (`<run>/debug-shell`, removed when
+the run's terminal closes) keeps it up.
+
+**Disk.** Workspaces beyond `budget_gb` are deleted least recently used
+first, through `podman unshare rm` because containers leave subordinate-uid
+files. Image tags no pipeline uses are removed. The 200 newest pipeline
+records and the 10 newest artifact sets are kept per repository.
+
+**Secrets** are files in `<state-dir>/secrets/` (mode 0600). A job gets
+only those its repository's `grants` release to the event. They reach the
+job through files under `$XDG_RUNTIME_DIR/zeughaus-ci/<run>/`, which the
+launcher removes.
+
+## 15. Not built
 
 Kept here so they are not mistaken for descriptions of the code:
 
@@ -646,17 +734,15 @@ Kept here so they are not mistaken for descriptions of the code:
 - Rich per-type inspection widgets on edges; nodes show text or a frame.
 - A browser editor that syncs with the store; the wasm build edits locally.
 - Terminal image protocols; the wire model reserves kinds for them.
-- Jobs, decided but not built:
+- Jobs of the graph (`job.run`), decided but not built; CI (section 14)
+  has its own webhook intake, freeze, secrets and VM machines:
   - Reading run files in the editor; `/runs` is served, nothing calls it.
-  - Webhooks (Gitea) land on the weida broker once it speaks HTTP and are
-    relayed to `/triggers`.
-  - `freeze` (SIGSTOP / cgroup freezer) as a per-node hold policy and
-    automatic host-state detection (game running, user idle, GPU busy).
+  - Webhooks for a graph land on the weida broker once it speaks HTTP and
+    are relayed to `/triggers`.
+  - `freeze` (SIGSTOP / cgroup freezer) as a per-node hold policy.
   - Secrets through weida's wrapped-secret flow: one refreshable token per
     run, child tokens per service ordered through it, everything invalidated
     when the run ends. Nothing secret-shaped in the store or in settings.
   - Workspace nodes (checkout, btrfs snapshot) producing the `cwd` a job
     runs in; caches per runner under its state directory.
-  - VM guests as machines with their own runner. `vm/win11/` is the reference
-    QEMU lifecycle for a headless Windows 11 guest; booting it from a job is
-    not wired.
+  - VM guests with their own runner; CI drives its VM over ssh instead.

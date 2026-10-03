@@ -25,6 +25,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   across every runner's section, wrapping at the ends, also while a
   terminal has the keyboard; its child (vim, tmux) no longer receives them.
   Not while the palette or a rename field is open.
+- CI on a runner: with `<state-dir>/ci.toml`, a runner runs pipelines that
+  a repository defines as scripts in `.ci/` (TOML headers: `on`, `needs`,
+  `image`, `machine`, `cache`, `secrets`, `when_busy`, `env`,
+  `timeout_minutes`):
+  - jobs run on the host, in rootless podman containers, or in a managed
+    Windows VM;
+  - pushes to a ref coalesce;
+  - artifacts pass between jobs;
+  - commit statuses go to GitHub or Forgejo;
+  - expensive jobs wait or freeze while the GPU is busy;
+  - a failed job's terminal becomes a shell where it ran.
+
+  New subcommands: `zeughaus-runner ci check|plan|run|status|forge-check|hook`.
+  `deploy/install-ci.sh` sets up the dedicated `zeughaus-ci` user and its
+  units.
+- `vm/win11/vm.sh toolchain` installs the build toolchain into the golden
+  image, and a persistent cache disk is attached as `W:`.
 
 ### Changed
 

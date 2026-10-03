@@ -35,6 +35,9 @@ pub fn run(args: &[String], state_dir: &Path) -> Option<ExitCode> {
         }
     }
     let command = match positional.first().map(String::as_str) {
+        // CI subcommands work on the state directory, not on a running
+        // runner's endpoint, and report their own outcome.
+        Some("ci") => return Some(crate::ci::cli::run(&positional[1..], state_dir)),
         Some("trigger") => parse_trigger(&positional[1..]),
         Some("hold") => parse_hold(&positional[1..]),
         _ => return None,

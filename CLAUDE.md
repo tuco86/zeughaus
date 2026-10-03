@@ -41,8 +41,8 @@ zeughaus-job/          # plugin: Job (a process in a runner-owned terminal, log 
 iced_terminal/         # the terminal widget: one wgpu primitive per pane, bundled ComicShannsMono Nerd Font
 iced_tabs/             # the tab tree the workspace shell uses: runner sections, groups, drop markers
 zeughaus-theme/        # the editor's theme: iced theme paired with a terminal colour scheme, catalogs for every widget, bundled pack, WezTerm scheme parser
-vm/win11/              # scripts: headless Windows 11 guest under QEMU/KVM, the reference for a VM-hosted runner (not wired)
-deploy/                # install.sh, systemd user units for store and runner, desktop entry template
+vm/win11/              # scripts: headless Windows 11 guest under QEMU/KVM, the CI runner's `win11` machine (boot, toolchain, per-boot prepare.ps1)
+deploy/                # install.sh, systemd user units for store and runner, desktop entry template; install-ci.sh and ci/ for the CI runner
 third_party/           # its own workspace: wezterm's terminal crates at the pinned revision, published as zeughaus-* packages
 ```
 
@@ -140,6 +140,24 @@ reattaches every shim and restores tabs and splits. The editor answers
 node sizes, palette, rename and terminal scroll-back to a restore file and
 reopens as it was (not where it was: Wayland does not let a client place
 its window).
+
+### CI runner
+
+A second runner runs CI as the Unix user `zeughaus-ci`
+(`deploy/install-ci.sh`, once, with sudo; `deploy/install.sh` updates it
+afterwards). Its home and state are `/var/lib/zeughaus-ci` (a btrfs
+subvolume outside snapper's snapshots). It has two user units,
+`zeughaus-ci-runner` (joins the store as a runner) and `zeughaus-ci-hook`
+(`ci hook --listen 10.8.0.10:8686`, the webhook intake that Caddy on sadala
+forwards `https://ci.doodleshnookie.net/hook/<repo>` to). Logs:
+`sudo journalctl _UID=$(id -u zeughaus-ci)`. Repositories, budgets and the
+VM are configured in `/var/lib/zeughaus-ci/state/ci.toml`, and secrets are
+files in `state/secrets/`. `zeughaus-ci run|status|forge-check` (a sudo
+wrapper) queues a pipeline and reads results. `zeughaus-runner ci check
+[DIR]` and `ci plan [DIR] <push|tag> <ref>` validate a `.ci/` folder without
+a runner. The Windows VM (`vm/win11/`, installed under
+`/usr/local/lib/zeughaus-ci/vm/win11`) is booted and stopped by the
+runner. `DESIGN.md` section 14 describes how it works.
 
 ### Agent stack and reload
 

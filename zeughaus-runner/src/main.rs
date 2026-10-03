@@ -11,6 +11,7 @@
 //! store is read back on every batch, so a graph created for this runner by
 //! any editor starts running here without a handshake.
 
+mod ci;
 mod cli;
 mod feed;
 mod jobs;
@@ -86,25 +87,13 @@ fn main() -> ExitCode {
     // Every shell and job inherits the runner's environment, which may name
     // no locale at all (ssh, launchd, a stripped service).
     #[cfg(unix)]
-    {
+    let locale = {
         let locale = zeughaus_terminal::locale::resolve();
         // SAFETY: nothing has started a thread yet; the shim branch above returned
         // and the store, runtime and transport are created further down.
         unsafe { locale.apply() };
-        let vars: Vec<String> = locale
-            .effective
-            .iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect();
-        eprintln!(
-            "[runner] terminal locale ({}): {}",
-            locale.source,
-            vars.join(" ")
-        );
-        for (key, value, reason) in &locale.refused {
-            eprintln!("[runner] terminal locale: ignoring {key}={value} ({reason})");
-        }
-    }
+        locale
+    };
     // Resolved once, now: after a rebuild replaced the file, the running
     // image is "(deleted)" and only this path still names the new binary,
     // which is what a restart executes and what new shims are started from.
@@ -142,6 +131,23 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(code) = cli::run(&args, &state_dir) {
         return code;
+    }
+    // Said only when serving: a subcommand's output is read by scripts.
+    #[cfg(unix)]
+    {
+        let vars: Vec<String> = locale
+            .effective
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        eprintln!(
+            "[runner] terminal locale ({}): {}",
+            locale.source,
+            vars.join(" ")
+        );
+        for (key, value, reason) in &locale.refused {
+            eprintln!("[runner] terminal locale: ignoring {key}={value} ({reason})");
+        }
     }
     eprintln!("[runner] state dir {}", state_dir.display());
     let session = zeughaus_sync::Session::resolve(parse_join_arg().as_deref());
@@ -274,6 +280,11 @@ fn main() -> ExitCode {
                 }
                 Err(e) => eprintln!("[runner] no hold service: {e}"),
             }
+        }
+        // CI runs its pipelines as this host's jobs; without a `ci.toml` it
+        // says so and does nothing.
+        if let Some(host) = &job_host {
+            ci::start(Arc::clone(host), state_dir.clone());
         }
         // The runner that produced a run's files is the one that serves them:
         // they are on this disk and nowhere else.
