@@ -203,6 +203,11 @@ wait_exit() {
     while running; do sleep 2; done
 }
 
+# The guest's last boot as a number; empty while ssh does not answer.
+boot_time() {
+    ssh_cmd '(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToFileTimeUtc()' 2>/dev/null | tr -dc 0-9
+}
+
 wait_ssh() {
     local deadline=$(( $(date +%s) + ${1:-3600} ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -246,15 +251,25 @@ install() {
     log "ssh answers, guest setup log follows"
     ssh_cmd 'Get-Content C:\zeughaus\setup.log' || true
     provision
-    # The first boot after Setup ends in a restart of its own
-    # (CloudExperienceHostBroker, "Reconfiguration"), about a minute in. It
-    # has to happen here: in the first `toolchain` or job boot it drops the
-    # ssh session midway.
+    # The first boot after Setup's own ends in a restart
+    # (CloudExperienceHostBroker, "Reconfiguration"), about a minute in; in
+    # a `toolchain` or job boot it drops the ssh session midway. One more
+    # boot here, watched until its boot time changes (or five quiet
+    # minutes pass), takes that restart into the golden image.
     log "settling: one more boot for the post-setup restart"
     ssh_cmd 'shutdown /r /t 0' || true
     sleep 30
     wait_ssh 900
-    sleep 180
+    local booted now
+    booted=$(boot_time) || true
+    for i in $(seq 1 30); do
+        sleep 10
+        now=$(boot_time) || true
+        if [ -n "$now" ] && [ "$now" != "$booted" ]; then
+            log "post-setup restart done"
+            break
+        fi
+    done
     wait_ssh 900
     ssh_cmd 'shutdown /s /t 0' || true
     wait_exit
