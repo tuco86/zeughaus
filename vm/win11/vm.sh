@@ -1,41 +1,48 @@
 #!/usr/bin/env bash
-# Headless Windows 11 under QEMU/KVM for the zeughaus runner.
+# Headless Windows 11 under QEMU/KVM for the zeughaus CI runner.
 #
 #   vm.sh iso        build unattend.iso from autounattend.xml, setup.ps1,
-#                    the ssh public key and the virtio boot drivers
+#                    the ssh public keys and the virtio boot drivers
 #   vm.sh install    create base.qcow2, run the unattended install until
 #                    ssh answers, provision, shut down, mark base.qcow2
 #                    read-only
-#   vm.sh run        boot a throwaway overlay of base.qcow2 (PERSIST=1 boots
-#                    base.qcow2 itself, for updating the golden image)
+#   vm.sh toolchain  boot base.qcow2 itself, install the build toolchain
+#                    (toolchain.ps1), shut down, mark it read-only
+#   vm.sh run        boot a throwaway overlay of base.qcow2 plus the
+#                    persistent cache disk (PERSIST=1 boots base.qcow2
+#                    itself, without cache disk, to update the golden image)
 #   vm.sh ssh [cmd]  ssh into the running VM
 #   vm.sh provision  install remaining virtio drivers and qemu-ga over ssh
 #   vm.sh stop       ACPI power off, wait for QEMU to exit
 #   vm.sh status
 #
-# State lives in $VM_DIR (default /var/lib/geselle/vm/win11, nodatacow).
+# State lives in $VM_DIR (default /var/lib/zeughaus-ci/vm/win11, nodatacow).
+# Needed there: win11.iso, virtio-win.iso, product-key (Windows 11 Pro).
+# SSH_PUBKEY is a ':'-separated list of public key files, all authorized.
 # The console is on VNC $VNC while the VM runs; ssh is forwarded to
-# 127.0.0.1:$SSH_PORT and reached as ssh host $SSH_HOST, whose entry lives
-# in ~/.ssh/config.local. What the runner will later drive over QMP is the
-# same QEMU command line as here.
+# 127.0.0.1:$SSH_PORT and reached as ssh host $SSH_HOST (~/.ssh/config).
+# The zeughaus-ci runner boots and stops it through this script and writes
+# stop/cont to $VM_DIR/monitor.sock to freeze a job.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-VM_DIR=${VM_DIR:-/var/lib/geselle/vm/win11}
+VM_DIR=${VM_DIR:-/var/lib/zeughaus-ci/vm/win11}
 CPUS=${CPUS:-8}
-MEM=${MEM:-16G}
+MEM=${MEM:-12G}
 DISK=${DISK:-128G}
+CACHE_DISK_SIZE=${CACHE_DISK_SIZE:-100G}
 SSH_PORT=${SSH_PORT:-2222}
-SSH_HOST=${SSH_HOST:-win11-geselle}
-VNC=${VNC:-127.0.0.1:0}
-GUEST_NAME=${GUEST_NAME:-win11-geselle}
+SSH_HOST=${SSH_HOST:-win11-ci}
+VNC=${VNC:-127.0.0.1:10}
+GUEST_NAME=${GUEST_NAME:-win11-ci}
 SSH_PUBKEY=${SSH_PUBKEY:-$HOME/.ssh/id_ed25519.pub}
 
-WIN_ISO=$VM_DIR/win11-enterprise-eval.iso
+WIN_ISO=${WIN_ISO:-$VM_DIR/win11.iso}
 VIRTIO_ISO=$VM_DIR/virtio-win.iso
 OPENSSH_MSI=$VM_DIR/OpenSSH-Win64.msi
 UNATTEND_ISO=$VM_DIR/unattend.iso
 BASE=$VM_DIR/base.qcow2
+CACHE=$VM_DIR/cache.qcow2
 OVERLAY=$VM_DIR/run.qcow2
 OVMF_CODE=/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd
 OVMF_VARS=$VM_DIR/OVMF_VARS.fd
@@ -84,14 +91,18 @@ warn_datacow() {
 
 iso() {
     [ -s "$VIRTIO_ISO" ] || die "missing $VIRTIO_ISO"
-    [ -s "$SSH_PUBKEY" ] || die "missing ssh public key $SSH_PUBKEY"
+    [ -s "$VM_DIR/product-key" ] || die "missing $VM_DIR/product-key (a Windows 11 Pro key, one line)"
+    local key
+    for key in ${SSH_PUBKEY//:/ }; do
+        [ -s "$key" ] || die "missing ssh public key $key"
+    done
     local stage=$VM_DIR/iso-root
-    local payload="$stage/geselle"
+    local payload="$stage/zeughaus"
     rm -rf "$stage"
     mkdir -p "$stage/drivers" "$payload/drivers"
 
     # /drivers: boot-critical, loaded by Windows Setup from E:\drivers.
-    # /geselle/drivers: the rest, installed with pnputil over ssh later.
+    # /zeughaus/drivers: the rest, installed with pnputil over ssh later.
     local d
     for d in viostor vioscsi NetKVM; do
         xorriso -osirrox on -indev "$VIRTIO_ISO" -extract "/$d/w11/amd64" "$stage/drivers/$d" 2>/dev/null
@@ -117,13 +128,19 @@ iso() {
     if [ ! -s "$VM_DIR/password" ]; then
         (umask 077; head -c 256 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' | cut -c1-24 >"$VM_DIR/password")
     fi
-    sed -e "s|@@PASSWORD@@|$(cat "$VM_DIR/password")|" \
-        -e "s|@@HOSTNAME@@|$GUEST_NAME|" \
-        "$HERE/autounattend.xml" >"$stage/autounattend.xml"
+    # The product key is substituted in the shell, so it never reaches argv.
+    local xml pkey
+    xml=$(sed -e "s|@@PASSWORD@@|$(cat "$VM_DIR/password")|" -e "s|@@HOSTNAME@@|$GUEST_NAME|" "$HERE/autounattend.xml")
+    pkey=$(tr -d '[:space:]' <"$VM_DIR/product-key")
+    printf '%s\n' "${xml//@@PRODUCT_KEY@@/$pkey}" >"$stage/autounattend.xml"
     cp "$HERE/setup.ps1" "$HERE/firstboot.ps1" "$payload/"
-    cp "$SSH_PUBKEY" "$payload/authorized_keys"
+    : >"$payload/authorized_keys"
+    for key in ${SSH_PUBKEY//:/ }; do
+        cat "$key" >>"$payload/authorized_keys"
+        [ -z "$(tail -c1 "$key")" ] || echo >>"$payload/authorized_keys"
+    done
 
-    xorriso -as mkisofs -quiet -o "$UNATTEND_ISO" -J -R -V GESELLE "$stage"
+    xorriso -as mkisofs -quiet -o "$UNATTEND_ISO" -J -R -V ZEUGHAUS "$stage"
     rm -rf "$stage"
     log "built $UNATTEND_ISO"
 }
@@ -204,7 +221,7 @@ install() {
     [ -e "$BASE" ] && die "$BASE exists; remove it to reinstall"
     rm -f "$OVMF_VARS"
     rm -rf "$TPM_DIR"
-    rm -f "$HOME/.ssh/known_hosts.geselle"
+    rm -f "$HOME/.ssh/known_hosts.win11-ci"
     nodatacow "$VM_DIR"
     qemu-img create -q -f qcow2 "$BASE" "$DISK"
 
@@ -227,7 +244,7 @@ install() {
 
     wait_ssh 3600
     log "ssh answers, guest setup log follows"
-    ssh_cmd 'Get-Content C:\geselle\setup.log' || true
+    ssh_cmd 'Get-Content C:\zeughaus\setup.log' || true
     provision
     ssh_cmd 'shutdown /s /t 0' || true
     wait_exit
@@ -240,28 +257,47 @@ install() {
 # is how the golden image gets updated.
 provision() {
     log "installing virtio drivers and qemu-ga"
-    ssh_cmd 'pnputil /add-driver C:\geselle\drivers\*.inf /subdirs /install' || true
-    ssh_cmd 'Start-Process -Wait msiexec.exe -ArgumentList "/i","C:\geselle\qemu-ga-x86_64.msi","/qn"; Get-Service QEMU-GA | Select-Object Status,StartType'
+    ssh_cmd 'pnputil /add-driver C:\zeughaus\drivers\*.inf /subdirs /install' || true
+    ssh_cmd 'Start-Process -Wait msiexec.exe -ArgumentList "/i","C:\zeughaus\qemu-ga-x86_64.msi","/qn"; Get-Service QEMU-GA | Select-Object Status,StartType'
     ssh_cmd 'Get-PnpDevice -PresentOnly | Where-Object { $_.Status -ne "OK" } | Select-Object Status,Class,FriendlyName'
 }
 
+# The cache disk is a second, persistent qcow2 that outlives the throwaway
+# overlay: prepare.ps1 formats it as W: on first use. A PERSIST=1 boot
+# changes the golden image and gets no cache disk.
 run() {
     [ -s "$BASE" ] || die "no base image; run install first"
     nodatacow "$VM_DIR"
     local disk=$BASE
+    local -a extra=()
     if [ "${PERSIST:-0}" != 1 ]; then
         disk=$OVERLAY
         rm -f "$OVERLAY"
         qemu-img create -q -f qcow2 -b "$BASE" -F qcow2 "$OVERLAY"
+        [ -e "$CACHE" ] || qemu-img create -q -f qcow2 "$CACHE" "$CACHE_DISK_SIZE"
+        extra=(-drive "if=none,id=hd1,format=qcow2,discard=unmap,cache=none,aio=native,file=$CACHE"
+            -device virtio-blk-pci,drive=hd1)
     else
         warn_datacow "$BASE"
         chmod 644 "$BASE"
     fi
     local -a media
-    mapfile -t media < <(disk_args "$disk")
+    mapfile -t media < <(disk_args "$disk"; [ "${#extra[@]}" -eq 0 ] || printf '%s\n' "${extra[@]}")
     launch "${media[@]}"
     wait_ssh 300
     log "up"
+}
+
+# Installs the build toolchain into the golden image. Idempotent enough to
+# rerun: the installers skip what is present.
+toolchain() {
+    PERSIST=1 run
+    scp -q "$HERE/toolchain.ps1" "$SSH_HOST:/C:/zeughaus/toolchain.ps1"
+    ssh_cmd 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\zeughaus\toolchain.ps1'
+    ssh_cmd 'shutdown /s /t 0' || true
+    wait_exit
+    chmod 444 "$BASE"
+    log "toolchain installed: $BASE"
 }
 
 stop() {
@@ -292,5 +328,6 @@ case "${1:-}" in
     stop) stop ;;
     status) status ;;
     provision) provision ;;
-    *) sed -n '2,19p' "$0"; exit 2 ;;
+    toolchain) toolchain ;;
+    *) sed -n '2,17p' "$0"; exit 2 ;;
 esac
