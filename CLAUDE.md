@@ -159,6 +159,14 @@ a runner. The Windows VM (`vm/win11/`, installed under
 `/usr/local/lib/zeughaus-ci/vm/win11`) is booted and stopped by the
 runner. `DESIGN.md` section 14 describes how it works.
 
+This repository is one of its repos: every push to Forgejo runs
+`.ci/gate.sh` (the gate below, in the `.ci/arch.Containerfile` image,
+against weida's `main` as the sibling checkout) and posts `zeughaus/gate`
+on the commit. Forgejo reaches the runner as the bot user `zeughaus-ci`
+(write on zeughaus, read on weida); its tokens and the webhook secret are
+in OpenBao under `secret/zeughaus/ci`. A change to `.ci/` is checked with
+`zeughaus-runner ci check` before it is pushed.
+
 ### Agent stack and reload
 
 An agent never drives the user's desktop. It builds its own binaries with

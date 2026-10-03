@@ -42,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   units.
 - `vm/win11/vm.sh toolchain` installs the build toolchain into the golden
   image, and a persistent cache disk is attached as `W:`.
+- The workspace gate runs on the CI for every push (`.ci/gate.sh`) and
+  reports `zeughaus/gate` on the commit in Forgejo.
 
 ### Changed
 

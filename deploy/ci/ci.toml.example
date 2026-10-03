@@ -35,6 +35,23 @@ webhook_secret = "GRIASDI_WEBHOOK_SECRET"
 [repos.griasdi.grants]             # secret -> event patterns it is released to
 GITHUB_TOKEN = ["tag v*", "cron *"]
 
+# zeughaus itself, on Forgejo. The bot user `zeughaus-ci` is a collaborator
+# with write on zeughaus (fetch, statuses) and read on weida, the sibling
+# checkout the workspace builds against; jobs get only the read token.
+[repos.zeughaus]
+url = "https://git.doodleshnookie.net/tuco86/zeughaus.git"
+forge = "forgejo"
+slug = "tuco86/zeughaus"
+api = "https://git.doodleshnookie.net"
+default_branch = "main"
+fetch_token = "FORGEJO_TOKEN"
+fetch_user = "zeughaus-ci"
+status_token = "FORGEJO_TOKEN"
+webhook_secret = "ZEUGHAUS_WEBHOOK_SECRET"
+
+[repos.zeughaus.grants]
+FORGEJO_READ_TOKEN = ["push *", "tag *", "cron *"]
+
 [repos.smoke]
 url = "/var/lib/zeughaus-ci/smoke.git"
 forge = "none"
