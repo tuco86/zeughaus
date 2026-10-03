@@ -36,7 +36,14 @@ if ($drive.SizeRemaining -lt 0.2 * $drive.Size) {
 }
 
 # With discard=unmap this hands the freed blocks back to cache.qcow2.
-Optimize-Volume -DriveLetter W -ReTrim
+# Housekeeping only: a volume Windows refuses to retrim (StorageWMI 40004
+# on a freshly formatted one) must not keep the machine from coming up.
+try {
+    Optimize-Volume -DriveLetter W -ReTrim
+}
+catch {
+    Write-Warning "retrim of W: failed: $_"
+}
 
 if (-not (Test-Path 'W:\cargo\bin\rustup.exe')) {
     $env:CARGO_HOME = 'W:\cargo'

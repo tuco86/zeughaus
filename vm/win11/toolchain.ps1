@@ -50,10 +50,16 @@ $asset = Get-ReleaseAsset 'Kitware/CMake' '^cmake-.*-windows-x86_64\.msi$'
 $cmake = Get-Download $asset.browser_download_url $asset.name
 Invoke-Installer 'msiexec.exe' @('/i', "`"$cmake`"", '/qn', 'ADD_CMAKE_TO_PATH=System')
 
-# LLVM: libclang for bindgen.
-$asset = Get-ReleaseAsset 'llvm/llvm-project' '^LLVM-.*-win64\.exe$'
+# LLVM: libclang for bindgen. Releases ship an MSI; older ones an NSIS .exe.
+$asset = Get-ReleaseAsset 'llvm/llvm-project' '^LLVM-.*-win64\.(msi|exe)$'
 $llvm = Get-Download $asset.browser_download_url $asset.name
-Invoke-Installer $llvm @('/S')
+if ($llvm.EndsWith('.msi')) {
+    Invoke-Installer 'msiexec.exe' @('/i', "`"$llvm`"", '/qn')
+}
+else {
+    Invoke-Installer $llvm @('/S')
+}
+if (-not (Test-Path 'C:\Program Files\LLVM\bin\libclang.dll')) { throw 'LLVM is not in C:\Program Files\LLVM' }
 [Environment]::SetEnvironmentVariable('LIBCLANG_PATH', 'C:\Program Files\LLVM\bin', 'Machine')
 
 # rustup-init, kept for prepare.ps1.

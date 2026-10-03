@@ -246,6 +246,16 @@ install() {
     log "ssh answers, guest setup log follows"
     ssh_cmd 'Get-Content C:\zeughaus\setup.log' || true
     provision
+    # The first boot after Setup ends in a restart of its own
+    # (CloudExperienceHostBroker, "Reconfiguration"), about a minute in. It
+    # has to happen here: in the first `toolchain` or job boot it drops the
+    # ssh session midway.
+    log "settling: one more boot for the post-setup restart"
+    ssh_cmd 'shutdown /r /t 0' || true
+    sleep 30
+    wait_ssh 900
+    sleep 180
+    wait_ssh 900
     ssh_cmd 'shutdown /s /t 0' || true
     wait_exit
     chmod 444 "$BASE"
