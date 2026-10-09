@@ -13,7 +13,6 @@ members = [
     "zeughaus-graph",
     "zeughaus-db",
     "zeughaus-record",
-    "zeughaus-sync",
     "zeughaus-link",
     "zeughaus-runner",
     "zeughaus-mux",
@@ -21,11 +20,9 @@ members = [
     "zeughaus-job",
     "zeughaus-theme",
 ]
-# zeughaus-module is a SpacetimeDB server module: it only builds for the
-# wasm32 module target via `spacetime build`, so it is kept out of the native
-# workspace build. third_party is its own workspace of upstream crates held to
-# upstream's formatting and lints, not to this gate.
-exclude = ["zeughaus-module", "third_party"]
+# third_party is its own workspace of upstream crates held to upstream's
+# formatting and lints, not to this gate.
+exclude = ["third_party"]
 resolver = "2"
 
 [workspace.package]
@@ -53,12 +50,10 @@ zeughaus-record = { path = "zeughaus-record", version = "0.1.0-dev" }
 # and artifact globs live in a node's settings, so the mux never carries a
 # command line. The editor registers it detached; only a runner executes.
 zeughaus-job = { path = "zeughaus-job", version = "0.1.0-dev" }
-zeughaus-sync = { path = "zeughaus-sync", version = "0.1.0-dev" }
 # What travels between a runner and its editors over weida, and the identities
-# both ends present: the sample feed, runtime events, path constants and the
-# credentials on disk. Frames are streams, and a state store is the wrong pipe
-# for 33 MB per frame, so this is its own transport. The QUIC transport itself
-# lives in a sibling checkout.
+# both ends present: the graph document, the sample feed, runtime events, path
+# constants and the credentials on disk. The QUIC transport itself lives in a
+# sibling checkout.
 zeughaus-link = { path = "zeughaus-link", version = "0.1.0-dev" }
 weida = { path = "../weida/crates/weida", version = "0.1.0-alpha.2" }
 zeughaus-runner = { path = "zeughaus-runner", version = "0.1.0-dev" }
@@ -96,10 +91,6 @@ iced_palette = "0.1.1"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 toml = "1.0"
-
-# SpacetimeDB client SDK. Native uses default (tokio) features; wasm enables the
-# `browser` feature in the per-target deps of the zeughaus binary.
-spacetimedb-sdk = "2.10"
 
 # Profiles apply from the top-level workspace being built, so iced_nodegraph's
 # own `profile.dev` never applies here. Without this,

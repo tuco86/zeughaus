@@ -1,20 +1,20 @@
-//! Edits held back from the shared store until the typing stops.
+//! Edits held back from the runner until the typing stops.
 //!
 //! A setting is typed one character at a time, and a character that reached
-//! the store on its own would be a complete parameter push: seven keystrokes
-//! would mean seven store writes, seven re-derivations of everything the value
+//! the runner on its own would be a complete parameter push: seven keystrokes
+//! would mean seven edits, seven re-derivations of everything the value
 //! feeds, seven relation edges replaced -- and, for a `db.database` path,
 //! seven SQLite files created on the runner, one per prefix of what the user
 //! was still typing.
 //!
-//! This window and its nodes keep seeing every character; only the store
+//! This window and its nodes keep seeing every character; only the runner
 //! waits. Two things make that safe rather than merely quieter:
 //!
-//! * the value the store still holds is remembered per key on the first
+//! * the value the runner still holds is remembered per key on the first
 //!   un-pushed edit, so a rename is detected against what was pushed rather
 //!   than against the previous keystroke -- seven keystrokes are one rename;
-//! * anything about to observe store state flushes first
-//!   ([`PendingEdits::drain`]), so no reader can see a graph the store does
+//! * anything about to observe the runner's state flushes first
+//!   ([`PendingEdits::drain`]), so no reader can see a graph the runner does
 //!   not have.
 
 use std::collections::HashMap;
@@ -22,16 +22,16 @@ use std::time::{Duration, Instant};
 
 use zeughaus_core::NodeId;
 
-/// How long a node's settings stay quiet before they reach the store. Long
+/// How long a node's settings stay quiet before they reach the runner. Long
 /// enough that ordinary typing never pushes mid-word, short enough that the
 /// pause after a word is not noticeable.
 pub const DEBOUNCE: Duration = Duration::from_millis(400);
 
-/// What one node owes the store: the value each touched setting had there
+/// What one node owes the runner: the value each touched setting had there
 /// before the edits started.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Owed {
-    /// Setting key -> the value the store still holds for it.
+    /// Setting key -> the value the runner still holds for it.
     pub was: HashMap<String, String>,
 }
 
@@ -41,7 +41,7 @@ struct Entry {
     last_edit: Instant,
 }
 
-/// Per-node settings edits that have not reached the store yet.
+/// Per-node settings edits that have not reached the runner yet.
 #[derive(Debug, Default)]
 pub struct PendingEdits {
     nodes: HashMap<NodeId, Entry>,
@@ -54,7 +54,7 @@ impl PendingEdits {
         }
     }
 
-    /// Records an edit of `key` on `node`. `was` is the value the store holds;
+    /// Records an edit of `key` on `node`. `was` is the value the runner holds;
     /// it is kept only the first time this key is touched after a flush, which
     /// is what makes a run of keystrokes one change.
     pub fn touch(&mut self, node: NodeId, key: &str, was: &str, now: Instant) {
@@ -80,7 +80,7 @@ impl PendingEdits {
     /// Takes the nodes whose last edit is at least `delay` old.
     ///
     /// Sorted by node id: two windows applying the same run of edits have to
-    /// produce the same sequence of store calls.
+    /// produce the same sequence of edits.
     pub fn settled(&mut self, now: Instant, delay: Duration) -> Vec<(NodeId, Owed)> {
         let due: Vec<NodeId> = self
             .nodes
@@ -91,7 +91,7 @@ impl PendingEdits {
         self.collect(due)
     }
 
-    /// Takes everything, however fresh: something is about to read the store.
+    /// Takes everything, however fresh: something is about to read the document.
     pub fn drain(&mut self) -> Vec<(NodeId, Owed)> {
         let all: Vec<NodeId> = self.nodes.keys().copied().collect();
         self.collect(all)
@@ -102,14 +102,14 @@ impl PendingEdits {
         self.nodes.remove(&node).map(|entry| entry.owed)
     }
 
-    /// Whether this window still owes the store a value for `key` on `node`.
+    /// Whether this window still owes the runner a value for `key` on `node`.
     ///
-    /// The one question a remote row has to ask before it overwrites a field.
-    /// A held-back edit is 400 ms of typing the store has not seen: adopting
-    /// the shared value for that key snaps the field back mid-word, and the
+    /// The one question a remote change has to ask before it overwrites a field.
+    /// A held-back edit is 400 ms of typing the runner has not seen: adopting
+    /// the runner's value for that key snaps the field back mid-word, and the
     /// held edit then pushes whatever the overwrite left behind. The common
-    /// trigger is this window's own echo -- the debounce fires, the store
-    /// echoes the row a moment later, and by then the user has typed on.
+    /// trigger is this window's own echo -- the debounce fires, the runner
+    /// echoes the change a moment later, and by then the user has typed on.
     pub fn owes(&self, node: NodeId, key: &str) -> bool {
         self.nodes
             .get(&node)
@@ -138,14 +138,14 @@ mod tests {
     }
 
     /// The whole point: a run of keystrokes is one change, and the value it is
-    /// compared against is the one the store holds -- not the previous
+    /// compared against is the one the runner holds -- not the previous
     /// keystroke. A rename detected per character would be seven renames.
     #[test]
-    fn a_run_of_edits_keeps_the_value_the_store_still_holds() {
+    fn a_run_of_edits_keeps_the_value_the_runner_still_holds() {
         let mut pending = PendingEdits::new();
         let start = Instant::now();
         let node = NodeId(1);
-        // `was` is what the store holds, which does not change while the edits
+        // `was` is what the runner holds, which does not change while the edits
         // are unflushed, so the caller passes the same thing every time.
         for step in 0..4 {
             pending.touch(node, "columns", "customer_id:int", start + ms(step * 50));
@@ -209,11 +209,11 @@ mod tests {
         assert!(pending.take(node).is_none());
     }
 
-    /// What a remote row asks before it overwrites a field. Owed is per key
-    /// and per node, and it ends the moment the edit reaches the store --
-    /// otherwise the shared value would never be adopted again.
+    /// What a remote change asks before it overwrites a field. Owed is per key
+    /// and per node, and it ends the moment the edit reaches the runner --
+    /// otherwise the runner's value would never be adopted again.
     #[test]
-    fn a_key_is_owed_until_it_reaches_the_store() {
+    fn a_key_is_owed_until_it_reaches_the_runner() {
         let mut pending = PendingEdits::new();
         let start = Instant::now();
         let node = NodeId(1);

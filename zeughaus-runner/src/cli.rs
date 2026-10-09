@@ -2,9 +2,9 @@
 //!
 //! Both talk to the endpoint a runner printed at start (`[runner] weida
 //! endpoint weida://sha256:<fp>@host:port/`) with the client identity of this
-//! machine's state directory, the same one an editor presents. No store is
-//! involved: a script, a cron entry or a webhook relay names the runner it
-//! means, and the fingerprint in the URL is what makes that safe.
+//! machine's state directory, the same one an editor presents. A script, a
+//! cron entry or a webhook relay names the runner it means, and the
+//! fingerprint in the URL is what makes that safe.
 //!
 //! ```text
 //! zeughaus-runner trigger <endpoint> <node-id> [payload]
@@ -24,7 +24,7 @@ use zeughaus_link::{
 /// serving: a second runner on the same state directory takes the first
 /// one's terminals.
 const USAGE: &str = "\
-usage: zeughaus-runner [--state-dir <dir>] [--feed-addr <host:port>] [--keep-runs <n>] [join <host[:port]/database>]
+usage: zeughaus-runner [--state-dir <dir>] [--feed-addr <host:port>] [--keep-runs <n>]
        zeughaus-runner trigger <endpoint> <node-id> [payload]
        zeughaus-runner hold <endpoint> on|off
        zeughaus-runner ci check|plan|run|status|forge-check|hook ...";
@@ -108,7 +108,7 @@ fn check_serve_args(args: &[String]) -> Result<ServeArgs, String> {
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "-h" | "--help" | "help" => return Ok(ServeArgs::Help),
-            "--feed-addr" | "--keep-runs" | "join" => {
+            "--feed-addr" | "--keep-runs" => {
                 if rest.next().is_none() {
                     return Err(format!("{arg} needs a value"));
                 }
@@ -362,17 +362,17 @@ mod tests {
         for serve in [
             &[][..],
             &["--feed-addr", "10.8.0.10:7443"][..],
-            &["--keep-runs", "20", "join", "127.0.0.1:3000/zeughaus"][..],
+            &["--keep-runs", "20"][..],
         ] {
             assert_eq!(check_serve_args(&args(serve)), Ok(ServeArgs::Serve));
         }
         assert_eq!(check_serve_args(&args(&["--help"])), Ok(ServeArgs::Help));
         assert_eq!(
-            check_serve_args(&args(&["join", "x", "-h"])),
+            check_serve_args(&args(&["--keep-runs", "3", "-h"])),
             Ok(ServeArgs::Help)
         );
         assert!(check_serve_args(&args(&["--version"])).is_err());
         assert!(check_serve_args(&args(&["status"])).is_err());
-        assert!(check_serve_args(&args(&["join"])).is_err());
+        assert!(check_serve_args(&args(&["--keep-runs"])).is_err());
     }
 }

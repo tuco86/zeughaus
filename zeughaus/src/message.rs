@@ -138,7 +138,7 @@ pub enum Message {
     RenameCommit,
     // Escape anywhere: closes the palette and abandons a rename.
     Escape,
-    // A manual trigger node was pressed. Recorded in the shared store so the
+    // A manual trigger node was pressed. Sent to the runner so the
     // one process that executes the graph fires the node once -- the
     // hand-driven counterpart to a timer, and it works from any window.
     NodeTriggered {
@@ -168,16 +168,14 @@ pub enum Message {
     // wasm editor has no timer subscription, so nothing emits it there.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     Tick,
-    // Drain queued remote sync events from the SpacetimeDB subscription and
-    // apply them to the editor. Only active while connected.
+    // The editor's clock: notices a changed runner list, commits settings
+    // that have gone quiet and ages the hint.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     SyncPoll,
-    // Copy the current collaboration session id to the clipboard (palette).
-    CopySessionId,
     // The window was asked to close, by the system or by the close button
     // in the editor's own titlebar. Handled rather than obeyed, because a
-    // settings edit held back for the debounce would otherwise be lost from
-    // the store: the editor flushes and then ends the runtime itself.
+    // settings edit held back for the debounce would otherwise be lost
+    // before it reached the runner: the editor flushes and then ends the runtime itself.
     CloseRequested,
     // The undecorated window's own titlebar and edge grips: the moves a
     // system titlebar would have made. The grips and the minimize button
@@ -218,10 +216,24 @@ pub enum Message {
     // File operations
     SaveGraph,
     LoadGraph,
-    // Constructed by the native load dialog. The browser editor has no file
-    // dialog, so nothing emits it there.
+    // Constructed by the restore path, which brings the local document back.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     GraphLoaded(zeughaus_core::GraphDocument),
+    // A file the user picked to import: its nodes and edges get fresh ids and
+    // join the graphs of the section in front. Constructed by the native
+    // load dialog only.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    GraphImported(zeughaus_core::GraphDocument),
+    // A runner's graph link reported its document, a change, a refusal or its
+    // end, on the link of that epoch: a task that has been replaced may still
+    // have events queued, and a document from a link this editor no longer
+    // holds must not be applied.
+    #[cfg(not(target_arch = "wasm32"))]
+    Graph(
+        crate::workspace::RunnerKey,
+        u64,
+        crate::graph_link::GraphEvent,
+    ),
     // A frame arrived on a Display node's feed. Native-only: the wasm editor
     // has no sync layer, so it never learns where frames come from and nothing
     // can emit this.
@@ -283,7 +295,7 @@ pub enum Message {
 mod tests {
     use super::*;
 
-    /// Save/load and SpacetimeDB sync round-trip pin names through `String`:
+    /// Save/load and the runner's graph protocol round-trip pin names through `String`:
     /// the label must survive as the plain pin name in both directions.
     #[test]
     fn label_round_trips_through_a_plain_string() {

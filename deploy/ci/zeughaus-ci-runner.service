@@ -3,7 +3,7 @@ Description=Zeughaus CI runner (executes the pipelines, owns their terminals)
 
 [Service]
 Type=simple
-ExecStart=/usr/local/lib/zeughaus-ci/bin/zeughaus-runner --state-dir %h/state --keep-runs 20 join 127.0.0.1:3000/zeughaus
+ExecStart=/usr/local/lib/zeughaus-ci/bin/zeughaus-runner --state-dir %h/state --keep-runs 20 --feed-addr 127.0.0.1:7444
 # SIGUSR1 saves the workspace and execs the binary at the same path: an
 # installed update is picked up without touching a terminal or a running job.
 ExecReload=/bin/kill -USR1 $MAINPID
@@ -11,8 +11,8 @@ ExecReload=/bin/kill -USR1 $MAINPID
 # unit's cgroup, and the default KillMode would take every job's shell down
 # with a stop or restart; the next runner reattaches them instead.
 KillMode=process
-# The store may still be starting after a boot: the runner exits when it
-# cannot connect, and is started again.
+# A fixed port, so the editors' `zeughaus.toml` keeps naming this runner
+# across restarts; a start that fails on it is retried.
 Restart=on-failure
 RestartSec=5s
 

@@ -171,7 +171,7 @@ enum SurfaceV1 {
 impl SavedWorkspaceV1 {
     /// Every tab at the top level. A graph pane goes like a closed one: it
     /// named no graph, and the graphs this runner executes get their panes
-    /// from the store. A tab that showed nothing else goes with it.
+    /// from the document. A tab that showed nothing else goes with it.
     fn migrate(self) -> SavedWorkspace {
         let items = self
             .tabs

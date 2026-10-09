@@ -49,7 +49,7 @@ impl App {
     /// feed alone.
     pub(super) fn display_for(&self, node_id: NodeId) -> Option<DisplayValue> {
         // A frame from a feed outranks a reported value, because for an image
-        // pin there is none: pixels never travel through the store or the
+        // pin there is none: pixels never travel through the graph link or the
         // event stream, so the feed is the only thing that has the frame.
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(frame) = self.feed_frame(node_id) {
@@ -575,7 +575,7 @@ fn title_setting<'a>(
 ///
 /// Every edit renders the whole value again and sends it as one
 /// [`Message::NodeSettingChanged`]. The setting therefore stays the plain
-/// `name:type` text that the store, the runner and the node's own parser
+/// `name:type` text that the runner and the node's own parser
 /// already speak, and this editor needs to know nothing about what the fields
 /// mean.
 fn field_setting<'a>(
@@ -874,7 +874,7 @@ mod tests {
     use super::*;
 
     /// The row editor's whole contract: every edit is the setting's full text
-    /// again, so the store, the runner and the node's parser keep speaking
+    /// again, so the runner and the node's parser keep speaking
     /// `name:type` and never learn there were widgets.
     #[test]
     fn editing_a_field_row_renders_the_whole_setting_again() {

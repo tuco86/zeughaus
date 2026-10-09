@@ -1,54 +1,25 @@
-//! The shared store: local edits on their way out, remote rows on their way
-//! in, and the parameters this editor derives for the database nodes.
+//! The graph's way to and from the runners: local edits go to the runner of
+//! their graph, changes come back from it, and this editor derives the
+//! parameters of the database nodes in between.
 //!
-//! Native only, like the store client itself: the browser editor has no sync
-//! layer, so nothing here is compiled for it.
+//! Native only, like the graph link itself: the browser editor has no
+//! transport to a runner, so nothing here is compiled for it.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
-use iced::Point;
-use zeughaus_core::{EdgeData, EdgeId, NodeData, NodeId, occupancy_winner};
+use iced::{Point, Task};
+use zeughaus_core::{EdgeData, EdgeId, GraphDocument, NodeData, NodeId, occupancy_winner};
+use zeughaus_link::{GraphChange, GraphEdit};
 
 use super::App;
 use super::graph::{EditorEdge, relation_references_to};
+use crate::graph_link::GraphEvent;
 use crate::message::{Message, PinLabel};
+use crate::workspace::RunnerKey;
 
-/// One local edit on its way to the store.
-///
-/// The payload is owned and captured when the edit was made, not read again at
-/// send time. That matters only for a replay after a reconnect: the store's
-/// snapshot arrives on the same connection and may already have overwritten
-/// this window's state with the older shared value, and re-reading state then
-/// would send the store its own stale value back.
-#[derive(Debug, Clone)]
-pub(super) enum Outbound {
-    Node(NodeData),
-    Params(NodeId, Vec<(String, String)>),
-    Move(NodeId, f32, f32),
-    Rename(NodeId, String),
-    Delete(NodeId),
-    Connect(EdgeData),
-    Disconnect(EdgeId),
-}
-
-/// Calls the reducer one queued edit means.
-fn send_outbound(
-    conn: &zeughaus_sync::module_bindings::DbConnection,
-    edit: &Outbound,
-) -> Result<(), String> {
-    match edit {
-        Outbound::Node(nd) => zeughaus_sync::send_create_node(conn, nd),
-        Outbound::Params(id, params) => zeughaus_sync::send_set_params(conn, id.0, params),
-        Outbound::Move(id, x, y) => zeughaus_sync::send_move_node(conn, id.0, *x, *y),
-        Outbound::Rename(id, name) => zeughaus_sync::send_rename_node(conn, id.0, name),
-        Outbound::Delete(id) => zeughaus_sync::send_delete_node(conn, id.0),
-        Outbound::Connect(e) => zeughaus_sync::send_connect_edge(conn, e),
-        Outbound::Disconnect(id) => zeughaus_sync::send_disconnect_edge(conn, id.0),
-    }
-}
-
-/// An editor edge as the store's row.
+/// An editor edge as the wire's row.
 pub(super) fn edge_data(e: &EditorEdge) -> EdgeData {
     EdgeData {
         id: e.id.0,
@@ -63,11 +34,11 @@ impl App {
     /// Records the name a table had before this commit, so the runner can
     /// rename the table in the file instead of creating a second one.
     ///
-    /// The editor is the only process that sees the edit: the store holds one
-    /// row per node, and a runner handed a row with a new name cannot tell a
-    /// rename from a table it has never heard of. `was` is the value the store
-    /// held, so however many keystrokes produced the new name, this is the one
-    /// name the file can still be under.
+    /// The editor is the only process that sees the edit: the runner holds
+    /// one node per table, and one handed a node with a new name cannot tell
+    /// a rename from a table it has never heard of. `was` is the value the
+    /// runner held, so however many keystrokes produced the new name, this is
+    /// the one name the file can still be under.
     pub(super) fn settle_table_rename(&mut self, node: NodeId, key: &str, was: &str) {
         if key != "name"
             || self
@@ -100,11 +71,11 @@ impl App {
         self.apply_setting(node, zeughaus_db::RENAMED_FROM, from);
     }
 
-    /// Commits one node's held-back settings to the store: the wires they
-    /// moved, the parameters they are derived into, and the row itself.
+    /// Commits one node's held-back settings to its runner: the wires they
+    /// moved, the parameters they are derived into, and the node itself.
     pub(super) fn commit_node(&mut self, node: NodeId, owed: crate::pending::Owed) {
-        // Sorted so a run of edits produces the same sequence of store calls
-        // in every window that replays it.
+        // Sorted so a run of edits produces the same sequence of edits to the
+        // runner in every window that replays it.
         let mut keys: Vec<(String, String)> = owed.was.into_iter().collect();
         keys.sort();
         for (key, was) in keys {
@@ -134,7 +105,7 @@ impl App {
     }
 
     /// Commits everything now, because something is about to read or change
-    /// the shared graph and must not see a store the local view has outgrown.
+    /// the shared graph and must not see a runner the local view has outgrown.
     pub(super) fn flush_pending(&mut self) {
         if self.pending.is_empty() {
             return;
@@ -144,23 +115,8 @@ impl App {
         }
     }
 
-    /// The live store connection, or `None` while there is none.
-    ///
-    /// `None` is a state, not a failure: the host may be restarting, and this
-    /// window keeps working on a graph it can no longer share.
-    pub(super) fn store_conn(&self) -> Option<&zeughaus_sync::module_bindings::DbConnection> {
-        self.stdb.as_ref().and_then(zeughaus_sync::Store::conn)
-    }
-
-    /// Whether this window's edits are reaching the shared graph.
-    pub(super) fn store_live(&self) -> bool {
-        self.stdb
-            .as_ref()
-            .is_some_and(zeughaus_sync::Store::is_live)
-    }
-
-    /// Serializes one node's current data (id, type, position, params) for a
-    /// reducer call.
+    /// Serializes one node's current data (id, type, position, params) for an
+    /// edit.
     pub(super) fn node_data(&self, id: NodeId) -> Option<NodeData> {
         let node = self.nodes.get(&id)?;
         let params: Vec<(String, String)> = self
@@ -181,128 +137,115 @@ impl App {
             y: node.position.y,
             params,
             parent: node.parent.0,
-            runner: node.runner.clone(),
         })
     }
 
-    // Send: local edits -> reducers. Guarded by `applying_remote` so a change
-    // applied from the store does not echo back as a new reducer call.
+    // Send: local edits -> the runner that holds the graph. Guarded by
+    // `applying_remote` so a change applied from a runner does not echo back
+    // as a new edit.
     //
-    // Every one of them goes through [`Self::dispatch`], which tries the store
-    // and keeps the edit when it cannot: a reducer call that failed is a log
-    // line nobody reads, and a session's worth of work must not go with the
-    // host.
+    // Every one of them names the node that routes it: the edit goes to the
+    // runner of that node's graph, and a graph no runner holds sends nothing.
     pub(super) fn push_node(&mut self, id: NodeId) {
-        if let Some(nd) = self.node_data(id) {
-            self.dispatch(Outbound::Node(nd));
+        if let Some(node) = self.node_data(id) {
+            self.dispatch_for(id, GraphEdit::CreateNode { node });
         }
     }
 
     pub(super) fn push_params(&mut self, id: NodeId) {
         if let Some(nd) = self.node_data(id) {
-            self.dispatch(Outbound::Params(id, nd.params));
+            self.dispatch_for(
+                id,
+                GraphEdit::SetParams {
+                    id: id.0,
+                    params: nd.params,
+                },
+            );
         }
     }
 
     pub(super) fn push_move(&mut self, id: NodeId, x: f32, y: f32) {
-        self.dispatch(Outbound::Move(id, x, y));
+        self.dispatch_for(id, GraphEdit::MoveNode { id: id.0, x, y });
     }
 
     pub(super) fn push_rename(&mut self, id: NodeId, name: String) {
-        self.dispatch(Outbound::Rename(id, name));
+        self.dispatch_for(
+            id,
+            GraphEdit::RenameNode {
+                id: id.0,
+                display_name: name,
+            },
+        );
     }
 
     pub(super) fn push_delete(&mut self, id: NodeId) {
-        self.dispatch(Outbound::Delete(id));
+        self.dispatch_for(id, GraphEdit::DeleteNode { id: id.0 });
     }
 
-    pub(super) fn push_edge(&mut self, e: EdgeData) {
-        self.dispatch(Outbound::Connect(e));
+    /// Routed by the node the wire starts at.
+    pub(super) fn push_edge(&mut self, edge: EdgeData) {
+        let node = NodeId(edge.from_node);
+        self.dispatch_for(node, GraphEdit::ConnectEdge { edge });
     }
 
-    pub(super) fn push_edge_remove(&mut self, id: EdgeId) {
-        self.dispatch(Outbound::Disconnect(id));
+    /// `node` is an endpoint of the wire: the edge is gone from the local
+    /// list by now, so the caller says whose runner holds it.
+    pub(super) fn push_edge_remove(&mut self, id: EdgeId, node: NodeId) {
+        self.dispatch_for(node, GraphEdit::DisconnectEdge { id: id.0 });
     }
 
-    /// Sends one edit to the store, or keeps it until the store is back.
+    /// Sends one edit to the runner of `node`'s graph.
     ///
     /// Silent while a remote change is being applied: that would echo the
-    /// change straight back as a new reducer call.
-    pub(super) fn dispatch(&mut self, edit: Outbound) {
+    /// change straight back as a new edit.
+    fn dispatch_for(&mut self, node: NodeId, edit: GraphEdit) {
         if self.applying_remote {
             return;
         }
-        let sent = self
-            .stdb
-            .as_ref()
-            .and_then(zeughaus_sync::Store::conn)
-            .map(|conn| send_outbound(conn, &edit));
-        match sent {
-            Some(Ok(())) => {}
-            Some(Err(e)) => {
-                // Once per distinct message: a store that refuses every call
-                // would otherwise print one line per keystroke.
-                if self.logged_sends.insert(e.clone()) {
-                    eprintln!("[stdb] {e}");
-                }
-                self.outbox.push(edit);
-            }
-            // No connection at all: nothing to say that the status bar is not
-            // already saying.
-            None => self.outbox.push(edit),
-        }
+        self.send_edit_for(node, edit);
     }
 
-    /// Replays what the store never received, oldest first.
+    /// Queues `edit` on the graph link of the runner that holds `node`'s
+    /// graph. Nothing is sent for a local graph, a runner that is not
+    /// connected, or a link whose task has not been started yet.
     ///
-    /// Order is the whole point: a node has to exist before an edge names it,
-    /// and a delete has to come after the create it undoes. An edit that fails
-    /// again stays queued, and everything after it stays behind it.
-    pub(super) fn flush_outbox(&mut self) {
-        if self.outbox.is_empty() {
-            return;
-        }
-        let Some(conn) = self.stdb.as_ref().and_then(zeughaus_sync::Store::conn) else {
+    /// Call this before the node is removed locally: the runner is read off
+    /// the node's graph.
+    fn send_edit_for(&mut self, node: NodeId, edit: GraphEdit) {
+        let Some(edits) = self
+            .runner_of(node)
+            .and_then(|target| self.runtime.links.get(&RunnerKey::new(target)))
+            .and_then(|link| link.edits.clone())
+        else {
             return;
         };
-        let queued = std::mem::take(&mut self.outbox);
-        let total = queued.len();
-        let mut kept: Vec<Outbound> = Vec::new();
-        for edit in queued {
-            if !kept.is_empty() {
-                kept.push(edit);
-                continue;
-            }
-            if let Err(e) = send_outbound(conn, &edit) {
-                eprintln!("[stdb] {e} (keeping {} edits)", total - kept.len());
-                kept.push(edit);
-            }
-        }
-        if kept.is_empty() {
-            eprintln!("[stdb] {total} local edit(s) reached the store");
-        }
-        self.outbox = kept;
+        let request = self.next_edit_request;
+        self.next_edit_request += 1;
+        // A send error means the task is gone; the next `restart_graph`
+        // replaces the channel.
+        let _ = edits.unbounded_send((request, edit));
     }
 
-    // Receive: drain queued remote events and apply them to the editor.
+    // Receive: what a runner reports is applied to the editor.
 
     /// Settles which wire owns a single-slot input pin, deleting the losers
-    /// here and in the store. Returns whether `arriving` won.
+    /// here and at the runner. Returns whether `arriving` won.
     ///
     /// Only the remote path needs it: a local connect cannot land on an
     /// occupied input (`can_connect` rejects it), but two windows can each
     /// draw one without seeing the other. The verdict comes from
     /// [`occupancy_winner`] rather than from arrival order, so every window
     /// and every runner keeps the same wire -- ordering by arrival leaves each
-    /// window with whichever row reached it last, and a window opened
+    /// window with whichever wire reached it last, and a window opened
     /// afterwards with a third answer.
     ///
-    /// The deletion is pushed even while a remote change is being applied.
-    /// That guard is there to stop an echo, and this is not one: the row
+    /// The deletion is sent even while a remote change is being applied.
+    /// That guard is there to stop an echo, and this is not one: the wire
     /// deleted is a different edge than the one that arrived. Every window
-    /// that sees both rows issues the same delete and the reducer is
-    /// idempotent, so agreeing is cheap and leaving the row is not -- nothing
-    /// would ever remove it and it would outlive every view that dropped it.
+    /// that sees both wires issues the same delete and the runner takes a
+    /// repeat as nothing to do, so agreeing is cheap and leaving the wire is
+    /// not -- nothing would ever remove it and it would outlive every view
+    /// that dropped it.
     pub(super) fn resolve_input_occupancy(
         &mut self,
         arriving: EdgeId,
@@ -322,99 +265,166 @@ impl App {
         let winner = occupancy_winner(contenders.iter().copied()).expect("contenders is not empty");
         for loser in contenders.into_iter().filter(|id| *id != winner) {
             self.forget_edge(loser);
-            // Not through `dispatch`: that is silent while a remote change is
-            // being applied, which is right for an echo and wrong here -- the
-            // row deleted is a different edge than the one that arrived. If
-            // the store is gone the loser's row goes with it anyway.
-            if let Some(conn) = self.store_conn() {
-                let _ = zeughaus_sync::send_disconnect_edge(conn, loser.0);
-            }
+            // Not through `dispatch_for`: that is silent while a remote change
+            // is being applied, which is right for an echo and wrong here --
+            // the wire deleted is a different edge than the one that arrived.
+            self.send_edit_for(to_node, GraphEdit::DisconnectEdge { id: loser.0 });
         }
         winner == arriving
     }
 
-    pub(super) fn drain_sync(&mut self) {
-        let mut events = Vec::new();
-        if let Some(rx) = &self.sync_rx {
-            while let Ok(ev) = rx.try_recv() {
-                events.push(ev);
+    /// Applies what one runner's graph link reported.
+    pub(super) fn apply_graph_event(&mut self, key: RunnerKey, event: GraphEvent) -> Task<Message> {
+        let label = self
+            .runtime
+            .links
+            .get(&key)
+            .map(|link| link.label.clone())
+            .unwrap_or_default();
+        match event {
+            GraphEvent::Attached { document } => {
+                self.applying_remote = true;
+                self.replace_runner_graphs(&key, document);
+                // The node an edge was waiting for may have been in this very
+                // document.
+                self.resolve_pending_edges();
+                self.applying_remote = false;
+                self.finish_remote_batch();
+                if let Some(link) = self.runtime.links.get_mut(&key) {
+                    link.graph_live = true;
+                }
+            }
+            GraphEvent::Changed(change) => {
+                self.applying_remote = true;
+                match change {
+                    GraphChange::NodeUpsert { node } => self.apply_node_upsert(node, key.as_str()),
+                    GraphChange::NodeRemove { id } => self.apply_node_remove(NodeId(id)),
+                    GraphChange::EdgeInsert { edge } => self.apply_edge_insert(edge),
+                    GraphChange::EdgeRemove { id } => self.apply_edge_remove(EdgeId(id)),
+                }
+                self.resolve_pending_edges();
+                self.applying_remote = false;
+                self.finish_remote_batch();
+            }
+            GraphEvent::Refused(message) => {
+                eprintln!("[graph] {label}: {message}");
+                self.hint = Some((
+                    format!("{label} refused an edit: {message}"),
+                    iced::time::Instant::now(),
+                ));
+                return Task::none();
+            }
+            GraphEvent::Lost | GraphEvent::GaveUp => {
+                if let Some(link) = self.runtime.links.get_mut(&key) {
+                    link.graph_live = false;
+                }
+                return Task::none();
             }
         }
-        if events.is_empty() {
-            return;
-        }
-        self.applying_remote = true;
-        for ev in events {
-            self.apply_sync_event(ev);
-        }
-        // The node an edge was waiting for may have been in this very batch.
-        self.resolve_pending_edges();
-        self.applying_remote = false;
-        // After the guard, not during: deriving a database node's parameters is
-        // this editor's own decision and has to reach the store, which
-        // `push_params` refuses while a remote change is being applied. It is
-        // also the whole batch that decides the answer -- the table a node
-        // reads its columns from may have arrived in it.
+        // A Display may have appeared, and with it a feed to open.
+        self.reconcile_runtime()
+    }
+
+    /// What follows every applied batch of remote changes.
+    ///
+    /// After the `applying_remote` guard, not during: deriving a database
+    /// node's parameters is this editor's own decision and has to reach the
+    /// runner, which `push_params` refuses while a remote change is being
+    /// applied. It is also the whole batch that decides the answer -- the
+    /// table a node reads its columns from may have arrived in it.
+    ///
+    /// A batch that added an edge changed what every node it touches shows:
+    /// the value was already known, the wire to carry it was not. Nothing
+    /// else refreshes the display map on the remote path, so without this a
+    /// graph built by another window sits there with the wires drawn and the
+    /// bodies empty until the next value arrives.
+    fn finish_remote_batch(&mut self) {
         self.derive_all_db_params();
-        // A batch that added an edge changed what every node it touches shows:
-        // the value was already known, the wire to carry it was not. Nothing
-        // else refreshes the display map on the remote path, so without this a
-        // graph built by another window sits there with the wires drawn and
-        // the bodies empty until the next value arrives.
         self.update_display_values();
     }
 
-    pub(super) fn apply_sync_event(&mut self, ev: zeughaus_sync::SyncEvent) {
-        use zeughaus_sync::SyncEvent;
-        match ev {
-            SyncEvent::NodeUpsert(nd) => self.apply_node_upsert(nd),
-            SyncEvent::NodeRemove(id) => self.apply_node_remove(NodeId(id)),
-            SyncEvent::EdgeInsert(ed) => self.apply_edge_insert(ed),
-            SyncEvent::EdgeRemove(id) => self.apply_edge_remove(EdgeId(id)),
-            SyncEvent::RuntimesChanged => self.apply_runtimes_changed(),
-            // The batch may have brought this editor's first look at the
-            // runtime table, which is where the endpoint to dial comes from.
-            SyncEvent::SubscriptionApplied => {}
-            // The store is back: whatever this window edited while it was gone
-            // has not reached it, and now can.
-            SyncEvent::Connected => self.flush_outbox(),
-            // Said in the status bar rather than here: `Store::is_live` is the
-            // authority, and it answers without waiting for an event.
-            SyncEvent::Disconnected => {}
+    /// Makes the nodes and wires of `key`'s graphs exactly what `document`
+    /// says: whatever this editor holds for that runner and the document
+    /// lacks is dropped, the rest is applied in the document's order.
+    fn replace_runner_graphs(&mut self, key: &RunnerKey, document: GraphDocument) {
+        let owned: Vec<NodeId> = self
+            .node_order
+            .iter()
+            .copied()
+            .filter(|id| self.runner_of(*id) == Some(key.as_str()))
+            .collect();
+        let known_nodes: HashSet<u64> = document.nodes.iter().map(|n| n.id).collect();
+        let known_edges: HashSet<u64> = document.edges.iter().map(|e| e.id).collect();
+        let owned_set: HashSet<NodeId> = owned.iter().copied().collect();
+        let stale_edges: Vec<EdgeId> = self
+            .edges
+            .iter()
+            .filter(|e| owned_set.contains(&e.from_node) || owned_set.contains(&e.to_node))
+            .filter(|e| !known_edges.contains(&e.id.0))
+            .map(|e| e.id)
+            .collect();
+        for edge in stale_edges {
+            self.apply_edge_remove(edge);
+        }
+        // Children come after their parents in `node_order`, so the reverse
+        // walk removes the inside of a graph before the graph.
+        for node in owned.into_iter().rev() {
+            if !known_nodes.contains(&node.0) {
+                self.apply_node_remove(node);
+            }
+        }
+        for node in document.nodes {
+            self.apply_node_upsert(node, key.as_str());
+        }
+        for edge in document.edges {
+            self.apply_edge_insert(edge);
         }
     }
 
-    /// Re-reads whether anything is executing the graph.
-    ///
-    /// The editor is not a candidate -- it registers as `Role::Viewer` and never
-    /// appears in the runtime table -- so this is purely informational. It is
-    /// still the difference between a live number and a stale one, which is the
-    /// one thing a user must not have to guess about.
-    pub(super) fn apply_runtimes_changed(&mut self) {
-        if let Some(conn) = self.store_conn() {
-            self.runtimes = zeughaus_sync::runtime_count(conn);
+    /// Drops every graph of a runner that is gone, with what is inside them:
+    /// there is nobody left to hold them, and the runner that replaces it
+    /// sends its own document.
+    pub(super) fn forget_runner_graphs(&mut self, key: &RunnerKey) {
+        let graphs: Vec<NodeId> = self
+            .top_level_graphs()
+            .filter(|node| node.runner == key.as_str())
+            .map(|node| node.id)
+            .collect();
+        self.applying_remote = true;
+        for graph in graphs {
+            // `descendants` yields a parent before its children.
+            let mut doomed = self.descendants(graph);
+            doomed.reverse();
+            doomed.push(graph);
+            for node in doomed {
+                self.apply_node_remove(node);
+            }
         }
+        self.applying_remote = false;
     }
 
-    pub(super) fn apply_node_upsert(&mut self, nd: NodeData) {
+    /// Adds or updates one node from a runner's document. `runner` is the
+    /// section the runner's graphs live in; it is kept on top-level nodes
+    /// only.
+    pub(super) fn apply_node_upsert(&mut self, nd: NodeData, runner: &str) {
         let id = NodeId(nd.id);
+        let runner = if nd.parent == 0 { runner } else { "" };
         let mut moved_from = None;
         if self.nodes.contains_key(&id) {
             if let Some(en) = self.nodes.get_mut(&id) {
                 en.position = Point::new(nd.x, nd.y);
                 en.display_name.clone_from(&nd.display_name);
-                // A legacy session's root nodes are adopted into a graph by
-                // a runner, which reparents rows this window already holds.
                 if en.parent != NodeId(nd.parent) {
                     moved_from = Some(en.parent);
                     en.parent = NodeId(nd.parent);
                 }
-                en.runner.clone_from(&nd.runner);
+                en.runner.clear();
+                en.runner.push_str(runner);
             }
             self.apply_params(id, &nd.params);
         } else {
-            self.insert_node_from_data(&nd);
-            // A value can arrive before the node row it belongs to: this is
+            self.insert_node_from_data(&nd, runner);
+            // A value can arrive before the node it belongs to: this is
             // where the one that was waiting is applied.
             self.reapply_remote_outputs(id);
         }
@@ -426,7 +436,7 @@ impl App {
         }
         // The database parameters this node needs are derived once the whole
         // batch has been applied (`derive_all_db_params`): they have to reach
-        // the store, and `push_params` is silent while a remote change is
+        // the runner, and `push_params` is silent while a remote change is
         // being applied.
     }
 
@@ -543,9 +553,8 @@ impl App {
             changed = true;
         }
         if changed {
-            // The store carries the parameter to the runner, which derives
-            // nothing itself: an insert's pins follow its column list, and
-            // that list is a parameter like any other.
+            // The runner derives nothing itself: an insert's pins follow its
+            // column list, and that list is a parameter like any other.
             self.push_params(node);
         }
     }
@@ -600,17 +609,17 @@ impl App {
         }
     }
 
-    /// Adopts the parameters a row carries. Every one of them is text the node
-    /// parses, so a refusal lands under the field exactly as it does for a
-    /// value typed in this window.
+    /// Adopts the parameters a node carries. Every one of them is text the
+    /// node parses, so a refusal lands under the field exactly as it does for
+    /// a value typed in this window.
     pub(super) fn apply_params(&mut self, id: NodeId, params: &[(String, String)]) {
         for (name, text) in params {
-            // A key this window still owes the store is one the user is
+            // A key this window still owes the runner is one the user is
             // typing: the shared value for it is older than what is on screen
             // (usually this window's own echo, one debounce behind), and
             // adopting it snaps the field back mid-word and then pushes the
             // snapped-back text. The remote value is taken for that key the
-            // next time the row arrives with nothing owed.
+            // next time the node arrives with nothing owed.
             if self.pending.owes(id, name) {
                 continue;
             }
@@ -636,7 +645,8 @@ impl App {
         self.setting_errors.remove(&id);
         // A value whose producer is gone is not a value any more, and node ids
         // are never reused, so nothing can inherit it. Same for what this
-        // window still owed the store: the row it would have updated is gone.
+        // window still owed the runner: the node it would have updated is
+        // gone.
         {
             self.pending.take(id);
             self.runtime.remote_outputs.remove(&id);
@@ -664,9 +674,9 @@ impl App {
         let from_node = NodeId(ed.from_node);
         let to_node = NodeId(ed.to_node);
         // An edge naming a node this window does not have yet is kept, not
-        // dropped: a subscription applies as one burst with no ordering between
-        // tables, so edges routinely arrive before their nodes. Dropping them
-        // leaves a freshly opened editor showing a fraction of the wires.
+        // dropped: a document applies as one burst, and a node of a type this
+        // build does not know never arrives at all. Dropping the edge would
+        // leave a freshly opened editor showing a fraction of the wires.
         if !self.nodes.contains_key(&from_node) || !self.nodes.contains_key(&to_node) {
             self.pending_edges.push(ed);
             return;
@@ -679,7 +689,7 @@ impl App {
             && !self.resolve_input_occupancy(edge_id, to_node, &to_pin)
         {
             // This wire lost the pin to one already there. It is gone from the
-            // store by now, so there is nothing left to draw.
+            // runner by now, so there is nothing left to draw.
             return;
         }
         self.edges.push(EditorEdge {
@@ -705,7 +715,7 @@ impl App {
     }
 
     /// Retries edges that named a node this window did not have yet. Called once
-    /// per drained batch, because the node they were waiting for may have been
+    /// per applied batch, because the node they were waiting for may have been
     /// in the same batch.
     pub(super) fn resolve_pending_edges(&mut self) {
         if self.pending_edges.is_empty() {
@@ -718,13 +728,13 @@ impl App {
 }
 
 /// Whether handling this message reads or changes the shared graph, and
-/// therefore has to see the store the local view already shows.
+/// therefore has to see the runner the local view already shows.
 ///
 /// The settings-editing messages are absent by design: holding them back from
-/// the store until the typing stops is exactly what this list protects.
+/// the runner until the typing stops is exactly what this list protects.
 /// `SyncPoll` is absent too -- it commits what has settled instead, and
 /// flushing there would make the delay meaningless.
-pub(super) fn observes_store(message: &Message) -> bool {
+pub(super) fn observes_graph(message: &Message) -> bool {
     matches!(
         message,
         Message::EdgeConnected { .. }
@@ -738,6 +748,6 @@ pub(super) fn observes_store(message: &Message) -> bool {
             | Message::SpawnNode { .. }
             | Message::NodeTriggered { .. }
             | Message::SaveGraph
-            | Message::GraphLoaded(_)
+            | Message::GraphImported(_)
     )
 }

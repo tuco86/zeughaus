@@ -69,9 +69,6 @@ pub fn build_commands(
 
     // Non-node commands first.
     let mut commands = vec![
-        command("session.copy", "Session / Copy Session ID".to_string())
-            .description("Copy the current collaboration session id to the clipboard")
-            .action(Message::CopySessionId),
         command("graph.autolayout", "Graph / Auto Layout".to_string())
             .description("Arrange the nodes of the current graph in columns by depth")
             .action(Message::AutoLayout),

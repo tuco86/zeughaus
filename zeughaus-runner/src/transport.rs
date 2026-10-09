@@ -22,8 +22,8 @@ use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
 use weida::{
-    Binding, EndpointAddr, Fingerprint, Listener, Puller, Replier, Runtime, RuntimeConfig,
-    ServerTls, TransferMeta, Trust,
+    Binding, EndpointAddr, Fingerprint, IncomingMeta, Listener, PeerIdentity, Puller, Replier,
+    Runtime, RuntimeConfig, ServerTls, TransferMeta, Trust,
 };
 use zeughaus_link::{MAX_TRIGGER_BYTES, Snapshot, TriggerRequest, credentials};
 
@@ -48,8 +48,8 @@ impl Transport {
     /// the process that exists first: an editor on this machine must find a
     /// key that is already trusted rather than one it minted itself.
     ///
-    /// Nothing is announced from here: the caller does that once it has a store
-    /// connection, and it must not happen before this returns -- an editor
+    /// Nothing is announced from here: the caller writes the endpoint file once
+    /// this returns, and it must not happen before -- an editor
     /// pointed at a runtime that is not yet serving would fail its first
     /// request and have no reason to try again.
     pub async fn start(bind: SocketAddr, state_dir: &Path) -> Result<Transport, String> {
@@ -139,6 +139,15 @@ fn announced_host(bind: SocketAddr) -> String {
     match bind.ip() {
         ip if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST).to_string(),
         ip => ip.to_string(),
+    }
+}
+
+/// The name the runner shows others for a peer: the fingerprint it proved.
+pub(crate) fn principal_of(meta: &IncomingMeta) -> Option<String> {
+    match &meta.peer {
+        Some(PeerIdentity::Key(fp)) => Some(fp.to_string()),
+        Some(other) => Some(format!("{other:?}")),
+        None => None,
     }
 }
 
@@ -373,7 +382,7 @@ mod tests {
 
     /// A full queue must cost a dropped press, not a stalled transport: this
     /// runs on the task that also reads the connection, and the event loop it
-    /// feeds serves the store and the clocks.
+    /// feeds serves the graph and the clocks.
     #[test]
     fn a_full_trigger_queue_drops_the_press() {
         let (tx, rx) = std::sync::mpsc::sync_channel::<TriggerRequest>(1);

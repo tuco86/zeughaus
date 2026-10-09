@@ -8,7 +8,8 @@
 //! WezTerm colour schemes -- the format every iTerm2-Color-Schemes entry is
 //! published in, so a scheme is dropped in rather than converted.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use iced_tabs::Placement;
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,9 @@ use zeughaus_theme::Theme;
 const FILE: &str = "editor.toml";
 /// The directory user themes are read from.
 const THEMES: &str = "themes";
+/// The file listing the remote runners this editor connects to besides the
+/// one of this machine.
+const CONFIG: &str = "zeughaus.toml";
 
 /// What one editor window starts as.
 ///
@@ -158,6 +162,94 @@ pub fn themes() -> Vec<Theme> {
     themes
 }
 
+/// `zeughaus.toml`: what the user adds by hand.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Config {
+    /// Runner URLs (`weida://sha256:...@host:port/`), each pinning its peer.
+    remotes: Vec<String>,
+}
+
+/// The `remotes` of a `zeughaus.toml` text.
+fn parse_remotes(text: &str) -> Result<Vec<String>, String> {
+    toml::from_str::<Config>(text)
+        .map(|config| config.remotes)
+        .map_err(|e| e.to_string())
+}
+
+/// Modification time of `path`; `None` while it is missing.
+fn stamp(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Which files the runner list was read from, as of when.
+///
+/// The list is the runner of this machine (its `endpoint` file, rewritten
+/// whenever that runner starts) followed by `zeughaus.toml`'s remotes. Both
+/// change while the editor runs, so the editor asks [`Self::poll`] on its
+/// clock instead of reading them again every turn.
+pub struct RunnerSources {
+    endpoint_mtime: Option<SystemTime>,
+    config_mtime: Option<SystemTime>,
+}
+
+impl RunnerSources {
+    /// The sources as they are now, with the runner URLs they name.
+    pub fn load() -> (Self, Vec<String>) {
+        let dir = zeughaus_link::credentials::state_dir();
+        let sources = Self {
+            endpoint_mtime: stamp(&zeughaus_link::credentials::endpoint_path(&dir)),
+            config_mtime: stamp(&dir.join(CONFIG)),
+        };
+        (sources, read_runner_urls(&dir))
+    }
+
+    /// The new URL list when either file changed (or appeared or vanished)
+    /// since the last call, else `None`.
+    pub fn poll(&mut self) -> Option<Vec<String>> {
+        let dir = zeughaus_link::credentials::state_dir();
+        let endpoint_mtime = stamp(&zeughaus_link::credentials::endpoint_path(&dir));
+        let config_mtime = stamp(&dir.join(CONFIG));
+        if endpoint_mtime == self.endpoint_mtime && config_mtime == self.config_mtime {
+            return None;
+        }
+        self.endpoint_mtime = endpoint_mtime;
+        self.config_mtime = config_mtime;
+        Some(read_runner_urls(&dir))
+    }
+}
+
+/// The local runner's URL, then the remotes, each only if it can be dialled
+/// with a pinned peer. A rejected entry is reported once per reload.
+fn read_runner_urls(dir: &Path) -> Vec<String> {
+    let mut candidates: Vec<String> = zeughaus_link::credentials::read_endpoint(dir)
+        .into_iter()
+        .collect();
+    let path = dir.join(CONFIG);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match parse_remotes(&text) {
+            Ok(remotes) => candidates.extend(remotes),
+            Err(e) => eprintln!("[config] {}: {e}", path.display()),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("[config] {}: {e}", path.display()),
+    }
+    candidates
+        .into_iter()
+        .filter(|url| match weida::EndpointAddr::parse(url) {
+            Ok(addr) if addr.peer.is_some() => true,
+            Ok(_) => {
+                eprintln!("[config] skipping {url}: no pinned fingerprint");
+                false
+            }
+            Err(e) => {
+                eprintln!("[config] skipping {url}: {e}");
+                false
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +274,13 @@ mod tests {
         let partial: Prefs = toml::from_str("theme = \"Dracula\"").expect("partial parse");
         assert_eq!(partial.theme, "Dracula");
         assert!(matches!(Placement::from(partial.tabs), Placement::Top));
+    }
+
+    #[test]
+    fn remotes_are_read_from_the_list_and_bad_toml_is_an_error() {
+        let remotes = parse_remotes("remotes = [\"weida://a\", \"weida://b\"]").expect("parse");
+        assert_eq!(remotes, ["weida://a", "weida://b"]);
+        assert!(parse_remotes("").expect("empty").is_empty());
+        assert!(parse_remotes("remotes = [").is_err());
     }
 }

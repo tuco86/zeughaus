@@ -135,11 +135,11 @@ pub fn client_tls() -> ClientTls {
 ///
 /// Weida keeps an address alive from its first successful dial on, and
 /// reports a first dial that failed to the caller instead: a runtime that is
-/// announced but not yet answering, or one whose row outlived it, has to be
+/// announced but not yet answering, or one whose endpoint outlived it, has to be
 /// asked again by this side. Only an address that cannot be dialled at all --
 /// malformed, or a fingerprint that is not one -- is given up on; everything
 /// else is a runtime that may still come, and the caller's task is dropped
-/// when the store says otherwise.
+/// when the endpoint file or `zeughaus.toml` says otherwise.
 ///
 /// `connect` is a plain closure returning the endpoint's `connect` future,
 /// not an `async` closure: the future an `AsyncFn` returns borrows the closure
@@ -196,8 +196,8 @@ pub async fn gave_up(link: &mut PeerEvents) -> GiveUp {
 ///
 /// `PeerChanged` is the one worth recognizing: a runner regenerates its
 /// identity per start, so a restarted runner on the same port is a stranger to
-/// the address that was dialled. The store announces the new address, and the
-/// task that logged this is replaced by one that dials it.
+/// the address that was dialled. The endpoint file (or `zeughaus.toml`) names
+/// the new address, and the task that logged this is replaced by one that dials it.
 pub fn explain(why: &GiveUp) -> String {
     match why {
         GiveUp::PeerChanged {

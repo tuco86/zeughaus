@@ -3,8 +3,8 @@
 //! Three endpoints, one vocabulary. [`RuntimeEvent`] is published on `/events`
 //! as it happens, [`Snapshot`] answers `/snapshot` for an editor that joined
 //! late, and [`TriggerRequest`] travels the other way on `/triggers`. None of
-//! it goes through the shared store: the store says WHO runs the graph and
-//! WHERE that runtime is reachable, and everything a pass produces travels
+//! it goes through the graph link: that carries the document (which nodes
+//! exist and how they are wired), and everything a pass produces travels
 //! straight from the process that computed it.
 //!
 //! `seq` is one monotonic counter per runner process, stamped on every event

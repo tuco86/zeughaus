@@ -17,9 +17,9 @@ mod node_view;
 pub(crate) mod restore;
 /// What the runtime reported: values, failures, feeds, particles.
 mod runtime;
-/// The shared store: rows in, edits out.
+/// The graphs the runners hold: edits out, changes in.
 #[cfg(not(target_arch = "wasm32"))]
-mod store;
+mod sync;
 /// The runner's terminals and the panes that show them.
 #[cfg(not(target_arch = "wasm32"))]
 mod terminal;
@@ -167,10 +167,10 @@ pub struct App {
     // not part of the shared graph document.
     node_sizes: HashMap<NodeId, iced::Size>,
 
-    // Edges from the store whose endpoint nodes have not arrived yet. A
-    // subscription applies as one burst with no ordering between tables, so an
-    // edge routinely precedes its nodes; dropping those is what left a fresh
-    // window showing a fraction of the wires.
+    // Edges whose endpoint nodes are not here yet wait until they arrive: a
+    // document or a burst of changes can name an edge before the nodes it joins
+    // (a node of an unknown type, or container pins not refreshed yet), and
+    // dropping those left wires missing.
     #[cfg(not(target_arch = "wasm32"))]
     pending_edges: Vec<EdgeData>,
 
@@ -210,37 +210,19 @@ pub struct App {
     /// The node whose header currently shows a name field, if any.
     renaming: Option<Rename>,
 
-    // The store connection, which rebuilds itself when the host goes away.
-    // Held rather than a bare `DbConnection` because there is no such thing as
-    // a connection a process can be handed once: a host restart or a dropped
-    // packet ends it, and editing against the corpse reaches nobody.
-    #[cfg(not(target_arch = "wasm32"))]
-    stdb: Option<zeughaus_sync::Store>,
-    // Edits that have not reached the store, in the order they were made.
-    // Replayed when the connection comes back. Each entry carries the payload
-    // as it was at the time of the edit, not a reference to state that the
-    // reconnect's snapshot may have overwritten in the meantime.
-    #[cfg(not(target_arch = "wasm32"))]
-    outbox: Vec<store::Outbound>,
-    // Reducer failures already logged, so a store that refuses every call does
-    // not fill the terminal with one line per edit.
-    #[cfg(not(target_arch = "wasm32"))]
-    logged_sends: HashSet<String>,
-    // Receiver for remote changes, drained on the SyncPoll timer.
-    #[cfg(not(target_arch = "wasm32"))]
-    sync_rx: Option<std::sync::mpsc::Receiver<zeughaus_sync::SyncEvent>>,
-    // True while applying a remote change, so it does not echo back as a reducer.
+    // True while applying a remote change, so it does not echo back as an edit.
     #[cfg(not(target_arch = "wasm32"))]
     applying_remote: bool,
-    // The joined collaboration session id (database name), if any. Shown via the
-    // palette "Copy Session ID" command so others can `join` the same session.
+    /// Where the runner list comes from: the local runner's endpoint file and
+    /// the remotes of `zeughaus.toml`. Polled on the sync clock.
     #[cfg(not(target_arch = "wasm32"))]
-    session_id: Option<String>,
-    // How many runtime processes the store knows about. This process registers
-    // as `Role::Viewer`, so it is never one of them: the count only answers
-    // "is anything computing the values on screen".
+    runner_sources: crate::prefs::RunnerSources,
+    /// The runners to be connected to, as URLs that pin a peer.
     #[cfg(not(target_arch = "wasm32"))]
-    runtimes: usize,
+    runner_urls: Vec<String>,
+    /// The number the next edit sent to a runner carries; a refusal names it.
+    #[cfg(not(target_arch = "wasm32"))]
+    next_edit_request: u64,
     /// What the runtime reported and what this editor holds about it: values,
     /// failures, feeds, particles. See [`RuntimeView`].
     runtime: RuntimeView,
@@ -253,9 +235,9 @@ pub struct App {
     /// ([`zeughaus_link::RuntimeEvent::SettingRejected`]). They agree about
     /// what a refusal is, so they share the map; a snapshot or a lost runtime
     /// replaces it wholesale, and a local refusal that has not reached the
-    /// store yet is recorded again by the next keystroke.
+    /// runner yet is recorded again by the next keystroke.
     setting_errors: HashMap<NodeId, HashMap<String, String>>,
-    /// Settings edits the store has not seen yet. See [`crate::pending`].
+    /// Settings edits the runner has not seen yet. See [`crate::pending`].
     #[cfg(not(target_arch = "wasm32"))]
     pending: crate::pending::PendingEdits,
     /// Each connected runner's terminal multiplexer, while one is reachable.
@@ -274,9 +256,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(session: Option<String>) -> Self {
-        #[cfg(target_arch = "wasm32")]
-        let _ = session;
+    pub fn new() -> Self {
         // Capture and LLM plugins are native-only (DXGI capture, local model
         // host). The wasm editor designs graphs; native runners execute them.
         let plugins: Vec<Box<dyn DomainPlugin>> = vec![
@@ -309,41 +289,11 @@ impl App {
             c
         });
 
-        // `session` is the join token, or `None` to host the default session
-        // on the local store. The token is what the palette's "Copy Session
-        // ID" shares so a buddy can join.
-        //
-        // The first connection still has to succeed: a token naming a store
-        // that is not there is a startup mistake, and retrying it forever
-        // would only hide it. What is not fatal is LOSING it -- see
-        // [`zeughaus_sync::Store`]. With no store at all this window edits a
-        // local scratch graph, which is what makes an editor usable before
-        // `spacetime start`; that graph is gone when the window closes unless
+        // The runners this window connects to. With none, this window edits
+        // a local scratch graph, which is gone when the window closes unless
         // it is saved to a file.
         #[cfg(not(target_arch = "wasm32"))]
-        let (stdb, sync_rx, session_id) = {
-            let session = zeughaus_sync::Session::resolve(session.as_deref());
-            // Role::Viewer: this process edits and displays, it never executes,
-            // so it must not register in the runtime table and be elected owner.
-            match zeughaus_sync::Store::open(
-                &session.uri,
-                &session.database,
-                zeughaus_sync::Role::Viewer,
-            ) {
-                Ok((store, rx)) => {
-                    eprintln!("[stdb] session token: {}", session.token);
-                    (Some(store), Some(rx), Some(session.token))
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[stdb] cannot reach {} / {}: {e} -- editing locally \
-                         (start it with `spacetime start` and restart to collaborate)",
-                        session.uri, session.database
-                    );
-                    (None, None, None)
-                }
-            }
-        };
+        let (runner_sources, runner_urls) = crate::prefs::RunnerSources::load();
 
         // The bundled pack first, then what the user dropped into the state
         // directory: a file theme that takes a pack name loses, so a bundled
@@ -416,23 +366,15 @@ impl App {
             palette_input: String::new(),
             palette_selected: 0,
             #[cfg(not(target_arch = "wasm32"))]
-            stdb,
-            #[cfg(not(target_arch = "wasm32"))]
-            sync_rx,
-            #[cfg(not(target_arch = "wasm32"))]
             applying_remote: false,
             #[cfg(not(target_arch = "wasm32"))]
-            session_id,
-            // No runtime is known until the subscription delivers that table,
-            // and this process never adds itself to it.
+            runner_sources,
             #[cfg(not(target_arch = "wasm32"))]
-            runtimes: 0,
+            runner_urls,
             #[cfg(not(target_arch = "wasm32"))]
-            outbox: Vec::new(),
-            #[cfg(not(target_arch = "wasm32"))]
-            logged_sends: HashSet::new(),
-            // Nothing is known about a runtime until one announces itself in
-            // the store: no address, no values, no feed.
+            next_edit_request: 1,
+            // Nothing is known about a runtime until a runner link reports:
+            // no values, no feed.
             runtime: RuntimeView::default(),
             setting_errors: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -445,11 +387,11 @@ impl App {
             #[cfg(not(target_arch = "wasm32"))]
             pending_restore: None,
         };
-        // Without a store this window edits a scratch document, and a fresh
+        // Without a runner this window edits a scratch document, and a fresh
         // one opens on a canvas rather than on an empty tab bar. A restore
         // or a loaded file replaces it.
         #[cfg(not(target_arch = "wasm32"))]
-        let scratch = app.stdb.is_none();
+        let scratch = app.runner_urls.is_empty();
         #[cfg(target_arch = "wasm32")]
         let scratch = true;
         if scratch && let Some(graph) = app.create_graph("") {
@@ -475,7 +417,7 @@ impl App {
         Task::none()
     }
 
-    /// No store, nothing to hold back.
+    /// No runner, nothing to hold back.
     #[cfg(target_arch = "wasm32")]
     fn flush_pending(&mut self) {}
 
@@ -512,26 +454,28 @@ impl App {
     /// is the difference.
     #[cfg(not(target_arch = "wasm32"))]
     fn runtime_text(&self) -> String {
-        // First, because it outranks everything after it: with no store this
-        // window is editing a graph nobody else will see, and the runtime
-        // counts behind it are whatever the last connection said.
-        if self.stdb.is_some() && !self.store_live() {
-            let owed = self.outbox.len();
-            return match owed {
-                0 => " | store offline (reconnecting)".to_string(),
-                1 => " | store offline (reconnecting, 1 edit waiting)".to_string(),
-                n => format!(" | store offline (reconnecting, {n} edits waiting)"),
-            };
-        }
-        let mut text = match self.runtimes {
-            0 => " | no runtime".to_string(),
+        let links = self.runtime.links.len();
+        let mut text = match links {
+            0 => " | no runner".to_string(),
             1 => " | 1 runner".to_string(),
             n => format!(" | {n} runners"),
         };
+        // Whether the graphs are the runners' current ones: a link that is
+        // not attached leaves its graphs as they were last seen.
+        if links > 0 {
+            let attached = self
+                .runtime
+                .links
+                .values()
+                .filter(|link| link.graph_live)
+                .count();
+            if attached != links {
+                text.push_str(&format!(" | graph: {attached} of {links} attached"));
+            }
+        }
         // Whether values are arriving, not just whether a runner exists: the
-        // event subscriptions are what carry them, and a dropped one leaves
+        // event streams are what carry them, and a dropped one leaves
         // every number of that runner's graphs a leftover.
-        let links = self.runtime.links.len();
         if links > 0 {
             let live = self
                 .runtime
@@ -698,7 +642,7 @@ impl App {
         self.selected.clear();
     }
 
-    /// The sections no runner stands behind: without a store every graph is
+    /// The sections no runner stands behind: without a runner every graph is
     /// local; with one, the graphs no runner's workspace shows are listed as
     /// not running, and the section is gone when there are none.
     fn sync_synthetic_sections(&mut self) {
@@ -706,7 +650,7 @@ impl App {
         self.local_views
             .retain(|graph| nodes.get(graph).is_some_and(|node| node.is_container));
         #[cfg(not(target_arch = "wasm32"))]
-        let store = self.stdb.is_some();
+        let store = !self.runtime.links.is_empty();
         #[cfg(target_arch = "wasm32")]
         let store = false;
         #[cfg(not(target_arch = "wasm32"))]
@@ -866,13 +810,13 @@ impl App {
     }
 
     fn apply(&mut self, message: Message) -> Task<Message> {
-        // Held-back settings edits reach the store before anything that reads
-        // or changes the shared graph. A wire drawn onto a pin the store does
+        // Held-back settings edits reach the runner before anything that reads
+        // or changes the shared graph. A wire drawn onto a pin the runner does
         // not know about yet, or a node deleted before its own text ever
         // arrived, would leave a graph nobody can reconstruct. The typing
         // messages are of course exempt -- holding them back is the point.
         #[cfg(not(target_arch = "wasm32"))]
-        if store::observes_store(&message) {
+        if sync::observes_graph(&message) {
             self.flush_pending();
         }
         match message {
@@ -984,7 +928,7 @@ impl App {
                 // iced_nodegraph normalizes on_connect to (output, input), so
                 // `from` is always the output pin and `to` the input pin. A pin
                 // on a container belongs to a boundary node inside it: edges in
-                // the store always connect real nodes.
+                // the document always connect real nodes.
                 let Some((from_node, from_pin)) =
                     self.resolve_boundary(NodeId(from.node_id), &from.pin_id, true)
                 else {
@@ -1134,8 +1078,8 @@ impl App {
             }
             Message::DeleteNodes(ids) => {
                 // Edits still owed by a node that is about to go are dropped,
-                // not committed: pushing a parameter onto a row the very next
-                // reducer call deletes is work for nothing.
+                // not committed: pushing a parameter onto a node the very next
+                // edit deletes is work for nothing.
                 #[cfg(not(target_arch = "wasm32"))]
                 for raw_id in &ids {
                     let mut doomed = self.descendants(NodeId(*raw_id));
@@ -1144,15 +1088,15 @@ impl App {
                         self.pending.take(id);
                     }
                 }
-                // What every other node still owes does go, before the store
+                // What every other node still owes does go, before the document
                 // changes shape underneath it.
                 self.flush_pending();
                 for raw_id in &ids {
                     let id = NodeId(*raw_id);
-                    // The store deletes a container's contents with it, so this
+                    // The runner deletes a container's subtree with it, so this
                     // window has to as well or it would keep nodes no graph
-                    // contains any more. One reducer call: the recursion lives
-                    // in the module.
+                    // contains any more. One edit: the runner deletes the
+                    // subtree.
                     #[cfg(not(target_arch = "wasm32"))]
                     self.push_delete(id);
                     let parent = self.nodes.get(&id).map(|node| node.parent);
@@ -1264,7 +1208,7 @@ impl App {
                 value,
             } => {
                 let id = NodeId(node_id);
-                // What the store still holds. The commit compares against it
+                // What the runner still holds. The commit compares against it
                 // rather than against the previous keystroke, which is what
                 // makes a run of characters one change.
                 let was = self.setting_or_default(id, &key);
@@ -1276,7 +1220,7 @@ impl App {
                 if key == "name" {
                     self.refresh_boundary_owner(id);
                 }
-                // Without a store there is nothing to hold back.
+                // Without a runner there is nothing to hold back.
                 #[cfg(target_arch = "wasm32")]
                 self.settle_relations(id, &key, &was);
             }
@@ -1359,7 +1303,7 @@ impl App {
                 let _ = node_id;
             }
             Message::NodeResized { node_id, size } => {
-                // View-local, so no reducer: a size is what THIS user wants to
+                // View-local, so no edit: a size is what THIS user wants to
                 // see, not part of the shared graph.
                 self.node_sizes.insert(NodeId(node_id), size);
                 // A drag only re-requests when it crosses a ladder tier; see
@@ -1388,29 +1332,21 @@ impl App {
             Message::SyncPoll => {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    // The editor's only clock while it is idle, so this is
-                    // where a run of settings edits that has gone quiet
-                    // reaches the store.
-                    // The reconnect, on this window's own clock: nothing
-                    // rebuilds the connection behind the editor's back.
-                    if let Some(store) = &mut self.stdb {
-                        store.poll();
+                    // The editor's only clock while it is idle: it notices a
+                    // changed runner list, and a run of settings edits that
+                    // has gone quiet reaches its runner here.
+                    if let Some(urls) = self.runner_sources.poll() {
+                        self.runner_urls = urls;
                     }
                     self.commit_settled();
                     self.expire_hint();
-                    self.drain_sync();
-                    // Also where the runtime endpoint is noticed. A runtime
-                    // announces its address by updating its own `runtime` row,
-                    // and the sync layer reports inserts and deletes of that
-                    // table but not updates -- so there is no event to wait for,
-                    // and the client cache is read instead.
                     return self.reconcile_runtime();
                 }
             }
             Message::CloseRequested => {
                 // The last thing this window does. A settings edit is held
                 // back for the debounce, so closing right after typing has to
-                // push it before the process ends or the store never hears it.
+                // push it before the process ends or the runner never hears it.
                 self.flush_pending();
                 // The runner has to see this editor leave. A process that
                 // exits with its QUIC connections open is, to the peer, one
@@ -1499,17 +1435,6 @@ impl App {
                 let e = crate::restart::exec(&path);
                 self.last_error = format!("restart failed: {e}");
             }
-            Message::CopySessionId => {
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    if let Some(id) = &self.session_id {
-                        self.last_error = format!("session token copied: {id}");
-                        return iced::clipboard::write(id.clone());
-                    }
-                    self.last_error =
-                        "no session (start `spacetime start` to host one)".to_string();
-                }
-            }
             // One of a runner's own terminals, shown in a tab or killed.
             // The answer is the next workspace snapshot, so nothing about the
             // structure is applied here.
@@ -1593,7 +1518,7 @@ impl App {
                 Err(e) => self.last_error = e,
             },
             // File dialogs are native-only (rfd). On wasm these are no-ops;
-            // persistence goes through the SpacetimeDB store instead.
+            // the runners hold the graphs instead.
             Message::SaveGraph => {
                 #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
                 if self.headless {
@@ -1601,7 +1526,16 @@ impl App {
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    let doc = self.to_document();
+                    let Some(doc) = self
+                        .top_level(self.current_graph)
+                        .map(|graph| self.document_of(graph))
+                    else {
+                        self.hint = Some((
+                            "no graph in focus to save".to_owned(),
+                            iced::time::Instant::now(),
+                        ));
+                        return Task::none();
+                    };
                     return Task::perform(
                         async move {
                             let file = rfd::AsyncFileDialog::new()
@@ -1644,7 +1578,7 @@ impl App {
                         },
                         |doc| {
                             if let Some(d) = doc {
-                                Message::GraphLoaded(d)
+                                Message::GraphImported(d)
                             } else {
                                 Message::PaletteCancel // no-op on cancel
                             }
@@ -1658,6 +1592,27 @@ impl App {
                 // document asks for.
                 #[cfg(not(target_arch = "wasm32"))]
                 return self.reconcile_runtime();
+            }
+            Message::GraphImported(doc) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.import_document(doc);
+                    return self.reconcile_runtime();
+                }
+                #[cfg(target_arch = "wasm32")]
+                let _ = doc;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::Graph(key, epoch, event) => {
+                if self
+                    .runtime
+                    .links
+                    .get(&key)
+                    .is_none_or(|link| link.graph_epoch != epoch)
+                {
+                    return Task::none();
+                }
+                return self.apply_graph_event(key, event);
             }
             #[cfg(not(target_arch = "wasm32"))]
             Message::FeedFrame(frame) => {
@@ -2493,8 +2448,7 @@ impl App {
         }
 
         // A hint ages out on its own, so it needs a clock of its own: the
-        // error tick only runs while a node is failing, and the sync poll only
-        // while a store is connected.
+        // error tick only runs while a node is failing.
         #[cfg(not(target_arch = "wasm32"))]
         if self.hint.is_some() {
             subs.push(
@@ -2502,13 +2456,12 @@ impl App {
             );
         }
 
-        // Drain remote sync events on a steady cadence while connected.
+        // The runner list and the settings edits that have gone quiet are
+        // looked at on a steady cadence.
         #[cfg(not(target_arch = "wasm32"))]
-        if self.stdb.is_some() {
-            subs.push(
-                iced::time::every(std::time::Duration::from_millis(100)).map(|_| Message::SyncPoll),
-            );
-        }
+        subs.push(
+            iced::time::every(std::time::Duration::from_millis(100)).map(|_| Message::SyncPoll),
+        );
 
         // A split drag holds its newest ratio back; without a clock the last
         // one of a gesture would never be sent, and the runner would keep a

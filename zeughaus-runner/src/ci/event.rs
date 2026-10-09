@@ -12,7 +12,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{ci_dir, read_json, write_json};
+use super::ci_dir;
+use crate::files::{read_json, write_json};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

@@ -12,23 +12,22 @@ before changing how the processes talk to each other, how values travel, or
 how a node is configured. Everything above its "Not built" section describes
 the code as it is.
 
-**Status**: working. Editor and runner run against a local SpacetimeDB;
-collaborative editing, live values, video feeds, subgraphs, drawn database
+**Status**: working. Editor and runner talk over weida; each runner holds and
+persists its own graphs, and editors edit them through it. Collaborative
+editing, live values, video feeds, subgraphs, drawn database
 schemas, Keras export, recordings and terminal panes are in use. The browser
-build of the editor compiles and edits locally (no store sync yet).
+build of the editor compiles and edits locally (it reaches no runner yet).
 
 ## Workspace Structure
 
 ```
 zeughaus/              # binary: the iced editor; edits the graph and views results, never executes
 zeughaus-runner/       # binary: headless process that executes the graph and owns the terminals
-zeughaus-core/         # Ty/Typed/Value, pins, ExecutableNode/DomainPlugin, settings, scalar wire encoding, store row types
+zeughaus-core/         # Ty/Typed/Value, pins, ExecutableNode/DomainPlugin, settings, scalar wire encoding, graph document types
 zeughaus-runtime/      # GraphExecutor: topology, node instances, edge cache, dirty set, async work, node errors
-zeughaus-sync/         # SpacetimeDB client shared by both binaries: generated bindings, Store, Session, reducers
-zeughaus-link/         # the runner<->editor protocol over weida (feed, events, snapshot, triggers, paths) and the credentials both ends present
+zeughaus-link/         # the runner<->editor protocol over weida (graph, feed, events, snapshot, triggers, paths) and the credentials both ends present
 zeughaus-mux/          # terminal mux wire model: stable ids, workspace topology, rows/deltas, bounded codec, client-side TerminalView (pure, wasm too)
 zeughaus-terminal/     # the runner's terminal engine: PTYs over portable-pty and a pinned wezterm-term (native only)
-zeughaus-module/       # SpacetimeDB server module (excluded from the native workspace; built by `spacetime build`)
 zeughaus-transform/    # plugin: 35 math/logic/string/trig nodes, constants, Display
 zeughaus-flow/         # plugin: Hold (event -> state), Button (manual event), Timer (the clock a source needs), All (fan-in)
 zeughaus-graph/        # plugin: Subgraph container and its Input/Output boundary nodes
@@ -42,7 +41,7 @@ iced_terminal/         # the terminal widget: one wgpu primitive per pane, bundl
 iced_tabs/             # the tab tree the workspace shell uses: runner sections, groups, drop markers
 zeughaus-theme/        # the editor's theme: iced theme paired with a terminal colour scheme, catalogs for every widget, bundled pack, WezTerm scheme parser
 vm/win11/              # scripts: headless Windows 11 guest under QEMU/KVM, the CI runner's `win11` machine (boot, toolchain, per-boot prepare.ps1)
-deploy/                # install.sh, systemd user units for store and runner, desktop entry template; install-ci.sh and ci/ for the CI runner
+deploy/                # install.sh, systemd user unit for the runner, desktop entry template; install-ci.sh and ci/ for the CI runner
 third_party/           # its own workspace: wezterm's terminal crates at the pinned revision, published as zeughaus-* packages
 ```
 
@@ -59,47 +58,36 @@ only changes made to it.
 ## Running it
 
 The user's stack is installed, not run from the checkout: `deploy/install.sh`
-`cargo install`s the editor and runner into `~/.cargo/bin`, installs two
-systemd user units -- `zeughaus-store` (`spacetime start`, 0.0.0.0:3000)
-and `zeughaus-runner` (requires the store, `KillMode=process` so the shims
-and their shells outlive a stop, `reload` = SIGUSR1) -- plus a desktop entry
-and icon matching the editor's Wayland app id, publishes the module, then
-starts or reloads the runner and restarts running editors. The editor is
-started from the application menu (`Zeughaus`). Logs: `journalctl --user -u
-zeughaus-runner` / `-u zeughaus-store`.
+`cargo install`s the editor and runner into `~/.cargo/bin`, installs the
+systemd user unit `zeughaus-runner` (`KillMode=process` so the shims and
+their shells outlive a stop, `reload` = SIGUSR1), a desktop entry and icon
+matching the editor's Wayland app id, then starts or reloads the runner and
+restarts running editors. The editor is started from the application menu
+(`Zeughaus`). Logs: `journalctl --user -u zeughaus-runner`.
 
-By hand, three processes, in this order:
+By hand, two processes, in this order:
 
 ```
-spacetime start                 # store, 0.0.0.0:3000
-cargo run -p zeughaus-runner    # executes the graph and owns the terminals
+cargo run -p zeughaus-runner    # holds and executes the graphs, owns the terminals
 cargo run -p zeughaus           # editor; start as many as you like
 ```
 
-Never next to the installed units: a second store fails on the port, and a
-second runner on the same state directory refuses to start (it holds
-`<state-dir>/runner.lock`).
+Never next to the installed unit: a second runner on the same state
+directory refuses to start (it holds `<state-dir>/runner.lock`).
 
-Publish the module once per schema change, and regenerate the checked-in
-bindings:
-
-```
-spacetime publish --server local zeughaus --module-path zeughaus-module
-spacetime generate --lang rust --out-dir zeughaus-sync/src/module_bindings --module-path zeughaus-module
-```
-
-Host and `spacetimedb-sdk` must share a major/minor version or the wire
-format mismatches on connect. `join <host[:port]/database>` on either binary
-joins another machine's session; the runner prints the token. The runner
-keeps `runner.pem` and `client.pem` under the state directory
-(`--state-dir`, `ZEUGHAUS_STATE_DIR`, else `~/.local/state/zeughaus`); a
-remote editor needs `client.pem` copied into its own state directory. An
-editor without a store edits a local scratch graph and shows no values.
+The runner keeps `runner.pem` and `client.pem` under the state directory
+(`--state-dir`, `ZEUGHAUS_STATE_DIR`, else `~/.local/state/zeughaus`), its
+graphs in `graphs/<id>.zgh` (one file per top-level graph) and its pinned URL
+in `endpoint`. An editor dials the runner of its own state directory through
+that file and every URL in `remotes = [..]` of `<state-dir>/zeughaus.toml`;
+a remote editor also needs `client.pem` copied into the remote runner's
+`clients/` directory and its own state directory. An editor without a
+runner edits a local scratch graph and shows no values.
 
 In the editor: `Ctrl+Space` (on macOS also `Cmd+Shift+P`) opens the command
 palette (spawn nodes into the
-focused graph pane, save/load a `.zgh` file, auto layout, pick a theme, copy
-the session token, split or close the focused pane, attach or close a job's
+focused graph pane, save/load one graph as a `.zgh` file, auto layout, pick a theme,
+split or close the focused pane, attach or close a job's
 terminal, hold or release a runner), and `Ctrl+PageDown`/`Ctrl+PageUp`
 switch to the next or previous tab, also from a terminal, whose child no
 longer receives them. The window draws its
@@ -107,7 +95,7 @@ own titlebar; the button in its corner moves the tab bar between the top and
 the left edge. Theme and tab bar placement persist in
 `<state-dir>/editor.toml`; WezTerm colour schemes dropped into
 `<state-dir>/themes/` appear as themes. The tab bar has one section per
-connected runner (plus `Local` without a store, or `Not running` for graphs
+connected runner (plus `Local` without a runner, or `Not running` for graphs
 no runner's workspace shows); a section's terminal, graph and folder
 glyphs (tooltips say which) add a terminal tab, a graph that runner
 executes, or a coloured group, and a CI runner's play/pause circle (filled
@@ -151,7 +139,8 @@ A second runner runs CI as the Unix user `zeughaus-ci`
 (`deploy/install-ci.sh`, once, with sudo; `deploy/install.sh` updates it
 afterwards). Its home and state are `/var/lib/zeughaus-ci` (a btrfs
 subvolume outside snapper's snapshots). It has two user units,
-`zeughaus-ci-runner` (joins the store as a runner) and `zeughaus-ci-hook`
+`zeughaus-ci-runner` (`--feed-addr 127.0.0.1:7444`; `deploy/install-ci.sh`
+prints the line to add to the editor's `zeughaus.toml`) and `zeughaus-ci-hook`
 (`ci hook --listen 10.8.0.10:8686`, the webhook intake that Caddy on sadala
 forwards `https://ci.doodleshnookie.net/hook/<repo>` to). Logs:
 `sudo journalctl _UID=$(id -u zeughaus-ci)`. Repositories, budgets and the
@@ -176,14 +165,13 @@ in OpenBao under `secret/zeughaus/ci`. A change to `.zeughaus-ci/` is checked wi
 An agent never drives the user's desktop. It builds its own binaries with
 the `remote` feature into a separate target directory (so it neither
 replaces the user's binaries nor holds their build lock), runs them against
-its own database and state directory, and drives a headless editor over a
+its own state directory, and drives a headless editor over a
 control socket:
 
 ```
-spacetime publish --server local zeughaus-agent --module-path zeughaus-module -y
 CARGO_TARGET_DIR=target/agent cargo build -p zeughaus --features remote -p zeughaus-runner
-ZEUGHAUS_STATE_DIR=/tmp/zh-agent target/agent/debug/zeughaus-runner join 127.0.0.1:3000/zeughaus-agent
-ZEUGHAUS_STATE_DIR=/tmp/zh-agent target/agent/debug/zeughaus --headless --control /tmp/zh-agent.sock join 127.0.0.1:3000/zeughaus-agent
+ZEUGHAUS_STATE_DIR=/tmp/zh-agent target/agent/debug/zeughaus-runner
+ZEUGHAUS_STATE_DIR=/tmp/zh-agent target/agent/debug/zeughaus --headless --control /tmp/zh-agent.sock
 target/agent/debug/zeughaus ctl /tmp/zh-agent.sock key ctrl+space
 target/agent/debug/zeughaus ctl /tmp/zh-agent.sock screenshot /tmp/shot.png
 ```
@@ -202,10 +190,8 @@ Signals to the agent's processes go by PID, never by name.
 When a change is finished, its gate passed and it is committed, the agent
 integrates it into the user's running stack; that is the point of the
 reload. `deploy/install.sh` does it in order: `cargo install` of both
-binaries (the running ones keep serving meanwhile), units, desktop entry,
-store start, `spacetime publish --server local zeughaus` without `-c`/`-y`
-(a migration that needs the data cleared stops the script and is the
-user's call, never the agent's), `systemctl --user reload zeughaus-runner`,
+binaries (the running ones keep serving meanwhile), unit, desktop entry,
+`systemctl --user reload zeughaus-runner`,
 and SIGUSR1 to every editor whose `/proc/<pid>/exe` is the installed
 binary and whose `SigCgt` has the handler. Confirm the reload: `readlink
 /proc/<pid>/exe` no longer ends in `(deleted)`. The agent's own processes
@@ -251,7 +237,7 @@ invocation per workspace at a time; long runs get a generous timeout.
   it shows is what the runner reported.
 - Runner and editor register the same plugin list in the same order; a
   native-only plugin is gated in the editor, not omitted from the runner.
-- Anything that travels between processes has one definition: store rows in
+- Anything that travels between processes has one definition: graph rows in
   `zeughaus-core::document`, runtime traffic in `zeughaus-link`, terminals
   in `zeughaus-mux`. Changing a wire type means changing both ends in one
   commit.

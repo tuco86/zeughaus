@@ -7,15 +7,19 @@ use std::sync::Arc;
 
 use iced::{Point, Vector};
 use iced_nodegraph::PinRef;
+#[cfg(not(target_arch = "wasm32"))]
+use zeughaus_core::EdgeData;
 use zeughaus_core::{
-    EdgeData, EdgeId, GraphDocument, NodeData, NodeId, PinBinding, PinDefinition, PinDirection,
-    PinKind, SettingDef, SettingKind, Ty, TypeConverters, Value, renamed_field,
+    EdgeId, GraphDocument, NodeData, NodeId, PinBinding, PinDefinition, PinDirection, PinKind,
+    SettingDef, SettingKind, Ty, TypeConverters, Value, renamed_field,
 };
 
 use super::App;
 #[cfg(not(target_arch = "wasm32"))]
-use super::store::edge_data;
+use super::sync::edge_data;
 use crate::message::{GraphIds, PinLabel};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::workspace::RunnerKey;
 
 pub struct EditorNode {
     pub id: NodeId,
@@ -85,12 +89,12 @@ impl App {
     /// Every node inside `parent`, at any depth.
     ///
     /// Deleting a container deletes its contents, so the local delete needs the
-    /// whole subtree -- otherwise this window would keep nodes the store has
+    /// whole subtree -- otherwise this window would keep nodes the runner has
     /// already dropped.
     ///
     /// The walk is bounded even though a tree cannot loop: `parent` is an
-    /// arbitrary column of the store's `node` table, so one hand-written row
-    /// naming itself (or a pair naming each other) is a cycle this editor did
+    /// arbitrary field of a node, so one hand-written file naming itself as
+    /// its own parent (or a pair naming each other) is a cycle this editor did
     /// not create and must survive.
     pub(super) fn descendants(&self, parent: NodeId) -> Vec<NodeId> {
         let mut found = Vec::new();
@@ -179,7 +183,7 @@ impl App {
         }
     }
 
-    /// The real node an edge endpoint has to name in the store.
+    /// The real node an edge endpoint has to name in the document.
     ///
     /// A wire dropped on a container's pin belongs to the boundary node behind
     /// that pin: edges always connect real nodes, so nothing outside the
@@ -642,7 +646,7 @@ impl App {
             self.forget_edge(wire);
             self.resync_pins(to_node);
             #[cfg(not(target_arch = "wasm32"))]
-            self.push_edge_remove(wire);
+            self.push_edge_remove(wire, to_node);
             // A table pin that lost its wire is a column list that no longer
             // applies, and a field that lost one is a foreign key that is
             // gone -- from whichever end declared it.
@@ -685,12 +689,12 @@ impl App {
     /// declares.
     ///
     /// The one path from a setting's text to a node, taken by a spawn default,
-    /// a keystroke, a row arriving from the store and a loaded document alike.
+    /// a keystroke, a change arriving from the runner and a loaded document alike.
     /// Every parameter is text -- the node is the only thing that knows what
     /// its settings mean -- so a value is never parsed on the way in.
     ///
     /// Immediate on purpose. What the user typed has to be on screen at the
-    /// next frame; what the *store* learns is a separate question, answered by
+    /// next frame; what the *runner* learns is a separate question, answered by
     /// [`App::commit_node`] once the typing stops.
     ///
     /// The node's refusal is kept and drawn under the field, so a rejected
@@ -738,7 +742,7 @@ impl App {
 
     /// Settles the wires a settings change moved or orphaned.
     ///
-    /// `was` is the value the store holds, so one name changed in place is one
+    /// `was` is the value the runner holds, so one name changed in place is one
     /// rename however many keystrokes produced it.
     pub(super) fn settle_relations(&mut self, node: NodeId, key: &str, was: &str) {
         let renamed = self
@@ -769,11 +773,11 @@ impl App {
     /// another name, and dropping a foreign key because the user fixed a typo
     /// would be the harshest possible reading of an edit.
     ///
-    /// A wire is replaced rather than renamed: the store addresses an edge by
-    /// id and has no way to change the pin it names, so the row is deleted and
+    /// A wire is replaced rather than renamed: the runner addresses an edge by
+    /// id and has no way to change the pin it names, so the edge is deleted and
     /// a new one inserted under a fresh [`EdgeId`]. An edge id is not identity
     /// here -- nothing outside the graph refers to one -- so this needs no
-    /// reducer of its own and leaves the module schema alone.
+    /// edit kind of its own.
     pub(super) fn rename_pin_edges(&mut self, node: NodeId, old: &str, new: &str) {
         let affected: Vec<(EdgeId, NodeId, PinLabel, NodeId, PinLabel)> = self
             .edges
@@ -796,7 +800,7 @@ impl App {
         for (id, from_node, from_pin, to_node, to_pin) in affected {
             self.forget_edge(id);
             #[cfg(not(target_arch = "wasm32"))]
-            self.push_edge_remove(id);
+            self.push_edge_remove(id, from_node);
 
             let from_pin = if from_node == node && from_pin.as_str() == old {
                 renamed.clone()
@@ -894,7 +898,7 @@ impl App {
     /// Whether an edge is a relation: both its ends are field pins.
     ///
     /// Only the derivation of the `relations` parameter asks, and that reaches
-    /// the runner through the store -- which the browser editor has no path to.
+    /// the runner through the graph link -- which the browser editor has no path to.
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn is_relation(&self, edge: &EditorEdge) -> bool {
         self.is_field_pin(edge.from_node, edge.from_pin.as_str())
@@ -912,7 +916,7 @@ impl App {
     /// reading "not a field pin" as "gone" would delete every live wire into
     /// a table's field the moment any setting on the node is edited.
     ///
-    /// A relation without its field is nothing: it would stay in the store,
+    /// A relation without its field is nothing: it would stay in the document,
     /// invisible in every view, and reattach itself if a field of that name
     /// ever came back. Renaming a field therefore drops its relations, which
     /// is the honest reading of "that field is gone".
@@ -933,7 +937,7 @@ impl App {
         for edge_id in orphaned {
             self.forget_edge(edge_id);
             #[cfg(not(target_arch = "wasm32"))]
-            self.push_edge_remove(edge_id);
+            self.push_edge_remove(edge_id, node);
         }
     }
 
@@ -962,57 +966,52 @@ impl App {
         self.edge_index = index;
     }
 
-    /// The graph as a `.zgh` document, for an explicit Save. On wasm nothing
-    /// writes one: the browser editor has no file dialog.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    pub(super) fn to_document(&self) -> GraphDocument {
-        let nodes = self
+    /// One top-level graph as a `.zgh` document: the graph node, everything
+    /// inside it, and the edges with both ends in it. Nothing writes one on
+    /// wasm: the browser editor has no file dialog.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn document_of(&self, graph: NodeId) -> GraphDocument {
+        let mut members = vec![graph];
+        members.extend(self.descendants(graph));
+        self.document_of_nodes(&members)
+    }
+
+    /// The graphs no runner holds: what the restore file carries.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn local_document(&self) -> GraphDocument {
+        let members: Vec<NodeId> = self
             .node_order
             .iter()
-            .filter_map(|id| {
-                let node = self.nodes.get(id)?;
-                let params: Vec<(String, String)> = self
-                    .node_settings
-                    .get(id)
-                    .map(|settings| {
-                        settings
-                            .iter()
-                            .map(|(key, value)| (key.clone(), value.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                Some(NodeData {
-                    id: node.id.0,
-                    type_id: node.type_id.clone(),
-                    display_name: node.display_name.clone(),
-                    x: node.position.x,
-                    y: node.position.y,
-                    params,
-                    parent: node.parent.0,
-                    runner: node.runner.clone(),
-                })
-            })
+            .copied()
+            .filter(|id| self.runner_of(*id).is_none())
             .collect();
+        self.document_of_nodes(&members)
+    }
 
+    /// `members` in the order given, with the edges that join two of them.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn document_of_nodes(&self, members: &[NodeId]) -> GraphDocument {
+        let inside: HashSet<NodeId> = members.iter().copied().collect();
+        let nodes = members
+            .iter()
+            .filter_map(|id| self.node_data(*id))
+            .collect();
         let edges = self
             .edges
             .iter()
-            .map(|e| EdgeData {
-                id: e.id.0,
-                from_node: e.from_node.0,
-                from_pin: e.from_pin.to_string(),
-                to_node: e.to_node.0,
-                to_pin: e.to_pin.to_string(),
-            })
+            .filter(|e| inside.contains(&e.from_node) && inside.contains(&e.to_node))
+            .map(edge_data)
             .collect();
-
         GraphDocument { nodes, edges }
     }
 
     /// Instantiates one node from its serialized data (explicit id, position,
     /// params) and records it. Shared by document loading and remote sync
     /// apply. No-op on a duplicate id or an unknown node type.
-    pub(super) fn insert_node_from_data(&mut self, node_data: &NodeData) {
+    ///
+    /// `runner` is the section the node's graph belongs to; it is kept on
+    /// top-level nodes only.
+    pub(super) fn insert_node_from_data(&mut self, node_data: &NodeData, runner: &str) {
         let type_id = &node_data.type_id;
         let Some(instance) = self.plugins.iter().find_map(|p| p.create_node(type_id)) else {
             return;
@@ -1037,7 +1036,11 @@ impl App {
                 settings: setting_defs,
                 parent: NodeId(node_data.parent),
                 is_container: self.is_container(type_id),
-                runner: node_data.runner.clone(),
+                runner: if node_data.parent == 0 {
+                    runner.to_owned()
+                } else {
+                    String::new()
+                },
             },
         );
         self.node_order.push(id);
@@ -1082,7 +1085,7 @@ impl App {
         adopt_orphans(&mut doc, NodeId::next());
         // Rebuild from document
         for node_data in &doc.nodes {
-            self.insert_node_from_data(node_data);
+            self.insert_node_from_data(node_data, "");
         }
         // Only now: a container's pins come from its children, and a saved
         // document lists them in whatever order it pleases. Refreshing during
@@ -1118,11 +1121,70 @@ impl App {
         // runtime publishes them.
         self.update_display_values();
     }
+
+    /// Adds a file's graph(s) to the section in front -- that runner's when it
+    /// is connected, else the local one -- under fresh ids, and sends them to
+    /// the runner like any other edit.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn import_document(&mut self, doc: GraphDocument) {
+        let target = self
+            .workspace
+            .active_tab()
+            .map(|tab| tab.runner.as_str().to_owned())
+            .filter(|key| self.runtime.links.contains_key(&RunnerKey::new(key)))
+            .unwrap_or_default();
+        let doc = remap_document(doc, || NodeId::next().0, || EdgeId::next().0);
+        for node_data in &doc.nodes {
+            self.insert_node_from_data(node_data, &target);
+        }
+        // After every node exists: a container's pins come from its children.
+        let containers: Vec<NodeId> = doc
+            .nodes
+            .iter()
+            .map(|n| NodeId(n.id))
+            .filter(|id| self.nodes.get(id).is_some_and(|node| node.is_container))
+            .collect();
+        for container in containers {
+            self.refresh_container_pins(container);
+        }
+        let edges: Vec<EdgeData> = doc
+            .edges
+            .iter()
+            .filter(|e| {
+                self.nodes.contains_key(&NodeId(e.from_node))
+                    && self.nodes.contains_key(&NodeId(e.to_node))
+            })
+            .cloned()
+            .collect();
+        for edge in &edges {
+            self.edges.push(EditorEdge {
+                id: EdgeId(edge.id),
+                from_node: NodeId(edge.from_node),
+                from_pin: PinLabel(Arc::from(edge.from_pin.as_str())),
+                to_node: NodeId(edge.to_node),
+                to_pin: PinLabel(Arc::from(edge.to_pin.as_str())),
+            });
+        }
+        self.reindex_edges();
+        for node_data in &doc.nodes {
+            self.push_node(NodeId(node_data.id));
+        }
+        for edge in edges {
+            self.push_edge(edge);
+        }
+        self.derive_all_db_params();
+        self.update_display_values();
+        self.pending_graph_focus = doc
+            .nodes
+            .iter()
+            .find(|n| n.parent == 0 && self.nodes.contains_key(&NodeId(n.id)))
+            .map(|n| NodeId(n.id));
+    }
 }
 
-/// Moves every root-level node that is not a graph into a new graph `graph`,
-/// the way the store's `adopt_root_nodes` migrates a legacy session. Does
-/// nothing when there is nothing to move.
+/// Moves every root-level node that is not a graph into a new graph `graph`:
+/// a document from before graphs were top-level containers keeps its nodes at
+/// the root. Does nothing when there is nothing to move.
 fn adopt_orphans(doc: &mut GraphDocument, graph: NodeId) {
     let orphans = |n: &NodeData| n.parent == 0 && n.type_id != "graph.sub";
     if !doc.nodes.iter().any(orphans) {
@@ -1139,8 +1201,80 @@ fn adopt_orphans(doc: &mut GraphDocument, graph: NodeId) {
         y: 0.0,
         parent: 0,
         params: Vec::new(),
-        runner: String::new(),
     });
+}
+
+/// `doc` with a fresh id for every node and edge, for adding a file to
+/// graphs that already hold ids of their own.
+///
+/// A parent the file does not contain becomes the root, an edge with an end
+/// the file does not contain is dropped, nodes that would end up at the root
+/// without being a graph are collected into one new graph, and the nodes come
+/// out parents first so a runner can create them in order.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn remap_document(
+    doc: GraphDocument,
+    mut node_id: impl FnMut() -> u64,
+    mut edge_id: impl FnMut() -> u64,
+) -> GraphDocument {
+    let fresh: Vec<u64> = doc.nodes.iter().map(|_| node_id()).collect();
+    let new_of: HashMap<u64, u64> = doc
+        .nodes
+        .iter()
+        .zip(&fresh)
+        .map(|(node, new)| (node.id, *new))
+        .collect();
+    let remapped: Vec<NodeData> = doc
+        .nodes
+        .into_iter()
+        .zip(fresh)
+        .map(|(mut node, new)| {
+            node.parent = new_of.get(&node.parent).copied().unwrap_or(0);
+            node.id = new;
+            node
+        })
+        .collect();
+    let edges: Vec<EdgeData> = doc
+        .edges
+        .into_iter()
+        .filter_map(|mut edge| {
+            edge.from_node = *new_of.get(&edge.from_node)?;
+            edge.to_node = *new_of.get(&edge.to_node)?;
+            edge.id = edge_id();
+            Some(edge)
+        })
+        .collect();
+    let mut doc = GraphDocument {
+        nodes: remapped,
+        edges,
+    };
+    adopt_orphans(&mut doc, NodeId(node_id()));
+
+    // Parents first. A node whose parent never gets placed sits in a cycle
+    // of the file's making; it and its edges are dropped.
+    let mut ordered: Vec<NodeData> = Vec::with_capacity(doc.nodes.len());
+    let mut placed: HashSet<u64> = HashSet::new();
+    let mut waiting = doc.nodes;
+    while !waiting.is_empty() {
+        let (ready, rest): (Vec<NodeData>, Vec<NodeData>) = waiting
+            .into_iter()
+            .partition(|node| node.parent == 0 || placed.contains(&node.parent));
+        if ready.is_empty() {
+            break;
+        }
+        placed.extend(ready.iter().map(|node| node.id));
+        ordered.extend(ready);
+        waiting = rest;
+    }
+    let edges = doc
+        .edges
+        .into_iter()
+        .filter(|e| placed.contains(&e.from_node) && placed.contains(&e.to_node))
+        .collect();
+    GraphDocument {
+        nodes: ordered,
+        edges,
+    }
 }
 
 /// Whether `start` can reach `goal` by following dataflow edges of `index`.
@@ -1265,7 +1399,7 @@ pub fn wire_refusal(wire: &Wire<'_>) -> Option<String> {
 ///
 /// A pin that is still declared, field or not, is not lost. Reading "not a
 /// field pin" as "gone" would delete an ordinary output wired to a table's
-/// field -- a live edge, gone from the shared store -- the moment any setting
+/// field -- a live edge, gone from the runner's document -- the moment any setting
 /// on that node is touched.
 fn is_lost_relation(own: Option<&PinDefinition>, other: Option<&PinDefinition>) -> bool {
     own.is_none() && other.is_some_and(|p| p.direction == PinDirection::Both)
@@ -1294,6 +1428,92 @@ pub(super) fn relation_references_to(from_pin: &str, to_pin: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn node(id: u64, type_id: &str, parent: u64) -> NodeData {
+        NodeData {
+            id,
+            type_id: type_id.to_owned(),
+            display_name: type_id.to_owned(),
+            x: 0.0,
+            y: 0.0,
+            params: Vec::new(),
+            parent,
+        }
+    }
+
+    /// A file's ids mean nothing next to the ids a graph already holds: every
+    /// one is replaced, and what referred to the old ones follows.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn an_imported_document_gets_fresh_ids_and_stays_consistent() {
+        let doc = GraphDocument {
+            nodes: vec![
+                node(11, "math.add", 10),
+                node(10, "graph.sub", 0),
+                node(12, "math.add", 0),
+                node(13, "math.add", 99),
+            ],
+            edges: vec![
+                EdgeData {
+                    id: 1,
+                    from_node: 11,
+                    from_pin: "out".to_owned(),
+                    to_node: 12,
+                    to_pin: "a".to_owned(),
+                },
+                EdgeData {
+                    id: 2,
+                    from_node: 11,
+                    from_pin: "out".to_owned(),
+                    to_node: 77,
+                    to_pin: "a".to_owned(),
+                },
+            ],
+        };
+        let (mut next_node, mut next_edge) = (1000, 2000);
+        let remapped = remap_document(
+            doc,
+            || {
+                next_node += 1;
+                next_node
+            },
+            || {
+                next_edge += 1;
+                next_edge
+            },
+        );
+
+        let ids: HashSet<u64> = remapped.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(ids.len(), remapped.nodes.len());
+        assert!(ids.iter().all(|id| *id > 1000));
+        // Every parent is the root or an earlier node.
+        let mut seen = HashSet::new();
+        for node in &remapped.nodes {
+            assert!(node.parent == 0 || seen.contains(&node.parent), "{node:?}");
+            seen.insert(node.id);
+        }
+        // The root level is graphs only: the file's own plus one new one that
+        // took the two loose nodes.
+        let roots: Vec<&NodeData> = remapped.nodes.iter().filter(|n| n.parent == 0).collect();
+        assert_eq!(roots.len(), 2);
+        assert!(roots.iter().all(|n| n.type_id == "graph.sub"));
+        let adopted = roots
+            .iter()
+            .find(|n| n.display_name == "Graph")
+            .expect("the new graph");
+        let loose = remapped
+            .nodes
+            .iter()
+            .filter(|n| n.parent == adopted.id)
+            .count();
+        assert_eq!(loose, 2);
+        // The edge between two nodes of the file follows them; the one to a
+        // node the file lacks is gone.
+        assert_eq!(remapped.edges.len(), 1);
+        let edge = &remapped.edges[0];
+        assert!(edge.id > 2000);
+        assert!(ids.contains(&edge.from_node) && ids.contains(&edge.to_node));
+    }
 
     /// Every refusal the drop can meet, and the sentence it produces. The
     /// widget only reports the pair, so this function is the whole of what the
@@ -1411,7 +1631,7 @@ mod tests {
 
     /// Reshaping a node's pins may only drop the relations whose field is
     /// actually gone. A wire on a pin that still exists stays -- deleting it
-    /// would remove a live edge from the shared store, where nothing brings it
+    /// would remove a live edge from the runner's document, where nothing brings it
     /// back.
     #[test]
     fn only_a_relation_whose_field_is_gone_is_dropped() {
@@ -1466,7 +1686,7 @@ mod tests {
         assert!(!flow_reaches(&index, NodeId(9), NodeId(1)));
 
         // A graph that already has a cycle must not hang the walk: one can
-        // arrive from the store, which the runner tolerates.
+        // arrive from the runner, which tolerates it.
         let looped: HashMap<NodeId, NodeEdges> =
             HashMap::from([(NodeId(1), node(vec![2])), (NodeId(2), node(vec![1]))]);
         assert!(flow_reaches(&looped, NodeId(1), NodeId(2)));

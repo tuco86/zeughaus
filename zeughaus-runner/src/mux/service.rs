@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
-use weida::{IncomingMeta, IncomingRequest, PeerIdentity, Replier, TransferMeta};
+use weida::{IncomingRequest, Replier, TransferMeta};
 use zeughaus_mux::message::{Capability, Command, ErrorCode};
 use zeughaus_mux::workspace::ProfileId;
 use zeughaus_mux::{
@@ -36,6 +36,7 @@ use super::frames::{ReadError, read_frame, write_frame};
 use super::persist::{self, SavedRun, SavedTerminal};
 use super::workspace::Workspace;
 use super::{GraphSync, OwnedPlacement};
+use crate::transport::principal_of;
 
 /// Scrollback rows sent with a head, above the visible ones: enough that a
 /// wheel notch or two needs no fetch, bounded so an attach stays small.
@@ -97,7 +98,7 @@ struct TerminalMeta {
     run: Option<SavedRun>,
 }
 
-/// The store's graphs as far as the panes that show them care.
+/// The document's graphs as far as the panes that show them care.
 #[derive(Default)]
 struct Graphs {
     /// This runner's top-level graphs that already had their chance at a
@@ -106,7 +107,7 @@ struct Graphs {
     seen: BTreeSet<u64>,
     /// Every node's display name, for tabs named after a graph.
     names: HashMap<u64, String>,
-    /// Every node id in the store; `None` until the first sync.
+    /// Every node id in the document; `None` until the first sync.
     exists: Option<HashSet<u64>>,
 }
 
@@ -394,7 +395,7 @@ impl MuxService {
         Ok(id)
     }
 
-    /// Brings the graph panes in line with the store, as
+    /// Brings the graph panes in line with the document, as
     /// [`Workspace::sync_graphs`] describes, and keeps the names tabs are
     /// titled with and the ids `OpenGraph` is checked against.
     pub fn sync_graphs(&self, update: GraphSync) {
@@ -1112,7 +1113,7 @@ impl MuxService {
         }
     }
 
-    /// Refuses to open a graph the store does not hold, which would be a
+    /// Refuses to open a graph the document does not hold, which would be a
     /// pane with nothing to show. Before the first sync nothing is known and
     /// everything is let through; a sync removes the pane if the graph turns
     /// out to be gone. Called with the workspace locked, as the lock order
@@ -1131,15 +1132,6 @@ impl MuxService {
             return Err(format!("no graph {graph}"));
         }
         Ok(())
-    }
-}
-
-/// The name the runner shows others for a peer: the fingerprint it proved.
-fn principal_of(meta: &IncomingMeta) -> Option<String> {
-    match &meta.peer {
-        Some(PeerIdentity::Key(fp)) => Some(fp.to_string()),
-        Some(other) => Some(format!("{other:?}")),
-        None => None,
     }
 }
 

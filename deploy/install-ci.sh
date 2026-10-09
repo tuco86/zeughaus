@@ -143,4 +143,13 @@ if ci_systemctl is-active --quiet zeughaus-ci-hook.service; then
 else
     ci_systemctl enable --now zeughaus-ci-hook.service
 fi
+
+# Editors find remote runners through `remotes` in their zeughaus.toml. The
+# runner writes its pinned URL at start; a reload that is still re-executing
+# has not written it yet, and the next run of this script prints it.
+editor_config=${XDG_STATE_HOME:-$HOME/.local/state}/zeughaus/zeughaus.toml
+url=$($SUDO cat "$ci_home/state/endpoint" 2>/dev/null || true)
+if [ -n "$url" ] && ! grep -qF "$url" "$editor_config" 2>/dev/null; then
+    say "add to $editor_config: remotes = [\"$url\"]"
+fi
 say "done"

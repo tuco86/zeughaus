@@ -3,13 +3,17 @@ mod app;
 // needs the sync layer to learn where a runtime serves.
 #[cfg(not(target_arch = "wasm32"))]
 mod feed;
+// The graph path: a runner's document and the edits that change it. Native-only,
+// like `mux`: the browser editor has no transport to a runner.
+#[cfg(not(target_arch = "wasm32"))]
+mod graph_link;
 mod message;
 // The terminal path: the runner's mux, its shared workspace and one stream
 // per terminal. Native-only, for the same reason as `feed`.
 #[cfg(not(target_arch = "wasm32"))]
 mod mux;
 mod palette;
-// Settings edits waiting to reach the store. Native-only: without a store
+// Settings edits waiting to reach the runner. Native-only: without a runner
 // there is nothing to hold them back from.
 #[cfg(not(target_arch = "wasm32"))]
 mod pending;
@@ -45,8 +49,8 @@ fn main() -> iced::Result {
     #[cfg(target_arch = "wasm32")]
     console_error_panic_hook::set_once();
 
-    // Give this process a unique id range so two collaborating editors sharing
-    // a SpacetimeDB store never assign colliding node/edge ids.
+    // Give this process a unique id range so two collaborating editors on
+    // one runner never assign colliding node/edge ids.
     #[cfg(not(target_arch = "wasm32"))]
     {
         zeughaus_core::NodeId::seed_unique();
@@ -59,13 +63,9 @@ fn main() -> iced::Result {
         std::process::exit(code)
     }
 
-    // `zeughaus`            -> edits a local scratch graph unless a store is
-    //                          reachable, then that store is the document
-    // `zeughaus join <id>`  -> join collaboration session <id>
-    #[cfg(not(target_arch = "wasm32"))]
-    let session = parse_join_arg();
-    #[cfg(target_arch = "wasm32")]
-    let session: Option<String> = None;
+    // `zeughaus` edits the graphs of the runners it finds (its own machine's
+    // and the remotes in `zeughaus.toml`), or a local scratch graph when it
+    // finds none.
 
     // What the process this one replaced left for it; see `restart`.
     #[cfg(not(target_arch = "wasm32"))]
@@ -77,9 +77,9 @@ fn main() -> iced::Result {
     #[cfg(not(target_arch = "wasm32"))]
     let maximized = restore.as_ref().is_some_and(|r| r.maximized);
     #[cfg(not(target_arch = "wasm32"))]
-    let boot = move || App::boot(session.clone(), restore.clone());
+    let boot = move || App::boot(restore.clone());
     #[cfg(target_arch = "wasm32")]
-    let (boot, size, maximized) = (move || App::new(session.clone()), WINDOW_SIZE, false);
+    let (boot, size, maximized) = (App::new, WINDOW_SIZE, false);
 
     let app = iced::application(boot, App::update, App::view)
         .subscription(App::subscription)
@@ -111,7 +111,7 @@ fn main() -> iced::Result {
         transparent: cfg!(not(target_arch = "wasm32")),
         // The close is handled rather than obeyed: a settings edit is held
         // back for 400 ms after the last keystroke, and closing the window
-        // in that window has to flush it to the store rather than drop it.
+        // in that window has to flush it to the runner rather than drop it.
         // `App` flushes and then ends the runtime itself. Set here rather
         // than through `exit_on_close_request`, which `window` would
         // overwrite.
@@ -173,18 +173,5 @@ fn window_icon() -> Option<iced::window::Icon> {
 /// buffer the window carries.
 #[cfg(target_arch = "wasm32")]
 fn window_icon() -> Option<iced::window::Icon> {
-    None
-}
-
-/// Parses `join <sessionid>` from the CLI args. Returns the session token to
-/// join, or `None` to host the default session on this machine's store.
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn parse_join_arg() -> Option<String> {
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        if a == "join" {
-            return args.next();
-        }
-    }
     None
 }

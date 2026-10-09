@@ -1,14 +1,15 @@
 //! The link between a runner and its editors: everything that travels between
 //! them over weida, and the identities both ends present.
 //!
-//! Graph state travels through SpacetimeDB, but nothing a pass produces does: a
-//! 3840x2160 RGBA frame is 33 MB, and a value that changes at frame rate is not
-//! what a state store is for. Both travel over the runtime's own QUIC
-//! connection instead, and this crate is what both ends speak -- pure data and
-//! pure pixel math, no I/O, so the runtime's server and the editor's client
-//! cannot disagree about the protocol.
+//! Each runner holds its own graph document and serves it on [`GRAPH_PATH`];
+//! editors edit it through that exchange. Nothing a pass produces travels
+//! there: a 3840x2160 RGBA frame is 33 MB, and a value that changes at frame
+//! rate is not part of a document. Both travel over the same QUIC connection
+//! on paths of their own, and this crate is what both ends speak -- pure data
+//! and pure pixel math, no I/O, so the runtime's server and the editor's
+//! client cannot disagree about the protocol.
 //!
-//! One listener, eight paths, each a different weida pattern:
+//! One listener, nine paths, each a different weida pattern:
 //!
 //! | path | pattern | carries |
 //! |---|---|---|
@@ -20,13 +21,16 @@
 //! | [`HOLD_PATH`] | req/rep | [`runs::HoldRequest`]: start no new runs |
 //! | [`BUSY_PATH`] | req/rep | [`machine::BusyRequest`]: override the CI busy measurement |
 //! | [`MUX_PATH`] | req/rep exchanges | the terminal mux (`zeughaus-mux`) |
+//! | [`GRAPH_PATH`] | one long exchange per editor | [`graph`]: the document, edits and changes |
 //!
 //! [`credentials`] is the part both ends must agree on before any of that: the
-//! files that hold the runner's identity and the client keys it trusts.
+//! files that hold the runner's identity and the client keys it trusts, and
+//! the endpoint file through which a local editor finds its runner.
 
 pub mod credentials;
 pub mod events;
 pub mod feed;
+pub mod graph;
 pub mod machine;
 pub mod runs;
 
@@ -37,6 +41,7 @@ pub use events::{
 pub use feed::{
     FeedRequest, FrameHeader, MAX_DIMENSION, MAX_SAMPLES_PER_AXIS, ladder, scale_to_fit,
 };
+pub use graph::{GRAPH_MAJOR, GraphChange, GraphEdit, GraphMessage, MAX_GRAPH_FRAME_BYTES};
 pub use machine::{BusyMode, BusyRequest, MAX_BUSY_BYTES, MachineState};
 pub use runs::{
     HoldReply, HoldRequest, MAX_HOLD_BYTES, MAX_RUN_CHUNK_BYTES, MAX_RUN_REPLY_BYTES,
@@ -75,3 +80,7 @@ pub const BUSY_PATH: &str = "/busy";
 /// pool key includes the path, so splitting them would cost a handshake
 /// each and a warm attach would stop being warm.
 pub const MUX_PATH: &str = "/mux";
+
+/// The graph document exchange: an editor attaches, receives the runner's
+/// whole document and then its changes, and sends edits on the same exchange.
+pub const GRAPH_PATH: &str = "/graph";

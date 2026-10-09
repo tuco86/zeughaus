@@ -18,8 +18,8 @@
 //! one is weida's; what a redial does not restore is the application state,
 //! so a `Lost` is reported upwards and the next `Connected` opens a fresh
 //! exchange and attaches again with what this side still holds. A `GaveUp`
-//! ends the task: a runner that restarted has a fresh identity, the store
-//! announces the replacement, and the app starts a task for it.
+//! ends the task: a runner that restarted has a fresh identity, the endpoint
+//! file (or `zeughaus.toml`) names the replacement, and the app starts a task for it.
 //!
 //! Native only, for the same reason as [`crate::feed`]: the wasm editor has
 //! no sync layer, so it never learns where a runner serves.

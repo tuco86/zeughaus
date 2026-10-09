@@ -120,7 +120,7 @@ fn post(state_dir: &Path, status: &Status) -> Result<(), String> {
         std::process::id(),
         status.job
     ));
-    super::write_atomic(&body_file, body.to_string().as_bytes())?;
+    crate::files::write_atomic(&body_file, body.to_string().as_bytes())?;
     let result = curl(
         &["-X", "POST", "-H", "Content-Type: application/json"],
         &auth_header(status.repo.forge, &token),

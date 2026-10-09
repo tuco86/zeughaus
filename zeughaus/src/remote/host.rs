@@ -120,14 +120,7 @@ pub(super) fn run(args: HostArgs) -> ! {
     }
 
     let runtime = Runtime::new(executor, sender);
-    let mut host = Host::new(
-        runtime,
-        renderer,
-        inputs,
-        args.size,
-        args.scale,
-        args.session,
-    );
+    let mut host = Host::new(runtime, renderer, inputs, args.size, args.scale);
     eprintln!("[remote] listening on {}", args.control.display());
     let code = host.run();
     host.close();
@@ -245,12 +238,11 @@ impl Host {
         inputs: mpsc::Receiver<Input>,
         size: Size,
         scale: f32,
-        session: Option<String>,
     ) -> Self {
         // A restarted host comes back with what the one it replaced showed,
         // exactly like a restarted window.
         let (app, boot) = runtime.enter(|| {
-            let (mut app, boot) = App::boot(session, crate::app::restore::from_env());
+            let (mut app, boot) = App::boot(crate::app::restore::from_env());
             app.set_headless();
             (app, boot)
         });
@@ -952,7 +944,7 @@ impl Host {
 }
 
 /// Periodic messages that mean "time passed", not "something happened":
-/// with a store connected the sync poll alone would keep `wait-idle` from
+/// with a runner connected the sync poll alone would keep `wait-idle` from
 /// ever answering.
 fn is_heartbeat(message: &Message) -> bool {
     matches!(message, Message::Tick | Message::SyncPoll)

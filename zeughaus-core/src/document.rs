@@ -1,9 +1,9 @@
-//! The graph as it is stored: one row per node and per edge.
+//! The graph as a runner holds it: one row per node and per edge.
 //!
-//! [`NodeData`] and [`EdgeData`] are the shape of the store's `node` and
-//! `edge` tables, and what the sync layer hands to the editor and the runner.
-//! [`GraphDocument`] is the same rows as one JSON file, which is what the
-//! editor's explicit Save/Load writes (`.zgh`).
+//! [`NodeData`] and [`EdgeData`] are what a runner keeps in its document,
+//! what travels to the editors over the link, and what each runner writes
+//! under its state directory. [`GraphDocument`] is the same rows as one JSON
+//! file, which is also what the editor's explicit Save/Load writes (`.zgh`).
 //!
 //! Pins and settings are not in here: both processes regenerate them from the
 //! plugin instances, so a row carries only what a user decided -- type,
@@ -12,14 +12,14 @@
 use serde::{Deserialize, Serialize};
 
 /// A whole graph as one JSON document.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GraphDocument {
     pub nodes: Vec<NodeData>,
     pub edges: Vec<EdgeData>,
 }
 
-/// One node as the store holds it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One node of a document.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeData {
     pub id: u64,
     pub type_id: String,
@@ -33,14 +33,10 @@ pub struct NodeData {
     /// Setting values as the user typed them, by setting key.
     #[serde(default)]
     pub params: Vec<(String, String)>,
-    /// The runner that executes this graph, as the `sha256:<hex>` fingerprint
-    /// of its endpoint. Set on top-level graphs only; empty everywhere else.
-    #[serde(default)]
-    pub runner: String,
 }
 
-/// One edge as the store holds it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One edge of a document.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EdgeData {
     pub id: u64,
     pub from_node: u64,
@@ -79,7 +75,6 @@ mod tests {
                 y: 200.0,
                 params: vec![("value".to_string(), "42".to_string())],
                 parent: 0,
-                runner: String::new(),
             }],
             edges: vec![EdgeData {
                 id: 10,

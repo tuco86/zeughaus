@@ -4,7 +4,7 @@ use crate::id::EdgeId;
 ///
 /// An input pin holds one edge, and a local connect cannot land on an
 /// occupied one. Two editors can still each draw a wire onto the same input
-/// without seeing the other's, so both rows reach the store and every client
+/// without seeing the other's, so both edges reach the runner and every client
 /// has to reach the same verdict -- from the data alone, because arrival
 /// order differs per client and deciding by it leaves the graph permanently
 /// different in every window.

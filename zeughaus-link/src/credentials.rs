@@ -42,6 +42,9 @@ const CLIENT_PEM: &str = "client.pem";
 /// Certificates of clients provisioned by hand (remote machines).
 const CLIENTS_DIR: &str = "clients";
 
+/// The pinned URL of the runner currently serving this state directory.
+const ENDPOINT_FILE: &str = "endpoint";
+
 /// Where the credentials live: `$ZEUGHAUS_STATE_DIR`, else
 /// `$XDG_STATE_HOME/zeughaus`, else `~/.local/state/zeughaus`
 /// (`%LOCALAPPDATA%\zeughaus\state` on Windows).
@@ -121,6 +124,34 @@ pub fn load_client_identity(dir: &Path) -> Option<Identity> {
     let path = dir.join(CLIENT_PEM);
     let identity = Identity::from_pem_file(&path);
     identity.fingerprint().ok().map(|_| identity)
+}
+
+/// Where the running runner's pinned URL is, for an editor on this machine.
+pub fn endpoint_path(dir: &Path) -> PathBuf {
+    dir.join(ENDPOINT_FILE)
+}
+
+/// Writes `<dir>/endpoint`: the runner's pinned URL and a newline.
+///
+/// Through `endpoint.<pid>.tmp` and a rename, so an editor polling the file
+/// never reads half a URL.
+pub fn write_endpoint(dir: &Path, url: &str) -> Result<(), String> {
+    let path = endpoint_path(dir);
+    let tmp = dir.join(format!("{ENDPOINT_FILE}.{}.tmp", std::process::id()));
+    fs::write(&tmp, format!("{url}\n"))
+        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, &path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("cannot move {} into place: {e}", tmp.display())
+    })
+}
+
+/// The URL in `<dir>/endpoint`, trimmed; `None` when the file is missing or
+/// empty.
+pub fn read_endpoint(dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(endpoint_path(dir)).ok()?;
+    let url = text.trim();
+    (!url.is_empty()).then(|| url.to_owned())
 }
 
 /// Whom the runner lets in: the bootstrapped local client plus every

@@ -26,7 +26,7 @@ pub enum OwnedPlacement {
     Triggered,
 }
 
-/// What the store says about the graphs a pane may show, as the runner
+/// What the document says about the graphs a pane may show, as the runner
 /// mirrors it.
 #[derive(Debug, Clone, Default)]
 pub struct GraphSync {
@@ -34,7 +34,7 @@ pub struct GraphSync {
     pub owned: Vec<u64>,
     /// Every node's display name: any container may be open in a pane.
     pub names: HashMap<u64, String>,
-    /// Every node id the store holds.
+    /// Every node id the document holds.
     pub exists: HashSet<u64>,
 }
 

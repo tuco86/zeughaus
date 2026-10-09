@@ -2,7 +2,7 @@
 //! window's size, the tab in front and the focused pane, what is collapsed,
 //! where each graph's camera was, the nodes' sizes, the selection, an open
 //! palette or rename, how far each terminal was scrolled back, and --
-//! without a store -- the scratch document itself.
+//! for the graphs no runner holds -- the local document itself.
 //!
 //! The window's position is not among them: a Wayland client can neither
 //! read nor set where its window sits, the compositor places it. Its size
@@ -54,8 +54,8 @@ pub struct RestoreState {
     pub collapsed: Vec<(String, Option<u64>)>,
     /// `(graph, x, y, zoom)`.
     pub cameras: Vec<(u64, f32, f32, f32)>,
-    /// The scratch graph of an editor without a store. With a store, the
-    /// store is the document.
+    /// The graphs no runner holds (the scratch graph of an editor that found
+    /// none). A runner's graphs come back from that runner.
     pub document: Option<GraphDocument>,
     /// `(node, width, height)` of nodes the user resized.
     #[serde(default)]
@@ -147,8 +147,8 @@ pub fn take(file: &Path) -> Option<RestoreState> {
 
 impl App {
     /// Starts the editor, from a restore file when there is one.
-    pub fn boot(session: Option<String>, restore: Option<RestoreState>) -> (App, Task<Message>) {
-        let mut app = App::new(session);
+    pub fn boot(restore: Option<RestoreState>) -> (App, Task<Message>) {
+        let mut app = App::new();
         let Some(state) = restore else {
             return (app, Task::none());
         };
@@ -250,7 +250,7 @@ impl App {
                 .map(|pane| (pane.runner.as_str().to_owned(), pane.pane.0)),
             collapsed,
             cameras,
-            document: self.stdb.is_none().then(|| self.to_document()),
+            document: Some(self.local_document()).filter(|document| !document.nodes.is_empty()),
             node_sizes,
             selected,
             palette: self

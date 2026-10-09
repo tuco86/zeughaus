@@ -24,6 +24,8 @@ use super::node_view::{DISPLAY_SIZE, is_display};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::feed::{self, FeedKey, FeedSpec, FrameOrder};
 #[cfg(not(target_arch = "wasm32"))]
+use crate::graph_link;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::message::Message;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::transport::Endpoint;
@@ -90,6 +92,18 @@ pub(super) struct RunnerLink {
     /// The sequence that state came with. A snapshot sets it outright,
     /// because a restarted runner counts from zero again.
     pub machine_seq: u64,
+    /// The task holding this runner's graph: its document in, edits out.
+    /// Aborts on drop.
+    pub graph: Option<iced::task::Handle>,
+    /// Which graph task the events on screen came from, drawn from the same
+    /// counter as `traffic_epoch` so a message names exactly one link.
+    pub graph_epoch: u64,
+    /// Whether that task is attached. The graphs of this runner are
+    /// last-known while it is not, which the status bar says.
+    pub graph_live: bool,
+    /// Where this editor's edits for this runner's graphs go. `None` until
+    /// the graph task was started.
+    pub edits: Option<graph_link::EditSender>,
 }
 
 /// Everything this editor knows about the runtimes executing its graphs.
@@ -105,7 +119,7 @@ pub(super) struct RunnerLink {
 #[derive(Default)]
 pub(super) struct RuntimeView {
     /// The runtime's values as last reported, per node and pin. Kept by node
-    /// rather than by wire because a value can arrive before the node row it
+    /// rather than by wire because a value can arrive before the node it
     /// belongs to -- and because this window computes nothing itself, so what
     /// the runtime said is the whole of what it can draw.
     pub remote_outputs: HashMap<NodeId, HashMap<String, Value>>,
@@ -153,7 +167,7 @@ pub(super) struct RuntimeView {
     #[cfg(not(target_arch = "wasm32"))]
     pub rejection_seq: HashMap<(NodeId, String), u64>,
     /// Which runner last reported something about a node. A report can
-    /// arrive before the node's row or its graph's row, so the node's graph
+    /// arrive before the node or its graph, so the node's graph
     /// cannot say whose report it was; this can, when that runner goes.
     #[cfg(not(target_arch = "wasm32"))]
     pub reported_by: HashMap<NodeId, RunnerKey>,
@@ -476,7 +490,7 @@ impl App {
 
     /// Redraws what one node's newly reported values change.
     ///
-    /// A node whose row has not arrived yet is remembered anyway: the value is
+    /// A node that has not arrived yet is remembered anyway: the value is
     /// in the map, and it is drawn as soon as `apply_node_upsert` creates the
     /// node.
     #[cfg(not(target_arch = "wasm32"))]
@@ -488,7 +502,7 @@ impl App {
     }
 
     /// Brings the runner links, their event subscriptions and muxes, and the
-    /// live feeds in line with what the graph and the store now say.
+    /// live feeds in line with what the graph and the runner list now say.
     ///
     /// The one place anything is dialled, called after everything that can
     /// change the answer: a Display node's wire, its size, its existence, a
@@ -499,12 +513,7 @@ impl App {
     /// Stopping is by removal: every task handle aborts on drop.
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn reconcile_runtime(&mut self) -> Task<Message> {
-        let announced = announced_runners(
-            &self
-                .store_conn()
-                .map(zeughaus_sync::runtimes)
-                .unwrap_or_default(),
-        );
+        let announced = announced_runners(&self.runner_urls);
         let mut tasks = Vec::new();
         // A runner that left takes its values, its terminals and its section
         // with it; its graphs show as not running.
@@ -518,6 +527,7 @@ impl App {
         for key in &gone {
             self.runtime.links.remove(key);
             self.forget_runner_values(key, false);
+            self.forget_runner_graphs(key);
             self.mux.remove(key);
             self.workspace.remove_section(key);
         }
@@ -551,6 +561,10 @@ impl App {
                             traffic_epoch: 0,
                             machine: None,
                             machine_seq: 0,
+                            graph: None,
+                            graph_epoch: 0,
+                            graph_live: false,
+                            edits: None,
                         },
                     );
                     (true, true)
@@ -561,6 +575,17 @@ impl App {
             }
             if restart_traffic {
                 tasks.push(self.restart_traffic(&runner.key));
+            }
+            // The graph task is replaced by the same rule: a runner that
+            // moved holds a different document, and one without a task is
+            // not attached to anything.
+            let graph_missing = self
+                .runtime
+                .links
+                .get(&runner.key)
+                .is_some_and(|link| link.graph.is_none());
+            if endpoint_changed || graph_missing {
+                tasks.push(self.restart_graph(&runner.key));
             }
             // The mux hangs off the same address and is replaced by the same
             // rule: a runner that moved owns different terminals, and one
@@ -641,6 +666,30 @@ impl App {
         }
         self.forget_runner_values(key, false);
         self.update_display_values();
+        task
+    }
+
+    /// Replaces one runner's graph task. A fresh channel takes over the edits:
+    /// what the old task still held is about a document the new attach
+    /// replaces.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn restart_graph(&mut self, key: &RunnerKey) -> Task<Message> {
+        self.runtime.next_epoch += 1;
+        let epoch = self.runtime.next_epoch;
+        let Some(link) = self.runtime.links.get_mut(key) else {
+            return Task::none();
+        };
+        let (sender, receiver) = iced::futures::channel::mpsc::unbounded();
+        link.edits = Some(sender);
+        link.graph_live = false;
+        link.graph_epoch = epoch;
+        let owner = key.clone();
+        let (task, handle) = Task::run(
+            graph_link::attach(link.endpoint.clone(), receiver),
+            move |event| Message::Graph(owner.clone(), epoch, event),
+        )
+        .abortable();
+        link.graph = Some(handle.abort_on_drop());
         task
     }
 
@@ -797,7 +846,7 @@ impl App {
     }
 }
 
-/// One runner as the store announces it.
+/// One runner as the editor's runner list names it.
 #[cfg(not(target_arch = "wasm32"))]
 struct Announced {
     key: RunnerKey,
@@ -805,15 +854,15 @@ struct Announced {
     label: String,
 }
 
-/// The runners the store's runtime rows announce, oldest first, keyed by the
-/// fingerprint their URL pins. A row without a pinned fingerprint cannot be
-/// told apart from another runner and is skipped; two rows with one
-/// fingerprint (one `runner.pem`, two processes) are one runner, the older.
+/// The runners the URLs name, in their order, keyed by the fingerprint their
+/// URL pins. A URL without a pinned fingerprint cannot be told apart from
+/// another runner and is skipped; two URLs with one fingerprint are one
+/// runner, the first.
 #[cfg(not(target_arch = "wasm32"))]
-fn announced_runners(rows: &[zeughaus_sync::RuntimeRow]) -> Vec<Announced> {
+fn announced_runners(urls: &[String]) -> Vec<Announced> {
     let mut out: Vec<Announced> = Vec::new();
-    for row in rows {
-        let Ok(addr) = weida::EndpointAddr::parse(&row.addr) else {
+    for url in urls {
+        let Ok(addr) = weida::EndpointAddr::parse(url) else {
             continue;
         };
         let Some(fingerprint) = addr.peer.map(|fp| fp.to_string()) else {
@@ -827,7 +876,7 @@ fn announced_runners(rows: &[zeughaus_sync::RuntimeRow]) -> Vec<Announced> {
         let short = fingerprint.get(7..15).unwrap_or(&fingerprint);
         out.push(Announced {
             key: RunnerKey::new(&fingerprint),
-            endpoint: Endpoint(row.addr.clone()),
+            endpoint: Endpoint(url.clone()),
             label: format!("{} {short}", addr.host),
         });
     }

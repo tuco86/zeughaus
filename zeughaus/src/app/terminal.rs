@@ -241,8 +241,8 @@ impl App {
                 Task::none()
             }
             MuxEvent::GaveUp => {
-                // This address names a peer that is gone for good. The store
-                // announces the replacement, and reconciliation dials it.
+                // This address names a peer that is gone for good. The endpoint
+                // file (or `zeughaus.toml`) names the replacement, and reconciliation dials it.
                 self.mux.remove(&key);
                 self.workspace.detach(&key);
                 self.rebuild_palette();

@@ -62,6 +62,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bundled Nerd Font with tooltips; the browser editor, which does not
   bundle the font, keeps the words. `iced_tabs` header controls are
   `Control`s with an optional font and tooltip.
+- Each runner holds its own graphs: it loads them from
+  `<state-dir>/graphs/<id>.zgh` (one file per top-level graph), serves them
+  to editors on the new `/graph` link path, applies their edits and writes
+  the files back at most once per second and on restart and stop. Editor
+  and runner must be updated together.
+- The editor connects to the runner of its state directory through
+  `<state-dir>/endpoint`, which a runner writes at start, and to every URL
+  in `remotes = [..]` of `<state-dir>/zeughaus.toml`; both files are
+  re-read when they change.
+- Save exports the focused graph; Load imports a file as a new graph with
+  fresh ids into the runner of the section in front.
+- The CI runner listens on the fixed loopback port 7444, and
+  `deploy/install-ci.sh` prints the `remotes` line for its URL.
+
+### Removed
+
+- SpacetimeDB: the `zeughaus-sync` and `zeughaus-module` crates, the
+  `zeughaus-store` unit, `join <host/database>` on both binaries and the
+  palette's "copy session token". Graphs stored there are not migrated.
 
 ### Fixed
 

@@ -17,13 +17,17 @@ under "Not built", so that nothing above that heading is aspirational.
  editor (zeughaus)          editor (zeughaus, another machine / browser)
    edits, draws               edits, draws
         |   ^                        |   ^
-  rows  |   | events, frames,        |   |
-        v   | terminals              v   |
- +-------------------+     weida (QUIC, mTLS)      +------------------+
- |  SpacetimeDB      |<---------------------------->|  zeughaus-runner |
- |  node, edge,      |  rows in, presence out       |  executes graph, |
- |  runtime          |                              |  owns terminals  |
- +-------------------+                              +------------------+
+  edits |   | graph changes, events, |   |
+        v   | frames, terminals      v   |
+          weida (QUIC, mTLS), one link per runner
+        |                              |
+        v                              v
+ +------------------+          +------------------+
+ |  zeughaus-runner |          |  zeughaus-runner |
+ |  holds its graph |   ...    |  (another host)  |
+ |  executes it,    |          |                  |
+ |  owns terminals  |          |                  |
+ +------------------+          +------------------+
 ```
 
 Two processes, and the split is not optional. `zeughaus` is an editor that
@@ -31,67 +35,87 @@ never executes a node; `zeughaus-runner` is a headless process that does
 nothing else. That is what makes every editor -- the one on the same machine,
 one on another continent, one in a browser -- the same thing, a remote view,
 and what keeps a side effect from happening twice: a screen capture fires once
-per session, not once per open window.
+per runner, not once per open window.
 
-They meet in two places:
+There is no central store. Everything travels over one weida link per runner
+(`zeughaus-link`), on separate paths:
 
-- **The store (SpacetimeDB, `zeughaus-module`, client in `zeughaus-sync`)**
-  holds the graph document and runtime presence, and nothing a pass produces.
-  Tables: `node` (id, type_id, display_name, x, y, params as JSON, parent),
-  `edge` (id, from_node, from_pin, to_node, to_pin), `runtime` (connection,
-  identity, auto-incremented `seq`, announced address). Reducers are
-  fine-grained (`create_node`, `move_node`, `set_node_params`, `delete_node`,
-  `connect_edge`, `disconnect_edge`, `join_runtime`, `announce_endpoint`);
-  conflicts are last-writer-wins per row. Ids are made process-unique at
-  startup (`NodeId::seed_unique`) so two editors never collide.
-- **The link (weida, `zeughaus-link`)** carries everything a pass produces,
-  straight from the runner to each editor: scalar outputs, node errors and
-  edge traffic on `/events` (pub/sub), a `/snapshot` for a late joiner
-  (req/rep), trigger presses the other way on `/triggers` (push/pull), frames
-  on `/samples` (one standing exchange per node pin), terminals on `/mux`.
-  Only `bool`/`int`/`float`/`str` are values on the wire
+- **The graph (`/graph`, `zeughaus-link/src/graph.rs`)** is the document: nodes
+  (id, type_id, display_name, x, y, params as JSON, parent) and edges (id,
+  from_node, from_pin, to_node, to_pin), and nothing a pass produces. The
+  runner holds it (`zeughaus-runner/src/graphs.rs`). An editor sends
+  `Attach { major }` (protocol major `GRAPH_MAJOR`, currently 1) as the first
+  frame and gets `Attached { revision, document }`, then a stream of
+  `Changed { revision, change }` (`NodeUpsert`, `NodeRemove`, `EdgeInsert`,
+  `EdgeRemove`); a revision that skips one ends the exchange and the next
+  attach resyncs. Edits go the other way as `Edit { request, edit }`
+  (`CreateNode`, `MoveNode`, `SetParams`, `RenameNode`, `DeleteNode`,
+  `ConnectEdge`, `DisconnectEdge`); the runner applies them in arrival order
+  (last writer wins per node) and answers a refusal with `Refused { request,
+  message }` to the sender only. An editor applies the change that comes back,
+  not its own edit, so the runner's document is the only truth. Frames are
+  length-prefixed JSON, bounded to `MAX_GRAPH_FRAME_BYTES`. Ids are made
+  process-unique at startup (`NodeId::seed_unique`) so two editors never
+  collide.
+- **Runtime traffic** carries everything a pass produces, straight from the
+  runner to each editor: scalar outputs, node errors and edge traffic on
+  `/events` (pub/sub), a `/snapshot` for a late joiner (req/rep), trigger
+  presses the other way on `/triggers` (push/pull), frames on `/samples` (one
+  standing exchange per node pin), terminals on `/mux`. Only
+  `bool`/`int`/`float`/`str` are values on the wire
   (`zeughaus-core/src/wire.rs`); frames have their own path; everything else
   stays in the runner.
 
-**Who executes** is decided by the store, not negotiated: every top-level
-graph (`graph.sub` with `parent == 0`) names its runner in the node's
-`runner` column (the `sha256:<hex>` fingerprint of that runner's endpoint),
-and each runner executes exactly the subtrees of the graphs that name it
-(`zeughaus-runner/src/runner.rs`, `in_scope_of`). Every runner calls
-`join_runtime` and announces its pinned URL
-(`weida://sha256:<fp>@host:port/`) in its `runtime` row; an editor dials
-every runner it finds there. Root-level nodes of a session from before
-graphs had owners are adopted once into a new graph by the runner with the
-lowest `seq` (`adopt_root_nodes`).
+**Who executes** is the runner that holds the graph: it executes every
+top-level graph (`graph.sub` with `parent == 0`) of its document and no
+other. A graph belongs to the runner it was created on; an editor files each
+graph under the runner it received it from and routes every edit of that
+graph's nodes to that runner's link.
 
-**Redial is weida's, resync is ours.** An editor dials each runtime address
-once (`zeughaus/src/transport.rs`, `first_dial`) under a `ReconnectPolicy`
+**Persistence.** A runner writes each top-level graph, with its descendants
+and their edges, to `<state-dir>/graphs/<id>.zgh` (the JSON `GraphDocument`
+of `zeughaus-core/src/document.rs`), at most once per second and on restart
+and stop; the file of a deleted graph is removed. On start it loads every
+`graphs/*.zgh`; an unreadable file is logged and left alone, a node or edge
+that does not fit (duplicate id, missing parent or endpoint, a top-level node
+that is not a `graph.sub`) is skipped with a warning.
+
+**Finding runners.** A runner writes its pinned URL
+(`weida://sha256:<fp>@host:port/`) to `<state-dir>/endpoint` after it
+started listening. The editor dials the runner in its own state directory's
+`endpoint` file and every URL in `remotes = [..]` of
+`<state-dir>/zeughaus.toml`, and re-reads both when they change; a URL that
+does not parse or pins no peer is logged and skipped. A runner that
+disappears from the list loses its graphs in the editor.
+
+**Redial is weida's, resync is ours.** An editor dials each runner once
+(`zeughaus/src/transport.rs`, `first_dial`) under a `ReconnectPolicy`
 (250 ms doubling to 4 s, never giving up). What a redial cannot restore, the
-editor does on `PeerEvent::Connected`: a fresh `/snapshot`, reopened feed
-exchanges, a fresh mux attach. A runner that restarted is a new peer; the new
-address in its `runtime` row is what replaces the tasks.
+editor does on `PeerEvent::Connected`: a fresh `/graph` attach and
+`/snapshot`, reopened feed exchanges, a fresh mux attach. A runner that
+restarted is a new peer with a new address in its `endpoint` file; that file
+is what replaces the tasks. Edits made while a link is down wait in the
+editor and are sent after the next attach.
 
-**Without a store or without its endpoint**, the runner refuses to start: a
-runner no editor can reach owns no graph and runs nothing, and a refused
-start lets the service manager retry (a `--feed-addr` on the WireGuard
-address fails until `wg0` is up at boot). The editor starts anyway and
-edits a local scratch graph: nothing computes it, the status bar says so, and
-the graph is gone on close unless saved as a file (`.zgh`, the JSON
-`GraphDocument` in `zeughaus-core/src/document.rs`). Save/Load is an explicit
-palette command in both modes; the store is never written from a file behind
-the user's back.
+**Without a runner**, the editor starts anyway and edits a local scratch
+graph: nothing computes it, the status bar says so, and the graph is gone on
+close unless saved as a file (`.zgh`). Save exports the focused graph, Load
+imports a file as a new graph (fresh ids) into the focused section's runner,
+or into the scratch graph when that section is `Local`; both are explicit
+palette commands, and no file is read or written behind the user's back.
+A runner whose `--feed-addr` is on the WireGuard address fails to start
+until `wg0` is up at boot, and the service manager retries.
 
 ## 2. Crates
 
 | crate | role | wasm |
 |---|---|---|
-| `zeughaus-core` | `Ty`/`Typed`/`Value`, pins, `ExecutableNode`/`DomainPlugin`, settings, converters, scalar wire encoding, store row types | yes |
+| `zeughaus-core` | `Ty`/`Typed`/`Value`, pins, `ExecutableNode`/`DomainPlugin`, settings, converters, scalar wire encoding, graph document types | yes |
 | `zeughaus-runtime` | `GraphExecutor`: topology, node instances, edge cache, dirty set, async work, node errors | yes |
-| `zeughaus-sync` | SpacetimeDB client: generated bindings, `Store` (reconnecting connection), `Session` resolution, ownership queries, reducer calls | native |
-| `zeughaus-link` | the runner<->editor protocol over weida: paths, feed, events, snapshot, triggers, run files, hold, and the credentials both ends present | native |
+| `zeughaus-link` | the runner<->editor protocol over weida: paths, graph, feed, events, snapshot, triggers, run files, hold, and the credentials both ends present | native |
 | `zeughaus-mux` | terminal mux wire model: stable ids, workspace topology, rows/deltas, bounded codec, client-side `TerminalView` | yes |
 | `zeughaus-terminal` | the runner's terminal engine: PTYs (`portable-pty`) and a pinned `wezterm-term` | native |
-| `zeughaus-runner` | the executing process: store loop, executor, weida listener, feed server, mux service, job host | native |
+| `zeughaus-runner` | the executing process: graph document, executor, weida listener, feed server, mux service, job host | native |
 | `zeughaus` | the editor | native + wasm32 |
 | `iced_terminal` | terminal widget: one wgpu primitive per pane, input to `TerminalCommand`s, bundled font | native |
 | `iced_tabs` | the tab tree the workspace shell uses: sections, one level of groups, drop targets and markers | yes |
@@ -99,13 +123,12 @@ the user's back.
 | `zeughaus-transform`, `-flow`, `-graph`, `-ml` | pure plugins | yes |
 | `zeughaus-job` | the `job.run` node and the `ProcessHost` trait it executes through; the runner implements the host, the editor registers the plugin detached | yes |
 | `zeughaus-capture`, `-db`, `-record`, `-llm` | plugins that touch the OS | native |
-| `zeughaus-module` | the SpacetimeDB server module; outside the native workspace, built by `spacetime build` | wasm module |
 
 Dependency direction: plugins depend on core only. The runtime depends on
-core. The runner depends on runtime, sync, link, mux, terminal and every
+core. The runner depends on runtime, link, mux, terminal and every
 plugin. The widget crates know nothing of the editor's theme: each implements
 its catalog for `iced::Theme`, and `zeughaus-theme` implements the same
-catalogs for its own type. The editor depends on core, sync, link, mux, the
+catalogs for its own type. The editor depends on core, link, mux, the
 widget crates, the theme and the plugins it can link -- **not on the
 runtime**: it holds node instances for what a node knows about itself, and
 gets every value from the runner.
@@ -210,12 +233,12 @@ once per graph revision. Semantics:
   last output into the edge and dirties only the target's subtree, so a node
   with side effects does not re-fire because someone drew a wire.
 
-The runner's loop (`zeughaus-runner/src/runner.rs`) applies store rows to the
+The runner's loop (`zeughaus-runner/src/runner.rs`) applies document changes to the
 executor, diffing parameters against what it last applied so a drag (which
-rewrites the row) does not rerun a node; serves clocked nodes; runs a pass;
+changes the node) does not rerun a node; serves clocked nodes; runs a pass;
 publishes what changed since the last publish (outputs, cleared pins, errors,
 rejections, delivered edges); and answers `/snapshot` from the same state.
-Two runners racing for one input pin resolve it identically from the data
+Input occupancy is resolved identically by every process from the data
 (`occupancy_winner`: the larger edge id wins), because arrival order differs
 per process.
 
@@ -230,11 +253,11 @@ sequence-guarded per pin so a late event never overwrites a fresh one, and
 cleared wholesale when the runtime goes away. A pin whose last run produced
 no value is drawn dim.
 
-Local edits go to the store through an outbox that replays after a reconnect;
-settings edits are held back 400 ms after the last keystroke
-(`pending.rs`) and flushed on close. A remote row is applied without echoing
-back as a reducer call. Edits made while a window still owes the store a key
-are not overwritten by an older shared value for that key.
+Local edits go to the runner of their graph as `Edit` frames; the editor
+applies the `Changed` frame that comes back, without echoing it again.
+Settings edits are held back 400 ms after the last keystroke
+(`pending.rs`) and flushed on close. Edits made while a window still owes
+the runner a key are not overwritten by an older shared value for that key.
 
 Connection rules run in one place (`wire_refusal`): while a cable is dragged,
 to decide whether the pin under the cursor is a target, and again when a drop
@@ -246,9 +269,9 @@ at the drop.
 `db.database`) has no pins of its own: the editor synthesizes them from its
 direct `graph.input`/`graph.output` children, named by each child's title. An
 edge drawn onto a container's pin is stored against the boundary child, so
-the store and the executor see one flat graph of real nodes; only the editor
+the runner and the executor see one flat graph of real nodes; only the editor
 knows about nesting. Deleting a container deletes its contents, recursively
-in the reducer and locally in every editor. A top-level graph is a
+in the runner and locally in every editor. A top-level graph is a
 container too: it is what a graph tab shows, and closing its last tab with
 its close button deletes it. A nested container's `open` button opens its
 contents in a tab of its own.
@@ -256,7 +279,7 @@ contents in a tab of its own.
 **Layout.** `AutoLayout` ranks nodes by longest path from a source and orders
 a rank by the barycentre of its placed predecessors; a cycle admits the lowest
 remaining id as if its incoming edges were not there. It is an ordinary move,
-shared through the store.
+shared through the runner.
 
 **Workspace.** The window is undecorated and draws its own titlebar: the
 button in the corner moves the tab strip between the titlebar and a sidebar
@@ -267,7 +290,7 @@ the rounding and resize grips; restoring the window brings them back.
 The browser canvas stays rectangular.
 Below it are tabs of split panes (`iced_tabs::tree`, `pane_grid`). The tab
 bar has one section per connected runner, labelled with its host and the
-start of its fingerprint, plus `Local` (no store: the scratch graphs) or
+start of its fingerprint, plus `Local` (no runner: the scratch graphs) or
 `Not running` (graphs whose runner is not connected). A runner section is
 that runner's shared workspace: loose tabs and one level of coloured,
 collapsible groups, each tab a split tree whose leaves are terminals
@@ -491,7 +514,7 @@ whichever tab is in front, and holds the keyboard while it is open.
 
 ## 10. The sample feed
 
-Frames never touch the store. A viewer holds one standing exchange per
+Frames never travel on `/graph`. A viewer holds one standing exchange per
 (node, pin) on `/samples`: it sends a `FeedRequest` once, naming the size it
 draws, and the runner scales the newest frame to a ladder tier (240, 360,
 480, 720, 1080 lines; box-averaged, at most 4x4 samples per output pixel) and
@@ -505,7 +528,7 @@ results keyed by (pin, tier, sequence).
 
 | what | where |
 |---|---|
-| store to join | `zeughaus join <host[:port]/database>`, `zeughaus-runner join <...>`; without it the default session on `127.0.0.1:3000/zeughaus`, and the LAN token is printed for others to join (`Session::resolve` in `zeughaus-sync`) |
+| runners to dial | the local runner's `<state-dir>/endpoint` (written by the runner at start) plus `remotes = ["weida://..."]` in `<state-dir>/zeughaus.toml`; both are re-read when they change. A graph lives on the runner it was created on and in its `<state-dir>/graphs/<id>.zgh` |
 | feed/listener bind | `zeughaus-runner --feed-addr <host:port>`; default loopback with an OS-chosen port, so two runners on one host do not collide |
 | credentials | `--state-dir <path>` on the runner, else `ZEUGHAUS_STATE_DIR`, else XDG state; a remote editor needs `client.pem` copied into its own state directory |
 | editor preferences | `<state-dir>/editor.toml` (`theme`, `tabs`), written by the editor when they change; `<state-dir>/themes/*.toml` are WezTerm colour schemes offered as themes by file name |
@@ -514,8 +537,8 @@ results keyed by (pin, tier, sequence).
 | LLM endpoint | the `base_url` setting on each conversation node (default `http://localhost:1234/v1`) |
 | runs | `<state-dir>/runs/<run-id>/` holds `log`, `exit`, `code` and `artifacts/` of every job run this runner executed; `--keep-runs <n>` (default 50) is how many successful runs stay, pruned when a run starts; failed runs and runs without an exit record are never pruned |
 | terminals | `<state-dir>/terminals/<id>/` (`spec.json`, `sock`, `shim.log`) per live terminal, `<state-dir>/workspace.json` for the tabs a restarted runner restores |
-| editor restart | `SIGUSR1` writes `<state-dir>/restore-<pid>.json` (window size and maximized state, active tab, focused pane and collapsed sections and groups by runner, cameras, node sizes, selection, an open palette with its input, a rename in progress, terminal scroll-back, nested views open in a section without a runner, the scratch document without a store) and `exec`s the editor, which reads and deletes it through `ZEUGHAUS_RESTORE`. The window's position is not restored: a Wayland client can neither read nor set it |
-| deployment | `deploy/install.sh`: binaries in `~/.cargo/bin`, systemd user units `zeughaus-store` and `zeughaus-runner` (`KillMode=process`: the shims outlive the runner process; `reload` is `SIGUSR1`), and `~/.local/share/applications/net.doodleshnookie.Zeughaus.desktop` with its icon, which is how a Wayland compositor shows the editor's icon |
+| editor restart | `SIGUSR1` writes `<state-dir>/restore-<pid>.json` (window size and maximized state, active tab, focused pane and collapsed sections and groups by runner, cameras, node sizes, selection, an open palette with its input, a rename in progress, terminal scroll-back, nested views open in a section without a runner, the scratch document without a runner) and `exec`s the editor, which reads and deletes it through `ZEUGHAUS_RESTORE`. The window's position is not restored: a Wayland client can neither read nor set it |
+| deployment | `deploy/install.sh`: binaries in `~/.cargo/bin`, the systemd user unit `zeughaus-runner` (`KillMode=process`: the shims outlive the runner process; `reload` is `SIGUSR1`), and `~/.local/share/applications/net.doodleshnookie.Zeughaus.desktop` with its icon, which is how a Wayland compositor shows the editor's icon |
 
 ## 12. Testing strategy
 
@@ -591,7 +614,7 @@ shell ends, the terminal closes; the log holds what it showed. A restarted
 runner does the same for the terminals of recorded runs with a code file.
 The `flow.all` node is the fan-in: it fires once every wired input has
 fired since it last fired, so a job starts when both of its predecessors' `ok`
-pins have. The store holds nothing about runs; `/runs` on the runner serves
+pins have. The graph holds nothing about runs; `/runs` on the runner serves
 any run file by range (`RunFileRequest` -> `RunFileReply`,
 `zeughaus-link/src/runs.rs`), so logs and artifacts stay on the machine that
 produced them.
@@ -643,15 +666,17 @@ attached it somewhere else.
 prints the reply. `<endpoint>` is the pinned root URL a runner prints at
 start; the client identity comes from the state directory (`--state-dir`,
 `ZEUGHAUS_STATE_DIR`), so a script, a cron entry or a webhook relay is the
-same principal as an editor on that machine. No store is involved.
+same principal as an editor on that machine. No graph is involved.
 
 ## 14. CI: pipelines from a repository's `.zeughaus-ci/` folder
 
 A runner with `<state-dir>/ci.toml` also runs CI (`zeughaus-runner/src/ci/`).
 Without the file nothing of it starts. On the workstation a second runner does
 this as the Unix user `zeughaus-ci` (`deploy/install-ci.sh`, units under
-`deploy/ci/`). It joins the user's store like any runner, so its terminals
-appear as a section of their own in every editor.
+`deploy/ci/`). Its unit runs `--feed-addr 127.0.0.1:7444`, and `install-ci.sh`
+prints the line to add to the user's `zeughaus.toml`
+(`remotes = ["<its endpoint>"]`); then its terminals appear as a section of
+their own in every editor.
 
 **Jobs are scripts.** Every `.sh`/`.ps1` file in `.zeughaus-ci/` with a TOML header
 between `# /// ci` and `# ///` is a job named after its file. The header
@@ -753,9 +778,8 @@ Kept here so they are not mistaken for descriptions of the code:
 
 - Staged deployment of graph versions (draft / staged / deployed).
 - Placement of nodes across several runners within one graph: a graph runs
-  on the runner it names, whole. Edges between graphs of different runners
-  are not carried; routing between runners would go over the weida broker,
-  not the store.
+  on the runner that holds it, whole. Edges between graphs of different runners
+  are not carried; routing between runners would go over the weida broker.
 - Opt-in per-node capture of results into a database; the recorder plugin
   writes datasets to disk instead.
 - Queue semantics on edges; every edge is last-value. For jobs that means
@@ -763,7 +787,7 @@ Kept here so they are not mistaken for descriptions of the code:
   instantiation of a pipeline subgraph for parallel branch builds, come when
   needed.
 - Rich per-type inspection widgets on edges; nodes show text or a frame.
-- A browser editor that syncs with the store; the wasm build edits locally.
+- A browser editor that reaches runners; the wasm build edits locally.
 - Terminal image protocols; the wire model reserves kinds for them.
 - Jobs of the graph (`job.run`), decided but not built; CI (section 14)
   has its own webhook intake, freeze, secrets and VM machines:
@@ -773,7 +797,7 @@ Kept here so they are not mistaken for descriptions of the code:
   - `freeze` (SIGSTOP / cgroup freezer) as a per-node hold policy.
   - Secrets through weida's wrapped-secret flow: one refreshable token per
     run, child tokens per service ordered through it, everything invalidated
-    when the run ends. Nothing secret-shaped in the store or in settings.
+    when the run ends. Nothing secret-shaped in a graph document or in settings.
   - Workspace nodes (checkout, btrfs snapshot) producing the `cwd` a job
     runs in; caches per runner under its state directory.
   - VM guests with their own runner; CI drives its VM over ssh instead.

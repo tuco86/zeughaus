@@ -1,19 +1,21 @@
 //! Headless graph runtime: the only process that executes a Zeughaus graph.
 //!
-//! It joins a session's shared store as a runtime, applies every graph change it
-//! observes to a [`GraphExecutor`], and publishes the scalar outputs it computes.
-//! Editors -- local or remote, native or browser -- edit and display; they never
-//! run a node. That is what keeps a node with side effects (a screen capture, an
-//! LLM request) firing once per session instead of once per open window.
+//! It holds the graph document itself: it loads `<state-dir>/graphs/*.zgh` at
+//! start, serves the document to editors on the graph link, applies every
+//! change to a [`GraphExecutor`], persists the files and publishes the scalar
+//! outputs it computes. Editors -- local or remote, native or browser -- edit
+//! and display; they never run a node. That is what keeps a node with side
+//! effects (a screen capture, an LLM request) firing once instead of once per
+//! open window.
 //!
-//! Several runners may join the same session. Every top-level graph names the
-//! runner that executes it, and each runner executes only its own graphs; the
-//! store is read back on every batch, so a graph created for this runner by
-//! any editor starts running here without a handshake.
+//! This runner executes every graph of its own document. An editor attached
+//! to several runners shows several documents side by side.
 
 mod ci;
 mod cli;
 mod feed;
+mod files;
+mod graphs;
 mod jobs;
 mod mux;
 mod runner;
@@ -31,24 +33,23 @@ use std::time::Duration;
 
 use zeughaus_core::{NodeId, Value, ZeughausError};
 use zeughaus_link::{
-    BUSY_PATH, EVENTS_PATH, FEED_PATH, HOLD_PATH, MUX_PATH, RUNS_PATH, SNAPSHOT_PATH, Snapshot,
-    TRIGGERS_PATH, TriggerRequest, credentials,
+    BUSY_PATH, EVENTS_PATH, FEED_PATH, GRAPH_PATH, GraphChange, HOLD_PATH, MUX_PATH, RUNS_PATH,
+    SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, TriggerRequest, credentials,
 };
 use zeughaus_runtime::DeferredWork;
-use zeughaus_sync::Role;
 
 use crate::feed::FrameRegistry;
+use crate::graphs::GraphService;
 use crate::jobs::JobHost;
 use crate::mux::MuxService;
 use crate::runner::{AsyncResult, Runner};
 use crate::transport::Transport;
 
-/// How long the loop blocks on the event channel before looking around.
+/// How long the loop blocks on the change channel before looking around.
 ///
-/// The SDK delivers row changes over a `std::sync::mpsc` channel, which cannot
-/// be selected over together with the async-result channel, so completed node
-/// work is picked up between batches. This is therefore the worst-case latency
-/// for an async result and for an ownership change -- short enough to be
+/// The channel cannot be selected over together with the async-result
+/// channel, so completed node work is picked up between batches. This is
+/// therefore the worst-case latency for an async result -- short enough to be
 /// imperceptible, long enough that an idle runner is free.
 const TICK: Duration = Duration::from_millis(50);
 
@@ -90,7 +91,7 @@ fn main() -> ExitCode {
     let locale = {
         let locale = zeughaus_terminal::locale::resolve();
         // SAFETY: nothing has started a thread yet; the shim branch above returned
-        // and the store, runtime and transport are created further down.
+        // and the runtime and transport are created further down.
         unsafe { locale.apply() };
         locale
     };
@@ -160,22 +161,6 @@ fn main() -> ExitCode {
         }
     }
     eprintln!("[runner] state dir {}", state_dir.display());
-    let session = zeughaus_sync::Session::resolve(parse_join_arg().as_deref());
-    let (uri, db) = (session.uri, session.database);
-    eprintln!("[runner] session {} -> {uri} / {db}", session.token);
-
-    // A `Store` rather than a bare connection: a runner outlives a host
-    // restart, and a dead connection it kept would leave it executing a graph
-    // another runner has taken over.
-    let (store, sync_rx) = match zeughaus_sync::Store::open(&uri, &db, Role::Runtime) {
-        Ok(pair) => pair,
-        Err(e) => {
-            eprintln!(
-                "[runner] cannot connect to {uri} / {db}: {e} (start it with `spacetime start`)"
-            );
-            return ExitCode::FAILURE;
-        }
-    };
 
     // Node work that has to run off the event loop, and the feed server. Four
     // workers because the feed's tasks live here: they park on QUIC flow
@@ -200,8 +185,7 @@ fn main() -> ExitCode {
         }
     };
 
-    // Bound before the runner exists, because the address is announced from the
-    // runner's first look at the store and an editor must never be handed an
+    // Bound before the runner exists: an editor must never be handed an
     // endpoint that is not serving yet.
     let frames = Arc::new(FrameRegistry::new());
     let transport = match rt.block_on(Transport::start(feed_addr, &state_dir)) {
@@ -212,6 +196,9 @@ fn main() -> ExitCode {
             // which keys this process accepted.
             for fingerprint in transport.trusted_clients() {
                 eprintln!("[runner] trusted client {fingerprint}");
+            }
+            if let Err(e) = credentials::write_endpoint(&state_dir, transport.url()) {
+                eprintln!("[runner] cannot write the endpoint file: {e}");
             }
             transport
         }
@@ -243,6 +230,7 @@ fn main() -> ExitCode {
     let mut mux_service: Option<MuxService> = None;
     // The CI machine's busy state, reported to editors whenever it changes.
     let mut machine: Option<Arc<ci::busy::Busy>> = None;
+    let (graphs, graph_rx, initial) = GraphService::load(&state_dir);
     {
         let listener = transport.listener();
         match listener.replier(FEED_PATH) {
@@ -317,37 +305,43 @@ fn main() -> ExitCode {
             }
             Err(e) => eprintln!("[runner] no run file service: {e}"),
         }
+        match listener.replier(GRAPH_PATH) {
+            Ok(replier) => {
+                rt.spawn(graphs.clone().accept(replier));
+            }
+            Err(e) => eprintln!("[runner] no graph service: {e}"),
+        }
     }
 
-    // The fingerprint pinned in this runner's own URL is what a graph's
-    // `runner` column names. Without an endpoint no editor could reach this
-    // process, and no graph can name it.
-    let fingerprint = weida::EndpointAddr::parse(transport.url())
-        .ok()
-        .and_then(|addr| addr.peer)
-        .map(|fp| fp.to_string());
-    if fingerprint.is_none() {
-        eprintln!("[runner] the endpoint names no key, so no graph is this runner's");
-    }
     let mut runner = Runner::new(
-        store,
         Arc::clone(&frames),
         publisher,
         Arc::clone(&snapshot),
         job_host.clone(),
-        fingerprint,
     );
-    runner.set_endpoint(transport.url().to_string());
-    // The epoch travels with the work: a result that comes back after ownership
-    // moved must not be applied, and the sender is the only place that knows
-    // which ownership it was dispatched under.
-    let (async_tx, async_rx) = std::sync::mpsc::channel::<(NodeId, u64, AsyncResult)>();
+    let (async_tx, async_rx) = std::sync::mpsc::channel::<(NodeId, AsyncResult)>();
+
+    // The document as loaded: every node before any edge, in document order,
+    // so an edge always finds both of its nodes.
+    for node in initial.nodes {
+        runner.apply(GraphChange::NodeUpsert { node });
+    }
+    for edge in initial.edges {
+        runner.apply(GraphChange::EdgeInsert { edge });
+    }
+    // The mux takes its first look even when the document is empty, so a pane
+    // of a graph that was deleted while this process was down goes too.
+    runner.graphs_changed();
+    if let Some(mux) = &mux_service {
+        mux.sync_graphs(runner.graph_sync());
+    }
+    let deferred = runner.pass();
+    dispatch(&rt, &async_tx, deferred);
 
     // Stopping drains. A signal holds the host so no further run starts and
-    // the loop leaves once the live ones have finished; the connection then
-    // closes and the module drops this process's `runtime` row, which is the
-    // handover a standby waits for. Killing it outright would take a live
-    // build's terminal with it, which is the one thing a job must survive.
+    // the loop leaves once the live ones have finished. Killing it outright
+    // would take a live build's terminal with it, which is the one thing a
+    // job must survive.
     let stopping = Arc::new(AtomicBool::new(false));
     {
         let stopping = Arc::clone(&stopping);
@@ -368,18 +362,15 @@ fn main() -> ExitCode {
     // Whether the draining line has been written: the loop turns twenty times
     // a second and the reason for waiting is worth saying once.
     let mut draining = false;
-    // Whether the mux has seen the store's graphs since the subscription
-    // applied. The first look is taken even when nothing changed, so a pane
-    // of a graph deleted while this process was down goes too.
-    let mut graphs_synced = false;
     loop {
         #[cfg(unix)]
         if restart_signal::take() {
-            restart(exe.as_ref().ok(), mux_service.as_ref());
+            restart(exe.as_ref().ok(), mux_service.as_ref(), &graphs);
         }
         if stopping.load(Ordering::SeqCst) {
             let live = job_host.as_ref().map_or(0, |host| host.live_runs());
             if live == 0 {
+                graphs.persist(true);
                 eprintln!("[runner] stopped");
                 return ExitCode::SUCCESS;
             }
@@ -389,25 +380,24 @@ fn main() -> ExitCode {
             }
         }
 
-        // Block for the first event, then take whatever else is already queued:
-        // one pass per burst of row changes rather than one per row. A
-        // subscription applying delivers a whole graph this way. The wait is
-        // capped by whatever a clocked node is waiting for, so a 30 Hz timer is
-        // served on time instead of at the polling interval.
-        let mut events = Vec::new();
-        match sync_rx.recv_timeout(runner.next_wait(TICK)) {
-            Ok(event) => events.push(event),
+        // Block for the first change, then take whatever else is already
+        // queued: one pass per burst of edits rather than one per edit. The
+        // wait is capped by whatever a clocked node is waiting for, so a 30 Hz
+        // timer is served on time instead of at the polling interval.
+        let mut changes = Vec::new();
+        match graph_rx.recv_timeout(runner.next_wait(TICK)) {
+            Ok(change) => changes.push(change),
             Err(RecvTimeoutError::Timeout) => {}
-            // Every sender is held by the store, which this process owns for
-            // its whole life, so this cannot happen while it is running -- and
-            // if it ever did, nothing would ever be received again.
+            // The sender is held by the graph service, which this process owns
+            // for its whole life, so this cannot happen while it is running --
+            // and if it ever did, nothing would ever be received again.
             Err(RecvTimeoutError::Disconnected) => {
-                eprintln!("[runner] the store channel closed, exiting");
+                eprintln!("[runner] the graph channel closed, exiting");
                 return ExitCode::FAILURE;
             }
         }
-        while let Ok(event) = sync_rx.try_recv() {
-            events.push(event);
+        while let Ok(change) = graph_rx.try_recv() {
+            changes.push(change);
         }
 
         let mut results = Vec::new();
@@ -419,29 +409,18 @@ fn main() -> ExitCode {
         // input to the pass. Latency is bounded by TICK, the same as an async
         // result -- and so is a press left over from a burst, because the loop
         // takes at most `MAX_PRESSES_PER_TURN` of them before it goes back to
-        // serving the store and the clocks.
+        // serving the graph and the clocks.
         let mut fired = false;
         let presses: Vec<TriggerRequest> = std::iter::from_fn(|| trigger_rx.try_recv().ok())
             .take(MAX_PRESSES_PER_TURN)
             .collect();
 
-        // The store first: an outage costs this process its ownership, and
-        // nothing below should decide anything on a connection that is gone.
-        runner.poll_store();
-
-        // Before anything is applied or published: a pass must not run on an
-        // ownership this process no longer has.
-        runner.refresh_ownership();
-
-        // The store's events before any result or press: a result delivered
-        // against a stale scope would still run the downstream nodes of a
-        // node this batch deleted or moved out of this runner's graphs.
-        let had_events = !events.is_empty();
-        for event in events {
-            runner.apply(event);
-        }
-        if had_events {
-            runner.reconcile();
+        // The changes before any result or press: a result delivered against a
+        // stale graph would still run the downstream nodes of a node this
+        // batch deleted.
+        let had_changes = !changes.is_empty();
+        for change in changes {
+            runner.apply(change);
         }
 
         // Clocked nodes are what make a source a source: nothing upstream ever
@@ -449,9 +428,9 @@ fn main() -> ExitCode {
         // and stops.
         let ticked = runner.mark_due_ticks();
 
-        for (node_id, epoch, result) in results {
-            let deferred = runner.deliver(node_id, epoch, result);
-            dispatch(&rt, &async_tx, runner.owner_epoch(), deferred);
+        for (node_id, result) in results {
+            let deferred = runner.deliver(node_id, result);
+            dispatch(&rt, &async_tx, deferred);
         }
 
         for press in presses {
@@ -462,18 +441,17 @@ fn main() -> ExitCode {
             runner.report_machine(busy.state());
         }
 
-        if had_events || ticked || fired {
+        if had_changes || ticked || fired {
             let deferred = runner.pass();
-            dispatch(&rt, &async_tx, runner.owner_epoch(), deferred);
-            // Only once the store's content is here: a partial picture would
-            // close the panes of graphs that simply have not arrived yet.
-            if runner.synced() && (runner.graphs_changed() || !graphs_synced) {
-                graphs_synced = true;
-                if let Some(mux) = &mux_service {
-                    mux.sync_graphs(runner.graph_sync());
-                }
+            dispatch(&rt, &async_tx, deferred);
+            if runner.graphs_changed()
+                && let Some(mux) = &mux_service
+            {
+                mux.sync_graphs(runner.graph_sync());
             }
         }
+
+        graphs.persist(false);
     }
 }
 
@@ -481,14 +459,13 @@ fn main() -> ExitCode {
 /// over `tx`.
 ///
 /// The join handle is awaited on a runtime worker rather than here, because the
-/// work takes seconds (an LLM request) and the event loop has to keep draining
-/// the store meanwhile. A join failure is reported like any other error: the
+/// work takes seconds (an LLM request) and the event loop has to keep serving
+/// edits meanwhile. A join failure is reported like any other error: the
 /// executor holds every downstream node back while a node is pending, so a
 /// panicking node that never reported would freeze that whole subtree.
 fn dispatch(
     rt: &tokio::runtime::Runtime,
-    tx: &Sender<(NodeId, u64, AsyncResult)>,
-    epoch: u64,
+    tx: &Sender<(NodeId, AsyncResult)>,
     deferred: DeferredWork,
 ) {
     for (node_id, work) in deferred {
@@ -502,7 +479,7 @@ fn dispatch(
                             "background task failed: {e}"
                         )))
                     });
-            let _ = tx.send((node_id, epoch, outputs.map_err(|e| e.to_string())));
+            let _ = tx.send((node_id, outputs.map_err(|e| e.to_string())));
         });
     }
 }
@@ -567,13 +544,14 @@ fn terminal_host(
 /// arguments. Returns only when that failed; the runner then carries on as
 /// it was.
 #[cfg(unix)]
-fn restart(exe: Option<&PathBuf>, mux: Option<&MuxService>) {
+fn restart(exe: Option<&PathBuf>, mux: Option<&MuxService>, graphs: &GraphService) {
     use std::os::unix::process::CommandExt;
 
     let Some(exe) = exe else {
         eprintln!("[runner] restart failed: this executable cannot be located");
         return;
     };
+    graphs.persist(true);
     if let Some(mux) = mux {
         mux.persist();
     }
@@ -663,18 +641,6 @@ mod restart_signal {
     pub fn take() -> bool {
         REQUESTED.swap(false, Ordering::SeqCst)
     }
-}
-
-/// Parses `join <session>` from the CLI args, mirroring the editor's argument
-/// shape. `None` runs the default local session.
-fn parse_join_arg() -> Option<String> {
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        if a == "join" {
-            return args.next();
-        }
-    }
-    None
 }
 
 /// Address the sample feed binds, from `--feed-addr <host:port>`.

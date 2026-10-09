@@ -20,7 +20,7 @@
 //! editors cannot disagree about it. Tabs never move between sections: each
 //! runner owns its own terminals and graphs.
 //!
-//! Two sections are not a runner's: `local` (no store; every graph of the
+//! Two sections are not a runner's: `local` (no runner; every graph of the
 //! scratch document) and `offline` (graphs whose runner is not connected).
 //! The app builds their snapshots from the document; they take no drops and
 //! send no commands.
@@ -76,7 +76,7 @@ pub const GROUP_COLORS: [[u8; 4]; 8] = [
 pub struct RunnerKey(pub Arc<str>);
 
 impl RunnerKey {
-    /// The section of an editor without a store: every graph it holds.
+    /// The section of an editor without a runner: every graph it holds.
     pub const LOCAL: &'static str = "local";
     /// The section of graphs whose runner is not connected.
     pub const OFFLINE: &'static str = "offline";
@@ -442,7 +442,7 @@ impl Workspace {
     ///
     /// Runner sections are ordered by label (host, then fingerprint) and
     /// come before the synthetic ones: an order that no reconnect, restart
-    /// or second editor changes, which the store's join order would.
+    /// or second editor changes, which the order of connecting would.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn ensure_runner(&mut self, key: RunnerKey, label: String) {
         match self.section_mut(&key) {

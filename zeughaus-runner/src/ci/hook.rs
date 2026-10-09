@@ -12,7 +12,8 @@ use sha2::Sha256;
 
 use super::config::{CiConfig, RepoConfig, read_secret};
 use super::event::{CiEvent, EventKind, write_inbox};
-use super::{ci_dir, now_secs, write_atomic};
+use super::{ci_dir, now_secs};
+use crate::files::write_atomic;
 
 /// Largest accepted request body.
 const MAX_BODY: usize = 5 * 1024 * 1024;

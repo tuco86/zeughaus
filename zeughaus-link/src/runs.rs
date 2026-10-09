@@ -1,11 +1,11 @@
 //! Run files: what an editor asks the runner that produced a run, and the
 //! hold switch that decides whether new runs start at all.
 //!
-//! A run's bytes never travel through the store and never travel between
+//! A run's bytes never travel through the graph link and never travel between
 //! runners: the log, the exit record and the copied artifacts are files under
 //! the state directory of the process that executed the run, and the only way
 //! to see them is to ask that process. That is what keeps a 400 MB build log
-//! out of the store and out of every editor that did not open it, and it is
+//! out of the document and out of every editor that did not open it, and it is
 //! what makes several runners work without a shared filesystem -- each serves
 //! its own runs.
 //!

@@ -1,9 +1,9 @@
 //! The editor's client for the runtime's sample feed: how a video signal gets
 //! from the process that computes it to the node body that draws it.
 //!
-//! Frames are the one thing the shared store does not carry. A 3840x2160 RGBA
-//! frame is 33 MB, per frame, replicated to every subscriber; scalars go through
-//! SpacetimeDB, pixels get their own QUIC connection. This module is the
+//! Frames are the one thing the runtime's event stream does not carry. A
+//! 3840x2160 RGBA frame is 33 MB, per frame, replicated to every subscriber;
+//! scalars travel as runtime events, pixels get their own QUIC connection. This module is the
 //! dialling half of that connection -- one long-lived exchange per (source node,
 //! pin), asking for the size the node body actually draws, reading
 //! [`FrameHeader`]-prefixed frames until the editor stops wanting them -- and
@@ -161,8 +161,8 @@ pub enum Traffic {
 ///
 /// The stream does end when weida gives the address up: a runner that
 /// restarted has a fresh identity, so the address that was dialled names a
-/// peer that no longer exists. The store announces the replacement, and this
-/// task is replaced by one that dials it.
+/// peer that no longer exists. The endpoint file (or `zeughaus.toml`) names
+/// the replacement, and reconciliation replaces this task with one that dials it.
 pub fn events(endpoint: Endpoint) -> impl Stream<Item = Traffic> {
     // Room for a burst of events while the UI is mid-redraw. Unlike frames
     // these are a few hundred bytes each, so buffering them is cheap and
@@ -422,7 +422,7 @@ pub async fn set_busy(endpoint: Endpoint, mode: BusyMode) -> Result<MachineState
 /// between attempts here is for the exchange the runtime ended on a live
 /// connection, which no redial paces. The stream does end when weida gives
 /// the address up -- a restarted runner is a stranger to it -- because every
-/// `open` from then on would fail at once, and the store's new address
+/// `open` from then on would fail at once, and the runner's new address
 /// replaces this task anyway.
 pub fn frames(spec: FeedSpec) -> impl Stream<Item = Frame> {
     // Capacity zero: the futures channel still admits one message per sender, so
@@ -772,7 +772,7 @@ mod tests {
         // A runner restarted with a fresh identity is a stranger to the
         // address: weida refuses it in the handshake and gives the address
         // up, and both streams end rather than looping on the loss. The
-        // store's new address is what replaces them.
+        // runner's new address is what replaces them.
         // Bounded by the redial schedule: two addresses back off
         // independently up to 4 s per attempt, and the feed's own re-open
         // pace sits on top, so the sum can pass ten seconds on a busy host.

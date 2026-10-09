@@ -11,7 +11,6 @@ description = "The headless zeughaus process that executes the node graph and ow
 [dependencies]
 zeughaus-core.workspace = true
 zeughaus-runtime.workspace = true
-zeughaus-sync.workspace = true
 # The runner<->editor protocol over weida and the credentials both ends present.
 # Shared with the editor so the two ends cannot disagree about it.
 zeughaus-link.workspace = true
@@ -29,19 +28,19 @@ zeughaus-record.workspace = true
 # Jobs: the node type, and the `ProcessHost` this process implements over its
 # mux so a run is a terminal it owns.
 zeughaus-job.workspace = true
-# Frames leave this process over QUIC, not through the store: a 4K RGBA frame
-# is 33 MB and a state store is the wrong pipe for it.
+# The link's transport: the graph document, frames and events leave this
+# process over QUIC.
 weida.workspace = true
 # The terminal multiplexer: `zeughaus-mux` is the wire model every editor
 # shares, `zeughaus-terminal` the PTYs and screens only this process holds.
 zeughaus-mux.workspace = true
 zeughaus-terminal.workspace = true
-# `workspace.json`: the tabs, splits and terminals a restarted runner
-# brings back.
+# `workspace.json` and the graph files under `graphs/`: the tabs, splits,
+# terminals and graphs a restarted runner brings back.
 serde.workspace = true
 serde_json = "1"
 # Blocking node work (LLM requests, screen capture) runs on tokio's blocking
-# pool so the event loop keeps draining the store. Multi-threaded because the
+# pool so the event loop keeps applying graph changes. Multi-threaded because the
 # feed server's tasks live here too: they park on QUIC flow control and scale
 # frames, which is milliseconds of CPU that must not sit in front of quinn's
 # driver.

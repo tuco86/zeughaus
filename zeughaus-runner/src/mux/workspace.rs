@@ -328,10 +328,10 @@ impl Workspace {
         shown
     }
 
-    /// Brings the graph panes in line with the store and returns whether
+    /// Brings the graph panes in line with the document and returns whether
     /// that is a new revision.
     ///
-    /// A leaf of a graph the store no longer holds goes like a closed pane.
+    /// A leaf of a graph the document no longer holds goes like a closed pane.
     /// Each graph of this runner's that is not in `seen` gets a tab of its
     /// own unless a pane already shows it, and is recorded there: a graph
     /// whose tab a user closed stays closed for as long as `seen` lives,
@@ -976,7 +976,7 @@ fn default_title(
         Some(SurfaceRef::Graph(graph)) => graph_title(graph)
             .filter(|t| !t.is_empty())
             .map(|mut title| {
-                // A node's name is the store's and unbounded; the wire's is
+                // A node's name is the document's and unbounded; the wire's is
                 // not.
                 if title.len() > MAX_TITLE_BYTES {
                     let mut end = MAX_TITLE_BYTES;
@@ -1950,7 +1950,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_panes_follow_the_store() {
+    fn graph_panes_follow_the_document() {
         let mut ws = fresh();
         let mut seen = BTreeSet::new();
         let mut names = HashMap::new();

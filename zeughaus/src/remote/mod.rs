@@ -1,7 +1,7 @@
 //! The editor without a window, driven over a Unix socket.
 //!
-//! `zeughaus --headless --control <socket> [--size <W>x<H>] [--scale <f>]
-//! [join <session>]` runs the real [`App`](crate::app::App) offscreen with a
+//! `zeughaus --headless --control <socket> [--size <W>x<H>] [--scale <f>]`
+//! runs the real [`App`](crate::app::App) offscreen with a
 //! hardware wgpu renderer; `zeughaus ctl <socket> <words...>` sends it one
 //! command line and prints the one-line reply, `ok ...` or `err <reason>`.
 //! Coordinates are logical pixels.
@@ -33,7 +33,7 @@ pub fn dispatch() -> Option<i32> {
         Err(e) => {
             eprintln!("[remote] {e}");
             eprintln!(
-                "usage: zeughaus --headless --control <socket> [--size <W>x<H>] [--scale <f>] [join <session>]"
+                "usage: zeughaus --headless --control <socket> [--size <W>x<H>] [--scale <f>]"
             );
             2
         }
@@ -46,8 +46,6 @@ struct HostArgs {
     /// Logical size of the pretend window.
     size: Size,
     scale: f32,
-    /// `join <session>`, read by the same parser the windowed editor uses.
-    session: Option<String>,
 }
 
 impl HostArgs {
@@ -63,10 +61,6 @@ impl HostArgs {
                 "--control" => control = Some(PathBuf::from(value()?)),
                 "--size" => size = parse_size(value()?)?,
                 "--scale" => scale = parse_scale(value()?)?,
-                // The session itself is `parse_join_arg`'s to read.
-                "join" => {
-                    value()?;
-                }
                 other => return Err(format!("unknown argument {other:?}")),
             }
         }
@@ -74,7 +68,6 @@ impl HostArgs {
             control: control.ok_or("--control <socket> is required")?,
             size,
             scale,
-            session: crate::parse_join_arg(),
         })
     }
 }

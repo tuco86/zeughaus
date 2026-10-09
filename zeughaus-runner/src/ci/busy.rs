@@ -54,7 +54,7 @@ impl Busy {
     /// refused rather than applied: the next restart would quietly undo it.
     pub fn set_mode(&self, mode: BusyMode) -> Result<MachineState, String> {
         let mut current = self.mode.lock().unwrap_or_else(|e| e.into_inner());
-        super::write_atomic(&self.file, format!("{}\n", mode.as_str()).as_bytes())?;
+        crate::files::write_atomic(&self.file, format!("{}\n", mode.as_str()).as_bytes())?;
         *current = mode;
         drop(current);
         let state = self.state();

@@ -1,5 +1,4 @@
-# Cargo build output at any level (workspace root and the out-of-workspace
-# zeughaus-module crate).
+# Cargo build output at any level.
 target/
 .claude/settings.local.json
 

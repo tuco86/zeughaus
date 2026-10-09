@@ -1,9 +1,9 @@
 //! Serving the sample feed: how a frame leaves this process.
 //!
-//! Everything the graph computes reaches an editor through SpacetimeDB except
-//! frames. A 3840x2160 RGBA frame is 33 177 600 bytes, so it travels over its
-//! own QUIC connection instead ([`weida`]), and this module is the serving end
-//! of the protocol that [`zeughaus_link`] defines.
+//! Scalar values reach an editor as events, but a frame does not: a 3840x2160
+//! RGBA frame is 33 177 600 bytes, so it travels over its own QUIC connection
+//! instead ([`weida`]), and this module is the serving end of the protocol
+//! that [`zeughaus_link`] defines.
 //!
 //! Three pieces, in the order a frame passes through them:
 //!
@@ -177,22 +177,6 @@ impl FrameRegistry {
         if moved {
             self.wake();
         }
-    }
-
-    /// Drops everything.
-    ///
-    /// Used when this process stops owning execution: the frames it holds are
-    /// the last ones it produced, another runtime is producing the real ones
-    /// now, and every viewer here has to be sent away rather than shown a
-    /// picture that has stopped moving.
-    pub fn clear(&self) {
-        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-        if slots.pins.is_empty() {
-            return;
-        }
-        slots.pins.clear();
-        drop(slots);
-        self.wake();
     }
 
     /// Signals every waiting feed. The value carried is the sequence counter,
@@ -718,18 +702,6 @@ mod tests {
         assert!(matches!(
             registry.next_for(NodeId(7), "frame", None),
             Next::Wait
-        ));
-    }
-
-    #[test]
-    fn losing_ownership_ends_every_feed() {
-        let registry = FrameRegistry::new();
-        let image = frame(4, 4, 1);
-        registry.publish([(NodeId(7), "frame", Some(&image))]);
-        registry.clear();
-        assert!(matches!(
-            registry.next_for(NodeId(7), "frame", None),
-            Next::Gone
         ));
     }
 

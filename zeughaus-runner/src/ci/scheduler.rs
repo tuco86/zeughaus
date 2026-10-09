@@ -164,7 +164,7 @@ impl Pipeline {
     }
 
     fn save(&self, state_dir: &Path) {
-        if let Err(e) = super::write_json(&self.path(state_dir), self) {
+        if let Err(e) = crate::files::write_json(&self.path(state_dir), self) {
             eprintln!(
                 "[ci] cannot save pipeline {} #{}: {e}",
                 self.repo, self.number
@@ -187,7 +187,7 @@ pub fn load_pipelines(state_dir: &Path) -> Vec<Pipeline> {
         for file in files.flatten() {
             let path = file.path();
             if path.extension().is_some_and(|e| e == "json")
-                && let Ok(pipeline) = super::read_json::<Pipeline>(&path)
+                && let Ok(pipeline) = crate::files::read_json::<Pipeline>(&path)
             {
                 out.push(pipeline);
             }
@@ -1062,7 +1062,7 @@ impl Scheduler {
             .and_then(|m| self.machines.get(m))
             .map(|m| m.config.ssh_host.clone())
             .unwrap_or_default();
-        let write = |path: &Path, text: &str| super::write_atomic(path, text.as_bytes());
+        let write = |path: &Path, text: &str| crate::files::write_atomic(path, text.as_bytes());
         let mut tag = None;
         let place = if let Some(image) = &job.image {
             let containerfile = git(

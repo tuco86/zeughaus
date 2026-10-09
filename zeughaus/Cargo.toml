@@ -55,12 +55,10 @@ rfd = "0.15"
 # `image` decodes/uploads raw RGBA frames (screen capture -> Display node).
 # `canvas` draws the node header's button symbols as paths.
 iced = { version = "0.14", features = ["advanced", "wgpu", "tokio", "image", "canvas"] }
-spacetimedb-sdk.workspace = true
-zeughaus-sync.workspace = true
-# Frames do not fit through a state store (33 MB for a 4K frame), so the video
-# path is its own QUIC transport: `zeughaus-link` is the protocol, `weida` the
-# transport, and `tokio::io` reads a frame off the stream. The QUIC runtime
-# itself is iced's tokio executor, which every feed task already runs on.
+# The link to the runners: `zeughaus-link` is the protocol (the graph
+# document, frames, events), `weida` the transport, and `tokio::io` reads a
+# frame off the stream. The QUIC runtime itself is iced's tokio executor,
+# which every feed task already runs on.
 zeughaus-link.workspace = true
 weida.workspace = true
 # The terminal surface: draws a `TerminalView` with one wgpu primitive per
@@ -108,7 +106,6 @@ tokio = { version = "1", features = ["rt", "macros", "test-util"] }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 iced = { version = "0.14", features = ["advanced", "wgpu", "image", "canvas"] }
 console_error_panic_hook = "0.1"
-spacetimedb-sdk = { workspace = true, features = ["browser"] }
 # The pack is the whole choice in the browser: no state directory, so no file
 # themes and nothing to persist.
 zeughaus-theme = { workspace = true }
