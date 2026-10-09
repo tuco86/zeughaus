@@ -97,6 +97,24 @@ notify-rust = { version = "4.18", default-features = false, features = ["z-with-
 # platform's handler (`xdg-open`, `open`, `start`).
 open = "5.3"
 
+# macOS has no window icon at all: the one icon an app shows is the Dock's,
+# and a binary outside an `.app` bundle carries none. `NSApplication`'s
+# `setApplicationIconImage:` is what gives one to this process. Already in the
+# tree under `rfd`, with the same explicit feature list.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSImage",
+    "NSResponder",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSBundle",
+    "NSData",
+] }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # `#[tokio::test]` for the first-dial schedule, with a paused clock.
 tokio = { version = "1", features = ["rt", "macros", "test-util"] }

@@ -8,6 +8,11 @@ same numbers produce the SVG and the PNG set without an external rasterizer.
     python3 zeughaus/assets/icon/render.py
 
 writes zeughaus.svg and zeughaus-<size>.png next to this file.
+
+    python3 zeughaus/assets/icon/render.py <size> <path.png>
+
+renders one PNG at any size to any path, which is how the macOS iconset gets
+its ten sizes without upscaling one of the checked-in PNGs.
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ from __future__ import annotations
 import math
 import pathlib
 import struct
+import sys
 import zlib
 
 GRID = 512.0
@@ -147,6 +153,12 @@ def svg():
 
 def main():
     here = pathlib.Path(__file__).parent
+    argv = sys.argv[1:]
+    if argv:
+        size, path = int(argv[0]), pathlib.Path(argv[1])
+        png(path, render(size), size)
+        print(path)
+        return
     (here / "zeughaus.svg").write_text(svg())
     # 256 is the window icon compiled into the editor, 64 the browser tab's
     # favicon. Nothing else is used, so nothing else is written.

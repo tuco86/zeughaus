@@ -143,19 +143,19 @@ fn platform_specific() -> iced::window::settings::PlatformSpecific {
 #[cfg(target_os = "linux")]
 pub(crate) const APP_ID: &str = "net.doodleshnookie.Zeughaus";
 
-/// The bundled icon, decoded once at startup: 256 px, which every window
-/// manager that shows it smaller scales down itself.
+/// The icon a window carries: the bundled 256 px mark, decoded once at
+/// startup. Every window manager that shows it smaller scales it down itself.
 ///
-/// This reaches X11 and Windows. It does not reach Wayland: winit 0.30 makes
-/// `set_window_icon` a no-op there, and the protocol that would carry it
-/// (`xdg_toplevel_icon_v1`, which KWin implements) arrived in winit 0.31.
-/// Until iced pins that, a Wayland compositor finds the icon through the
-/// desktop entry named after [`APP_ID`], which `deploy/install.sh` installs.
+/// This reaches X11 and Windows. It reaches neither Wayland nor macOS: winit
+/// 0.30 makes `set_window_icon` a no-op on both, and on macOS there is
+/// nothing for it to reach -- the icon of an app there is the Dock's, which
+/// [`dock_icon`] sets. On Wayland the protocol that would carry one
+/// (`xdg_toplevel_icon_v1`, which KWin implements) arrived in winit 0.31;
+/// until iced pins that, a compositor finds the icon through the desktop
+/// entry named after [`APP_ID`], which `deploy/install.sh` installs.
 #[cfg(not(target_arch = "wasm32"))]
 fn window_icon() -> Option<iced::window::Icon> {
-    const DATA: &[u8] = include_bytes!("../assets/icon/zeughaus-256.png");
-
-    let mut reader = png::Decoder::new(std::io::Cursor::new(DATA))
+    let mut reader = png::Decoder::new(std::io::Cursor::new(ICON_PNG))
         .read_info()
         .ok()?;
     let mut pixels = vec![0; reader.output_buffer_size()?];
@@ -167,6 +167,51 @@ fn window_icon() -> Option<iced::window::Icon> {
     }
     pixels.truncate(info.buffer_size());
     iced::window::icon::from_rgba(pixels, info.width, info.height).ok()
+}
+
+/// The stencilled Z, compiled in: `zeughaus/assets/icon/render.py` writes it.
+#[cfg(not(target_arch = "wasm32"))]
+const ICON_PNG: &[u8] = include_bytes!("../assets/icon/zeughaus-256.png");
+
+/// Gives a plain binary the icon the Dock and the app switcher show. A macOS
+/// app reads its icon from the `Info.plist` of the bundle it runs in, and the
+/// editor is a binary first: run from `cargo run` or from `~/.cargo/bin` it
+/// has no bundle, so it hands AppKit the image itself.
+///
+/// Called once the window is open, never before: the Dock creates the tile
+/// for a process while AppKit finishes launching, and an image handed over
+/// before that is the tile's own icon again by the time it appears.
+///
+/// `deploy/macos-app.sh` builds the bundle, which is the better icon -- an
+/// icns carries every size the Dock, the switcher and Finder ask for, this
+/// is one 256 px image -- so inside one this does nothing.
+#[cfg(target_os = "macos")]
+pub(crate) fn dock_icon() {
+    use objc2::AllocAnyThread;
+    use objc2_app_kit::{NSApplication, NSImage};
+
+    // Off the main thread there is no application object to talk to. The
+    // window's events arrive on it, so this is a check, not a fallback.
+    let Some(mtm) = objc2::MainThreadMarker::new() else {
+        return;
+    };
+    // Only a bundle has an identifier, and only its icns is worth keeping.
+    if objc2_foundation::NSBundle::mainBundle()
+        .bundleIdentifier()
+        .is_some()
+    {
+        return;
+    }
+    // AppKit decodes the PNG itself: it keeps the file's resolution, which a
+    // raw RGBA bitmap would have to be told about.
+    let data = objc2_foundation::NSData::with_bytes(ICON_PNG);
+    let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else {
+        return;
+    };
+    // SAFETY: `setApplicationIconImage:` is generated as unsafe only because
+    // the generator cannot tell whether `None` is allowed; this passes an
+    // image.
+    unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image)) };
 }
 
 /// The browser tab's icon is a `<link rel="icon">` in `index.html`, not a

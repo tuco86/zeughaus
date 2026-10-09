@@ -50,6 +50,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   override it until set back. The mode survives a restart
   (`<state-dir>/ci/busy-mode`). New `/busy` endpoint and `machine` event;
   editor and runner must be updated together for the control to appear.
+- `deploy/macos-app.sh` builds `Zeughaus.app` around a release build of the
+  editor: the Info.plist that names the app, and an icns `render.py` draws
+  at the ten sizes the Dock, the switcher and Finder ask for.
 
 ### Changed
 
@@ -89,6 +92,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the alternate screen after scrollback was evicted: the two screens number
   their rows independently, so each switch now starts a new terminal epoch
   and the runner sends a fresh head instead of a delta.
+- The editor shows its icon on macOS: an app reads it from the `Info.plist`
+  of its bundle, so a binary run outside one (`cargo run`) now hands the
+  mark to AppKit itself, once the window is open.
 - Shift+Enter in a terminal sends a line feed instead of the carriage
   return of Enter, so a prompt such as omp's or Claude Code's breaks the
   line instead of submitting.
