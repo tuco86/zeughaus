@@ -28,7 +28,7 @@ use super::forge::{self, State, Status};
 use super::header::{JobDef, WhenBusy};
 use super::launch::{self, Launch, Place};
 use super::machine::Machine;
-use super::{cleanup, pipeline};
+use super::{CI_DIR, cleanup, pipeline};
 use crate::jobs::JobHost;
 
 const TICK: Duration = Duration::from_secs(1);
@@ -87,7 +87,7 @@ pub enum PipelineStatus {
     Running,
     Succeeded,
     Failed,
-    /// The pipeline could not be set up: fetch, resolve or `.ci` validation.
+    /// The pipeline could not be set up: fetch, resolve or `.zeughaus-ci` validation.
     Error,
 }
 
@@ -1067,7 +1067,7 @@ impl Scheduler {
         let place = if let Some(image) = &job.image {
             let containerfile = git(
                 &mirror,
-                &["show", &format!("{sha}:.ci/{image}.Containerfile")],
+                &["show", &format!("{sha}:{CI_DIR}/{image}.Containerfile")],
                 &[],
             )?;
             let digest = hex::encode(Sha256::digest(containerfile.as_bytes()));
@@ -1563,12 +1563,12 @@ fn rev_parse(mirror: &Path, rev: &str) -> Result<String, String> {
         .map_err(|_| format!("{rev} does not exist"))
 }
 
-/// The `.ci/` files of a commit: (name, text) of every job or helper file,
+/// The `.zeughaus-ci/` files of a commit: (name, text) of every job or helper file,
 /// and the names of the Containerfiles.
 type CiFiles = (Vec<(String, String)>, Vec<String>);
 
 fn read_ci(mirror: &Path, sha: &str) -> Result<CiFiles, String> {
-    let listing = git(mirror, &["ls-tree", sha, ".ci/"], &[])?;
+    let listing = git(mirror, &["ls-tree", sha, &format!("{CI_DIR}/")], &[])?;
     let mut files = Vec::new();
     let mut containerfiles = Vec::new();
     for line in listing.lines() {
@@ -1578,7 +1578,10 @@ fn read_ci(mirror: &Path, sha: &str) -> Result<CiFiles, String> {
         if meta.split_whitespace().nth(1) != Some("blob") {
             continue;
         }
-        let Some(name) = path.strip_prefix(".ci/") else {
+        let Some(name) = path
+            .strip_prefix(CI_DIR)
+            .and_then(|rest| rest.strip_prefix('/'))
+        else {
             continue;
         };
         if name.ends_with(".Containerfile") {

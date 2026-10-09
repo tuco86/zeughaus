@@ -645,7 +645,7 @@ start; the client identity comes from the state directory (`--state-dir`,
 `ZEUGHAUS_STATE_DIR`), so a script, a cron entry or a webhook relay is the
 same principal as an editor on that machine. No store is involved.
 
-## 14. CI: pipelines from a repository's `.ci/` folder
+## 14. CI: pipelines from a repository's `.zeughaus-ci/` folder
 
 A runner with `<state-dir>/ci.toml` also runs CI (`zeughaus-runner/src/ci/`).
 Without the file nothing of it starts. On the workstation a second runner does
@@ -653,13 +653,13 @@ this as the Unix user `zeughaus-ci` (`deploy/install-ci.sh`, units under
 `deploy/ci/`). It joins the user's store like any runner, so its terminals
 appear as a section of their own in every editor.
 
-**Jobs are scripts.** Every `.sh`/`.ps1` file in `.ci/` with a TOML header
+**Jobs are scripts.** Every `.sh`/`.ps1` file in `.zeughaus-ci/` with a TOML header
 between `# /// ci` and `# ///` is a job named after its file. The header
 holds these keys:
 
 - `on`: `push <glob>`, `tag <glob>`, or `cron <5 fields>`;
 - `needs`: exactly one of `on` and `needs` is set;
-- `image` (a `.ci/<image>.Containerfile`) or `machine` (a VM from
+- `image` (a `.zeughaus-ci/<image>.Containerfile`) or `machine` (a VM from
   `ci.toml`); neither means the host;
 - `cache`, `secrets`, `when_busy` (`wait`/`freeze`/`run`), `env`,
   `timeout_minutes`.
@@ -682,7 +682,7 @@ has no HTTP listener.
 1. Fetch into a bare mirror `ci/mirrors/<repo>.git`, with the token in the
    environment and never in argv.
 2. Pin the commit as `refs/ci/<n>`.
-3. Read `.ci/` at that commit.
+3. Read `.zeughaus-ci/` at that commit.
 4. Record every decision in `ci/pipelines/<repo>/<n>.json` before acting
    on it.
 

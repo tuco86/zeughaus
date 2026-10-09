@@ -10,6 +10,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
+use super::CI_DIR;
 use super::header::JobDef;
 
 /// Everything `launch.sh` needs that is not in the job header.
@@ -154,13 +155,14 @@ pub fn launch_sh(launch: &Launch<'_>) -> String {
             let image = job.image.as_deref().unwrap_or_default();
             let _ = write!(
                 out,
-                "podman image exists {tag} || podman build -t {tag} -f {file} .ci || exit 71\n\
+                "podman image exists {tag} || podman build -t {tag} -f {file} {ctx} || exit 71\n\
                  podman run --rm -it --init --name {name} --cpus {cpus} --memory {memory} \
                  --env-file \"$secret_dir/env\" -v \"$ws:/work\" -v {run}:/ci/run \
                  -v {inputs}:/ci/inputs:ro -w /work {tag} /bin/sh /ci/run/inner.sh\n\
                  exit $?\n",
                 tag = sh_quote(tag),
-                file = sh_quote(&format!(".ci/{image}.Containerfile")),
+                file = sh_quote(&format!("{CI_DIR}/{image}.Containerfile")),
+                ctx = sh_quote(CI_DIR),
                 name = sh_quote(&format!("zci-{}", launch.run_id)),
                 memory = sh_quote(memory),
                 run = sh_path(launch.run_dir),
@@ -184,7 +186,7 @@ pub fn inner_sh(job: &JobDef) -> String {
          if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi\n",
         secs = u64::from(job.timeout_minutes) * 60,
         interpreter = job.interpreter,
-        file = sh_quote(&format!(".ci/{}", job.file)),
+        file = sh_quote(&format!("{CI_DIR}/{}", job.file)),
     )
 }
 
@@ -226,7 +228,7 @@ pub fn inner_ps1(job: &JobDef, run_id: &str, pipeline: u64) -> String {
         rc = ps_quote(&format!(r"{run}\rc")),
         env = ps_quote(&format!(r"{run}\env.ps1")),
         bundle = ps_quote(&format!(r"{run}\src.bundle")),
-        file = ps_quote(&format!(r".ci\{}", job.file)),
+        file = ps_quote(&format!(r"{CI_DIR}\{}", job.file)),
     )
 }
 

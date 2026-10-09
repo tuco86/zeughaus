@@ -1,9 +1,10 @@
-//! Event patterns, validation of a repository's whole `.ci/` set, and the
+//! Event patterns, validation of a repository's whole `.zeughaus-ci/` set, and the
 //! selection of the jobs an event runs.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
+use super::CI_DIR;
 use super::event::{CiEvent, EventKind};
 use super::header::{JobDef, parse_job};
 
@@ -107,7 +108,7 @@ fn single_glob(kind: &str, rest: &str) -> Result<String, String> {
     Ok(rest.to_string())
 }
 
-/// Parses and validates every job of a `.ci/` folder. `files` are the
+/// Parses and validates every job of a `.zeughaus-ci/` folder. `files` are the
 /// non-Containerfile files as (name, text); `containerfiles` are file names
 /// ending in `.Containerfile`. The result is in topological order, ties
 /// broken by name.
@@ -122,7 +123,7 @@ pub fn load_jobs(
         };
         if let Some(prev) = by_name.get(&job.name) {
             return Err(format!(
-                ".ci/{file}: job `{}` is already defined by .ci/{}",
+                "{CI_DIR}/{file}: job `{}` is already defined by {CI_DIR}/{}",
                 job.name, prev.file
             ));
         }
@@ -140,7 +141,7 @@ fn validate(
     all: &BTreeMap<String, JobDef>,
     containerfiles: &[String],
 ) -> Result<(), String> {
-    let fail = |msg: String| format!(".ci/{}: {msg}", job.file);
+    let fail = |msg: String| format!("{CI_DIR}/{}: {msg}", job.file);
     if job.on.is_empty() == job.needs.is_empty() {
         return Err(fail(
             "exactly one of `on` and `needs` must be non-empty".into(),
@@ -167,7 +168,7 @@ fn validate(
     if let Some(image) = &job.image {
         let wanted = format!("{image}.Containerfile");
         if !containerfiles.contains(&wanted) {
-            return Err(fail(format!("image `{image}` has no .ci/{wanted}")));
+            return Err(fail(format!("image `{image}` has no {CI_DIR}/{wanted}")));
         }
     }
     if job.when_busy == super::header::WhenBusy::Freeze
@@ -205,7 +206,7 @@ fn topological(by_name: BTreeMap<String, JobDef>) -> Result<Vec<JobDef>, String>
             let files: Vec<String> = waiting
                 .keys()
                 .filter_map(|name| by_name.get(*name))
-                .map(|job| format!(".ci/{}", job.file))
+                .map(|job| format!("{CI_DIR}/{}", job.file))
                 .collect();
             return Err(format!("dependency cycle among jobs: {}", files.join(", ")));
         };
@@ -394,7 +395,7 @@ mod tests {
             ),
             (
                 vec![file("a.sh", &format!("{on}\nimage = \"nope\""))],
-                "no .ci/nope.Containerfile",
+                "no .zeughaus-ci/nope.Containerfile",
             ),
             (
                 vec![file("a.sh", &format!("{on}\nwhen_busy = \"freeze\""))],
@@ -413,7 +414,7 @@ mod tests {
         for (files, expect) in cases {
             let err = load(&files).unwrap_err();
             assert!(err.contains(expect), "expected `{expect}` in `{err}`");
-            assert!(err.contains(".ci/"), "{err}");
+            assert!(err.contains(".zeughaus-ci/"), "{err}");
         }
     }
 

@@ -1,4 +1,4 @@
-//! The `# /// ci` header block at the top of a `.ci/` script.
+//! The `# /// ci` header block at the top of a `.zeughaus-ci/` script.
 //!
 //! The block is TOML inside comment lines, so the script stays valid for its
 //! interpreter and a helper file without a block is simply not a job.
@@ -37,7 +37,7 @@ impl fmt::Display for WhenBusy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobDef {
     pub name: String,
-    /// File name inside `.ci/`, e.g. `check.sh`.
+    /// File name inside `.zeughaus-ci/`, e.g. `check.sh`.
     pub file: String,
     pub on: Vec<String>,
     pub needs: Vec<String>,
@@ -122,9 +122,9 @@ fn check_cache(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Parses the header of one `.ci/` file. `Ok(None)` is a helper file.
+/// Parses the header of one `.zeughaus-ci/` file. `Ok(None)` is a helper file.
 pub fn parse_job(file_name: &str, text: &str) -> Result<Option<JobDef>, String> {
-    let fail = |msg: String| format!(".ci/{file_name}: {msg}");
+    let fail = |msg: String| format!("{}/{file_name}: {msg}", super::CI_DIR);
     let Some(toml) = extract(text).map_err(fail)? else {
         return Ok(None);
     };
@@ -219,7 +219,7 @@ mod tests {
     fn unknown_key_is_rejected() {
         let text = "# /// ci\n# on = [\"push main\"]\n# bogus = 1\n# ///\n";
         let err = parse_job("x.sh", text).unwrap_err();
-        assert!(err.starts_with(".ci/x.sh: "), "{err}");
+        assert!(err.starts_with(".zeughaus-ci/x.sh: "), "{err}");
         assert!(err.contains("bogus"), "{err}");
     }
 

@@ -56,7 +56,7 @@ tokio = { version = "1", features = [
     # and waits for the live runs.
     "signal",
 ] }
-# CI: `ci.toml` and the `.ci` job headers, webhook signatures (hmac and sha2
+# CI: `ci.toml` and the `.zeughaus-ci` job headers, webhook signatures (hmac and sha2
 # share one `digest` major), the hook's HTTP intake, cron schedules in the
 # local time zone, and the basic-auth header a mirror fetch presents.
 toml.workspace = true

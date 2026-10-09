@@ -1,4 +1,4 @@
-//! `zeughaus-runner ci ...`: checking a `.ci` folder, queueing a pipeline,
+//! `zeughaus-runner ci ...`: checking a `.zeughaus-ci` folder, queueing a pipeline,
 //! reading their state, the forge token check and the webhook intake.
 //!
 //! ```text
@@ -19,6 +19,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
+use super::CI_DIR;
 use super::config::CiConfig;
 use super::event::{self, CiEvent, EventKind};
 use super::header::JobDef;
@@ -48,7 +49,7 @@ pub fn run(args: &[String], state_dir: &Path) -> ExitCode {
     }
 }
 
-/// The jobs of a `.ci` folder on disk, validated as a pipeline would be.
+/// The jobs of a `.zeughaus-ci` folder on disk, validated as a pipeline would be.
 fn load_dir(dir: &Path) -> Result<Vec<JobDef>, String> {
     let entries =
         std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
@@ -74,7 +75,7 @@ fn load_dir(dir: &Path) -> Result<Vec<JobDef>, String> {
 
 fn check(args: &[String]) -> Result<(), String> {
     let dir = match args {
-        [] => ".ci",
+        [] => CI_DIR,
         [dir] => dir.as_str(),
         _ => return Err("usage: ci check [DIR]".to_owned()),
     };
@@ -132,7 +133,7 @@ fn plan(args: &[String]) -> Result<(), String> {
     let starts_event = |arg: &String| matches!(arg.as_str(), "push" | "tag" | "cron");
     let (dir, rest) = match args.first() {
         Some(first) if !starts_event(first) => (first.as_str(), &args[1..]),
-        _ => (".ci", args),
+        _ => (CI_DIR, args),
     };
     let [kind, rest @ ..] = rest else {
         return Err(USAGE.to_owned());

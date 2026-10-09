@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminal has the keyboard; its child (vim, tmux) no longer receives them.
   Not while the palette or a rename field is open.
 - CI on a runner: with `<state-dir>/ci.toml`, a runner runs pipelines that
-  a repository defines as scripts in `.ci/` (TOML headers: `on`, `needs`,
+  a repository defines as scripts in `.zeughaus-ci/` (TOML headers: `on`, `needs`,
   `image`, `machine`, `cache`, `secrets`, `when_busy`, `env`,
   `timeout_minutes`):
   - jobs run on the host, in rootless podman containers, or in a managed
@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   units.
 - `vm/win11/vm.sh toolchain` installs the build toolchain into the golden
   image, and a persistent cache disk is attached as `W:`.
-- The workspace gate runs on the CI for every push (`.ci/gate.sh`) and
+- The workspace gate runs on the CI for every push (`.zeughaus-ci/gate.sh`) and
   reports `zeughaus/gate` on the commit in Forgejo.
 - A CI runner's section in the tab bar shows whether its machine counts as
   busy (a play or pause circle, filled when overridden) and cycles the busy

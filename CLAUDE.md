@@ -158,17 +158,17 @@ forwards `https://ci.doodleshnookie.net/hook/<repo>` to). Logs:
 VM are configured in `/var/lib/zeughaus-ci/state/ci.toml`, and secrets are
 files in `state/secrets/`. `zeughaus-ci run|status|forge-check` (a sudo
 wrapper) queues a pipeline and reads results. `zeughaus-runner ci check
-[DIR]` and `ci plan [DIR] <push|tag> <ref>` validate a `.ci/` folder without
+[DIR]` and `ci plan [DIR] <push|tag> <ref>` validate a `.zeughaus-ci/` folder without
 a runner. The Windows VM (`vm/win11/`, installed under
 `/usr/local/lib/zeughaus-ci/vm/win11`) is booted and stopped by the
 runner. `DESIGN.md` section 14 describes how it works.
 
 This repository is one of its repos: every push to Forgejo runs
-`.ci/gate.sh` (the gate below, in the `.ci/arch.Containerfile` image,
+`.zeughaus-ci/gate.sh` (the gate below, in the `.zeughaus-ci/arch.Containerfile` image,
 against weida's `main` as the sibling checkout) and posts `zeughaus/gate`
 on the commit. Forgejo reaches the runner as the bot user `zeughaus-ci`
 (write on zeughaus, read on weida); its tokens and the webhook secret are
-in OpenBao under `secret/zeughaus/ci`. A change to `.ci/` is checked with
+in OpenBao under `secret/zeughaus/ci`. A change to `.zeughaus-ci/` is checked with
 `zeughaus-runner ci check` before it is pushed.
 
 ### Agent stack and reload
