@@ -26,6 +26,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use super::CI_DIR;
+use super::channels::Channels;
 use super::config::CiConfig;
 use super::event::{self, CiEvent, EventKind};
 use super::excerpt;
@@ -50,6 +51,8 @@ pub fn run(args: &[String], state_dir: &Path) -> ExitCode {
         Some("forge-check") => forge_check(state_dir, &args[1..]),
         Some("secrets-check") => secrets_check(state_dir, &args[1..]),
         Some("hook") => return super::hook::run(state_dir, &args[1..]),
+        // Internal: the program of a transcript terminal, started by `/ci`.
+        Some("replay") => return super::replay::run(&args[1..]),
         _ => Err(USAGE.to_owned()),
     };
     match result {
@@ -61,8 +64,9 @@ pub fn run(args: &[String], state_dir: &Path) -> ExitCode {
     }
 }
 
-/// The jobs of a `.zeughaus-ci` folder on disk, validated as a pipeline would be.
-fn load_dir(dir: &Path) -> Result<Vec<JobDef>, String> {
+/// The jobs and channels of a `.zeughaus-ci` folder on disk, validated as a
+/// pipeline would be.
+fn load_dir(dir: &Path) -> Result<(Vec<JobDef>, Channels), String> {
     let entries =
         std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
     let mut files = Vec::new();
@@ -82,7 +86,8 @@ fn load_dir(dir: &Path) -> Result<Vec<JobDef>, String> {
     }
     files.sort();
     containerfiles.sort();
-    pipeline::load_jobs(&files, &containerfiles)
+    let jobs = pipeline::load_jobs(&files, &containerfiles)?;
+    Ok((jobs, Channels::from_files(&files)?))
 }
 
 fn check(args: &[String]) -> Result<(), String> {
@@ -91,7 +96,8 @@ fn check(args: &[String]) -> Result<(), String> {
         [dir] => dir.as_str(),
         _ => return Err("usage: ci check [DIR]".to_owned()),
     };
-    for job in load_dir(Path::new(dir))? {
+    let (jobs, channels) = load_dir(Path::new(dir))?;
+    for job in jobs {
         let triggers = if job.on.is_empty() {
             format!("needs: {}", job.needs.join(", "))
         } else {
@@ -104,6 +110,10 @@ fn check(args: &[String]) -> Result<(), String> {
             triggers,
             job.when_busy
         );
+    }
+    for (name, patterns) in channels.names() {
+        let on: Vec<String> = patterns.iter().map(Pattern::to_string).collect();
+        println!("channel {name}  on: {}", on.join(", "));
     }
     Ok(())
 }
@@ -154,7 +164,8 @@ fn plan(args: &[String]) -> Result<(), String> {
         return Err(USAGE.to_owned());
     }
     let event = parse_event("", kind, rest, "main")?;
-    let jobs = load_dir(Path::new(dir))?;
+    let (jobs, channels) = load_dir(Path::new(dir))?;
+    println!("channel {}", channels.of(&event));
     let selected = pipeline::select(&jobs, &event);
     if selected.is_empty() {
         println!("no jobs");
@@ -231,9 +242,10 @@ fn status(state_dir: &Path, args: &[String]) -> Result<(), String> {
         let sha = pipeline.sha.as_deref().unwrap_or("-");
         let _ = writeln!(
             out,
-            "{} #{} {} {} {} {}",
+            "{} #{} {} {} {} {} {}",
             pipeline.repo,
             pipeline.number,
+            pipeline.channel(),
             pipeline.event.kind,
             pipeline.event.git_ref,
             &sha[..sha.len().min(7)],
@@ -295,7 +307,7 @@ fn log(state_dir: &Path, args: &[String]) -> Result<(), String> {
         .run_dir
         .as_ref()
         .ok_or_else(|| format!("{repo} #{number} {job} never ran"))?;
-    let text = excerpt::read_log(&run_dir.join("log"))?;
+    let text = excerpt::read_log(run_dir)?;
     let lines: Vec<&str> = text.lines().collect();
     let start = tail.map_or(0, |n| lines.len().saturating_sub(n));
     let mut out = lines[start..].join("\n");

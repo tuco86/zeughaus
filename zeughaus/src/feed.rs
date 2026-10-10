@@ -27,9 +27,10 @@ use tokio::io::AsyncReadExt;
 use weida::{PeerEvent, PeerEvents, Requester, TransferMeta};
 use zeughaus_core::Image;
 use zeughaus_link::{
-    BUSY_PATH, BusyMode, BusyRequest, EVENTS_PATH, FEED_PATH, FeedRequest, FrameHeader, HOLD_PATH,
-    HoldReply, HoldRequest, MAX_BUSY_BYTES, MAX_EVENT_BYTES, MAX_HOLD_BYTES, MAX_SNAPSHOT_BYTES,
-    MachineState, RuntimeEvent, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, TriggerRequest, ladder,
+    BUSY_PATH, BusyMode, BusyRequest, CI_PATH, CiReply, CiRequest, EVENTS_PATH, FEED_PATH,
+    FeedRequest, FrameHeader, HOLD_PATH, HoldReply, HoldRequest, MAX_BUSY_BYTES,
+    MAX_CI_REPLY_BYTES, MAX_EVENT_BYTES, MAX_HOLD_BYTES, MAX_SNAPSHOT_BYTES, MachineState,
+    RuntimeEvent, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, TriggerRequest, ladder,
 };
 
 use crate::transport::{Endpoint, QUIC, client_tls, explain, first_dial, gave_up, policy};
@@ -408,6 +409,28 @@ pub async fn set_busy(endpoint: Endpoint, mode: BusyMode) -> Result<MachineState
         .await
         .map_err(|e| format!("busy: {e}"))?;
     MachineState::decode(&encoded).ok_or_else(|| "busy: malformed".to_owned())
+}
+
+/// Asks a CI runner one question about its pipelines, machines or job
+/// transcripts. The runner's own refusal comes back as the error.
+pub async fn ci(endpoint: Endpoint, request: CiRequest) -> Result<CiReply, String> {
+    let quic = QUIC.as_ref().ok_or("no QUIC runtime")?;
+    let url = endpoint.path(CI_PATH)?;
+    let requester = quic.requester(client_tls());
+    first_dial(&url, || requester.connect(&url)).await?;
+    let reply = requester
+        .request(&request.encode())
+        .await
+        .map_err(|e| format!("ci: {e}"))?;
+    let encoded = reply
+        .collect(MAX_CI_REPLY_BYTES)
+        .await
+        .map_err(|e| format!("ci: {e}"))?;
+    match CiReply::decode(&encoded) {
+        Some(CiReply::Error { message }) => Err(message),
+        Some(reply) => Ok(reply),
+        None => Err("ci: malformed".to_owned()),
+    }
 }
 
 /// Streams one feed's frames for as long as the editor wants them.

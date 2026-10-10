@@ -199,6 +199,7 @@ mod tests {
                 job("windows", &["push *"], windows),
                 job("publish", &[], publish),
             ],
+            channel: String::new(),
         }
     }
 

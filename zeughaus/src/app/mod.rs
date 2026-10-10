@@ -5,6 +5,10 @@
 //! each reaches those fields directly rather than through accessors it would
 //! be the only caller of.
 
+/// The CI sections: the channels and pipelines of a runner's CI, and the
+/// transcripts of their jobs.
+#[cfg(not(target_arch = "wasm32"))]
+mod ci;
 /// The graph as the editor holds it: nodes, edges, node instances, and the
 /// rules a wire has to pass.
 mod graph;
@@ -245,6 +249,10 @@ pub struct App {
     /// action.
     #[cfg(not(target_arch = "wasm32"))]
     mux: BTreeMap<RunnerKey, MuxState>,
+    /// Each connected runner's CI as its section shows it, by the runner's
+    /// key. A runner that does not run CI has none.
+    #[cfg(not(target_arch = "wasm32"))]
+    ci: BTreeMap<RunnerKey, ci::CiClient>,
     /// Running without a window (`zeughaus --headless`): nobody sits in front
     /// of a file dialog, and rfd would open one on the desktop of whoever
     /// started the process.
@@ -382,6 +390,8 @@ impl App {
             // No mux until a runtime announces where it serves.
             #[cfg(not(target_arch = "wasm32"))]
             mux: BTreeMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            ci: BTreeMap::new(),
             #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
             headless: false,
             #[cfg(not(target_arch = "wasm32"))]
@@ -397,7 +407,8 @@ impl App {
         if scratch && let Some(graph) = app.create_graph("") {
             app.pending_graph_focus = Some(graph);
         }
-        app.sync_workspace();
+        // No runner is known yet, so no CI section has anything to ask.
+        let _ = app.sync_workspace();
         app
     }
 
@@ -607,14 +618,20 @@ impl App {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.apply(message);
-        self.sync_workspace();
+        let synced = self.sync_workspace();
         #[cfg(not(target_arch = "wasm32"))]
         if self.pending_restore.is_some() {
             let restored = self.finish_restore();
-            self.sync_workspace();
-            return Task::batch([task, restored]);
+            let resynced = self.sync_workspace();
+            return Task::batch([task, synced, restored, resynced]);
         }
-        task
+        // Most messages ask for nothing here, and a batch is a stream the
+        // runtime polls whether or not it holds anything.
+        if synced.units() == 0 {
+            task
+        } else {
+            Task::batch([task, synced])
+        }
     }
 
     /// Brings the synthetic sections, a pending graph focus and
@@ -626,8 +643,15 @@ impl App {
     /// it once here instead of at each of those sites is what keeps them
     /// from ever disagreeing. A selection from another graph is dropped
     /// because a delete would act on nodes the user can no longer see.
-    fn sync_workspace(&mut self) {
+    ///
+    /// The task is what the CI sections ask their runners for when one is
+    /// new.
+    fn sync_workspace(&mut self) -> Task<Message> {
         self.sync_synthetic_sections();
+        #[cfg(not(target_arch = "wasm32"))]
+        let asked = self.sync_ci_sections();
+        #[cfg(target_arch = "wasm32")]
+        let asked = Task::none();
         if let Some(graph) = self.pending_graph_focus
             && ((self.workspace.show_graph(graph) && !self.awaits_runner_tab(graph))
                 || !self.nodes.contains_key(&graph))
@@ -635,11 +659,11 @@ impl App {
             self.pending_graph_focus = None;
         }
         let target = self.workspace.focused_graph().unwrap_or(NodeId(0));
-        if target == self.current_graph {
-            return;
+        if target != self.current_graph {
+            self.current_graph = target;
+            self.selected.clear();
         }
-        self.current_graph = target;
-        self.selected.clear();
+        asked
     }
 
     /// The sections no runner stands behind: without a runner every graph is
@@ -834,6 +858,11 @@ impl App {
                 // synthetic section has no runner to tell.
                 let mut closed = Task::none();
                 match &message {
+                    // A CI section is the editor's own: it has no runner's tab
+                    // to close.
+                    workspace::Message::CloseTab(tab) if tab.runner.ci_runner().is_some() => {
+                        return Task::none();
+                    }
                     workspace::Message::CloseTab(tab) => {
                         let surfaces: Vec<Surface> = self
                             .workspace
@@ -1642,6 +1671,14 @@ impl App {
             Message::TerminalAction(pane, action) => {
                 return self.apply_terminal_action(pane, action);
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::Ci(key, message) => {
+                return self.apply_ci(key, message);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::CiPoll => {
+                return self.poll_ci();
+            }
         }
         Task::none()
     }
@@ -1746,7 +1783,8 @@ impl App {
         .unwrap_or_default()
     }
 
-    /// What a pane is called in its grip: its graph's or terminal's title.
+    /// What a pane is called in its grip: its graph's, terminal's or CI
+    /// view's title.
     fn pane_title(&self, key: &RunnerKey, surface: Surface) -> String {
         match surface {
             Surface::Graph(graph) => self
@@ -1754,7 +1792,13 @@ impl App {
                 .get(&NodeId(graph))
                 .map_or_else(|| "Graph".to_owned(), |node| node.display_name.clone()),
             Surface::Empty => "Empty".to_owned(),
+            Surface::Ci(view) => self.ci_pane_title(key, view),
             Surface::Terminal(terminal) => {
+                // A transcript is named for the job it replays.
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(title) = self.ci_terminal_title(key, terminal) {
+                    return title;
+                }
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some((view, _)) = self.terminal_view(key, terminal) {
                     let guard = view.lock().unwrap_or_else(|e| e.into_inner());
@@ -1799,8 +1843,15 @@ impl App {
                 } else if key.as_str() == RunnerKey::LOCAL {
                     controls.push(header_control("graph", GLYPH_GRAPH, "+ Graph", "New graph"));
                 }
+                // The busy toggle is the CI section's: the machine is what the
+                // CI runs its jobs on, and the runner's own section is about
+                // its terminals and graphs.
                 #[cfg(not(target_arch = "wasm32"))]
-                if let Some(machine) = self.runtime.links.get(key).and_then(|link| link.machine) {
+                if let Some(machine) = key
+                    .ci_runner()
+                    .and_then(|runner| self.runtime.links.get(&runner))
+                    .and_then(|link| link.machine)
+                {
                     controls.push(busy_control(machine));
                 }
                 let tab = |t| tab_entry(key, t);
@@ -1868,7 +1919,7 @@ impl App {
             on_control: Box::new(|key, control| match control {
                 "graph" => Message::NewGraph(key),
                 "group" => Message::Workspace(W::NewGroup(key)),
-                "busy" => Message::CycleBusy(key),
+                "busy" => Message::CycleBusy(key.ci_runner().unwrap_or(key)),
                 _ => Message::Workspace(W::NewShell(key)),
             }),
             on_press_tab: Box::new(|tab| Message::Workspace(W::PressTab(tab))),
@@ -2042,9 +2093,13 @@ impl App {
                     "Empty pane",
                     "Its surface could not be restored. Close it or split it again.",
                 ),
-                Surface::Terminal(terminal) => {
-                    self.terminal_pane(pane_ref.clone(), &key, *terminal)
-                }
+                // A transcript is the runner's terminal, shown to this editor
+                // and never typed into.
+                Surface::Terminal(terminal) => match key.ci_runner() {
+                    Some(runner) => self.terminal_pane(pane_ref.clone(), &runner, *terminal, true),
+                    None => self.terminal_pane(pane_ref.clone(), &key, *terminal, false),
+                },
+                Surface::Ci(view) => self.ci_view(&key, *view),
             };
             // Always a stack with the body first: iced keeps a child's state
             // by its index, so the overlay coming and going with a drag
@@ -2129,11 +2184,23 @@ impl App {
         _pane: Option<PaneRef>,
         _key: &RunnerKey,
         _terminal: zeughaus_mux::TerminalId,
+        _read_only: bool,
     ) -> Element<'_, Message, Theme> {
         unavailable(
             "Terminal",
             "Terminals run on the runner and are not shown in the browser editor.",
         )
+    }
+
+    /// A CI view in the browser editor, which reaches no runner.
+    #[cfg(target_arch = "wasm32")]
+    fn ci_view(&self, _section: &RunnerKey, _view: u64) -> Element<'_, Message, Theme> {
+        unavailable("CI", "CI views need the native editor")
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn ci_pane_title(&self, _section: &RunnerKey, _view: u64) -> String {
+        "CI".to_owned()
     }
 
     fn graph_view(&self, graph: NodeId) -> Element<'_, Message, Theme> {
@@ -2467,6 +2534,15 @@ impl App {
             iced::time::every(std::time::Duration::from_millis(100)).map(|_| Message::SyncPoll),
         );
 
+        // The CI views ask their runners again on a slow clock; a change
+        // reaches them as an event at once.
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.ci.is_empty() {
+            subs.push(
+                iced::time::every(std::time::Duration::from_secs(5)).map(|_| Message::CiPoll),
+            );
+        }
+
         // A split drag holds its newest ratio back; without a clock the last
         // one of a gesture would never be sent, and the runner would keep a
         // ratio from the middle of the drag.
@@ -2634,13 +2710,15 @@ fn tab_entry<'a>(
     key: &RunnerKey,
     tab: &'a zeughaus_mux::TabSnapshot,
 ) -> iced_tabs::Tab<'a, TabRef> {
+    // A CI tab is a view this editor makes, not something to close.
     let mut entry = iced_tabs::Tab::new(
         TabRef {
             runner: key.clone(),
             tab: tab.id,
         },
         tab.title.as_str(),
-    );
+    )
+    .closable(key.ci_runner().is_none());
     if let Some(accent) = workspace::accent(tab) {
         entry = entry.accent(accent);
     }

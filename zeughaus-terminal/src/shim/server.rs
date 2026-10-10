@@ -1,7 +1,6 @@
 //! The shim process: one PTY and its child, held across runner restarts.
 
 use std::collections::VecDeque;
-use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -16,13 +15,14 @@ use super::proto::{
 };
 use crate::Profile;
 use crate::session::pty_size;
+use crate::wal::{self, WalWriter};
 
 /// What the reader, the waiter and the connections share. One lock, so that
 /// "append to the replay, then send to the session" and "send the replay,
 /// then register the session" can never interleave.
 struct Shared {
     ring: VecDeque<u8>,
-    log: Option<File>,
+    wal: Option<WalWriter>,
     client: Option<UnixStream>,
     exit: Option<ShimExit>,
     killed: bool,
@@ -132,14 +132,8 @@ fn serve(dir: &Path) -> io::Result<()> {
         .master
         .try_clone_reader()
         .map_err(|e| fail(&mut killer, io::Error::other(e)))?;
-    let log = match &spec.log {
-        Some(path) => Some(
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|e| fail(&mut killer, e))?,
-        ),
+    let wal = match &spec.wal {
+        Some(path) => Some(WalWriter::open(path, spec.wal_cap).map_err(|e| fail(&mut killer, e))?),
         None => None,
     };
     let sock = dir.join("sock");
@@ -150,7 +144,7 @@ fn serve(dir: &Path) -> io::Result<()> {
         dir: dir.to_path_buf(),
         shared: Mutex::new(Shared {
             ring: VecDeque::new(),
-            log,
+            wal,
             client: None,
             exit: None,
             killed: false,
@@ -200,7 +194,7 @@ fn serve(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Copies every PTY chunk into the replay, the log and the attached session.
+/// Copies every PTY chunk into the replay, the WAL and the attached session.
 fn read_loop(shim: &Shim, mut reader: Box<dyn Read + Send>) {
     let mut buf = vec![0u8; OUTPUT_CHUNK];
     loop {
@@ -210,6 +204,7 @@ fn read_loop(shim: &Shim, mut reader: Box<dyn Read + Send>) {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => return,
         };
+        let at = wal::now_micros();
         let chunk = &buf[..read];
         let mut shared = lock(&shim.shared);
         let held = shared.ring.len();
@@ -218,10 +213,10 @@ fn read_loop(shim: &Shim, mut reader: Box<dyn Read + Send>) {
         // A chunk is never larger than the ring, so dropping the oldest
         // bytes always makes room for all of it.
         shared.ring.extend(chunk);
-        if let Some(log) = shared.log.as_mut()
-            && log.write_all(chunk).is_err()
+        if let Some(wal) = shared.wal.as_mut()
+            && wal.append(at, chunk).is_err()
         {
-            shared.log = None;
+            shared.wal = None;
         }
         shared.send(&FromShim::Output(chunk).encode());
     }

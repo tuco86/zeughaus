@@ -18,13 +18,14 @@
 //!
 //! ```no_run
 //! use zeughaus_mux::{Dimensions, TerminalId};
+//! use zeughaus_terminal::wal::Wal;
 //! use zeughaus_terminal::{Profile, Session, TerminalHost};
 //!
 //! let session = Session::spawn(
 //!     TerminalId(1),
 //!     &Profile::default_shell(),
 //!     Dimensions { cols: 80, rows: 24 },
-//!     None,
+//!     Wal::Off,
 //!     &TerminalHost::Local,
 //! )?;
 //! let head = session.head(0);
@@ -40,6 +41,7 @@ mod model;
 mod session;
 #[cfg(unix)]
 pub mod shim;
+pub mod wal;
 
 pub use config::MAX_SCROLLBACK_ROWS;
 pub use model::{FIRST_EPOCH, MAX_FETCH_ROWS, MAX_ROWS_ABOVE};

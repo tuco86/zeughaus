@@ -291,7 +291,8 @@ The browser canvas stays rectangular.
 Below it are tabs of split panes (`iced_tabs::tree`, `pane_grid`). The tab
 bar has one section per connected runner, labelled with its host and the
 start of its fingerprint, plus `Local` (no runner: the scratch graphs) or
-`Not running` (graphs whose runner is not connected). A runner section is
+`Not running` (graphs whose runner is not connected), and after the runners
+a `CI <label>` section for each runner that runs CI (section 14). A runner section is
 that runner's shared workspace: loose tabs and one level of coloured,
 collapsible groups, each tab a split tree whose leaves are terminals
 (section 9) or graphs, and order, groups, splits and ids come from the
@@ -370,7 +371,7 @@ and the tab bar's placement are per window and persist in
 | `capture` | `screen` | xdg-desktop-portal ScreenCast/Screenshot on Wayland (async, retried while the portal warms up), `scrap` otherwise |
 | `db` | `database` (container), `table`, `insert`, `query`, `sql` | SQLite; section 8 |
 | `record` | `writer`, `player` | a recording is a directory of `<seq>.png` plus `index.jsonl`; the player is a clocked source |
-| `job` | `run` | a process in a terminal the runner owns, log per run on disk; section 13. Registered detached in the editor: same catalog, never executes |
+| `job` | `run` | a process in a terminal the runner owns, a timestamped WAL per run on disk; section 13. Registered detached in the editor: same catalog, never executes |
 
 Registration is one list in each process (`Runner::new`, `App::new`), the
 same plugins in the same order, native-only ones gated in the editor. A node
@@ -464,13 +465,23 @@ kills its child; closing an editor window does not.
 **Shims and restart.** On unix every terminal's PTY and child live in a shim
 process, the runner binary started as `zeughaus-runner shim
 <state-dir>/terminals/<id>` (`zeughaus-terminal/src/shim`). It detaches into
-a session of its own, starts the profile from `spec.json`, tees a job's log,
-keeps the last 4 MiB of output, and serves one session at a time on `sock`
+a session of its own, starts the profile from `spec.json`, writes the
+terminal's WAL, keeps the last 4 MiB of output, and serves one session at a time on `sock`
 with length-prefixed postcard frames (`Hello`/`Welcome`, `Input`, `Resize`,
 `Redraw`, `Close`; `Output`, `Exited`). A new session gets the replay first,
 parsed with the terminal's answerbacks muted, then live output, with no gap
 between them. Dropping a session leaves the shim running; only `Close` (a
-closed pane, `CloseTerminal`) ends it. The mux writes
+closed pane, `CloseTerminal`) ends it.
+
+**The WAL.** Every terminal's byte stream is written to a WAL with a time
+per chunk (`zeughaus-terminal/src/wal.rs`): the magic `ZGHWAL1\n`, then
+records of `u64 LE` microseconds since the epoch, `u32 LE` length and the
+bytes one PTY read returned, stamped by the shim before anything else
+touches them. A reader stops at the last complete record, so a torn tail is
+not an error. The times sit on the byte stream, not on lines; a line's time
+is derived from the chunk it ends in. A shell's WAL is `wal` in its shim
+directory, rotates at 64 MiB into `wal.1` and goes with the terminal; a
+job run's is `<run_dir>/wal` and stays with the run. The mux writes
 `<state-dir>/workspace.json` (tabs, groups, splits, id counters, per
 terminal its label, grid and job run) after every structural change; a
 version 1 file is migrated, its graph panes dropped. A starting runner
@@ -546,8 +557,8 @@ results keyed by (pin, tier, sequence).
 | capture backend | the portal is used when `WAYLAND_DISPLAY` is set |
 | paths inside nodes | `db.database` `path` and `record.writer` `dir` are settings, resolved against the runner's working directory |
 | LLM endpoint | the `base_url` setting on each conversation node (default `http://localhost:1234/v1`) |
-| runs | `<state-dir>/runs/<run-id>/` holds `log`, `exit`, `code` and `artifacts/` of every job run this runner executed; `--keep-runs <n>` (default 50) is how many successful runs stay, pruned when a run starts; failed runs and runs without an exit record are never pruned |
-| terminals | `<state-dir>/terminals/<id>/` (`spec.json`, `sock`, `shim.log`) per live terminal, `<state-dir>/workspace.json` for the tabs a restarted runner restores |
+| runs | `<state-dir>/runs/<run-id>/` holds `wal` (a run from before the WAL: `log`), `exit`, `code` and `artifacts/` of every job run this runner executed; `--keep-runs <n>` (default 50) is how many successful runs stay, pruned when a run starts; failed runs and runs without an exit record are never pruned |
+| terminals | `<state-dir>/terminals/<id>/` (`spec.json`, `sock`, `shim.log`, a shell's `wal` and `wal.1`) per live terminal, `<state-dir>/workspace.json` for the tabs a restarted runner restores |
 | editor restart | `SIGUSR1` writes `<state-dir>/restore-<pid>.json` (window size and maximized state, active tab, focused pane and collapsed sections and groups by runner, cameras, node sizes, selection, an open palette with its input, a rename in progress, terminal scroll-back, nested views open in a section without a runner, the scratch document without a runner) and `exec`s the editor, which reads and deletes it through `ZEUGHAUS_RESTORE`. The window's position is not restored: a Wayland client can neither read nor set it |
 | deployment | `deploy/install.sh`: binaries in `~/.cargo/bin`, the systemd user unit `zeughaus-runner` (`KillMode=process`: the shims outlive the runner process; `reload` is `SIGUSR1`), and `~/.local/share/applications/net.doodleshnookie.Zeughaus.desktop` with its icon, which is how a Wayland compositor shows the editor's icon |
 
@@ -608,9 +619,10 @@ a command, the graph does. The plugin defines `ProcessHost` (`held`,
 `JobPlugin::detached()`, which only contributes the catalog entry.
 
 **A run.** `JobHost::spawn` allocates `<state-dir>/runs/<id>/` (ids continue
-past whatever is on disk, so a restart never reuses one), creates `log`, and
+past whatever is on disk, so a restart never reuses one), creates an empty
+WAL `wal`, and
 starts the process through `MuxService::spawn_owned`: a terminal with no
-pane whose PTY bytes are appended to the log before they are parsed, by the
+pane whose PTY bytes are appended to the WAL before they are parsed, by the
 shim that holds the PTY. The node defers the wait to the blocking pool; when
 the child exits, `exit` is written (`code`, `killed`, `started`, `finished`),
 declared artifacts are copied under `artifacts/`, and the outputs are
@@ -621,13 +633,15 @@ wrapper that, on a non-zero exit, writes the code to `<run_dir>/code` and
 `exec`s `$SHELL` in the same directory and environment: the run is reported
 from the code file while the shell lives on in the terminal, which is what
 makes a failed job a place to look rather than a screen to read. When that
-shell ends, the terminal closes; the log holds what it showed. A restarted
+shell ends, the terminal closes; the WAL holds what it showed. A restarted
 runner does the same for the terminals of recorded runs with a code file.
+Readers go through `jobs::run_output`, which also reads the raw `log` of a
+run from before the WAL.
 The `flow.all` node is the fan-in: it fires once every wired input has
 fired since it last fired, so a job starts when both of its predecessors' `ok`
 pins have. The graph holds nothing about runs; `/runs` on the runner serves
-any run file by range (`RunFileRequest` -> `RunFileReply`,
-`zeughaus-link/src/runs.rs`), so logs and artifacts stay on the machine that
+any run file (`wal`, `exit`, `artifacts/<rel>`) by range (`RunFileRequest` -> `RunFileReply`,
+`zeughaus-link/src/runs.rs`), so output and artifacts stay on the machine that
 produced them.
 
 **Owned terminals in the mux.** Terminal lifetime is separate from pane
@@ -722,6 +736,17 @@ has no HTTP listener.
 4. Record every decision in `ci/pipelines/<repo>/<n>.json` before acting
    on it.
 
+**Channels** group a repository's pipelines (`channels.rs`).
+`.zeughaus-ci/channels.toml` lists `[[channel]]` tables of `name` and `on`
+patterns; the first channel whose `on` matches the event gets the pipeline
+(`release` on `tag v*`, `nightly` on `cron *`, `dev` on `push *`). Without
+a match, or without the file, a push lands in a channel named after its
+branch, a tag in `tags`, a cron in `cron`, and records from before channels
+are grouped the same way. The channel is decided in setup and kept in the
+record; an invalid file fails the setup like an invalid job header. `ci check`
+lists the channels, `ci plan` starts with the one an event selects, and
+`ci status` shows it per pipeline. Retention counts per channel (**Disk**).
+
 A job is one `JobHost` run marked `external`, so it shows up in the
 `Triggered` group. Its terminal runs `<run>/launch.sh`, which checks the
 commit out into a persistent workspace `ci/work/<repo>/<job>` (cleaned
@@ -745,7 +770,7 @@ Commit statuses (`zeughaus/<job>`) go to GitHub or Forgejo through `curl`,
 with the token on stdin.
 
 **A failure says why.** When a run fails, the thread that waited for it
-reads the end of `<run>/log`, removes the escape sequences
+reads the end of `<run>/wal`, removes the escape sequences
 (`excerpt.rs`) and keeps the 40 lines before the launcher's
 `[zeughaus-ci] <job> exited <code>` marker: the job's own last words, not
 the debug shell's. The excerpt goes into the job's record and into
@@ -754,8 +779,13 @@ a cause (`panicked at`, then `error[`, `error:`, `FAILED`) instead of the
 bare exit code, unless the job holds secrets, whose output stays on the
 machine. `ci status` prints the run directory and the excerpt under
 every failed job of each repository's newest pipeline, and `ci log <repo>
-<n> <job> [--tail N]` prints a job's whole log as plain text; both read
+<n> <job> [--tail N]` prints a job's whole output as plain text; both read
 through the `zeughaus-ci` wrapper like the rest of `ci`.
+
+**Transcripts stay on the CI.** Right after a job's run is spawned, its
+`<run>/wal` is hard-linked as `ci/pipelines/<repo>/<n>.runs/<job>/wal`: the
+same inode, so it grows live and outlives `--keep-runs`; it goes with its
+pipeline record.
 
 **The default branch has an owner.** `streak.rs` derives from the records,
 per job of the default branch (push and cron pipelines), the first
@@ -790,8 +820,9 @@ keeps it); the scheduler acts on the mode, or under `auto` on the
 measurement. `/busy` (`BusyRequest { mode }` -> `MachineState { mode, busy
 }`, `zeughaus-link/src/machine.rs`) sets the mode. The runner publishes
 every change as `RuntimeEvent::Machine` on the `machine` topic and carries
-the current state in the snapshot, so a CI runner's section in the editor
-shows a control that cycles auto, busy, free: a play circle while free, a
+the current state in the snapshot, which it answers only once that state
+is in, so the editor's CI section shows a control that cycles auto, busy,
+free: a play circle while free, a
 pause circle while busy, filled when the mode is set by hand. A runner
 without CI reports no machine and has no control.
 
@@ -813,10 +844,35 @@ GPU, so it holds and freezes only jobs that run here (host, container,
 VM), never a unix host's. Both kinds share the scheduler's timeout clock,
 which kills the local ssh.
 
+**The CI view.** `/ci` (`CiRequest` -> `CiReply`,
+`zeughaus-link/src/ci.rs`, served by `ci/serve.rs`) answers an overview
+(every channel with its newest pipeline, and the machines: the workstation
+with its busy state, then each VM and unix host with its status, each with
+the jobs active on it), a channel's pipelines newest first by pages, one
+pipeline, and opens or closes a transcript. Every saved record is
+announced as `RuntimeEvent::CiPipeline` on the `ci` topic. In the editor
+(`zeughaus/src/app/ci.rs`) a runner that reports a machine gets a section
+`CI <label>` after the runners: a `Runners` tab with the machines, then one
+locked group per repository with a tab per channel, `<channel>@<repo>`. A
+channel tab draws its pipelines with iced_nodegraph, newest on top, each a
+framed band with a header line around its jobs laid out by their `needs`,
+bordered by status; nothing can be moved, wired or deleted. Pressing a job
+opens its transcript in a pane beside the graph: the runner starts
+`zeughaus-runner ci replay <wal> [--until <run>/exit]` in a terminal of
+its mux placed `Transcript` (in no tab, never listed as detached, dropped
+and killed when the runner restarts), which writes the recorded bytes to
+a raw-mode tty and follows the WAL while the job runs, so the editor shows
+it through the ordinary terminal stream, live, read-only. A CI keeps at
+most 16 transcript terminals across editors and closes the least recently
+opened one first; an editor asks again for its open transcripts after the
+runner restarts. The section's ids are the editor's own (`SurfaceRef::Ci`),
+and it takes no structural command.
+
 **Disk.** Workspaces beyond `budget_gb` are deleted least recently used
 first, through `podman unshare rm` because containers leave subordinate-uid
 files. Image tags no pipeline uses are removed. The 200 newest pipeline
-records and the 10 newest artifact sets are kept per repository.
+records per channel, with their transcripts (running ones never go), and
+the 10 newest artifact sets per repository are kept.
 
 **Secrets** (`secrets.rs`) live in one OpenBao KV v2 document
 (`[secrets]` in `ci.toml`, `secret/zeughaus/ci`); `ci.toml` only names

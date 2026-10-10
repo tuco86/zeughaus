@@ -9,10 +9,15 @@
 //! disk under `<state-dir>/ci/`, so a restarted runner picks up where the
 //! previous one stopped.
 //!
+//! Editors read the channels, pipelines and machines over `/ci` ([`serve`])
+//! and open a job's output as a read-only terminal; the scheduler announces
+//! every record it writes, so an editor asks again only when one changed.
+//!
 //! Without `<state-dir>/ci.toml` none of this runs and the runner is exactly
 //! what it is without CI.
 
 pub mod busy;
+pub mod channels;
 pub mod cleanup;
 pub mod cli;
 pub mod config;
@@ -24,8 +29,10 @@ pub mod hook;
 pub mod launch;
 pub mod machine;
 pub mod pipeline;
+pub mod replay;
 pub mod scheduler;
 pub mod secrets;
+pub mod serve;
 pub mod streak;
 
 use std::path::Path;

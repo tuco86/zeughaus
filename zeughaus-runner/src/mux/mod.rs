@@ -24,6 +24,10 @@ pub enum OwnedPlacement {
     /// press from outside any editor, which nobody asked to see and so
     /// nobody would find among the detached terminals.
     Triggered,
+    /// In no pane and not listed as detached: a read-only replay of a CI
+    /// job's output that the editor which asked for it shows in a pane of
+    /// its own. Not kept across a runner restart.
+    Transcript,
 }
 
 /// What the document says about the graphs a pane may show, as the runner

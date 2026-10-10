@@ -98,9 +98,13 @@ the left edge. Theme and tab bar placement persist in
 connected runner (plus `Local` without a runner, or `Not running` for graphs
 no runner's workspace shows); a section's terminal, graph and folder
 glyphs (tooltips say which) add a terminal tab, a graph that runner
-executes, or a coloured group, and a CI runner's play/pause circle (filled
-when set by hand) cycles its busy mode through auto (the GPU measurement),
-busy and free. Closing a graph's tab
+executes, or a coloured group. A runner that runs CI also gets a
+`CI <label>` section: a `Runners` tab with its machines and a locked group
+per repository with one tab per channel (`<channel>@<repo>`, pipelines as
+DAGs, newest on top; pressing a job shows its transcript read-only, live
+while it runs), and the section's play/pause circle (filled when set by
+hand) cycles the busy mode through auto (the GPU measurement), busy and
+free. Channels come from `.zeughaus-ci/channels.toml`. Closing a graph's tab
 deletes the graph. Double-clicking a
 tab or a group's name renames it; a tab that shows one graph renames the
 graph. A container node's `open` opens its contents in a tab. With the bar
@@ -117,7 +121,8 @@ terminal someone else drives, `Ctrl+Shift+C`/`V` copy and paste,
 `Ctrl`+click opens a terminal's hyperlink. A
 `Job` node runs its
 `command` line when its `run` pin fires or it is pressed; a failed run keeps
-its terminal for attaching, every run keeps `<state-dir>/runs/<id>/log`.
+its terminal for attaching, every run keeps a timestamped WAL in
+`<state-dir>/runs/<id>/wal`, and every shell one in its shim directory.
 `zeughaus-runner trigger <endpoint> <node-id> [payload]` and
 `zeughaus-runner hold <endpoint> on|off` do the same from a script, against
 the endpoint URL a runner prints at start; a triggered run's terminal lands

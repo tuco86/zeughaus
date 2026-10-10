@@ -168,10 +168,10 @@ impl App {
                 };
                 // A different runner process owns different terminals: every
                 // id this editor holds names something that no longer exists.
-                if mux
+                let restarted = mux
                     .incarnation
-                    .is_some_and(|held| held != hello.incarnation)
-                {
+                    .is_some_and(|held| held != hello.incarnation);
+                if restarted {
                     mux.terminals.clear();
                 }
                 mux.incarnation = Some(hello.incarnation);
@@ -201,8 +201,15 @@ impl App {
                     }
                 }
                 self.workspace.apply_snapshot(&key, *workspace);
+                // The transcripts a CI view showed were that process's
+                // terminals too.
+                let reopen = if restarted {
+                    self.reopen_ci_transcripts(&key)
+                } else {
+                    Task::none()
+                };
                 self.rebuild_palette();
-                self.reconcile_terminals(&key)
+                Task::batch([reopen, self.reconcile_terminals(&key)])
             }
             MuxEvent::Workspace(snapshot) => {
                 let Some(mux) = self.mux.get_mut(&key) else {
@@ -253,14 +260,22 @@ impl App {
 
     /// Brings `key`'s terminal streams in line with what its workspace shows.
     ///
-    /// One task per terminal any tab references; nothing for a terminal that
-    /// was closed, and no second task for one already streaming. A terminal
-    /// whose view survived a blink reattaches at the sequence it holds, so
-    /// the runner continues with deltas instead of resending the screen.
+    /// One task per terminal any tab references or a CI view shows as a
+    /// transcript; nothing for a terminal that was closed, and no second task
+    /// for one already streaming. A terminal whose view survived a blink
+    /// reattaches at the sequence it holds, so the runner continues with
+    /// deltas instead of resending the screen.
     pub(super) fn reconcile_terminals(&mut self, key: &RunnerKey) -> Task<Message> {
         let Some(endpoint) = self.runtime.links.get(key).map(|l| l.endpoint.clone()) else {
             return Task::none();
         };
+        // The transcripts a CI view of this runner shows are its terminals
+        // too, though no pane of its workspace names them.
+        let replays: Vec<zeughaus_mux::TerminalId> = self
+            .ci
+            .get(key)
+            .map(|client| client.terminals().collect())
+            .unwrap_or_default();
         let Some(mux) = self.mux.get_mut(key) else {
             return Task::none();
         };
@@ -269,6 +284,7 @@ impl App {
             .workspace
             .iter()
             .flat_map(|workspace| workspace.terminals())
+            .chain(replays)
             .collect();
         // Removal is the whole lifetime: the handle aborts on drop, so a
         // closed pane's stream cannot outlive it.
@@ -326,6 +342,15 @@ impl App {
             TerminalEvent::Ready(sender) => live.commands = Some(sender),
             TerminalEvent::Changed => {}
             TerminalEvent::Notification { title, body } => {
+                // A replay says what the job said when it ran, which is not
+                // news.
+                if self
+                    .ci
+                    .get(&key)
+                    .is_some_and(|client| client.shows(terminal))
+                {
+                    return Task::none();
+                }
                 // The user is looking at it: the terminal already shows
                 // whatever the child wanted to say.
                 let watched = self.window_focused
@@ -403,8 +428,14 @@ impl App {
         let Some(Surface::Terminal(terminal)) = self.workspace.surface_of(&pane) else {
             return Task::none();
         };
-        let key = pane.runner.clone();
+        // A pane of a CI section shows a transcript of that runner's: its
+        // terminal, replayed to this editor and never driven from it.
+        let replay = pane.runner.ci_runner();
+        let key = replay.clone().unwrap_or_else(|| pane.runner.clone());
         match action {
+            TerminalAction::Command(_) | TerminalAction::TakeControl if replay.is_some() => {
+                Task::none()
+            }
             TerminalAction::Command(command) => {
                 self.send_input(&key, terminal, command);
                 Task::none()
@@ -613,18 +644,21 @@ impl App {
     /// when its pane is focused and the runner's lease when this client
     /// holds it -- or when nobody does: the first client that types acquires
     /// an unclaimed terminal, so its keys must go out. A viewer sees the same
-    /// rows and gets the take-control shortcut instead of the keys.
+    /// rows and gets the take-control shortcut instead of the keys. A
+    /// `read_only` pane is never the controlling one, whoever holds the
+    /// lease: a transcript is looked at, not driven.
     pub(super) fn terminal_pane(
         &self,
         pane: Option<PaneRef>,
         key: &RunnerKey,
         terminal: zeughaus_mux::TerminalId,
+        read_only: bool,
     ) -> Element<'_, Message, Theme> {
         let Some((view, serials)) = self.terminal_view(key, terminal) else {
             return unavailable("Terminal", "Waiting for the runner's first screen.");
         };
         let principal = self.mux.get(key).and_then(|mux| mux.principal.as_deref());
-        let controlling = {
+        let controlling = !read_only && {
             let guard = view.lock().unwrap_or_else(|e| e.into_inner());
             guard.as_ref().is_none_or(|view| {
                 view.controller.as_ref().is_none_or(|controller| {

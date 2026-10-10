@@ -84,6 +84,16 @@ pub enum RuntimeEvent {
         title: String,
         body: String,
     },
+    /// A pipeline's record changed: it was queued, a job moved, or it
+    /// finished. Carries only its identity; an editor asks `/ci` for the
+    /// rows. Only a runner that runs CI sends it; it is not state, so no
+    /// snapshot carries it.
+    CiPipeline {
+        seq: u64,
+        repo: String,
+        channel: String,
+        number: u64,
+    },
 }
 
 impl RuntimeEvent {
@@ -201,7 +211,7 @@ pub const TOPIC_ERROR: &str = "error";
 /// Topic of [`RuntimeEvent::Machine`].
 pub const TOPIC_MACHINE: &str = "machine";
 
-/// Topic of [`RuntimeEvent::CiAlert`].
+/// Topic of [`RuntimeEvent::CiAlert`] and [`RuntimeEvent::CiPipeline`].
 pub const TOPIC_CI: &str = "ci";
 
 /// Largest event payload a subscriber reads. An event is a few identifiers and
@@ -269,6 +279,12 @@ mod tests {
                 seq: 15,
                 title: "griasdi main is red (#138)".to_owned(),
                 body: "windows red since #138".to_owned(),
+            },
+            RuntimeEvent::CiPipeline {
+                seq: 16,
+                repo: "griasdi".to_owned(),
+                channel: "dev".to_owned(),
+                number: 138,
             },
         ];
         for event in events {

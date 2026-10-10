@@ -41,9 +41,12 @@ pub struct ShimSpec {
     pub scrollback_rows: usize,
     pub cols: u16,
     pub rows: u16,
-    /// Appended to, never truncated: a job's log is created by its host
+    /// The WAL the shim tees the child's output into (see [`crate::wal`]);
+    /// appended to, never truncated: a job's WAL is created by its host
     /// before the run starts.
-    pub log: Option<PathBuf>,
+    pub wal: Option<PathBuf>,
+    /// Size at which that WAL rotates into `<wal>.1`; `None` never rotates.
+    pub wal_cap: Option<u64>,
 }
 
 /// How the shim's child ended.

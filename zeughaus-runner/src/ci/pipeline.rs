@@ -2,6 +2,7 @@
 //! selection of the jobs an event runs.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::str::FromStr;
 
 use super::CI_DIR;
@@ -97,6 +98,17 @@ impl Pattern {
                     && event.cron.as_deref().map(normalize_cron).as_deref() == Some(expr.as_str())
             }
             Pattern::AnyCron => event.kind == EventKind::Cron,
+        }
+    }
+}
+
+impl fmt::Display for Pattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Pattern::Push(glob) => write!(f, "push {glob}"),
+            Pattern::Tag(glob) => write!(f, "tag {glob}"),
+            Pattern::Cron(expr) => write!(f, "cron {expr}"),
+            Pattern::AnyCron => f.write_str("cron *"),
         }
     }
 }

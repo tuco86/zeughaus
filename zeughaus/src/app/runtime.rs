@@ -248,6 +248,9 @@ impl App {
                     link.machine_seq = snapshot.seq;
                 }
                 self.update_display_values();
+                // Events missed during a gap are not replayed, so the CI views
+                // ask for what they show again.
+                return self.resync_ci(&key);
             }
             Traffic::Event(RuntimeEvent::Output {
                 seq,
@@ -359,6 +362,15 @@ impl App {
             // no reason to hold it back, since nothing on screen says it.
             Traffic::Event(RuntimeEvent::CiAlert { title, body, .. }) => {
                 return super::terminal::notify_desktop(title, body);
+            }
+            // Not state either: the CI views ask the runner for the pipeline.
+            Traffic::Event(RuntimeEvent::CiPipeline {
+                repo,
+                channel,
+                number,
+                ..
+            }) => {
+                return self.apply_ci_event(&key, repo, channel, number);
             }
             Traffic::Lost => {
                 if let Some(link) = self.runtime.links.get_mut(&key) {

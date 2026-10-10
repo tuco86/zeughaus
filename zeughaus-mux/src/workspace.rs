@@ -224,6 +224,9 @@ pub enum SurfaceRef {
     /// a reconstruction that lost its surface. Never the result of a split.
     Empty,
     Terminal(TerminalId),
+    /// An editor's own view of a CI runner, by an id the editor assigns. Only
+    /// in an editor's synthetic CI sections; a runner never sends it.
+    Ci(u64),
 }
 
 /// A change to the shared structure, sent on the control exchange and

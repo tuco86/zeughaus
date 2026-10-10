@@ -1,13 +1,12 @@
 //! What a failed job said last: the excerpt of its log that travels with
 //! the result, and the one line of it that names the cause.
 //!
-//! A run's `log` is the PTY's bytes as the terminal received them, colours,
+//! A run's output is the PTY's bytes as the terminal received them, colours,
 //! cursor movement and progress bars included. [`plain_text`] reduces that
 //! to the lines a reader would see; the excerpt is the tail before the
 //! launcher's `[zeughaus-ci] <job> exited <code>` marker, so the shell that
 //! follows a failure never ends up in it.
 
-use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -15,7 +14,7 @@ use std::time::{Duration, Instant};
 pub const EXCERPT_LINES: usize = 40;
 /// Bytes read from the end of a log for an excerpt: 40 lines of a build
 /// with long paths and colour codes fit many times over.
-const TAIL_BYTES: u64 = 256 * 1024;
+const TAIL_BYTES: usize = 256 * 1024;
 /// How long the excerpt waits for the marker. The exit code is written
 /// before the marker is printed, so the run can end before the marker
 /// reached the log; a launcher that failed before the job (checkout, image
@@ -136,32 +135,13 @@ pub fn cause(excerpt: &str) -> Option<String> {
     })
 }
 
-/// The last `max` bytes of a file, from the first line that starts inside
-/// them: a cut through a character or an escape sequence would otherwise
-/// open the text.
-fn read_tail(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
-    let mut file = std::fs::File::open(path)?;
-    let len = file.metadata()?.len();
-    let start = len.saturating_sub(max);
-    file.seek(SeekFrom::Start(start))?;
-    let mut bytes = Vec::with_capacity((len - start) as usize);
-    file.read_to_end(&mut bytes)?;
-    if start > 0
-        && let Some(newline) = bytes.iter().position(|&b| b == b'\n')
-    {
-        bytes.drain(..=newline);
-    }
-    Ok(bytes)
-}
-
 /// The excerpt of the failed run in `run_dir`, also written to
 /// `<run_dir>/excerpt`. Waits up to [`MARKER_WAIT`] for the exit marker to
-/// reach the log; `None` when the log cannot be read.
+/// reach the output; `None` when the output cannot be read.
 pub fn extract(run_dir: &Path) -> Option<String> {
-    let log = run_dir.join("log");
     let deadline = Instant::now() + MARKER_WAIT;
     let text = loop {
-        let text = plain_text(&read_tail(&log, TAIL_BYTES).ok()?);
+        let text = plain_text(&crate::jobs::run_output_tail(run_dir, TAIL_BYTES).ok()?);
         if text.lines().any(is_marker) || Instant::now() >= deadline {
             break text;
         }
@@ -174,11 +154,11 @@ pub fn extract(run_dir: &Path) -> Option<String> {
     Some(excerpt)
 }
 
-/// A whole log as plain text, for `ci log`.
-pub fn read_log(path: &Path) -> Result<String, String> {
-    std::fs::read(path)
+/// A whole run's output as plain text, for `ci log`.
+pub fn read_log(run_dir: &Path) -> Result<String, String> {
+    crate::jobs::run_output(run_dir)
         .map(|bytes| plain_text(&bytes))
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))
+        .map_err(|e| format!("cannot read the output of {}: {e}", run_dir.display()))
 }
 
 #[cfg(test)]

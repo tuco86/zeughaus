@@ -331,6 +331,21 @@ impl Runner {
         );
     }
 
+    /// Tells editors that a pipeline's record changed, for them to ask the
+    /// CI for the rows they show. Not state, so no snapshot carries it.
+    pub fn report_ci_change(&mut self, change: crate::ci::scheduler::CiChange) {
+        let seq = self.next_seq();
+        self.emit(
+            TOPIC_CI,
+            RuntimeEvent::CiPipeline {
+                seq,
+                repo: change.repo,
+                channel: change.channel,
+                number: change.number,
+            },
+        );
+    }
+
     /// Publishes one event on `topic`. A failure is reported once per distinct
     /// message: a broken publisher fails on every event, and a log line per
     /// event would bury everything else.

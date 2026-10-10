@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 use zeughaus_mux::{Dimensions, TerminalCommand, TerminalHead, TerminalId};
 use zeughaus_terminal::shim::ShimConn;
 use zeughaus_terminal::shim::proto::{REPLAY_BYTES, ToShim};
+use zeughaus_terminal::wal;
+use zeughaus_terminal::wal::Wal;
 use zeughaus_terminal::{Profile, Session, ShimHost, TerminalHost};
 
 const SIZE: Dimensions = Dimensions { cols: 80, rows: 24 };
@@ -73,8 +75,14 @@ fn marker_pid(session: &Session) -> Option<String> {
 fn a_shell_outlives_its_session_and_is_found_again() {
     let host = host("reattach");
     let id = TerminalId(3);
-    let session = Session::spawn(id, &sh(&[]), SIZE, None, &TerminalHost::Shim(host.clone()))
-        .expect("start a shell in a shim");
+    let session = Session::spawn(
+        id,
+        &sh(&[]),
+        SIZE,
+        Wal::Off,
+        &TerminalHost::Shim(host.clone()),
+    )
+    .expect("start a shell in a shim");
     session
         .apply(&TerminalCommand::Text {
             serial: 1,
@@ -131,7 +139,7 @@ fn a_shim_replays_at_most_its_ring_and_always_the_newest_bytes() {
         id,
         &sh(&["-c", script]),
         SIZE,
-        None,
+        Wal::Capped,
         &TerminalHost::Shim(host.clone()),
     )
     .expect("start the flood in a shim");
@@ -156,6 +164,17 @@ fn a_shim_replays_at_most_its_ring_and_always_the_newest_bytes() {
         replay.len()
     );
     assert!(replay.ends_with(b"END-OF-FLOOD"));
+
+    // The shim's own WAL holds the whole stream, not just the ring, with
+    // times that never run backwards.
+    let records = wal::read(&host.dir(id).join("wal")).expect("the shim's WAL");
+    let stream: Vec<u8> = records
+        .iter()
+        .flat_map(|r| r.bytes.iter().copied())
+        .collect();
+    assert_eq!(stream.len(), 5_000_000 + "END-OF-FLOOD".len());
+    assert!(stream.ends_with(b"END-OF-FLOOD"));
+    assert!(records.windows(2).all(|w| w[0].at_micros <= w[1].at_micros));
 
     conn.send(&ToShim::Close).expect("close");
     let dir = host.dir(id);

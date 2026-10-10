@@ -30,6 +30,7 @@ use zeughaus_mux::{
     ServerHello, TerminalAttach, TerminalAttached, TerminalCommand, TerminalId, TopologyCommand,
     WireError, WorkspaceSnapshot,
 };
+use zeughaus_terminal::wal::Wal;
 use zeughaus_terminal::{Profile, Session, TerminalHost};
 
 use super::frames::{ReadError, read_frame, write_frame};
@@ -341,13 +342,13 @@ impl MuxService {
     /// [`MuxService::close_terminal`], closing its tab in the locked group
     /// and the runner's exit do that.
     ///
-    /// `log` is appended every byte the program writes, which is how a
-    /// run's log is recorded; `run` is what a restarted runner needs to
-    /// finish the run's record.
+    /// `wal` records every byte the program writes with the time it was
+    /// read, which is how a run's output is kept; `run` is what a restarted
+    /// runner needs to finish the run's record.
     pub fn spawn_owned(
         &self,
         profile: Profile,
-        log: Option<std::path::PathBuf>,
+        wal: Wal,
         run: Option<SavedRun>,
         placement: OwnedPlacement,
     ) -> Result<TerminalId, String> {
@@ -356,7 +357,7 @@ impl MuxService {
             id,
             &profile,
             Dimensions { cols: 80, rows: 24 },
-            log.as_deref(),
+            wal,
             &self.inner.host,
         )
         .map_err(|e| format!("cannot start {}: {e}", profile.label))?;
@@ -1051,7 +1052,7 @@ impl MuxService {
                 id,
                 profile,
                 Dimensions { cols: 80, rows: 24 },
-                None,
+                Wal::Capped,
                 &self.inner.host,
             )
             .map_err(|e| format!("cannot start {}: {e}", profile.label))?;
@@ -1862,7 +1863,7 @@ mod tests {
                     env: vec![],
                     scrollback_rows: 100,
                 },
-                None,
+                Wal::Off,
                 None,
                 OwnedPlacement::Detached,
             )

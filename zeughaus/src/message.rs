@@ -281,7 +281,8 @@ pub enum Message {
     #[cfg(not(target_arch = "wasm32"))]
     HoldReplied(Result<zeughaus_link::HoldReply, String>),
     // Move a CI runner's busy mode to the next one: auto, busy, free. The
-    // toggle next to its section header.
+    // toggle next to the header of the runner's CI section; the key is the
+    // runner's, not that section's.
     CycleBusy(crate::workspace::RunnerKey),
     // What the runner answered: the machine's state after the change.
     #[cfg(not(target_arch = "wasm32"))]
@@ -289,6 +290,65 @@ pub enum Message {
         crate::workspace::RunnerKey,
         Result<zeughaus_link::MachineState, String>,
     ),
+    // What a runner's CI answered one of this editor's CI views, or what the
+    // user did in one. The key is the runner, not its CI section. Native
+    // only: the browser editor reaches no runner.
+    #[cfg(not(target_arch = "wasm32"))]
+    Ci(crate::workspace::RunnerKey, CiMsg),
+    // The clock that keeps every CI view current: asks each CI runner for
+    // its overview. Emitted by a subscription that exists while a CI view
+    // does; a subscription's map cannot capture a runner, so it names none.
+    #[cfg(not(target_arch = "wasm32"))]
+    CiPoll,
+}
+
+/// What one runner's CI views say.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone)]
+pub enum CiMsg {
+    /// The channels and machines the runner reported.
+    Overview(Result<zeughaus_link::CiOverview, String>),
+    /// A channel's pipelines, newest first: the first page, or the next
+    /// older one.
+    Pipelines {
+        view: u64,
+        older: bool,
+        result: Result<Vec<zeughaus_link::PipelineView>, String>,
+    },
+    /// One pipeline after a change; `None` when the runner no longer has it.
+    /// Boxed: a pipeline is large, and a message is moved by value through
+    /// every queue the editor has.
+    Pipeline {
+        repo: String,
+        number: u64,
+        result: Result<Option<Box<zeughaus_link::PipelineView>>, String>,
+    },
+    /// The user pressed a job: show its transcript.
+    OpenJob {
+        view: u64,
+        number: u64,
+        job: String,
+    },
+    /// The terminal the runner replays a job's output in.
+    Transcript {
+        view: u64,
+        number: u64,
+        job: String,
+        result: Result<u64, String>,
+    },
+    CloseTranscript {
+        view: u64,
+    },
+    /// The user asked for the pipelines older than those shown.
+    LoadOlder {
+        view: u64,
+    },
+    /// The user moved the camera of a channel view.
+    Camera {
+        view: u64,
+        position: Point,
+        zoom: f32,
+    },
 }
 
 #[cfg(test)]

@@ -33,8 +33,8 @@ use std::time::Duration;
 
 use zeughaus_core::{NodeId, Value, ZeughausError};
 use zeughaus_link::{
-    BUSY_PATH, EVENTS_PATH, FEED_PATH, GRAPH_PATH, GraphChange, HOLD_PATH, MUX_PATH, RUNS_PATH,
-    SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, TriggerRequest, credentials,
+    BUSY_PATH, CI_PATH, EVENTS_PATH, FEED_PATH, GRAPH_PATH, GraphChange, HOLD_PATH, MUX_PATH,
+    RUNS_PATH, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, TriggerRequest, credentials,
 };
 use zeughaus_runtime::DeferredWork;
 
@@ -228,9 +228,14 @@ fn main() -> ExitCode {
     let mut job_host: Option<Arc<JobHost>> = None;
     // Kept for the restart, which saves the workspace before it `exec`s.
     let mut mux_service: Option<MuxService> = None;
-    // CI's busy state and alerts, reported to editors as they change.
+    // CI's busy state, alerts and pipeline changes, reported to editors as
+    // they happen.
     let mut ci_handle: Option<ci::Ci> = None;
     let (graphs, graph_rx, initial) = GraphService::load(&state_dir);
+    // Registered with the other paths, answered only once the snapshot says
+    // whether this runner runs CI: an editor that reconnects during startup
+    // would otherwise see a CI runner without its machine and drop its view.
+    let mut snapshot_replier = None;
     {
         let listener = transport.listener();
         match listener.replier(FEED_PATH) {
@@ -244,9 +249,7 @@ fn main() -> ExitCode {
             Err(e) => eprintln!("[runner] no event stream: {e}"),
         }
         match listener.replier(SNAPSHOT_PATH) {
-            Ok(replier) => {
-                rt.spawn(transport::serve_snapshots(replier, Arc::clone(&snapshot)));
-            }
+            Ok(replier) => snapshot_replier = Some(replier),
             Err(e) => eprintln!("[runner] no snapshot service: {e}"),
         }
         match listener.puller(TRIGGERS_PATH) {
@@ -295,6 +298,21 @@ fn main() -> ExitCode {
                 }
                 Err(e) => eprintln!("[runner] no busy service: {e}"),
             }
+            if let Some(mux) = &mux_service {
+                match listener.replier(CI_PATH) {
+                    Ok(replier) => {
+                        let server = ci::serve::CiServer::new(
+                            state_dir.clone(),
+                            started.machines.clone(),
+                            Arc::clone(&started.busy),
+                            mux.clone(),
+                            exe.as_ref().ok().cloned(),
+                        );
+                        rt.spawn(ci::serve::serve(replier, Arc::new(server)));
+                    }
+                    Err(e) => eprintln!("[runner] no ci service: {e}"),
+                }
+            }
             ci_handle = Some(started);
         }
         // The runner that produced a run's files is the one that serves them:
@@ -319,6 +337,12 @@ fn main() -> ExitCode {
         Arc::clone(&snapshot),
         job_host.clone(),
     );
+    if let Some(ci) = &ci_handle {
+        runner.report_machine(ci.busy.state());
+    }
+    if let Some(replier) = snapshot_replier {
+        rt.spawn(transport::serve_snapshots(replier, Arc::clone(&snapshot)));
+    }
     let (async_tx, async_rx) = std::sync::mpsc::channel::<(NodeId, AsyncResult)>();
 
     // The document as loaded: every node before any edge, in document order,
@@ -441,6 +465,9 @@ fn main() -> ExitCode {
             runner.report_machine(ci.busy.state());
             while let Ok(alert) = ci.alerts.try_recv() {
                 runner.report_ci_alert(alert);
+            }
+            while let Ok(change) = ci.changes.try_recv() {
+                runner.report_ci_change(change);
             }
         }
 

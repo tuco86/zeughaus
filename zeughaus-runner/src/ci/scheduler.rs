@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 use zeughaus_job::{JobSpec, ProcessHost, RunExit, record_run_end};
 
 use super::busy::{self, Busy};
+use super::channels::{self, Channels};
 use super::config::{CiConfig, RepoConfig};
 use super::event::{self, CiEvent, EventKind};
 use super::forge::{self, State, Status};
@@ -67,7 +68,7 @@ impl JobStatus {
         )
     }
 
-    fn is_active(self) -> bool {
+    pub fn is_active(self) -> bool {
         matches!(
             self,
             JobStatus::Starting | JobStatus::Running | JobStatus::Frozen
@@ -152,6 +153,9 @@ pub struct Pipeline {
     #[serde(default)]
     pub finished: Option<u64>,
     pub jobs: Vec<JobRecord>,
+    /// See [`channels`]; empty in records from before channels existed.
+    #[serde(default)]
+    pub channel: String,
 }
 
 fn pipelines_dir(state_dir: &Path, repo: &str) -> PathBuf {
@@ -160,6 +164,16 @@ fn pipelines_dir(state_dir: &Path, repo: &str) -> PathBuf {
 
 fn artifacts_dir(state_dir: &Path, repo: &str, number: u64) -> PathBuf {
     pipelines_dir(state_dir, repo).join(format!("{number}.artifacts"))
+}
+
+/// Where a job's transcript is kept: `wal` in this directory is a hard link
+/// to the run's WAL, so it grows with the run and outlives the pruning of
+/// `<state>/runs/`. Beside the pipeline's record, so retention takes it with
+/// the record.
+pub fn transcript_dir(state_dir: &Path, repo: &str, number: u64, job: &str) -> PathBuf {
+    pipelines_dir(state_dir, repo)
+        .join(format!("{number}.runs"))
+        .join(job)
 }
 
 fn mirror_dir(state_dir: &Path, repo: &str) -> PathBuf {
@@ -177,12 +191,31 @@ impl Pipeline {
         pipelines_dir(state_dir, &self.repo).join(format!("{}.json", self.number))
     }
 
-    fn save(&self, state_dir: &Path) {
+    /// Writes the record, then announces it on `changes` for the host loop
+    /// to tell editors. A receiver that went away is not an error: the
+    /// record is on disk either way.
+    fn save(&self, state_dir: &Path, changes: &Sender<CiChange>) {
         if let Err(e) = crate::files::write_json(&self.path(state_dir), self) {
             eprintln!(
                 "[ci] cannot save pipeline {} #{}: {e}",
                 self.repo, self.number
             );
+            return;
+        }
+        let _ = changes.send(CiChange {
+            repo: self.repo.clone(),
+            channel: self.channel(),
+            number: self.number,
+        });
+    }
+
+    /// The channel the pipeline belongs to; a record from before channels
+    /// existed has none stored and is sorted by its event.
+    pub fn channel(&self) -> String {
+        if self.channel.is_empty() {
+            channels::fallback(&self.event)
+        } else {
+            self.channel.clone()
         }
     }
 }
@@ -306,6 +339,8 @@ struct Scheduler {
     /// Jobs whose freeze or thaw failed, so it is logged once.
     freeze_warned: HashSet<(String, u64, String)>,
     alerts: Sender<Alert>,
+    /// Every record written, for the host loop to announce to editors.
+    changes: Sender<CiChange>,
 }
 
 /// A default branch that turned red, or stays red: for the editors'
@@ -315,6 +350,15 @@ pub struct Alert {
     pub body: String,
 }
 
+/// A pipeline record that was just written. The host loop turns it into an
+/// event, and the editor asks `/ci` for the rows it shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiChange {
+    pub repo: String,
+    pub channel: String,
+    pub number: u64,
+}
+
 /// What a runner that runs CI shares with its host loop.
 pub struct Ci {
     /// The machine's busy state, which `/busy` overrides and editors are
@@ -322,6 +366,12 @@ pub struct Ci {
     pub busy: Arc<Busy>,
     /// Alerts the host loop publishes to editors.
     pub alerts: Receiver<Alert>,
+    /// Pipeline records as the scheduler writes them, for the host loop to
+    /// announce to editors.
+    pub changes: Receiver<CiChange>,
+    /// The machines jobs run on. The scheduler drives them; `/ci` only
+    /// reads their state.
+    pub machines: BTreeMap<String, Machine>,
 }
 
 /// Starts the CI scheduler thread, unless there is no `ci.toml`.
@@ -354,10 +404,19 @@ pub fn start(host: Arc<JobHost>, state_dir: PathBuf) -> Option<Ci> {
     let busy = busy::start(config.busy.clone(), &state_dir);
     let shared = Arc::clone(&busy);
     let (alerts, alerts_rx) = std::sync::mpsc::channel();
+    let (changes, changes_rx) = std::sync::mpsc::channel();
+    let machines: BTreeMap<String, Machine> = config
+        .machines
+        .iter()
+        .map(|(name, cfg)| (name.clone(), Machine::new(name, cfg, &state_dir)))
+        .collect();
+    let scheduled = machines.clone();
     let spawned = std::thread::Builder::new()
         .name("zeughaus-ci".into())
         .spawn(move || {
-            let mut scheduler = Scheduler::new(host, state_dir, config, shared, alerts, secrets);
+            let mut scheduler = Scheduler::new(
+                host, state_dir, config, shared, alerts, changes, scheduled, secrets,
+            );
             scheduler.recover();
             loop {
                 scheduler.tick();
@@ -371,24 +430,26 @@ pub fn start(host: Arc<JobHost>, state_dir: PathBuf) -> Option<Ci> {
     Some(Ci {
         busy,
         alerts: alerts_rx,
+        changes: changes_rx,
+        machines,
     })
 }
 
 impl Scheduler {
+    // One argument for each thing `start` makes before the thread exists; a
+    // struct to carry them would only rename the list.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         host: Arc<JobHost>,
         state_dir: PathBuf,
         config: CiConfig,
         busy: Arc<Busy>,
         alerts: Sender<Alert>,
+        changes: Sender<CiChange>,
+        machines: BTreeMap<String, Machine>,
         secrets: Arc<Secrets>,
     ) -> Scheduler {
         let (tx, rx) = std::sync::mpsc::channel();
-        let machines = config
-            .machines
-            .iter()
-            .map(|(name, cfg)| (name.clone(), Machine::new(name, cfg, &state_dir)))
-            .collect();
         let crons = config
             .repos
             .keys()
@@ -418,6 +479,7 @@ impl Scheduler {
             last_tick: Instant::now(),
             freeze_warned: HashSet::new(),
             alerts,
+            changes,
         }
     }
 
@@ -439,7 +501,7 @@ impl Scheduler {
                     job.status = JobStatus::Pending;
                     continue;
                 };
-                if !run_dir.join("log").exists() {
+                if !run_dir.join("wal").exists() && !run_dir.join("log").exists() {
                     // Never spawned: start it again from the beginning.
                     job.status = JobStatus::Pending;
                     job.run_dir = None;
@@ -456,7 +518,7 @@ impl Scheduler {
             for (job, run_dir) in watches {
                 self.watch_recovered(&pipeline, &job, run_dir);
             }
-            pipeline.save(&self.state_dir);
+            pipeline.save(&self.state_dir, &self.changes);
             eprintln!(
                 "[ci] recovered {} #{} ({})",
                 pipeline.repo, pipeline.number, pipeline.event.git_ref
@@ -689,6 +751,7 @@ impl Scheduler {
             created: super::now_secs(),
             finished: None,
             jobs: Vec::new(),
+            channel: channels::fallback(&event),
         };
         let setup = self.set_up(&name, &repo, &event, &mut pipeline);
         let jobs = match setup {
@@ -703,7 +766,7 @@ impl Scheduler {
                 pipeline.status = PipelineStatus::Error;
                 pipeline.note = e.clone();
                 pipeline.finished = Some(super::now_secs());
-                pipeline.save(&self.state_dir);
+                pipeline.save(&self.state_dir, &self.changes);
                 self.post(
                     &pipeline,
                     "ci",
@@ -745,7 +808,7 @@ impl Scheduler {
                 excerpt: None,
             })
             .collect();
-        pipeline.save(&self.state_dir);
+        pipeline.save(&self.state_dir, &self.changes);
         eprintln!(
             "[ci] {name} #{} {} {} {}: {}",
             pipeline.number,
@@ -793,7 +856,7 @@ impl Scheduler {
         pipeline.status = PipelineStatus::NoJobs;
         pipeline.note = note.clone();
         pipeline.finished = Some(super::now_secs());
-        pipeline.save(&self.state_dir);
+        pipeline.save(&self.state_dir, &self.changes);
         self.post(
             &pipeline,
             "pipeline",
@@ -836,6 +899,7 @@ impl Scheduler {
         };
         pipeline.sha = Some(sha.clone());
         let (files, containerfiles) = read_ci(&mirror, &sha)?;
+        pipeline.channel = Channels::from_files(&files)?.of(event);
         // git has no empty directories: nothing listed is no folder.
         if files.is_empty() && containerfiles.is_empty() {
             return Ok(None);
@@ -873,7 +937,7 @@ impl Scheduler {
                 PipelineStatus::Failed
             };
             pipeline.finished = Some(super::now_secs());
-            pipeline.save(&self.state_dir);
+            pipeline.save(&self.state_dir, &self.changes);
             eprintln!(
                 "[ci] {} #{} {}",
                 pipeline.repo,
@@ -980,7 +1044,7 @@ impl Scheduler {
                     pipeline.jobs[ji].status = JobStatus::Skipped;
                     pipeline.jobs[ji].note = note.clone();
                     pipeline.jobs[ji].finished = Some(super::now_secs());
-                    pipeline.save(&self.state_dir);
+                    pipeline.save(&self.state_dir, &self.changes);
                     let pipeline = self.running[pi].clone();
                     self.post(&pipeline, &name, State::Error, note);
                     continue;
@@ -1003,7 +1067,7 @@ impl Scheduler {
                         let pipeline = &mut self.running[pi];
                         pipeline.jobs[ji].status = JobStatus::Waiting;
                         pipeline.jobs[ji].note = "machine busy".to_owned();
-                        pipeline.save(&self.state_dir);
+                        pipeline.save(&self.state_dir, &self.changes);
                         let pipeline = self.running[pi].clone();
                         self.post(
                             &pipeline,
@@ -1041,7 +1105,7 @@ impl Scheduler {
         job.note = note.clone();
         job.finished = Some(super::now_secs());
         let name = job.def.name.clone();
-        pipeline.save(&self.state_dir);
+        pipeline.save(&self.state_dir, &self.changes);
         let pipeline = self.running[pi].clone();
         let description = self.failure_description(&pipeline, &name, &note);
         self.post(&pipeline, &name, state, description);
@@ -1066,12 +1130,12 @@ impl Scheduler {
             job.note.clear();
             job.active_secs = 0;
         }
-        self.running[pi].save(&self.state_dir);
+        self.running[pi].save(&self.state_dir, &self.changes);
         match self.prepare_job(pi, ji, &run_dir, started) {
             Ok(Prepared::Spawned) => {
                 let pipeline = &mut self.running[pi];
                 pipeline.jobs[ji].status = JobStatus::Running;
-                pipeline.save(&self.state_dir);
+                pipeline.save(&self.state_dir, &self.changes);
                 let pipeline = self.running[pi].clone();
                 let job = &pipeline.jobs[ji];
                 self.post(
@@ -1341,6 +1405,7 @@ impl Scheduler {
         let number = pipeline.number;
         let job_name = job.name.clone();
         let run_dir = run_dir.to_path_buf();
+        let store = transcript_dir(&self.state_dir, &pipeline.repo, number, &job_name);
         if let Some(machine) = &job.machine {
             let machine = self
                 .machines
@@ -1391,6 +1456,11 @@ impl Scheduler {
                             return;
                         }
                     };
+                    if let Err(e) = link_transcript(&run_dir, &store) {
+                        eprintln!(
+                            "[ci] {repo_name} #{number} {job_name}: transcript not kept: {e}"
+                        );
+                    }
                     let _ = tx.send(Msg::Spawned {
                         repo: repo_name.clone(),
                         number,
@@ -1402,6 +1472,9 @@ impl Scheduler {
             return Ok(Prepared::Booting);
         }
         let handle = self.host.spawn(spec)?;
+        if let Err(e) = link_transcript(&run_dir, &store) {
+            eprintln!("[ci] {repo_name} #{number} {job_name}: transcript not kept: {e}");
+        }
         std::thread::Builder::new()
             .name("zeughaus-ci-job".into())
             .spawn(move || {
@@ -1421,7 +1494,7 @@ impl Scheduler {
                     return;
                 };
                 self.running[pi].jobs[ji].status = JobStatus::Running;
-                self.running[pi].save(&self.state_dir);
+                self.running[pi].save(&self.state_dir, &self.changes);
                 let pipeline = self.running[pi].clone();
                 self.post(
                     &pipeline,
@@ -1446,7 +1519,7 @@ impl Scheduler {
                     return;
                 };
                 self.running[pi].jobs[ji].note = note.clone();
-                self.running[pi].save(&self.state_dir);
+                self.running[pi].save(&self.state_dir, &self.changes);
                 let pipeline = self.running[pi].clone();
                 self.post(
                     &pipeline,
@@ -1487,7 +1560,7 @@ impl Scheduler {
                 pipeline.jobs[ji].status = JobStatus::Skipped;
                 pipeline.jobs[ji].note = note.clone();
                 pipeline.jobs[ji].finished = Some(super::now_secs());
-                pipeline.save(&self.state_dir);
+                pipeline.save(&self.state_dir, &self.changes);
                 let pipeline = self.running[pi].clone();
                 self.post(&pipeline, &job, State::Error, note);
             }
@@ -1561,7 +1634,7 @@ impl Scheduler {
         record.finished = Some(now);
         record.excerpt = if succeeded { None } else { excerpt };
         eprintln!("[ci] {repo} #{number} {job}: {note}");
-        pipeline.save(&self.state_dir);
+        pipeline.save(&self.state_dir, &self.changes);
         let pipeline = self.running[pi].clone();
         let description = if succeeded {
             format!("{note} (#{number})")
@@ -1704,7 +1777,7 @@ impl Scheduler {
                 } else {
                     String::new()
                 };
-                pipeline.save(&self.state_dir);
+                pipeline.save(&self.state_dir, &self.changes);
                 let pipeline = self.running[pi].clone();
                 self.post(&pipeline, &name, State::Pending, description);
             }
@@ -1773,7 +1846,7 @@ impl Scheduler {
             }
         }
         for pi in changed {
-            self.running[pi].save(&self.state_dir);
+            self.running[pi].save(&self.state_dir, &self.changes);
         }
     }
 }
@@ -2024,4 +2097,128 @@ fn link_tree(from: &Path, to: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Gives the run's WAL a second name in the pipeline's transcript store: one
+/// inode, so the transcript is live while the run writes and stays when
+/// `<state>/runs/` is pruned. The WAL exists by now: [`JobHost::spawn`]
+/// creates it before the child starts.
+fn link_transcript(run_dir: &Path, store: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(store)?;
+    std::fs::hard_link(run_dir.join("wal"), store.join("wal"))
+}
+
+#[cfg(test)]
+mod tests {
+    use zeughaus_terminal::wal::{self, WalWriter};
+
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("zeughaus-sched-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the scratch directory");
+        dir
+    }
+
+    fn pipeline(channel: &str) -> Pipeline {
+        Pipeline {
+            repo: "view".to_owned(),
+            number: 7,
+            key: String::new(),
+            event: CiEvent {
+                repo: "view".to_owned(),
+                kind: EventKind::Push,
+                git_ref: "main".to_owned(),
+                sha: None,
+                cron: None,
+                actor: "test".to_owned(),
+                delivery: None,
+                received: 0,
+            },
+            sha: None,
+            status: PipelineStatus::Running,
+            note: String::new(),
+            created: 0,
+            finished: None,
+            jobs: Vec::new(),
+            channel: channel.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_saved_record_is_announced_under_its_channel() {
+        let state = scratch("announce");
+        let (changes, announced) = std::sync::mpsc::channel();
+        pipeline("release").save(&state, &changes);
+        // A record from before channels existed is announced under the
+        // channel its event sorts into.
+        let mut old = pipeline("");
+        old.number = 8;
+        old.save(&state, &changes);
+
+        assert!(pipelines_dir(&state, "view").join("7.json").exists());
+        assert_eq!(
+            announced.try_recv(),
+            Ok(CiChange {
+                repo: "view".to_owned(),
+                channel: "release".to_owned(),
+                number: 7,
+            })
+        );
+        assert_eq!(
+            announced.try_recv(),
+            Ok(CiChange {
+                repo: "view".to_owned(),
+                channel: "main".to_owned(),
+                number: 8,
+            })
+        );
+        assert!(announced.try_recv().is_err());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_written_is_not_announced() {
+        let state = scratch("unwritable");
+        // A state directory below a file cannot be created.
+        let file = state.join("file");
+        std::fs::write(&file, "").expect("write the blocking file");
+        let (changes, announced) = std::sync::mpsc::channel();
+        pipeline("dev").save(&file.join("state"), &changes);
+        assert!(announced.try_recv().is_err());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_transcript_is_the_runs_wal_under_a_second_name() {
+        let state = scratch("transcript");
+        let run_dir = state.join("runs").join("1");
+        std::fs::create_dir_all(&run_dir).expect("create the run directory");
+        let mut writer = WalWriter::open(&run_dir.join("wal"), None).expect("open the WAL");
+        writer.append(1, b"first ").expect("append");
+
+        let store = transcript_dir(&state, "view", 7, "build");
+        assert_eq!(
+            store,
+            state.join("ci/pipelines/view/7.runs/build"),
+            "the store sits beside the pipeline's record, so retention takes both"
+        );
+        link_transcript(&run_dir, &store).expect("link the transcript");
+
+        // Live: what the run writes after the link is read through it.
+        writer.append(2, b"second").expect("append");
+        assert_eq!(
+            wal::read_bytes(&store.join("wal")).expect("read through the link"),
+            b"first second"
+        );
+        // Kept: pruning the run's directory leaves the transcript.
+        std::fs::remove_dir_all(&run_dir).expect("prune the run");
+        assert_eq!(
+            wal::read_bytes(&store.join("wal")).expect("read after the prune"),
+            b"first second"
+        );
+        let _ = std::fs::remove_dir_all(&state);
+    }
 }

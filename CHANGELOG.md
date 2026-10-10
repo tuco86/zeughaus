@@ -70,6 +70,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps it zipped as the job's artifact `Zeughaus-macos-arm64.zip`.
   `deploy/macos-app.sh` honours `CARGO_TARGET_DIR`.
 
+- A CI runner gets a `CI <label>` section in the tab bar: a `Runners` tab
+  listing the workstation, the Windows VM and unix hosts with their status
+  and active jobs, and a locked group per repository with one tab per
+  channel. A channel tab draws its pipelines as DAGs of jobs, newest on
+  top, each in a framed band with its header; pressing a job shows its
+  transcript read-only in the terminal widget, live while it runs. The
+  busy control moved from the runner's section to this one. New `/ci`
+  endpoint and `ci` pipeline event: editor and runner must be updated
+  together.
+- Channels: `.zeughaus-ci/channels.toml` lists `[[channel]]` tables of
+  `name` and `on` patterns; the first match names an event's channel, else
+  the branch, `tags` or `cron`. `ci check`, `ci plan` and `ci status` show
+  it. Job transcripts are kept on the CI with their pipeline record.
+- Every terminal writes a WAL of its output with a timestamp per chunk:
+  job runs to `<run>/wal`, shells to `wal` in their shim directory
+  (rotated at 64 MiB, removed with the terminal).
 ### Changed
 
 - CI secrets come from OpenBao instead of files under
@@ -81,6 +97,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hook answers 503 and the forge redelivers. New `ci secrets-check` lists
   every named secret as `ok` or `missing`.
 - CI machines have a `kind`: `windows-vm` (the existing VM; `ci.toml`
+- A job run's output is `<run>/wal` instead of the raw `<run>/log`;
+  `/runs` serves `wal` instead of `log`. Runs from before keep their `log`,
+  and `ci log` and the failure excerpts read both.
+- The CI keeps the newest 200 pipelines per channel instead of per
+  repository, and removes a pruned pipeline's transcripts with it.
   needs `kind = "windows-vm"` added) or `unix-host`, a host reached over
   ssh that is always on, such as a Mac. A unix host's jobs wait up to
   `wait_minutes` (15) for it to answer and are then skipped, not failed,

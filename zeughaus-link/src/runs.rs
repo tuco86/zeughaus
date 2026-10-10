@@ -2,7 +2,7 @@
 //! hold switch that decides whether new runs start at all.
 //!
 //! A run's bytes never travel through the graph link and never travel between
-//! runners: the log, the exit record and the copied artifacts are files under
+//! runners: the output WAL, the exit record and the copied artifacts are files under
 //! the state directory of the process that executed the run, and the only way
 //! to see them is to ask that process. That is what keeps a 400 MB build log
 //! out of the document and out of every editor that did not open it, and it is
@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunFileRequest {
     pub run_id: u64,
-    /// `"log"`, `"exit"` or `"artifacts/<relative path>"`; no `..`, no
+    /// `"wal"`, `"exit"` or `"artifacts/<relative path>"`; no `..`, no
     /// absolute path.
     pub name: String,
     pub offset: u64,
@@ -55,10 +55,10 @@ impl RunFileRequest {
             return Err("a run file name cannot contain NUL");
         }
         match self.name.as_str() {
-            "log" | "exit" => Ok(()),
+            "wal" | "exit" => Ok(()),
             name => {
                 let Some(rel) = name.strip_prefix("artifacts/") else {
-                    return Err("a run holds log, exit and artifacts/<path>");
+                    return Err("a run holds wal, exit and artifacts/<path>");
                 };
                 if rel.is_empty() {
                     return Err("an artifact path is empty");
@@ -191,14 +191,14 @@ mod tests {
 
     #[test]
     fn the_files_a_run_has_are_accepted() {
-        for name in ["log", "exit", "artifacts/a/b.txt"] {
+        for name in ["wal", "exit", "artifacts/a/b.txt"] {
             assert!(ask(name).validate().is_ok(), "refused {name}");
         }
     }
 
     #[test]
     fn an_oversized_chunk_is_refused() {
-        let mut request = ask("log");
+        let mut request = ask("wal");
         request.limit = MAX_RUN_CHUNK_BYTES + 1;
         assert!(request.validate().is_err());
     }

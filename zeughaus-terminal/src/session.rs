@@ -21,9 +21,8 @@
 //! child (`TERMINAL_MUX_ARCHITECTURE_PLAN.md`, "Authority and lifetime").
 
 use std::ffi::OsString;
-use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -39,6 +38,7 @@ use zeughaus_mux::{
 use crate::config::MAX_SCROLLBACK_ROWS;
 use crate::convert;
 use crate::model::Model;
+use crate::wal::{self, Wal, WalWriter};
 
 /// Bytes read from the PTY in one go. Large enough that a full-screen redraw
 /// or a `cat` of a big file is a handful of parser calls rather than
@@ -198,10 +198,9 @@ struct Inner {
     /// status the kill produced into [`ExitState::Killed`].
     killed: AtomicBool,
     changes: watch::Sender<u64>,
-    /// A copy of every byte the child writes, taken before the parser sees
-    /// it. A job's log is this sink; a write error ends the tee and leaves
-    /// the terminal running.
-    tee: Mutex<Option<Box<dyn Write + Send>>>,
+    /// A record of every byte the child writes, taken before the parser
+    /// sees it. A write error ends the WAL and leaves the terminal running.
+    wal: Mutex<Option<WalWriter>>,
     /// Called by the reader after the child changed the terminal's title.
     /// The title reaches places no subscriber streams to (a workspace's tab
     /// bar), so it has its own notice besides `changes`.
@@ -223,7 +222,7 @@ impl Inner {
         label: &str,
         writer: Box<dyn Write + Send>,
         io: Io,
-        tee: Option<Box<dyn Write + Send>>,
+        wal: Option<WalWriter>,
         muted: Arc<AtomicBool>,
     ) -> Arc<Inner> {
         let writer = Arc::new(Mutex::new(writer));
@@ -253,7 +252,7 @@ impl Inner {
             io,
             killed: AtomicBool::new(false),
             changes,
-            tee: Mutex::new(tee),
+            wal: Mutex::new(wal),
             on_title: Mutex::new(None),
         })
     }
@@ -282,10 +281,11 @@ impl Session {
     /// Starts the profile's program in a PTY on `host`, and begins parsing
     /// its output.
     ///
-    /// `log`, when given, is appended every byte the child writes before it
-    /// is parsed: the raw PTY stream, escape sequences included, which is a
-    /// recording of what the program produced rather than of what the screen
-    /// shows. A write error ends the log and the terminal carries on.
+    /// `wal` says where the child's output is recorded, timestamped per
+    /// chunk, before it is parsed: the raw PTY stream, escape sequences
+    /// included, which is a recording of what the program produced rather
+    /// than of what the screen shows. A write error ends the WAL and the
+    /// terminal carries on.
     ///
     /// Returns as soon as the child exists; output arrives on a reader
     /// thread and is announced through [`Session::changes`].
@@ -293,7 +293,7 @@ impl Session {
         id: TerminalId,
         profile: &Profile,
         size: Dimensions,
-        log: Option<&Path>,
+        wal: Wal,
         host: &TerminalHost,
     ) -> Result<Session, SpawnError> {
         if !size.is_valid() {
@@ -303,9 +303,9 @@ impl Session {
             )));
         }
         match host {
-            TerminalHost::Local => Session::spawn_local(id, profile, size, log),
+            TerminalHost::Local => Session::spawn_local(id, profile, size, wal),
             #[cfg(unix)]
-            TerminalHost::Shim(shim) => Session::spawn_shim(id, profile, size, log, shim),
+            TerminalHost::Shim(shim) => Session::spawn_shim(id, profile, size, wal, shim),
         }
     }
 
@@ -313,17 +313,16 @@ impl Session {
         id: TerminalId,
         profile: &Profile,
         size: Dimensions,
-        log: Option<&Path>,
+        wal: Wal,
     ) -> Result<Session, SpawnError> {
-        let tee: Option<Box<dyn Write + Send>> = match log {
-            Some(path) => Some(Box::new(
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
+        // A local session has no directory of its own, so `Capped` has
+        // nowhere to write.
+        let wal = match wal {
+            Wal::At(path) => Some(
+                WalWriter::open(&path, None)
                     .map_err(|e| SpawnError::Spawn(format!("{}: {e}", path.display())))?,
-            )),
-            None => None,
+            ),
+            Wal::Capped | Wal::Off => None,
         };
         let pty = native_pty_system()
             .openpty(pty_size(size))
@@ -358,7 +357,7 @@ impl Session {
                 master: Mutex::new(master),
                 killer: Mutex::new(killer),
             },
-            tee,
+            wal,
             Arc::new(AtomicBool::new(false)),
         );
         let session = Session { inner };
@@ -373,7 +372,7 @@ impl Session {
         id: TerminalId,
         profile: &Profile,
         size: Dimensions,
-        log: Option<&Path>,
+        wal: Wal,
         host: &ShimHost,
     ) -> Result<Session, SpawnError> {
         use std::os::unix::fs::DirBuilderExt;
@@ -391,6 +390,13 @@ impl Session {
             .mode(0o700)
             .create(&dir)
             .map_err(|e| failed(&e))?;
+        // The shim directory is removed when the terminal closes, and a
+        // capped WAL with it.
+        let (wal, wal_cap) = match wal {
+            Wal::Off => (None, None),
+            Wal::Capped => (Some(dir.join("wal")), Some(wal::SHELL_WAL_CAP)),
+            Wal::At(path) => (Some(path), None),
+        };
         let spec = crate::shim::ShimSpec {
             label: profile.label.clone(),
             program: profile.program.clone(),
@@ -400,7 +406,8 @@ impl Session {
             scrollback_rows: profile.scrollback_rows,
             cols: size.cols,
             rows: size.rows,
-            log: log.map(Path::to_path_buf),
+            wal,
+            wal_cap,
         };
         let json = serde_json::to_vec_pretty(&spec).map_err(|e| failed(&e))?;
         std::fs::write(dir.join("spec.json"), json).map_err(|e| failed(&e))?;
@@ -790,22 +797,22 @@ fn read_loop(inner: Arc<Inner>, mut reader: Box<dyn Read + Send>) {
             // back as EOF.
             Err(_) => break,
         };
-        consume(&inner, &buf[..read], &mut title);
+        let at = wal::now_micros();
+        consume(&inner, at, &buf[..read], &mut title);
     }
 }
 
-/// One chunk of the child's output: teed, parsed, published.
-fn consume(inner: &Inner, chunk: &[u8], title: &mut String) {
-    // The tee copies the raw stream first: what a job's log records is
-    // what the program wrote, whatever the parser then makes of it.
+/// One chunk of the child's output, read at `at` (microseconds since the
+/// epoch): logged, parsed, published.
+fn consume(inner: &Inner, at: u64, chunk: &[u8], title: &mut String) {
+    // The WAL takes the raw stream first: what it records is what the
+    // program wrote, whatever the parser then makes of it.
     {
-        let mut tee = inner.tee.lock().unwrap_or_else(|e| e.into_inner());
-        let failed = match tee.as_mut() {
-            Some(sink) => sink.write_all(chunk).and_then(|()| sink.flush()).is_err(),
-            None => false,
-        };
-        if failed {
-            *tee = None;
+        let mut wal = inner.wal.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(writer) = wal.as_mut()
+            && writer.append(at, chunk).is_err()
+        {
+            *wal = None;
         }
     }
     let mut retitled = false;
@@ -868,7 +875,11 @@ fn shim_loop(inner: Arc<Inner>, mut conn: crate::shim::ShimConn) {
     let mut title = inner.model().title();
     loop {
         match conn.recv() {
-            Ok(Some(FromShim::Output(chunk))) => consume(&inner, chunk, &mut title),
+            // The shim already logged the chunk; this session has no WAL of
+            // its own, so the time is not used.
+            Ok(Some(FromShim::Output(chunk))) => {
+                consume(&inner, wal::now_micros(), chunk, &mut title);
+            }
             Ok(Some(FromShim::Exited(exit))) => {
                 let exit = shim_exit(&inner, exit);
                 inner.model().set_exit(exit);
@@ -1061,7 +1072,7 @@ mod tests {
             TerminalId(7),
             &shell("printf hello; exit 3"),
             Dimensions { cols: 40, rows: 6 },
-            None,
+            Wal::Off,
             &TerminalHost::Local,
         )
         .expect("spawn /bin/sh");
@@ -1084,7 +1095,7 @@ mod tests {
             TerminalId(8),
             &shell("sleep 30"),
             Dimensions { cols: 40, rows: 6 },
-            None,
+            Wal::Off,
             &TerminalHost::Local,
         )
         .expect("spawn /bin/sh");
@@ -1100,30 +1111,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_logged_child_is_appended_byte_for_byte() {
-        let log = std::env::temp_dir().join(format!("zh-session-log-{}", std::process::id()));
-        std::fs::write(&log, "earlier\n").expect("seed the log");
+    async fn a_walled_child_is_appended_with_a_time_per_chunk() {
+        let path = std::env::temp_dir().join(format!("zh-session-wal-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut seed = WalWriter::open(&path, None).expect("seed the WAL");
+        seed.append(1, b"earlier\n").expect("seed a record");
+        drop(seed);
         let session = Session::spawn(
             TerminalId(9),
-            &shell("printf teed-hello; exit 0"),
+            &shell("printf a; sleep 1; printf b"),
             Dimensions { cols: 40, rows: 6 },
-            Some(&log),
+            Wal::At(path.clone()),
             &TerminalHost::Local,
         )
         .expect("spawn /bin/sh");
 
-        let logged = || std::fs::read_to_string(&log).unwrap_or_default();
         let finished = settle(&session, Duration::from_secs(10), |session| {
-            session.exit().is_some() && logged().contains("teed-hello")
+            session.exit().is_some()
         })
         .await;
 
-        let text = logged();
-        let _ = std::fs::remove_file(&log);
-        assert!(finished, "the log never saw the output: {text:?}");
+        let records = wal::read(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        assert!(finished, "the child never finished");
+        assert_eq!(records[0].bytes, b"earlier\n", "the WAL was truncated");
+        let stream: Vec<u8> = records[1..]
+            .iter()
+            .flat_map(|r| r.bytes.iter().copied())
+            .collect();
+        assert_eq!(stream, b"ab");
+        let first = records[1].at_micros;
+        let last = records.last().expect("records").at_micros;
         assert!(
-            text.starts_with("earlier\n"),
-            "the log was truncated: {text:?}"
+            last - first >= 900_000,
+            "chunks {first} and {last} are not a second apart"
         );
     }
 }

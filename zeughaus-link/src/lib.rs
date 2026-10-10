@@ -9,7 +9,7 @@
 //! and pure pixel math, no I/O, so the runtime's server and the editor's
 //! client cannot disagree about the protocol.
 //!
-//! One listener, nine paths, each a different weida pattern:
+//! One listener, ten paths, each a different weida pattern:
 //!
 //! | path | pattern | carries |
 //! |---|---|---|
@@ -20,6 +20,7 @@
 //! | [`RUNS_PATH`] | req/rep | [`runs`]: a range of one file of one run |
 //! | [`HOLD_PATH`] | req/rep | [`runs::HoldRequest`]: start no new runs |
 //! | [`BUSY_PATH`] | req/rep | [`machine::BusyRequest`]: override the CI busy measurement |
+//! | [`CI_PATH`] | req/rep | [`ci`]: channels, pipelines, machines, job transcripts |
 //! | [`MUX_PATH`] | req/rep exchanges | the terminal mux (`zeughaus-mux`) |
 //! | [`GRAPH_PATH`] | one long exchange per editor | [`graph`]: the document, edits and changes |
 //!
@@ -27,6 +28,7 @@
 //! files that hold the runner's identity and the client keys it trusts, and
 //! the endpoint file through which a local editor finds its runner.
 
+pub mod ci;
 pub mod credentials;
 pub mod events;
 pub mod feed;
@@ -34,6 +36,10 @@ pub mod graph;
 pub mod machine;
 pub mod runs;
 
+pub use ci::{
+    ChannelView, CiOverview, CiReply, CiRequest, JobView, MAX_CI_REPLY_BYTES, MAX_CI_REQUEST_BYTES,
+    MachineView, PipelineView,
+};
 pub use events::{
     ErrorRow, MAX_EVENT_BYTES, MAX_SNAPSHOT_BYTES, MAX_TRIGGER_BYTES, OutputRow, RejectionRow,
     RuntimeEvent, Snapshot, TOPIC_CI, TOPIC_EDGE, TOPIC_ERROR, TOPIC_MACHINE, TOPIC_OUTPUT,
@@ -74,6 +80,11 @@ pub const HOLD_PATH: &str = "/hold";
 /// Req/Rep endpoint that overrides a CI runner's busy measurement. Served
 /// only by a runner that runs CI.
 pub const BUSY_PATH: &str = "/busy";
+
+/// Req/Rep endpoint a CI runner answers [`ci::CiRequest`]s on: its channels,
+/// pipelines, machines and job transcripts. Served only by a runner that
+/// runs CI.
+pub const CI_PATH: &str = "/ci";
 
 /// Req/Rep endpoint carrying every terminal-mux exchange: the control
 /// stream, one stream per attached terminal and the short scrollback

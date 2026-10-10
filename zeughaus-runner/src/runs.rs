@@ -1,6 +1,6 @@
 //! Serving the files of the runs this process executed.
 //!
-//! A run's log, its exit record and its copied artifacts live under
+//! A run's output WAL, its exit record and its copied artifacts live under
 //! `<state-dir>/runs/<run-id>/`, on the runner that produced them and nowhere
 //! else, so an editor that wants to read one asks this endpoint for a range of
 //! it. Range reads rather than a download: a log is written while it is read,

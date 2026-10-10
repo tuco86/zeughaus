@@ -78,6 +78,16 @@ impl Vm {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The power state as the CI view shows it.
+    fn status(&self) -> &'static str {
+        match self.lock().power {
+            Power::Off => "off",
+            Power::Booting => "booting",
+            Power::Ready => "ready",
+            Power::Stopping => "stopping",
+        }
+    }
+
     /// Takes a lease, booting and preparing the VM first if it is off.
     /// Blocks for as long as that takes; called from a job's own thread.
     fn acquire(&self) -> Result<(), String> {
@@ -286,6 +296,8 @@ pub struct Host {
     name: String,
     config: UnixHostConfig,
     log: PathBuf,
+    /// The last probe's answer; `None` until one ran.
+    online: Mutex<Option<bool>>,
 }
 
 impl Host {
@@ -294,12 +306,28 @@ impl Host {
             name: name.to_owned(),
             log: machine_log(state_dir, name),
             config,
+            online: Mutex::new(None),
         })
+    }
+
+    /// `"online"` or `"offline"` by the last probe, `"unknown"` before any.
+    fn status(&self) -> &'static str {
+        match *self.online.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some(true) => "online",
+            Some(false) => "offline",
+            None => "unknown",
+        }
     }
 
     /// Whether the host answers ssh and its run directory is usable; the
     /// probe also prunes runs a killed launcher left behind.
     fn probe(&self) -> bool {
+        let online = self.run_probe();
+        *self.online.lock().unwrap_or_else(|e| e.into_inner()) = Some(online);
+        online
+    }
+
+    fn run_probe(&self) -> bool {
         let Ok(log) = open_log(&self.log) else {
             return false;
         };
@@ -449,6 +477,23 @@ impl Machine {
         match self {
             Machine::Vm(_) => None,
             Machine::Host(host) => Some(&host.config.dir),
+        }
+    }
+
+    /// `"windows-vm"` or `"unix-host"`, as the CI view shows it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Machine::Vm(_) => "windows-vm",
+            Machine::Host(_) => "unix-host",
+        }
+    }
+
+    /// A VM's power state or a unix host's last probe; see [`Vm::status`]
+    /// and [`Host::status`].
+    pub fn status(&self) -> &'static str {
+        match self {
+            Machine::Vm(vm) => vm.status(),
+            Machine::Host(host) => host.status(),
         }
     }
 }

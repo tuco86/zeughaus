@@ -2,16 +2,18 @@
 //! and the `/hold` service that stops it starting new ones.
 //!
 //! A run is a terminal this process owns. It has no pane until an editor
-//! attaches one, its PTY bytes are teed to `<state-dir>/runs/<id>/log` as they
-//! are parsed, and its exit record is written beside them. That is what makes
-//! a failed job a terminal to attach to rather than a log to read: the screen
-//! the child left behind survives the child.
+//! attaches one, its PTY bytes are teed to `<state-dir>/runs/<id>/wal` as they
+//! are parsed, each chunk with the time it was read, and its exit record is
+//! written beside them. That is what makes a failed job a terminal to attach
+//! to rather than a log to read: the screen the child left behind survives
+//! the child.
 //!
 //! Run ids come from the state directory rather than from a counter that
 //! starts at zero, so a restarted runner cannot hand out an id whose directory
-//! already holds someone else's log.
+//! already holds someone else's output.
 
 use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -22,6 +24,7 @@ use zeughaus_job::{JobSpec, ProcessHost, RunExit, RunHandle, record_run_end};
 use zeughaus_link::{HoldReply, HoldRequest, MAX_HOLD_BYTES};
 use zeughaus_mux::{ExitState, TerminalId};
 use zeughaus_terminal::Profile;
+use zeughaus_terminal::wal::{self, Wal, WalWriter};
 
 use crate::mux::{MuxService, OwnedPlacement, SavedRun};
 
@@ -32,7 +35,7 @@ const POLL: Duration = Duration::from_millis(50);
 
 /// Scrollback a run's terminal keeps: a failed build is read from its end,
 /// and the last ten thousand rows is where the error is.
-const RUN_SCROLLBACK_ROWS: usize = 10_000;
+pub(crate) const RUN_SCROLLBACK_ROWS: usize = 10_000;
 
 /// Successful runs kept on disk beyond which older ones are deleted when a
 /// new run starts. Failed runs, and runs that never wrote an exit record
@@ -185,13 +188,13 @@ impl ProcessHost for JobHost {
     }
 
     fn spawn(&self, spec: JobSpec) -> Result<Box<dyn RunHandle>, String> {
-        // Created before the child, because a run whose log cannot be
+        // Created before the child, because a run whose output cannot be
         // written is a run nobody can read afterwards -- and that is worth
         // refusing rather than discovering when it fails. The terminal
         // appends to it from here on, in whichever process holds the PTY.
-        let log_path = spec.run_dir.join("log");
-        File::create(&log_path)
-            .map_err(|e| format!("cannot create {}: {e}", log_path.display()))?;
+        let wal_path = spec.run_dir.join("wal");
+        WalWriter::open(&wal_path, None)
+            .map_err(|e| format!("cannot create {}: {e}", wal_path.display()))?;
         let run = SavedRun {
             run_dir: spec.run_dir.clone(),
             started: spec.started,
@@ -237,7 +240,7 @@ impl ProcessHost for JobHost {
         };
         let terminal = self
             .mux
-            .spawn_owned(profile, Some(log_path), Some(run), placement)?;
+            .spawn_owned(profile, Wal::At(wal_path), Some(run), placement)?;
         self.live.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(Run {
             mux: self.mux.clone(),
@@ -436,6 +439,40 @@ pub async fn serve_hold(replier: Replier, host: Arc<JobHost>) {
     }
 }
 
+/// A run's output bytes: its WAL, or the raw `log` of a run from before the
+/// WAL.
+pub fn run_output(run_dir: &Path) -> io::Result<Vec<u8>> {
+    let wal = run_dir.join("wal");
+    if wal.exists() {
+        wal::read_bytes(&wal)
+    } else {
+        std::fs::read(run_dir.join("log"))
+    }
+}
+
+/// The last `max` bytes of [`run_output`], from the first line that starts
+/// inside them: a cut through a character or an escape sequence would
+/// otherwise open the text.
+pub fn run_output_tail(run_dir: &Path, max: usize) -> io::Result<Vec<u8>> {
+    let wal = run_dir.join("wal");
+    let mut bytes = if wal.exists() {
+        wal::tail_bytes(&wal, max)?
+    } else {
+        let mut file = File::open(run_dir.join("log"))?;
+        let len = file.metadata()?.len();
+        file.seek(SeekFrom::Start(len.saturating_sub(max as u64)))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        bytes
+    };
+    if bytes.len() >= max
+        && let Some(newline) = bytes.iter().position(|&b| b == b'\n')
+    {
+        bytes.drain(..=newline);
+    }
+    Ok(bytes)
+}
+
 /// A real child in a real PTY through the whole path: the `job.run` node,
 /// this host, the mux and the terminal engine. Unix only, like the engine's
 /// own tests: it drives `/bin/sh`.
@@ -508,7 +545,7 @@ mod tests {
         assert!(!outputs.contains_key("ok"));
         let run_dir = PathBuf::from(outputs["dir"].downcast_ref::<String>().unwrap());
         assert_eq!(run_dir, state_dir.join("runs").join("1"));
-        let log = std::fs::read_to_string(run_dir.join("log")).unwrap();
+        let log = String::from_utf8_lossy(&run_output(&run_dir).unwrap()).into_owned();
         assert!(
             log.contains("marker-one got=payload-text in="),
             "log was: {log:?}"
@@ -535,11 +572,7 @@ mod tests {
         assert_eq!(outputs["ok"].downcast_ref::<bool>(), Some(&true));
         let run_dir = PathBuf::from(outputs["dir"].downcast_ref::<String>().unwrap());
         assert_eq!(run_dir, state_dir.join("runs").join("2"));
-        assert!(
-            std::fs::read_to_string(run_dir.join("log"))
-                .unwrap()
-                .contains("marker-two")
-        );
+        assert!(String::from_utf8_lossy(&run_output(&run_dir).unwrap()).contains("marker-two"));
         assert!(!run_dir.join("code").exists());
         assert!(mux.session(TerminalId(2)).is_none());
         assert!(mux.session(TerminalId(1)).is_some());

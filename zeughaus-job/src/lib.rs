@@ -36,7 +36,7 @@ pub struct JobSpec {
     pub env: Vec<(String, String)>,
     /// `None` runs the child in the runner's working directory.
     pub cwd: Option<PathBuf>,
-    /// The directory this run's log, exit record and artifacts go into,
+    /// The directory this run's WAL, exit record and artifacts go into,
     /// already created by [`ProcessHost::new_run_dir`].
     pub run_dir: PathBuf,
     /// After a non-zero exit, leave a shell in the run's terminal with the
@@ -86,8 +86,8 @@ pub trait ProcessHost: Send + Sync {
     /// Allocate `<state-dir>/runs/<run-id>/`, created, and return it.
     fn new_run_dir(&self) -> Result<PathBuf, String>;
 
-    /// Start the process in an owned terminal, teeing its PTY bytes to
-    /// `<run_dir>/log`.
+    /// Start the process in an owned terminal, teeing its PTY bytes, each
+    /// chunk with the time it was read, to `<run_dir>/wal`.
     fn spawn(&self, spec: JobSpec) -> Result<Box<dyn RunHandle>, String>;
 }
 
