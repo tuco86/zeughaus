@@ -72,6 +72,18 @@ fn truncate(text: &str) -> String {
     text.chars().take(MAX_DESCRIPTION).collect()
 }
 
+/// `<text> (#<pipeline>)`, with `text` cut so the pipeline number survives
+/// the forge's limit.
+pub fn describe(text: &str, pipeline: u64) -> String {
+    let suffix = format!(" (#{pipeline})");
+    let room = MAX_DESCRIPTION.saturating_sub(suffix.chars().count());
+    if text.chars().count() <= room {
+        return format!("{text}{suffix}");
+    }
+    let cut: String = text.chars().take(room.saturating_sub(3)).collect();
+    format!("{}...{suffix}", cut.trim_end())
+}
+
 /// The authorization header for `repo`'s forge.
 fn auth_header(forge: Forge, token: &str) -> String {
     match forge {

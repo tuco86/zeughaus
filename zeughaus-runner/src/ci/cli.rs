@@ -8,6 +8,7 @@
 //! ci run <repo> <push|tag> <ref> [<sha>]
 //! ci run <repo> cron "<expr>"
 //! ci status [N]
+//! ci log <repo> <pipeline> <job> [--tail N]
 //! ci forge-check <repo>
 //! ci hook --listen <addr>
 //! ```
@@ -16,19 +17,24 @@
 //! directory's `ci.toml`. None of them talks to a running runner: `run`
 //! drops an event into the inbox the scheduler drains.
 
+use std::collections::HashSet;
+use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::Path;
 use std::process::ExitCode;
 
 use super::CI_DIR;
 use super::config::CiConfig;
 use super::event::{self, CiEvent, EventKind};
+use super::excerpt;
 use super::header::JobDef;
 use super::pipeline::{self, Pattern};
-use super::scheduler::{self, place_name};
+use super::scheduler::{self, JobStatus, PipelineStatus, place_name};
+use super::streak;
 
 const USAGE: &str = "usage: zeughaus-runner ci check [DIR] | plan [DIR] <push|tag> <ref> | \
 plan [DIR] cron \"<expr>\" | run <repo> <push|tag> <ref> [<sha>] | run <repo> cron \"<expr>\" | \
-status [N] | forge-check <repo> | hook --listen <addr>";
+status [N] | log <repo> <pipeline> <job> [--tail N] | forge-check <repo> | hook --listen <addr>";
 
 pub fn run(args: &[String], state_dir: &Path) -> ExitCode {
     let result = match args.first().map(String::as_str) {
@@ -36,6 +42,7 @@ pub fn run(args: &[String], state_dir: &Path) -> ExitCode {
         Some("plan") => plan(&args[1..]),
         Some("run") => queue(state_dir, &args[1..]),
         Some("status") => status(state_dir, &args[1..]),
+        Some("log") => log(state_dir, &args[1..]),
         Some("forge-check") => forge_check(state_dir, &args[1..]),
         Some("hook") => return super::hook::run(state_dir, &args[1..]),
         _ => Err(USAGE.to_owned()),
@@ -177,15 +184,48 @@ fn queue(state_dir: &Path, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The default branch of every configured repository first (green, or which
+/// jobs are red since when), then the newest `N` pipelines. The newest
+/// pipeline of each repository shows the run directory and the excerpt of
+/// every failed job; older ones keep to one line per job.
 fn status(state_dir: &Path, args: &[String]) -> Result<(), String> {
     let count = match args {
         [] => 10,
         [n] => n.parse().map_err(|_| format!("{n:?} is not a number"))?,
         _ => return Err("usage: ci status [N]".to_owned()),
     };
+    let now = super::now_secs();
+    let mut out = String::new();
+    if let Some(config) = CiConfig::load(state_dir)? {
+        for (name, repo) in &config.repos {
+            let pipelines = scheduler::load_repo_pipelines(state_dir, name);
+            if pipelines.is_empty() {
+                continue;
+            }
+            let branch = &repo.default_branch;
+            let mut line = streak::of_branch(&pipelines, branch).describe(now);
+            // The streak counts pipelines with jobs; a newest push without
+            // a CI folder means none of it is running any more.
+            if let Some(newest) = pipelines
+                .iter()
+                .filter(|p| streak::is_branch(p, branch))
+                .max_by_key(|p| p.number)
+                && newest.status == PipelineStatus::NoJobs
+            {
+                let _ = write!(line, "; #{}: {}", newest.number, newest.note);
+            }
+            let _ = writeln!(out, "{name} {branch}: {line}");
+        }
+        out.push('\n');
+    }
+    let mut seen = HashSet::new();
     for pipeline in scheduler::load_pipelines(state_dir).into_iter().take(count) {
+        // A record without jobs (a setup error, no CI folder) has nothing
+        // to explain; the newest one that ran something gets the long form.
+        let newest = !pipeline.jobs.is_empty() && seen.insert(pipeline.repo.clone());
         let sha = pipeline.sha.as_deref().unwrap_or("-");
-        println!(
+        let _ = writeln!(
+            out,
             "{} #{} {} {} {} {}",
             pipeline.repo,
             pipeline.number,
@@ -195,18 +235,73 @@ fn status(state_dir: &Path, args: &[String]) -> Result<(), String> {
             pipeline.status.as_str()
         );
         if !pipeline.note.is_empty() {
-            println!("  {}", pipeline.note);
+            let _ = writeln!(out, "  {}", pipeline.note);
         }
         for job in &pipeline.jobs {
-            println!(
+            let _ = writeln!(
+                out,
                 "  {:<20} {:<10} {}",
                 job.def.name,
                 job.status.as_str(),
                 job.note
             );
+            if !newest || job.status != JobStatus::Failed {
+                continue;
+            }
+            if let Some(run_dir) = &job.run_dir {
+                let _ = writeln!(out, "    run {}", run_dir.display());
+            }
+            for line in job.excerpt.iter().flat_map(|e| e.lines()) {
+                let _ = writeln!(out, "    | {line}");
+            }
         }
     }
+    print_out(&out);
     Ok(())
+}
+
+/// A job's log as plain text, whole or its last `N` lines.
+fn log(state_dir: &Path, args: &[String]) -> Result<(), String> {
+    const USAGE: &str = "usage: ci log <repo> <pipeline> <job> [--tail N]";
+    let (repo, number, job, tail) = match args {
+        [repo, number, job] => (repo, number, job, None),
+        [repo, number, job, flag, n] if flag == "--tail" => (
+            repo,
+            number,
+            job,
+            Some(
+                n.parse::<usize>()
+                    .map_err(|_| format!("{n:?} is not a number"))?,
+            ),
+        ),
+        _ => return Err(USAGE.to_owned()),
+    };
+    let number = number
+        .trim_start_matches('#')
+        .parse::<u64>()
+        .map_err(|_| format!("{number:?} is not a pipeline number"))?;
+    let pipeline = scheduler::load_pipeline(state_dir, repo, number)?;
+    let record = pipeline
+        .jobs
+        .iter()
+        .find(|j| j.def.name == *job)
+        .ok_or_else(|| format!("{repo} #{number} has no job {job}"))?;
+    let run_dir = record
+        .run_dir
+        .as_ref()
+        .ok_or_else(|| format!("{repo} #{number} {job} never ran"))?;
+    let text = excerpt::read_log(&run_dir.join("log"))?;
+    let lines: Vec<&str> = text.lines().collect();
+    let start = tail.map_or(0, |n| lines.len().saturating_sub(n));
+    let mut out = lines[start..].join("\n");
+    out.push('\n');
+    print_out(&out);
+    Ok(())
+}
+
+/// Writes to stdout, quietly stopping when the reader went away (`| head`).
+fn print_out(text: &str) {
+    let _ = std::io::stdout().lock().write_all(text.as_bytes());
 }
 
 fn forge_check(state_dir: &Path, args: &[String]) -> Result<(), String> {

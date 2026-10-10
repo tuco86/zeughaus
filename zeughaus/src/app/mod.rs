@@ -1624,7 +1624,7 @@ impl App {
             }
             #[cfg(not(target_arch = "wasm32"))]
             Message::Traffic(epoch, traffic) => {
-                self.apply_traffic(epoch, traffic);
+                return self.apply_traffic(epoch, traffic);
             }
             #[cfg(not(target_arch = "wasm32"))]
             Message::Mux(epoch, event) => {

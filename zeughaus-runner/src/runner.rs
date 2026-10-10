@@ -20,7 +20,7 @@ use zeughaus_core::{
     TypeConverters, Value, encode_scalar, occupancy_winner,
 };
 use zeughaus_link::{
-    ErrorRow, GraphChange, MachineState, OutputRow, RejectionRow, RuntimeEvent, Snapshot,
+    ErrorRow, GraphChange, MachineState, OutputRow, RejectionRow, RuntimeEvent, Snapshot, TOPIC_CI,
     TOPIC_EDGE, TOPIC_ERROR, TOPIC_MACHINE, TOPIC_OUTPUT,
 };
 use zeughaus_runtime::{DeferredWork, GraphExecutor};
@@ -316,6 +316,19 @@ impl Runner {
             },
         );
         self.published.flush(self.seq, &self.snapshot);
+    }
+
+    /// Tells editors that a default branch is red.
+    pub fn report_ci_alert(&mut self, alert: crate::ci::scheduler::Alert) {
+        let seq = self.next_seq();
+        self.emit(
+            TOPIC_CI,
+            RuntimeEvent::CiAlert {
+                seq,
+                title: alert.title,
+                body: alert.body,
+            },
+        );
     }
 
     /// Publishes one event on `topic`. A failure is reported once per distinct

@@ -145,8 +145,9 @@ prints the line to add to the editor's `zeughaus.toml`) and `zeughaus-ci-hook`
 forwards `https://ci.doodleshnookie.net/hook/<repo>` to). Logs:
 `sudo journalctl _UID=$(id -u zeughaus-ci)`. Repositories, budgets and the
 VM are configured in `/var/lib/zeughaus-ci/state/ci.toml`, and secrets are
-files in `state/secrets/`. `zeughaus-ci run|status|forge-check` (a sudo
-wrapper) queues a pipeline and reads results. `zeughaus-runner ci check
+files in `state/secrets/`. `zeughaus-ci run|status|log|forge-check` (a sudo
+wrapper) queues a pipeline and reads results, a failed job's excerpt and
+its log. `zeughaus-runner ci check
 [DIR]` and `ci plan [DIR] <push|tag> <ref>` validate a `.zeughaus-ci/` folder without
 a runner. The Windows VM (`vm/win11/`, installed under
 `/usr/local/lib/zeughaus-ci/vm/win11`) is booted and stopped by the

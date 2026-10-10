@@ -17,6 +17,7 @@ pub mod cleanup;
 pub mod cli;
 pub mod config;
 pub mod event;
+pub mod excerpt;
 pub mod forge;
 pub mod header;
 pub mod hook;
@@ -24,10 +25,11 @@ pub mod launch;
 pub mod machine;
 pub mod pipeline;
 pub mod scheduler;
+pub mod streak;
 
 use std::path::Path;
 
-pub use scheduler::start;
+pub use scheduler::{Ci, start};
 
 /// The folder of a repository that holds its CI jobs.
 pub const CI_DIR: &str = ".zeughaus-ci";

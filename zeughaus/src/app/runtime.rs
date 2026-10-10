@@ -178,12 +178,16 @@ pub(super) struct RuntimeView {
 
 impl App {
     /// Applies what the runtime reported: values, their absence, and the edges
-    /// a value crossed.
+    /// a value crossed; a CI alert goes to the desktop.
     ///
     /// This is the only way a value ever reaches the editor -- it computes
     /// nothing itself -- and the only place particles are born.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(super) fn apply_traffic(&mut self, epoch: u64, traffic: crate::feed::Traffic) {
+    pub(super) fn apply_traffic(
+        &mut self,
+        epoch: u64,
+        traffic: crate::feed::Traffic,
+    ) -> Task<Message> {
         use crate::feed::Traffic;
         use zeughaus_link::RuntimeEvent;
 
@@ -197,7 +201,7 @@ impl App {
             .find(|(_, link)| link.traffic_epoch == epoch)
             .map(|(key, _)| key.clone())
         else {
-            return;
+            return Task::none();
         };
         match traffic {
             Traffic::Snapshot(snapshot) => {
@@ -254,10 +258,10 @@ impl App {
             }) => {
                 let node = NodeId(node_id);
                 if !self.accept_output_seq(node, &pin, seq) {
-                    return;
+                    return Task::none();
                 }
                 let Some(value) = zeughaus_core::decode_scalar(&ty, &value) else {
-                    return;
+                    return Task::none();
                 };
                 self.runtime.reported_by.insert(node, key.clone());
                 self.runtime
@@ -270,7 +274,7 @@ impl App {
             Traffic::Event(RuntimeEvent::OutputCleared { seq, node_id, pin }) => {
                 let node = NodeId(node_id);
                 if !self.accept_output_seq(node, &pin, seq) {
-                    return;
+                    return Task::none();
                 }
                 self.runtime.reported_by.insert(node, key.clone());
                 if let Some(pins) = self.runtime.remote_outputs.get_mut(&node) {
@@ -351,6 +355,11 @@ impl App {
                     link.machine_seq = seq;
                 }
             }
+            // Not state: nothing to keep, and the window being focused is
+            // no reason to hold it back, since nothing on screen says it.
+            Traffic::Event(RuntimeEvent::CiAlert { title, body, .. }) => {
+                return super::terminal::notify_desktop(title, body);
+            }
             Traffic::Lost => {
                 if let Some(link) = self.runtime.links.get_mut(&key) {
                     link.traffic_live = false;
@@ -367,6 +376,7 @@ impl App {
                 self.forget_runner_values(&key, true);
             }
         }
+        Task::none()
     }
 
     /// Forgets what `runner` reported about the nodes of its graphs, and

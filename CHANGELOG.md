@@ -53,6 +53,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `deploy/macos-app.sh` builds `Zeughaus.app` around a release build of the
   editor: the Info.plist that names the app, and an icns `render.py` draws
   at the ten sizes the Dock, the switcher and Finder ask for.
+- A CI failure says why and a red default branch makes noise. A failed
+  job keeps the 40 log lines before its exit (`<run>/excerpt`); its
+  commit status names the cause line (`panicked at ...`) instead of the
+  exit code, prefixed `red since #<n>:` while the default branch stays
+  red. `zeughaus-ci status` leads with each default branch's streak and
+  prints the excerpt of every failed job of the newest pipeline;
+  `zeughaus-ci log <repo> <n> <job> [--tail N]` prints a job's log as
+  plain text. A job turning the default branch red, and every red
+  pipeline after its first hour, notify every connected editor's desktop
+  (new `ci` event: editor and runner must be updated together). A push to
+  the default branch without `.zeughaus-ci/` is recorded as `no-jobs` and
+  posts an error on `zeughaus/pipeline`.
 
 ### Changed
 

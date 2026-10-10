@@ -75,6 +75,15 @@ pub enum RuntimeEvent {
         mode: BusyMode,
         busy: bool,
     },
+    /// A repository's default branch turned red, or has stayed red for an
+    /// hour and failed again. An editor shows it on the desktop. Only a
+    /// runner that runs CI sends it; it is not state, so no snapshot
+    /// carries it.
+    CiAlert {
+        seq: u64,
+        title: String,
+        body: String,
+    },
 }
 
 impl RuntimeEvent {
@@ -192,6 +201,9 @@ pub const TOPIC_ERROR: &str = "error";
 /// Topic of [`RuntimeEvent::Machine`].
 pub const TOPIC_MACHINE: &str = "machine";
 
+/// Topic of [`RuntimeEvent::CiAlert`].
+pub const TOPIC_CI: &str = "ci";
+
 /// Largest event payload a subscriber reads. An event is a few identifiers and
 /// a scalar rendered as text; the cap is what stops a peer from making a viewer
 /// allocate on its behalf.
@@ -252,6 +264,11 @@ mod tests {
                 seq: 14,
                 mode: BusyMode::Busy,
                 busy: true,
+            },
+            RuntimeEvent::CiAlert {
+                seq: 15,
+                title: "griasdi main is red (#138)".to_owned(),
+                body: "windows red since #138".to_owned(),
             },
         ];
         for event in events {

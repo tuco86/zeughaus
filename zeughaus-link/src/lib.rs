@@ -36,7 +36,8 @@ pub mod runs;
 
 pub use events::{
     ErrorRow, MAX_EVENT_BYTES, MAX_SNAPSHOT_BYTES, MAX_TRIGGER_BYTES, OutputRow, RejectionRow,
-    RuntimeEvent, Snapshot, TOPIC_EDGE, TOPIC_ERROR, TOPIC_MACHINE, TOPIC_OUTPUT, TriggerRequest,
+    RuntimeEvent, Snapshot, TOPIC_CI, TOPIC_EDGE, TOPIC_ERROR, TOPIC_MACHINE, TOPIC_OUTPUT,
+    TriggerRequest,
 };
 pub use feed::{
     FeedRequest, FrameHeader, MAX_DIMENSION, MAX_SAMPLES_PER_AXIS, ladder, scale_to_fit,

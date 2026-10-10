@@ -661,7 +661,7 @@ impl App {
 /// a round trip to the notification service, and one that hangs must not
 /// freeze the window. Normal urgency, so the desktop expires it like any
 /// other.
-fn notify_desktop(summary: String, body: String) -> Task<Message> {
+pub(super) fn notify_desktop(summary: String, body: String) -> Task<Message> {
     let mut notification = notify_rust::Notification::new();
     notification
         .appname("Zeughaus")

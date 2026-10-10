@@ -228,8 +228,8 @@ fn main() -> ExitCode {
     let mut job_host: Option<Arc<JobHost>> = None;
     // Kept for the restart, which saves the workspace before it `exec`s.
     let mut mux_service: Option<MuxService> = None;
-    // The CI machine's busy state, reported to editors whenever it changes.
-    let mut machine: Option<Arc<ci::busy::Busy>> = None;
+    // CI's busy state and alerts, reported to editors as they change.
+    let mut ci_handle: Option<ci::Ci> = None;
     let (graphs, graph_rx, initial) = GraphService::load(&state_dir);
     {
         let listener = transport.listener();
@@ -285,17 +285,17 @@ fn main() -> ExitCode {
         }
         // CI runs its pipelines as this host's jobs; without a `ci.toml` it
         // says so and does nothing, and there is no machine to override.
-        if let Some(busy) = job_host
+        if let Some(started) = job_host
             .as_ref()
             .and_then(|host| ci::start(Arc::clone(host), state_dir.clone()))
         {
             match listener.replier(BUSY_PATH) {
                 Ok(replier) => {
-                    rt.spawn(ci::busy::serve(replier, Arc::clone(&busy)));
+                    rt.spawn(ci::busy::serve(replier, Arc::clone(&started.busy)));
                 }
                 Err(e) => eprintln!("[runner] no busy service: {e}"),
             }
-            machine = Some(busy);
+            ci_handle = Some(started);
         }
         // The runner that produced a run's files is the one that serves them:
         // they are on this disk and nowhere else.
@@ -437,8 +437,11 @@ fn main() -> ExitCode {
             fired |= runner.trigger(press.node_id, press.payload, press.external);
         }
 
-        if let Some(busy) = &machine {
-            runner.report_machine(busy.state());
+        if let Some(ci) = &ci_handle {
+            runner.report_machine(ci.busy.state());
+            while let Ok(alert) = ci.alerts.try_recv() {
+                runner.report_ci_alert(alert);
+            }
         }
 
         if had_changes || ticked || fired {

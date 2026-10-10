@@ -28,7 +28,8 @@ use super::forge::{self, State, Status};
 use super::header::{JobDef, WhenBusy};
 use super::launch::{self, Launch, Place};
 use super::machine::Machine;
-use super::{CI_DIR, cleanup, pipeline};
+use super::streak::{self, Streak};
+use super::{CI_DIR, cleanup, excerpt, pipeline};
 use crate::jobs::JobHost;
 
 const TICK: Duration = Duration::from_secs(1);
@@ -36,6 +37,11 @@ const TICK: Duration = Duration::from_secs(1);
 const CRON_REFRESH: Duration = Duration::from_secs(3600);
 /// How often a recovered run's exit record is looked for.
 const RECOVERY_POLL: Duration = Duration::from_secs(2);
+/// How long a job of the default branch stays red before every further red
+/// pipeline alerts again, not only the one that turned it red.
+const RED_REMINDER: Duration = Duration::from_secs(3600);
+/// Characters of a cause line an alert carries.
+const ALERT_CAUSE_CHARS: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -82,13 +88,15 @@ impl JobStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum PipelineStatus {
     Running,
     Succeeded,
     Failed,
     /// The pipeline could not be set up: fetch, resolve or `.zeughaus-ci` validation.
     Error,
+    /// A push to the default branch whose commit has no `.zeughaus-ci/`.
+    NoJobs,
 }
 
 impl PipelineStatus {
@@ -98,6 +106,7 @@ impl PipelineStatus {
             PipelineStatus::Succeeded => "succeeded",
             PipelineStatus::Failed => "failed",
             PipelineStatus::Error => "error",
+            PipelineStatus::NoJobs => "no-jobs",
         }
     }
 }
@@ -122,6 +131,10 @@ pub struct JobRecord {
     /// Seconds a machine job has run unfrozen: its timeout clock.
     #[serde(default)]
     pub active_secs: u64,
+    /// The end of a failed run's log, before its debug shell (see
+    /// [`excerpt`]).
+    #[serde(default)]
+    pub excerpt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,20 +194,33 @@ pub fn load_pipelines(state_dir: &Path) -> Vec<Pipeline> {
         return out;
     };
     for repo in repos.flatten() {
-        let Ok(files) = std::fs::read_dir(repo.path()) else {
-            continue;
-        };
-        for file in files.flatten() {
-            let path = file.path();
-            if path.extension().is_some_and(|e| e == "json")
-                && let Ok(pipeline) = crate::files::read_json::<Pipeline>(&path)
-            {
-                out.push(pipeline);
-            }
-        }
+        out.extend(read_records(&repo.path()));
     }
     out.sort_by_key(|p| std::cmp::Reverse((p.created, p.number)));
     out
+}
+
+/// The pipeline records of one repository, in no particular order.
+pub fn load_repo_pipelines(state_dir: &Path, repo: &str) -> Vec<Pipeline> {
+    read_records(&pipelines_dir(state_dir, repo))
+}
+
+fn read_records(dir: &Path) -> Vec<Pipeline> {
+    let Ok(files) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    files
+        .flatten()
+        .map(|file| file.path())
+        .filter(|path| path.extension().is_some_and(|e| e == "json"))
+        .filter_map(|path| crate::files::read_json::<Pipeline>(&path).ok())
+        .collect()
+}
+
+/// The record of pipeline `number` of `repo`.
+pub fn load_pipeline(state_dir: &Path, repo: &str, number: u64) -> Result<Pipeline, String> {
+    let path = pipelines_dir(state_dir, repo).join(format!("{number}.json"));
+    crate::files::read_json(&path).map_err(|e| format!("{repo} #{number}: {e}"))
 }
 
 fn next_number(state_dir: &Path, repo: &str) -> u64 {
@@ -229,6 +255,8 @@ enum Msg {
         number: u64,
         job: String,
         exit: RunExit,
+        /// The end of a failed run's log; `None` for a success.
+        excerpt: Option<String>,
     },
     /// The job never ran: its machine did not come up or the spawn failed.
     StartFailed {
@@ -259,12 +287,27 @@ struct Scheduler {
     last_tick: Instant,
     /// Jobs whose freeze or thaw failed, so it is logged once.
     freeze_warned: HashSet<(String, u64, String)>,
+    alerts: Sender<Alert>,
 }
 
-/// Starts the CI scheduler thread, unless there is no `ci.toml`. Returns
-/// the machine's busy state, which `/busy` overrides and editors are told
-/// about.
-pub fn start(host: Arc<JobHost>, state_dir: PathBuf) -> Option<Arc<Busy>> {
+/// A default branch that turned red, or stays red: for the editors'
+/// desktops.
+pub struct Alert {
+    pub title: String,
+    pub body: String,
+}
+
+/// What a runner that runs CI shares with its host loop.
+pub struct Ci {
+    /// The machine's busy state, which `/busy` overrides and editors are
+    /// told about.
+    pub busy: Arc<Busy>,
+    /// Alerts the host loop publishes to editors.
+    pub alerts: Receiver<Alert>,
+}
+
+/// Starts the CI scheduler thread, unless there is no `ci.toml`.
+pub fn start(host: Arc<JobHost>, state_dir: PathBuf) -> Option<Ci> {
     let config = match CiConfig::load(&state_dir) {
         Ok(Some(config)) => config,
         Ok(None) => {
@@ -283,10 +326,11 @@ pub fn start(host: Arc<JobHost>, state_dir: PathBuf) -> Option<Arc<Busy>> {
     );
     let busy = busy::start(config.busy.clone(), &state_dir);
     let shared = Arc::clone(&busy);
+    let (alerts, alerts_rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("zeughaus-ci".into())
         .spawn(move || {
-            let mut scheduler = Scheduler::new(host, state_dir, config, shared);
+            let mut scheduler = Scheduler::new(host, state_dir, config, shared, alerts);
             scheduler.recover();
             loop {
                 scheduler.tick();
@@ -297,11 +341,20 @@ pub fn start(host: Arc<JobHost>, state_dir: PathBuf) -> Option<Arc<Busy>> {
         eprintln!("[ci] cannot start the scheduler: {e}");
         return None;
     }
-    Some(busy)
+    Some(Ci {
+        busy,
+        alerts: alerts_rx,
+    })
 }
 
 impl Scheduler {
-    fn new(host: Arc<JobHost>, state_dir: PathBuf, config: CiConfig, busy: Arc<Busy>) -> Scheduler {
+    fn new(
+        host: Arc<JobHost>,
+        state_dir: PathBuf,
+        config: CiConfig,
+        busy: Arc<Busy>,
+        alerts: Sender<Alert>,
+    ) -> Scheduler {
         let (tx, rx) = std::sync::mpsc::channel();
         let machines = config
             .machines
@@ -335,6 +388,7 @@ impl Scheduler {
             last_cron_check: Local::now(),
             last_tick: Instant::now(),
             freeze_warned: HashSet::new(),
+            alerts,
         }
     }
 
@@ -396,11 +450,13 @@ impl Scheduler {
             .spawn(move || {
                 loop {
                     if let Some(exit) = read_exit_record(&run_dir) {
+                        let excerpt = failure_excerpt(&run_dir, exit);
                         let _ = tx.send(Msg::Done {
                             repo,
                             number,
                             job,
                             exit,
+                            excerpt,
                         });
                         return;
                     }
@@ -594,7 +650,11 @@ impl Scheduler {
         };
         let setup = self.set_up(&name, &repo, &event, &mut pipeline);
         let jobs = match setup {
-            Ok(jobs) => jobs,
+            Ok(Some(jobs)) => jobs,
+            Ok(None) => {
+                self.no_ci_folder(pipeline, &repo);
+                return;
+            }
             Err(e) => {
                 eprintln!("[ci] {name} {} {}: {e}", event.kind, event.git_ref);
                 pipeline.number = next_number(&self.state_dir, &name);
@@ -640,6 +700,7 @@ impl Scheduler {
                 finished: None,
                 image_tag: None,
                 active_secs: 0,
+                excerpt: None,
             })
             .collect();
         pipeline.save(&self.state_dir);
@@ -667,6 +728,38 @@ impl Scheduler {
         self.running.push(pipeline);
     }
 
+    /// A commit without `.zeughaus-ci/`. Silent on other refs, where most
+    /// branches have no jobs on purpose; on the default branch it means CI
+    /// is off, which is recorded and posted as a `zeughaus/pipeline` error.
+    fn no_ci_folder(&mut self, mut pipeline: Pipeline, repo: &RepoConfig) {
+        let sha = pipeline.sha.clone().unwrap_or_default();
+        let mut note = format!("no {CI_DIR}/ in {}", &sha[..sha.len().min(7)]);
+        eprintln!(
+            "[ci] {} {} {}: {note}",
+            pipeline.repo, pipeline.event.kind, pipeline.event.git_ref
+        );
+        if !(matches!(pipeline.event.kind, EventKind::Push)
+            && pipeline.event.git_ref == repo.default_branch)
+        {
+            return;
+        }
+        let mirror = mirror_dir(&self.state_dir, &pipeline.repo);
+        if git(&mirror, &["ls-tree", &sha, ".ci"], &[]).is_ok_and(|out| !out.trim().is_empty()) {
+            note.push_str("; found .ci/, which the runner no longer reads");
+        }
+        pipeline.number = next_number(&self.state_dir, &pipeline.repo);
+        pipeline.status = PipelineStatus::NoJobs;
+        pipeline.note = note.clone();
+        pipeline.finished = Some(super::now_secs());
+        pipeline.save(&self.state_dir);
+        self.post(
+            &pipeline,
+            "pipeline",
+            State::Error,
+            forge::describe(&note, pipeline.number),
+        );
+    }
+
     /// Fetch, resolve and select: the jobs of the pipeline for `event`.
     /// Sets the pipeline's sha as soon as it is known, so an error after
     /// that can still be posted.
@@ -676,7 +769,7 @@ impl Scheduler {
         repo: &RepoConfig,
         event: &CiEvent,
         pipeline: &mut Pipeline,
-    ) -> Result<Vec<JobDef>, String> {
+    ) -> Result<Option<Vec<JobDef>>, String> {
         let mirror = self.fetch(name, repo)?;
         self.refresh_crons(name, &mirror);
         let sha = match &event.sha {
@@ -701,12 +794,17 @@ impl Scheduler {
         };
         pipeline.sha = Some(sha.clone());
         let (files, containerfiles) = read_ci(&mirror, &sha)?;
+        // git has no empty directories: nothing listed is no folder.
+        if files.is_empty() && containerfiles.is_empty() {
+            return Ok(None);
+        }
         let jobs = pipeline::load_jobs(&files, &containerfiles)?;
         let selected = pipeline::select(&jobs, event);
-        Ok(jobs
-            .into_iter()
-            .filter(|job| selected.contains(&job.name))
-            .collect())
+        Ok(Some(
+            jobs.into_iter()
+                .filter(|job| selected.contains(&job.name))
+                .collect(),
+        ))
     }
 
     fn find(&mut self, repo: &str, number: u64) -> Option<usize> {
@@ -740,6 +838,9 @@ impl Scheduler {
                 pipeline.number,
                 pipeline.status.as_str()
             );
+            if pipeline.status == PipelineStatus::Failed {
+                self.alert_red(&pipeline);
+            }
             let mirror = mirror_dir(&self.state_dir, &pipeline.repo);
             if let Err(e) = git(
                 &mirror,
@@ -894,10 +995,10 @@ impl Scheduler {
         job.note = note.clone();
         job.finished = Some(super::now_secs());
         let name = job.def.name.clone();
-        let number = pipeline.number;
         pipeline.save(&self.state_dir);
         let pipeline = self.running[pi].clone();
-        self.post(&pipeline, &name, state, format!("{note} (#{number})"));
+        let description = self.failure_description(&pipeline, &name, &note);
+        self.post(&pipeline, &name, state, description);
     }
 
     fn start_job(&mut self, pi: usize, ji: usize) {
@@ -1245,11 +1346,19 @@ impl Scheduler {
                 number,
                 job,
                 exit,
-            } => self.finish_job(&repo, number, &job, exit),
+                excerpt,
+            } => self.finish_job(&repo, number, &job, exit, excerpt),
         }
     }
 
-    fn finish_job(&mut self, repo: &str, number: u64, job: &str, exit: RunExit) {
+    fn finish_job(
+        &mut self,
+        repo: &str,
+        number: u64,
+        job: &str,
+        exit: RunExit,
+        excerpt: Option<String>,
+    ) {
         let Some(pi) = self.find(repo, number) else {
             return;
         };
@@ -1300,10 +1409,97 @@ impl Scheduler {
         record.code = exit.code;
         record.note = note.clone();
         record.finished = Some(now);
+        record.excerpt = if succeeded { None } else { excerpt };
         eprintln!("[ci] {repo} #{number} {job}: {note}");
         pipeline.save(&self.state_dir);
         let pipeline = self.running[pi].clone();
-        self.post(&pipeline, job, state, format!("{note} (#{number})"));
+        let description = if succeeded {
+            format!("{note} (#{number})")
+        } else {
+            self.failure_description(&pipeline, job, &note)
+        };
+        self.post(&pipeline, job, state, description);
+    }
+
+    // ------------------------------------------------------------ red default branch
+
+    /// The streak of the repository's default branch, when `pipeline` ran
+    /// for that branch. Read from the records, `pipeline`'s saved state
+    /// included.
+    fn branch_streak(&self, pipeline: &Pipeline) -> Option<Streak> {
+        let branch = &self.config.repos.get(&pipeline.repo)?.default_branch;
+        streak::is_branch(pipeline, branch).then(|| {
+            streak::of_branch(
+                &load_repo_pipelines(&self.state_dir, &pipeline.repo),
+                branch,
+            )
+        })
+    }
+
+    /// What the forge shows for a failed job: the cause line of its
+    /// excerpt in place of the bare note, and the streak when the default
+    /// branch was red for this job before this pipeline.
+    fn failure_description(&self, pipeline: &Pipeline, job: &str, note: &str) -> String {
+        let mut text = pipeline
+            .jobs
+            .iter()
+            .find(|j| j.def.name == job)
+            .and_then(shareable_cause)
+            .unwrap_or_else(|| note.to_owned());
+        if let Some(red) = self
+            .branch_streak(pipeline)
+            .and_then(|s| s.red.into_iter().find(|r| r.job == job))
+            && red.since < pipeline.number
+        {
+            text = format!("red since #{}: {text}", red.since);
+        }
+        forge::describe(&text, pipeline.number)
+    }
+
+    /// Tells the user when the default branch turns red, and again for
+    /// every red pipeline once a job has been red for [`RED_REMINDER`]: in
+    /// the journal, and on the desktop of every editor connected.
+    fn alert_red(&self, pipeline: &Pipeline) {
+        let Some(streak) = self.branch_streak(pipeline) else {
+            return;
+        };
+        let now = super::now_secs();
+        let mut due = false;
+        let mut lines = Vec::new();
+        for job in pipeline
+            .jobs
+            .iter()
+            .filter(|j| j.status == JobStatus::Failed)
+        {
+            let Some(red) = streak.red.iter().find(|r| r.job == job.def.name) else {
+                continue;
+            };
+            due |= red.since == pipeline.number
+                || now.saturating_sub(red.since_created) >= RED_REMINDER.as_secs();
+            let mut line = red.describe(now);
+            if let Some(cause) = shareable_cause(job) {
+                // One log line can be a megabyte; a notification is read
+                // at a glance.
+                let cause: String = cause.chars().take(ALERT_CAUSE_CHARS).collect();
+                line = format!("{line}: {cause}");
+            }
+            lines.push(line);
+        }
+        if !due || lines.is_empty() {
+            return;
+        }
+        if let Some((number, jobs)) = &streak.last_deploy {
+            lines.push(format!("last {} #{number}", jobs.join(", ")));
+        }
+        let title = format!(
+            "{} {} is red (#{})",
+            pipeline.repo, pipeline.event.git_ref, pipeline.number
+        );
+        eprintln!("[ci] {title}: {}", lines.join("; "));
+        let _ = self.alerts.send(Alert {
+            title,
+            body: lines.join("\n"),
+        });
     }
 
     // ------------------------------------------------------------ busy, freeze, timeouts
@@ -1448,7 +1644,26 @@ fn wait_and_report(
         number,
         job,
         exit,
+        excerpt: failure_excerpt(run_dir, exit),
     });
+}
+
+/// The excerpt of a run that failed; `None` for a success.
+fn failure_excerpt(run_dir: &Path, exit: RunExit) -> Option<String> {
+    if exit.code == Some(0) {
+        return None;
+    }
+    excerpt::extract(run_dir)
+}
+
+/// The cause line of a failed job's excerpt, unless the job holds secrets:
+/// its excerpt is its own output, and a status description or an alert is
+/// read by people the secrets are not for.
+fn shareable_cause(job: &JobRecord) -> Option<String> {
+    if !job.def.secrets.is_empty() {
+        return None;
+    }
+    job.excerpt.as_deref().and_then(excerpt::cause)
 }
 
 fn failure_note(exit: RunExit) -> String {

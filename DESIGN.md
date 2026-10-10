@@ -744,6 +744,33 @@ and arrive hard-linked as `CI_INPUTS/<need>/` in the jobs that need them.
 Commit statuses (`zeughaus/<job>`) go to GitHub or Forgejo through `curl`,
 with the token on stdin.
 
+**A failure says why.** When a run fails, the thread that waited for it
+reads the end of `<run>/log`, removes the escape sequences
+(`excerpt.rs`) and keeps the 40 lines before the launcher's
+`[zeughaus-ci] <job> exited <code>` marker: the job's own last words, not
+the debug shell's. The excerpt goes into the job's record and into
+`<run>/excerpt`. The commit status carries its first line that looks like
+a cause (`panicked at`, then `error[`, `error:`, `FAILED`) instead of the
+bare exit code, unless the job holds secrets, whose output stays on the
+machine. `ci status` prints the run directory and the excerpt under
+every failed job of each repository's newest pipeline, and `ci log <repo>
+<n> <job> [--tail N]` prints a job's whole log as plain text; both read
+through the `zeughaus-ci` wrapper like the rest of `ci`.
+
+**The default branch has an owner.** `streak.rs` derives from the records,
+per job of the default branch (push and cron pipelines), the first
+pipeline of its current run of failures, and the last pipeline in which
+every deploy job (one without `on`) succeeded. `ci status` leads with it
+(`griasdi main: windows red since #138 (79e9035, 17 h, 13 pipelines); last
+publish #136`). A failed job in a streak that began in an earlier pipeline
+posts `red since #<n>: <cause>`. The pipeline that turns a job red, and
+every red pipeline once a job has been red for an hour, raise an alert: a
+line in the journal and `RuntimeEvent::CiAlert` on the `ci` topic, which
+every connected editor shows as a desktop notification. A push to the
+default branch whose commit has no `.zeughaus-ci/` is recorded as a
+`no-jobs` pipeline and posts an `error` on `zeughaus/pipeline`, naming a
+leftover `.ci/`; on other refs that stays silent.
+
 A restarted runner reloads the running pipelines from disk. It waits for
 the `exit` record that `adopt_runs` writes for each live run, and thaws
 whatever a previous process froze.
