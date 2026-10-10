@@ -65,6 +65,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (new `ci` event: editor and runner must be updated together). A push to
   the default branch without `.zeughaus-ci/` is recorded as `no-jobs` and
   posts an error on `zeughaus/pipeline`.
+- The CI builds `Zeughaus.app` for Apple silicon on the Mac `atik` for
+  every push to `main` and every `v*` tag (`.zeughaus-ci/macos.sh`) and
+  keeps it zipped as the job's artifact `Zeughaus-macos-arm64.zip`.
+  `deploy/macos-app.sh` honours `CARGO_TARGET_DIR`.
 
 ### Changed
 

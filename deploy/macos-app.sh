@@ -44,7 +44,7 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 sed "s|@VERSION@|$version|g" "$root/deploy/macos/Info.plist" >"$app/Contents/Info.plist"
 cp "$work/zeughaus.icns" "$app/Contents/Resources/zeughaus.icns"
-cp "$root/target/release/zeughaus" "$app/Contents/MacOS/zeughaus"
+cp "${CARGO_TARGET_DIR:-$root/target}/release/zeughaus" "$app/Contents/MacOS/zeughaus"
 # Ad-hoc signature: an unsigned binary that was copied around is killed on
 # launch by Gatekeeper on Apple silicon.
 codesign --force --sign - "$app" >/dev/null 2>&1 || say "codesign failed; the app may refuse to launch"
