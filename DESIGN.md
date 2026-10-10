@@ -695,8 +695,8 @@ holds these keys:
 
 - `on`: `push <glob>`, `tag <glob>`, or `cron <5 fields>`;
 - `needs`: exactly one of `on` and `needs` is set;
-- `image` (a `.zeughaus-ci/<image>.Containerfile`) or `machine` (a VM from
-  `ci.toml`); neither means the host;
+- `image` (a `.zeughaus-ci/<image>.Containerfile`) or `machine` (a Windows
+  VM or a unix host from `ci.toml`); neither means the host;
 - `cache`, `secrets`, `when_busy` (`wait`/`freeze`/`run`), `env`,
   `timeout_minutes`.
 
@@ -733,7 +733,7 @@ except the `cache` paths) and starts the job:
 
 On failure, `inner.sh`/`launch.sh` writes `<run>/code`, which ends the
 host's wait, and execs a shell where the job ran. For a machine job that is
-an ssh session in the guest. The failed run's terminal is the debug
+an ssh session in the guest or on the unix host. The failed run's terminal is the debug
 session, detached and attachable from the palette, and closes when that
 shell ends. A run that fails before its shell (a checkout, an image build,
 the copy into the guest) keeps its terminal with the final screen, detached
@@ -778,7 +778,8 @@ whatever a previous process froze.
 **Busy and freeze.** `busy.rs` samples `nvidia-smi` every 10 s. The machine
 counts as busy once the mean over `busy_after_seconds` reaches
 `gpu_percent`, and as free again once the mean over `free_after_seconds` is
-below it. While busy, only `when_busy = "run"` jobs start. Running
+below it. While busy, only `when_busy = "run"` jobs start, except on a unix
+host, which does not share this GPU. Running
 `freeze` jobs are paused, with `podman pause` for a container and HMP
 `stop` on the VM's `monitor.sock` for a machine, and resumed when the
 machine is free.
@@ -794,11 +795,23 @@ shows a control that cycles auto, busy, free: a play circle while free, a
 pause circle while busy, filled when the mode is set by hand. A runner
 without CI reports no machine and has no control.
 
-**Machines** (`machine.rs`): a VM is booted on the first job that needs it
-(`vm.sh run`, then `prepare.ps1` in the guest). It runs one job at a time,
-and `vm.sh stop` shuts it down after `idle_minutes` without a job. A guest
-shell opened within the last 24 hours (`<run>/debug-shell`, removed when
-the run's terminal closes) keeps it up.
+**Machines** (`machine.rs`) come in two kinds (`kind` in `ci.toml`). A
+`windows-vm` is booted on the first job that needs it (`vm.sh run`, then
+`prepare.ps1` in the guest). It runs one job at a time, and `vm.sh stop`
+shuts it down after `idle_minutes` without a job. A guest shell opened
+within the last 24 hours (`<run>/debug-shell`, removed when the run's
+terminal closes) keeps it up and runs `.ps1` jobs. A `unix-host` (the Mac `atik`) runs `.sh` jobs, is always on
+and reached over ssh: a job probes it first (which also prunes run
+directories older than 25 hours that a killed launcher left behind),
+waits up to `wait_minutes` while it does not answer, and is then skipped,
+not failed, so an offline host never turns a branch red. The launcher
+copies the bundle, the inputs and an `env.sh` into `<dir>/runs/<id>`,
+checks the commit out in `<dir>/work/<repo>/<job>`, runs the job under
+`ssh -tt`, copies `out/` back and removes the run directory; a failure
+opens a shell on the host. The busy measurement is this workstation's
+GPU, so it holds and freezes only jobs that run here (host, container,
+VM), never a unix host's. Both kinds share the scheduler's timeout clock,
+which kills the local ssh.
 
 **Disk.** Workspaces beyond `budget_gb` are deleted least recently used
 first, through `podman unshare rm` because containers leave subordinate-uid

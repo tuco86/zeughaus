@@ -1,11 +1,13 @@
 //! The scripts a CI job's terminal runs, rendered as text.
 //!
 //! `launch.sh` is the terminal's program on this machine for every kind of
-//! job: it checks the commit out (on the host, or over ssh in the guest) and
-//! starts the job where it runs. `inner.sh` / `inner.ps1` is the job itself
-//! in its environment; on failure it records the exit code where
-//! [`JobHost`](crate::jobs::JobHost)'s wait finds it and becomes a shell in
-//! the same place, so a failed job is a terminal to debug in.
+//! job: it checks the commit out (on the host, or over ssh in the guest or on
+//! a unix host) and starts the job where it runs. `inner.sh` / `inner.ps1` is
+//! the job itself in its environment; on failure it records the exit code
+//! where [`JobHost`](crate::jobs::JobHost)'s wait finds it and becomes a shell
+//! in the same place, so a failed job is a terminal to debug in. A unix host
+//! runs the job from `inner.sh` staged in its own run directory, whose
+//! launcher reads the exit status off the ssh session instead.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -39,8 +41,12 @@ pub enum Place<'a> {
         cpus: u32,
         memory: &'a str,
     },
-    /// In a VM reached as `ssh_host`; the workspace lives in the guest.
-    Machine { ssh_host: &'a str },
+    /// In a Windows VM reached as `ssh_host`; the workspace lives in the
+    /// guest.
+    WindowsVm { ssh_host: &'a str },
+    /// On a unix host (macOS included) reached as `ssh_host`; `dir` is its
+    /// absolute CI directory, below which `runs/` and `work/` live.
+    UnixHost { ssh_host: &'a str, dir: &'a str },
 }
 
 /// A word for `sh`, quoted so nothing in it is interpreted.
@@ -107,12 +113,14 @@ fn clean_excludes(job: &JobDef, quote: fn(&str) -> String) -> String {
         .collect()
 }
 
-/// `launch.sh` for a host or container job.
+/// `launch.sh` for a job on this machine (host or container), or for the
+/// remote kinds, which have their own launchers.
 pub fn launch_sh(launch: &Launch<'_>) -> String {
     let job = launch.job;
     let workspace = match &launch.place {
         Place::Host { workspace } | Place::Container { workspace, .. } => *workspace,
-        Place::Machine { .. } => return launch_sh_machine(launch),
+        Place::WindowsVm { .. } => return launch_sh_windows_vm(launch),
+        Place::UnixHost { .. } => return launch_sh_unix_host(launch),
     };
     let mut out = preamble(launch, "");
     let _ = write!(
@@ -169,7 +177,7 @@ pub fn launch_sh(launch: &Launch<'_>) -> String {
                 inputs = sh_path(&launch.run_dir.join("inputs")),
             );
         }
-        Place::Machine { .. } => unreachable!("handled above"),
+        Place::WindowsVm { .. } | Place::UnixHost { .. } => unreachable!("handled above"),
     }
     out
 }
@@ -241,11 +249,11 @@ pub fn debug_ps1(run_id: &str) -> String {
     )
 }
 
-/// `launch.sh` for a machine job: stage the run in the guest over ssh, run
+/// `launch.sh` for a Windows VM job: stage the run in the guest over ssh, run
 /// it there, copy its output back, and on failure open a shell in the guest.
-fn launch_sh_machine(launch: &Launch<'_>) -> String {
-    let Place::Machine { ssh_host } = launch.place else {
-        unreachable!("only machine places get here");
+fn launch_sh_windows_vm(launch: &Launch<'_>) -> String {
+    let Place::WindowsVm { ssh_host } = launch.place else {
+        unreachable!("only Windows VM places get here");
     };
     let run = launch.run_dir;
     let id = launch.run_id;
@@ -301,8 +309,128 @@ fn launch_sh_machine(launch: &Launch<'_>) -> String {
     out
 }
 
+/// The run directory on a unix host: `<dir>/runs/<id>`.
+pub fn remote_run_dir(dir: &str, run_id: &str) -> String {
+    format!("{dir}/runs/{run_id}")
+}
+
+/// The workspace of a job on a unix host: `<dir>/work/<repo>/<job>`.
+pub fn remote_workspace(dir: &str, repo: &str, job: &str) -> String {
+    format!("{dir}/work/{repo}/{job}")
+}
+
+/// The command that finds out whether a unix host answers, and removes the
+/// run directories a killed launcher left behind (with their `env.sh`). The
+/// age is above the debug shell's hold, so no live run loses its directory.
+pub fn host_probe(dir: &str) -> String {
+    let runs = sh_quote(&format!("{dir}/runs"));
+    format!(
+        "mkdir -p {runs} && find {runs} -mindepth 1 -maxdepth 1 -mmin +1500 -exec rm -rf {{}} +"
+    )
+}
+
+/// `inner.sh` on a unix host: the checkout from the run's bundle, then the
+/// job. Its exit status is the ssh session's. There is no `timeout`
+/// (macOS has none); the scheduler's clock ends the local ssh instead.
+pub fn inner_unix(job: &JobDef, dir: &str, run_id: &str, pipeline: u64) -> String {
+    format!(
+        "set -u\n\
+         run={run}\n\
+         set -a\n\
+         . \"$run/env.sh\" || exit 70\n\
+         set +a\n\
+         mkdir -p \"$CI_WORKSPACE\" \"$CI_OUTPUT\" && cd \"$CI_WORKSPACE\" || {{ printf '[zeughaus-ci] cannot enter %s\\n' \"$CI_WORKSPACE\"; exit 70; }}\n\
+         [ -d .git ] || git init -q || exit 70\n\
+         if ! {{ git fetch -q --no-tags \"$run/src.bundle\" '+refs/ci/{pipeline}:refs/ci/head' \
+         && git checkout -q --force --detach refs/ci/head \
+         && git clean -ffdxq{excludes}; }}; then\n\
+         \tprintf '[zeughaus-ci] checkout failed\\n'\n\
+         \texit 70\n\
+         fi\n\
+         touch .git/zci-last-used\n\
+         exec {interpreter} {file}\n",
+        run = sh_quote(&remote_run_dir(dir, run_id)),
+        excludes = clean_excludes(job, sh_quote),
+        interpreter = job.interpreter,
+        file = sh_quote(&format!("{CI_DIR}/{}", job.file)),
+    )
+}
+
+/// `debug.sh`: the job's environment and workspace, for the shell that
+/// follows a failure.
+pub fn debug_unix(dir: &str, run_id: &str) -> String {
+    format!(
+        "run={run}\n\
+         set -a\n\
+         . \"$run/env.sh\"\n\
+         set +a\n\
+         cd \"$CI_WORKSPACE\" 2>/dev/null\n\
+         exec \"${{SHELL:-/bin/sh}}\" -i\n",
+        run = sh_quote(&remote_run_dir(dir, run_id)),
+    )
+}
+
+/// `launch.sh` for a unix host job: stage the run on the host over ssh, run
+/// it there, copy its output back, and on failure open a shell on the host.
+///
+/// Remote command strings are quoted for the remote shell and then once more
+/// as the local word. scp paths are one local word and no more: OpenSSH's
+/// scp speaks sftp by default, which takes the path as it is, so the remote
+/// directory (absolute, free of shell metacharacters) is not quoted for the
+/// remote side.
+fn launch_sh_unix_host(launch: &Launch<'_>) -> String {
+    let Place::UnixHost { ssh_host, dir } = launch.place else {
+        unreachable!("only unix host places get here");
+    };
+    let run = launch.run_dir;
+    let remote = remote_run_dir(dir, launch.run_id);
+    let remote_word = sh_quote(&remote);
+    let host = sh_quote(ssh_host);
+    let debug_marker = sh_path(&run.join("debug-shell"));
+    let remove = sh_quote(&format!("rm -rf {remote_word}"));
+    let mut out = preamble(
+        launch,
+        &format!("; rm -f {debug_marker}; ssh {host} {remove} </dev/null >/dev/null 2>&1"),
+    );
+    let _ = write!(
+        out,
+        "run={run}\n\
+         ssh {host} {mkdir} </dev/null || exit 75\n\
+         scp -q \"$run/remote/inner.sh\" \"$run/remote/debug.sh\" \"$run/src.bundle\" \"$secret_dir/env.sh\" {dest} || exit 75\n\
+         scp -q -r \"$run/inputs\" {dest_in} || exit 75\n\
+         exec 3<&0\n\
+         ssh -tt {host} {inner} <&3 &\n\
+         echo $! > \"$run/ssh.pid\"\n\
+         wait $!\n\
+         rc=$?\n\
+         rm -f \"$run/ssh.pid\"\n\
+         [ -e \"$run/timeout\" ] && rc=124\n\
+         if [ \"$rc\" -eq 0 ]; then\n\
+         \tscp -q -r {dest_out} \"$run/artifacts\" || rc=74\n\
+         \t[ \"$rc\" -eq 0 ] && exit 0\n\
+         fi\n\
+         printf '%s\\n' \"$rc\" > \"$run/code\"\n\
+         printf '\\n[zeughaus-ci] %s exited %s; a shell on %s follows\\n' {job} \"$rc\" {host}\n\
+         touch {debug_marker}\n\
+         ssh -tt {host} {debug} <&3\n\
+         exit $rc\n",
+        run = sh_path(run),
+        mkdir = sh_quote(&format!("mkdir -p {remote_word}")),
+        dest = sh_quote(&format!("{ssh_host}:{remote}/")),
+        dest_in = sh_quote(&format!("{ssh_host}:{remote}/in")),
+        dest_out = sh_quote(&format!("{ssh_host}:{remote}/out")),
+        inner = sh_quote(&format!("sh {remote_word}/inner.sh")),
+        debug = sh_quote(&format!("sh {remote_word}/debug.sh")),
+        job = sh_quote(&launch.job.name),
+    );
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use super::super::header::parse_job;
     use super::*;
 
     #[test]
@@ -334,5 +462,97 @@ mod tests {
     #[test]
     fn powershell_quotes_double_single_quotes() {
         assert_eq!(ps_quote("it's"), "'it''s'");
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.name=ci", "-c", "user.email=ci@example.invalid"])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "ci")
+            .env("GIT_AUTHOR_EMAIL", "ci@example.invalid")
+            .env("GIT_COMMITTER_NAME", "ci")
+            .env("GIT_COMMITTER_EMAIL", "ci@example.invalid")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// Runs `inner_unix` for a job whose file holds `body`, against a
+    /// directory that stands in for the remote run directory. Returns the
+    /// script's exit code, the committed sha and the scratch directory.
+    fn run_inner_unix(test: &str, body: &str) -> (i32, String, PathBuf) {
+        let base = std::env::temp_dir().join(format!("zci-launch-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        let remote = base.join("remote");
+        let run = remote.join("runs/r1");
+        std::fs::create_dir_all(repo.join(CI_DIR)).unwrap();
+        std::fs::create_dir_all(&run).unwrap();
+        let text = format!("#!/bin/sh\n# /// ci\n# on = [\"push main\"]\n# ///\n{body}");
+        std::fs::write(repo.join(CI_DIR).join("t.sh"), &text).unwrap();
+        let job = parse_job("t.sh", &text).unwrap().unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "t"]);
+        git(&repo, &["update-ref", "refs/ci/1", "HEAD"]);
+        let sha = git(&repo, &["rev-parse", "HEAD"]);
+        let bundle = run.join("src.bundle");
+        git(
+            &repo,
+            &[
+                "bundle",
+                "create",
+                "-q",
+                bundle.to_str().unwrap(),
+                "refs/ci/1",
+            ],
+        );
+        let vars = vec![
+            (
+                "CI_WORKSPACE".to_owned(),
+                base.join("ws").to_string_lossy().into_owned(),
+            ),
+            (
+                "CI_OUTPUT".to_owned(),
+                run.join("out").to_string_lossy().into_owned(),
+            ),
+            ("CI_SHA".to_owned(), sha.clone()),
+        ];
+        std::fs::write(run.join("env.sh"), env_sh(&vars)).unwrap();
+        let script = inner_unix(&job, remote.to_str().unwrap(), "r1", 1);
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("run sh");
+        (status.code().expect("exit code"), sha, base)
+    }
+
+    #[test]
+    fn unix_inner_checks_out_the_bundle_and_runs_the_job() {
+        let (code, sha, base) =
+            run_inner_unix("ok", "printf %s \"$CI_SHA\" > \"$CI_OUTPUT/sha\"\n");
+        let written = std::fs::read_to_string(base.join("remote/runs/r1/out/sha")).ok();
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(code, 0);
+        assert_eq!(written.as_deref(), Some(sha.as_str()));
+    }
+
+    #[test]
+    fn unix_inner_passes_the_job_exit_code_on() {
+        let (code, _, base) = run_inner_unix("fail", "exit 3\n");
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(code, 3);
     }
 }

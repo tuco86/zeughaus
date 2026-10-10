@@ -122,9 +122,22 @@ fn default_idle_minutes() -> u64 {
     20
 }
 
+fn default_wait_minutes() -> u64 {
+    15
+}
+
+/// A machine a job's `machine = "<name>"` runs on; `kind` says which.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum MachineConfig {
+    WindowsVm(VmConfig),
+    UnixHost(UnixHostConfig),
+}
+
+/// A Windows VM this workstation boots on demand.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct MachineConfig {
+pub struct VmConfig {
     pub script: PathBuf,
     pub dir: PathBuf,
     pub ssh_host: String,
@@ -136,6 +149,20 @@ pub struct MachineConfig {
     pub cache_disk: String,
     #[serde(default = "default_idle_minutes")]
     pub idle_minutes: u64,
+}
+
+/// A unix host reached over ssh, always on: no boot, no freeze.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnixHostConfig {
+    pub ssh_host: String,
+    /// Absolute path on the host; `runs/` and `work/` live below it.
+    pub dir: String,
+    /// `CI_CPUS` and `CARGO_BUILD_JOBS` of its jobs.
+    pub cpus: u32,
+    /// How long a job waits for the host to answer before it is skipped.
+    #[serde(default = "default_wait_minutes")]
+    pub wait_minutes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -217,11 +244,28 @@ impl CiConfig {
     }
 
     fn validate(&mut self) -> Result<(), String> {
-        for name in self.machines.keys() {
+        for (name, machine) in &self.machines {
             if !valid_name(name) {
                 return Err(format!(
                     "machine name `{name}` must match [a-z0-9][a-z0-9-]*"
                 ));
+            }
+            if let MachineConfig::UnixHost(host) = machine {
+                if host.ssh_host.is_empty() {
+                    return Err(format!("machine `{name}`: `ssh_host` must not be empty"));
+                }
+                // scp (sftp) takes remote paths verbatim while ssh hands them
+                // to a shell: only a path that needs no quoting means the
+                // same to both.
+                let plain = |c: char| c.is_ascii_alphanumeric() || "/._-".contains(c);
+                if !host.dir.starts_with('/') || !host.dir.chars().all(plain) {
+                    return Err(format!(
+                        "machine `{name}`: `dir` must be an absolute path of [A-Za-z0-9/._-]"
+                    ));
+                }
+                if host.cpus == 0 {
+                    return Err(format!("machine `{name}`: `cpus` must be at least 1"));
+                }
             }
         }
         if let Some(secrets) = &mut self.secrets {
@@ -302,6 +346,7 @@ free_after_seconds = 300
 cpus = 12
 memory = "24g"
 [machines.win11]
+kind = "windows-vm"
 script = "/usr/local/lib/zeughaus-ci/vm/win11/vm.sh"
 dir = "/var/lib/zeughaus-ci/vm/win11"
 ssh_host = "win11-ci"
@@ -309,6 +354,11 @@ cpus = 8
 memory = "12G"
 cache_disk = "100G"
 idle_minutes = 20
+[machines.atik]
+kind = "unix-host"
+ssh_host = "atik-ci"
+dir = "/Users/uebelacker/zeughaus-ci"
+cpus = 12
 [repos.griasdi]
 url = "https://github.com/Griasdi/Griasdi.git"
 forge = "github"
@@ -356,9 +406,17 @@ forge = "none"
         assert_eq!(config.budget_gb, 50);
         assert_eq!(config.busy.free_after_seconds, 300);
         assert_eq!(config.containers.memory, "24g");
-        let win = &config.machines["win11"];
+        assert_eq!(config.machines.len(), 2);
+        let MachineConfig::WindowsVm(win) = &config.machines["win11"] else {
+            panic!("win11 is not a windows-vm");
+        };
         assert_eq!(win.ssh_host, "win11-ci");
         assert_eq!(win.idle_minutes, 20);
+        let MachineConfig::UnixHost(atik) = &config.machines["atik"] else {
+            panic!("atik is not a unix-host");
+        };
+        assert_eq!(atik.dir, "/Users/uebelacker/zeughaus-ci");
+        assert_eq!(atik.wait_minutes, 15);
         let griasdi = &config.repos["griasdi"];
         assert_eq!(griasdi.forge, Forge::Github);
         assert_eq!(griasdi.api, "https://api.github.com");
@@ -396,9 +454,33 @@ forge = "none"
         );
         assert!(CiConfig::parse("[repos.a]\nurl = \"x\"\nforge = \"github\"").is_err());
         assert!(
-            CiConfig::parse("[machines.W]\nscript = \"s\"\ndir = \"d\"\nssh_host = \"h\"").is_err()
+            CiConfig::parse(
+                "[machines.W]\nkind = \"windows-vm\"\nscript = \"s\"\ndir = \"d\"\nssh_host = \"h\""
+            )
+            .is_err()
         );
-        assert!(CiConfig::parse("[machines.w]\nscript = \"s\"\ndir = \"d\"").is_err());
+        assert!(
+            CiConfig::parse("[machines.w]\nkind = \"windows-vm\"\nscript = \"s\"\ndir = \"d\"")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn machine_kinds() {
+        let host = |extra: &str| {
+            CiConfig::parse(&format!(
+                "[machines.m]\nkind = \"unix-host\"\nssh_host = \"h\"\ncpus = 2\n{extra}"
+            ))
+        };
+        assert!(host("dir = \"/srv/ci\"").is_ok());
+        let err = host("dir = \"srv/ci\"").unwrap_err();
+        assert!(err.contains("absolute"), "{err}");
+        assert!(host("dir = \"/srv/ci\"\nscript = \"s\"").is_err());
+        // Without `kind` a machine is neither, whatever its fields say.
+        assert!(
+            CiConfig::parse("[machines.w]\nscript = \"s\"\ndir = \"d\"\nssh_host = \"h\"").is_err()
+        );
+        assert!(CiConfig::parse("[machines.w]\nkind = \"vm\"\nssh_host = \"h\"").is_err());
     }
 
     #[test]

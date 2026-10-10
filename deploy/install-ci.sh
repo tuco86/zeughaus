@@ -9,8 +9,9 @@
 #      snapshots of `@` do not pin the CI caches;
 #   3. the user, its subordinate ids and linger;
 #   4. resource limits of the user's slice;
-#   5. the user's directories, ssh key and ssh config;
-#   6. the runner binary, the VM scripts and the `zeughaus-ci` wrapper;
+#   5. the user's directories and ssh key;
+#   6. the runner binary, the VM scripts, the `zeughaus-ci` wrapper and the
+#      ssh config (the VM guest and the unix hosts);
 #   7. trust for the invoking user's editor certificate;
 #   8. a ci.toml from the example, when none exists;
 #   9. the user units, started or reloaded.
@@ -90,7 +91,6 @@ if [ "$update" -eq 0 ]; then
     if [ ! -f "$ci_home/.ssh/id_ed25519" ]; then
         as_ci ssh-keygen -q -t ed25519 -N '' -f "$ci_home/.ssh/id_ed25519"
     fi
-    $SUDO install -o "$ci_user" -g "$ci_user" -m600 "$root/deploy/ci/ssh_config" "$ci_home/.ssh/config"
 fi
 
 say "6/9 binary and scripts"
@@ -99,6 +99,7 @@ for f in autounattend.xml setup.ps1 firstboot.ps1 toolchain.ps1 prepare.ps1; do
     $SUDO install -Dm644 "$root/vm/win11/$f" "$lib/vm/win11/$f"
 done
 $SUDO install -Dm755 "$root/vm/win11/vm.sh" "$lib/vm/win11/vm.sh"
+$SUDO install -o "$ci_user" -g "$ci_user" -m600 "$root/deploy/ci/ssh_config" "$ci_home/.ssh/config"
 wrapper=$(mktemp)
 cat >"$wrapper" <<EOF
 #!/bin/sh

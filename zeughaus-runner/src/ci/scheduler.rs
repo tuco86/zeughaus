@@ -27,7 +27,7 @@ use super::event::{self, CiEvent, EventKind};
 use super::forge::{self, State, Status};
 use super::header::{JobDef, WhenBusy};
 use super::launch::{self, Launch, Place};
-use super::machine::Machine;
+use super::machine::{Machine, StartError};
 use super::secrets::{self, Secrets};
 use super::streak::{self, Streak};
 use super::{CI_DIR, cleanup, excerpt, pipeline};
@@ -251,6 +251,13 @@ enum Msg {
         number: u64,
         job: String,
     },
+    /// A machine job waits for its machine; `note` says for what.
+    Waiting {
+        repo: String,
+        number: u64,
+        job: String,
+        note: String,
+    },
     Done {
         repo: String,
         number: u64,
@@ -261,6 +268,14 @@ enum Msg {
     },
     /// The job never ran: its machine did not come up or the spawn failed.
     StartFailed {
+        repo: String,
+        number: u64,
+        job: String,
+        note: String,
+    },
+    /// The job never ran because its machine stayed offline: not the
+    /// commit's fault, so it is skipped rather than failed.
+    StartSkipped {
         repo: String,
         number: u64,
         job: String,
@@ -281,7 +296,7 @@ struct Scheduler {
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     busy: Arc<Busy>,
-    machines: BTreeMap<String, Arc<Machine>>,
+    machines: BTreeMap<String, Machine>,
     statuses: Sender<Status>,
     /// The only reader of OpenBao in this process; jobs never see its token.
     secrets: Arc<Secrets>,
@@ -372,7 +387,7 @@ impl Scheduler {
         let machines = config
             .machines
             .iter()
-            .map(|(name, cfg)| (name.clone(), Machine::new(name, cfg.clone(), &state_dir)))
+            .map(|(name, cfg)| (name.clone(), Machine::new(name, cfg, &state_dir)))
             .collect();
         let crons = config
             .repos
@@ -949,13 +964,17 @@ impl Scheduler {
                         .find(|j| j.def.name == need)
                         .map(|j| j.status)
                 };
-                if let Some(failed) = job.def.needs.iter().find(|need| {
-                    matches!(
-                        need_status(need),
-                        Some(JobStatus::Failed | JobStatus::Skipped)
-                    )
+                if let Some((failed, failed_status)) = job.def.needs.iter().find_map(|need| {
+                    need_status(need)
+                        .filter(|s| matches!(s, JobStatus::Failed | JobStatus::Skipped))
+                        .map(|s| (need, s))
                 }) {
-                    let note = format!("skipped: {failed} failed (#{})", pipeline.number);
+                    let how = if failed_status == JobStatus::Skipped {
+                        "skipped"
+                    } else {
+                        "failed"
+                    };
+                    let note = format!("skipped: {failed} {how} (#{})", pipeline.number);
                     let name = job.def.name.clone();
                     let pipeline = &mut self.running[pi];
                     pipeline.jobs[ji].status = JobStatus::Skipped;
@@ -977,7 +996,7 @@ impl Scheduler {
                 if self.host.held() {
                     continue;
                 }
-                if busy && job.def.when_busy != WhenBusy::Run {
+                if busy && job.def.when_busy != WhenBusy::Run && self.follows_busy(&job.def) {
                     if status != JobStatus::Waiting {
                         let name = job.def.name.clone();
                         let number = pipeline.number;
@@ -1139,18 +1158,42 @@ impl Scheduler {
                 "/ci/run/artifacts".to_owned(),
                 "/ci/inputs".to_owned(),
             )
-        } else if let Some(machine) = &job.machine {
-            let cfg = self
+        } else if let Some(name) = &job.machine {
+            let machine = self
                 .machines
-                .get(machine)
-                .map(|m| m.config.cpus)
-                .ok_or_else(|| format!("machine {machine} is not configured"))?;
-            (
-                cfg,
-                launch::guest_workspace(&pipeline.repo, &job.name),
-                format!(r"{}\out", launch::guest_run_dir(&run_id)),
-                format!(r"{}\in", launch::guest_run_dir(&run_id)),
-            )
+                .get(name)
+                .ok_or_else(|| format!("machine {name} is not configured"))?;
+            let is_ps1 = job.file.ends_with(".ps1");
+            match (machine.unix_dir().is_some(), is_ps1) {
+                (true, true) => {
+                    return Err(format!(
+                        "machine {name} is a unix host; a .ps1 job cannot run there"
+                    ));
+                }
+                (false, false) => {
+                    return Err(format!(
+                        "machine {name} is a Windows VM; it runs only .ps1 jobs"
+                    ));
+                }
+                _ => {}
+            }
+            match machine.unix_dir() {
+                Some(dir) => {
+                    let remote = launch::remote_run_dir(dir, &run_id);
+                    (
+                        machine.cpus(),
+                        launch::remote_workspace(dir, &pipeline.repo, &job.name),
+                        format!("{remote}/out"),
+                        format!("{remote}/in"),
+                    )
+                }
+                None => (
+                    machine.cpus(),
+                    launch::guest_workspace(&pipeline.repo, &job.name),
+                    format!(r"{}\out", launch::guest_run_dir(&run_id)),
+                    format!(r"{}\in", launch::guest_run_dir(&run_id)),
+                ),
+            }
         } else {
             let cores = std::thread::available_parallelism()
                 .map(|n| n.get() as u32)
@@ -1187,12 +1230,9 @@ impl Scheduler {
         env.extend(job.env.iter().map(|(k, v)| (k.clone(), v.clone())));
 
         let workspace = workspace_dir(&self.state_dir, &pipeline.repo, &job.name);
-        let ssh_host = job
-            .machine
-            .as_ref()
-            .and_then(|m| self.machines.get(m))
-            .map(|m| m.config.ssh_host.clone())
-            .unwrap_or_default();
+        let machine = job.machine.as_ref().and_then(|m| self.machines.get(m));
+        let ssh_host = machine.map(|m| m.ssh_host().to_owned()).unwrap_or_default();
+        let unix_dir = machine.and_then(|m| m.unix_dir()).map(str::to_owned);
         let write = |path: &Path, text: &str| crate::files::write_atomic(path, text.as_bytes());
         let mut tag = None;
         let place = if let Some(image) = &job.image {
@@ -1218,17 +1258,8 @@ impl Scheduler {
                 memory: &self.config.containers.memory,
             }
         } else if job.machine.is_some() {
-            let mut guest_env = env.clone();
-            guest_env.extend(secrets.iter().cloned());
-            write_secret(&secret_dir.join("env.ps1"), &launch::env_ps1(&guest_env))?;
-            write(
-                &run_dir.join("vm").join("inner.ps1"),
-                &launch::inner_ps1(job, &run_id, pipeline.number),
-            )?;
-            write(
-                &run_dir.join("vm").join("debug.ps1"),
-                &launch::debug_ps1(&run_id),
-            )?;
+            let mut remote_env = env.clone();
+            remote_env.extend(secrets.iter().cloned());
             let bundle = run_dir.join("src.bundle");
             git(
                 &mirror,
@@ -1241,8 +1272,33 @@ impl Scheduler {
                 ],
                 &[],
             )?;
-            Place::Machine {
-                ssh_host: &ssh_host,
+            if let Some(dir) = &unix_dir {
+                write_secret(&secret_dir.join("env.sh"), &launch::env_sh(&remote_env))?;
+                write(
+                    &run_dir.join("remote").join("inner.sh"),
+                    &launch::inner_unix(job, dir, &run_id, pipeline.number),
+                )?;
+                write(
+                    &run_dir.join("remote").join("debug.sh"),
+                    &launch::debug_unix(dir, &run_id),
+                )?;
+                Place::UnixHost {
+                    ssh_host: &ssh_host,
+                    dir,
+                }
+            } else {
+                write_secret(&secret_dir.join("env.ps1"), &launch::env_ps1(&remote_env))?;
+                write(
+                    &run_dir.join("vm").join("inner.ps1"),
+                    &launch::inner_ps1(job, &run_id, pipeline.number),
+                )?;
+                write(
+                    &run_dir.join("vm").join("debug.ps1"),
+                    &launch::debug_ps1(&run_id),
+                )?;
+                Place::WindowsVm {
+                    ssh_host: &ssh_host,
+                }
             }
         } else {
             write_secret(&secret_dir.join("env.sh"), &launch::env_sh(&secrets))?;
@@ -1294,12 +1350,32 @@ impl Scheduler {
             std::thread::Builder::new()
                 .name("zeughaus-ci-job".into())
                 .spawn(move || {
-                    if let Err(note) = machine.acquire() {
-                        let _ = tx.send(Msg::StartFailed {
-                            repo: repo_name,
+                    let waiting_tx = tx.clone();
+                    let mut waiting = |note: String| {
+                        let _ = waiting_tx.send(Msg::Waiting {
+                            repo: repo_name.clone(),
                             number,
-                            job: job_name,
+                            job: job_name.clone(),
                             note,
+                        });
+                    };
+                    if let Err(e) = machine.acquire(&mut waiting) {
+                        // The launcher, which removes the secrets it was
+                        // handed, never runs.
+                        let _ = std::fs::remove_dir_all(&secret_dir);
+                        let _ = tx.send(match e {
+                            StartError::Failed(note) => Msg::StartFailed {
+                                repo: repo_name,
+                                number,
+                                job: job_name,
+                                note,
+                            },
+                            StartError::Offline(note) => Msg::StartSkipped {
+                                repo: repo_name,
+                                number,
+                                job: job_name,
+                                note,
+                            },
                         });
                         return;
                     }
@@ -1357,6 +1433,28 @@ impl Scheduler {
                     ),
                 );
             }
+            Msg::Waiting {
+                repo,
+                number,
+                job,
+                note,
+            } => {
+                let Some(pi) = self.find(&repo, number) else {
+                    return;
+                };
+                let Some(ji) = self.running[pi].jobs.iter().position(|j| j.def.name == job) else {
+                    return;
+                };
+                self.running[pi].jobs[ji].note = note.clone();
+                self.running[pi].save(&self.state_dir);
+                let pipeline = self.running[pi].clone();
+                self.post(
+                    &pipeline,
+                    &job,
+                    State::Pending,
+                    format!("waiting: {note} (#{number})"),
+                );
+            }
             Msg::StartFailed {
                 repo,
                 number,
@@ -1370,6 +1468,28 @@ impl Scheduler {
                     return;
                 };
                 self.fail_start(pi, ji, note, State::Error);
+            }
+            Msg::StartSkipped {
+                repo,
+                number,
+                job,
+                note,
+            } => {
+                let Some(pi) = self.find(&repo, number) else {
+                    return;
+                };
+                let Some(ji) = self.running[pi].jobs.iter().position(|j| j.def.name == job) else {
+                    return;
+                };
+                let note = format!("skipped: {note} (#{number})");
+                eprintln!("[ci] {repo} #{number} {job}: {note}");
+                let pipeline = &mut self.running[pi];
+                pipeline.jobs[ji].status = JobStatus::Skipped;
+                pipeline.jobs[ji].note = note.clone();
+                pipeline.jobs[ji].finished = Some(super::now_secs());
+                pipeline.save(&self.state_dir);
+                let pipeline = self.running[pi].clone();
+                self.post(&pipeline, &job, State::Error, note);
             }
             Msg::Done {
                 repo,
@@ -1539,7 +1659,7 @@ impl Scheduler {
         for pi in 0..self.running.len() {
             for ji in 0..self.running[pi].jobs.len() {
                 let job = &self.running[pi].jobs[ji];
-                if job.def.when_busy != WhenBusy::Freeze {
+                if job.def.when_busy != WhenBusy::Freeze || !self.follows_busy(&job.def) {
                     continue;
                 }
                 let target = match (busy, job.status) {
@@ -1597,7 +1717,7 @@ impl Scheduler {
                 .machines
                 .get(machine)
                 .ok_or_else(|| format!("machine {machine} is not configured"))?;
-            return machine.monitor(if freeze { "stop" } else { "cont" });
+            return machine.freeze(freeze);
         }
         let run_id = run_dir
             .and_then(|d| d.file_name())
@@ -1607,6 +1727,16 @@ impl Scheduler {
             if freeze { "pause" } else { "unpause" },
             &format!("zci-{run_id}"),
         ])
+    }
+
+    /// Whether `job` waits and freezes while this workstation is busy. The
+    /// busy measurement is this workstation's GPU; a unix host's jobs do not
+    /// compete for it.
+    fn follows_busy(&self, job: &JobDef) -> bool {
+        job.machine
+            .as_ref()
+            .and_then(|m| self.machines.get(m))
+            .is_none_or(Machine::follows_busy)
     }
 
     /// The timeout of a machine job, whose clock runs only while it is not
@@ -1740,7 +1870,7 @@ fn read_exit_record(run_dir: &Path) -> Option<RunExit> {
 }
 
 /// Resumes every container and VM a previous process may have frozen.
-fn thaw_everything(machines: &BTreeMap<String, Arc<Machine>>) {
+fn thaw_everything(machines: &BTreeMap<String, Machine>) {
     if let Ok(output) = Command::new("podman")
         .args([
             "ps",
@@ -1761,9 +1891,7 @@ fn thaw_everything(machines: &BTreeMap<String, Arc<Machine>>) {
         }
     }
     for machine in machines.values() {
-        if machine.config.dir.join("qemu.pid").exists() {
-            let _ = machine.monitor("cont");
-        }
+        machine.thaw_if_running();
     }
 }
 

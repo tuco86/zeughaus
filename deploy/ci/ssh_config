@@ -8,3 +8,14 @@ Host win11-ci
     ConnectTimeout 5
     ServerAliveInterval 0
     LogLevel ERROR
+
+# atik, the MacBook on WireGuard: unix-host jobs run there as uebelacker.
+Host atik-ci
+    HostName 10.8.0.7
+    User uebelacker
+    UserKnownHostsFile ~/.ssh/known_hosts.atik-ci
+    StrictHostKeyChecking accept-new
+    ConnectTimeout 10
+    ServerAliveInterval 30
+    ServerAliveCountMax 6
+    LogLevel ERROR

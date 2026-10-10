@@ -1,9 +1,16 @@
-//! A VM the CI boots on demand and stops after an idle timeout.
+//! The machines a CI job can run on: a VM the CI boots on demand and stops
+//! after an idle timeout, and a unix host (a Mac, say) that is always on and
+//! reached over ssh.
 //!
-//! The VM is driven through its `vm.sh` (boot, stop) and its HMP monitor
+//! A VM is driven through its `vm.sh` (boot, stop) and its HMP monitor
 //! socket (freeze, thaw). One job runs in it at a time; the scheduler
 //! enforces that, and the lease count here is what keeps the idle stop away
-//! while a job is booting or running.
+//! while a job is booting or running. A unix host is only probed: it has no
+//! power state to manage, and a job waits for it to answer.
+//!
+//! The busy measurement is this workstation's GPU, so it holds and freezes
+//! only the jobs that run on the workstation (host, container, VM), never a
+//! unix host's.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -12,7 +19,10 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
-use super::config::MachineConfig;
+use super::config::{MachineConfig, UnixHostConfig, VmConfig};
+
+/// How often an offline unix host is probed again while a job waits for it.
+const HOST_RETRY: Duration = Duration::from_secs(30);
 
 /// How long a failed run's debug shell keeps the VM up after it was opened.
 const DEBUG_HOLD: Duration = Duration::from_secs(24 * 3600);
@@ -33,28 +43,26 @@ struct Inner {
     debug_runs: Vec<PathBuf>,
 }
 
-pub struct Machine {
+pub struct Vm {
     pub name: String,
-    pub config: MachineConfig,
+    config: VmConfig,
     log: PathBuf,
     inner: Mutex<Inner>,
     changed: Condvar,
 }
 
-impl Machine {
+impl Vm {
     /// A machine whose QEMU is alive counts as up: a restarted runner finds
     /// the VM its predecessor booted.
-    pub fn new(name: &str, config: MachineConfig, state_dir: &Path) -> Arc<Machine> {
+    fn new(name: &str, config: VmConfig, state_dir: &Path) -> Arc<Vm> {
         let power = if qemu_alive(&config.dir) {
             Power::Ready
         } else {
             Power::Off
         };
-        Arc::new(Machine {
+        Arc::new(Vm {
             name: name.to_owned(),
-            log: super::ci_dir(state_dir)
-                .join("machines")
-                .join(format!("{name}.log")),
+            log: machine_log(state_dir, name),
             config,
             inner: Mutex::new(Inner {
                 power,
@@ -72,7 +80,7 @@ impl Machine {
 
     /// Takes a lease, booting and preparing the VM first if it is off.
     /// Blocks for as long as that takes; called from a job's own thread.
-    pub fn acquire(&self) -> Result<(), String> {
+    fn acquire(&self) -> Result<(), String> {
         let mut inner = self.lock();
         loop {
             match inner.power {
@@ -120,27 +128,27 @@ impl Machine {
     }
 
     /// A lease for a job a previous runner started in a VM that is still up.
-    pub fn adopt(&self) {
+    fn adopt(&self) {
         let mut inner = self.lock();
         inner.leases += 1;
         inner.power = Power::Ready;
     }
 
-    pub fn release(&self) {
+    fn release(&self) {
         let mut inner = self.lock();
         inner.leases = inner.leases.saturating_sub(1);
         inner.last_release = Instant::now();
     }
 
     /// A failed run whose terminal may open a shell in the guest.
-    pub fn add_debug_run(&self, run_dir: PathBuf) {
+    fn add_debug_run(&self, run_dir: PathBuf) {
         self.lock().debug_runs.push(run_dir);
     }
 
     /// Stops the VM once nothing has used it for `idle_minutes` and no
     /// debug shell is open in it. The stop runs on a thread of its own:
     /// an ACPI power-off takes up to two minutes.
-    pub fn tick(self: &Arc<Self>) {
+    fn tick(self: &Arc<Self>) {
         let mut inner = self.lock();
         if inner.power == Power::Ready && !qemu_alive(&self.config.dir) {
             eprintln!("[ci] machine {}: QEMU is gone", self.name);
@@ -185,7 +193,7 @@ impl Machine {
     }
 
     /// Pauses (`stop`) or resumes (`cont`) every vCPU through the HMP monitor.
-    pub fn monitor(&self, command: &str) -> Result<(), String> {
+    fn monitor(&self, command: &str) -> Result<(), String> {
         let path = self.config.dir.join("monitor.sock");
         let mut stream = UnixStream::connect(&path)
             .map_err(|e| format!("cannot connect {}: {e}", path.display()))?;
@@ -212,7 +220,7 @@ impl Machine {
     /// `vm.sh <command>` with this machine's settings, output appended to
     /// the machine's log.
     fn vm(&self, command: &str) -> Result<(), String> {
-        let log = self.log_file()?;
+        let log = open_log(&self.log)?;
         let status = Command::new(&self.config.script)
             .arg(command)
             .env("VM_DIR", &self.config.dir)
@@ -230,17 +238,6 @@ impl Machine {
         } else {
             Err(format!("vm.sh {command} exited {status}"))
         }
-    }
-
-    fn log_file(&self) -> Result<std::fs::File, String> {
-        if let Some(parent) = self.log.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log)
-            .map_err(|e| format!("cannot open {}: {e}", self.log.display()))
     }
 
     /// Boots the VM and runs `prepare.ps1` in it: the cache disk as W:,
@@ -269,7 +266,7 @@ impl Machine {
     }
 
     fn run_logged(&self, command: &mut Command, what: &str) -> Result<(), String> {
-        let log = self.log_file()?;
+        let log = open_log(&self.log)?;
         let status = command
             .stdin(Stdio::null())
             .stdout(log.try_clone().map_err(|e| e.to_string())?)
@@ -282,6 +279,196 @@ impl Machine {
             Err(format!("{what} exited {status}"))
         }
     }
+}
+
+/// A unix host reached over ssh, always on.
+pub struct Host {
+    name: String,
+    config: UnixHostConfig,
+    log: PathBuf,
+}
+
+impl Host {
+    fn new(name: &str, config: UnixHostConfig, state_dir: &Path) -> Arc<Host> {
+        Arc::new(Host {
+            name: name.to_owned(),
+            log: machine_log(state_dir, name),
+            config,
+        })
+    }
+
+    /// Whether the host answers ssh and its run directory is usable; the
+    /// probe also prunes runs a killed launcher left behind.
+    fn probe(&self) -> bool {
+        let Ok(log) = open_log(&self.log) else {
+            return false;
+        };
+        let Ok(err) = log.try_clone() else {
+            return false;
+        };
+        Command::new("ssh")
+            .args(["-o", "BatchMode=yes"])
+            .arg(&self.config.ssh_host)
+            .arg(super::launch::host_probe(&self.config.dir))
+            .stdin(Stdio::null())
+            .stdout(log)
+            .stderr(err)
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// Returns once the host answers, or after `wait_minutes` without an
+    /// answer. `waiting` is told once, at the first failed probe, so the
+    /// pipeline can show why the job has not started. Blocks; called from a
+    /// job's own thread.
+    fn acquire(&self, waiting: &mut dyn FnMut(String)) -> Result<(), String> {
+        if self.probe() {
+            return Ok(());
+        }
+        eprintln!("[ci] machine {}: offline", self.name);
+        waiting(format!("machine {} offline", self.name));
+        let deadline = Instant::now() + Duration::from_secs(self.config.wait_minutes * 60);
+        while Instant::now() < deadline {
+            std::thread::sleep(HOST_RETRY.min(deadline.saturating_duration_since(Instant::now())));
+            if self.probe() {
+                eprintln!("[ci] machine {}: back", self.name);
+                return Ok(());
+            }
+        }
+        Err(format!(
+            "machine {} offline for {} min",
+            self.name, self.config.wait_minutes
+        ))
+    }
+}
+
+/// Why a job's machine did not take it.
+pub enum StartError {
+    /// The machine failed to come up: the job fails.
+    Failed(String),
+    /// The machine did not answer within its wait: the job is skipped.
+    Offline(String),
+}
+
+/// A machine of either kind, as the scheduler holds it.
+#[derive(Clone)]
+pub enum Machine {
+    Vm(Arc<Vm>),
+    Host(Arc<Host>),
+}
+
+impl Machine {
+    /// The machine `config` describes; see [`Vm::new`] for a VM found up.
+    pub fn new(name: &str, config: &MachineConfig, state_dir: &Path) -> Machine {
+        match config {
+            MachineConfig::WindowsVm(vm) => Machine::Vm(Vm::new(name, vm.clone(), state_dir)),
+            MachineConfig::UnixHost(host) => {
+                Machine::Host(Host::new(name, host.clone(), state_dir))
+            }
+        }
+    }
+
+    /// Makes the machine ready for one job. A VM is booted if it is off; a
+    /// unix host is waited for, and `waiting` gets the reason once.
+    pub fn acquire(&self, waiting: &mut dyn FnMut(String)) -> Result<(), StartError> {
+        match self {
+            Machine::Vm(vm) => vm.acquire().map_err(StartError::Failed),
+            Machine::Host(host) => host.acquire(waiting).map_err(StartError::Offline),
+        }
+    }
+
+    /// A lease for a job a previous runner started on a VM that is still up.
+    pub fn adopt(&self) {
+        if let Machine::Vm(vm) = self {
+            vm.adopt();
+        }
+    }
+
+    pub fn release(&self) {
+        if let Machine::Vm(vm) = self {
+            vm.release();
+        }
+    }
+
+    /// A failed run whose terminal may open a shell in the guest.
+    pub fn add_debug_run(&self, run_dir: PathBuf) {
+        if let Machine::Vm(vm) = self {
+            vm.add_debug_run(run_dir);
+        }
+    }
+
+    pub fn tick(&self) {
+        if let Machine::Vm(vm) = self {
+            vm.tick();
+        }
+    }
+
+    /// Pauses or resumes a VM's vCPUs. A unix host is never frozen.
+    pub fn freeze(&self, freeze: bool) -> Result<(), String> {
+        match self {
+            Machine::Vm(vm) => vm.monitor(if freeze { "stop" } else { "cont" }),
+            Machine::Host(host) => Err(format!(
+                "machine {} is a unix host and is never frozen",
+                host.name
+            )),
+        }
+    }
+
+    /// Resumes a VM a previous process may have frozen.
+    pub fn thaw_if_running(&self) {
+        if let Machine::Vm(vm) = self
+            && vm.config.dir.join("qemu.pid").exists()
+        {
+            let _ = vm.monitor("cont");
+        }
+    }
+
+    /// Whether the workstation's busy measurement holds and freezes jobs on
+    /// this machine: only if they share the workstation's GPU.
+    pub fn follows_busy(&self) -> bool {
+        matches!(self, Machine::Vm(_))
+    }
+
+    pub fn ssh_host(&self) -> &str {
+        match self {
+            Machine::Vm(vm) => &vm.config.ssh_host,
+            Machine::Host(host) => &host.config.ssh_host,
+        }
+    }
+
+    pub fn cpus(&self) -> u32 {
+        match self {
+            Machine::Vm(vm) => vm.config.cpus,
+            Machine::Host(host) => host.config.cpus,
+        }
+    }
+
+    /// The absolute directory on a unix host that holds its `runs/` and
+    /// `work/`; a VM has none.
+    pub fn unix_dir(&self) -> Option<&str> {
+        match self {
+            Machine::Vm(_) => None,
+            Machine::Host(host) => Some(&host.config.dir),
+        }
+    }
+}
+
+/// `ci/machines/<name>.log`, where a machine's own commands write.
+fn machine_log(state_dir: &Path, name: &str) -> PathBuf {
+    super::ci_dir(state_dir)
+        .join("machines")
+        .join(format!("{name}.log"))
+}
+
+fn open_log(log: &Path) -> Result<std::fs::File, String> {
+    if let Some(parent) = log.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .map_err(|e| format!("cannot open {}: {e}", log.display()))
 }
 
 /// Whether `<dir>/qemu.pid` names a live process.

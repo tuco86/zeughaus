@@ -76,6 +76,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that names secrets needs `[secrets]`. While OpenBao is unreachable the
   hook answers 503 and the forge redelivers. New `ci secrets-check` lists
   every named secret as `ok` or `missing`.
+- CI machines have a `kind`: `windows-vm` (the existing VM; `ci.toml`
+  needs `kind = "windows-vm"` added) or `unix-host`, a host reached over
+  ssh that is always on, such as a Mac. A unix host's jobs wait up to
+  `wait_minutes` (15) for it to answer and are then skipped, not failed,
+  so they never turn a branch red; they ignore the workstation's busy
+  state. `deploy/install-ci.sh --update` now ships the CI user's ssh
+  config, which names the Mac `atik-ci`.
 - The mux protocol is major version 3: a key carries press or release, and
   a notification is a terminal event. Editor and runner must be updated
   together.

@@ -21,6 +21,7 @@ cpus = 12
 memory = "24g"
 
 [machines.win11]
+kind = "windows-vm"                # windows-vm | unix-host
 script = "/usr/local/lib/zeughaus-ci/vm/win11/vm.sh"
 dir = "/var/lib/zeughaus-ci/vm/win11"
 ssh_host = "win11-ci"
@@ -28,6 +29,14 @@ cpus = 8
 memory = "12G"
 cache_disk = "100G"
 idle_minutes = 20
+
+# A unix host reached over ssh, always on: no boot, no freeze. Jobs wait up
+# to wait_minutes for it to answer, then are skipped. macOS counts as unix.
+[machines.atik]
+kind = "unix-host"
+ssh_host = "atik-ci"
+dir = "/Users/uebelacker/zeughaus-ci"
+cpus = 12
 
 [repos.griasdi]
 url = "https://github.com/Griasdi/Griasdi.git"

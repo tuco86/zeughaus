@@ -158,12 +158,10 @@ fn validate(
     if job.image.is_some() && job.machine.is_some() {
         return Err(fail("`image` and `machine` are mutually exclusive".into()));
     }
-    let is_ps1 = job.file.ends_with(".ps1");
-    if is_ps1 && job.machine.is_none() {
+    // Whether a `.sh` job fits its machine depends on the machine's kind in
+    // the runner's ci.toml; the scheduler checks that when the job starts.
+    if job.file.ends_with(".ps1") && job.machine.is_none() {
         return Err(fail("a .ps1 job requires `machine`".into()));
-    }
-    if !is_ps1 && job.machine.is_some() {
-        return Err(fail("`machine` requires a .ps1 job".into()));
     }
     if let Some(image) = &job.image {
         let wanted = format!("{image}.Containerfile");
@@ -389,10 +387,6 @@ mod tests {
                 "mutually exclusive",
             ),
             (vec![file("a.ps1", on)], "requires `machine`"),
-            (
-                vec![file("a.sh", &format!("{on}\nmachine = \"w\""))],
-                "requires a .ps1",
-            ),
             (
                 vec![file("a.sh", &format!("{on}\nimage = \"nope\""))],
                 "no .zeughaus-ci/nope.Containerfile",

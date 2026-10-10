@@ -153,7 +153,10 @@ checks the forge token and every secret `ci.toml` names. `zeughaus-runner ci che
 [DIR]` and `ci plan [DIR] <push|tag> <ref>` validate a `.zeughaus-ci/` folder without
 a runner. The Windows VM (`vm/win11/`, installed under
 `/usr/local/lib/zeughaus-ci/vm/win11`) is booted and stopped by the
-runner. `DESIGN.md` section 14 describes how it works.
+runner. The Mac `atik` is the unix host `atik-ci` (`deploy/ci/ssh_config`):
+jobs with `machine = "atik"` run there over ssh as `uebelacker` under
+`~/zeughaus-ci`, and are skipped after 15 minutes when it does not answer.
+`DESIGN.md` section 14 describes how it works.
 
 This repository is one of its repos: every push to Forgejo runs
 `.zeughaus-ci/gate.sh` (the gate below, in the `.zeughaus-ci/arch.Containerfile` image,
