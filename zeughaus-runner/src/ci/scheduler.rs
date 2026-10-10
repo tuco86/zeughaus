@@ -22,12 +22,13 @@ use sha2::{Digest, Sha256};
 use zeughaus_job::{JobSpec, ProcessHost, RunExit, record_run_end};
 
 use super::busy::{self, Busy};
-use super::config::{CiConfig, RepoConfig, read_secret};
+use super::config::{CiConfig, RepoConfig};
 use super::event::{self, CiEvent, EventKind};
 use super::forge::{self, State, Status};
 use super::header::{JobDef, WhenBusy};
 use super::launch::{self, Launch, Place};
 use super::machine::Machine;
+use super::secrets::{self, Secrets};
 use super::streak::{self, Streak};
 use super::{CI_DIR, cleanup, excerpt, pipeline};
 use crate::jobs::JobHost;
@@ -282,6 +283,8 @@ struct Scheduler {
     busy: Arc<Busy>,
     machines: BTreeMap<String, Arc<Machine>>,
     statuses: Sender<Status>,
+    /// The only reader of OpenBao in this process; jobs never see its token.
+    secrets: Arc<Secrets>,
     crons: BTreeMap<String, CronCache>,
     last_cron_check: DateTime<Local>,
     last_tick: Instant,
@@ -324,13 +327,22 @@ pub fn start(host: Arc<JobHost>, state_dir: PathBuf) -> Option<Ci> {
         config.repos.len(),
         config.machines.len()
     );
+    let secrets = Secrets::new(config.secrets.clone(), &state_dir);
+    match secrets::check(&secrets, &config) {
+        Ok(lines) => {
+            for line in lines {
+                eprintln!("[ci] secrets: {line}");
+            }
+        }
+        Err(e) => eprintln!("[ci] secrets: {e}"),
+    }
     let busy = busy::start(config.busy.clone(), &state_dir);
     let shared = Arc::clone(&busy);
     let (alerts, alerts_rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("zeughaus-ci".into())
         .spawn(move || {
-            let mut scheduler = Scheduler::new(host, state_dir, config, shared, alerts);
+            let mut scheduler = Scheduler::new(host, state_dir, config, shared, alerts, secrets);
             scheduler.recover();
             loop {
                 scheduler.tick();
@@ -354,6 +366,7 @@ impl Scheduler {
         config: CiConfig,
         busy: Arc<Busy>,
         alerts: Sender<Alert>,
+        secrets: Arc<Secrets>,
     ) -> Scheduler {
         let (tx, rx) = std::sync::mpsc::channel();
         let machines = config
@@ -376,7 +389,8 @@ impl Scheduler {
             .collect();
         Scheduler {
             busy,
-            statuses: forge::poster(state_dir.clone()),
+            statuses: forge::poster(state_dir.clone(), Arc::clone(&secrets)),
+            secrets,
             host,
             state_dir,
             config,
@@ -526,7 +540,7 @@ impl Scheduler {
         }
         let mut env = Vec::new();
         if let Some(secret) = &repo.fetch_token {
-            let token = read_secret(&self.state_dir, secret)?;
+            let token = self.secrets.get(secret).map_err(|e| e.to_string())?;
             let basic = base64::engine::general_purpose::STANDARD
                 .encode(format!("{}:{token}", repo.fetch_user));
             env.push(("GIT_CONFIG_COUNT".to_owned(), "1".to_owned()));
@@ -547,7 +561,20 @@ impl Scheduler {
                 "+refs/tags/*:refs/tags/*",
             ],
             &env,
-        )?;
+        )
+        .map_err(|e| match &repo.fetch_token {
+            Some(secret)
+                if ["could not read Username", " 401", " 403"]
+                    .iter()
+                    .any(|s| e.contains(s)) =>
+            {
+                format!(
+                    "{e} (fetch token rejected: expired or revoked? check {secret} in {})",
+                    self.secrets.document()
+                )
+            }
+            _ => e,
+        })?;
         Ok(mirror)
     }
 
@@ -1098,7 +1125,10 @@ impl Scheduler {
                     pipeline.event.kind, pipeline.event.git_ref
                 ));
             }
-            secrets.push((name.clone(), read_secret(&self.state_dir, name)?));
+            secrets.push((
+                name.clone(),
+                self.secrets.get(name).map_err(|e| e.to_string())?,
+            ));
         }
         let secret_dir = secret_dir(&self.state_dir, &run_id)?;
 

@@ -10,8 +10,9 @@ use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use super::config::{CiConfig, RepoConfig, read_secret};
+use super::config::{CiConfig, RepoConfig};
 use super::event::{CiEvent, EventKind, write_inbox};
+use super::secrets::{self, SecretError, Secrets};
 use super::{ci_dir, now_secs};
 use crate::files::write_atomic;
 
@@ -92,10 +93,12 @@ fn signature_ok(secret: &[u8], body: &[u8], sig_hex: &str) -> bool {
 
 /// Decides the answer to one request. Returns the event to enqueue, if any.
 /// Delivery ids are recorded in `deliveries`; the caller persists them.
+/// `webhook_secret` reads a secret by name at request time, so a rotation in
+/// OpenBao needs no restart.
 #[allow(clippy::too_many_arguments)]
 fn handle(
     repos: &BTreeMap<String, RepoConfig>,
-    secrets: &BTreeMap<String, Vec<u8>>,
+    webhook_secret: &dyn Fn(&str) -> Result<String, SecretError>,
     deliveries: &mut Deliveries,
     method: &str,
     url: &str,
@@ -130,10 +133,22 @@ fn handle(
         return (400, "unknown forge", None);
     };
 
-    let (Some(secret), Some(sig)) = (secrets.get(name), sig_hex) else {
+    let (Some(secret_name), Some(sig)) = (&repo.webhook_secret, sig_hex) else {
         return (401, "unauthorized", None);
     };
-    if !signature_ok(secret, body, sig) {
+    let secret = match webhook_secret(secret_name) {
+        Ok(secret) => secret,
+        Err(SecretError::Absent(e)) => {
+            eprintln!("[ci-hook] {name}: {e}");
+            return (401, "unauthorized", None);
+        }
+        // Not recording the delivery: the forge redelivers on a 5xx.
+        Err(SecretError::Unavailable(e)) => {
+            eprintln!("[ci-hook] {name}: {e}");
+            return (503, "secrets unavailable", None);
+        }
+    };
+    if !signature_ok(secret.as_bytes(), body, sig) {
         return (401, "unauthorized", None);
     }
 
@@ -239,17 +254,18 @@ pub fn run(state_dir: &Path, args: &[String]) -> ExitCode {
         }
     };
 
-    let mut secrets = BTreeMap::new();
-    for (name, repo) in &config.repos {
-        let Some(secret_name) = &repo.webhook_secret else {
-            eprintln!("[ci-hook] {name}: no webhook_secret; its hook answers 401");
-            continue;
-        };
-        match read_secret(state_dir, secret_name) {
-            Ok(value) => {
-                secrets.insert(name.clone(), value.into_bytes());
+    let secrets = Secrets::new(config.secrets.clone(), state_dir);
+    match secrets::check(&secrets, &config) {
+        Ok(lines) => {
+            for line in lines {
+                eprintln!("[ci-hook] secrets: {line}");
             }
-            Err(e) => eprintln!("[ci-hook] {name}: {e}; its hook answers 401"),
+        }
+        Err(e) => eprintln!("[ci-hook] secrets: {e}"),
+    }
+    for (name, repo) in &config.repos {
+        if repo.webhook_secret.is_none() {
+            eprintln!("[ci-hook] {name}: no webhook_secret; its hook answers 401");
         }
     }
 
@@ -291,7 +307,7 @@ pub fn run(state_dir: &Path, args: &[String]) -> ExitCode {
         } else {
             handle(
                 &config.repos,
-                &secrets,
+                &|name| secrets.get(name),
                 &mut deliveries,
                 &method,
                 &url,
@@ -345,18 +361,26 @@ mod tests {
 
     fn repos() -> BTreeMap<String, RepoConfig> {
         let toml = r#"
+[secrets]
+addr = "http://127.0.0.1:1"
+path = "zeughaus/ci"
+role_id = "r"
 [repos.griasdi]
 url = "https://github.com/Griasdi/Griasdi.git"
 forge = "github"
 slug = "Griasdi/Griasdi"
 api = "https://api.github.com"
-webhook_secret = "HOOK_SECRET"
+webhook_secret = "GRIASDI_WEBHOOK_SECRET"
 "#;
         CiConfig::parse(toml).expect("config").repos
     }
 
-    fn secrets() -> BTreeMap<String, Vec<u8>> {
-        BTreeMap::from([("griasdi".to_owned(), SECRET.to_vec())])
+    fn secret(name: &str) -> Result<String, SecretError> {
+        if name == "GRIASDI_WEBHOOK_SECRET" {
+            Ok(String::from_utf8(SECRET.to_vec()).expect("utf-8"))
+        } else {
+            Err(SecretError::Absent(format!("no field {name}")))
+        }
     }
 
     fn sign(body: &[u8]) -> String {
@@ -383,7 +407,52 @@ webhook_secret = "HOOK_SECRET"
     }
 
     fn post(d: &mut Deliveries, headers: &[(String, String)], body: &[u8], url: &str) -> Response {
-        handle(&repos(), &secrets(), d, "POST", url, headers, body, 42)
+        handle(&repos(), &secret, d, "POST", url, headers, body, 42)
+    }
+
+    #[test]
+    fn unreadable_secret_is_503_and_redeliverable() {
+        let body = push_body("refs/heads/main", "");
+        let headers = github("push", "u1", &sign(&body));
+        let mut d = Deliveries::default();
+        let sealed = |_: &str| -> Result<String, SecretError> {
+            Err(SecretError::Unavailable("openbao is sealed".into()))
+        };
+        let answer = handle(
+            &repos(),
+            &sealed,
+            &mut d,
+            "POST",
+            "/hook/griasdi",
+            &headers,
+            &body,
+            1,
+        );
+        assert_eq!((answer.0, answer.1), (503, "secrets unavailable"));
+        assert!(!d.contains("u1"));
+        let (code, text, _) = post(&mut d, &headers, &body, "/hook/griasdi");
+        assert_eq!((code, text), (202, "queued"));
+    }
+
+    #[test]
+    fn absent_secret_is_401() {
+        let body = push_body("refs/heads/main", "");
+        let headers = github("push", "a1", &sign(&body));
+        let mut d = Deliveries::default();
+        let absent = |name: &str| -> Result<String, SecretError> {
+            Err(SecretError::Absent(format!("no field {name}")))
+        };
+        let answer = handle(
+            &repos(),
+            &absent,
+            &mut d,
+            "POST",
+            "/hook/griasdi",
+            &headers,
+            &body,
+            1,
+        );
+        assert_eq!(answer.0, 401);
     }
 
     #[test]
@@ -540,7 +609,7 @@ webhook_secret = "HOOK_SECRET"
         assert_eq!(post(&mut d, &headers, &body, "/other").0, 404);
         let get = handle(
             &repos(),
-            &secrets(),
+            &secret,
             &mut d,
             "GET",
             "/hook/griasdi",

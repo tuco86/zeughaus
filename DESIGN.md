@@ -805,9 +805,19 @@ first, through `podman unshare rm` because containers leave subordinate-uid
 files. Image tags no pipeline uses are removed. The 200 newest pipeline
 records and the 10 newest artifact sets are kept per repository.
 
-**Secrets** are files in `<state-dir>/secrets/` (mode 0600). A job gets
-only those its repository's `grants` release to the event. They reach the
-job through files under `$XDG_RUNTIME_DIR/zeughaus-ci/<run>/`, which the
+**Secrets** (`secrets.rs`) live in one OpenBao KV v2 document
+(`[secrets]` in `ci.toml`, `secret/zeughaus/ci`); `ci.toml` only names
+them. The runner, the hook and the CLI log in with the AppRole
+`zeughaus-ci`, whose secret_id is sealed with `systemd-creds` to this
+machine and the CI user (`deploy/ci/openbao.sh` creates and rotates it).
+The token stays in the process; a document is read at use time and kept
+for `cache_ttl_seconds`, never served stale, so a value rotated in OpenBao
+takes effect without a restart. When OpenBao cannot be reached, fetches,
+job starts and statuses fail with its message and the hook answers 503,
+which the forge redelivers. `ci secrets-check`, and every start of runner
+and hook, list each named secret as present or missing. A job gets only
+those its repository's `grants` release to the event. They reach the job
+through files under `$XDG_RUNTIME_DIR/zeughaus-ci/<run>/`, which the
 launcher removes.
 
 ## 15. Not built

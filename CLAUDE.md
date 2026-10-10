@@ -144,10 +144,12 @@ prints the line to add to the editor's `zeughaus.toml`) and `zeughaus-ci-hook`
 (`ci hook --listen 10.8.0.10:8686`, the webhook intake that Caddy on sadala
 forwards `https://ci.doodleshnookie.net/hook/<repo>` to). Logs:
 `sudo journalctl _UID=$(id -u zeughaus-ci)`. Repositories, budgets and the
-VM are configured in `/var/lib/zeughaus-ci/state/ci.toml`, and secrets are
-files in `state/secrets/`. `zeughaus-ci run|status|log|forge-check` (a sudo
-wrapper) queues a pipeline and reads results, a failed job's excerpt and
-its log. `zeughaus-runner ci check
+VM are configured in `/var/lib/zeughaus-ci/state/ci.toml`; secrets live in
+OpenBao (`secret/zeughaus/ci`, read with the AppRole that
+`deploy/ci/openbao.sh` seals to the CI user).
+`zeughaus-ci run|status|log|forge-check|secrets-check` (a sudo wrapper)
+queues a pipeline, reads results, a failed job's excerpt and its log, and
+checks the forge token and every secret `ci.toml` names. `zeughaus-runner ci check
 [DIR]` and `ci plan [DIR] <push|tag> <ref>` validate a `.zeughaus-ci/` folder without
 a runner. The Windows VM (`vm/win11/`, installed under
 `/usr/local/lib/zeughaus-ci/vm/win11`) is booted and stopped by the

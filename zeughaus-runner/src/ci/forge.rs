@@ -8,9 +8,11 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
-use super::config::{Forge, RepoConfig, read_secret};
+use super::config::{Forge, RepoConfig};
+use super::secrets::Secrets;
 
 /// Longest description GitHub accepts.
 const MAX_DESCRIPTION: usize = 140;
@@ -48,20 +50,20 @@ pub struct Status {
 /// Posts statuses on a thread of its own, in the order they were sent: a
 /// `success` must not overtake the `pending` before it, and the scheduler's
 /// tick must not wait twenty seconds for a forge that does not answer.
-pub fn poster(state_dir: PathBuf) -> Sender<Status> {
+pub fn poster(state_dir: PathBuf, secrets: Arc<Secrets>) -> Sender<Status> {
     let (tx, rx) = std::sync::mpsc::channel::<Status>();
     let spawned = std::thread::Builder::new()
         .name("zeughaus-ci-status".into())
-        .spawn(move || post_all(&state_dir, rx));
+        .spawn(move || post_all(&state_dir, &secrets, rx));
     if let Err(e) = spawned {
         eprintln!("[ci] no status thread, statuses are not posted: {e}");
     }
     tx
 }
 
-fn post_all(state_dir: &Path, rx: Receiver<Status>) {
+fn post_all(state_dir: &Path, secrets: &Secrets, rx: Receiver<Status>) {
     for status in rx {
-        if let Err(e) = post(state_dir, &status) {
+        if let Err(e) = post(state_dir, secrets, &status) {
             eprintln!("[ci] status {} {}: {e}", status.repo_name, status.job);
         }
     }
@@ -114,14 +116,14 @@ fn repo_url(repo: &RepoConfig) -> Option<String> {
     }
 }
 
-fn post(state_dir: &Path, status: &Status) -> Result<(), String> {
+fn post(state_dir: &Path, secrets: &Secrets, status: &Status) -> Result<(), String> {
     let Some(url) = statuses_url(&status.repo, &status.sha) else {
         return Ok(());
     };
     let Some(secret) = &status.repo.status_token else {
         return Ok(());
     };
-    let token = read_secret(state_dir, secret)?;
+    let token = secrets.get(secret).map_err(|e| e.to_string())?;
     let body = serde_json::json!({
         "state": status.state.as_str(),
         "context": format!("zeughaus/{}", status.job),
@@ -181,14 +183,14 @@ fn curl(args: &[&str], headers: &str, body: Option<&Path>, url: &str) -> Result<
 }
 
 /// `ci forge-check`: whether the status token can see the repository.
-pub fn check(state_dir: &Path, repo: &RepoConfig) -> Result<String, String> {
+pub fn check(secrets: &Secrets, repo: &RepoConfig) -> Result<String, String> {
     let Some(url) = repo_url(repo) else {
         return Err("the repo has forge = \"none\"".to_owned());
     };
     let Some(secret) = &repo.status_token else {
         return Err("the repo has no status_token".to_owned());
     };
-    let token = read_secret(state_dir, secret)?;
+    let token = secrets.get(secret).map_err(|e| e.to_string())?;
     let body = curl(&[], &auth_header(repo.forge, &token), None, &url)?;
     let value: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| format!("unexpected answer: {e}"))?;

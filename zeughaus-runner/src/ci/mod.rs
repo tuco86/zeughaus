@@ -25,6 +25,7 @@ pub mod launch;
 pub mod machine;
 pub mod pipeline;
 pub mod scheduler;
+pub mod secrets;
 pub mod streak;
 
 use std::path::Path;

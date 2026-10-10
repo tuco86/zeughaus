@@ -1,7 +1,8 @@
-//! `<state-dir>/ci.toml` and the secret files next to it.
+//! `<state-dir>/ci.toml`.
 //!
-//! A secret is a file `<state-dir>/secrets/<NAME>`; the config only ever
-//! names secrets, so `ci.toml` holds nothing that must stay private.
+//! The config only ever names secrets; their values live in OpenBao
+//! (`[secrets]`, read by `super::secrets`), so `ci.toml` holds nothing that
+//! must stay private.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,41 @@ pub struct CiConfig {
     pub machines: BTreeMap<String, MachineConfig>,
     #[serde(default)]
     pub repos: BTreeMap<String, RepoConfig>,
+    /// Where the values of the secrets named below live.
+    pub secrets: Option<SecretsConfig>,
+}
+
+fn default_mount() -> String {
+    "secret".into()
+}
+
+fn default_cache_ttl() -> u64 {
+    30
+}
+
+fn default_bao_timeout() -> u64 {
+    5
+}
+
+/// One KV v2 document in OpenBao, read with the runner's own AppRole.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretsConfig {
+    /// `http://10.8.0.1:8200`; a trailing `/` is trimmed.
+    pub addr: String,
+    /// KV v2 mount.
+    #[serde(default = "default_mount")]
+    pub mount: String,
+    /// Document path below the mount, e.g. `zeughaus/ci`.
+    pub path: String,
+    /// The AppRole's role_id; not secret, the secret_id is sealed apart.
+    pub role_id: String,
+    /// How long a read document answers from memory.
+    #[serde(default = "default_cache_ttl")]
+    pub cache_ttl_seconds: u64,
+    /// curl's `--max-time` per request.
+    #[serde(default = "default_bao_timeout")]
+    pub timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -150,6 +186,15 @@ impl RepoConfig {
                 .any(|p| Pattern::parse_grant(p).is_ok_and(|p| p.matches(event)))
         })
     }
+
+    /// Every secret this repo names: its tokens and the keys of `grants`.
+    pub fn secret_names(&self) -> impl Iterator<Item = &String> {
+        self.fetch_token
+            .iter()
+            .chain(&self.status_token)
+            .chain(&self.webhook_secret)
+            .chain(self.grants.keys())
+    }
 }
 
 impl CiConfig {
@@ -179,22 +224,35 @@ impl CiConfig {
                 ));
             }
         }
+        if let Some(secrets) = &mut self.secrets {
+            secrets.addr = secrets.addr.trim_end_matches('/').to_string();
+            for (field, value) in [
+                ("addr", &secrets.addr),
+                ("path", &secrets.path),
+                ("role_id", &secrets.role_id),
+            ] {
+                if value.is_empty() {
+                    return Err(format!("[secrets]: `{field}` must not be empty"));
+                }
+            }
+        }
         for (name, repo) in &mut self.repos {
             if !valid_name(name) {
                 return Err(format!("repo name `{name}` must match [a-z0-9][a-z0-9-]*"));
             }
-            let secrets = repo
-                .fetch_token
-                .iter()
-                .chain(&repo.status_token)
-                .chain(&repo.webhook_secret)
-                .chain(repo.grants.keys());
-            for secret in secrets {
+            let mut names_secrets = false;
+            for secret in repo.secret_names() {
+                names_secrets = true;
                 if !valid_env_name(secret) {
                     return Err(format!(
                         "repo `{name}`: secret name `{secret}` must match [A-Z_][A-Z0-9_]*"
                     ));
                 }
+            }
+            if names_secrets && self.secrets.is_none() {
+                return Err(format!(
+                    "repo `{name}` names secrets but ci.toml has no [secrets]"
+                ));
             }
             for (secret, patterns) in &repo.grants {
                 for pattern in patterns {
@@ -209,44 +267,6 @@ impl CiConfig {
         }
         Ok(())
     }
-}
-
-/// Reads `<state-dir>/secrets/<name>`. The file must not be accessible to
-/// group or other. Errors never contain the value.
-pub fn read_secret(state_dir: &Path, name: &str) -> Result<String, String> {
-    if !valid_env_name(name) {
-        return Err(format!("secret name `{name}` must match [A-Z_][A-Z0-9_]*"));
-    }
-    let path = state_dir.join("secrets").join(name);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::metadata(&path)
-            .map_err(|e| format!("cannot read secret {name} ({}): {e}", path.display()))?;
-        let mode = meta.permissions().mode();
-        if mode & 0o077 != 0 {
-            return Err(format!(
-                "secret file {} has mode {:o}; it must not be accessible to group or other (chmod 600)",
-                path.display(),
-                mode & 0o777
-            ));
-        }
-    }
-    let mut value = std::fs::read_to_string(&path)
-        .map_err(|e| format!("cannot read secret {name} ({}): {e}", path.display()))?;
-    if value.ends_with('\n') {
-        value.pop();
-        if value.ends_with('\r') {
-            value.pop();
-        }
-    }
-    if value.contains('\n') {
-        return Err(format!(
-            "secret {name} ({}) spans several lines",
-            path.display()
-        ));
-    }
-    Ok(value)
 }
 
 /// `[a-z0-9][a-z0-9-]*`
@@ -301,6 +321,10 @@ status_token = "GITHUB_TOKEN"
 webhook_secret = "GRIASDI_WEBHOOK_SECRET"
 [repos.griasdi.grants]
 GITHUB_TOKEN = ["tag v*", "cron *"]
+[secrets]
+addr = "http://10.8.0.1:8200/"
+path = "zeughaus/ci"
+role_id = "r-1"
 [repos.smoke]
 url = "/var/lib/zeughaus-ci/smoke.git"
 forge = "none"
@@ -378,6 +402,23 @@ forge = "none"
     }
 
     #[test]
+    fn secrets_need_a_source() {
+        let err = CiConfig::parse("[repos.a]\nurl = \"x\"\nfetch_token = \"TOKEN\"").unwrap_err();
+        assert_eq!(err, "repo `a` names secrets but ci.toml has no [secrets]");
+        let err =
+            CiConfig::parse("[repos.a]\nurl = \"x\"\n[repos.a.grants]\nTOKEN = []").unwrap_err();
+        assert_eq!(err, "repo `a` names secrets but ci.toml has no [secrets]");
+        assert!(CiConfig::parse("[secrets]\naddr = \"a\"\npath = \"p\"\nrole_id = \"\"").is_err());
+        let config =
+            CiConfig::parse("[secrets]\naddr = \"http://b:8200/\"\npath = \"p\"\nrole_id = \"r\"")
+                .unwrap();
+        let secrets = config.secrets.unwrap();
+        assert_eq!(secrets.addr, "http://b:8200");
+        assert_eq!(secrets.mount, "secret");
+        assert_eq!(secrets.cache_ttl_seconds, 30);
+    }
+
+    #[test]
     fn grants_match_events() {
         let config = CiConfig::parse(EXAMPLE).unwrap();
         let repo = &config.repos["griasdi"];
@@ -411,45 +452,6 @@ forge = "none"
         assert!(CiConfig::load(&dir).unwrap().is_none());
         std::fs::write(dir.join(CONFIG_FILE), "budget_gb = 7").unwrap();
         assert_eq!(CiConfig::load(&dir).unwrap().unwrap().budget_gb, 7);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn secrets_are_trimmed_and_mode_checked() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = temp("secret");
-        let secrets = dir.join("secrets");
-        std::fs::create_dir_all(&secrets).unwrap();
-        let file = secrets.join("TOKEN_A");
-        let set_mode = |mode| {
-            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
-        };
-
-        std::fs::write(&file, "s3cret\n").unwrap();
-        set_mode(0o600);
-        assert_eq!(read_secret(&dir, "TOKEN_A").unwrap(), "s3cret");
-
-        std::fs::write(&file, "s3cret\r\n").unwrap();
-        assert_eq!(read_secret(&dir, "TOKEN_A").unwrap(), "s3cret");
-
-        std::fs::write(&file, "s3cret").unwrap();
-        assert_eq!(read_secret(&dir, "TOKEN_A").unwrap(), "s3cret");
-
-        std::fs::write(&file, "a\nb\n").unwrap();
-        let err = read_secret(&dir, "TOKEN_A").unwrap_err();
-        assert!(err.contains("several lines"), "{err}");
-
-        std::fs::write(&file, "s3cret\n").unwrap();
-        set_mode(0o640);
-        let err = read_secret(&dir, "TOKEN_A").unwrap_err();
-        assert!(err.contains("mode"), "{err}");
-        assert!(!err.contains("s3cret"), "{err}");
-        set_mode(0o604);
-        assert!(read_secret(&dir, "TOKEN_A").is_err());
-
-        assert!(read_secret(&dir, "lower").is_err());
-        assert!(read_secret(&dir, "MISSING").is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

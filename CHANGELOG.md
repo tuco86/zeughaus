@@ -68,6 +68,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CI secrets come from OpenBao instead of files under
+  `<state-dir>/secrets/`: `[secrets]` in `ci.toml` names the KV v2
+  document, the runner logs in with the AppRole `zeughaus-ci` whose
+  secret_id `deploy/ci/openbao.sh` seals with `systemd-creds`, and reads
+  at use time, so a rotated token takes effect without a restart. A repo
+  that names secrets needs `[secrets]`. While OpenBao is unreachable the
+  hook answers 503 and the forge redelivers. New `ci secrets-check` lists
+  every named secret as `ok` or `missing`.
 - The mux protocol is major version 3: a key carries press or release, and
   a notification is a terminal event. Editor and runner must be updated
   together.

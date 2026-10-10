@@ -81,7 +81,7 @@ if [ "$update" -eq 0 ]; then
 
     say "5/9 directories, ssh"
     as_ci mkdir -p "$ci_home/.config/systemd/user" "$ci_home/vm/win11"
-    as_ci install -d -m700 "$ci_home/state" "$ci_home/state/secrets" "$ci_home/.ssh"
+    as_ci install -d -m700 "$ci_home/state" "$ci_home/.ssh"
     # qcow2 files on btrfs need nodatacow (vm/win11/vm.sh); the flag only
     # takes effect on a directory that holds no image yet.
     if [ -z "$($SUDO ls -A "$ci_home/vm/win11")" ]; then

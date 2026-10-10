@@ -1,7 +1,15 @@
 # <state-dir>/ci.toml of the CI runner. Without this file CI is off.
-# Secrets are files <state-dir>/secrets/<NAME> (mode 0600), never listed here.
+# Secret values live in OpenBao ([secrets]); this file only names them.
 
 budget_gb = 50                     # host workspaces under ci/work; LRU deletion beyond this
+
+[secrets]
+addr = "http://10.8.0.1:8200"      # OpenBao on sadala over WireGuard
+mount = "secret"                   # KV v2
+path = "zeughaus/ci"               # one document; its fields are the secret names
+role_id = "<printed by deploy/ci/openbao.sh>"
+cache_ttl_seconds = 30             # a read document answers from memory this long
+timeout_seconds = 5
 
 [busy]
 gpu_percent = 50                   # nvidia-smi utilization.gpu threshold

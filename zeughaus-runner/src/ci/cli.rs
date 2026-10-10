@@ -1,5 +1,6 @@
 //! `zeughaus-runner ci ...`: checking a `.zeughaus-ci` folder, queueing a pipeline,
-//! reading their state, the forge token check and the webhook intake.
+//! reading their state, the forge token and OpenBao checks and the webhook
+//! intake.
 //!
 //! ```text
 //! ci check [DIR]
@@ -10,6 +11,7 @@
 //! ci status [N]
 //! ci log <repo> <pipeline> <job> [--tail N]
 //! ci forge-check <repo>
+//! ci secrets-check
 //! ci hook --listen <addr>
 //! ```
 //!
@@ -30,11 +32,13 @@ use super::excerpt;
 use super::header::JobDef;
 use super::pipeline::{self, Pattern};
 use super::scheduler::{self, JobStatus, PipelineStatus, place_name};
+use super::secrets::{self, Secrets};
 use super::streak;
 
 const USAGE: &str = "usage: zeughaus-runner ci check [DIR] | plan [DIR] <push|tag> <ref> | \
 plan [DIR] cron \"<expr>\" | run <repo> <push|tag> <ref> [<sha>] | run <repo> cron \"<expr>\" | \
-status [N] | log <repo> <pipeline> <job> [--tail N] | forge-check <repo> | hook --listen <addr>";
+status [N] | log <repo> <pipeline> <job> [--tail N] | forge-check <repo> | secrets-check | \
+hook --listen <addr>";
 
 pub fn run(args: &[String], state_dir: &Path) -> ExitCode {
     let result = match args.first().map(String::as_str) {
@@ -44,6 +48,7 @@ pub fn run(args: &[String], state_dir: &Path) -> ExitCode {
         Some("status") => status(state_dir, &args[1..]),
         Some("log") => log(state_dir, &args[1..]),
         Some("forge-check") => forge_check(state_dir, &args[1..]),
+        Some("secrets-check") => secrets_check(state_dir, &args[1..]),
         Some("hook") => return super::hook::run(state_dir, &args[1..]),
         _ => Err(USAGE.to_owned()),
     };
@@ -313,6 +318,20 @@ fn forge_check(state_dir: &Path, args: &[String]) -> Result<(), String> {
         .repos
         .get(repo)
         .ok_or_else(|| format!("unknown repo {repo}"))?;
-    println!("{}", super::forge::check(state_dir, repo_config)?);
+    let secrets = Secrets::new(config.secrets.clone(), state_dir);
+    println!("{}", super::forge::check(&secrets, repo_config)?);
+    Ok(())
+}
+
+/// Every secret `ci.toml` names, read from OpenBao once.
+fn secrets_check(state_dir: &Path, args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err("usage: ci secrets-check".to_owned());
+    }
+    let config = load_config(state_dir)?;
+    let secrets = Secrets::new(config.secrets.clone(), state_dir);
+    for line in secrets::check(&secrets, &config)? {
+        println!("{line}");
+    }
     Ok(())
 }
