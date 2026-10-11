@@ -2374,6 +2374,7 @@ dependencies = [
 name = "iced_tabs"
 version = "0.1.0-dev"
 dependencies = [
+ "iced_runtime",
  "iced_widget",
 ]
 

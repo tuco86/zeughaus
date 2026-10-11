@@ -8,11 +8,15 @@
 //! whether the press was a click (activate) or the start of a drag, and
 //! feeds the hovered [`Target`] back as the [`Marker`] of the next pass.
 
+use std::any::Any;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::marker::PhantomData;
 
+use iced_runtime::{self as runtime, Task};
 use iced_widget::core::layout::{self, Layout};
+use iced_widget::core::widget::operation::scrollable::AbsoluteOffset;
+use iced_widget::core::widget::operation::{Operation, Outcome};
 use iced_widget::core::widget::{self, Tree, Widget, tree};
 use iced_widget::core::{
     Alignment, Background, Border, Color, Event, Font, Length, Padding, Point, Rectangle, Size,
@@ -439,19 +443,24 @@ where
     match placement {
         Placement::Top => {
             // The scrollable shrinks to its row and scrolls once the row
-            // outgrows the bar; the fill zone takes what is left.
+            // outgrows the bar; the fill zone takes what is left. Its thin
+            // bar floats over the tabs' bottom edge and exists only while
+            // the row overflows, so it never moves a tab.
             let mut row = Row::new()
-                .push(
+                .push(SidewaysWheel::new(
                     scrollable(
                         Row::with_children(sections)
                             .spacing(12)
                             .height(Length::Fill),
                     )
+                    .id(BAR)
                     .direction(scrollable::Direction::Horizontal(
-                        scrollable::Scrollbar::hidden(),
+                        scrollable::Scrollbar::new()
+                            .width(SCROLLBAR)
+                            .scroller_width(SCROLLBAR),
                     ))
                     .height(Length::Fill),
-                )
+                ))
                 .height(Length::Fill);
             if let Some(fill) = fill {
                 row = row.push(fill);
@@ -472,6 +481,7 @@ where
                             .spacing(6)
                             .width(Length::Fill),
                     )
+                    .id(BAR)
                     .direction(scrollable::Direction::Vertical(scrollable::Scrollbar::new()))
                     .height(Length::Shrink),
                 )
@@ -492,6 +502,294 @@ where
                 })
                 .into()
         }
+    }
+}
+
+/// The bar's scrollable.
+const BAR: widget::Id = widget::Id::new("iced_tabs.bar");
+
+/// The front tab, as reported to a widget operation by its body.
+const ACTIVE_TAB: widget::Id = widget::Id::new("iced_tabs.active");
+
+/// Thickness of the scrollbar under a bar on top.
+const SCROLLBAR: f32 = 4.0;
+
+/// Scrolls the tab bar just far enough that the front tab is fully inside
+/// it: sideways on top, vertically at the left. It does nothing when the tab
+/// is already in view, when the bar does not overflow, or when no bar is
+/// shown.
+///
+/// Run it after every change of the front tab, once the view with the new
+/// front tab exists; the bar keeps no selection of its own to react to.
+pub fn reveal_active<Message>() -> Task<Message>
+where
+    Message: Send + 'static,
+{
+    runtime::task::widget(Reveal::default()).then(|offset| match offset {
+        Some(offset) => runtime::widget::operation::scroll_to(BAR, offset),
+        None => Task::none(),
+    })
+}
+
+/// What the bar's scrollable reported about its viewport.
+#[derive(Clone, Copy)]
+struct Viewport {
+    bounds: Rectangle,
+    content: Rectangle,
+    translation: Vector,
+}
+
+/// Collects the bar's viewport and the front tab's bounds in one pass over
+/// the tree and answers with the offset that brings the tab into view.
+#[derive(Default)]
+struct Reveal {
+    viewport: Option<Viewport>,
+    tab: Option<Rectangle>,
+}
+
+impl Reveal {
+    fn offset(&self) -> Option<AbsoluteOffset<Option<f32>>> {
+        let (viewport, tab) = (self.viewport?, self.tab?);
+        // Both rectangles are in layout space, before the scroll shifts the
+        // content, so the tab's place in the content is the plain difference.
+        let x = reveal_axis(
+            tab.x - viewport.content.x,
+            tab.width,
+            viewport.translation.x,
+            viewport.bounds.width,
+            viewport.content.width,
+        );
+        let y = reveal_axis(
+            tab.y - viewport.content.y,
+            tab.height,
+            viewport.translation.y,
+            viewport.bounds.height,
+            viewport.content.height,
+        );
+        (x.is_some() || y.is_some()).then_some(AbsoluteOffset { x, y })
+    }
+}
+
+impl Operation<Option<AbsoluteOffset<Option<f32>>>> for Reveal {
+    fn traverse(
+        &mut self,
+        operate: &mut dyn FnMut(&mut dyn Operation<Option<AbsoluteOffset<Option<f32>>>>),
+    ) {
+        operate(self);
+    }
+
+    fn scrollable(
+        &mut self,
+        id: Option<&widget::Id>,
+        bounds: Rectangle,
+        content_bounds: Rectangle,
+        translation: Vector,
+        _state: &mut dyn widget::operation::Scrollable,
+    ) {
+        if id == Some(&BAR) {
+            self.viewport = Some(Viewport {
+                bounds,
+                content: content_bounds,
+                translation,
+            });
+        }
+    }
+
+    fn custom(&mut self, id: Option<&widget::Id>, bounds: Rectangle, _state: &mut dyn Any) {
+        if id == Some(&ACTIVE_TAB) {
+            self.tab = Some(bounds);
+        }
+    }
+
+    fn finish(&self) -> Outcome<Option<AbsoluteOffset<Option<f32>>>> {
+        Outcome::Some(self.offset())
+    }
+}
+
+/// The scroll offset along one axis that shows the span `start..start + len`
+/// of a content `content` long in a viewport `view` long that is scrolled to
+/// `offset`, or `None` when nothing has to move. A span that does not fit is
+/// shown from its start.
+fn reveal_axis(start: f32, len: f32, offset: f32, view: f32, content: f32) -> Option<f32> {
+    if content <= view {
+        return None;
+    }
+    let wanted = if len >= view || start < offset {
+        start
+    } else if start + len > offset + view {
+        start + len - view
+    } else {
+        return None;
+    };
+    let wanted = wanted.clamp(0.0, content - view);
+    ((wanted - offset).abs() > f32::EPSILON).then_some(wanted)
+}
+
+/// Lets a mouse wheel scroll a horizontal bar: a wheel only moves along the
+/// vertical axis, which a horizontal scrollable ignores. A step that has no
+/// sideways part is given one; a trackpad's own sideways steps are left
+/// alone.
+struct SidewaysWheel<'a, Message, Theme, Renderer> {
+    content: Element<'a, Message, Theme, Renderer>,
+}
+
+impl<'a, Message, Theme, Renderer> SidewaysWheel<'a, Message, Theme, Renderer> {
+    fn new(content: impl Into<Element<'a, Message, Theme, Renderer>>) -> Self {
+        Self {
+            content: content.into(),
+        }
+    }
+}
+
+impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer>
+    for SidewaysWheel<'_, Message, Theme, Renderer>
+where
+    Renderer: renderer::Renderer,
+{
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn widget::Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        let sideways;
+        let event = match event {
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+                sideways = Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: sideways_step(*delta),
+                });
+                &sideways
+            }
+            other => other,
+        };
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+}
+
+impl<'a, Message, Theme, Renderer> From<SidewaysWheel<'a, Message, Theme, Renderer>>
+    for Element<'a, Message, Theme, Renderer>
+where
+    Message: 'a,
+    Theme: 'a,
+    Renderer: renderer::Renderer + 'a,
+{
+    fn from(wheel: SidewaysWheel<'a, Message, Theme, Renderer>) -> Self {
+        Element::new(wheel)
+    }
+}
+
+/// `delta` with a sideways part: a step without one (a plain wheel) gets the
+/// vertical amount on both axes, so that it scrolls with or without Shift,
+/// which makes the scrollable swap them.
+fn sideways_step(delta: mouse::ScrollDelta) -> mouse::ScrollDelta {
+    match delta {
+        mouse::ScrollDelta::Lines { x: 0.0, y } => mouse::ScrollDelta::Lines { x: y, y },
+        mouse::ScrollDelta::Pixels { x: 0.0, y } => mouse::ScrollDelta::Pixels { x: y, y },
+        other => other,
     }
 }
 
@@ -1158,6 +1456,9 @@ where
         renderer: &Renderer,
         operation: &mut dyn widget::Operation,
     ) {
+        if self.selected {
+            operation.custom(Some(&ACTIVE_TAB), layout.bounds(), &mut ());
+        }
         self.content
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
@@ -1408,5 +1709,49 @@ mod tests {
             bounds,
             Point::new(cx - 5.0, cy + 1.0)
         ));
+    }
+
+    #[test]
+    fn revealing_scrolls_the_least_that_shows_the_span() {
+        // A 100 long viewport over 400 of content, scrolled to 100..200.
+        let reveal = |start, len| reveal_axis(start, len, 100.0, 100.0, 400.0);
+        // Already inside, edges included: nothing moves.
+        assert_eq!(reveal(120.0, 60.0), None);
+        assert_eq!(reveal(100.0, 100.0 - 1.0), None);
+        // Past the end: its end meets the viewport's end.
+        assert_eq!(reveal(230.0, 50.0), Some(180.0));
+        // Before the start: its start meets the viewport's start.
+        assert_eq!(reveal(40.0, 30.0), Some(40.0));
+        // Too long to fit: shown from its start.
+        assert_eq!(reveal(250.0, 120.0), Some(250.0));
+        // The ends of the content are the limits.
+        assert_eq!(reveal(390.0, 10.0), Some(300.0));
+        assert_eq!(reveal(0.0, 20.0), Some(0.0));
+    }
+
+    #[test]
+    fn a_bar_that_fits_never_scrolls() {
+        assert_eq!(reveal_axis(500.0, 20.0, 0.0, 600.0, 600.0), None);
+        assert_eq!(reveal_axis(0.0, 20.0, 0.0, 600.0, 400.0), None);
+    }
+
+    #[test]
+    fn a_wheel_without_a_sideways_part_gets_one() {
+        let step = |delta| match sideways_step(delta) {
+            mouse::ScrollDelta::Lines { x, y } | mouse::ScrollDelta::Pixels { x, y } => (x, y),
+        };
+        assert_eq!(
+            step(mouse::ScrollDelta::Lines { x: 0.0, y: -2.0 }),
+            (-2.0, -2.0)
+        );
+        assert_eq!(
+            step(mouse::ScrollDelta::Pixels { x: 0.0, y: 7.0 }),
+            (7.0, 7.0)
+        );
+        // A trackpad's own sideways step stays as it is.
+        assert_eq!(
+            step(mouse::ScrollDelta::Pixels { x: 3.0, y: 1.0 }),
+            (3.0, 1.0)
+        );
     }
 }

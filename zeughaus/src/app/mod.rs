@@ -617,20 +617,38 @@ impl App {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let front = self.workspace.active_tab().cloned();
+        let placement = self.workspace.placement;
         let task = self.apply(message);
         let synced = self.sync_workspace();
         #[cfg(not(target_arch = "wasm32"))]
-        if self.pending_restore.is_some() {
+        let restored = if self.pending_restore.is_some() {
             let restored = self.finish_restore();
             let resynced = self.sync_workspace();
-            return Task::batch([task, synced, restored, resynced]);
+            Some(Task::batch([restored, resynced]))
+        } else {
+            None
+        };
+        // The bar scrolls only when the front tab or the bar's edge changed,
+        // never per frame; it runs after the view that holds the new front
+        // tab has been laid out.
+        let reveal = if self.workspace.active_tab() != front.as_ref()
+            || self.workspace.placement != placement
+        {
+            iced_tabs::reveal_active()
+        } else {
+            Task::none()
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(restored) = restored {
+            return Task::batch([task, synced, restored, reveal]);
         }
         // Most messages ask for nothing here, and a batch is a stream the
         // runtime polls whether or not it holds anything.
-        if synced.units() == 0 {
+        if synced.units() + reveal.units() == 0 {
             task
         } else {
-            Task::batch([task, synced])
+            Task::batch([task, synced, reveal])
         }
     }
 

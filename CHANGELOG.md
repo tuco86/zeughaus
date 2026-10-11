@@ -142,6 +142,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- With the tab bar on top, tabs that do not fit are reachable: a thin
+  scrollbar shows the overflow, the wheel scrolls the bar sideways, and
+  the bar scrolls the active tab into view whenever it changes (also on
+  `Ctrl+PageDown`/`Ctrl+PageUp`).
 - systemd-oomd no longer takes every shell down with the runner: under a
   systemd user manager the runner starts each terminal's shim in a
   transient scope of its own (`systemd-run --user --scope`), so an OOM
