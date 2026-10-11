@@ -6,3 +6,6 @@ target/
 # default SQLite file and the recorder's default dataset directory.
 zeughaus.sqlite*
 recordings/
+
+# Agent working notes; DESIGN.md and CHANGELOG.md are the record.
+plan/
