@@ -7,7 +7,7 @@
 //! terminals that survive the restart; their end is read back from the exit
 //! record [`JobHost::adopt_runs`] writes.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
@@ -236,6 +236,55 @@ pub fn load_pipelines(state_dir: &Path) -> Vec<Pipeline> {
     }
     out.sort_by_key(|p| std::cmp::Reverse((p.created, p.number)));
     out
+}
+
+/// Fills `subject` of stored records that predate the field, from each
+/// repository's mirror, one `git log` per repository and chunk of shas.
+/// Idempotent: a record that has a subject or whose commit the mirror no
+/// longer has is left alone, so a second run changes nothing.
+fn backfill_subjects(state_dir: &Path, changes: &Sender<CiChange>) {
+    let mut pipelines: Vec<Pipeline> = load_pipelines(state_dir)
+        .into_iter()
+        .filter(|p| p.subject.is_empty() && p.sha.is_some())
+        .collect();
+    pipelines.sort_by(|a, b| a.repo.cmp(&b.repo));
+    for group in pipelines.chunk_by_mut(|a, b| a.repo == b.repo) {
+        let repo = group[0].repo.clone();
+        let mirror = mirror_dir(state_dir, &repo);
+        let mut shas: Vec<String> = group.iter().filter_map(|p| p.sha.clone()).collect();
+        shas.sort();
+        shas.dedup();
+        let mut subjects = HashMap::new();
+        let mut failed = false;
+        for chunk in shas.chunks(100) {
+            let mut args = vec!["log", "--no-walk", "--format=%H%x00%s"];
+            args.extend(chunk.iter().map(String::as_str));
+            match git(&mirror, &args, &[]) {
+                Ok(out) => subjects.extend(parse_subjects(&out)),
+                Err(_) => failed = true,
+            }
+        }
+        if failed {
+            eprintln!("[ci] cannot read commit subjects of {repo} from its mirror");
+        }
+        for pipeline in group.iter_mut() {
+            let subject = pipeline.sha.as_ref().and_then(|s| subjects.get(s));
+            if let Some(subject) = subject.filter(|s| !s.is_empty()) {
+                pipeline.subject = subject.clone();
+                pipeline.save(state_dir, changes);
+            }
+        }
+    }
+}
+
+/// `sha NUL subject` lines of `git log --format=%H%x00%s`.
+fn parse_subjects(out: &str) -> HashMap<String, String> {
+    out.lines()
+        .filter_map(|line| {
+            let (sha, subject) = line.split_once('\0')?;
+            Some((sha.to_owned(), subject.trim().to_owned()))
+        })
+        .collect()
 }
 
 /// The pipeline records of one repository, in no particular order.
@@ -491,6 +540,7 @@ impl Scheduler {
 
     /// Picks up the pipelines a previous process left running.
     fn recover(&mut self) {
+        backfill_subjects(&self.state_dir, &self.changes);
         let mut recovered = Vec::new();
         for mut pipeline in load_pipelines(&self.state_dir) {
             if pipeline.status != PipelineStatus::Running {
@@ -2122,6 +2172,14 @@ mod tests {
     use zeughaus_terminal::wal::{self, WalWriter};
 
     use super::*;
+
+    #[test]
+    fn subjects_parse_with_empty_and_spaced_text() {
+        let map = parse_subjects("aaa\0fix: a  b\nbbb\0\nccc\0 x \n");
+        assert_eq!(map["aaa"], "fix: a  b");
+        assert_eq!(map["bbb"], "");
+        assert_eq!(map["ccc"], "x");
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir =
