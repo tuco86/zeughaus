@@ -68,6 +68,9 @@ iced_terminal.workspace = true
 # submitted through `iced_wgpu`'s primitive renderer (iced keeps it private).
 iced_nodegraph_sdf.workspace = true
 iced_wgpu = "0.14"
+# The local date and time in a CI pipeline's tooltip. Native only: the CI views
+# are not built for the browser. Already in the tree under the runner.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # `io-util` reads a frame off the QUIC stream, `time` paces the first dial of a
 # runtime, `macros` is `select!` between a subscription and its peer events,
 # `signal` is the SIGUSR1 that restarts the editor.

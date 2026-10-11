@@ -848,17 +848,22 @@ which kills the local ssh.
 `zeughaus-link/src/ci.rs`, served by `ci/serve.rs`) answers an overview
 (every channel with its newest pipeline, and the machines: the workstation
 with its busy state, then each VM and unix host with its status, each with
-the jobs active on it), a channel's pipelines newest first by pages, one
-pipeline, and opens or closes a transcript. Every saved record is
-announced as `RuntimeEvent::CiPipeline` on the `ci` topic. In the editor
+the jobs active on it as `MachineJob { repo, channel, number, job }`), a
+channel's pipelines newest first by pages, one pipeline, and opens or
+closes a transcript. Every saved record is announced as
+`RuntimeEvent::CiPipeline` on the `ci` topic. In the editor
 (`zeughaus/src/app/ci.rs`) a runner that reports a machine gets a section
-`CI <label>` after the runners: a `Runners` tab with the machines, then one
-locked group per repository with a tab per channel, `<channel>@<repo>`. A
-channel tab lists its pipelines in a scrollable, newest on top and
-separated by rules: per pipeline `#<n> push to <ref> <sha> by <actor>` and
-its status, the commit's subject (the runner reads it from its mirror when
-the pipeline starts), its note, and its jobs as cards laid out by their
-`needs` and bordered by status. The cables between the cards are one
+`CI <label>` after the runners: a `Runners` tab with a table of the
+machines, whose running jobs open their transcripts, then one locked group
+per repository with a tab per channel, `<channel>@<repo>`, whose accent
+dot is the tone of the channel's newest pipeline. A channel tab lists its
+pipelines in a scrollable, newest on top and separated by rules: per
+pipeline `#<n> push to <ref> <sha> by <actor>`, its status, its age (the
+local time on hover), the commit's subject (the runner reads it from its
+mirror when the pipeline starts, and once at start for records without
+one), its note, and its jobs as cards laid out by their `needs` and
+bordered by status. While the channel in front has something running, a
+one-second clock moves its elapsed times. The cables between the cards are one
 `iced_nodegraph_sdf` primitive under them; nothing pans, zooms, moves or
 takes the wheel, so the list scrolls like any other. Pressing a job
 opens its transcript in a pane beside the list: the runner starts

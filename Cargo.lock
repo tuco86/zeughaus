@@ -7278,6 +7278,7 @@ dependencies = [
 name = "zeughaus"
 version = "0.1.0-dev"
 dependencies = [
+ "chrono",
  "console_error_panic_hook",
  "getrandom 0.4.3",
  "iced",

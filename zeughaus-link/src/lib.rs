@@ -38,7 +38,7 @@ pub mod runs;
 
 pub use ci::{
     ChannelView, CiOverview, CiReply, CiRequest, JobView, MAX_CI_REPLY_BYTES, MAX_CI_REQUEST_BYTES,
-    MachineView, PipelineView,
+    MachineJob, MachineView, PipelineView,
 };
 pub use events::{
     ErrorRow, MAX_EVENT_BYTES, MAX_SNAPSHOT_BYTES, MAX_TRIGGER_BYTES, OutputRow, RejectionRow,

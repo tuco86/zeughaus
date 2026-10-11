@@ -17,7 +17,7 @@ use weida::{Replier, TransferMeta};
 use zeughaus_link::ci::MAX_PIPELINES_PER_REQUEST;
 use zeughaus_link::{
     BusyMode, ChannelView, CiOverview, CiReply, CiRequest, JobView, MAX_CI_REPLY_BYTES,
-    MAX_CI_REQUEST_BYTES, MachineView, PipelineView,
+    MAX_CI_REQUEST_BYTES, MachineJob, MachineView, PipelineView,
 };
 use zeughaus_mux::TerminalId;
 use zeughaus_terminal::Profile;
@@ -132,11 +132,11 @@ impl CiServer {
     /// with the jobs running on it.
     fn machine_views(&self, pipelines: &[Pipeline]) -> Vec<MachineView> {
         let active = active_jobs(pipelines);
-        let running_on = |machine: Option<&str>| -> Vec<String> {
+        let running_on = |machine: Option<&str>| -> Vec<MachineJob> {
             active
                 .iter()
                 .filter(|(on, _)| on.as_deref() == machine)
-                .map(|(_, label)| label.clone())
+                .map(|(_, job)| job.clone())
                 .collect()
         };
         let state = self.busy.state();
@@ -351,9 +351,9 @@ fn channel_views(pipelines: &[Pipeline]) -> Vec<ChannelView> {
         .collect()
 }
 
-/// The jobs running now as (the machine they run on, `<repo> #<n> <job>`);
-/// no machine is the workstation itself.
-fn active_jobs(pipelines: &[Pipeline]) -> Vec<(Option<String>, String)> {
+/// The jobs running now with the machine they run on; no machine is the
+/// workstation itself.
+fn active_jobs(pipelines: &[Pipeline]) -> Vec<(Option<String>, MachineJob)> {
     pipelines
         .iter()
         .filter(|p| p.status == PipelineStatus::Running)
@@ -364,7 +364,12 @@ fn active_jobs(pipelines: &[Pipeline]) -> Vec<(Option<String>, String)> {
                 .map(move |j| {
                     (
                         j.def.machine.clone(),
-                        format!("{} #{} {}", p.repo, p.number, j.def.name),
+                        MachineJob {
+                            repo: p.repo.clone(),
+                            channel: p.channel.clone(),
+                            number: p.number,
+                            job: j.def.name.clone(),
+                        },
                     )
                 })
         })
@@ -727,6 +732,12 @@ mod tests {
                 channel("view", "release", 3, "failed"),
             ]
         );
+        let running = |number: u64, job: &str| MachineJob {
+            repo: "view".to_owned(),
+            channel: "dev".to_owned(),
+            number,
+            job: job.to_owned(),
+        };
         let machines: Vec<_> = seen
             .machines
             .iter()
@@ -735,15 +746,20 @@ mod tests {
                     m.name.as_str(),
                     m.kind.as_str(),
                     m.status.as_str(),
-                    m.jobs.iter().map(String::as_str).collect::<Vec<_>>(),
+                    m.jobs.clone(),
                 )
             })
             .collect();
         assert_eq!(
             machines,
             [
-                ("workstation", "workstation", "free", vec!["view #2 build"]),
-                ("mac", "unix-host", "unknown", vec!["view #2 mac"]),
+                (
+                    "workstation",
+                    "workstation",
+                    "free",
+                    vec![running(2, "build")]
+                ),
+                ("mac", "unix-host", "unknown", vec![running(2, "mac")]),
             ]
         );
 

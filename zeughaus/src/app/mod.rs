@@ -2561,6 +2561,13 @@ impl App {
             );
         }
 
+        // Running pipelines and jobs show their elapsed seconds, which only
+        // a redraw moves; the clock exists while such a channel is in front.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.ci_clock_wanted() {
+            subs.push(iced::time::every(std::time::Duration::from_secs(1)).map(|_| Message::Tick));
+        }
+
         // A split drag holds its newest ratio back; without a clock the last
         // one of a gesture would never be sent, and the runner would keep a
         // ratio from the middle of the drag.

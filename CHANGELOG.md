@@ -71,16 +71,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps it zipped as the job's artifact `Zeughaus-macos-arm64.zip`.
   `deploy/macos-app.sh` honours `CARGO_TARGET_DIR`.
 - A CI runner gets a `CI <label>` section in the tab bar: a `Runners` tab
-  listing the workstation, the Windows VM and unix hosts with their status
-  and active jobs, and a locked group per repository with one tab per
-  channel. A channel tab lists its pipelines in a plain scrollable, newest
-  on top: what started each (`#200 push to main abcdef0 by cebor`), its
-  status and commit subject, and its jobs as a DAG of cards with cables
-  drawn by the node graph's renderer; pressing a job shows its
-  transcript read-only in the terminal widget, live while it runs. The
-  busy control moved from the runner's section to this one. New `/ci`
-  endpoint and `ci` pipeline event: editor and runner must be updated
-  together.
+  with a table of the workstation, the Windows VM and unix hosts, their
+  coloured state and their running jobs (each opens its transcript), and
+  a locked group per repository with one tab per channel, its dot coloured
+  by the channel's newest pipeline. A channel tab lists its pipelines in a
+  plain scrollable, newest on top: what started each (`#200 push to main
+  abcdef0 by cebor`), its status, when it started (`3h ago`, the exact time
+  on hover; running pipelines and jobs count up live) and commit subject,
+  and its jobs as a DAG of cards with cables drawn by the node graph's
+  renderer; pressing a job shows its transcript read-only in the terminal
+  widget, live while it runs. The busy control moved from the runner's
+  section to this one. New `/ci` endpoint and `ci` pipeline event: editor
+  and runner must be updated together. A CI runner fills in the commit
+  subject of records from before it was kept once at start.
 - Channels: `.zeughaus-ci/channels.toml` lists `[[channel]]` tables of
   `name` and `on` patterns; the first match names an event's channel, else
   the branch, `tags` or `cron`. `ci check`, `ci plan` and `ci status` show

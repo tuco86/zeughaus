@@ -130,8 +130,18 @@ pub struct MachineView {
     /// `workstation`, `windows-vm` or `unix-host`.
     pub kind: String,
     pub status: String,
-    /// The jobs running on it, as `<repo> #<n> <job>`.
-    pub jobs: Vec<String>,
+    /// The jobs running on it.
+    pub jobs: Vec<MachineJob>,
+}
+
+/// A job running on a machine, named so that an editor can open its
+/// transcript in the channel's tab.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineJob {
+    pub repo: String,
+    pub channel: String,
+    pub number: u64,
+    pub job: String,
 }
 
 impl CiRequest {
@@ -253,7 +263,12 @@ mod tests {
                             name: "workstation".to_owned(),
                             kind: "workstation".to_owned(),
                             status: "free".to_owned(),
-                            jobs: vec!["griasdi #7 build".to_owned()],
+                            jobs: vec![MachineJob {
+                                repo: "griasdi".to_owned(),
+                                channel: "dev".to_owned(),
+                                number: 7,
+                                job: "build".to_owned(),
+                            }],
                         },
                         MachineView {
                             name: "win11".to_owned(),

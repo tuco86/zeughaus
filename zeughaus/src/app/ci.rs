@@ -23,11 +23,15 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 
 use iced::widget::text::Wrapping;
-use iced::widget::{button, column, pin, responsive, row, rule, scrollable, stack, text};
+use iced::widget::{
+    button, column, container, pin, responsive, row, rule, scrollable, stack, text, tooltip,
+};
 use iced::{Alignment, Color, Element, Length, Point, Size, Task};
 use iced_nodegraph_sdf::Shape;
 use zeughaus_core::NodeId;
-use zeughaus_link::{CiOverview, CiReply, CiRequest, JobView, PipelineView};
+use zeughaus_link::{
+    CiOverview, CiReply, CiRequest, JobView, MachineJob, MachineView, PipelineView,
+};
 use zeughaus_mux::{
     Axis, GroupId, GroupSnapshot, PaneId, PaneNode, SplitId, TabId, TabSnapshot, TerminalId,
     WorkspaceItem, WorkspaceSnapshot,
@@ -40,7 +44,7 @@ use super::{App, unavailable};
 use crate::feed;
 use crate::message::{CiMsg, Message};
 use crate::transport::Endpoint;
-use crate::workspace::{self, RunnerKey, Surface};
+use crate::workspace::{self, RunnerKey, Surface, TabRef};
 
 mod cables;
 
@@ -80,6 +84,10 @@ const SP_4: f32 = 16.0;
 /// Text sizes: secondary lines, and everything else.
 const TEXT_SM: f32 = 12.0;
 const TEXT_MD: f32 = 14.0;
+/// Column widths of the Runners table.
+const MACHINE_WIDTH: f32 = 160.0;
+const KIND_WIDTH: f32 = 110.0;
+const STATE_WIDTH: f32 = 150.0;
 
 /// This editor's view of one runner's CI.
 pub(super) struct CiClient {
@@ -317,6 +325,20 @@ impl ChannelState {
         }
     }
 
+    /// Whether a pipeline or a job of the channel is running with a start
+    /// to count from: what a ticking clock has to redraw.
+    fn ticking(&self) -> bool {
+        self.pipelines.iter().any(|shown| {
+            let pipeline = &shown.pipeline;
+            (pipeline.finished.is_none() && matches!(Tone::of(&pipeline.status), Tone::Active))
+                || pipeline.jobs.iter().any(|job| {
+                    job.started.is_some()
+                        && job.finished.is_none()
+                        && matches!(Tone::of(&job.status), Tone::Active)
+                })
+        })
+    }
+
     fn upsert(&mut self, pipeline: PipelineView) {
         let number = pipeline.number;
         // Newest first, so a number sorts after the ones above it.
@@ -393,9 +415,24 @@ impl CiClient {
         self.terminals().any(|shown| shown == terminal)
     }
 
+    /// The colour of the dot on a channel's tab: how its newest pipeline
+    /// went, in the tone its cards use. None while there is nothing to say.
+    fn accent(&self, state: &ChannelState, theme: &Theme) -> Option<[u8; 4]> {
+        let channel = self
+            .overview
+            .as_ref()?
+            .channels
+            .iter()
+            .find(|c| c.repo == state.repo && c.channel == state.channel)?;
+        match Tone::of(&channel.status) {
+            Tone::Idle => None,
+            tone => Some(tone.color(theme).into_rgba8()),
+        }
+    }
+
     /// The section's snapshot: the Runners tab, then a locked group per
     /// repository with a tab per channel.
-    fn snapshot(&self) -> WorkspaceSnapshot {
+    fn snapshot(&self, theme: &Theme) -> WorkspaceSnapshot {
         let mut items = vec![WorkspaceItem::Tab(TabSnapshot {
             id: TabId(RUNNERS),
             title: "Runners".to_owned(),
@@ -413,7 +450,7 @@ impl CiClient {
                 .map(|(view, state)| TabSnapshot {
                     id: TabId(view),
                     title: state.title.clone(),
-                    accent_rgba: None,
+                    accent_rgba: self.accent(state, theme),
                     root: state.root(view),
                 })
                 .collect();
@@ -852,7 +889,7 @@ impl App {
             self.workspace.set_synthetic(
                 RunnerKey::ci(key),
                 &format!("CI {}", client.label),
-                Some(client.snapshot()),
+                Some(client.snapshot(&self.theme)),
             );
         }
         if tasks.is_empty() {
@@ -885,6 +922,14 @@ impl App {
             CiMsg::LoadOlder { view } => client.ask_pipelines(&key, view, true),
             CiMsg::OpenJob { view, number, job } => {
                 let asked = client.open_job(&key, view, number, job);
+                // A job opened from the Runners tab is in another tab.
+                let tab = TabRef {
+                    runner: RunnerKey::ci(&key),
+                    tab: TabId(view),
+                };
+                if self.workspace.active_tab() != Some(&tab) {
+                    self.workspace.activate(tab);
+                }
                 // The transcript this one replaced is no longer wanted.
                 Task::batch([asked, self.reconcile_terminals(&key)])
             }
@@ -913,6 +958,21 @@ impl App {
             .map(|(key, client)| client.ask_overview(key))
             .collect();
         Task::batch(tasks)
+    }
+
+    /// Whether something on screen counts seconds: the tab in front is a
+    /// channel with a running pipeline or job. The one-second clock runs
+    /// only while this holds, since every tick redraws the window.
+    pub(super) fn ci_clock_wanted(&self) -> bool {
+        let Some(front) = self.workspace.active_tab() else {
+            return false;
+        };
+        front
+            .runner
+            .ci_runner()
+            .and_then(|runner| self.ci.get(&runner))
+            .and_then(|client| client.views.get(&front.tab.0))
+            .is_some_and(ChannelState::ticking)
     }
 
     /// A pipeline of `repo`'s `channel` changed. The pipeline is asked for
@@ -1035,7 +1095,7 @@ impl App {
             return unavailable("CI", "This section is not a runner's CI.");
         };
         if view == RUNNERS {
-            return self.runners_view(client);
+            return self.runners_view(runner, client);
         }
         match client.views.get(&view) {
             Some(state) => self.channel_view(runner, view, state),
@@ -1043,8 +1103,13 @@ impl App {
         }
     }
 
-    /// The machines the CI runs jobs on, one row each.
-    fn runners_view<'a>(&'a self, client: &'a CiClient) -> Element<'a, Message, Theme> {
+    /// The machines the CI runs jobs on: a table under a toolbar, like a
+    /// channel's list.
+    fn runners_view<'a>(
+        &'a self,
+        runner: &'a RunnerKey,
+        client: &'a CiClient,
+    ) -> Element<'a, Message, Theme> {
         let Some(overview) = &client.overview else {
             return unavailable(
                 "Runners",
@@ -1052,25 +1117,113 @@ impl App {
             );
         };
         let muted = self.theme.muted();
-        let rows = overview.machines.iter().map(|machine| {
-            let jobs = if machine.jobs.is_empty() {
-                "idle".to_owned()
-            } else {
-                machine.jobs.join(", ")
-            };
-            row![
-                text(machine.name.as_str()).size(14).width(160),
-                text(machine.kind.as_str()).size(12).color(muted).width(110),
-                text(machine.status.as_str()).size(12).width(150),
-                text(jobs).size(12),
-            ]
-            .spacing(12)
+        let head = |label: &'static str| text(label).size(TEXT_SM).color(muted);
+        let toolbar = row![text("Runners").size(TEXT_MD)]
             .align_y(Alignment::Center)
+            .padding([SP_2, SP_4]);
+        let mut table = column![
+            row![
+                head("Machine").width(MACHINE_WIDTH),
+                head("Kind").width(KIND_WIDTH),
+                head("State").width(STATE_WIDTH),
+                head("Jobs"),
+            ]
+            .spacing(SP_3)
+        ]
+        .spacing(SP_3)
+        .padding(SP_4);
+        for machine in &overview.machines {
+            table = table
+                .push(rule::horizontal(1))
+                .push(self.machine_row(runner, client, machine));
+        }
+        let body = scrollable(table).width(Length::Fill).height(Length::Fill);
+        column![toolbar, rule::horizontal(1), body].into()
+    }
+
+    /// One machine: its name, kind, state, and what it is running, each job
+    /// a link to its transcript.
+    fn machine_row<'a>(
+        &'a self,
+        runner: &'a RunnerKey,
+        client: &'a CiClient,
+        machine: &'a MachineView,
+    ) -> Element<'a, Message, Theme> {
+        let muted = self.theme.muted();
+        let jobs: Element<'a, Message, Theme> = if machine.jobs.is_empty() {
+            text("idle").size(TEXT_SM).color(muted).into()
+        } else {
+            row(machine
+                .jobs
+                .iter()
+                .map(|job| self.machine_job(runner, client, job)))
+            .spacing(SP_3)
+            .wrap()
             .into()
-        });
-        scrollable(column(rows).spacing(12).padding(16))
-            .width(Length::Fill)
-            .height(Length::Fill)
+        };
+        row![
+            text(machine.name.as_str())
+                .size(TEXT_MD)
+                .width(MACHINE_WIDTH),
+            text(machine.kind.as_str())
+                .size(TEXT_SM)
+                .color(muted)
+                .width(KIND_WIDTH),
+            text(machine.status.as_str())
+                .size(TEXT_SM)
+                .color(state_tone(&machine.status).text(&self.theme))
+                .width(STATE_WIDTH),
+            jobs,
+        ]
+        .spacing(SP_3)
+        .align_y(Alignment::Center)
+        .into()
+    }
+
+    /// `<repo> #<n> <job>`: pressing it brings its channel's tab to the
+    /// front with the job's transcript open. A channel this editor does not
+    /// show leaves plain text.
+    fn machine_job<'a>(
+        &'a self,
+        runner: &'a RunnerKey,
+        client: &'a CiClient,
+        job: &'a MachineJob,
+    ) -> Element<'a, Message, Theme> {
+        let label = text(format!("{} #{} {}", job.repo, job.number, job.job)).size(TEXT_SM);
+        let view = client
+            .repos
+            .get(&job.repo)
+            .and_then(|repo| repo.channels.get(&job.channel))
+            .copied()
+            .filter(|view| client.views.contains_key(view));
+        let Some(view) = view else {
+            return label.into();
+        };
+        button(label)
+            .padding(0)
+            .style(|theme: &Theme, status| {
+                let palette = theme.extended();
+                let text_color = match status {
+                    button::Status::Hovered | button::Status::Pressed => {
+                        palette.background.base.text
+                    }
+                    _ => Tone::Active.text(theme),
+                };
+                button::Style {
+                    text_color,
+                    ..button::Style::default()
+                }
+            })
+            .on_press_with(move || {
+                Message::Ci(
+                    runner.clone(),
+                    CiMsg::OpenJob {
+                        view,
+                        number: job.number,
+                        job: job.job.clone(),
+                    },
+                )
+            })
             .into()
     }
 
@@ -1185,6 +1338,7 @@ impl App {
         let pipeline = &shown.pipeline;
         let tone = Tone::of(&pipeline.status);
         let muted = self.theme.muted();
+        let now = now();
         let status = match pipeline.finished {
             Some(finished) if finished >= pipeline.created => {
                 format!(
@@ -1193,12 +1347,22 @@ impl App {
                     duration(finished - pipeline.created)
                 )
             }
+            None if matches!(tone, Tone::Active) => format!(
+                "{} {}",
+                pipeline.status,
+                duration(now.saturating_sub(pipeline.created))
+            ),
             _ => pipeline.status.clone(),
         };
+        let started = tip(
+            text(ago(pipeline.created, now)).size(TEXT_SM).color(muted),
+            local(pipeline.created),
+        );
         let mut header = column![
             row![
                 text(summary(pipeline)).size(TEXT_MD),
                 text(status).size(TEXT_SM).color(tone.text(&self.theme)),
+                started,
             ]
             .spacing(SP_3)
             .align_y(Alignment::Center)
@@ -1224,7 +1388,7 @@ impl App {
         }
         let mut entry = column![header].spacing(SP_3);
         if !shown.jobs.cards.is_empty() {
-            entry = entry.push(self.job_graph(runner, view, shown));
+            entry = entry.push(self.job_graph(runner, view, shown, now));
         }
         entry.into()
     }
@@ -1236,6 +1400,7 @@ impl App {
         runner: &'a RunnerKey,
         view: u64,
         shown: &'a Shown,
+        now: u64,
     ) -> Element<'a, Message, Theme> {
         let graph = &shown.jobs;
         let number = shown.pipeline.number;
@@ -1252,7 +1417,7 @@ impl App {
         );
         for (job, &at) in shown.pipeline.jobs.iter().zip(&graph.cards) {
             layers.push(
-                pin(self.job_card(runner, view, number, job))
+                pin(self.job_card(runner, view, number, job, now))
                     .position(at)
                     .into(),
             );
@@ -1271,12 +1436,16 @@ impl App {
         view: u64,
         number: u64,
         job: &'a JobView,
+        now: u64,
     ) -> Element<'a, Message, Theme> {
         let muted = self.theme.muted();
         let tone = Tone::of(&job.status);
         let status = match (job.started, job.finished) {
             (Some(started), Some(finished)) if finished >= started => {
                 format!("{} {}", job.status, duration(finished - started))
+            }
+            (Some(started), None) if matches!(tone, Tone::Active) => {
+                format!("{} {}", job.status, duration(now.saturating_sub(started)))
             }
             _ => job.status.clone(),
         };
@@ -1392,5 +1561,97 @@ fn duration(seconds: u64) -> String {
         0..60 => format!("{seconds}s"),
         60..3600 => format!("{}m {:02}s", seconds / 60, seconds % 60),
         _ => format!("{}h {:02}m", seconds / 3600, seconds % 3600 / 60),
+    }
+}
+
+/// The colour family of a machine's state word.
+fn state_tone(state: &str) -> Tone {
+    // `free (set)`: the word that says how it is, not how it got there.
+    match state.split_whitespace().next() {
+        Some("free" | "ready" | "online") => Tone::Good,
+        Some("busy" | "booting" | "stopping") => Tone::Active,
+        Some("offline") => Tone::Bad,
+        _ => Tone::Idle,
+    }
+}
+
+/// Seconds since the UNIX epoch, the clock `PipelineView.created` is read
+/// against.
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// `just now`, `5m ago`, `3h ago`, `2d ago`.
+fn ago(then: u64, now: u64) -> String {
+    match now.saturating_sub(then) {
+        0..60 => "just now".to_owned(),
+        seconds @ 60..3600 => format!("{}m ago", seconds / 60),
+        seconds @ 3600..86_400 => format!("{}h ago", seconds / 3600),
+        seconds => format!("{}d ago", seconds / 86_400),
+    }
+}
+
+/// The local date and time of an epoch second, to the second.
+fn local(seconds: u64) -> String {
+    i64::try_from(seconds)
+        .ok()
+        .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+        .map_or_else(
+            || format!("{seconds} s after the epoch"),
+            |time| {
+                time.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            },
+        )
+}
+
+/// `content` with `words` in a bubble below it, styled as the tab bar's
+/// tooltips are.
+fn tip<'a>(
+    content: impl Into<Element<'a, Message, Theme>>,
+    words: String,
+) -> Element<'a, Message, Theme> {
+    let bubble = container(text(words).size(TEXT_SM))
+        .padding([3, 6])
+        .style(|theme: &Theme| {
+            let style = iced_tabs::Catalog::tooltip(theme);
+            container::Style {
+                background: style.background,
+                text_color: Some(style.text),
+                border: style.border,
+                ..container::Style::default()
+            }
+        });
+    tooltip(content, bubble, tooltip::Position::Bottom)
+        .gap(SP_1)
+        .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ago_steps_at_each_unit_boundary() {
+        assert_eq!(ago(100, 100), "just now");
+        assert_eq!(ago(100, 159), "just now");
+        assert_eq!(ago(100, 160), "1m ago");
+        assert_eq!(ago(0, 3599), "59m ago");
+        assert_eq!(ago(0, 3600), "1h ago");
+        assert_eq!(ago(0, 86_399), "23h ago");
+        assert_eq!(ago(0, 86_400), "1d ago");
+        // A runner's clock ahead of this one is not a negative age.
+        assert_eq!(ago(500, 100), "just now");
+    }
+
+    #[test]
+    fn state_words_keep_their_tone_with_a_set_marker() {
+        assert!(matches!(state_tone("free (set)"), Tone::Good));
+        assert!(matches!(state_tone("busy"), Tone::Active));
+        assert!(matches!(state_tone("offline"), Tone::Bad));
+        assert!(matches!(state_tone("off"), Tone::Idle));
     }
 }
