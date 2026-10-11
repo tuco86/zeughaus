@@ -146,6 +146,10 @@ pub struct Pipeline {
     pub key: String,
     pub event: CiEvent,
     pub sha: Option<String>,
+    /// The first line of the commit's message, read from the mirror once
+    /// the sha is known; empty in records from before it was kept.
+    #[serde(default)]
+    pub subject: String,
     pub status: PipelineStatus,
     #[serde(default)]
     pub note: String,
@@ -746,6 +750,7 @@ impl Scheduler {
             key,
             event: event.clone(),
             sha: None,
+            subject: String::new(),
             status: PipelineStatus::Running,
             note: String::new(),
             created: super::now_secs(),
@@ -898,6 +903,10 @@ impl Scheduler {
             }
         };
         pipeline.sha = Some(sha.clone());
+        // Only shown, so a commit git cannot describe leaves it empty.
+        pipeline.subject = git(&mirror, &["log", "-1", "--format=%s", &sha], &[])
+            .map(|subject| subject.trim().to_owned())
+            .unwrap_or_default();
         let (files, containerfiles) = read_ci(&mirror, &sha)?;
         pipeline.channel = Channels::from_files(&files)?.of(event);
         // git has no empty directories: nothing listed is no folder.
@@ -2138,6 +2147,7 @@ mod tests {
                 received: 0,
             },
             sha: None,
+            subject: String::new(),
             status: PipelineStatus::Running,
             note: String::new(),
             created: 0,

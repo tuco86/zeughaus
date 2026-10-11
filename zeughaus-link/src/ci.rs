@@ -55,8 +55,9 @@ pub enum CiReply {
     Pipelines {
         pipelines: Vec<PipelineView>,
     },
+    /// Boxed: a pipeline is far larger than every other reply.
     Pipeline {
-        pipeline: Option<PipelineView>,
+        pipeline: Option<Box<PipelineView>>,
     },
     /// The mux terminal id of the transcript.
     Transcript {
@@ -94,6 +95,13 @@ pub struct PipelineView {
     pub event: String,
     pub git_ref: String,
     pub sha: Option<String>,
+    /// Who caused the pipeline: the pushing user, `cron`, or whoever queued
+    /// it by hand. Empty from a runner that does not report it.
+    #[serde(default)]
+    pub actor: String,
+    /// The first line of the commit's message; empty when it is not known.
+    #[serde(default)]
+    pub subject: String,
     pub status: String,
     pub note: String,
     /// Seconds since the UNIX epoch.
@@ -166,6 +174,8 @@ mod tests {
             event: "push".to_owned(),
             git_ref: "main".to_owned(),
             sha: Some("0123456789abcdef".to_owned()),
+            actor: "cebor".to_owned(),
+            subject: "fix(ci): keep the header short".to_owned(),
             status: "running".to_owned(),
             note: String::new(),
             created: 1_700_000_000,
@@ -258,7 +268,7 @@ mod tests {
                 pipelines: vec![pipeline()],
             },
             CiReply::Pipeline {
-                pipeline: Some(pipeline()),
+                pipeline: Some(Box::new(pipeline())),
             },
             CiReply::Pipeline { pipeline: None },
             CiReply::Transcript { terminal: 9 },

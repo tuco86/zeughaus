@@ -90,7 +90,10 @@ impl CiServer {
                 pipelines: page(self.records(&repo), &channel, before, limit),
             },
             CiRequest::Pipeline { repo, number } => CiReply::Pipeline {
-                pipeline: self.record(&repo, number).as_ref().map(pipeline_view),
+                pipeline: self
+                    .record(&repo, number)
+                    .as_ref()
+                    .map(|record| Box::new(pipeline_view(record))),
             },
             CiRequest::OpenTranscript { repo, number, job } => {
                 self.open_transcript(&repo, number, &job)
@@ -302,6 +305,8 @@ fn pipeline_view(pipeline: &Pipeline) -> PipelineView {
         event: pipeline.event.kind.to_string(),
         git_ref: pipeline.event.git_ref.clone(),
         sha: pipeline.sha.clone(),
+        actor: pipeline.event.actor.clone(),
+        subject: pipeline.subject.clone(),
         status: pipeline.status.as_str().to_owned(),
         note: pipeline.note.clone(),
         created: pipeline.created,
@@ -495,6 +500,7 @@ mod tests {
                 received: 0,
             },
             sha: Some(format!("{number:040}")),
+            subject: String::new(),
             status,
             note: String::new(),
             created: number,

@@ -190,6 +190,7 @@ mod tests {
                 received: 0,
             },
             sha: Some(format!("{number:07}abcdef")),
+            subject: String::new(),
             status: PipelineStatus::Failed,
             note: String::new(),
             created: number * 3600,

@@ -77,6 +77,9 @@ postcard = { version = "1.1", features = ["use-std"] }
 
 iced = { version = "0.14", features = ["advanced", "wgpu", "tokio"] }
 iced_nodegraph = "0.5"
+# The renderer behind iced_nodegraph, drawn directly where a graph is only
+# shown (a CI pipeline's cables). Same release line as `iced_nodegraph`.
+iced_nodegraph_sdf = "0.5"
 iced_tabs = { path = "iced_tabs", version = "0.1.0-dev" }
 # The terminal surface: one widget, one wgpu primitive per pane, drawing a
 # `zeughaus_mux::view::TerminalView`. Its own crate so the pipeline compiles

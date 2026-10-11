@@ -73,8 +73,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A CI runner gets a `CI <label>` section in the tab bar: a `Runners` tab
   listing the workstation, the Windows VM and unix hosts with their status
   and active jobs, and a locked group per repository with one tab per
-  channel. A channel tab draws its pipelines as DAGs of jobs, newest on
-  top, each in a framed band with its header; pressing a job shows its
+  channel. A channel tab lists its pipelines in a plain scrollable, newest
+  on top: what started each (`#200 push to main abcdef0 by cebor`), its
+  status and commit subject, and its jobs as a DAG of cards with cables
+  drawn by the node graph's renderer; pressing a job shows its
   transcript read-only in the terminal widget, live while it runs. The
   busy control moved from the runner's section to this one. New `/ci`
   endpoint and `ci` pipeline event: editor and runner must be updated

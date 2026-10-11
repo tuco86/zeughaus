@@ -8,11 +8,14 @@
 //! `local` section is built from the document: a snapshot whose ids this
 //! module mints and no runner knows.
 //!
-//! A channel tab draws the channel's pipelines as bands of job nodes in a node
-//! graph that cannot be edited. Pressing a job asks the runner for a
-//! transcript: a read-only terminal of the runner's own mux that replays the
-//! job's recorded output, live while the job runs, and which the tab then
-//! shows beside the graph like any other terminal.
+//! A channel tab lists the channel's pipelines, newest on top, in a plain
+//! scrollable: per pipeline its trigger, commit and status over a drawing of
+//! its jobs. The jobs are cards laid out by what they need, joined by cables
+//! drawn with the node graph's renderer; nothing in it pans, zooms or moves.
+//! Pressing a job asks the runner for a transcript: a read-only terminal of
+//! the runner's own mux that replays the job's recorded output, live while
+//! the job runs, and which the tab then shows beside the list like any other
+//! terminal.
 //!
 //! Native only: the browser editor reaches no runner.
 
@@ -20,12 +23,9 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 
 use iced::widget::text::Wrapping;
-use iced::widget::{Row, button, column, container, row, scrollable, space, text};
-use iced::{Alignment, Element, Length, Point, Size, Task};
-use iced_nodegraph::{
-    Ids, Keymap, NodeGraph, NodeStatus, NodeStyle, Pattern, PinDirection, PinRef, PinSide,
-    default_node_style, edge as ng_edge, node as ng_node, node_pin,
-};
+use iced::widget::{button, column, pin, responsive, row, rule, scrollable, stack, text};
+use iced::{Alignment, Color, Element, Length, Point, Size, Task};
+use iced_nodegraph_sdf::Shape;
 use zeughaus_core::NodeId;
 use zeughaus_link::{CiOverview, CiReply, CiRequest, JobView, PipelineView};
 use zeughaus_mux::{
@@ -34,12 +34,15 @@ use zeughaus_mux::{
 };
 use zeughaus_theme::Theme;
 
-use super::layout::auto_layout;
+use self::cables::{Cables, cable};
+use super::layout::auto_cells;
 use super::{App, unavailable};
 use crate::feed;
 use crate::message::{CiMsg, Message};
 use crate::transport::Endpoint;
 use crate::workspace::{self, RunnerKey, Surface};
+
+mod cables;
 
 /// The id of the Runners view, its tab and its pane. Every other id of a
 /// section comes from its client's counter, which starts above this.
@@ -58,57 +61,25 @@ const TRANSCRIPT_BIT: u64 = 1 << 63;
 /// A repository's group has no colour of its own.
 const GROUP_GREY: [u8; 4] = [0x80, 0x80, 0x80, 0xff];
 
-/// Where the camera of a channel view starts: the first band off the corner.
-const CAMERA_START: Point = Point::new(24.0, 24.0);
-
-/// The size of a job's node, in world units. It is a fixed box, so a band can
+/// The size of a job's card. It is a fixed box, so a pipeline's drawing can
 /// be sized without measuring what is in it.
 const JOB_WIDTH: f32 = 200.0;
-const JOB_HEIGHT: f32 = 100.0;
-/// The strip of a band that holds its header line.
-const HEADER_HEIGHT: f32 = 36.0;
-/// Space between a band's edge and the jobs inside it.
-const BAND_MARGIN: f32 = 40.0;
-/// Space between two bands.
-const BAND_GAP: f32 = 24.0;
-/// A band is never narrower than its header line needs.
-const MIN_BAND_WIDTH: f32 = 520.0;
-/// Jobs of one pipeline drawn. A node id is `number << 16 | index`, and the
-/// last index of the 16 bits names the band's frame.
-const MAX_JOBS: usize = 0xFFFF;
-/// Characters of a job's note its node shows.
+const JOB_HEIGHT: f32 = 96.0;
+/// Space between two columns of cards: the room a cable bends in.
+const COLUMN_GAP: f32 = 72.0;
+/// Space between two cards of one column.
+const ROW_GAP: f32 = 16.0;
+/// Characters of a job's note its card shows.
 const NOTE_CHARS: usize = 60;
 
-/// The id vocabulary of a channel view's node graph.
-///
-/// A node is a job (or a band's frame) by the ids [`job_id`] and
-/// [`frame_id`] make, a pin is the input (0) or the output (1) of a job, and
-/// an edge is [`edge_id`]. Pins carry no payload.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct CiIds;
-
-impl Ids for CiIds {
-    type NodeId = u64;
-    type PinId = u8;
-    type EdgeId = u64;
-    type AnchorId = u64;
-    type Payload = ();
-}
-
-const INPUT: u8 = 0;
-const OUTPUT: u8 = 1;
-
-fn job_id(number: u64, index: usize) -> u64 {
-    (number << 16) | index as u64
-}
-
-fn frame_id(number: u64) -> u64 {
-    (number << 16) | 0xFFFF
-}
-
-fn edge_id(number: u64, from: usize, to: usize) -> u64 {
-    (number << 32) | ((from as u64) << 16) | to as u64
-}
+/// The spacing scale of a channel's list.
+const SP_1: f32 = 4.0;
+const SP_2: f32 = 8.0;
+const SP_3: f32 = 12.0;
+const SP_4: f32 = 16.0;
+/// Text sizes: secondary lines, and everything else.
+const TEXT_SM: f32 = 12.0;
+const TEXT_MD: f32 = 14.0;
 
 /// This editor's view of one runner's CI.
 pub(super) struct CiClient {
@@ -162,11 +133,10 @@ struct ChannelState {
     /// Whether the runner has nothing older than the last pipeline loaded.
     exhausted: bool,
     error: Option<String>,
-    camera: (Point, f32),
     transcript: Option<Transcript>,
 }
 
-/// The job whose output a view shows beside its graph.
+/// The job whose output a view shows beside its list.
 struct Transcript {
     number: u64,
     job: String,
@@ -180,59 +150,57 @@ struct Transcript {
 /// out once rather than on every frame.
 struct Shown {
     pipeline: PipelineView,
-    header: String,
-    band: Band,
-}
-
-/// Where a pipeline's jobs go inside its band, and how large the band is.
-struct Band {
-    size: Size,
-    /// One per job, in the pipeline's order.
-    slots: Vec<Slot>,
-    /// `(needed, needing)` job indices.
-    edges: Vec<(usize, usize)>,
-}
-
-#[derive(Clone, Copy)]
-struct Slot {
-    /// Relative to the band's top left corner, header strip included.
-    at: Point,
-    input: bool,
-    output: bool,
+    jobs: JobGraph,
 }
 
 impl Shown {
     fn new(pipeline: PipelineView) -> Shown {
         Shown {
-            header: header(&pipeline),
-            band: Band::of(&pipeline),
+            jobs: JobGraph::of(&pipeline),
             pipeline,
         }
     }
 }
 
-/// `#<n>  <event> <ref>  <sha7>  <status>`, and the note after it when there
-/// is one.
-fn header(pipeline: &PipelineView) -> String {
+/// The drawing of a pipeline's jobs: where each card goes and the cables
+/// between them, in the drawing's own coordinates.
+struct JobGraph {
+    size: Size,
+    /// Top left corner of each job's card, in the pipeline's order.
+    cards: Vec<Point>,
+    /// One per need, from the right edge of the needed job's card to the
+    /// left edge of the needing one's.
+    cables: Vec<Shape>,
+    /// Where a cable meets a card, once per card edge.
+    ports: Vec<[f32; 2]>,
+}
+
+/// `#<n>  push to <ref>  <sha7>  by <actor>`: what started the pipeline.
+fn summary(pipeline: &PipelineView) -> String {
+    let trigger = match pipeline.event.as_str() {
+        "push" => format!("push to {}", pipeline.git_ref),
+        "cron" => format!("cron on {}", pipeline.git_ref),
+        event => format!("{event} {}", pipeline.git_ref),
+    };
     let sha = pipeline
         .sha
         .as_deref()
         .map(|sha| sha.get(..7).unwrap_or(sha))
         .unwrap_or_default();
+    // A cron's actor is `cron`, which the trigger already says.
+    let actor = if pipeline.actor.is_empty() || pipeline.actor == pipeline.event {
+        String::new()
+    } else {
+        format!("by {}", pipeline.actor)
+    };
     let mut parts = vec![
         format!("#{}", pipeline.number),
-        format!("{} {}", pipeline.event, pipeline.git_ref),
+        trigger,
         sha.to_owned(),
-        pipeline.status.clone(),
+        actor,
     ];
     parts.retain(|part| !part.trim().is_empty());
-    let mut header = parts.join("  ");
-    let note = flatten(&pipeline.note, usize::MAX);
-    if !note.is_empty() {
-        header.push_str("  ");
-        header.push_str(&note);
-    }
-    header
+    parts.join("  ")
 }
 
 /// `text` on one line, cut after `limit` characters.
@@ -245,9 +213,9 @@ fn flatten(text: &str, limit: usize) -> String {
         .to_owned()
 }
 
-impl Band {
-    fn of(pipeline: &PipelineView) -> Band {
-        let jobs = &pipeline.jobs[..pipeline.jobs.len().min(MAX_JOBS)];
+impl JobGraph {
+    fn of(pipeline: &PipelineView) -> JobGraph {
+        let jobs = &pipeline.jobs;
         let index: HashMap<&str, usize> = jobs
             .iter()
             .enumerate()
@@ -270,35 +238,47 @@ impl Band {
             .iter()
             .map(|&(from, to)| (NodeId(from as u64), NodeId(to as u64)))
             .collect();
-        let mut slots = vec![
-            Slot {
-                at: Point::ORIGIN,
-                input: false,
-                output: false,
-            };
-            jobs.len()
-        ];
-        for (node, at) in auto_layout(&nodes, &wires) {
-            if let Some(slot) = slots.get_mut(node.0 as usize) {
-                slot.at = Point::new(at.x, HEADER_HEIGHT + at.y);
+        let mut cards = vec![Point::ORIGIN; jobs.len()];
+        for (node, (column, row)) in auto_cells(&nodes, &wires) {
+            if let Some(card) = cards.get_mut(node.0 as usize) {
+                *card = Point::new(
+                    column as f32 * (JOB_WIDTH + COLUMN_GAP),
+                    row as f32 * (JOB_HEIGHT + ROW_GAP),
+                );
             }
         }
-        for &(from, to) in &edges {
-            slots[from].output = true;
-            slots[to].input = true;
-        }
 
-        let size = if slots.is_empty() {
-            Size::new(MIN_BAND_WIDTH, HEADER_HEIGHT + BAND_MARGIN)
+        let output = |at: usize| [cards[at].x + JOB_WIDTH, cards[at].y + JOB_HEIGHT * 0.5];
+        let input = |at: usize| [cards[at].x, cards[at].y + JOB_HEIGHT * 0.5];
+        let cables = edges
+            .iter()
+            .map(|&(from, to)| cable(output(from), input(to)))
+            .collect();
+        let mut outputs = vec![false; jobs.len()];
+        let mut inputs = vec![false; jobs.len()];
+        for &(from, to) in &edges {
+            outputs[from] = true;
+            inputs[to] = true;
+        }
+        let ports = (0..jobs.len())
+            .filter(|&at| outputs[at])
+            .map(output)
+            .chain((0..jobs.len()).filter(|&at| inputs[at]).map(input))
+            .collect();
+
+        let size = if cards.is_empty() {
+            Size::ZERO
         } else {
-            let right = slots.iter().map(|slot| slot.at.x).fold(0.0, f32::max);
-            let bottom = slots.iter().map(|slot| slot.at.y).fold(0.0, f32::max);
-            Size::new(
-                (right + JOB_WIDTH + BAND_MARGIN).max(MIN_BAND_WIDTH),
-                bottom + JOB_HEIGHT + BAND_MARGIN,
-            )
+            let right = cards.iter().map(|card| card.x).fold(0.0, f32::max);
+            let bottom = cards.iter().map(|card| card.y).fold(0.0, f32::max);
+            Size::new(right + JOB_WIDTH, bottom + JOB_HEIGHT)
         };
-        Band { size, slots, edges }
+        JobGraph {
+            size,
+            cards,
+            cables,
+            ports,
+        }
     }
 }
 
@@ -314,7 +294,6 @@ impl ChannelState {
             stale: false,
             exhausted: false,
             error: None,
-            camera: (CAMERA_START, 1.0),
             transcript: None,
         }
     }
@@ -800,7 +779,7 @@ async fn pipeline(
     number: u64,
 ) -> Result<Option<Box<PipelineView>>, String> {
     match feed::ci(endpoint, CiRequest::Pipeline { repo, number }).await? {
-        CiReply::Pipeline { pipeline } => Ok(pipeline.map(Box::new)),
+        CiReply::Pipeline { pipeline } => Ok(pipeline),
         _ => Err(UNEXPECTED.to_owned()),
     }
 }
@@ -904,16 +883,6 @@ impl App {
                 result,
             } => client.pipeline_arrived(&key, repo, number, result),
             CiMsg::LoadOlder { view } => client.ask_pipelines(&key, view, true),
-            CiMsg::Camera {
-                view,
-                position,
-                zoom,
-            } => {
-                if let Some(state) = client.views.get_mut(&view) {
-                    state.camera = (position, zoom);
-                }
-                Task::none()
-            }
             CiMsg::OpenJob { view, number, job } => {
                 let asked = client.open_job(&key, view, number, job);
                 // The transcript this one replaced is no longer wanted.
@@ -1105,7 +1074,7 @@ impl App {
             .into()
     }
 
-    /// A channel: its toolbar over the graph of its pipelines.
+    /// A channel: its toolbar over the list of its pipelines.
     fn channel_view<'a>(
         &'a self,
         runner: &'a RunnerKey,
@@ -1113,43 +1082,34 @@ impl App {
         state: &'a ChannelState,
     ) -> Element<'a, Message, Theme> {
         let secondary = |theme: &Theme, status| button::secondary(theme.base(), status);
-        let mut toolbar = row![text(state.title.as_str()).size(14)]
-            .spacing(10)
+        let mut toolbar = row![text(state.title.as_str()).size(TEXT_MD)]
+            .spacing(SP_3)
             .align_y(Alignment::Center)
-            .padding([6, 10]);
-        if state.loaded && !state.exhausted {
-            let older = button(text("Load older").size(12))
-                .padding([2, 8])
-                .style(secondary);
-            toolbar = toolbar.push(if state.loading {
-                older
-            } else {
-                older.on_press_with(move || Message::Ci(runner.clone(), CiMsg::LoadOlder { view }))
-            });
-        }
+            .padding([SP_2, SP_4]);
         if let Some(open) = &state.transcript {
             toolbar = toolbar
                 .push(
                     text(format!("#{} {}", open.number, open.job))
-                        .size(12)
+                        .size(TEXT_SM)
                         .color(self.theme.muted()),
                 )
                 .push(
-                    button(text("Close transcript").size(12))
-                        .padding([2, 8])
+                    button(text("Close transcript").size(TEXT_SM))
+                        .padding([SP_1, SP_2])
                         .style(secondary)
                         .on_press_with(move || {
                             Message::Ci(runner.clone(), CiMsg::CloseTranscript { view })
                         }),
                 );
             if let Some(error) = &open.error {
-                toolbar = toolbar.push(text(error.as_str()).size(12).color(self.theme.error()));
+                toolbar =
+                    toolbar.push(text(error.as_str()).size(TEXT_SM).color(self.theme.error()));
             }
         }
         if !state.pipelines.is_empty()
             && let Some(error) = &state.error
         {
-            toolbar = toolbar.push(text(error.as_str()).size(12).color(self.theme.error()));
+            toolbar = toolbar.push(text(error.as_str()).size(TEXT_SM).color(self.theme.error()));
         }
 
         let body: Element<'a, Message, Theme> = if state.pipelines.is_empty() {
@@ -1158,93 +1118,162 @@ impl App {
                 state.error.as_deref().unwrap_or("Loading pipelines."),
             )
         } else {
-            self.pipeline_graph(runner, view, state)
+            self.pipeline_list(runner, view, state)
         };
-        column![toolbar, body].into()
+        column![toolbar, rule::horizontal(1), body].into()
     }
 
-    /// The pipelines of a channel as bands of job nodes, newest on top, in a
-    /// graph the user can pan and zoom and nothing else: it reports no
-    /// callback but the camera, and its key bindings are off.
-    fn pipeline_graph<'a>(
+    /// The pipelines of a channel, newest on top and separated by rules, and
+    /// at the end the button that loads older ones. The list scrolls both
+    /// ways: a pipeline's drawing is as wide as its jobs need, and the list
+    /// is never narrower than the pane, so the rules reach across it.
+    fn pipeline_list<'a>(
         &'a self,
         runner: &'a RunnerKey,
         view: u64,
         state: &'a ChannelState,
     ) -> Element<'a, Message, Theme> {
-        let (position, zoom) = state.camera;
-        let mut graph: NodeGraph<'a, CiIds, Message, Theme> = NodeGraph::new();
-        graph = graph
-            .camera(position, zoom)
-            .on_camera(move |position, zoom| {
-                Message::Ci(
-                    runner.clone(),
-                    CiMsg::Camera {
-                        view,
-                        position,
-                        zoom,
-                    },
-                )
-            })
-            .keymap(Keymap::none());
+        let widest = state
+            .pipelines
+            .iter()
+            .map(|shown| shown.jobs.size.width)
+            .fold(0.0, f32::max)
+            + 2.0 * SP_4;
+        responsive(move |size| {
+            let mut list = column![]
+                .spacing(SP_4)
+                .padding(SP_4)
+                .width(widest.max(size.width));
+            for (at, shown) in state.pipelines.iter().enumerate() {
+                if at > 0 {
+                    list = list.push(rule::horizontal(1));
+                }
+                list = list.push(self.pipeline_entry(runner, view, shown));
+            }
+            if state.loaded && !state.exhausted {
+                let older = button(text("Load older").size(TEXT_SM))
+                    .padding([SP_1, SP_2])
+                    .style(|theme: &Theme, status| button::secondary(theme.base(), status));
+                list = list.push(if state.loading {
+                    older
+                } else {
+                    older.on_press_with(move || {
+                        Message::Ci(runner.clone(), CiMsg::LoadOlder { view })
+                    })
+                });
+            }
+            scrollable(list)
+                .direction(scrollable::Direction::Both {
+                    vertical: scrollable::Scrollbar::default(),
+                    horizontal: scrollable::Scrollbar::default(),
+                })
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        })
+        .into()
+    }
 
-        let mut top = 0.0;
-        for shown in &state.pipelines {
-            let number = shown.pipeline.number;
-            let band = &shown.band;
-            let header = container(
-                text(shown.header.as_str())
-                    .size(13)
-                    .wrapping(Wrapping::None),
-            )
-            .width(band.size.width)
-            .height(band.size.height)
-            .padding([8, 12])
-            .clip(true);
-            graph = graph.push_node(
-                ng_node(frame_id(number), Point::new(0.0, top), header)
-                    .frame()
-                    .style(band_style),
+    /// One pipeline: what started it and how it went, the commit's subject,
+    /// the pipeline's note, and the drawing of its jobs.
+    fn pipeline_entry<'a>(
+        &'a self,
+        runner: &'a RunnerKey,
+        view: u64,
+        shown: &'a Shown,
+    ) -> Element<'a, Message, Theme> {
+        let pipeline = &shown.pipeline;
+        let tone = Tone::of(&pipeline.status);
+        let muted = self.theme.muted();
+        let status = match pipeline.finished {
+            Some(finished) if finished >= pipeline.created => {
+                format!(
+                    "{} in {}",
+                    pipeline.status,
+                    duration(finished - pipeline.created)
+                )
+            }
+            _ => pipeline.status.clone(),
+        };
+        let mut header = column![
+            row![
+                text(summary(pipeline)).size(TEXT_MD),
+                text(status).size(TEXT_SM).color(tone.text(&self.theme)),
+            ]
+            .spacing(SP_3)
+            .align_y(Alignment::Center)
+        ]
+        .spacing(SP_1);
+        if !pipeline.subject.is_empty() {
+            header = header.push(
+                text(flatten(&pipeline.subject, usize::MAX))
+                    .size(TEXT_MD)
+                    .color(muted),
             );
-            for (index, (job, slot)) in shown.pipeline.jobs.iter().zip(&band.slots).enumerate() {
-                let tone = Tone::of(&job.status);
-                graph = graph.push_node(
-                    ng_node(
-                        job_id(number, index),
-                        Point::new(slot.at.x, top + slot.at.y),
-                        self.job_body(runner, view, number, job, *slot),
-                    )
-                    .style(move |theme: &Theme, status| tone.style(theme, status)),
-                );
-            }
-            for &(from, to) in &band.edges {
-                graph = graph.push_edge(ng_edge(
-                    edge_id(number, from, to),
-                    PinRef::new(job_id(number, from), OUTPUT),
-                    PinRef::new(job_id(number, to), INPUT),
-                ));
-            }
-            top += band.size.height + BAND_GAP;
         }
-        container(graph)
-            .width(Length::Fill)
-            .height(Length::Fill)
+        if !pipeline.note.is_empty() {
+            let color = match tone {
+                Tone::Bad => self.theme.error(),
+                _ => muted,
+            };
+            header = header.push(
+                text(flatten(&pipeline.note, usize::MAX))
+                    .size(TEXT_SM)
+                    .color(color),
+            );
+        }
+        let mut entry = column![header].spacing(SP_3);
+        if !shown.jobs.cards.is_empty() {
+            entry = entry.push(self.job_graph(runner, view, shown));
+        }
+        entry.into()
+    }
+
+    /// A pipeline's jobs: the cables at the bottom, a card per job over
+    /// them. Only the cards take input.
+    fn job_graph<'a>(
+        &'a self,
+        runner: &'a RunnerKey,
+        view: u64,
+        shown: &'a Shown,
+    ) -> Element<'a, Message, Theme> {
+        let graph = &shown.jobs;
+        let number = shown.pipeline.number;
+        let mut layers: Vec<Element<'a, Message, Theme>> =
+            Vec::with_capacity(graph.cards.len() + 1);
+        layers.push(
+            Cables::new(
+                graph.size,
+                &graph.cables,
+                &graph.ports,
+                self.theme.extended().background.strong.color,
+            )
+            .into(),
+        );
+        for (job, &at) in shown.pipeline.jobs.iter().zip(&graph.cards) {
+            layers.push(
+                pin(self.job_card(runner, view, number, job))
+                    .position(at)
+                    .into(),
+            );
+        }
+        stack(layers)
+            .width(graph.size.width)
+            .height(graph.size.height)
             .into()
     }
 
-    /// What a job's node holds: a button that opens the job's transcript, with
-    /// a pin on its left edge when the job needs another and one on its right
-    /// when another needs it. The pins sit at the middle of the button's
-    /// height, and take no part in dragging: the graph is read-only.
-    fn job_body<'a>(
+    /// A job's card: its name, how its run went, where it runs and its note,
+    /// outlined by how the run went. Pressing it opens the job's transcript.
+    fn job_card<'a>(
         &'a self,
         runner: &'a RunnerKey,
         view: u64,
         number: u64,
         job: &'a JobView,
-        slot: Slot,
     ) -> Element<'a, Message, Theme> {
         let muted = self.theme.muted();
+        let tone = Tone::of(&job.status);
         let status = match (job.started, job.finished) {
             (Some(started), Some(finished)) if finished >= started => {
                 format!("{} {}", job.status, duration(finished - started))
@@ -1252,23 +1281,32 @@ impl App {
             _ => job.status.clone(),
         };
         let mut lines = column![
-            text(job.name.as_str()).size(14).wrapping(Wrapping::None),
-            text(status).size(12).wrapping(Wrapping::None),
+            text(job.name.as_str())
+                .size(TEXT_MD)
+                .wrapping(Wrapping::None),
+            text(status)
+                .size(TEXT_SM)
+                .color(tone.text(&self.theme))
+                .wrapping(Wrapping::None),
             text(job.place.as_str())
-                .size(12)
+                .size(TEXT_SM)
                 .color(muted)
                 .wrapping(Wrapping::None),
         ]
-        .spacing(2);
+        .spacing(SP_1);
         if !job.note.is_empty() {
-            lines = lines.push(text(flatten(&job.note, NOTE_CHARS)).size(11).color(muted));
+            lines = lines.push(
+                text(flatten(&job.note, NOTE_CHARS))
+                    .size(TEXT_SM)
+                    .color(muted),
+            );
         }
-        let open = button(lines)
+        button(lines)
             .width(JOB_WIDTH)
             .height(JOB_HEIGHT)
-            .padding(8)
+            .padding(SP_2)
             .clip(true)
-            .style(job_button)
+            .style(move |theme: &Theme, status| tone.card(theme, status))
             .on_press_with(move || {
                 Message::Ci(
                     runner.clone(),
@@ -1278,45 +1316,12 @@ impl App {
                         job: job.name.clone(),
                     },
                 )
-            });
-
-        let mut body: Row<'a, Message, Theme> = Row::new().align_y(Alignment::Center);
-        if slot.input {
-            body = body.push(
-                node_pin(PinSide::Left, INPUT, space())
-                    .direction(PinDirection::Input)
-                    .disable_interactions(),
-            );
-        }
-        body = body.push(open);
-        if slot.output {
-            body = body.push(
-                node_pin(PinSide::Right, OUTPUT, space())
-                    .direction(PinDirection::Output)
-                    .disable_interactions(),
-            );
-        }
-        body.into()
+            })
+            .into()
     }
 }
 
-/// A band's backdrop: the comment preset with a body so thin that the cables
-/// show through it. The graph draws every cable under every node, a frame's
-/// body included.
-fn band_style(theme: &Theme, status: NodeStatus) -> NodeStyle {
-    NodeStyle {
-        fill_color: theme
-            .extended()
-            .background
-            .weak
-            .color
-            .scale_alpha(0.25)
-            .into(),
-        ..NodeStyle::comment(theme.base(), status)
-    }
-}
-
-/// How a job's node is outlined: by how its run went.
+/// How a run went: the colour of a job card's outline and of a status word.
 #[derive(Clone, Copy)]
 enum Tone {
     Good,
@@ -1329,48 +1334,55 @@ impl Tone {
     fn of(status: &str) -> Tone {
         match status {
             "succeeded" => Tone::Good,
-            "failed" => Tone::Bad,
+            "failed" | "error" => Tone::Bad,
             "running" | "starting" => Tone::Active,
             _ => Tone::Idle,
         }
     }
 
-    fn style(self, theme: &Theme, status: NodeStatus) -> NodeStyle {
+    fn color(self, theme: &Theme) -> Color {
         let palette = theme.extended();
-        let border = match self {
+        match self {
             Tone::Good => palette.success.base.color,
             Tone::Bad => palette.danger.base.color,
             Tone::Active => palette.primary.base.color,
             Tone::Idle => palette.background.strong.color,
-        };
-        NodeStyle {
-            corner_radius: 8.0,
-            border_color: border.into(),
-            border_pattern: Pattern::solid(2.0),
-            ..default_node_style(theme.base(), status)
         }
     }
-}
 
-/// A job's button: no body of its own, since the node draws it, and a tint
-/// under the pointer so it reads as pressable.
-fn job_button(theme: &Theme, status: button::Status) -> button::Style {
-    let palette = theme.extended();
-    let rest = button::Style {
-        background: None,
-        text_color: palette.background.base.text,
-        border: iced::Border {
-            radius: 8.0.into(),
+    /// A status word: the outline's hue mixed towards the foreground, since
+    /// a border colour is too dark to read as text on a dark theme; an idle
+    /// one is plain secondary text.
+    fn text(self, theme: &Theme) -> Color {
+        match self {
+            Tone::Idle => theme.muted(),
+            _ => iced::theme::palette::mix(
+                self.color(theme),
+                theme.extended().background.base.text,
+                0.25,
+            ),
+        }
+    }
+
+    /// A job's card. Opaque, because the cables run under the cards, and a
+    /// step lighter under the pointer so it reads as pressable.
+    fn card(self, theme: &Theme, status: button::Status) -> button::Style {
+        let palette = theme.extended();
+        let background = match status {
+            button::Status::Hovered => palette.background.weak.color,
+            button::Status::Pressed => palette.background.neutral.color,
+            button::Status::Active | button::Status::Disabled => palette.background.weaker.color,
+        };
+        button::Style {
+            background: Some(background.into()),
+            text_color: palette.background.base.text,
+            border: iced::Border {
+                color: self.color(theme),
+                width: 2.0,
+                radius: 8.0.into(),
+            },
             ..Default::default()
-        },
-        ..Default::default()
-    };
-    match status {
-        button::Status::Hovered | button::Status::Pressed => button::Style {
-            background: Some(palette.background.weak.color.scale_alpha(0.5).into()),
-            ..rest
-        },
-        button::Status::Active | button::Status::Disabled => rest,
+        }
     }
 }
 

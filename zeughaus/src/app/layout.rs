@@ -30,6 +30,26 @@ const LAYOUT_MARGIN: f32 = 40.0;
 /// incoming edges were not there, which is exactly "ignore the back edge", and
 /// guarantees termination because every step places one node.
 pub(super) fn auto_layout(nodes: &[NodeId], edges: &[(NodeId, NodeId)]) -> Vec<(NodeId, Point)> {
+    auto_cells(nodes, edges)
+        .into_iter()
+        .map(|(node, (column, row))| {
+            (
+                node,
+                Point::new(
+                    LAYOUT_MARGIN + column as f32 * LAYOUT_COLUMN,
+                    LAYOUT_MARGIN + row as f32 * LAYOUT_ROW,
+                ),
+            )
+        })
+        .collect()
+}
+
+/// The grid [`auto_layout`] places on: `(column, row)` per node, sorted by
+/// id, for a caller that spaces the cells itself.
+pub(super) fn auto_cells(
+    nodes: &[NodeId],
+    edges: &[(NodeId, NodeId)],
+) -> Vec<(NodeId, (usize, usize))> {
     use std::collections::BTreeSet;
 
     let present: HashSet<NodeId> = nodes.iter().copied().collect();
@@ -102,7 +122,7 @@ pub(super) fn auto_layout(nodes: &[NodeId], edges: &[(NodeId, NodeId)]) -> Vec<(
         columns[depth].push(*node);
     }
 
-    let mut positions: HashMap<NodeId, Point> = HashMap::with_capacity(nodes.len());
+    let mut cells: HashMap<NodeId, (usize, usize)> = HashMap::with_capacity(nodes.len());
     for (depth, column) in columns.iter().enumerate() {
         let mut sorted: Vec<(Option<f32>, u64, NodeId)> = column
             .iter()
@@ -111,7 +131,7 @@ pub(super) fn auto_layout(nodes: &[NodeId], edges: &[(NodeId, NodeId)]) -> Vec<(
                     .get(node)
                     .into_iter()
                     .flatten()
-                    .filter_map(|source| positions.get(source).map(|p| p.y))
+                    .filter_map(|source| cells.get(source).map(|&(_, row)| row as f32))
                     .collect();
                 let barycenter = if heights.is_empty() {
                     None
@@ -133,17 +153,11 @@ pub(super) fn auto_layout(nodes: &[NodeId], edges: &[(NodeId, NodeId)]) -> Vec<(
             (None, None) => a.1.cmp(&b.1),
         });
         for (row, (_, _, node)) in sorted.into_iter().enumerate() {
-            positions.insert(
-                node,
-                Point::new(
-                    LAYOUT_MARGIN + depth as f32 * LAYOUT_COLUMN,
-                    LAYOUT_MARGIN + row as f32 * LAYOUT_ROW,
-                ),
-            );
+            cells.insert(node, (depth, row));
         }
     }
 
-    let mut out: Vec<(NodeId, Point)> = positions.into_iter().collect();
+    let mut out: Vec<(NodeId, (usize, usize))> = cells.into_iter().collect();
     out.sort_by_key(|(node, _)| node.0);
     out
 }

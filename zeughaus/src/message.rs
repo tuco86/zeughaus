@@ -343,12 +343,6 @@ pub enum CiMsg {
     LoadOlder {
         view: u64,
     },
-    /// The user moved the camera of a channel view.
-    Camera {
-        view: u64,
-        position: Point,
-        zoom: f32,
-    },
 }
 
 #[cfg(test)]
