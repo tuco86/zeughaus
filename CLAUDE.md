@@ -229,7 +229,8 @@ push only after the gate:
 - `cargo check --target wasm32-unknown-unknown -p zeughaus`
 
 A change to a crate's manifest or to what it includes also passes
-`cargo publish --workspace --dry-run`.
+`cargo publish --workspace --dry-run` (a repeated one only after clearing
+the stale unpacked crates, `RELEASING.md` step 4).
 
 Iterate with `cargo check -q --message-format short -p <crate>`. One cargo
 invocation per workspace at a time; long runs get a generous timeout.

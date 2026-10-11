@@ -61,6 +61,18 @@ feature unification. It resolves crates that are not part of this workspace
 from crates.io, so a changed `third_party` crate has to be published first
 (step 6).
 
+Cargo unpacks the packaged crates of that local registry into
+`~/.cargo/registry/src/-<hash>/`, one directory per registry path, and never
+unpacks the same version there again. A second dry run of the same `-dev`
+version then builds against the sources of the first one and fails on
+anything added since (an unresolved import of a new type). Remove those
+directories before a repeated dry run; they hold only this workspace's
+crates:
+
+```bash
+rm -rf ~/.cargo/registry/src/-*/ target/package
+```
+
 ## 5. Commit and tag
 
 ```bash
