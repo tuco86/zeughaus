@@ -130,7 +130,10 @@ in that runner's locked `Triggered` group.
 
 Every terminal lives in a shim process (`zeughaus-runner shim <dir>`, one
 per terminal under `<state-dir>/terminals/`), so shells and job runs
-survive the runner. `SIGUSR1` makes the runner save
+survive the runner. Under a systemd user manager each shim runs in a
+transient scope of its own (`systemd-run --user --scope`): systemd-oomd
+kills whole cgroups, and then takes one terminal instead of the runner and
+every shell. `SIGUSR1` makes the runner save
 `<state-dir>/workspace.json` and `exec` its binary again; the new process
 reattaches every shim and restores tabs and splits. The editor answers
 `SIGUSR1` the same way: it saves its window size, tabs, cameras, selection,

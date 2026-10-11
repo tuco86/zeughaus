@@ -8,9 +8,12 @@ ExecStart=%h/.cargo/bin/zeughaus-runner
 # SIGUSR1 saves the workspace and execs the binary at the same path: a
 # `cargo install` over it is picked up without touching a terminal.
 ExecReload=/bin/kill -USR1 $MAINPID
-# Every terminal lives in a shim this process forked. The shims share the
-# unit's cgroup, and the default KillMode would take every shell down with
-# a stop or restart; the next runner reattaches them instead.
+# Every terminal lives in a shim this process starts, each in a transient
+# scope of its own (`systemd-run --user --scope`), so systemd-oomd takes one
+# terminal instead of the unit. Shims from before that, or started where
+# the scope could not be had, share the unit's cgroup, and the default
+# KillMode would take them down with a stop or restart; the next runner
+# reattaches them instead.
 KillMode=process
 # A start that fails (the state directory held by another runner, a bind
 # error) is retried.

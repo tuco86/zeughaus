@@ -142,6 +142,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- systemd-oomd no longer takes every shell down with the runner: under a
+  systemd user manager the runner starts each terminal's shim in a
+  transient scope of its own (`systemd-run --user --scope`), so an OOM
+  kill hits the one terminal using the memory. Shims started before the
+  update stay in the runner's unit until they exit.
 - The editor no longer panics when a terminal switches between the primary
   and the alternate screen while scrolled back, or is scrolled or resized on
   the alternate screen after scrollback was evicted: the two screens number

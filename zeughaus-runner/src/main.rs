@@ -553,11 +553,14 @@ fn terminal_host(
 ) -> zeughaus_terminal::TerminalHost {
     #[cfg(unix)]
     match exe {
-        Some(exe) => zeughaus_terminal::TerminalHost::Shim(zeughaus_terminal::ShimHost {
-            program: exe.clone(),
-            args: vec!["shim".into()],
-            root: state_dir.join("terminals"),
-        }),
+        Some(exe) => {
+            let (program, args) = shim_command(exe);
+            zeughaus_terminal::TerminalHost::Shim(zeughaus_terminal::ShimHost {
+                program,
+                args,
+                root: state_dir.join("terminals"),
+            })
+        }
         None => {
             eprintln!("[runner] cannot locate this executable; terminals end with the runner");
             zeughaus_terminal::TerminalHost::Local
@@ -568,6 +571,47 @@ fn terminal_host(
         let _ = (exe, state_dir);
         zeughaus_terminal::TerminalHost::Local
     }
+}
+
+/// How a shim is started: `exe shim`, inside a transient systemd scope of
+/// its own when this user has a systemd manager to ask. A shim started
+/// plainly stays in the runner's cgroup, and systemd-oomd kills whole
+/// cgroups: one hungry build in one terminal then takes the runner and
+/// every shell with it. In a scope per shim it takes that terminal only.
+/// `systemd-run --scope` registers itself and then execs the shim, so the
+/// shim forks away exactly as it does without it.
+#[cfg(unix)]
+fn shim_command(exe: &std::path::Path) -> (PathBuf, Vec<std::ffi::OsString>) {
+    use std::process::{Command, Stdio};
+
+    const SCOPE: [&str; 6] = [
+        "--user",
+        "--scope",
+        "--quiet",
+        "--collect",
+        "--description=Zeughaus terminal",
+        "--",
+    ];
+    // Asked once with a command that does nothing: no systemd, no user
+    // manager or no bus to it all mean the plain start.
+    let scoped = Command::new("systemd-run")
+        .args(SCOPE)
+        .arg("true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !scoped {
+        return (exe.to_path_buf(), vec!["shim".into()]);
+    }
+    eprintln!("[runner] terminals start in systemd scopes of their own");
+    let args = SCOPE
+        .iter()
+        .map(std::ffi::OsString::from)
+        .chain([exe.as_os_str().to_owned(), "shim".into()])
+        .collect();
+    ("systemd-run".into(), args)
 }
 
 /// Saves the workspace and replaces this process with `exe`, same PID and
