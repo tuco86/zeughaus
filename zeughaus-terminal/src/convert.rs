@@ -80,7 +80,18 @@ pub(crate) fn key(input: KeyInput) -> Option<(KeyCode, KeyModifiers)> {
 /// There is no raw key event behind a wire key, so what needs one is not
 /// reported: a bare modifier key, and the base-layout key of
 /// `REPORT_ALTERNATE_KEYS` (the shifted key is, from the character itself).
+///
+/// An unmodified Delete press is `CSI 3 ~` here, as the protocol specifies
+/// for a legacy functional key: WezTerm's encoder sends it as the BS byte,
+/// which every line editor reads as Backspace.
 pub(crate) fn kitty(input: KeyInput, flags: KittyKeyboardFlags) -> String {
+    if input.key == Key::Named(NamedKey::Delete)
+        && input.kind == KeyKind::Press
+        && input.modifiers == Modifiers::default()
+        && !flags.contains(KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES)
+    {
+        return "\x1b[3~".to_owned();
+    }
     let key = match input.key {
         Key::Char(c) => KittyCode::Char(c),
         Key::Named(named) => match named {

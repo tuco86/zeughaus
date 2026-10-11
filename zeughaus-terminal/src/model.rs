@@ -867,7 +867,7 @@ mod tests {
 
     #[test]
     fn keys_are_encoded_where_the_modes_are_known() {
-        use zeughaus_mux::NamedKey::{Enter, Up};
+        use zeughaus_mux::NamedKey::{Backspace, Delete, Enter, Up};
         use zeughaus_mux::input::Key::Char;
         let mut fixture = Fixture::new(20, 3, 10);
         let legacy = |fixture: &mut Fixture, input: KeyInput, expected: &[u8]| {
@@ -884,6 +884,9 @@ mod tests {
         legacy(&mut fixture, press(named(Enter), 0), b"\r");
         // xterm cannot tell Shift+Enter from Enter; a line feed can.
         legacy(&mut fixture, press(named(Enter), SHIFT), b"\n");
+        // Backspace erases left of the cursor (VERASE), Delete under it.
+        legacy(&mut fixture, press(named(Backspace), 0), b"\x7f");
+        legacy(&mut fixture, press(named(Delete), 0), b"\x1b[3~");
         let release = KeyInput {
             kind: zeughaus_mux::KeyKind::Release,
             ..press(Char('a'), 0)
@@ -894,7 +897,7 @@ mod tests {
 
     #[test]
     fn a_child_that_pushes_kitty_flags_gets_kitty_keys() {
-        use zeughaus_mux::NamedKey::Enter;
+        use zeughaus_mux::NamedKey::{Backspace, Delete, Enter};
         use zeughaus_mux::input::Key::Char;
         let mut fixture = Fixture::new(20, 3, 10);
         // Support is advertised: the query is answered with the flags in
@@ -916,6 +919,20 @@ mod tests {
         assert_eq!(
             kitty(&mut fixture, press(Char('a'), 0)).as_deref(),
             Some("a")
+        );
+        // Unmodified Backspace and Delete keep their legacy bytes; Delete is
+        // never the BS byte that programs read as Backspace.
+        assert_eq!(
+            kitty(&mut fixture, press(named(Backspace), 0)).as_deref(),
+            Some("\x7f")
+        );
+        assert_eq!(
+            kitty(&mut fixture, press(named(Delete), 0)).as_deref(),
+            Some("\x1b[3~")
+        );
+        assert_eq!(
+            kitty(&mut fixture, press(named(Delete), CTRL)).as_deref(),
+            Some("\x1b[3;5~")
         );
         let release = KeyInput {
             kind: zeughaus_mux::KeyKind::Release,
