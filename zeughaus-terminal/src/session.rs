@@ -1126,20 +1126,28 @@ mod tests {
         )
         .expect("spawn /bin/sh");
 
+        // The exit is recorded without waiting for the reader (see
+        // `wait_loop`), so the last chunk may land in the WAL after it.
+        let stream = |records: &[wal::Record]| -> Vec<u8> {
+            records
+                .iter()
+                .skip(1)
+                .flat_map(|r| r.bytes.iter().copied())
+                .collect()
+        };
         let finished = settle(&session, Duration::from_secs(10), |session| {
-            session.exit().is_some()
+            session.exit().is_some() && stream(&wal::read(&path).unwrap_or_default()) == b"ab"
         })
         .await;
 
         let records = wal::read(&path).unwrap_or_default();
         let _ = std::fs::remove_file(&path);
-        assert!(finished, "the child never finished");
+        assert!(
+            finished,
+            "the child never finished or its output never arrived"
+        );
         assert_eq!(records[0].bytes, b"earlier\n", "the WAL was truncated");
-        let stream: Vec<u8> = records[1..]
-            .iter()
-            .flat_map(|r| r.bytes.iter().copied())
-            .collect();
-        assert_eq!(stream, b"ab");
+        assert_eq!(stream(&records), b"ab");
         let first = records[1].at_micros;
         let last = records.last().expect("records").at_micros;
         assert!(

@@ -517,6 +517,22 @@ mod tests {
             .expect("the run completes")
     }
 
+    /// The run's output once it contains `needle`, or as it is after five
+    /// seconds. A run is over when its child exited or the wrapper wrote
+    /// `code`, and what it printed just before can still be on its way into
+    /// the WAL; the CI's excerpt waits for its marker the same way.
+    fn output_with(run_dir: &Path, needle: &str) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let log =
+                String::from_utf8_lossy(&run_output(run_dir).unwrap_or_default()).into_owned();
+            if log.contains(needle) || std::time::Instant::now() >= deadline {
+                return log;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
     #[test]
     fn a_run_is_logged_and_only_a_failed_one_keeps_its_terminal() {
         let state_dir = fresh_state_dir("e2e");
@@ -545,7 +561,7 @@ mod tests {
         assert!(!outputs.contains_key("ok"));
         let run_dir = PathBuf::from(outputs["dir"].downcast_ref::<String>().unwrap());
         assert_eq!(run_dir, state_dir.join("runs").join("1"));
-        let log = String::from_utf8_lossy(&run_output(&run_dir).unwrap()).into_owned();
+        let log = output_with(&run_dir, "a shell follows");
         assert!(
             log.contains("marker-one got=payload-text in="),
             "log was: {log:?}"
@@ -572,7 +588,7 @@ mod tests {
         assert_eq!(outputs["ok"].downcast_ref::<bool>(), Some(&true));
         let run_dir = PathBuf::from(outputs["dir"].downcast_ref::<String>().unwrap());
         assert_eq!(run_dir, state_dir.join("runs").join("2"));
-        assert!(String::from_utf8_lossy(&run_output(&run_dir).unwrap()).contains("marker-two"));
+        assert!(output_with(&run_dir, "marker-two").contains("marker-two"));
         assert!(!run_dir.join("code").exists());
         assert!(mux.session(TerminalId(2)).is_none());
         assert!(mux.session(TerminalId(1)).is_some());
