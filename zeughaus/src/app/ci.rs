@@ -518,9 +518,10 @@ impl CiClient {
                     .map(|c| (c.repo.as_str(), c.channel.as_str()))
                     .collect();
                 channels.sort_unstable();
-                for (repo, channel) in channels {
+                for &(repo, channel) in &channels {
                     self.view_of(repo, channel);
                 }
+                tasks.extend(self.forget_unlisted(&channels));
                 self.overview = Some(overview);
                 // The first page of a channel no view has loaded yet, and of
                 // one whose last attempt failed.
@@ -540,6 +541,37 @@ impl CiClient {
             tasks.push(self.ask_overview(key));
         }
         Task::batch(tasks)
+    }
+
+    /// Drops the views of channels the runner no longer lists (a repository
+    /// taken out of `ci.toml`, a channel whose last pipeline was pruned) and
+    /// the groups left empty, closing the transcripts they held. `listed` is
+    /// sorted.
+    fn forget_unlisted(&mut self, listed: &[(&str, &str)]) -> Vec<Task<Message>> {
+        let mut tasks = Vec::new();
+        for (repo, known) in &mut self.repos {
+            known.channels.retain(|channel, view| {
+                if listed
+                    .binary_search(&(repo.as_str(), channel.as_str()))
+                    .is_ok()
+                {
+                    return true;
+                }
+                if let Some(terminal) = self
+                    .views
+                    .remove(view)
+                    .and_then(|state| state.transcript)
+                    .and_then(|transcript| transcript.terminal)
+                {
+                    tasks.push(close(self.endpoint.clone(), terminal));
+                }
+                false
+            });
+        }
+        self.repos.retain(|_, known| !known.channels.is_empty());
+        self.fetching
+            .retain(|(repo, _), _| self.repos.contains_key(repo));
+        tasks
     }
 
     /// A channel's first page, or with `older` the page after the last
@@ -1653,5 +1685,41 @@ mod tests {
         assert!(matches!(state_tone("busy"), Tone::Active));
         assert!(matches!(state_tone("offline"), Tone::Bad));
         assert!(matches!(state_tone("off"), Tone::Idle));
+    }
+
+    /// A repository taken out of the runner's configuration leaves the tab
+    /// bar with the next overview, and the channels that stay keep their
+    /// views, so their tabs stay where they are.
+    #[test]
+    fn channels_the_overview_drops_lose_their_views_and_groups() {
+        let listing = |channels: &[(&str, &str)]| CiOverview {
+            channels: channels
+                .iter()
+                .map(|&(repo, channel)| zeughaus_link::ChannelView {
+                    repo: repo.to_owned(),
+                    channel: channel.to_owned(),
+                    latest: 1,
+                    status: "succeeded".to_owned(),
+                })
+                .collect(),
+            machines: Vec::new(),
+        };
+        let key = RunnerKey::new("sha256:ci");
+        let mut client = CiClient::new(Endpoint("weida://ci/".to_owned()), "ci".to_owned());
+        let _ = client.overview_arrived(
+            &key,
+            Ok(listing(&[
+                ("griasdi", "main"),
+                ("smoke", "cron"),
+                ("smoke", "main"),
+            ])),
+        );
+        let main = client.repos["griasdi"].channels["main"];
+        assert_eq!(client.views.len(), 3);
+
+        let _ = client.overview_arrived(&key, Ok(listing(&[("griasdi", "main")])));
+        assert!(!client.repos.contains_key("smoke"));
+        assert_eq!(client.views.keys().copied().collect::<Vec<_>>(), vec![main]);
+        assert_eq!(client.repos["griasdi"].channels["main"], main);
     }
 }

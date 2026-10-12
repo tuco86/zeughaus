@@ -6381,7 +6381,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "weida"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "bytes",
  "futures-io",
@@ -6400,11 +6400,11 @@ dependencies = [
 
 [[package]]
 name = "weida-core"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 
 [[package]]
 name = "weida-protocol"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "minicbor",
  "weida-core",
@@ -6412,7 +6412,7 @@ dependencies = [
 
 [[package]]
 name = "weida-runtime"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "tokio",
  "weida-core",
@@ -6421,7 +6421,7 @@ dependencies = [
 
 [[package]]
 name = "weida-winpipe"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "tokio",
  "windows-sys 0.61.2",
