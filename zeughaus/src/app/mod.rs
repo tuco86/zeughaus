@@ -224,6 +224,9 @@ pub struct App {
     /// The runners to be connected to, as URLs that pin a peer.
     #[cfg(not(target_arch = "wasm32"))]
     runner_urls: Vec<String>,
+    /// The CI services to be connected to, as URLs that pin a peer.
+    #[cfg(not(target_arch = "wasm32"))]
+    ci_urls: Vec<String>,
     /// The number the next edit sent to a runner carries; a refusal names it.
     #[cfg(not(target_arch = "wasm32"))]
     next_edit_request: u64,
@@ -249,8 +252,8 @@ pub struct App {
     /// action.
     #[cfg(not(target_arch = "wasm32"))]
     mux: BTreeMap<RunnerKey, MuxState>,
-    /// Each connected runner's CI as its section shows it, by the runner's
-    /// key. A runner that does not run CI has none.
+    /// Each connected CI service as its section shows it, by the CI link's
+    /// key (its fingerprint). Runner links have none.
     #[cfg(not(target_arch = "wasm32"))]
     ci: BTreeMap<RunnerKey, ci::CiClient>,
     /// Running without a window (`zeughaus --headless`): nobody sits in front
@@ -301,7 +304,7 @@ impl App {
         // a local scratch graph, which is gone when the window closes unless
         // it is saved to a file.
         #[cfg(not(target_arch = "wasm32"))]
-        let (runner_sources, runner_urls) = crate::prefs::RunnerSources::load();
+        let (runner_sources, sources) = crate::prefs::RunnerSources::load();
 
         // The bundled pack first, then what the user dropped into the state
         // directory: a file theme that takes a pack name loses, so a bundled
@@ -378,7 +381,9 @@ impl App {
             #[cfg(not(target_arch = "wasm32"))]
             runner_sources,
             #[cfg(not(target_arch = "wasm32"))]
-            runner_urls,
+            runner_urls: sources.runners,
+            #[cfg(not(target_arch = "wasm32"))]
+            ci_urls: sources.ci,
             #[cfg(not(target_arch = "wasm32"))]
             next_edit_request: 1,
             // Nothing is known about a runtime until a runner link reports:
@@ -465,7 +470,12 @@ impl App {
     /// is the difference.
     #[cfg(not(target_arch = "wasm32"))]
     fn runtime_text(&self) -> String {
-        let links = self.runtime.links.len();
+        let links = self
+            .runtime
+            .links
+            .values()
+            .filter(|link| link.kind == runtime::LinkKind::Runner)
+            .count();
         let mut text = match links {
             0 => " | no runner".to_string(),
             1 => " | 1 runner".to_string(),
@@ -478,7 +488,7 @@ impl App {
                 .runtime
                 .links
                 .values()
-                .filter(|link| link.graph_live)
+                .filter(|link| link.kind == runtime::LinkKind::Runner && link.graph_live)
                 .count();
             if attached != links {
                 text.push_str(&format!(" | graph: {attached} of {links} attached"));
@@ -492,7 +502,7 @@ impl App {
                 .runtime
                 .links
                 .values()
-                .filter(|link| link.traffic_live)
+                .filter(|link| link.kind == runtime::LinkKind::Runner && link.traffic_live)
                 .count();
             if live == links {
                 text.push_str(" | live");
@@ -511,7 +521,18 @@ impl App {
         // Whether a shell is reachable, said in its own words: a terminal
         // pane showing a last-known screen looks exactly like a live one.
         if links > 0 {
-            let attached = self.mux.values().filter(|mux| mux.attached).count();
+            let attached = self
+                .mux
+                .iter()
+                .filter(|(key, mux)| {
+                    mux.attached
+                        && self
+                            .runtime
+                            .links
+                            .get(*key)
+                            .is_some_and(|link| link.kind == runtime::LinkKind::Runner)
+                })
+                .count();
             if attached == links {
                 text.push_str(" | mux: attached");
             } else {
@@ -594,6 +615,7 @@ impl App {
             .runtime
             .links
             .iter()
+            .filter(|(_, link)| link.kind == runtime::LinkKind::Runner)
             .map(|(key, link)| palette::RunnerPalette {
                 key: key.clone(),
                 label: link.label.as_str(),
@@ -1387,7 +1409,8 @@ impl App {
                     // changed runner list, and a run of settings edits that
                     // has gone quiet reaches its runner here.
                     if let Some(urls) = self.runner_sources.poll() {
-                        self.runner_urls = urls;
+                        self.runner_urls = urls.runners;
+                        self.ci_urls = urls.ci;
                     }
                     self.commit_settled();
                     self.expire_hint();
@@ -1861,14 +1884,11 @@ impl App {
                 } else if key.as_str() == RunnerKey::LOCAL {
                     controls.push(header_control("graph", GLYPH_GRAPH, "+ Graph", "New graph"));
                 }
-                // The busy toggle is the CI section's: the machine is what the
-                // CI runs its jobs on, and the runner's own section is about
-                // its terminals and graphs.
+                // The busy toggle sits on the runner section whose runner
+                // reports a busy-measuring machine; the CI section has none.
                 #[cfg(not(target_arch = "wasm32"))]
-                if let Some(machine) = key
-                    .ci_runner()
-                    .and_then(|runner| self.runtime.links.get(&runner))
-                    .and_then(|link| link.machine)
+                if key.ci_runner().is_none()
+                    && let Some(machine) = self.runtime.links.get(key).and_then(|link| link.machine)
                 {
                     controls.push(busy_control(machine));
                 }
@@ -1937,7 +1957,7 @@ impl App {
             on_control: Box::new(|key, control| match control {
                 "graph" => Message::NewGraph(key),
                 "group" => Message::Workspace(W::NewGroup(key)),
-                "busy" => Message::CycleBusy(key.ci_runner().unwrap_or(key)),
+                "busy" => Message::CycleBusy(key),
                 _ => Message::Workspace(W::NewShell(key)),
             }),
             on_press_tab: Box::new(|tab| Message::Workspace(W::PressTab(tab))),

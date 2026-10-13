@@ -168,13 +168,14 @@ pub fn themes() -> Vec<Theme> {
 struct Config {
     /// Runner URLs (`weida://sha256:...@host:port/`), each pinning its peer.
     remotes: Vec<String>,
+    /// CI service URLs, in the same form. A CI holds pipelines and
+    /// transcripts, no graphs.
+    ci: Vec<String>,
 }
 
-/// The `remotes` of a `zeughaus.toml` text.
-fn parse_remotes(text: &str) -> Result<Vec<String>, String> {
-    toml::from_str::<Config>(text)
-        .map(|config| config.remotes)
-        .map_err(|e| e.to_string())
+/// The `remotes` and `ci` of a `zeughaus.toml` text.
+fn parse_config(text: &str) -> Result<Config, String> {
+    toml::from_str::<Config>(text).map_err(|e| e.to_string())
 }
 
 /// Modification time of `path`; `None` while it is missing.
@@ -182,31 +183,41 @@ fn stamp(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// Which files the runner list was read from, as of when.
+/// The peers this editor dials, as URLs that each pin their peer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sources {
+    /// Runners: the local one, then the remotes.
+    pub runners: Vec<String>,
+    /// CI services.
+    pub ci: Vec<String>,
+}
+
+/// Which files the peer lists were read from, as of when.
 ///
-/// The list is the runner of this machine (its `endpoint` file, rewritten
-/// whenever that runner starts) followed by `zeughaus.toml`'s remotes. Both
-/// change while the editor runs, so the editor asks [`Self::poll`] on its
-/// clock instead of reading them again every turn.
+/// The runner list is the runner of this machine (its `endpoint` file,
+/// rewritten whenever that runner starts) followed by `zeughaus.toml`'s
+/// remotes; the CI list is its `ci`. Both files change while the editor runs,
+/// so the editor asks [`Self::poll`] on its clock instead of reading them
+/// again every turn.
 pub struct RunnerSources {
     endpoint_mtime: Option<SystemTime>,
     config_mtime: Option<SystemTime>,
 }
 
 impl RunnerSources {
-    /// The sources as they are now, with the runner URLs they name.
-    pub fn load() -> (Self, Vec<String>) {
+    /// The sources as they are now, with the URLs they name.
+    pub fn load() -> (Self, Sources) {
         let dir = zeughaus_link::credentials::state_dir();
         let sources = Self {
             endpoint_mtime: stamp(&zeughaus_link::credentials::endpoint_path(&dir)),
             config_mtime: stamp(&dir.join(CONFIG)),
         };
-        (sources, read_runner_urls(&dir))
+        (sources, read_sources(&dir))
     }
 
-    /// The new URL list when either file changed (or appeared or vanished)
+    /// The new lists when either file changed (or appeared or vanished)
     /// since the last call, else `None`.
-    pub fn poll(&mut self) -> Option<Vec<String>> {
+    pub fn poll(&mut self) -> Option<Sources> {
         let dir = zeughaus_link::credentials::state_dir();
         let endpoint_mtime = stamp(&zeughaus_link::credentials::endpoint_path(&dir));
         let config_mtime = stamp(&dir.join(CONFIG));
@@ -215,25 +226,45 @@ impl RunnerSources {
         }
         self.endpoint_mtime = endpoint_mtime;
         self.config_mtime = config_mtime;
-        Some(read_runner_urls(&dir))
+        Some(read_sources(&dir))
     }
 }
 
-/// The local runner's URL, then the remotes, each only if it can be dialled
-/// with a pinned peer. A rejected entry is reported once per reload.
-fn read_runner_urls(dir: &Path) -> Vec<String> {
-    let mut candidates: Vec<String> = zeughaus_link::credentials::read_endpoint(dir)
-        .into_iter()
-        .collect();
+/// Both lists. A rejected entry is reported once per reload.
+fn read_sources(dir: &Path) -> Sources {
+    let mut config = Config::default();
     let path = dir.join(CONFIG);
     match std::fs::read_to_string(&path) {
-        Ok(text) => match parse_remotes(&text) {
-            Ok(remotes) => candidates.extend(remotes),
+        Ok(text) => match parse_config(&text) {
+            Ok(parsed) => config = parsed,
             Err(e) => eprintln!("[config] {}: {e}", path.display()),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => eprintln!("[config] {}: {e}", path.display()),
     }
+    Sources {
+        runners: read_runner_urls(dir, config.remotes),
+        ci: read_ci_urls(config.ci),
+    }
+}
+
+/// The local runner's URL, then the remotes, each only if it can be dialled
+/// with a pinned peer.
+fn read_runner_urls(dir: &Path, remotes: Vec<String>) -> Vec<String> {
+    let mut candidates: Vec<String> = zeughaus_link::credentials::read_endpoint(dir)
+        .into_iter()
+        .collect();
+    candidates.extend(remotes);
+    pinned(candidates)
+}
+
+/// The CI URLs that can be dialled with a pinned peer.
+fn read_ci_urls(urls: Vec<String>) -> Vec<String> {
+    pinned(urls)
+}
+
+/// What of `candidates` pins a peer; the rest is reported and dropped.
+fn pinned(candidates: Vec<String>) -> Vec<String> {
     candidates
         .into_iter()
         .filter(|url| match weida::EndpointAddr::parse(url) {
@@ -277,10 +308,19 @@ mod tests {
     }
 
     #[test]
-    fn remotes_are_read_from_the_list_and_bad_toml_is_an_error() {
-        let remotes = parse_remotes("remotes = [\"weida://a\", \"weida://b\"]").expect("parse");
-        assert_eq!(remotes, ["weida://a", "weida://b"]);
-        assert!(parse_remotes("").expect("empty").is_empty());
-        assert!(parse_remotes("remotes = [").is_err());
+    fn remotes_and_ci_are_read_from_their_lists_and_bad_toml_is_an_error() {
+        let config = parse_config("remotes = [\"weida://a\", \"weida://b\"]\nci = [\"weida://c\"]")
+            .expect("parse");
+        assert_eq!(config.remotes, ["weida://a", "weida://b"]);
+        assert_eq!(config.ci, ["weida://c"]);
+        let empty = parse_config("").expect("empty");
+        assert!(empty.remotes.is_empty() && empty.ci.is_empty());
+        assert!(parse_config("remotes = [").is_err());
+    }
+
+    #[test]
+    fn a_ci_url_without_a_pinned_fingerprint_is_rejected() {
+        assert!(read_ci_urls(vec!["weida://127.0.0.1:7444/".to_owned()]).is_empty());
+        assert!(read_ci_urls(vec!["not a url".to_owned()]).is_empty());
     }
 }

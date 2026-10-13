@@ -40,6 +40,7 @@ use zeughaus_theme::Theme;
 
 use self::cables::{Cables, cable};
 use super::layout::auto_cells;
+use super::runtime::LinkKind;
 use super::{App, unavailable};
 use crate::feed;
 use crate::message::{CiMsg, Message};
@@ -873,27 +874,25 @@ async fn close_transcript(endpoint: Endpoint, terminal: u64) -> Result<(), Strin
 }
 
 impl App {
-    /// Brings the CI sections in line with the runners: one client per
-    /// connected runner that runs CI, each with its section.
+    /// Brings the CI sections in line with the CI links: one client per
+    /// connected CI service, each with its section.
     ///
-    /// A runner that runs CI is one that reported a machine. A client stays
-    /// while its runner restarts -- its traffic is lost and the machine with
-    /// it for a moment, and a runner without a pinned port comes back on
-    /// another one -- so the tab in front does not change under the user;
-    /// it goes when the runner is gone or reports in again without a
-    /// machine. The overview of a new client is asked for here, which is
-    /// why this returns a task.
+    /// A client stays while its CI restarts -- its traffic is lost for a
+    /// moment, and a CI without a pinned port comes back on another one -- so
+    /// the tab in front does not change under the user; it goes when the link
+    /// is gone. The overview of a new client is asked for here, which is why
+    /// this returns a task.
     pub(super) fn sync_ci_sections(&mut self) -> Task<Message> {
         let ended: Vec<RunnerKey> = self
             .ci
-            .iter()
-            .filter(|(key, _)| {
+            .keys()
+            .filter(|key| {
                 self.runtime
                     .links
                     .get(*key)
-                    .is_none_or(|link| link.traffic_live && link.machine.is_none())
+                    .is_none_or(|link| link.kind != LinkKind::Ci)
             })
-            .map(|(key, _)| key.clone())
+            .cloned()
             .collect();
         for key in ended {
             self.ci.remove(&key);
@@ -902,7 +901,7 @@ impl App {
 
         let mut tasks = Vec::new();
         for (key, link) in &self.runtime.links {
-            if link.machine.is_some() && !self.ci.contains_key(key) {
+            if link.kind == LinkKind::Ci && !self.ci.contains_key(key) {
                 let mut client = CiClient::new(link.endpoint.clone(), link.label.clone());
                 tasks.push(client.ask_overview(key));
                 self.ci.insert(key.clone(), client);

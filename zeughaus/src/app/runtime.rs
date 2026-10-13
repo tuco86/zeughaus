@@ -74,6 +74,8 @@ pub(super) struct LiveFeed {
 /// One connected runner as this editor talks to it.
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) struct RunnerLink {
+    /// Whether this is a runner or a CI service.
+    pub kind: LinkKind,
     /// Where it serves. A different one means every address dialled is stale.
     pub endpoint: Endpoint,
     /// What its section is called: host and the start of its fingerprint.
@@ -86,8 +88,9 @@ pub(super) struct RunnerLink {
     /// Which subscription the traffic on screen came from, drawn from the
     /// editor-wide counter so a message names exactly one link.
     pub traffic_epoch: u64,
-    /// The CI machine's busy state as the runner last reported it; `None`
-    /// for a runner without CI, and while its traffic is lost.
+    /// The busy state of the machine this runner measures, as it last
+    /// reported it; `None` for a runner that measures none, and while its
+    /// traffic is lost. Always `None` for a CI link.
     pub machine: Option<zeughaus_link::MachineState>,
     /// The sequence that state came with. A snapshot sets it outright,
     /// because a restarted runner counts from zero again.
@@ -535,7 +538,7 @@ impl App {
     /// Stopping is by removal: every task handle aborts on drop.
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn reconcile_runtime(&mut self) -> Task<Message> {
-        let announced = announced_runners(&self.runner_urls);
+        let announced = announced_peers(&self.runner_urls, &self.ci_urls);
         let mut tasks = Vec::new();
         // A runner that left takes its values, its terminals and its section
         // with it; its graphs show as not running.
@@ -557,8 +560,11 @@ impl App {
         // address already dialled there is stale.
         let mut moved: Vec<RunnerKey> = Vec::new();
         for runner in announced {
-            self.workspace
-                .ensure_runner(runner.key.clone(), runner.label.clone());
+            let kind = runner.kind;
+            if kind == LinkKind::Runner {
+                self.workspace
+                    .ensure_runner(runner.key.clone(), runner.label.clone());
+            }
             let (restart_traffic, endpoint_changed) = match self.runtime.links.get_mut(&runner.key)
             {
                 Some(link) => {
@@ -576,6 +582,7 @@ impl App {
                     self.runtime.links.insert(
                         runner.key.clone(),
                         RunnerLink {
+                            kind,
                             endpoint: runner.endpoint,
                             label: runner.label,
                             traffic: None,
@@ -600,13 +607,13 @@ impl App {
             }
             // The graph task is replaced by the same rule: a runner that
             // moved holds a different document, and one without a task is
-            // not attached to anything.
+            // not attached to anything. A CI holds no graph.
             let graph_missing = self
                 .runtime
                 .links
                 .get(&runner.key)
                 .is_some_and(|link| link.graph.is_none());
-            if endpoint_changed || graph_missing {
+            if kind == LinkKind::Runner && (endpoint_changed || graph_missing) {
                 tasks.push(self.restart_graph(&runner.key));
             }
             // The mux hangs off the same address and is replaced by the same
@@ -868,39 +875,57 @@ impl App {
     }
 }
 
-/// One runner as the editor's runner list names it.
+/// What a peer the editor dials is for.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LinkKind {
+    /// Executes graphs and owns terminals.
+    Runner,
+    /// Serves pipelines and transcripts; has no graph and no workspace.
+    Ci,
+}
+
+/// One peer as the editor's lists name it.
 #[cfg(not(target_arch = "wasm32"))]
 struct Announced {
     key: RunnerKey,
     endpoint: Endpoint,
     label: String,
+    kind: LinkKind,
 }
 
-/// The runners the URLs name, in their order, keyed by the fingerprint their
-/// URL pins. A URL without a pinned fingerprint cannot be told apart from
-/// another runner and is skipped; two URLs with one fingerprint are one
-/// runner, the first.
+/// The peers the URLs name, runners first and each list in its order, keyed by
+/// the fingerprint their URL pins. A URL without a pinned fingerprint cannot
+/// be told apart from another peer and is skipped; two URLs with one
+/// fingerprint are one peer, the first. A CI whose fingerprint is also a
+/// runner's is kept as the runner: one fingerprint is one section key.
 #[cfg(not(target_arch = "wasm32"))]
-fn announced_runners(urls: &[String]) -> Vec<Announced> {
+fn announced_peers(runner_urls: &[String], ci_urls: &[String]) -> Vec<Announced> {
     let mut out: Vec<Announced> = Vec::new();
-    for url in urls {
-        let Ok(addr) = weida::EndpointAddr::parse(url) else {
-            continue;
-        };
-        let Some(fingerprint) = addr.peer.map(|fp| fp.to_string()) else {
-            continue;
-        };
-        if out.iter().any(|a| a.key.as_str() == fingerprint) {
-            continue;
+    for (urls, kind) in [(runner_urls, LinkKind::Runner), (ci_urls, LinkKind::Ci)] {
+        for url in urls {
+            let Ok(addr) = weida::EndpointAddr::parse(url) else {
+                continue;
+            };
+            let Some(fingerprint) = addr.peer.map(|fp| fp.to_string()) else {
+                continue;
+            };
+            if let Some(first) = out.iter().find(|a| a.key.as_str() == fingerprint) {
+                if first.kind != kind {
+                    eprintln!("[config] ci {url}: also listed as a runner, kept as the runner");
+                }
+                continue;
+            }
+            // The host and the first eight hex digits after `sha256:`: enough
+            // to tell two peers on one host apart at a glance.
+            let short = fingerprint.get(7..15).unwrap_or(&fingerprint);
+            out.push(Announced {
+                key: RunnerKey::new(&fingerprint),
+                endpoint: Endpoint(url.clone()),
+                label: format!("{} {short}", addr.host),
+                kind,
+            });
         }
-        // The host and the first eight hex digits after `sha256:`: enough to
-        // tell two runners on one host apart at a glance.
-        let short = fingerprint.get(7..15).unwrap_or(&fingerprint);
-        out.push(Announced {
-            key: RunnerKey::new(&fingerprint),
-            endpoint: Endpoint(url.clone()),
-            label: format!("{} {short}", addr.host),
-        });
     }
     out
 }

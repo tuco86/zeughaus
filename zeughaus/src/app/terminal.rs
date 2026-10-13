@@ -138,6 +138,14 @@ impl App {
         task
     }
 
+    /// Whether `key` is a CI service link rather than a runner.
+    pub(super) fn is_ci_link(&self, key: &RunnerKey) -> bool {
+        self.runtime
+            .links
+            .get(key)
+            .is_some_and(|link| link.kind == super::runtime::LinkKind::Ci)
+    }
+
     /// The runner whose mux attachment `epoch` names, if it is still live.
     fn mux_key(&self, epoch: u64) -> Option<RunnerKey> {
         self.mux
@@ -200,7 +208,12 @@ impl App {
                         let _ = sender.try_send(command);
                     }
                 }
-                self.workspace.apply_snapshot(&key, *workspace);
+                // A CI has no workspace: its sections are drawn from its CI
+                // client, and its empty snapshot must not create a runner
+                // section under its key.
+                if !self.is_ci_link(&key) {
+                    self.workspace.apply_snapshot(&key, *workspace);
+                }
                 // The transcripts a CI view showed were that process's
                 // terminals too.
                 let reopen = if restarted {
