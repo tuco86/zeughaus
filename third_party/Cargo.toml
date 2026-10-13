@@ -1,6 +1,6 @@
 # The terminal core of zeughaus-terminal: wezterm's `wezterm-term` and every
 # crate it pulls from the wezterm repository, copied from wezterm at
-# 2658f629cd7251ce63a1698f238da2585676aa4e, and wez's `finl_unicode` fork
+# e2a98e1b8af156988ad0ac778658ac27b60a55fb, and wez's `finl_unicode` fork
 # (branch `no_std`) at a1892f26245529f2ef3877a9ebd610c96cec07a6. The crates.io
 # releases of these crates lag that revision (the no_std rework, a larger
 # vtparse parameter limit), and `wezterm-term`, `wezterm-cell`,
@@ -107,7 +107,7 @@ wezterm-char-props = { package = "zeughaus-wezterm-char-props", version = "0.1.3
 wezterm-color-types = { package = "zeughaus-wezterm-color-types", version = "0.3.0", path = "wezterm/color-types", default-features = false }
 wezterm-dynamic = { package = "zeughaus-wezterm-dynamic", version = "0.2.1", path = "wezterm/wezterm-dynamic", default-features = false }
 wezterm-dynamic-derive = { package = "zeughaus-wezterm-dynamic-derive", version = "0.1.1", path = "wezterm/wezterm-dynamic/derive" }
-wezterm-escape-parser = { package = "zeughaus-wezterm-escape-parser", version = "0.1.0", path = "wezterm/wezterm-escape-parser" }
+wezterm-escape-parser = { package = "zeughaus-wezterm-escape-parser", version = "0.1.1", path = "wezterm/wezterm-escape-parser" }
 wezterm-input-types = { package = "zeughaus-wezterm-input-types", version = "0.1.0", path = "wezterm/wezterm-input-types", default-features = false }
 wezterm-surface = { package = "zeughaus-wezterm-surface", version = "0.1.0", path = "wezterm/wezterm-surface" }
 windows-sys = { version = "0.61.2", default-features = false }

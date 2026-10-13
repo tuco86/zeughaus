@@ -2830,7 +2830,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-wezterm-escape-parser"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "bitflags 2.13.2",

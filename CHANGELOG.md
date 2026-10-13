@@ -205,6 +205,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   list (attach it from the palette to look) and closes when the shell that
   followed the failure ends, also for runs a previous runner recorded; CI
   debug shells no longer sit in the tab bar.
+- An OSC 8 link whose URI contains `;` opens whole instead of cut at the
+  first `;`: `third_party/` follows wezterm to e2a98e1b, which also fixes
+  `zeughaus-wezterm-escape-parser` (now 0.1.1) building without `std`.
 
 ## [0.1.0-alpha.1] - 2026-09-26
 
