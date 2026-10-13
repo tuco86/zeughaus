@@ -5,8 +5,7 @@
 //! is read, so a peer cannot make this process allocate more than the kind
 //! allows.
 
-use tokio::io::{AsyncRead, AsyncReadExt};
-use weida::OutgoingTransfer;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeughaus_mux::{CodecError, FrameHeader, Message};
 
 /// Why a frame could not be read.
@@ -49,8 +48,8 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
 
 /// Writes one frame. A codec refusal is this side's bug and is reported as
 /// such; a transport failure is the peer going away.
-pub async fn write_frame(
-    writer: &mut OutgoingTransfer,
+pub async fn write_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
     message: &Message,
     request_id: u64,
 ) -> Result<(), String> {

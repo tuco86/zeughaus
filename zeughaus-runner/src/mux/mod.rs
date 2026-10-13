@@ -1,11 +1,10 @@
 //! The terminal multiplexer this runner owns: the shared workspace, the
 //! terminal sessions, and the `/mux` exchanges that serve them.
 //!
-//! `workspace` is the pure structure and its rules; `frames` reads and
-//! writes `zeughaus_mux` frames on weida streams; `service` is everything
-//! with a socket or a child process in it.
+//! `workspace` is the pure structure and its rules; `service` is everything
+//! with a socket or a child process in it. The frame reader and writer are
+//! `zeughaus_terminal::frames`.
 
-mod frames;
 mod persist;
 mod service;
 mod workspace;

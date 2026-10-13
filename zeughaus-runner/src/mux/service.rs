@@ -26,32 +26,22 @@ use zeughaus_mux::message::{Capability, Command, ErrorCode};
 use zeughaus_mux::workspace::ProfileId;
 use zeughaus_mux::{
     ClientHello, ClientInstanceId, CommandOutcome, CommandReply, ControlAttach, Controller,
-    Dimensions, MAJOR, MINOR, Message, RequestId, RowFetch, RowPage, RunnerIncarnation,
-    ServerHello, TerminalAttach, TerminalAttached, TerminalCommand, TerminalId, TopologyCommand,
-    WireError, WorkspaceSnapshot,
+    Dimensions, MAJOR, MINOR, Message, RequestId, RowFetch, RunnerIncarnation, ServerHello,
+    TerminalAttach, TerminalCommand, TerminalId, TopologyCommand, WireError, WorkspaceSnapshot,
 };
+use zeughaus_terminal::frames::{ReadError, read_frame, write_frame};
+use zeughaus_terminal::serve::{fetch_rows, stream_terminal};
 use zeughaus_terminal::wal::Wal;
 use zeughaus_terminal::{Profile, Session, TerminalHost};
 
-use super::frames::{ReadError, read_frame, write_frame};
 use super::persist::{self, SavedRun, SavedTerminal};
 use super::workspace::Workspace;
 use super::{GraphSync, OwnedPlacement};
 use crate::transport::principal_of;
 
-/// Scrollback rows sent with a head, above the visible ones: enough that a
-/// wheel notch or two needs no fetch, bounded so an attach stays small.
-const HEAD_ROWS_ABOVE: usize = 128;
-
 /// How long after a client vanishes its leases are held for it, so a network
 /// blink does not make its terminals read-only.
 const LEASE_GRACE: Duration = Duration::from_secs(10);
-
-/// The render cadence a subscriber coalesces at during a burst: a delta at
-/// most this often per terminal per client, whatever the child prints. A
-/// change after quiet goes out at once -- a keystroke's echo is not a burst,
-/// and waiting for company would put this whole window on every keystroke.
-const COALESCE: Duration = Duration::from_millis(12);
 
 /// Replies remembered per client for deduplicating a command resent after a
 /// redial.
@@ -595,125 +585,72 @@ impl MuxService {
             code: ErrorCode::UnknownTerminal,
             message: format!("no {terminal}"),
         })?;
-        let mut changes = session.changes();
-        let current = *changes.borrow_and_update();
-        let epoch = session.epoch();
-        let mut head = match attach.known {
-            Some(known) if known == (epoch, current) => None,
-            _ => Some(session.head(HEAD_ROWS_ABOVE)),
-        };
-        // Serials are per client and per exchange: a fresh attach starts
-        // its count at zero, whatever the engine has applied for others.
-        if let Some(head) = head.as_mut() {
-            head.input_serial_ack = 0;
-        }
-        let mut acked_serial = 0u64;
-        let mut sent_seq = head.as_ref().map_or(current, |h| h.seq);
-        let mut sent_epoch = head.as_ref().map_or(epoch, |h| h.epoch);
-        write_frame(
+        // Serials are per client and per exchange; the streaming half stamps
+        // every delta with the highest one handled here.
+        let acked_serial = AtomicU64::new(0);
+
+        let streaming = stream_terminal(
+            &session,
+            &attach,
+            &acked_serial,
             reply,
-            &Message::TerminalAttached(TerminalAttached { head }),
-            0,
-        )
-        .await
-        .map_err(|e| gone(&e))?;
-
-        // Every row written since the last delta travels, wherever the
-        // screen has scrolled it to, so what a client is scrolled to needs no
-        // bookkeeping here; `Viewport` is accepted and changes nothing.
-        let mut size = attach.size;
-        if self.controls(terminal, client) {
-            let _ = session.apply(&TerminalCommand::Resize(size));
-        }
-
-        let mut canceled = std::pin::pin!(canceled);
-        let mut last_sent = Instant::now() - COALESCE;
-        loop {
-            tokio::select! {
-                () = &mut canceled => break Ok(()),
-                changed = changes.changed() => {
-                    if changed.is_err() {
-                        break Ok(());
-                    }
-                    // Pace, do not delay: a change within the cadence of the
-                    // last delta waits for the rest of it, a change after
-                    // quiet is sent as it is.
-                    let due = last_sent + COALESCE;
-                    let now = Instant::now();
-                    if due > now {
-                        tokio::time::sleep(due - now).await;
-                    }
-                    changes.borrow_and_update();
-                    last_sent = Instant::now();
-                    let delta = session.delta_since(sent_seq);
-                    // A screen switch renumbers the rows: what the client
-                    // holds is of the other screen, and only a head replaces
-                    // it.
-                    let message = if delta.epoch == sent_epoch {
-                        let mut delta = delta;
-                        delta.input_serial_ack = acked_serial;
-                        sent_seq = delta.to_seq;
-                        Message::TerminalDelta(delta)
-                    } else {
-                        let mut head = session.head(HEAD_ROWS_ABOVE);
-                        head.input_serial_ack = acked_serial;
-                        sent_seq = head.seq;
-                        sent_epoch = head.epoch;
-                        Message::TerminalHead(head)
-                    };
-                    if let Err(e) = write_frame(reply, &message, 0).await {
-                        break Err(gone(&e));
-                    }
-                    if !self.exists(terminal) {
-                        // The pane was closed: the final delta carried the
-                        // exit, and there is nothing more to say.
-                        break Ok(());
-                    }
+            || {
+                if self.controls(terminal, client) {
+                    let _ = session.apply(&TerminalCommand::Resize(attach.size));
                 }
-                frame = read_frame(&mut body) => {
-                    let message = match frame {
-                        Ok((_, message)) => message,
-                        Err(ReadError::Ended) | Err(ReadError::Io(_)) => break Ok(()),
-                        Err(ReadError::Codec(e)) => break Err(WireError {
+            },
+            || !self.exists(terminal),
+        );
+        let reading = async {
+            loop {
+                let message = match read_frame(&mut body).await {
+                    Ok((_, message)) => message,
+                    Err(ReadError::Ended) | Err(ReadError::Io(_)) => return Ok(()),
+                    Err(ReadError::Codec(e)) => {
+                        return Err(WireError {
                             code: ErrorCode::Protocol,
                             message: e.to_string(),
-                        }),
-                    };
-                    let Message::TerminalCommand(command) = message else {
-                        break Err(WireError {
-                            code: ErrorCode::Protocol,
-                            message: format!("{:?} on a terminal exchange", message.kind()),
                         });
-                    };
-                    match command {
-                        TerminalCommand::Viewport { .. } => {}
-                        TerminalCommand::Resize(d) => {
-                            size = d;
-                            if self.acquire_if_free(terminal, client, &principal, &session)
-                                && let Err(e) = session.apply(&TerminalCommand::Resize(size))
-                            {
-                                eprintln!("[mux] {terminal}: resize refused: {e}");
-                            }
+                    }
+                };
+                let Message::TerminalCommand(command) = message else {
+                    return Err(WireError {
+                        code: ErrorCode::Protocol,
+                        message: format!("{:?} on a terminal exchange", message.kind()),
+                    });
+                };
+                match command {
+                    TerminalCommand::Viewport { .. } => {}
+                    TerminalCommand::Resize(d) => {
+                        if self.acquire_if_free(terminal, client, &principal, &session)
+                            && let Err(e) = session.apply(&TerminalCommand::Resize(d))
+                        {
+                            eprintln!("[mux] {terminal}: resize refused: {e}");
                         }
-                        input => {
-                            // Acknowledged whether or not it is applied: a
-                            // viewer's keystroke is handled by being dropped,
-                            // and its cursor must not wait for it forever.
-                            if let Some(serial) = input.serial() {
-                                acked_serial = acked_serial.max(serial);
-                            }
-                            // The first client that types acquires an unowned
-                            // terminal; a viewer's input is dropped, never
-                            // queued -- taking control is an explicit command.
-                            if self.acquire_if_free(terminal, client, &principal, &session)
-                                && let Err(e) = session.apply(&input)
-                            {
-                                eprintln!("[mux] {terminal}: input refused: {e}");
-                            }
+                    }
+                    input => {
+                        // Acknowledged whether or not it is applied: a
+                        // viewer's keystroke is handled by being dropped,
+                        // and its cursor must not wait for it forever.
+                        if let Some(serial) = input.serial() {
+                            acked_serial.fetch_max(serial, Ordering::SeqCst);
+                        }
+                        // The first client that types acquires an unowned
+                        // terminal; a viewer's input is dropped, never
+                        // queued -- taking control is an explicit command.
+                        if self.acquire_if_free(terminal, client, &principal, &session)
+                            && let Err(e) = session.apply(&input)
+                        {
+                            eprintln!("[mux] {terminal}: input refused: {e}");
                         }
                     }
                 }
             }
+        };
+        tokio::select! {
+            () = canceled => Ok(()),
+            result = streaming => result.map_err(|e| gone(&e)),
+            result = reading => result,
         }
     }
 
@@ -726,23 +663,12 @@ impl MuxService {
             code: ErrorCode::UnknownTerminal,
             message: format!("no {}", fetch.terminal),
         })?;
-        let Some((seq, first_retained, rows)) = session.rows(fetch.epoch, fetch.range) else {
-            return Err(WireError {
-                code: ErrorCode::Stale,
-                message: "unknown epoch".to_owned(),
-            });
-        };
-        let page = RowPage {
-            terminal: fetch.terminal,
-            epoch: fetch.epoch,
-            generation: fetch.generation,
-            first_retained,
-            seq,
-            rows,
-        };
-        write_frame(reply, &Message::RowPage(page), fetch.generation)
-            .await
-            .map_err(|e| gone(&e))
+        match fetch_rows(&session, &fetch) {
+            Message::Error(error) => Err(error),
+            page => write_frame(reply, &page, fetch.generation)
+                .await
+                .map_err(|e| gone(&e)),
+        }
     }
 
     // --- state -------------------------------------------------------------
@@ -1155,8 +1081,10 @@ mod tests {
     use weida::{ClientTls, EndpointAddr, Identity, Runtime, RuntimeConfig, ServerTls, Trust};
     use zeughaus_mux::input::Key;
     use zeughaus_mux::{
-        AttachTarget, Axis, KeyInput, KeyKind, Modifiers, NamedKey, SurfaceRef, TerminalEvent,
+        AttachTarget, Axis, KeyInput, KeyKind, Modifiers, NamedKey, SurfaceRef, TerminalAttached,
+        TerminalEvent,
     };
+    use zeughaus_terminal::serve::HEAD_ROWS_ABOVE;
 
     struct Client {
         requester: weida::Requester,
@@ -1499,14 +1427,14 @@ mod tests {
             0,
         )
         .await;
+        // The echo of the command line holds "100" too, before anything
+        // scrolled; wait until the screen has moved past the fetched range.
         let mut visible = None;
         until(&mut term, |delta| {
-            if row_text(&delta.row_replacements).contains("100") {
-                visible = delta.visible;
-                true
-            } else {
-                false
+            if let Some(v) = delta.visible {
+                visible = Some(v);
             }
+            visible.is_some_and(|v| v.start >= 40)
         })
         .await;
         let visible = visible.expect("a delta names the visible rows");

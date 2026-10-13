@@ -35,9 +35,11 @@
 
 mod config;
 mod convert;
+pub mod frames;
 #[cfg(unix)]
 pub mod locale;
 mod model;
+pub mod serve;
 mod session;
 #[cfg(unix)]
 pub mod shim;

@@ -182,6 +182,8 @@ enum Io {
     },
     #[cfg(unix)]
     Shim { sender: crate::shim::ShimSender },
+    /// No child at all: output arrives through `Session::feed`.
+    Fed,
 }
 
 struct Inner {
@@ -487,6 +489,36 @@ impl Session {
         )
     }
 
+    /// A session with no child: the screen is whatever [`Session::feed`] is
+    /// given, and [`Session::finish`] ends it. It is how a recorded stream
+    /// (a transcript) is served as a terminal. Input commands are ignored.
+    pub fn fed(id: TerminalId, size: Dimensions, scrollback: usize, label: &str) -> Session {
+        let inner = Inner::new(
+            id,
+            size,
+            scrollback.min(MAX_SCROLLBACK_ROWS),
+            label,
+            Box::new(std::io::sink()),
+            Io::Fed,
+            None,
+            Arc::new(AtomicBool::new(true)),
+        );
+        Session { inner }
+    }
+
+    /// Parses `bytes` as terminal output and announces the change. Only
+    /// meaningful on a [`Session::fed`] one.
+    pub fn feed(&self, bytes: &[u8]) {
+        let mut title = self.inner.model().title();
+        consume(&self.inner, wal::now_micros(), bytes, &mut title);
+    }
+
+    /// Records how the stream ended. The first exit stands.
+    pub fn finish(&self, exit: ExitState) {
+        self.inner.model().set_exit(exit);
+        self.inner.publish();
+    }
+
     #[cfg(unix)]
     fn attach_shim(
         id: TerminalId,
@@ -652,6 +684,19 @@ impl Session {
     /// the child as bytes or changes the model; an error is a refusal (a
     /// paste beyond the wire limit, an impossible size), never a panic.
     pub fn apply(&self, command: &TerminalCommand) -> Result<(), String> {
+        // A fed session has no child: input has nowhere to go, and a paste or
+        // a mouse report would only rewrite a screen somebody else drew.
+        if matches!(self.inner.io, Io::Fed)
+            && matches!(
+                command,
+                TerminalCommand::Key { .. }
+                    | TerminalCommand::Text { .. }
+                    | TerminalCommand::Paste { .. }
+                    | TerminalCommand::Mouse { .. }
+            )
+        {
+            return Ok(());
+        }
         match command {
             TerminalCommand::Key { serial, input } => {
                 // Encoded under the model's lock, written after it: the
@@ -718,6 +763,7 @@ impl Session {
                             rows: size.rows,
                         })
                         .map_err(|e| e.to_string())?,
+                    Io::Fed => {}
                 }
             }
             TerminalCommand::Focus(focused) => {
@@ -742,6 +788,10 @@ impl Session {
             #[cfg(unix)]
             Io::Shim { sender } => {
                 let _ = sender.send(&crate::shim::proto::ToShim::Close);
+            }
+            Io::Fed => {
+                self.inner.model().set_exit(ExitState::Killed);
+                self.inner.publish();
             }
         }
     }
@@ -1047,6 +1097,36 @@ mod tests {
             .iter()
             .flat_map(|row| row.spans.iter().map(|span| span.text.as_str()))
             .collect()
+    }
+
+    #[test]
+    fn a_fed_session_shows_what_it_was_fed_and_ends_when_finished() {
+        let session = Session::fed(TerminalId(9), Dimensions { cols: 80, rows: 24 }, 100, "t");
+        assert_eq!(session.exit(), None);
+        session.feed(b"hello\r\nworld");
+        let rows: Vec<String> = session
+            .head(0)
+            .rows
+            .iter()
+            .map(|row| {
+                row.spans
+                    .iter()
+                    .map(|s| s.text.as_str())
+                    .collect::<String>()
+            })
+            .map(|row| row.trim_end().to_owned())
+            .filter(|row| !row.is_empty())
+            .collect();
+        assert_eq!(rows, ["hello", "world"]);
+        // Input has nowhere to go and is not an error.
+        session
+            .apply(&TerminalCommand::Text {
+                serial: 1,
+                text: "x".to_owned(),
+            })
+            .expect("ignored");
+        session.finish(ExitState::Exited { code: 0 });
+        assert_eq!(session.exit(), Some(ExitState::Exited { code: 0 }));
     }
 
     /// Wait for `done` to hold, driven by the session's own notifications.
