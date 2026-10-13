@@ -7389,8 +7389,10 @@ dependencies = [
 name = "zeughaus-link"
 version = "0.1.0-dev"
 dependencies = [
+ "postcard",
  "serde",
  "serde_json",
+ "tokio",
  "weida",
  "zeughaus-core",
 ]

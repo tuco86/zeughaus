@@ -21,6 +21,8 @@
 //! | [`HOLD_PATH`] | req/rep | [`runs::HoldRequest`]: start no new runs |
 //! | [`BUSY_PATH`] | req/rep | [`machine::BusyRequest`]: override the CI busy measurement |
 //! | [`CI_PATH`] | req/rep | [`ci`]: channels, pipelines, machines, job transcripts |
+//! | [`ENLIST_PATH`] | one long exchange per runner | [`enlist`]: a runner takes assignments from the CI and streams output |
+//! | [`ARTIFACTS_PATH`] | one exchange per transfer | [`enlist::ArtifactRequest`]: a run's artifact tar |
 //! | [`MUX_PATH`] | req/rep exchanges | the terminal mux (`zeughaus-mux`) |
 //! | [`GRAPH_PATH`] | one long exchange per editor | [`graph`]: the document, edits and changes |
 //!
@@ -30,6 +32,7 @@
 
 pub mod ci;
 pub mod credentials;
+pub mod enlist;
 pub mod events;
 pub mod feed;
 pub mod graph;
@@ -96,3 +99,10 @@ pub const MUX_PATH: &str = "/mux";
 /// The graph document exchange: an editor attaches, receives the runner's
 /// whole document and then its changes, and sends edits on the same exchange.
 pub const GRAPH_PATH: &str = "/graph";
+
+/// The exchange a runner enlists into the CI on: one long exchange per runner,
+/// carrying [`enlist::FromRunner`] and [`enlist::ToRunner`] frames.
+pub const ENLIST_PATH: &str = "/enlist";
+
+/// Req/Rep endpoint a run's artifact tar travels on, one exchange per transfer.
+pub const ARTIFACTS_PATH: &str = "/artifacts";

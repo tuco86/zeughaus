@@ -16,3 +16,14 @@ serde_json = "1.0"
 # the fingerprints a pinned URL carries are weida's types, so the files on disk
 # are written and read as weida sees them and nothing translates in between.
 weida.workspace = true
+# Frame helpers for the enlist exchanges. Off for the wasm editor, which never
+# speaks them.
+tokio = { version = "1", default-features = false, features = ["io-util"], optional = true }
+postcard = { workspace = true, optional = true }
+
+[features]
+tokio = ["dep:tokio", "dep:postcard"]
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["io-util", "rt", "macros"] }
+postcard = { workspace = true }
