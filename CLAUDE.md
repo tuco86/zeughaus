@@ -188,10 +188,11 @@ not in `ci.toml` is refused. The Windows VM scripts (`vm/win11/`) are
 installed under `/usr/local/lib/zeughaus/vm/win11` and booted and stopped by
 the `tuco-pc` runner.
 
-Updates: `deploy/install-sadala.sh` (from tuco-pc: cross-builds with
-`deploy/build-aarch64.sh` in an arm64 container, installs both binaries,
-restarts the CI and reloads the sadala runner; `--setup --ci-toml <file>` the
-first time) and `deploy/install.sh` (tuco-pc, also the service runner);
+Updates: `deploy/install-sadala.sh` (on atik: builds with
+`deploy/build-aarch64.sh` in a native arm64 container of colima's docker,
+installs both binaries, restarts the CI and reloads the sadala runner;
+`--setup --ci-toml <file>` the first time, `--skip-build` to install what is
+already built) and `deploy/install.sh` (tuco-pc, also the service runner);
 `deploy/install-macos.sh` on atik.
 
 This repository is one of its repos: every push to Forgejo runs

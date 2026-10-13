@@ -1,6 +1,7 @@
 #!/bin/sh
-# Installs the CI and a runner on sadala (aarch64 Ubuntu), from the x86_64
-# workstation over ssh. Each runs as its own system user with its own state,
+# Installs the CI and a runner on sadala (aarch64 Ubuntu) over ssh, from
+# atik: its arm64 container engine builds the binaries natively
+# (deploy/build-aarch64.sh). Each runs as its own system user with its own state,
 # so the CI's secrets and the runner's jobs and shells never share a uid:
 #
 #   zeughaus-ci  /var/lib/zeughaus-ci  `zeughaus-ci serve` (weida 10.8.0.1:7444,

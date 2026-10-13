@@ -39,9 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - a failed job's terminal becomes a shell where it ran.
 
   Subcommands: `zeughaus-ci serve|check|plan|run|status|log|forge-check|secrets-check`.
-  `deploy/install-sadala.sh` installs it with a runner on sadala and
-  `deploy/build-aarch64.sh` builds it there. Editors list CIs as
-  `ci = [..]` in `zeughaus.toml`.
+  `deploy/install-sadala.sh` installs it with a runner on sadala, from
+  atik, where `deploy/build-aarch64.sh` builds both for aarch64 Linux in a
+  native arm64 container. Editors list CIs as `ci = [..]` in `zeughaus.toml`.
 - `zeughaus-runner timeout <seconds> -- <program> [args..]` runs a program
   under a deadline (`SIGTERM` to its process group, `SIGKILL` 60 s later,
   exit 124), because macOS has no `timeout`; host CI jobs use it.
