@@ -22,12 +22,13 @@ build of the editor compiles and edits locally (it reaches no runner yet).
 
 ```
 zeughaus/              # binary: the iced editor; edits the graph and views results, never executes
-zeughaus-runner/       # binary: headless process that executes the graph and owns the terminals
+zeughaus-runner/       # binary: headless process that executes the graph, owns the terminals and runs the CI jobs it is assigned
+zeughaus-ci/           # binary: the CI service; schedules pipelines onto enlisted runners, webhook intake, stored transcripts
 zeughaus-core/         # Ty/Typed/Value, pins, ExecutableNode/DomainPlugin, settings, scalar wire encoding, graph document types
 zeughaus-runtime/      # GraphExecutor: topology, node instances, edge cache, dirty set, async work, node errors
-zeughaus-link/         # the runner<->editor protocol over weida (graph, feed, events, snapshot, triggers, paths) and the credentials both ends present
+zeughaus-link/         # the runner<->editor protocol over weida (graph, feed, events, snapshot, triggers, paths), the runner<->CI enlist protocol and the credentials both ends present
 zeughaus-mux/          # terminal mux wire model: stable ids, workspace topology, rows/deltas, bounded codec, client-side TerminalView (pure, wasm too)
-zeughaus-terminal/     # the runner's terminal engine: PTYs over portable-pty and a pinned wezterm-term (native only)
+zeughaus-terminal/     # the terminal engine: PTYs over portable-pty and a pinned wezterm-term in the runner, byte-fed sessions for the CI's transcripts (native only)
 zeughaus-transform/    # plugin: 35 math/logic/string/trig nodes, constants, Display
 zeughaus-flow/         # plugin: Hold (event -> state), Button (manual event), Timer (the clock a source needs), All (fan-in)
 zeughaus-graph/        # plugin: Subgraph container and its Input/Output boundary nodes
@@ -40,8 +41,8 @@ zeughaus-job/          # plugin: Job (a process in a runner-owned terminal, log 
 iced_terminal/         # the terminal widget: one wgpu primitive per pane, bundled ComicShannsMono Nerd Font
 iced_tabs/             # the tab tree the workspace shell uses: runner sections, groups, drop markers
 zeughaus-theme/        # the editor's theme: iced theme paired with a terminal colour scheme, catalogs for every widget, bundled pack, WezTerm scheme parser
-vm/win11/              # scripts: headless Windows 11 guest under QEMU/KVM, the CI runner's `win11` machine (boot, toolchain, per-boot prepare.ps1)
-deploy/                # install.sh, systemd user unit for the runner, desktop entry template, macos-app.sh and the bundle's Info.plist; install-ci.sh and ci/ for the CI runner
+vm/win11/              # scripts: headless Windows 11 guest under QEMU/KVM, the service runner's `win11` machine (boot, toolchain, per-boot prepare.ps1)
+deploy/                # install.sh, systemd user unit for the runner, desktop entry template, macos-app.sh and the bundle's Info.plist; install-sadala.sh, install-runner-user.sh, install-macos.sh, build-aarch64.sh; runner/ (unit, ssh config, enlist.toml.example) and ci/ (CI unit, ci.toml.example, openbao.sh), macos/ (launchd agent)
 third_party/           # its own workspace: wezterm's terminal crates at the pinned revision, published as zeughaus-* packages
 ```
 
@@ -79,7 +80,8 @@ The runner keeps `runner.pem` and `client.pem` under the state directory
 (`--state-dir`, `ZEUGHAUS_STATE_DIR`, else `~/.local/state/zeughaus`), its
 graphs in `graphs/<id>.zgh` (one file per top-level graph) and its pinned URL
 in `endpoint`. An editor dials the runner of its own state directory through
-that file and every URL in `remotes = [..]` of `<state-dir>/zeughaus.toml`;
+that file and every URL in `remotes = [..]` of `<state-dir>/zeughaus.toml`
+(CIs are listed next to them as `ci = [..]`);
 a remote editor also needs `client.pem` copied into the remote runner's
 `clients/` directory and its own state directory. An editor without a
 runner edits a local scratch graph and shows no values.
@@ -98,12 +100,14 @@ the left edge. Theme and tab bar placement persist in
 connected runner (plus `Local` without a runner, or `Not running` for graphs
 no runner's workspace shows); a section's terminal, graph and folder
 glyphs (tooltips say which) add a terminal tab, a graph that runner
-executes, or a coloured group. A runner that runs CI also gets a
-`CI <label>` section: a `Runners` tab with its machines and a locked group
+executes, or a coloured group. A `CI <label>` section for each CI the editor
+dials (the `ci = [..]` URLs) holds a `Runners` tab with the enlisted runners
+and their machines and a locked group
 per repository with one tab per channel (`<channel>@<repo>`, pipelines as
 DAGs, newest on top; pressing a job shows its transcript read-only, live
-while it runs), and the section's play/pause circle (filled when set by
-hand) cycles the busy mode through auto (the GPU measurement), busy and
+while it runs). The play/pause circle (filled when set by
+hand) sits on the section of the runner that has `[busy]` (`tuco-pc`) and
+cycles the busy mode through auto (the GPU measurement), busy and
 free. Channels come from `.zeughaus-ci/channels.toml`. Closing a graph's tab
 deletes the graph. Double-clicking a
 tab or a group's name renames it; a tab that shows one graph renames the
@@ -141,38 +145,63 @@ node sizes, palette, rename and terminal scroll-back to a restore file and
 reopens as it was (not where it was: Wayland does not let a client place
 its window).
 
-### CI runner
+### CI
 
-A second runner runs CI as the Unix user `zeughaus-ci`
-(`deploy/install-ci.sh`, once, with sudo; `deploy/install.sh` updates it
-afterwards). Its home and state are `/var/lib/zeughaus-ci` (a btrfs
-subvolume outside snapper's snapshots). It has two user units,
-`zeughaus-ci-runner` (`--feed-addr 127.0.0.1:7444`; `deploy/install-ci.sh`
-prints the line to add to the editor's `zeughaus.toml`) and `zeughaus-ci-hook`
-(`ci hook --listen 10.8.0.10:8686`, the webhook intake that Caddy on sadala
-forwards `https://ci.doodleshnookie.net/hook/<repo>` to). Logs:
-`sudo journalctl _UID=$(id -u zeughaus-ci)`. Repositories, budgets and the
-VM are configured in `/var/lib/zeughaus-ci/state/ci.toml`; secrets live in
-OpenBao (`secret/zeughaus/ci`, read with the AppRole that
-`deploy/ci/openbao.sh` seals to the CI user).
-`zeughaus-ci run|status|log|forge-check|secrets-check` (a sudo wrapper)
-queues a pipeline, reads results, a failed job's excerpt and its log, and
-checks the forge token and every secret `ci.toml` names. `zeughaus-runner ci check
-[DIR]` and `ci plan [DIR] <push|tag> <ref>` validate a `.zeughaus-ci/` folder without
-a runner. The Windows VM (`vm/win11/`, installed under
-`/usr/local/lib/zeughaus-ci/vm/win11`) is booted and stopped by the
-runner. The Mac `atik` is the unix host `atik-ci` (`deploy/ci/ssh_config`):
-jobs with `machine = "atik"` run there over ssh as `uebelacker` under
-`~/zeughaus-ci`, and are skipped after 15 minutes when it does not answer.
-`DESIGN.md` section 14 describes how it works.
+CI is its own process, `zeughaus-ci`, that runners enlist into; it executes
+nothing itself. On sadala (aarch64 Ubuntu) it runs as the Unix user
+`zeughaus-ci` (home and state `/var/lib/zeughaus-ci`) in the user unit
+`zeughaus-ci` (`deploy/ci/zeughaus-ci.service`: `serve --listen 10.8.0.1:7444
+--hook 127.0.0.1:8686`; Caddy there forwards
+`https://ci.doodleshnookie.net/hook/<repo>` to the hook). Logs:
+`sudo journalctl _UID=$(id -u zeughaus-ci)` on sadala. Repositories, the
+runners it accepts and the forge tokens are in
+`/var/lib/zeughaus-ci/state/ci.toml` (`deploy/ci/ci.toml.example`);
+secrets live in OpenBao (`secret/zeughaus/ci`, read with the AppRole that
+`deploy/ci/openbao.sh`, run on sadala, seals to the CI user). The wrapper
+`/usr/local/bin/zeughaus-ci` on sadala runs the binary as that user:
+`zeughaus-ci run|status|log|forge-check|secrets-check` queues a pipeline,
+reads results, a failed job's excerpt and its log, and checks the forge
+token and every secret `ci.toml` names. `zeughaus-ci check [DIR]` and `plan
+[DIR] <push|tag> <ref>` validate a `.zeughaus-ci/` folder without a service.
+
+Four runners enlist, each with an `<state-dir>/enlist.toml`
+(`deploy/runner/enlist.toml.example`: `ci` (the CI's pinned URL, the line in
+its `endpoint` file), `name`, `cpus`, `budget_gb`, and the optional tables
+`[containers]`, `[busy]` (nvidia-smi) and `[machines.<name>]` (a Windows
+VM)). The CI pins each one by the fingerprint in its own `endpoint` file:
+
+| host | runner | enlisted as | installed by |
+|---|---|---|---|
+| sadala | Unix user `zeughaus`, `10.8.0.1:7443` | `sadala` | `deploy/install-sadala.sh` |
+| tuco-pc | user `hannes`, `10.8.0.10:7443` (a local drop-in of its unit sets `--feed-addr`) | `tuco-pc-hannes` | `deploy/install.sh` |
+| tuco-pc | user `zeughaus` (home `/var/lib/zeughaus`), `10.8.0.10:7444`; containers, the `win11` VM, GPU busy | `tuco-pc`, the default runner | `deploy/install-runner-user.sh --feed-addr 10.8.0.10:7444`; `deploy/install.sh` updates it |
+| atik (macOS) | launchd agent `net.doodleshnookie.zeughaus-runner`, `10.8.0.7:7443`, log `~/Library/Logs/zeughaus-runner.log` | `atik` | `deploy/install-macos.sh` |
+
+In `ci.toml`, `default_runner` names the runner of every job without a
+`machine`; `[runners.<name>]` has its `fingerprint`, its `machines` (VMs
+it boots) and `wait_minutes` (15: a job whose runner is offline is skipped
+after that, not failed). A job header places a job: `machine = "<runner>"`
+runs on that runner's host (`.sh`), `machine = "<vm>"` on the VM of the
+runner that lists it (`.ps1`), `image = "<image>"` in a container of the
+default runner, and neither on the default runner's host. A runner that is
+not in `ci.toml` is refused. The Windows VM scripts (`vm/win11/`) are
+installed under `/usr/local/lib/zeughaus/vm/win11` and booted and stopped by
+the `tuco-pc` runner.
+
+Updates: `deploy/install-sadala.sh` (from tuco-pc: cross-builds with
+`deploy/build-aarch64.sh` in an arm64 container, installs both binaries,
+restarts the CI and reloads the sadala runner; `--setup --ci-toml <file>` the
+first time) and `deploy/install.sh` (tuco-pc, also the service runner);
+`deploy/install-macos.sh` on atik.
 
 This repository is one of its repos: every push to Forgejo runs
 `.zeughaus-ci/gate.sh` (the gate below, in the `.zeughaus-ci/arch.Containerfile` image,
 against weida's `main` as the sibling checkout) and posts `zeughaus/gate`
-on the commit. Forgejo reaches the runner as the bot user `zeughaus-ci`
+on the commit. Forgejo reaches the CI as the bot user `zeughaus-ci`
 (write on zeughaus, read on weida); its tokens and the webhook secret are
 in OpenBao under `secret/zeughaus/ci`. A change to `.zeughaus-ci/` is checked with
-`zeughaus-runner ci check` before it is pushed.
+`zeughaus-ci check` before it is pushed. `DESIGN.md` section 14 describes how it
+works.
 
 ### Agent stack and reload
 
@@ -183,7 +212,7 @@ its own state directory, and drives a headless editor over a
 control socket:
 
 ```
-CARGO_TARGET_DIR=target/agent cargo build -p zeughaus --features remote -p zeughaus-runner
+CARGO_TARGET_DIR=target/agent cargo build -p zeughaus --features remote -p zeughaus-runner -p zeughaus-ci
 ZEUGHAUS_STATE_DIR=/tmp/zh-agent target/agent/debug/zeughaus-runner
 ZEUGHAUS_STATE_DIR=/tmp/zh-agent target/agent/debug/zeughaus --headless --control /tmp/zh-agent.sock
 target/agent/debug/zeughaus ctl /tmp/zh-agent.sock key ctrl+space
@@ -200,6 +229,13 @@ logical pixels; `MS` paces a move or drag). `ctl` resolves a relative
 writes an MP4 through `ffmpeg` with the pointer drawn in, for attaching to
 an issue or PR by hand; screenshots and videos are never committed.
 Signals to the agent's processes go by PID, never by name.
+
+To test CI, the agent runs its own `zeughaus-ci --state-dir /tmp/zh-ci serve
+--listen 127.0.0.1:7999` with a `ci.toml` that pins its agent runner's
+fingerprint (from that runner's `endpoint` file), gives the runner an
+`enlist.toml` (`ci` = the CI's `endpoint`, `name`), and lists the CI as `ci =
+[..]` in the headless editor's `zeughaus.toml`. Never against the production
+CI or its Forgejo webhook.
 
 When a change is finished, its gate passed and it is committed, the agent
 integrates it into the user's running stack; that is the point of the

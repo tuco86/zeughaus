@@ -30,12 +30,14 @@ under "Not built", so that nothing above that heading is aspirational.
  +------------------+          +------------------+
 ```
 
-Two processes, and the split is not optional. `zeughaus` is an editor that
+Two processes do the work, and the split is not optional. `zeughaus` is an editor that
 never executes a node; `zeughaus-runner` is a headless process that does
 nothing else. That is what makes every editor -- the one on the same machine,
 one on another continent, one in a browser -- the same thing, a remote view,
 and what keeps a side effect from happening twice: a screen capture fires once
-per runner, not once per open window.
+per runner, not once per open window. A third, `zeughaus-ci` (section 14),
+schedules CI pipelines onto the runners that enlist into it and is dialled by
+editors for what it shows.
 
 There is no central store. Everything travels over one weida link per runner
 (`zeughaus-link`), on separate paths:
@@ -86,7 +88,9 @@ started listening. The editor dials the runner in its own state directory's
 `endpoint` file and every URL in `remotes = [..]` of
 `<state-dir>/zeughaus.toml`, and re-reads both when they change; a URL that
 does not parse or pins no peer is logged and skipped. A runner that
-disappears from the list loses its graphs in the editor.
+disappears from the list loses its graphs in the editor. The CIs are the
+URLs in `ci = [..]` of the same file, read the same way; a fingerprint
+listed under both is kept as a runner.
 
 **Redial is weida's, resync is ours.** An editor dials each runner once
 (`zeughaus/src/transport.rs`, `first_dial`) under a `ReconnectPolicy`
@@ -112,10 +116,11 @@ until `wg0` is up at boot, and the service manager retries.
 |---|---|---|
 | `zeughaus-core` | `Ty`/`Typed`/`Value`, pins, `ExecutableNode`/`DomainPlugin`, settings, converters, scalar wire encoding, graph document types | yes |
 | `zeughaus-runtime` | `GraphExecutor`: topology, node instances, edge cache, dirty set, async work, node errors | yes |
-| `zeughaus-link` | the runner<->editor protocol over weida: paths, graph, feed, events, snapshot, triggers, run files, hold, and the credentials both ends present | native |
+| `zeughaus-link` | the runner<->editor protocol over weida: paths, graph, feed, events, snapshot, triggers, run files, hold, the CI view, the runner<->CI enlist protocol, and the credentials both ends present | native |
 | `zeughaus-mux` | terminal mux wire model: stable ids, workspace topology, rows/deltas, bounded codec, client-side `TerminalView` | yes |
-| `zeughaus-terminal` | the runner's terminal engine: PTYs (`portable-pty`) and a pinned `wezterm-term` | native |
-| `zeughaus-runner` | the executing process: graph document, executor, weida listener, feed server, mux service, job host | native |
+| `zeughaus-terminal` | the terminal engine: PTYs (`portable-pty`) and a pinned `wezterm-term` in the runner; byte-fed sessions and the read-only stream in both runner and CI | native |
+| `zeughaus-runner` | the executing process: graph document, executor, weida listener, feed server, mux service, job host, and the executor of the CI jobs it is assigned |
+| `zeughaus-ci` | the CI service: pipelines, scheduler, webhook intake, runner registry, stored transcripts; executes nothing |
 | `zeughaus` | the editor | native + wasm32 |
 | `iced_terminal` | terminal widget: one wgpu primitive per pane, input to `TerminalCommand`s, bundled font | native |
 | `iced_tabs` | the tab tree the workspace shell uses: sections, one level of groups, drop targets and markers | yes |
@@ -292,7 +297,7 @@ Below it are tabs of split panes (`iced_tabs::tree`, `pane_grid`). The tab
 bar has one section per connected runner, labelled with its host and the
 start of its fingerprint, plus `Local` (no runner: the scratch graphs) or
 `Not running` (graphs whose runner is not connected), and after the runners
-a `CI <label>` section for each runner that runs CI (section 14). A runner section is
+a `CI <label>` section for each CI the editor dials (section 14). A runner section is
 that runner's shared workspace: loose tabs and one level of coloured,
 collapsible groups, each tab a split tree whose leaves are terminals
 (section 9) or graphs, and order, groups, splits and ids come from the
@@ -695,13 +700,20 @@ same principal as an editor on that machine. No graph is involved.
 
 ## 14. CI: pipelines from a repository's `.zeughaus-ci/` folder
 
-A runner with `<state-dir>/ci.toml` also runs CI (`zeughaus-runner/src/ci/`).
-Without the file nothing of it starts. On the workstation a second runner does
-this as the Unix user `zeughaus-ci` (`deploy/install-ci.sh`, units under
-`deploy/ci/`). Its unit runs `--feed-addr 127.0.0.1:7444`, and `install-ci.sh`
-prints the line to add to the user's `zeughaus.toml`
-(`remotes = ["<its endpoint>"]`); then its terminals appear as a section of
-their own in every editor.
+`zeughaus-ci` (`zeughaus-ci/`) is a third process: a service that schedules
+pipelines onto the runners that enlist into it and keeps their records and
+transcripts. It executes nothing. A runner executes: with an
+`<state-dir>/enlist.toml` it dials the CI and runs what it is assigned as
+jobs of its own `JobHost` (`zeughaus-runner/src/enlist/`). An editor lists CIs
+as `ci = ["<endpoint>"]` next to `remotes` in `zeughaus.toml`. In production:
+
+| host | process | Unix user | address | enlisted as |
+|---|---|---|---|---|
+| sadala (aarch64) | `zeughaus-ci serve` | `zeughaus-ci` | weida `10.8.0.1:7444`, HTTP `127.0.0.1:8686` | - |
+| sadala | runner | `zeughaus` | `10.8.0.1:7443` | `sadala` |
+| tuco-pc | runner | `hannes` | `10.8.0.10:7443` | `tuco-pc-hannes` |
+| tuco-pc | runner: containers, Windows VM, GPU busy | `zeughaus` | `10.8.0.10:7444` | `tuco-pc` (default runner) |
+| atik (macOS) | runner, launchd agent | `uebelacker` | `10.8.0.7:7443` | `atik` |
 
 **Jobs are scripts.** Every `.sh`/`.ps1` file in `.zeughaus-ci/` with a TOML header
 between `# /// ci` and `# ///` is a job named after its file. The header
@@ -709,23 +721,40 @@ holds these keys:
 
 - `on`: `push <glob>`, `tag <glob>`, or `cron <5 fields>`;
 - `needs`: exactly one of `on` and `needs` is set;
-- `image` (a `.zeughaus-ci/<image>.Containerfile`) or `machine` (a Windows
-  VM or a unix host from `ci.toml`); neither means the host;
+- `image` (a `.zeughaus-ci/<image>.Containerfile`) or `machine` (a runner or
+  a Windows VM of one, by name); neither means the host of the default
+  runner;
 - `cache`, `secrets`, `when_busy` (`wait`/`freeze`/`run`), `env`,
   `timeout_minutes`.
 
-Files without a header are helpers. `ci check` validates a folder and
-`ci plan` shows what an event selects (`header.rs`, `pipeline.rs`). The
-selection is the jobs whose `on` matches the event, plus every job whose
-`needs` are all selected.
+Files without a header are helpers. `zeughaus-ci check` validates a folder and
+`zeughaus-ci plan` shows what an event selects, both without a service
+(`header.rs`, `pipeline.rs`). The selection is the jobs whose `on` matches the
+event, plus every job whose `needs` are all selected.
 
-**Events are files.** A webhook (`ci hook`, a separate process behind
-Caddy on sadala, HMAC-checked), `ci run` and the cron schedules all write
-`ci/inbox/*.json`. The scheduler moves each inbox file to
+**Where a job runs** is decided once, when its pipeline is set up
+(`scheduler.rs`, `place`), and kept in the job's record as `runner` and
+`place`. `ci.toml` names the runners: `default_runner` and one
+`[runners.<name>]` each with the `fingerprint` of the runner's own pinned
+URL, the `machines` it boots and the `wait_minutes` (15) a job waits for it.
+
+- `machine = X` where `X` is a runner: that runner's host. The job is `.sh`.
+- `machine = X` where `X` is in some runner's `machines`: that machine on that
+  runner. The job is `.ps1`.
+- `image = I`: a container on the default runner.
+- neither: the host of the default runner.
+
+A name that is neither a runner nor a machine of one, or the wrong script
+kind, fails the pipeline's setup like an invalid header.
+
+**Events are files.** A webhook (`serve --hook <addr>`, HMAC-checked, Caddy on
+sadala forwards `https://ci.doodleshnookie.net/hook/<repo>` to it),
+`zeughaus-ci run` and the cron schedules all write `ci/inbox/*.json`. The
+scheduler moves each inbox file to
 `ci/queue/<repo>.<kind>.<hash(ref, cron)>.json`, overwriting what waits
 there. A newer push to a ref therefore replaces the one queued behind a
-running pipeline and never cancels the running one. The runner itself still
-has no HTTP listener.
+running pipeline and never cancels the running one. Without `--hook` the
+service has no HTTP listener and pipelines come from `run` and cron.
 
 **Pipelines** (`scheduler.rs`, one thread):
 
@@ -743,55 +772,122 @@ patterns; the first channel whose `on` matches the event gets the pipeline
 a match, or without the file, a push lands in a channel named after its
 branch, a tag in `tags`, a cron in `cron`, and records from before channels
 are grouped the same way. The channel is decided in setup and kept in the
-record; an invalid file fails the setup like an invalid job header. `ci check`
-lists the channels, `ci plan` starts with the one an event selects, and
-`ci status` shows it per pipeline. Retention counts per channel (**Disk**).
+record; an invalid file fails the setup like an invalid job header. `check`
+lists the channels, `plan` starts with the one an event selects, and
+`status` shows it per pipeline. Retention counts per channel (**Disk**).
 
-A job is one `JobHost` run marked `external`, so it shows up in the
-`Triggered` group. Its terminal runs `<run>/launch.sh`, which checks the
-commit out into a persistent workspace `ci/work/<repo>/<job>` (cleaned
-except the `cache` paths) and starts the job:
+**The enlist protocol** (`zeughaus-link/src/enlist.rs`, `ENLIST_MAJOR` 1) is
+one long exchange on `/enlist` (req/rep) per runner. Frames are a 4-byte
+little-endian length and a postcard body, at most `MAX_ENLIST_FRAME_BYTES`
+(1 MiB), refused before the body is allocated.
 
-- **Host:** directly.
+- The runner opens with `Hello { major, name, offer, runs }`: its `Offer`
+  (`os`, `arch`, `cpus`, whether it has `containers`, its `machines`) and a
+  `RunReport` for each run in its `assigned/` directory. The CI checks the
+  TLS principal against the `fingerprint` of the `[runners.*]` entry that
+  `name` names, and the major, and answers `Refused { message }` or
+  `Welcome { major, offsets }`, where each offset is how many bytes of that
+  run's output the CI already holds.
+- The runner then reports `Busy`, `Machine` (a machine's status), `Started`,
+  `StartFailed`, `Output { run, offset, bytes }` (at most
+  `MAX_OUTPUT_CHUNK`), `Frozen` and `Finished { run, end }`; the CI sends
+  `Assign`, `Kill`, `Upload` and `Forget`. A run is named
+  `<repo>.<number>.<job>` (`run_id`).
+- `Assign` carries everything the run needs and the runner has not: the
+  repository URL and the fetch token, the commit, the script, the place, the
+  environment (`CI`, `CI_REPO`, `CI_REF`, `CI_SHA`, `CI_JOB`, ...), the
+  granted secrets, the timeout, `when_busy` and the inputs. The runner adds
+  the paths and the CPU count (`CI_WORKSPACE`, `CI_OUTPUT`, `CI_INPUTS`,
+  `CI_CPUS`, `CARGO_BUILD_JOBS`).
+- Output is the run's `wal` byte for byte. The CI appends a chunk when its
+  offset is the stored length, appends only the part beyond the length when
+  the offset is below it (a resend after a reconnect), and ends the exchange
+  when it is above: the runner reconnects and resumes from the new
+  `Welcome`. Output of a run the CI did not assign to that runner is
+  refused.
+
+The runner keeps the connection (`link.rs`): it redials after 1 s, doubling
+to 30 s, starting over after a connection that lasted 60 s. It presents its
+own `runner.pem` as the client identity, and the CI's URL in `enlist.toml`
+pins the CI. Both sides log it: `[enlist] connected to <ci> as <name>`,
+`refused: <message>`, `lost: <cause>`.
+
+**A run on the runner** (`run.rs`). `Assign` is prepared on a thread of its
+own, after the runner is no longer held (`zeughaus-runner hold`):
+
+1. Fetch the mirror `ci/mirrors/<repo>.git` (the CI's own copy is a separate
+   one), check the commit is there, pin it as `refs/ci/<n>`.
+2. Stage the inputs into `<run>/inputs/<need>/`: hard-linked from this
+   runner's `ci/artifacts/<run>/` when the need ran here, else downloaded
+   from the CI and unpacked.
+3. Write the secrets as files under `$XDG_RUNTIME_DIR/zeughaus-ci/<run>/`
+   (`ci/tmp/<run>` where there is no `XDG_RUNTIME_DIR`, as on macOS), which
+   the launcher removes.
+4. Render `launch.sh` and start it as a `JobHost` run marked `external`, so it
+   shows up in that runner's `Triggered` group. Persist
+   `ci/assigned/<run>.json` (the assignment without secrets and fetch
+   token) and send `Started`.
+5. Deliver the log every 200 ms from the offset of the last `Welcome`. When
+   the run ends and its log has stopped growing, hard-link a non-empty
+   `<run>/artifacts` into `ci/artifacts/<run>/` (on success) and send
+   `Finished { code, killed, timed_out, artifacts }`.
+
+A failed run is not over for the runner: `inner.sh`/`launch.sh` writes
+`<run>/code`, which ends the wait and sends `Finished`, and execs a shell
+where the job ran. The failed run's terminal is that debug session on the
+runner, detached and attachable from the palette, and closes when the shell
+ends. For a machine job it is an ssh session in the guest. A run that fails
+before its shell (a checkout, an image build, the copy into the guest) keeps
+its terminal with the final screen, detached as well.
+
+The launcher checks the commit out into a persistent workspace
+`ci/work/<repo>/<job>` (cleaned except the `cache` paths) and starts the
+job:
+
+- **Host:** directly, under `zeughaus-runner timeout <seconds> -- <program>`
+  (a process group that gets `SIGTERM`, `SIGKILL` 60 s later, exit 124;
+  macOS has no `timeout`).
 - **Container:** `podman run --rm -it` with the workspace at `/work`.
 - **Machine:** over ssh, from a git bundle, in `W:\work\<repo>\<job>`.
 
-On failure, `inner.sh`/`launch.sh` writes `<run>/code`, which ends the
-host's wait, and execs a shell where the job ran. For a machine job that is
-an ssh session in the guest or on the unix host. The failed run's terminal is the debug
-session, detached and attachable from the palette, and closes when that
-shell ends. A run that fails before its shell (a checkout, an image build,
-the copy into the guest) keeps its terminal with the final screen, detached
-as well.
+Host and container jobs time out inside `inner.sh`; a machine job on the
+runner's own clock (`control.rs`), which counts only unfrozen seconds, writes
+`<run>/timeout` and kills the local ssh. `Kill` closes the run's terminal.
 
-Artifacts go through `CI_OUTPUT` into `ci/pipelines/<repo>/<n>.artifacts/<job>/`
-and arrive hard-linked as `CI_INPUTS/<need>/` in the jobs that need them.
-Commit statuses (`zeughaus/<job>`) go to GitHub or Forgejo through `curl`,
-with the token on stdin.
+**Artifacts** go through `CI_OUTPUT`. A runner keeps a successful run's set
+and hard-links it as `CI_INPUTS/<need>/` for a job of its own that needs it.
+For a job on another runner the CI asks `Upload { run }`: the runner packs the
+set into a tar and sends it on `/artifacts` (req/rep, one tar per exchange,
+`ArtifactRequest`/`ArtifactReply`, at most `MAX_ARTIFACT_BYTES`); the CI
+stores it as `ci/pipelines/<repo>/<n>.artifacts/<job>.tar`, and the job that
+needs it is not assigned before the file exists. The consuming runner
+downloads it on the same path. Only configured runners may use `/artifacts`.
+Commit statuses (`zeughaus/<job>`) go from the CI to GitHub or Forgejo
+through `curl`, with the token on stdin.
 
-**A failure says why.** When a run fails, the thread that waited for it
-reads the end of `<run>/wal`, removes the escape sequences
-(`excerpt.rs`) and keeps the 40 lines before the launcher's
-`[zeughaus-ci] <job> exited <code>` marker: the job's own last words, not
-the debug shell's. The excerpt goes into the job's record and into
-`<run>/excerpt`. The commit status carries its first line that looks like
-a cause (`panicked at`, then `error[`, `error:`, `FAILED`) instead of the
-bare exit code, unless the job holds secrets, whose output stays on the
-machine. `ci status` prints the run directory and the excerpt under
-every failed job of each repository's newest pipeline, and `ci log <repo>
-<n> <job> [--tail N]` prints a job's whole output as plain text; both read
-through the `zeughaus-ci` wrapper like the rest of `ci`.
+**A failure says why.** When a run ends, the CI reads the end of its stored
+WAL, removes the escape sequences (`excerpt.rs`) and keeps the 40 lines
+before the launcher's `[zeughaus-ci] <job> exited <code>` marker: the job's
+own last words, not the debug shell's. The excerpt goes into the job's
+record. The commit status carries its first line that looks like a cause
+(`panicked at`, then `error[`, `error:`, `FAILED`) instead of the bare exit
+code, unless the job holds secrets, whose output stays on the CI. `zeughaus-ci
+status` prints the excerpt under every failed job of each repository's
+newest pipeline and the job's runner, and `zeughaus-ci log <repo> <n> <job>
+[--tail N]` prints a job's whole output as plain text; both read the state
+directory, so on sadala they go through the `/usr/local/bin/zeughaus-ci`
+wrapper, like `run`, `forge-check` and `secrets-check`.
 
-**Transcripts stay on the CI.** Right after a job's run is spawned, its
-`<run>/wal` is hard-linked as `ci/pipelines/<repo>/<n>.runs/<job>/wal`: the
-same inode, so it grows live and outlives `--keep-runs`; it goes with its
-pipeline record.
+**Transcripts stay on the CI.** The output a runner sends is stored as
+`ci/pipelines/<repo>/<n>.runs/<job>/wal`, and the end of the run as
+`.../exit` (`code=<code or none>`). They go with the pipeline record, not
+with any runner's `--keep-runs`.
 
 **The default branch has an owner.** `streak.rs` derives from the records,
 per job of the default branch (push and cron pipelines), the first
 pipeline of its current run of failures, and the last pipeline in which
-every deploy job (one without `on`) succeeded. `ci status` leads with it
-(`griasdi main: windows red since #138 (79e9035, 17 h, 13 pipelines); last
+every deploy job (one without `on`) succeeded. `zeughaus-ci status` leads with
+it (`griasdi main: windows red since #138 (79e9035, 17 h, 13 pipelines); last
 publish #136`). A failed job in a streak that began in an earlier pipeline
 posts `red since #<n>: <cause>`. The pipeline that turns a job red, and
 every red pipeline once a job has been red for an hour, raise an alert: a
@@ -801,102 +897,129 @@ default branch whose commit has no `.zeughaus-ci/` is recorded as a
 `no-jobs` pipeline and posts an `error` on `zeughaus/pipeline`, naming a
 leftover `.ci/`; on other refs that stays silent.
 
-A restarted runner reloads the running pipelines from disk. It waits for
-the `exit` record that `adopt_runs` writes for each live run, and thaws
-whatever a previous process froze.
+**Waiting, skipping, failing.** A job whose needs succeeded is `Waiting`
+while its runner is not connected (`waiting for runner <R>`), is `Skipped`
+after the runner's `wait_minutes` without it (`runner <R> offline`; the
+forge hears `success`, so an offline Mac never turns a branch red), and
+waits while the runner is busy and its `when_busy` is not `run` (`runner <R>
+busy`), or while its workspace (one job of one repository per runner) or
+machine is in use. A container place on a runner that offers none, or a
+machine it does not list, fails the job. A job waiting for a need's
+artifacts on another runner says so.
 
-**Busy and freeze.** `busy.rs` samples `nvidia-smi` every 10 s. The machine
-counts as busy once the mean over `busy_after_seconds` reaches
-`gpu_percent`, and as free again once the mean over `free_after_seconds` is
-below it. While busy, only `when_busy = "run"` jobs start, except on a unix
-host, which does not share this GPU. Running
-`freeze` jobs are paused, with `podman pause` for a container and HMP
-`stop` on the VM's `monitor.sock` for a machine, and resumed when the
-machine is free.
+**Restarts.** The CI persists a record before acting, and a run lives on its
+runner, so either side may restart:
+
+- A restarted CI reloads its running pipelines; their active jobs keep status
+  and runner until the runner reports.
+- A runner's `Hello` settles its jobs: a `Starting` job the runner does not
+  know, assigned before this connection, goes back to `Pending` and is
+  assigned again; a `Running` job it does not know fails (`runner <R> lost
+  the run`); a reported run the CI has no job for is told `Kill` and
+  `Forget`; a reported run that already ended is handled as `Finished`.
+  `Welcome.offsets` resume the output where the CI's copy ends.
+- A runner that is gone (`RunnerGone`) leaves its jobs alone. One that stays
+  away past the job's timeout plus 15 minutes fails them (`runner <R> lost`);
+  one that comes back before reports the runs and they go on.
+- A restarted runner reloads `assigned/*.json`, reattaches each run's terminal
+  (`adopt_runs`), waits for the `exit` record of those without an end, and
+  delivers log and `Finished` after the next `Welcome`. An `Assign` it had
+  not started is lost, and the CI assigns it again. It thaws whatever a
+  previous process froze. `Forget` removes a run's file.
+
+**Busy and freeze** belong to the runner that has a `[busy]` table in its
+`enlist.toml`. `busy.rs` samples `nvidia-smi` every 10 s. The runner counts
+as busy once the mean over `busy_after_seconds` reaches `gpu_percent`, and as
+free again once the mean over `free_after_seconds` is below it. While busy,
+the CI assigns it only `when_busy = "run"` jobs. Running `freeze` jobs of that
+runner are paused, with `podman pause` for a container and HMP `stop` on the
+VM's `monitor.sock` for a machine, and resumed when it is free; the runner
+reports each as `Frozen`.
 
 The measurement can be overridden. `Busy` holds the GPU's verdict and a
-mode (`auto`, `busy`, `free`; `<state-dir>/ci/busy-mode`, so a restart
-keeps it); the scheduler acts on the mode, or under `auto` on the
+mode (`auto`, `busy`, `free`; `<state-dir>/ci/busy-mode` of the runner, so a
+restart keeps it); the runner acts on the mode, or under `auto` on the
 measurement. `/busy` (`BusyRequest { mode }` -> `MachineState { mode, busy
-}`, `zeughaus-link/src/machine.rs`) sets the mode. The runner publishes
-every change as `RuntimeEvent::Machine` on the `machine` topic and carries
-the current state in the snapshot, which it answers only once that state
-is in, so the editor's CI section shows a control that cycles auto, busy,
-free: a play circle while free, a
-pause circle while busy, filled when the mode is set by hand. A runner
-without CI reports no machine and has no control.
+}`, `zeughaus-link/src/machine.rs`) on the runner sets the mode. The runner
+publishes every change as `RuntimeEvent::Machine` on the `machine` topic,
+carries the current state in the snapshot, which it answers only once that
+state is in, and sends it to the CI as `Busy`. So the editor's section of
+that runner shows a control that cycles auto, busy, free: a play circle
+while free, a pause circle while busy, filled when the mode is set by hand.
+A runner without `[busy]` reports no machine and has no control.
 
-**Machines** (`machine.rs`) come in two kinds (`kind` in `ci.toml`). A
-`windows-vm` is booted on the first job that needs it (`vm.sh run`, then
-`prepare.ps1` in the guest). It runs one job at a time, and `vm.sh stop`
-shuts it down after `idle_minutes` without a job. A guest shell opened
+**Machines** (`machine.rs`, a runner's `[machines.<name>]`) are Windows VMs
+(`kind = "windows-vm"`). One is booted on the first job that needs it (`vm.sh
+run`, then `prepare.ps1` in the guest). It runs one job at a time, and `vm.sh
+stop` shuts it down after `idle_minutes` without a job. A guest shell opened
 within the last 24 hours (`<run>/debug-shell`, removed when the run's
-terminal closes) keeps it up and runs `.ps1` jobs. A `unix-host` (the Mac `atik`) runs `.sh` jobs, is always on
-and reached over ssh: a job probes it first (which also prunes run
-directories older than 25 hours that a killed launcher left behind),
-waits up to `wait_minutes` while it does not answer, and is then skipped,
-not failed, so an offline host never turns a branch red. The launcher
-copies the bundle, the inputs and an `env.sh` into `<dir>/runs/<id>`,
-checks the commit out in `<dir>/work/<repo>/<job>`, runs the job under
-`ssh -tt`, copies `out/` back and removes the run directory; a failure
-opens a shell on the host. The busy measurement is this workstation's
-GPU, so it holds and freezes only jobs that run here (host, container,
-VM), never a unix host's. Both kinds share the scheduler's timeout clock,
-which kills the local ssh.
+terminal closes) keeps it up and runs `.ps1` jobs. The launcher copies the
+bundle, the inputs and an `env.ps1` into the guest, checks the commit out in
+`W:\work\<repo>\<job>`, runs the job under `ssh -tt`, copies `out/` back and
+removes the run directory; a failure opens a shell in the guest. The runner
+reports each machine's status to the CI as `Machine`.
 
-**The CI view.** `/ci` (`CiRequest` -> `CiReply`,
-`zeughaus-link/src/ci.rs`, served by `ci/serve.rs`) answers an overview
-(every channel with its newest pipeline, and the machines: the workstation
-with its busy state, then each VM and unix host with its status, each with
-the jobs active on it as `MachineJob { repo, channel, number, job }`), a
+**The CI view.** `zeughaus-ci serve` is a weida peer for editors too: `/ci`
+(`CiRequest` -> `CiReply`, `zeughaus-link/src/ci.rs`, `serve.rs`), `/events`,
+`/snapshot` (always `machine: None`, no outputs) and `/mux`. An editor's
+key is under `<state-dir>/clients/`; a runner's is pinned by `ci.toml`, and
+each service admits only the kind of peer it is for. `/ci` answers an
+overview (every channel with its newest pipeline, and the machines: every
+configured runner in name order as `kind = "runner"` with `offline`, `online`,
+or `busy`/`free` (with ` (set)` when the mode is set by hand), then each
+machine the connected runners report as `kind = "windows-vm"`, each with the
+jobs active on it as `MachineJob { repo, channel, number, job }`), a
 channel's pipelines newest first by pages, one pipeline, and opens or
 closes a transcript. Every saved record is announced as
 `RuntimeEvent::CiPipeline` on the `ci` topic. In the editor
-(`zeughaus/src/app/ci.rs`) a runner that reports a machine gets a section
-`CI <label>` after the runners: a `Runners` tab with a table of the
-machines, whose running jobs open their transcripts, then one locked group
+(`zeughaus/src/app/ci.rs`) each URL of `ci` is a link of its own, and its
+section `CI <label>` comes after the runners: a `Runners` tab with a table of the
+runners and machines, whose running jobs open their transcripts, then one locked group
 per repository with a tab per channel, `<channel>@<repo>`, whose accent
 dot is the tone of the channel's newest pipeline. A channel tab lists its
 pipelines in a scrollable, newest on top and separated by rules: per
 pipeline `#<n> push to <ref> <sha> by <actor>`, its status, its age (the
-local time on hover), the commit's subject (the runner reads it from its
+local time on hover), the commit's subject (the CI reads it from its
 mirror when the pipeline starts, and once at start for records without
 one), its note, and its jobs as cards laid out by their `needs` and
 bordered by status. While the channel in front has something running, a
 one-second clock moves its elapsed times. The cables between the cards are one
 `iced_nodegraph_sdf` primitive under them; nothing pans, zooms, moves or
 takes the wheel, so the list scrolls like any other. Pressing a job
-opens its transcript in a pane beside the list: the runner starts
-`zeughaus-runner ci replay <wal> [--until <run>/exit]` in a terminal of
-its mux placed `Transcript` (in no tab, never listed as detached, dropped
-and killed when the runner restarts), which writes the recorded bytes to
-a raw-mode tty and follows the WAL while the job runs, so the editor shows
-it through the ordinary terminal stream, live, read-only. A CI keeps at
-most 16 transcript terminals across editors and closes the least recently
-opened one first; an editor asks again for its open transcripts after the
-runner restarts. The section's ids are the editor's own (`SurfaceRef::Ci`),
-and it takes no structural command.
+opens its transcript in a pane beside the list: the CI creates a
+`Session::fed` (`zeughaus-terminal`), a screen that a follower task feeds
+from the stored `wal` every 200 ms and that ends with the `exit` file, and
+serves it on its own `/mux` through `zeughaus_terminal::serve::stream_terminal`,
+so the editor shows it through the ordinary terminal stream, live,
+read-only. The CI's mux has no workspace, no shells and ignores input. It
+keeps at most 16 transcript screens across editors and closes the least
+recently opened one first; an editor asks again for its open transcripts
+after the CI restarts. The section's ids are the editor's own
+(`SurfaceRef::Ci`), and it takes no structural command. An editor's link to
+a CI takes no workspace, graph or feed of its own: only `/events`,
+`/snapshot`, `/ci` and `/mux`.
 
-**Disk.** Workspaces beyond `budget_gb` are deleted least recently used
-first, through `podman unshare rm` because containers leave subordinate-uid
-files. Image tags no pipeline uses are removed. The 200 newest pipeline
-records per channel, with their transcripts (running ones never go), and
-the 10 newest artifact sets per repository are kept.
+**Disk.** The CI keeps the 200 newest pipeline records per channel, with
+their transcripts (running ones never go), and the 10 newest artifact sets
+per repository. A runner deletes workspaces beyond its `budget_gb` (50) least
+recently used first, through `podman unshare rm` because containers leave
+subordinate-uid files, removes image tags no pipeline uses, and keeps the 10
+newest artifact sets per repository.
 
 **Secrets** (`secrets.rs`) live in one OpenBao KV v2 document
 (`[secrets]` in `ci.toml`, `secret/zeughaus/ci`); `ci.toml` only names
-them. The runner, the hook and the CLI log in with the AppRole
-`zeughaus-ci`, whose secret_id is sealed with `systemd-creds` to this
-machine and the CI user (`deploy/ci/openbao.sh` creates and rotates it).
-The token stays in the process; a document is read at use time and kept
+them. The CI, its hook and the CLI log in with the AppRole
+`zeughaus-ci`, whose secret_id is sealed with `systemd-creds` to the host
+and the CI user (`deploy/ci/openbao.sh`, run on sadala, creates and rotates
+it). The token stays in the process; a document is read at use time and kept
 for `cache_ttl_seconds`, never served stale, so a value rotated in OpenBao
 takes effect without a restart. When OpenBao cannot be reached, fetches,
 job starts and statuses fail with its message and the hook answers 503,
-which the forge redelivers. `ci secrets-check`, and every start of runner
-and hook, list each named secret as present or missing. A job gets only
-those its repository's `grants` release to the event. They reach the job
-through files under `$XDG_RUNTIME_DIR/zeughaus-ci/<run>/`, which the
-launcher removes.
+which the forge redelivers. `zeughaus-ci secrets-check`, and every start of
+`serve`, list each named secret as present or missing. A job gets only
+those its repository's `grants` release to the event. They travel in
+`Assign` to the runner the job is placed on and reach the job through files
+there.
 
 ## 15. Not built
 
@@ -926,4 +1049,4 @@ Kept here so they are not mistaken for descriptions of the code:
     when the run ends. Nothing secret-shaped in a graph document or in settings.
   - Workspace nodes (checkout, btrfs snapshot) producing the `cwd` a job
     runs in; caches per runner under its state directory.
-  - VM guests with their own runner; CI drives its VM over ssh instead.
+  - VM guests with their own runner; a runner drives its VM over ssh instead.
