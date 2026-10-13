@@ -12,8 +12,6 @@
 //! starts at zero, so a restarted runner cannot hand out an id whose directory
 //! already holds someone else's output.
 
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -24,7 +22,7 @@ use zeughaus_job::{JobSpec, ProcessHost, RunExit, RunHandle, record_run_end};
 use zeughaus_link::{HoldReply, HoldRequest, MAX_HOLD_BYTES};
 use zeughaus_mux::{ExitState, TerminalId};
 use zeughaus_terminal::Profile;
-use zeughaus_terminal::wal::{self, Wal, WalWriter};
+use zeughaus_terminal::wal::{Wal, WalWriter};
 
 use crate::mux::{MuxService, OwnedPlacement, SavedRun};
 
@@ -121,6 +119,16 @@ impl JobHost {
                 }
             });
         }
+    }
+
+    /// Ends the run in `run_dir` by closing its terminal, which kills the
+    /// child; the run's wait then reports it as killed.
+    pub fn kill_run(&self, run_dir: &Path) -> Result<(), String> {
+        let terminal = self
+            .mux
+            .terminal_of_run(run_dir)
+            .ok_or_else(|| format!("no live terminal for {}", run_dir.display()))?;
+        self.mux.close_terminal(terminal)
     }
 }
 
@@ -439,51 +447,24 @@ pub async fn serve_hold(replier: Replier, host: Arc<JobHost>) {
     }
 }
 
-/// A run's output bytes: its WAL, or the raw `log` of a run from before the
-/// WAL.
-pub fn run_output(run_dir: &Path) -> io::Result<Vec<u8>> {
-    let wal = run_dir.join("wal");
-    if wal.exists() {
-        wal::read_bytes(&wal)
-    } else {
-        std::fs::read(run_dir.join("log"))
-    }
-}
-
-/// The last `max` bytes of [`run_output`], from the first line that starts
-/// inside them: a cut through a character or an escape sequence would
-/// otherwise open the text.
-pub fn run_output_tail(run_dir: &Path, max: usize) -> io::Result<Vec<u8>> {
-    let wal = run_dir.join("wal");
-    let mut bytes = if wal.exists() {
-        wal::tail_bytes(&wal, max)?
-    } else {
-        let mut file = File::open(run_dir.join("log"))?;
-        let len = file.metadata()?.len();
-        file.seek(SeekFrom::Start(len.saturating_sub(max as u64)))?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        bytes
-    };
-    if bytes.len() >= max
-        && let Some(newline) = bytes.iter().position(|&b| b == b'\n')
-    {
-        bytes.drain(..=newline);
-    }
-    Ok(bytes)
-}
-
 /// A real child in a real PTY through the whole path: the `job.run` node,
 /// this host, the mux and the terminal engine. Unix only, like the engine's
 /// own tests: it drives `/bin/sh`.
 #[cfg(all(test, unix))]
 mod tests {
     use std::collections::HashMap;
+    use std::io;
 
     use zeughaus_core::{DomainPlugin, InputSet, NodeContext, NodeId, Press, Value};
     use zeughaus_job::JobPlugin;
+    use zeughaus_terminal::wal;
 
     use super::*;
+
+    /// A run's output bytes: its WAL.
+    fn run_output(run_dir: &Path) -> io::Result<Vec<u8>> {
+        wal::read_bytes(&run_dir.join("wal"))
+    }
 
     fn fresh_state_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("zeughaus-jobs-{name}-{}", std::process::id()));

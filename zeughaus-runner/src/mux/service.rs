@@ -325,6 +325,15 @@ impl MuxService {
         runs
     }
 
+    /// The terminal that runs the job whose run directory is `run_dir`, if it
+    /// still exists.
+    pub fn terminal_of_run(&self, run_dir: &std::path::Path) -> Option<TerminalId> {
+        let meta = self.inner.meta.lock().unwrap_or_else(|e| e.into_inner());
+        meta.iter()
+            .find(|(_, meta)| meta.run.as_ref().is_some_and(|run| run.run_dir == run_dir))
+            .map(|(id, _)| *id)
+    }
+
     /// Starts a terminal the runner owns: a job's process, not a pane's
     /// shell. `placement` says whether a pane shows it from the start; a
     /// detached one waits for a client to attach it. Closing a pane that

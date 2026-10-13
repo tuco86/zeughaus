@@ -1,14 +1,16 @@
-//! The runner binary as a client of a running runner: `trigger` and `hold`.
+//! The runner binary's subcommands: `trigger` and `hold` as a client of a
+//! running runner, and `timeout` as the deadline a host CI job runs under.
 //!
-//! Both talk to the endpoint a runner printed at start (`[runner] weida
-//! endpoint weida://sha256:<fp>@host:port/`) with the client identity of this
-//! machine's state directory, the same one an editor presents. A script, a
-//! cron entry or a webhook relay names the runner it means, and the
-//! fingerprint in the URL is what makes that safe.
+//! `trigger` and `hold` talk to the endpoint a runner printed at start
+//! (`[runner] weida endpoint weida://sha256:<fp>@host:port/`) with the client
+//! identity of this machine's state directory, the same one an editor
+//! presents. A script, a cron entry or a webhook relay names the runner it
+//! means, and the fingerprint in the URL is what makes that safe.
 //!
 //! ```text
 //! zeughaus-runner trigger <endpoint> <node-id> [payload]
 //! zeughaus-runner hold <endpoint> on|off
+//! zeughaus-runner timeout <seconds> -- <program> [args..]
 //! ```
 
 use std::path::Path;
@@ -27,7 +29,23 @@ const USAGE: &str = "\
 usage: zeughaus-runner [--state-dir <dir>] [--feed-addr <host:port>] [--keep-runs <n>]
        zeughaus-runner trigger <endpoint> <node-id> [payload]
        zeughaus-runner hold <endpoint> on|off
-       zeughaus-runner ci check|plan|run|status|forge-check|hook ...";
+       zeughaus-runner timeout <seconds> -- <program> [args..]";
+
+/// Runs `timeout` if the first argument names it. Checked before the serving
+/// flags are read and before `--state-dir` is stripped: everything after the
+/// `--` belongs to the program, and a program may have flags of that name.
+pub fn timeout(args: &[String]) -> Option<ExitCode> {
+    if args.first().map(String::as_str) != Some("timeout") {
+        return None;
+    }
+    Some(match crate::timeout::parse(&args[1..]) {
+        Ok(request) => ExitCode::from(crate::timeout::run(&request) as u8),
+        Err(e) => {
+            eprintln!("[timeout] {e}");
+            ExitCode::from(125)
+        }
+    })
+}
 
 /// Runs a subcommand if the first argument names one. `None` means the
 /// arguments are the runner's own and the process should serve.
@@ -45,9 +63,6 @@ pub fn run(args: &[String], state_dir: &Path) -> Option<ExitCode> {
         }
     }
     let command = match positional.first().map(String::as_str) {
-        // CI subcommands work on the state directory, not on a running
-        // runner's endpoint, and report their own outcome.
-        Some("ci") => return Some(crate::ci::cli::run(&positional[1..], state_dir)),
         Some("trigger") => parse_trigger(&positional[1..]),
         Some("hold") => parse_hold(&positional[1..]),
         _ => {

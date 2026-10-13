@@ -100,9 +100,6 @@ pub struct Workspace {
     owned: BTreeSet<TerminalId>,
     /// The subset of `owned` no pane currently shows.
     detached: BTreeSet<TerminalId>,
-    /// The subset of `owned` that is a CI job's transcript: shown by the
-    /// editor that opened it, listed nowhere, never saved as a live terminal.
-    transcripts: BTreeSet<TerminalId>,
 }
 
 impl Workspace {
@@ -119,7 +116,6 @@ impl Workspace {
             next_pane: 1,
             owned: BTreeSet::new(),
             detached: BTreeSet::new(),
-            transcripts: BTreeSet::new(),
         }
     }
 
@@ -130,11 +126,6 @@ impl Workspace {
         match placement {
             OwnedPlacement::Detached => {
                 self.detached.insert(terminal);
-            }
-            // Listed nowhere: the editor that asked for it shows it in a
-            // pane of its own, and no other client should find it.
-            OwnedPlacement::Transcript => {
-                self.transcripts.insert(terminal);
             }
             // A run the snapshot has no room for waits detached, where a
             // client can attach it once other tabs are gone.
@@ -233,7 +224,6 @@ impl Workspace {
             next_terminal,
             owned: self.owned.iter().copied().collect(),
             detached: self.detached.iter().copied().collect(),
-            transcripts: self.transcripts.iter().copied().collect(),
             terminals,
         }
     }
@@ -259,17 +249,8 @@ impl Workspace {
             next_group: saved.next_group.max(1),
             next_split: saved.next_split.max(1),
             next_pane: saved.next_pane.max(1),
-            // A transcript's replay process belongs to the editor session that
-            // opened it; no editor holds it after a restart, and the caller
-            // kills a session the restored workspace does not know.
-            owned: saved
-                .owned
-                .iter()
-                .copied()
-                .filter(|t| alive(*t) && !saved.transcripts.contains(t))
-                .collect(),
+            owned: saved.owned.iter().copied().filter(|t| alive(*t)).collect(),
             detached: BTreeSet::new(),
-            transcripts: BTreeSet::new(),
         };
         let restore_tab = |tab: &SavedTab| {
             let mut root = Some(tab.root.clone());
@@ -588,7 +569,6 @@ impl Workspace {
                 }
                 self.owned.remove(terminal);
                 self.detached.remove(terminal);
-                self.transcripts.remove(terminal);
                 Applied {
                     killed: vec![*terminal],
                 }
@@ -2110,35 +2090,5 @@ mod tests {
         assert!(snap(&ws).groups().next().unwrap().locked);
         assert!(detached_ids(&ws).is_empty());
         assert!(!ws.knows(TerminalId(200)));
-    }
-
-    #[test]
-    fn a_transcript_is_listed_nowhere_and_does_not_survive_a_restore() {
-        let mut ws = fresh();
-        let transcript = TerminalId(700);
-        let detached = TerminalId(701);
-        ws.add_owned(transcript, OwnedPlacement::Transcript);
-        ws.add_owned(detached, OwnedPlacement::Detached);
-        assert_eq!(detached_ids(&ws), vec![detached]);
-        assert!(ws.knows(transcript) && pane_showing(&ws, transcript).is_none());
-
-        let saved = ws.to_saved(800, Vec::new());
-        assert_eq!(saved.transcripts, vec![transcript]);
-        let restored = Workspace::restore(RunnerIncarnation::from_bytes([1; 16]), &saved, |_| true);
-        assert!(
-            !restored.knows(transcript),
-            "the service kills a session the workspace does not know"
-        );
-        assert_eq!(detached_ids(&restored), vec![detached]);
-
-        let applied = apply(
-            &mut ws,
-            &mut spawner(),
-            TopologyCommand::CloseTerminal {
-                terminal: transcript,
-            },
-        );
-        assert_eq!(applied.killed, vec![transcript]);
-        assert!(ws.to_saved(800, Vec::new()).transcripts.is_empty());
     }
 }

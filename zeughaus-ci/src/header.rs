@@ -4,31 +4,18 @@
 //! interpreter and a helper file without a block is simply not a job.
 
 use std::collections::BTreeMap;
-use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use zeughaus_link::enlist::WhenBusy;
 
-use super::config::{valid_env_name, valid_name};
+use crate::config::{valid_env_name, valid_name};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum WhenBusy {
-    /// Do not start while the machine is busy.
-    #[default]
-    Wait,
-    /// Start anyway; freeze while the machine is busy.
-    Freeze,
-    /// Start anyway and never freeze.
-    Run,
-}
-
-impl fmt::Display for WhenBusy {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            WhenBusy::Wait => "wait",
-            WhenBusy::Freeze => "freeze",
-            WhenBusy::Run => "run",
-        })
+/// The spelling of `when_busy` in a job header.
+pub fn when_busy_name(when_busy: WhenBusy) -> &'static str {
+    match when_busy {
+        WhenBusy::Wait => "wait",
+        WhenBusy::Freeze => "freeze",
+        WhenBusy::Run => "run",
     }
 }
 
@@ -124,7 +111,7 @@ fn check_cache(path: &str) -> Result<(), String> {
 
 /// Parses the header of one `.zeughaus-ci/` file. `Ok(None)` is a helper file.
 pub fn parse_job(file_name: &str, text: &str) -> Result<Option<JobDef>, String> {
-    let fail = |msg: String| format!("{}/{file_name}: {msg}", super::CI_DIR);
+    let fail = |msg: String| format!("{}/{file_name}: {msg}", crate::CI_DIR);
     let Some(toml) = extract(text).map_err(fail)? else {
         return Ok(None);
     };

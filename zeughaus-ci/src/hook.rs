@@ -3,18 +3,19 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::sync::Arc;
 
 use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use super::config::{CiConfig, RepoConfig};
-use super::event::{CiEvent, EventKind, write_inbox};
-use super::secrets::{self, SecretError, Secrets};
-use super::{ci_dir, now_secs};
+use crate::config::{CiConfig, RepoConfig};
+use crate::event::{CiEvent, EventKind, write_inbox};
 use crate::files::write_atomic;
+use crate::secrets::{SecretError, Secrets};
+use crate::{ci_dir, now_secs};
 
 /// Largest accepted request body.
 const MAX_BODY: usize = 5 * 1024 * 1024;
@@ -232,52 +233,33 @@ fn handle(
     )
 }
 
-fn listen_arg(args: &[String]) -> Option<&str> {
-    let at = args.iter().position(|a| a == "--listen")?;
-    args.get(at + 1).map(String::as_str)
-}
-
-pub fn run(state_dir: &Path, args: &[String]) -> ExitCode {
-    let Some(addr) = listen_arg(args) else {
-        eprintln!("[ci-hook] usage: ci hook --listen <addr>");
-        return ExitCode::FAILURE;
-    };
-    let config = match CiConfig::load(state_dir) {
-        Ok(Some(config)) => config,
-        Ok(None) => {
-            eprintln!("[ci-hook] no ci.toml");
-            return ExitCode::FAILURE;
-        }
-        Err(e) => {
-            eprintln!("[ci-hook] {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let secrets = Secrets::new(config.secrets.clone(), state_dir);
-    match secrets::check(&secrets, &config) {
-        Ok(lines) => {
-            for line in lines {
-                eprintln!("[ci-hook] secrets: {line}");
-            }
-        }
-        Err(e) => eprintln!("[ci-hook] secrets: {e}"),
-    }
+/// Binds `addr` and serves the intake on its own thread, `zeughaus-ci-hook`.
+///
+/// The bind is synchronous so that a port that is taken fails the start of
+/// the process instead of a thread nobody reads.
+pub fn start(
+    addr: SocketAddr,
+    config: Arc<CiConfig>,
+    secrets: Arc<Secrets>,
+    state_dir: PathBuf,
+) -> Result<(), String> {
     for (name, repo) in &config.repos {
         if repo.webhook_secret.is_none() {
             eprintln!("[ci-hook] {name}: no webhook_secret; its hook answers 401");
         }
     }
+    let server =
+        tiny_http::Server::http(addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
+    let bound = server.server_addr().to_ip().unwrap_or(addr);
+    eprintln!("[ci-hook] listening on {bound}");
+    std::thread::Builder::new()
+        .name("zeughaus-ci-hook".to_owned())
+        .spawn(move || serve(&server, &config, &secrets, &state_dir))
+        .map_err(|e| format!("cannot start the hook thread: {e}"))?;
+    Ok(())
+}
 
-    let server = match tiny_http::Server::http(addr) {
-        Ok(server) => server,
-        Err(e) => {
-            eprintln!("[ci-hook] cannot listen on {addr}: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    eprintln!("[ci-hook] listening on {addr}");
-
+fn serve(server: &tiny_http::Server, config: &CiConfig, secrets: &Secrets, state_dir: &Path) {
     let mut deliveries = Deliveries::load(state_dir);
     for mut request in server.incoming_requests() {
         let method = request.method().to_string();
@@ -350,7 +332,6 @@ pub fn run(state_dir: &Path, args: &[String]) -> ExitCode {
             eprintln!("[ci-hook] respond: {e}");
         }
     }
-    ExitCode::SUCCESS
 }
 
 #[cfg(test)]
@@ -361,6 +342,9 @@ mod tests {
 
     fn repos() -> BTreeMap<String, RepoConfig> {
         let toml = r#"
+default_runner = "r"
+[runners.r]
+fingerprint = "sha256:0000000000000000000000000000000000000000000000000000000000000001"
 [secrets]
 addr = "http://127.0.0.1:1"
 path = "zeughaus/ci"

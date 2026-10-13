@@ -11,8 +11,8 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
-use super::config::{Forge, RepoConfig};
-use super::secrets::Secrets;
+use crate::config::{Forge, RepoConfig};
+use crate::secrets::Secrets;
 
 /// Longest description GitHub accepts.
 const MAX_DESCRIPTION: usize = 140;

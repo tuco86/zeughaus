@@ -1,7 +1,25 @@
-# <state-dir>/ci.toml of the CI runner. Without this file CI is off.
+# <state-dir>/ci.toml of zeughaus-ci. Without this file `zeughaus-ci serve` exits.
 # Secret values live in OpenBao ([secrets]); this file only names them.
 
-budget_gb = 50                     # host workspaces under ci/work; LRU deletion beyond this
+default_runner = "tuco-pc"         # runs every job that names no `machine`
+
+# Runners that may enlist: pinned by the fingerprint printed in their
+# `<state-dir>/endpoint` (weida://sha256:<fp>@host:port/). A runner that is not
+# listed here is refused.
+[runners.tuco-pc]
+fingerprint = "<fingerprint>"
+machines = ["win11"]               # Windows VMs this runner boots: `machine = "win11"`
+wait_minutes = 15                  # a job waits this long for the runner, then is skipped
+
+[runners.tuco-pc-hannes]
+fingerprint = "<fingerprint>"
+
+# A job with `machine = "atik"` runs on this runner itself.
+[runners.atik]
+fingerprint = "<fingerprint>"
+
+[runners.sadala]
+fingerprint = "<fingerprint>"
 
 [secrets]
 addr = "http://10.8.0.1:8200"      # OpenBao on sadala over WireGuard
@@ -10,33 +28,6 @@ path = "zeughaus/ci"               # one document; its fields are the secret nam
 role_id = "<printed by deploy/ci/openbao.sh>"
 cache_ttl_seconds = 30             # a read document answers from memory this long
 timeout_seconds = 5
-
-[busy]
-gpu_percent = 50                   # nvidia-smi utilization.gpu threshold
-busy_after_seconds = 60            # mean over this window >= threshold -> busy
-free_after_seconds = 300           # mean over this window < threshold -> free
-
-[containers]
-cpus = 12
-memory = "24g"
-
-[machines.win11]
-kind = "windows-vm"                # windows-vm | unix-host
-script = "/usr/local/lib/zeughaus-ci/vm/win11/vm.sh"
-dir = "/var/lib/zeughaus-ci/vm/win11"
-ssh_host = "win11-ci"
-cpus = 8
-memory = "12G"
-cache_disk = "100G"
-idle_minutes = 20
-
-# A unix host reached over ssh, always on: no boot, no freeze. Jobs wait up
-# to wait_minutes for it to answer, then are skipped. macOS counts as unix.
-[machines.atik]
-kind = "unix-host"
-ssh_host = "atik-ci"
-dir = "/Users/uebelacker/zeughaus-ci"
-cpus = 12
 
 [repos.griasdi]
 url = "https://github.com/Griasdi/Griasdi.git"

@@ -1,0 +1,37 @@
+# <state-dir>/enlist.toml: enlists this runner into a zeughaus-ci service.
+# Without the file the runner serves its own graphs and terminals and dials
+# nobody. The CI must list this runner's fingerprint (the one in its endpoint
+# file) under [runners.<name>] in its ci.toml.
+
+# The CI's pinned URL: the line `zeughaus-ci serve` printed (its `endpoint` file).
+ci = "weida://sha256:<fp>@10.8.0.1:7444/"
+# The name this runner enlists under; [a-z0-9][a-z0-9-]*.
+name = "tuco-pc"
+# CI_CPUS of host jobs; the machine's parallelism by default.
+cpus = 16
+# Size limit of the host workspaces under <state-dir>/ci/work.
+budget_gb = 50
+
+# Present: this runner runs `image = ...` jobs in rootless podman containers.
+[containers]
+cpus = 12
+memory = "24g"
+
+# Present: the GPU is measured with nvidia-smi and jobs wait or freeze while
+# it is busy. An editor's busy toggle overrides the measurement.
+[busy]
+gpu_percent = 50
+busy_after_seconds = 60
+free_after_seconds = 300
+
+# A machine behind this runner, named in a job's `machine` key (and in the
+# CI's `runners.<name>.machines`).
+[machines.win11]
+kind = "windows-vm"
+script = "/usr/local/lib/zeughaus/vm/win11/vm.sh"
+dir = "/var/lib/zeughaus/vm/win11"
+ssh_host = "win11-ci"
+cpus = 8
+memory = "12G"
+cache_disk = "100G"
+idle_minutes = 20

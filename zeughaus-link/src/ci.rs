@@ -1,14 +1,14 @@
-//! What an editor asks a CI runner about its pipelines, and what it gets back.
+//! What an editor asks the CI about its pipelines, and what it gets back.
 //!
 //! One req/rep exchange on [`CI_PATH`](crate::CI_PATH): a [`CiRequest`] in,
-//! a [`CiReply`] out, both JSON. The runner's pipeline records stay on the
-//! runner; the views here carry only what the editor draws. A change of a
+//! a [`CiReply`] out, both JSON. The CI's pipeline records stay on the CI;
+//! the views here carry only what the editor draws. A change of a
 //! record is announced on `/events` as [`RuntimeEvent::CiPipeline`]
 //! (crate::RuntimeEvent) and the editor then asks for the rows it shows.
 //!
-//! A transcript is a terminal in the runner's mux: [`CiRequest::OpenTranscript`]
-//! answers with the terminal id, which the editor attaches through the normal
-//! mux exchanges.
+//! A transcript is a read-only terminal in the CI's mux:
+//! [`CiRequest::OpenTranscript`] answers with the terminal id, which the
+//! editor attaches through the normal mux exchanges.
 
 use serde::{Deserialize, Serialize};
 
@@ -115,7 +115,7 @@ pub struct PipelineView {
 pub struct JobView {
     pub name: String,
     pub needs: Vec<String>,
-    /// Where the job runs: host, container or a machine name.
+    /// Where the job runs: its runner, and the image or machine on it.
     pub place: String,
     pub status: String,
     pub note: String,
@@ -127,7 +127,8 @@ pub struct JobView {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MachineView {
     pub name: String,
-    /// `workstation`, `windows-vm` or `unix-host`.
+    /// `runner` (an enlisted runner, or one that is configured and offline)
+    /// or `windows-vm` (a machine a runner reports).
     pub kind: String,
     pub status: String,
     /// The jobs running on it.
@@ -260,8 +261,8 @@ mod tests {
                     }],
                     machines: vec![
                         MachineView {
-                            name: "workstation".to_owned(),
-                            kind: "workstation".to_owned(),
+                            name: "tuco-pc".to_owned(),
+                            kind: "runner".to_owned(),
                             status: "free".to_owned(),
                             jobs: vec![MachineJob {
                                 repo: "griasdi".to_owned(),

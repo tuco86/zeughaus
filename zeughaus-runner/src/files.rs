@@ -1,5 +1,5 @@
-//! Small file helpers shared by the runner's persisted state: CI events and
-//! pipelines, and the graph files.
+//! Small file helpers shared by the runner's persisted state: the records of
+//! enlisted runs, and the graph files.
 
 use std::path::Path;
 

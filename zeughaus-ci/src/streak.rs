@@ -7,8 +7,8 @@
 //! the branch count; a job that a pipeline skipped or did not select says
 //! nothing about it, so the streak looks past that pipeline.
 
-use super::event::EventKind;
-use super::scheduler::{JobStatus, Pipeline};
+use crate::event::EventKind;
+use crate::scheduler::{JobStatus, Pipeline};
 
 /// One job of the default branch that failed in its latest result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,9 +142,10 @@ impl Streak {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ci::event::CiEvent;
-    use crate::ci::header::{JobDef, WhenBusy};
-    use crate::ci::scheduler::{JobRecord, PipelineStatus};
+    use crate::event::CiEvent;
+    use crate::header::JobDef;
+    use crate::scheduler::{JobRecord, PipelineStatus};
+    use zeughaus_link::enlist::WhenBusy;
 
     fn job(name: &str, on: &[&str], status: JobStatus) -> JobRecord {
         JobRecord {
@@ -164,12 +165,12 @@ mod tests {
             },
             status,
             note: String::new(),
-            run_dir: None,
             code: None,
             started: None,
             finished: None,
-            image_tag: None,
-            active_secs: 0,
+            runner: None,
+            place: None,
+            artifacts: false,
             excerpt: None,
         }
     }

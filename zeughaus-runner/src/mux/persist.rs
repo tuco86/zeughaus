@@ -29,10 +29,6 @@ pub struct SavedWorkspace {
     pub next_terminal: u64,
     pub owned: Vec<TerminalId>,
     pub detached: Vec<TerminalId>,
-    /// The subset of `owned` that is a CI transcript. A restart drops them:
-    /// the editor that opened one is gone.
-    #[serde(default)]
-    pub transcripts: Vec<TerminalId>,
     pub terminals: Vec<SavedTerminal>,
 }
 
@@ -202,7 +198,6 @@ impl SavedWorkspaceV1 {
             next_terminal: self.next_terminal,
             owned: self.owned,
             detached: self.detached,
-            transcripts: Vec::new(),
             terminals: self.terminals,
         }
     }

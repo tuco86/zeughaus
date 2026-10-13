@@ -11,8 +11,8 @@
 //! This runner executes every graph of its own document. An editor attached
 //! to several runners shows several documents side by side.
 
-mod ci;
 mod cli;
+mod enlist;
 mod feed;
 mod files;
 mod graphs;
@@ -20,6 +20,7 @@ mod jobs;
 mod mux;
 mod runner;
 mod runs;
+mod timeout;
 mod transport;
 
 use std::collections::HashMap;
@@ -33,8 +34,8 @@ use std::time::Duration;
 
 use zeughaus_core::{NodeId, Value, ZeughausError};
 use zeughaus_link::{
-    BUSY_PATH, CI_PATH, EVENTS_PATH, FEED_PATH, GRAPH_PATH, GraphChange, HOLD_PATH, MUX_PATH,
-    RUNS_PATH, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, TriggerRequest, credentials,
+    BUSY_PATH, EVENTS_PATH, FEED_PATH, GRAPH_PATH, GraphChange, HOLD_PATH, MUX_PATH, RUNS_PATH,
+    SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, TriggerRequest, credentials,
 };
 use zeughaus_runtime::DeferredWork;
 
@@ -84,6 +85,12 @@ fn main() -> ExitCode {
             };
             return zeughaus_terminal::shim::run(std::path::Path::new(&dir));
         }
+    }
+    // The deadline a host CI job runs under: a subcommand of this binary, so
+    // it must not read the serving flags, which the program after `--` may
+    // have too.
+    if let Some(code) = cli::timeout(&std::env::args().skip(1).collect::<Vec<_>>()) {
+        return code;
     }
     // Every shell and job inherits the runner's environment, which may name
     // no locale at all (ssh, launchd, a stripped service).
@@ -138,6 +145,15 @@ fn main() -> ExitCode {
     #[cfg(unix)]
     let _state_lock = match lock_state_dir(&state_dir) {
         Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("[runner] {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // A malformed `enlist.toml` is refused before anything is bound: a runner
+    // that silently stays out of the CI would leave its jobs waiting.
+    let enlist_config = match enlist::config::load(&state_dir) {
+        Ok(config) => config,
         Err(e) => {
             eprintln!("[runner] {e}");
             return ExitCode::FAILURE;
@@ -228,13 +244,11 @@ fn main() -> ExitCode {
     let mut job_host: Option<Arc<JobHost>> = None;
     // Kept for the restart, which saves the workspace before it `exec`s.
     let mut mux_service: Option<MuxService> = None;
-    // CI's busy state, alerts and pipeline changes, reported to editors as
-    // they happen.
-    let mut ci_handle: Option<ci::Ci> = None;
+    // The busy measurement of an enlisted runner that has one, reported to
+    // editors as it changes.
+    let mut busy_handle: Option<Arc<enlist::busy::Busy>> = None;
     let (graphs, graph_rx, initial) = GraphService::load(&state_dir);
-    // Registered with the other paths, answered only once the snapshot says
-    // whether this runner runs CI: an editor that reconnects during startup
-    // would otherwise see a CI runner without its machine and drop its view.
+    // Registered with the other paths, answered once the loop below starts.
     let mut snapshot_replier = None;
     {
         let listener = transport.listener();
@@ -286,34 +300,37 @@ fn main() -> ExitCode {
                 Err(e) => eprintln!("[runner] no hold service: {e}"),
             }
         }
-        // CI runs its pipelines as this host's jobs; without a `ci.toml` it
-        // says so and does nothing, and there is no machine to override.
-        if let Some(started) = job_host
-            .as_ref()
-            .and_then(|host| ci::start(Arc::clone(host), state_dir.clone()))
-        {
+        // Enlisting makes this runner execute the CI's jobs as its own; without
+        // an `enlist.toml` it does not dial anyone.
+        if let Some(config) = enlist_config {
+            match &job_host {
+                Some(host) => match exe.as_ref() {
+                    Ok(exe) => {
+                        match enlist::start(Arc::clone(host), config, &state_dir, exe.clone()) {
+                            Ok(enlisted) => busy_handle = enlisted.busy,
+                            Err(e) => {
+                                eprintln!("[runner] {e}");
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[runner] cannot enlist without its own path: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+                None => {
+                    eprintln!("[enlist] no terminal mux, so no job can run here; not enlisting")
+                }
+            }
+        }
+        if let Some(busy) = &busy_handle {
             match listener.replier(BUSY_PATH) {
                 Ok(replier) => {
-                    rt.spawn(ci::busy::serve(replier, Arc::clone(&started.busy)));
+                    rt.spawn(enlist::busy::serve(replier, Arc::clone(busy)));
                 }
                 Err(e) => eprintln!("[runner] no busy service: {e}"),
             }
-            if let Some(mux) = &mux_service {
-                match listener.replier(CI_PATH) {
-                    Ok(replier) => {
-                        let server = ci::serve::CiServer::new(
-                            state_dir.clone(),
-                            started.machines.clone(),
-                            Arc::clone(&started.busy),
-                            mux.clone(),
-                            exe.as_ref().ok().cloned(),
-                        );
-                        rt.spawn(ci::serve::serve(replier, Arc::new(server)));
-                    }
-                    Err(e) => eprintln!("[runner] no ci service: {e}"),
-                }
-            }
-            ci_handle = Some(started);
         }
         // The runner that produced a run's files is the one that serves them:
         // they are on this disk and nowhere else.
@@ -337,8 +354,8 @@ fn main() -> ExitCode {
         Arc::clone(&snapshot),
         job_host.clone(),
     );
-    if let Some(ci) = &ci_handle {
-        runner.report_machine(ci.busy.state());
+    if let Some(busy) = &busy_handle {
+        runner.report_machine(busy.state());
     }
     if let Some(replier) = snapshot_replier {
         rt.spawn(transport::serve_snapshots(replier, Arc::clone(&snapshot)));
@@ -461,14 +478,8 @@ fn main() -> ExitCode {
             fired |= runner.trigger(press.node_id, press.payload, press.external);
         }
 
-        if let Some(ci) = &ci_handle {
-            runner.report_machine(ci.busy.state());
-            while let Ok(alert) = ci.alerts.try_recv() {
-                runner.report_ci_alert(alert);
-            }
-            while let Ok(change) = ci.changes.try_recv() {
-                runner.report_ci_change(change);
-            }
+        if let Some(busy) = &busy_handle {
+            runner.report_machine(busy.state());
         }
 
         if had_changes || ticked || fired {

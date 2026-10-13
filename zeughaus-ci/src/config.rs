@@ -1,35 +1,27 @@
 //! `<state-dir>/ci.toml`.
 //!
 //! The config only ever names secrets; their values live in OpenBao
-//! (`[secrets]`, read by `super::secrets`), so `ci.toml` holds nothing that
+//! (`[secrets]`, read by `crate::secrets`), so `ci.toml` holds nothing that
 //! must stay private.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::Deserialize;
 
-use super::event::CiEvent;
-use super::pipeline::Pattern;
+use crate::event::CiEvent;
+use crate::pipeline::Pattern;
 
 pub const CONFIG_FILE: &str = "ci.toml";
-
-fn default_budget_gb() -> u64 {
-    50
-}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CiConfig {
-    /// Size limit of the host workspaces under `ci/work`.
-    #[serde(default = "default_budget_gb")]
-    pub budget_gb: u64,
+    /// The runner of jobs that name no `machine`.
+    pub default_runner: String,
+    /// Runners that may enlist, by name.
     #[serde(default)]
-    pub busy: BusyConfig,
-    #[serde(default)]
-    pub containers: ContainerConfig,
-    #[serde(default)]
-    pub machines: BTreeMap<String, MachineConfig>,
+    pub runners: BTreeMap<String, RunnerConfig>,
     #[serde(default)]
     pub repos: BTreeMap<String, RepoConfig>,
     /// Where the values of the secrets named below live.
@@ -69,100 +61,21 @@ pub struct SecretsConfig {
     pub timeout_seconds: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct BusyConfig {
-    /// `nvidia-smi` utilization.gpu threshold in percent.
-    pub gpu_percent: u32,
-    /// Mean over this window at or above the threshold means busy.
-    pub busy_after_seconds: u64,
-    /// Mean over this window below the threshold means free.
-    pub free_after_seconds: u64,
-}
-
-impl Default for BusyConfig {
-    fn default() -> Self {
-        Self {
-            gpu_percent: 50,
-            busy_after_seconds: 60,
-            free_after_seconds: 300,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct ContainerConfig {
-    pub cpus: u32,
-    pub memory: String,
-}
-
-impl Default for ContainerConfig {
-    fn default() -> Self {
-        Self {
-            cpus: 12,
-            memory: "24g".into(),
-        }
-    }
-}
-
-fn default_machine_cpus() -> u32 {
-    8
-}
-
-fn default_machine_memory() -> String {
-    "12G".into()
-}
-
-fn default_cache_disk() -> String {
-    "100G".into()
-}
-
-fn default_idle_minutes() -> u64 {
-    20
-}
-
-fn default_wait_minutes() -> u64 {
+fn default_wait_minutes() -> u32 {
     15
 }
 
-/// A machine a job's `machine = "<name>"` runs on; `kind` says which.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
-pub enum MachineConfig {
-    WindowsVm(VmConfig),
-    UnixHost(UnixHostConfig),
-}
-
-/// A Windows VM this workstation boots on demand.
+/// A runner that may enlist, pinned by the fingerprint of its certificate.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct VmConfig {
-    pub script: PathBuf,
-    pub dir: PathBuf,
-    pub ssh_host: String,
-    #[serde(default = "default_machine_cpus")]
-    pub cpus: u32,
-    #[serde(default = "default_machine_memory")]
-    pub memory: String,
-    #[serde(default = "default_cache_disk")]
-    pub cache_disk: String,
-    #[serde(default = "default_idle_minutes")]
-    pub idle_minutes: u64,
-}
-
-/// A unix host reached over ssh, always on: no boot, no freeze.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UnixHostConfig {
-    pub ssh_host: String,
-    /// Absolute path on the host; `runs/` and `work/` live below it.
-    pub dir: String,
-    /// `CI_CPUS` and `CARGO_BUILD_JOBS` of its jobs.
-    pub cpus: u32,
-    /// How long a job waits for the host to answer before it is skipped.
+pub struct RunnerConfig {
+    pub fingerprint: String,
+    /// Machines (Windows VMs) this runner boots for jobs with `machine = <name>`.
+    #[serde(default)]
+    pub machines: Vec<String>,
+    /// How long a job waits for this runner to connect before it is skipped.
     #[serde(default = "default_wait_minutes")]
-    pub wait_minutes: u64,
+    pub wait_minutes: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -225,6 +138,27 @@ impl RepoConfig {
 }
 
 impl CiConfig {
+    /// The runner whose pinned fingerprint is `fingerprint`.
+    pub fn runner_of_fingerprint(&self, fingerprint: &str) -> Option<&str> {
+        let wanted = fingerprint.parse::<weida::Fingerprint>().ok()?.to_string();
+        self.runners
+            .iter()
+            .find(|(_, runner)| runner.fingerprint == wanted)
+            .map(|(name, _)| name.as_str())
+    }
+
+    pub fn is_runner_fingerprint(&self, fingerprint: &str) -> bool {
+        self.runner_of_fingerprint(fingerprint).is_some()
+    }
+
+    /// The runner that offers machine `machine`.
+    pub fn runner_of_machine(&self, machine: &str) -> Option<&str> {
+        self.runners
+            .iter()
+            .find(|(_, runner)| runner.machines.iter().any(|m| m == machine))
+            .map(|(name, _)| name.as_str())
+    }
+
     pub fn parse(text: &str) -> Result<CiConfig, String> {
         let mut config: CiConfig =
             toml::from_str(text).map_err(|e| format!("{CONFIG_FILE}: {e}"))?;
@@ -244,27 +178,51 @@ impl CiConfig {
     }
 
     fn validate(&mut self) -> Result<(), String> {
-        for (name, machine) in &self.machines {
+        if self.runners.is_empty() {
+            return Err("ci.toml: at least one [runners.<name>] is required".into());
+        }
+        if !self.runners.contains_key(&self.default_runner) {
+            return Err(format!(
+                "default_runner `{}` is not a key of [runners]",
+                self.default_runner
+            ));
+        }
+        let mut machines: BTreeMap<&str, &str> = BTreeMap::new();
+        for (name, runner) in &mut self.runners {
             if !valid_name(name) {
                 return Err(format!(
-                    "machine name `{name}` must match [a-z0-9][a-z0-9-]*"
+                    "runner name `{name}` must match [a-z0-9][a-z0-9-]*"
                 ));
             }
-            if let MachineConfig::UnixHost(host) = machine {
-                if host.ssh_host.is_empty() {
-                    return Err(format!("machine `{name}`: `ssh_host` must not be empty"));
-                }
-                // scp (sftp) takes remote paths verbatim while ssh hands them
-                // to a shell: only a path that needs no quoting means the
-                // same to both.
-                let plain = |c: char| c.is_ascii_alphanumeric() || "/._-".contains(c);
-                if !host.dir.starts_with('/') || !host.dir.chars().all(plain) {
+            let fingerprint = runner
+                .fingerprint
+                .parse::<weida::Fingerprint>()
+                .map_err(|e| format!("runner `{name}`: bad fingerprint: {e}"))?;
+            // The principal of a connection is `Fingerprint::to_string`, so the
+            // stored form must be that spelling.
+            runner.fingerprint = fingerprint.to_string();
+            if runner.wait_minutes == 0 {
+                return Err(format!(
+                    "runner `{name}`: `wait_minutes` must be at least 1"
+                ));
+            }
+        }
+        for (name, runner) in &self.runners {
+            for machine in &runner.machines {
+                if !valid_name(machine) {
                     return Err(format!(
-                        "machine `{name}`: `dir` must be an absolute path of [A-Za-z0-9/._-]"
+                        "machine name `{machine}` must match [a-z0-9][a-z0-9-]*"
                     ));
                 }
-                if host.cpus == 0 {
-                    return Err(format!("machine `{name}`: `cpus` must be at least 1"));
+                if self.runners.contains_key(machine) {
+                    return Err(format!(
+                        "machine `{machine}` of runner `{name}` is also a runner name"
+                    ));
+                }
+                if let Some(other) = machines.insert(machine, name) {
+                    return Err(format!(
+                        "machine `{machine}` is listed by runners `{other}` and `{name}`"
+                    ));
                 }
             }
         }
@@ -334,31 +292,20 @@ pub fn valid_env_name(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ci::event::EventKind;
+    use crate::event::EventKind;
+    use std::path::PathBuf;
+
+    const FP_A: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
+    const FP_B: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000002";
 
     const EXAMPLE: &str = r#"
-budget_gb = 50
-[busy]
-gpu_percent = 50
-busy_after_seconds = 60
-free_after_seconds = 300
-[containers]
-cpus = 12
-memory = "24g"
-[machines.win11]
-kind = "windows-vm"
-script = "/usr/local/lib/zeughaus-ci/vm/win11/vm.sh"
-dir = "/var/lib/zeughaus-ci/vm/win11"
-ssh_host = "win11-ci"
-cpus = 8
-memory = "12G"
-cache_disk = "100G"
-idle_minutes = 20
-[machines.atik]
-kind = "unix-host"
-ssh_host = "atik-ci"
-dir = "/Users/uebelacker/zeughaus-ci"
-cpus = 12
+default_runner = "tuco-pc"
+[runners.tuco-pc]
+fingerprint = "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+machines = ["win11"]
+[runners.atik]
+fingerprint = "sha256:0000000000000000000000000000000000000000000000000000000000000002"
+wait_minutes = 30
 [repos.griasdi]
 url = "https://github.com/Griasdi/Griasdi.git"
 forge = "github"
@@ -379,6 +326,10 @@ role_id = "r-1"
 url = "/var/lib/zeughaus-ci/smoke.git"
 forge = "none"
 "#;
+
+    fn with_runners(extra: &str) -> String {
+        format!("default_runner = \"a\"\n[runners.a]\nfingerprint = \"{FP_A}\"\n{extra}")
+    }
 
     fn event(kind: EventKind, git_ref: &str) -> CiEvent {
         CiEvent {
@@ -403,20 +354,15 @@ forge = "none"
     #[test]
     fn parses_the_example() {
         let config = CiConfig::parse(EXAMPLE).unwrap();
-        assert_eq!(config.budget_gb, 50);
-        assert_eq!(config.busy.free_after_seconds, 300);
-        assert_eq!(config.containers.memory, "24g");
-        assert_eq!(config.machines.len(), 2);
-        let MachineConfig::WindowsVm(win) = &config.machines["win11"] else {
-            panic!("win11 is not a windows-vm");
-        };
-        assert_eq!(win.ssh_host, "win11-ci");
-        assert_eq!(win.idle_minutes, 20);
-        let MachineConfig::UnixHost(atik) = &config.machines["atik"] else {
-            panic!("atik is not a unix-host");
-        };
-        assert_eq!(atik.dir, "/Users/uebelacker/zeughaus-ci");
-        assert_eq!(atik.wait_minutes, 15);
+        assert_eq!(config.default_runner, "tuco-pc");
+        assert_eq!(config.runners.len(), 2);
+        assert_eq!(config.runners["tuco-pc"].machines, ["win11"]);
+        assert_eq!(config.runners["tuco-pc"].wait_minutes, 15);
+        assert_eq!(config.runners["atik"].wait_minutes, 30);
+        assert_eq!(config.runner_of_fingerprint(FP_B), Some("atik"));
+        assert!(config.is_runner_fingerprint(FP_A));
+        assert!(!config.is_runner_fingerprint("sha256:nope"));
+        assert_eq!(config.runner_of_machine("win11"), Some("tuco-pc"));
         let griasdi = &config.repos["griasdi"];
         assert_eq!(griasdi.forge, Forge::Github);
         assert_eq!(griasdi.api, "https://api.github.com");
@@ -428,72 +374,77 @@ forge = "none"
     }
 
     #[test]
-    fn empty_config_has_defaults() {
-        let config = CiConfig::parse("").unwrap();
-        assert_eq!(config.budget_gb, 50);
-        assert_eq!(config.busy.gpu_percent, 50);
-        assert_eq!(config.containers.cpus, 12);
-        assert!(config.repos.is_empty());
+    fn deploy_example_parses() {
+        let text = include_str!("../../deploy/ci/ci.toml.example");
+        // The fingerprints in the example are placeholders; swap them for valid ones.
+        let text = text.replace("<fingerprint>", FP_A);
+        CiConfig::parse(&text).unwrap();
+    }
+
+    #[test]
+    fn default_runner_is_required_and_must_exist() {
+        assert!(CiConfig::parse("").is_err());
+        let err = CiConfig::parse(&format!(
+            "default_runner = \"b\"\n[runners.a]\nfingerprint = \"{FP_A}\""
+        ))
+        .unwrap_err();
+        assert!(err.contains("default_runner"), "{err}");
+        assert!(CiConfig::parse(&with_runners("")).is_ok());
+    }
+
+    #[test]
+    fn machine_names_are_unique_and_not_runner_names() {
+        let err = CiConfig::parse(&with_runners(&format!(
+            "machines = [\"a\"]\n[runners.b]\nfingerprint = \"{FP_B}\"\n"
+        )))
+        .unwrap_err();
+        assert!(err.contains("machine `a`"), "{err}");
+        let err = CiConfig::parse(&with_runners(&format!(
+            "machines = [\"m\"]\n[runners.b]\nfingerprint = \"{FP_B}\"\nmachines = [\"m\"]\n"
+        )))
+        .unwrap_err();
+        assert!(err.contains("machine `m`"), "{err}");
+    }
+
+    #[test]
+    fn runner_validation() {
+        let bad_fp = "default_runner = \"a\"\n[runners.a]\nfingerprint = \"nope\"";
+        assert!(CiConfig::parse(bad_fp).is_err());
+        let bad_name = format!("default_runner = \"A\"\n[runners.A]\nfingerprint = \"{FP_A}\"");
+        assert!(CiConfig::parse(&bad_name).is_err());
+        assert!(CiConfig::parse(&with_runners("machines = [\"W\"]")).is_err());
     }
 
     #[test]
     fn unknown_fields_are_rejected() {
-        assert!(CiConfig::parse("bogus = 1").is_err());
-        assert!(CiConfig::parse("[busy]\nnope = 1").is_err());
-        assert!(CiConfig::parse("[repos.a]\nurl = \"x\"\nnope = 1").is_err());
+        assert!(CiConfig::parse(&format!("bogus = 1\n{}", with_runners(""))).is_err());
+        assert!(CiConfig::parse("budget_gb = 50").is_err());
+        let err = CiConfig::parse(&with_runners("nope = 1")).unwrap_err();
+        assert!(err.contains("nope"), "{err}");
+        let base = with_runners("");
+        assert!(CiConfig::parse(&format!("{base}[repos.a]\nurl = \"x\"\nnope = 1")).is_err());
     }
 
     #[test]
     fn validation() {
-        assert!(CiConfig::parse("[repos.Bad]\nurl = \"x\"").is_err());
-        assert!(CiConfig::parse("[repos.a]\nurl = \"x\"\nfetch_token = \"lower\"").is_err());
-        assert!(CiConfig::parse("[repos.a]\nurl = \"x\"\n[repos.a.grants]\nlower = []").is_err());
-        assert!(
-            CiConfig::parse("[repos.a]\nurl = \"x\"\n[repos.a.grants]\nA = [\"cron 1 2\"]")
-                .is_err()
-        );
-        assert!(CiConfig::parse("[repos.a]\nurl = \"x\"\nforge = \"github\"").is_err());
-        assert!(
-            CiConfig::parse(
-                "[machines.W]\nkind = \"windows-vm\"\nscript = \"s\"\ndir = \"d\"\nssh_host = \"h\""
-            )
-            .is_err()
-        );
-        assert!(
-            CiConfig::parse("[machines.w]\nkind = \"windows-vm\"\nscript = \"s\"\ndir = \"d\"")
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn machine_kinds() {
-        let host = |extra: &str| {
-            CiConfig::parse(&format!(
-                "[machines.m]\nkind = \"unix-host\"\nssh_host = \"h\"\ncpus = 2\n{extra}"
-            ))
-        };
-        assert!(host("dir = \"/srv/ci\"").is_ok());
-        let err = host("dir = \"srv/ci\"").unwrap_err();
-        assert!(err.contains("absolute"), "{err}");
-        assert!(host("dir = \"/srv/ci\"\nscript = \"s\"").is_err());
-        // Without `kind` a machine is neither, whatever its fields say.
-        assert!(
-            CiConfig::parse("[machines.w]\nscript = \"s\"\ndir = \"d\"\nssh_host = \"h\"").is_err()
-        );
-        assert!(CiConfig::parse("[machines.w]\nkind = \"vm\"\nssh_host = \"h\"").is_err());
+        let parse = |extra: &str| CiConfig::parse(&format!("{}{extra}", with_runners("")));
+        assert!(parse("[repos.Bad]\nurl = \"x\"").is_err());
+        assert!(parse("[repos.a]\nurl = \"x\"\nfetch_token = \"lower\"").is_err());
+        assert!(parse("[repos.a]\nurl = \"x\"\n[repos.a.grants]\nlower = []").is_err());
+        assert!(parse("[repos.a]\nurl = \"x\"\n[repos.a.grants]\nA = [\"cron 1 2\"]").is_err());
+        assert!(parse("[repos.a]\nurl = \"x\"\nforge = \"github\"").is_err());
     }
 
     #[test]
     fn secrets_need_a_source() {
-        let err = CiConfig::parse("[repos.a]\nurl = \"x\"\nfetch_token = \"TOKEN\"").unwrap_err();
+        let parse = |extra: &str| CiConfig::parse(&format!("{}{extra}", with_runners("")));
+        let err = parse("[repos.a]\nurl = \"x\"\nfetch_token = \"TOKEN\"").unwrap_err();
         assert_eq!(err, "repo `a` names secrets but ci.toml has no [secrets]");
-        let err =
-            CiConfig::parse("[repos.a]\nurl = \"x\"\n[repos.a.grants]\nTOKEN = []").unwrap_err();
+        let err = parse("[repos.a]\nurl = \"x\"\n[repos.a.grants]\nTOKEN = []").unwrap_err();
         assert_eq!(err, "repo `a` names secrets but ci.toml has no [secrets]");
-        assert!(CiConfig::parse("[secrets]\naddr = \"a\"\npath = \"p\"\nrole_id = \"\"").is_err());
+        assert!(parse("[secrets]\naddr = \"a\"\npath = \"p\"\nrole_id = \"\"").is_err());
         let config =
-            CiConfig::parse("[secrets]\naddr = \"http://b:8200/\"\npath = \"p\"\nrole_id = \"r\"")
-                .unwrap();
+            parse("[secrets]\naddr = \"http://b:8200/\"\npath = \"p\"\nrole_id = \"r\"").unwrap();
         let secrets = config.secrets.unwrap();
         assert_eq!(secrets.addr, "http://b:8200");
         assert_eq!(secrets.mount, "secret");
@@ -532,8 +483,8 @@ forge = "none"
     fn load_missing_is_none() {
         let dir = temp("load");
         assert!(CiConfig::load(&dir).unwrap().is_none());
-        std::fs::write(dir.join(CONFIG_FILE), "budget_gb = 7").unwrap();
-        assert_eq!(CiConfig::load(&dir).unwrap().unwrap().budget_gb, 7);
+        std::fs::write(dir.join(CONFIG_FILE), with_runners("")).unwrap();
+        assert_eq!(CiConfig::load(&dir).unwrap().unwrap().default_runner, "a");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

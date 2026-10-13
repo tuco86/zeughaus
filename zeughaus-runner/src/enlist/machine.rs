@@ -1,16 +1,10 @@
-//! The machines a CI job can run on: a VM the CI boots on demand and stops
-//! after an idle timeout, and a unix host (a Mac, say) that is always on and
-//! reached over ssh.
+//! A machine behind this runner that a CI job can run on: a Windows VM booted
+//! on demand and stopped after an idle timeout.
 //!
-//! A VM is driven through its `vm.sh` (boot, stop) and its HMP monitor
-//! socket (freeze, thaw). One job runs in it at a time; the scheduler
-//! enforces that, and the lease count here is what keeps the idle stop away
-//! while a job is booting or running. A unix host is only probed: it has no
-//! power state to manage, and a job waits for it to answer.
-//!
-//! The busy measurement is this workstation's GPU, so it holds and freezes
-//! only the jobs that run on the workstation (host, container, VM), never a
-//! unix host's.
+//! A VM is driven through its `vm.sh` (boot, stop) and its HMP monitor socket
+//! (freeze, thaw). One job runs in it at a time; the CI enforces that, and the
+//! lease count here is what keeps the idle stop away while a job is booting
+//! or running.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -19,10 +13,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
-use super::config::{MachineConfig, UnixHostConfig, VmConfig};
-
-/// How often an offline unix host is probed again while a job waits for it.
-const HOST_RETRY: Duration = Duration::from_secs(30);
+use super::config::VmConfig;
 
 /// How long a failed run's debug shell keeps the VM up after it was opened.
 const DEBUG_HOLD: Duration = Duration::from_secs(24 * 3600);
@@ -54,7 +45,7 @@ pub struct Vm {
 impl Vm {
     /// A machine whose QEMU is alive counts as up: a restarted runner finds
     /// the VM its predecessor booted.
-    fn new(name: &str, config: VmConfig, state_dir: &Path) -> Arc<Vm> {
+    pub fn new(name: &str, config: VmConfig, state_dir: &Path) -> Arc<Vm> {
         let power = if qemu_alive(&config.dir) {
             Power::Ready
         } else {
@@ -78,8 +69,8 @@ impl Vm {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The power state as the CI view shows it.
-    fn status(&self) -> &'static str {
+    /// The power state as the CI's machine list shows it.
+    pub fn status(&self) -> &'static str {
         match self.lock().power {
             Power::Off => "off",
             Power::Booting => "booting",
@@ -88,9 +79,17 @@ impl Vm {
         }
     }
 
+    pub fn ssh_host(&self) -> &str {
+        &self.config.ssh_host
+    }
+
+    pub fn cpus(&self) -> u32 {
+        self.config.cpus
+    }
+
     /// Takes a lease, booting and preparing the VM first if it is off.
     /// Blocks for as long as that takes; called from a job's own thread.
-    fn acquire(&self) -> Result<(), String> {
+    pub fn acquire(&self) -> Result<(), String> {
         let mut inner = self.lock();
         loop {
             match inner.power {
@@ -108,18 +107,18 @@ impl Vm {
         inner.leases += 1;
         drop(inner);
 
-        eprintln!("[ci] machine {}: booting", self.name);
+        eprintln!("[enlist] machine {}: booting", self.name);
         let booted = self.boot();
         let mut inner = self.lock();
         match &booted {
             Ok(()) => {
                 inner.power = Power::Ready;
-                eprintln!("[ci] machine {}: ready", self.name);
+                eprintln!("[enlist] machine {}: ready", self.name);
             }
             Err(e) => {
                 inner.leases -= 1;
                 inner.last_release = Instant::now();
-                eprintln!("[ci] machine {}: {e}", self.name);
+                eprintln!("[enlist] machine {}: {e}", self.name);
                 // A half-booted QEMU would make the next `vm.sh run` refuse.
                 drop(inner);
                 let _ = self.vm("stop");
@@ -138,30 +137,30 @@ impl Vm {
     }
 
     /// A lease for a job a previous runner started in a VM that is still up.
-    fn adopt(&self) {
+    pub fn adopt(&self) {
         let mut inner = self.lock();
         inner.leases += 1;
         inner.power = Power::Ready;
     }
 
-    fn release(&self) {
+    pub fn release(&self) {
         let mut inner = self.lock();
         inner.leases = inner.leases.saturating_sub(1);
         inner.last_release = Instant::now();
     }
 
     /// A failed run whose terminal may open a shell in the guest.
-    fn add_debug_run(&self, run_dir: PathBuf) {
+    pub fn add_debug_run(&self, run_dir: PathBuf) {
         self.lock().debug_runs.push(run_dir);
     }
 
     /// Stops the VM once nothing has used it for `idle_minutes` and no
     /// debug shell is open in it. The stop runs on a thread of its own:
     /// an ACPI power-off takes up to two minutes.
-    fn tick(self: &Arc<Self>) {
+    pub fn tick(self: &Arc<Self>) {
         let mut inner = self.lock();
         if inner.power == Power::Ready && !qemu_alive(&self.config.dir) {
-            eprintln!("[ci] machine {}: QEMU is gone", self.name);
+            eprintln!("[enlist] machine {}: QEMU is gone", self.name);
             inner.power = Power::Off;
             drop(inner);
             self.changed.notify_all();
@@ -180,11 +179,11 @@ impl Vm {
         drop(inner);
         let machine = Arc::clone(self);
         let spawned = std::thread::Builder::new()
-            .name(format!("zeughaus-ci-{}-stop", self.name))
+            .name(format!("zeughaus-enlist-{}-stop", self.name))
             .spawn(move || {
-                eprintln!("[ci] machine {}: idle, stopping", machine.name);
+                eprintln!("[enlist] machine {}: idle, stopping", machine.name);
                 if let Err(e) = machine.vm("stop") {
-                    eprintln!("[ci] machine {}: stop: {e}", machine.name);
+                    eprintln!("[enlist] machine {}: stop: {e}", machine.name);
                 }
                 let mut inner = machine.lock();
                 inner.power = if qemu_alive(&machine.config.dir) {
@@ -197,8 +196,20 @@ impl Vm {
                 machine.changed.notify_all();
             });
         if let Err(e) = spawned {
-            eprintln!("[ci] machine {}: no stop thread: {e}", self.name);
+            eprintln!("[enlist] machine {}: no stop thread: {e}", self.name);
             self.lock().power = Power::Ready;
+        }
+    }
+
+    /// Pauses or resumes the vCPUs.
+    pub fn freeze(&self, freeze: bool) -> Result<(), String> {
+        self.monitor(if freeze { "stop" } else { "cont" })
+    }
+
+    /// Resumes a VM a previous process may have frozen.
+    pub fn thaw_if_running(&self) {
+        if self.config.dir.join("qemu.pid").exists() {
+            let _ = self.monitor("cont");
         }
     }
 
@@ -287,213 +298,6 @@ impl Vm {
             Ok(())
         } else {
             Err(format!("{what} exited {status}"))
-        }
-    }
-}
-
-/// A unix host reached over ssh, always on.
-pub struct Host {
-    name: String,
-    config: UnixHostConfig,
-    log: PathBuf,
-    /// The last probe's answer; `None` until one ran.
-    online: Mutex<Option<bool>>,
-}
-
-impl Host {
-    fn new(name: &str, config: UnixHostConfig, state_dir: &Path) -> Arc<Host> {
-        Arc::new(Host {
-            name: name.to_owned(),
-            log: machine_log(state_dir, name),
-            config,
-            online: Mutex::new(None),
-        })
-    }
-
-    /// `"online"` or `"offline"` by the last probe, `"unknown"` before any.
-    fn status(&self) -> &'static str {
-        match *self.online.lock().unwrap_or_else(|e| e.into_inner()) {
-            Some(true) => "online",
-            Some(false) => "offline",
-            None => "unknown",
-        }
-    }
-
-    /// Whether the host answers ssh and its run directory is usable; the
-    /// probe also prunes runs a killed launcher left behind.
-    fn probe(&self) -> bool {
-        let online = self.run_probe();
-        *self.online.lock().unwrap_or_else(|e| e.into_inner()) = Some(online);
-        online
-    }
-
-    fn run_probe(&self) -> bool {
-        let Ok(log) = open_log(&self.log) else {
-            return false;
-        };
-        let Ok(err) = log.try_clone() else {
-            return false;
-        };
-        Command::new("ssh")
-            .args(["-o", "BatchMode=yes"])
-            .arg(&self.config.ssh_host)
-            .arg(super::launch::host_probe(&self.config.dir))
-            .stdin(Stdio::null())
-            .stdout(log)
-            .stderr(err)
-            .status()
-            .is_ok_and(|status| status.success())
-    }
-
-    /// Returns once the host answers, or after `wait_minutes` without an
-    /// answer. `waiting` is told once, at the first failed probe, so the
-    /// pipeline can show why the job has not started. Blocks; called from a
-    /// job's own thread.
-    fn acquire(&self, waiting: &mut dyn FnMut(String)) -> Result<(), String> {
-        if self.probe() {
-            return Ok(());
-        }
-        eprintln!("[ci] machine {}: offline", self.name);
-        waiting(format!("machine {} offline", self.name));
-        let deadline = Instant::now() + Duration::from_secs(self.config.wait_minutes * 60);
-        while Instant::now() < deadline {
-            std::thread::sleep(HOST_RETRY.min(deadline.saturating_duration_since(Instant::now())));
-            if self.probe() {
-                eprintln!("[ci] machine {}: back", self.name);
-                return Ok(());
-            }
-        }
-        Err(format!(
-            "machine {} offline for {} min",
-            self.name, self.config.wait_minutes
-        ))
-    }
-}
-
-/// Why a job's machine did not take it.
-pub enum StartError {
-    /// The machine failed to come up: the job fails.
-    Failed(String),
-    /// The machine did not answer within its wait: the job is skipped.
-    Offline(String),
-}
-
-/// A machine of either kind, as the scheduler holds it.
-#[derive(Clone)]
-pub enum Machine {
-    Vm(Arc<Vm>),
-    Host(Arc<Host>),
-}
-
-impl Machine {
-    /// The machine `config` describes; see [`Vm::new`] for a VM found up.
-    pub fn new(name: &str, config: &MachineConfig, state_dir: &Path) -> Machine {
-        match config {
-            MachineConfig::WindowsVm(vm) => Machine::Vm(Vm::new(name, vm.clone(), state_dir)),
-            MachineConfig::UnixHost(host) => {
-                Machine::Host(Host::new(name, host.clone(), state_dir))
-            }
-        }
-    }
-
-    /// Makes the machine ready for one job. A VM is booted if it is off; a
-    /// unix host is waited for, and `waiting` gets the reason once.
-    pub fn acquire(&self, waiting: &mut dyn FnMut(String)) -> Result<(), StartError> {
-        match self {
-            Machine::Vm(vm) => vm.acquire().map_err(StartError::Failed),
-            Machine::Host(host) => host.acquire(waiting).map_err(StartError::Offline),
-        }
-    }
-
-    /// A lease for a job a previous runner started on a VM that is still up.
-    pub fn adopt(&self) {
-        if let Machine::Vm(vm) = self {
-            vm.adopt();
-        }
-    }
-
-    pub fn release(&self) {
-        if let Machine::Vm(vm) = self {
-            vm.release();
-        }
-    }
-
-    /// A failed run whose terminal may open a shell in the guest.
-    pub fn add_debug_run(&self, run_dir: PathBuf) {
-        if let Machine::Vm(vm) = self {
-            vm.add_debug_run(run_dir);
-        }
-    }
-
-    pub fn tick(&self) {
-        if let Machine::Vm(vm) = self {
-            vm.tick();
-        }
-    }
-
-    /// Pauses or resumes a VM's vCPUs. A unix host is never frozen.
-    pub fn freeze(&self, freeze: bool) -> Result<(), String> {
-        match self {
-            Machine::Vm(vm) => vm.monitor(if freeze { "stop" } else { "cont" }),
-            Machine::Host(host) => Err(format!(
-                "machine {} is a unix host and is never frozen",
-                host.name
-            )),
-        }
-    }
-
-    /// Resumes a VM a previous process may have frozen.
-    pub fn thaw_if_running(&self) {
-        if let Machine::Vm(vm) = self
-            && vm.config.dir.join("qemu.pid").exists()
-        {
-            let _ = vm.monitor("cont");
-        }
-    }
-
-    /// Whether the workstation's busy measurement holds and freezes jobs on
-    /// this machine: only if they share the workstation's GPU.
-    pub fn follows_busy(&self) -> bool {
-        matches!(self, Machine::Vm(_))
-    }
-
-    pub fn ssh_host(&self) -> &str {
-        match self {
-            Machine::Vm(vm) => &vm.config.ssh_host,
-            Machine::Host(host) => &host.config.ssh_host,
-        }
-    }
-
-    pub fn cpus(&self) -> u32 {
-        match self {
-            Machine::Vm(vm) => vm.config.cpus,
-            Machine::Host(host) => host.config.cpus,
-        }
-    }
-
-    /// The absolute directory on a unix host that holds its `runs/` and
-    /// `work/`; a VM has none.
-    pub fn unix_dir(&self) -> Option<&str> {
-        match self {
-            Machine::Vm(_) => None,
-            Machine::Host(host) => Some(&host.config.dir),
-        }
-    }
-
-    /// `"windows-vm"` or `"unix-host"`, as the CI view shows it.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Machine::Vm(_) => "windows-vm",
-            Machine::Host(_) => "unix-host",
-        }
-    }
-
-    /// A VM's power state or a unix host's last probe; see [`Vm::status`]
-    /// and [`Host::status`].
-    pub fn status(&self) -> &'static str {
-        match self {
-            Machine::Vm(vm) => vm.status(),
-            Machine::Host(host) => host.status(),
         }
     }
 }

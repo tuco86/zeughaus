@@ -25,7 +25,7 @@ use super::config::BusyConfig;
 /// How often `nvidia-smi` is asked.
 const INTERVAL: Duration = Duration::from_secs(10);
 
-/// The shared verdict, read every scheduler tick.
+/// The shared verdict, read by the executor's clock every second.
 pub struct Busy {
     /// What the GPU says, kept up to date whatever the mode.
     measured: AtomicBool,
@@ -59,7 +59,7 @@ impl Busy {
         drop(current);
         let state = self.state();
         eprintln!(
-            "[ci] busy mode {}: machine {}",
+            "[enlist] busy mode {}: machine {}",
             mode.as_str(),
             if state.busy { "busy" } else { "free" }
         );
@@ -73,7 +73,7 @@ fn load_mode(file: &Path) -> BusyMode {
     match std::fs::read_to_string(file) {
         Ok(text) => BusyMode::parse(text.trim()).unwrap_or_else(|| {
             eprintln!(
-                "[ci] {}: {:?} is not auto, busy or free; using auto",
+                "[enlist] {}: {:?} is not auto, busy or free; using auto",
                 file.display(),
                 text.trim()
             );
@@ -81,7 +81,7 @@ fn load_mode(file: &Path) -> BusyMode {
         }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => BusyMode::Auto,
         Err(e) => {
-            eprintln!("[ci] cannot read {}: {e}; using auto", file.display());
+            eprintln!("[enlist] cannot read {}: {e}; using auto", file.display());
             BusyMode::Auto
         }
     }
@@ -93,7 +93,7 @@ pub fn start(config: BusyConfig, state_dir: &Path) -> Arc<Busy> {
     let file = super::ci_dir(state_dir).join("busy-mode");
     let mode = load_mode(&file);
     if mode != BusyMode::Auto {
-        eprintln!("[ci] busy mode {}", mode.as_str());
+        eprintln!("[enlist] busy mode {}", mode.as_str());
     }
     let busy = Arc::new(Busy {
         measured: AtomicBool::new(false),
@@ -105,7 +105,7 @@ pub fn start(config: BusyConfig, state_dir: &Path) -> Arc<Busy> {
         .name("zeughaus-ci-busy".into())
         .spawn(move || sample_forever(&config, &shared));
     if let Err(e) = spawned {
-        eprintln!("[ci] no busy detection: {e}");
+        eprintln!("[enlist] no busy detection: {e}");
     }
     busy
 }
@@ -117,41 +117,41 @@ pub async fn serve(replier: Replier, busy: Arc<Busy>) {
         let mut request = match replier.accept().await {
             Ok(request) => request,
             Err(e) => {
-                eprintln!("[ci] stopped serving busy: {e}");
+                eprintln!("[enlist] stopped serving busy: {e}");
                 return;
             }
         };
         let payload = match request.take_body().collect(MAX_BUSY_BYTES).await {
             Ok(payload) => payload,
             Err(e) => {
-                eprintln!("[ci] unreadable busy request: {e}");
+                eprintln!("[enlist] unreadable busy request: {e}");
                 continue;
             }
         };
         let Some(asked) = BusyRequest::decode(&payload) else {
             eprintln!(
-                "[ci] refused a malformed busy request ({} bytes)",
+                "[enlist] refused a malformed busy request ({} bytes)",
                 payload.len()
             );
             continue;
         };
         let state = busy.set_mode(asked.mode).unwrap_or_else(|e| {
-            eprintln!("[ci] busy mode {}: {e}", asked.mode.as_str());
+            eprintln!("[enlist] busy mode {}: {e}", asked.mode.as_str());
             busy.state()
         });
         let mut reply = match request.reply(TransferMeta::default()).await {
             Ok(reply) => reply,
             Err(e) => {
-                eprintln!("[ci] cannot reply to a busy request: {e}");
+                eprintln!("[enlist] cannot reply to a busy request: {e}");
                 continue;
             }
         };
         if let Err(e) = reply.write_all(&state.encode()).await {
-            eprintln!("[ci] cannot write a busy reply: {e}");
+            eprintln!("[enlist] cannot write a busy reply: {e}");
             continue;
         }
         if let Err(e) = reply.finish() {
-            eprintln!("[ci] cannot finish a busy reply: {e}");
+            eprintln!("[enlist] cannot finish a busy reply: {e}");
         }
     }
 }
@@ -179,17 +179,17 @@ fn sample_forever(config: &BusyConfig, busy: &Busy) {
                 let is = decide(&values, config, was);
                 if is != was {
                     busy.measured.store(is, Ordering::SeqCst);
-                    eprintln!("[ci] GPU {}", if is { "busy" } else { "free" });
+                    eprintln!("[enlist] GPU {}", if is { "busy" } else { "free" });
                 }
             }
             Err(e) => {
                 if !warned {
                     warned = true;
-                    eprintln!("[ci] no GPU utilisation ({e}); the GPU never counts as busy");
+                    eprintln!("[enlist] no GPU utilisation ({e}); the GPU never counts as busy");
                 }
                 if busy.measured.load(Ordering::SeqCst) {
                     busy.measured.store(false, Ordering::SeqCst);
-                    eprintln!("[ci] GPU free");
+                    eprintln!("[enlist] GPU free");
                 }
             }
         }

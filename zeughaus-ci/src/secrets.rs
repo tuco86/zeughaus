@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
-use super::config::{CiConfig, SecretsConfig};
+use crate::config::{CiConfig, SecretsConfig};
 
 /// The sealed secret_id, relative to the state directory.
 pub const CRED_FILE: &str = "bao-secret-id.cred";
@@ -755,9 +755,13 @@ mod tests {
         assert!(!text.contains("alpha") && !text.contains("tok") && !text.contains("sid-1"));
     }
 
+    /// The runner every parsed config needs.
+    const RUNNERS: &str = "default_runner = \"r\"\n[runners.r]\n\
+        fingerprint = \"sha256:0000000000000000000000000000000000000000000000000000000000000001\"\n";
+
     fn ci_config(addr: &str) -> CiConfig {
         CiConfig::parse(&format!(
-            "[secrets]\naddr = \"{addr}\"\npath = \"zeughaus/ci\"\nrole_id = \"role-1\"\n\
+            "{RUNNERS}[secrets]\naddr = \"{addr}\"\npath = \"zeughaus/ci\"\nrole_id = \"role-1\"\n\
              [repos.a]\nurl = \"x\"\nfetch_token = \"A\"\nstatus_token = \"B\"\n\
              [repos.a.grants]\nC = [\"tag v*\"]\nA = [\"tag v*\"]\n"
         ))
@@ -791,7 +795,7 @@ mod tests {
     #[test]
     fn check_without_secrets_or_names_is_empty() {
         let secrets = Secrets::new(None, Path::new("/nonexistent"));
-        let config = CiConfig::parse("").unwrap();
+        let config = CiConfig::parse(RUNNERS).unwrap();
         assert_eq!(check(&secrets, &config).unwrap(), Vec::<String>::new());
     }
 }

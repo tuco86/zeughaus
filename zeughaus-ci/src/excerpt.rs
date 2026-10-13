@@ -8,19 +8,12 @@
 //! follows a failure never ends up in it.
 
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 /// Lines an excerpt keeps.
 pub const EXCERPT_LINES: usize = 40;
 /// Bytes read from the end of a log for an excerpt: 40 lines of a build
 /// with long paths and colour codes fit many times over.
 const TAIL_BYTES: usize = 256 * 1024;
-/// How long the excerpt waits for the marker. The exit code is written
-/// before the marker is printed, so the run can end before the marker
-/// reached the log; a launcher that failed before the job (checkout, image
-/// build) prints none, and its excerpt is the end of the log after this.
-const MARKER_WAIT: Duration = Duration::from_secs(2);
-const MARKER_POLL: Duration = Duration::from_millis(100);
 /// The prefix of every line the launcher prints itself.
 const MARKER: &str = "[zeughaus-ci] ";
 /// What a cause line looks like, in order of preference: a panic or a
@@ -135,30 +128,38 @@ pub fn cause(excerpt: &str) -> Option<String> {
     })
 }
 
-/// The excerpt of the failed run in `run_dir`, also written to
-/// `<run_dir>/excerpt`. Waits up to [`MARKER_WAIT`] for the exit marker to
-/// reach the output; `None` when the output cannot be read.
-pub fn extract(run_dir: &Path) -> Option<String> {
-    let deadline = Instant::now() + MARKER_WAIT;
-    let text = loop {
-        let text = plain_text(&crate::jobs::run_output_tail(run_dir, TAIL_BYTES).ok()?);
-        if text.lines().any(is_marker) || Instant::now() >= deadline {
-            break text;
-        }
-        std::thread::sleep(MARKER_POLL);
-    };
+/// The excerpt of the failed run whose transcript is in `dir`, also written
+/// to `<dir>/excerpt`. The transcript is complete when the runner reports
+/// the run finished, so a missing exit marker means none was printed (a
+/// launcher that failed before the job) and the excerpt is the end of the
+/// log. `None` when the output cannot be read.
+pub fn extract(dir: &Path) -> Option<String> {
+    let text = plain_text(&run_output_tail(dir, TAIL_BYTES).ok()?);
     let excerpt = excerpt(&text);
-    if let Err(e) = crate::files::write_atomic(&run_dir.join("excerpt"), excerpt.as_bytes()) {
-        eprintln!("[ci] {}: {e}", run_dir.display());
+    if let Err(e) = crate::files::write_atomic(&dir.join("excerpt"), excerpt.as_bytes()) {
+        eprintln!("[ci] {}: {e}", dir.display());
     }
     Some(excerpt)
 }
 
 /// A whole run's output as plain text, for `ci log`.
-pub fn read_log(run_dir: &Path) -> Result<String, String> {
-    crate::jobs::run_output(run_dir)
+pub fn read_log(dir: &Path) -> Result<String, String> {
+    zeughaus_terminal::wal::read_bytes(&dir.join("wal"))
         .map(|bytes| plain_text(&bytes))
-        .map_err(|e| format!("cannot read the output of {}: {e}", run_dir.display()))
+        .map_err(|e| format!("cannot read the output of {}: {e}", dir.display()))
+}
+
+/// The last `max` bytes of the transcript, from the first line that starts
+/// inside them: a cut through a character or an escape sequence would
+/// otherwise open the text.
+fn run_output_tail(dir: &Path, max: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = zeughaus_terminal::wal::tail_bytes(&dir.join("wal"), max)?;
+    if bytes.len() >= max
+        && let Some(newline) = bytes.iter().position(|&b| b == b'\n')
+    {
+        bytes.drain(..=newline);
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]

@@ -1,20 +1,15 @@
-//! Disk housekeeping after a pipeline: the workspace budget, container
-//! images nothing uses any more, and old pipeline records.
+//! Disk housekeeping after a run: the workspace budget, container images
+//! nothing uses any more, and artifact sets of old pipelines.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
 
-use serde::Deserialize;
+use zeughaus_link::enlist::parse_run_id;
 
-use super::event::CiEvent;
-use crate::files::read_json;
-
-/// Pipeline records kept per repository and channel.
-const KEEP_PIPELINES: usize = 200;
 /// Pipelines whose artifacts are kept per repository.
-const KEEP_ARTIFACTS: usize = 10;
+pub const KEEP_ARTIFACTS: usize = 10;
 
 /// The workspaces under `ci/work/<repo>/<job>`.
 fn workspaces(state_dir: &Path) -> Vec<PathBuf> {
@@ -80,10 +75,14 @@ pub fn enforce_budget(state_dir: &Path, budget_gb: u64, in_use: &HashSet<PathBuf
         }
         match remove_workspace(&ws) {
             Ok(()) => {
-                eprintln!("[ci] budget: removed {} ({} MiB)", ws.display(), size >> 20);
+                eprintln!(
+                    "[enlist] budget: removed {} ({} MiB)",
+                    ws.display(),
+                    size >> 20
+                );
                 total = total.saturating_sub(size);
             }
-            Err(e) => eprintln!("[ci] budget: cannot remove {}: {e}", ws.display()),
+            Err(e) => eprintln!("[enlist] budget: cannot remove {}: {e}", ws.display()),
         }
     }
 }
@@ -136,7 +135,7 @@ pub fn prune_images(repo: &str, used: &HashSet<String>) {
             .stderr(Stdio::null())
             .status();
         if removed.is_ok_and(|s| s.success()) {
-            eprintln!("[ci] removed image {tag}");
+            eprintln!("[enlist] removed image {tag}");
         }
     }
     let _ = Command::new("podman")
@@ -146,116 +145,74 @@ pub fn prune_images(repo: &str, used: &HashSet<String>) {
         .status();
 }
 
-/// Keeps the newest [`KEEP_PIPELINES`] pipeline records of every channel of
-/// `repo` (with their transcripts under `<n>.runs/`) and the newest
-/// [`KEEP_ARTIFACTS`] artifact directories, and always those of the
-/// pipelines in `running`.
-pub fn prune_pipelines(state_dir: &Path, repo: &str, running: &HashSet<u64>) {
-    let dir = super::ci_dir(state_dir).join("pipelines").join(repo);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+/// Keeps the artifact sets (`ci/artifacts/<run>`) of the newest `keep`
+/// pipelines of every repository, and always those of the runs in `live`.
+/// A directory that is not a run id is not ours and stays.
+pub fn prune_artifacts(state_dir: &Path, keep: usize, live: &HashSet<String>) {
+    let root = super::artifacts_dir(state_dir);
+    let Ok(entries) = std::fs::read_dir(&root) else {
         return;
     };
-    let mut by_channel: HashMap<String, Vec<u64>> = HashMap::new();
-    let mut artifacts = Vec::new();
+    let mut by_repo: BTreeMap<String, Vec<(u64, PathBuf, String)>> = BTreeMap::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if let Some(n) = name
-            .strip_suffix(".json")
-            .and_then(|n| n.parse::<u64>().ok())
-        {
-            if let Some(channel) = record_channel(&entry.path()) {
-                by_channel.entry(channel).or_default().push(n);
+        if let Some((repo, number, _)) = parse_run_id(&name) {
+            by_repo
+                .entry(repo)
+                .or_default()
+                .push((number, entry.path(), name));
+        }
+    }
+    for runs in by_repo.values() {
+        let mut numbers: Vec<u64> = runs.iter().map(|(number, _, _)| *number).collect();
+        numbers.sort_unstable_by(|a, b| b.cmp(a));
+        numbers.dedup();
+        let Some(&oldest_kept) = numbers.get(keep.saturating_sub(1)) else {
+            continue;
+        };
+        for (number, path, run) in runs {
+            if *number >= oldest_kept || live.contains(run) {
+                continue;
             }
-        } else if let Some(n) = name
-            .strip_suffix(".artifacts")
-            .and_then(|n| n.parse::<u64>().ok())
-        {
-            artifacts.push((n, entry.path()));
+            if let Err(e) = std::fs::remove_dir_all(path) {
+                eprintln!("[enlist] cannot remove {}: {e}", path.display());
+            }
         }
     }
-    for mut numbers in by_channel.into_values() {
-        numbers.sort_by_key(|n| std::cmp::Reverse(*n));
-        for n in numbers
-            .into_iter()
-            .skip(KEEP_PIPELINES)
-            .filter(|n| !running.contains(n))
-        {
-            let _ = std::fs::remove_file(dir.join(format!("{n}.json")));
-            let _ = std::fs::remove_dir_all(dir.join(format!("{n}.runs")));
-        }
-    }
-    artifacts.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
-    for (_, path) in artifacts
-        .into_iter()
-        .skip(KEEP_ARTIFACTS)
-        .filter(|(n, _)| !running.contains(n))
-    {
-        let _ = std::fs::remove_dir_all(path);
-    }
-}
-
-/// The channel of a pipeline record, reading only what decides it. A record
-/// that cannot be read is left alone.
-fn record_channel(path: &Path) -> Option<String> {
-    #[derive(Deserialize)]
-    struct Head {
-        #[serde(default)]
-        channel: String,
-        event: CiEvent,
-    }
-    let head: Head = read_json(path).ok()?;
-    Some(if head.channel.is_empty() {
-        super::channels::fallback(&head.event)
-    } else {
-        head.channel
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ci::event::EventKind;
-
-    fn write_record(dir: &Path, n: u64, channel: &str) {
-        let event = CiEvent {
-            repo: "r".to_owned(),
-            kind: EventKind::Push,
-            git_ref: "main".to_owned(),
-            sha: None,
-            cron: None,
-            actor: "test".to_owned(),
-            delivery: None,
-            received: 0,
-        };
-        let record = serde_json::json!({ "channel": channel, "event": event, "number": n });
-        std::fs::write(dir.join(format!("{n}.json")), record.to_string()).unwrap();
-        std::fs::create_dir_all(dir.join(format!("{n}.runs/build"))).unwrap();
-    }
 
     #[test]
-    fn keeps_the_newest_per_channel() {
-        let state = std::env::temp_dir().join(format!("zh-prune-{}", std::process::id()));
+    fn only_the_newest_pipelines_keep_their_artifacts() {
+        let state = std::env::temp_dir().join(format!("zci-prune-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&state);
-        let dir = crate::ci::ci_dir(&state).join("pipelines").join("r");
-        std::fs::create_dir_all(&dir).unwrap();
-        for n in 1..=205 {
-            write_record(&dir, n, "dev");
+        let root = crate::enlist::artifacts_dir(&state);
+        for number in 1..=4u64 {
+            std::fs::create_dir_all(root.join(format!("demo.{number}.build"))).unwrap();
         }
-        for n in 301..=303 {
-            write_record(&dir, n, "release");
-        }
-        // A pipeline still running survives past the cap.
-        let running: HashSet<u64> = [2].into_iter().collect();
-        prune_pipelines(&state, "r", &running);
-        let exists = |n: u64| dir.join(format!("{n}.json")).exists();
-        let runs = |n: u64| dir.join(format!("{n}.runs")).exists();
-        for n in [1, 3, 4, 5] {
-            assert!(!exists(n) && !runs(n), "{n} should be gone");
-        }
-        assert!(exists(2) && runs(2));
-        for n in (6..=205).chain(301..=303) {
-            assert!(exists(n) && runs(n), "{n} should be kept");
-        }
+        std::fs::create_dir_all(root.join("other.1.build")).unwrap();
+        std::fs::create_dir_all(root.join("not-a-run")).unwrap();
+        let live = HashSet::from(["demo.1.build".to_owned()]);
+        prune_artifacts(&state, 2, &live);
+        let mut left: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
         let _ = std::fs::remove_dir_all(&state);
+        assert_eq!(
+            left,
+            [
+                "demo.1.build",
+                "demo.3.build",
+                "demo.4.build",
+                "not-a-run",
+                "other.1.build"
+            ]
+        );
     }
 }

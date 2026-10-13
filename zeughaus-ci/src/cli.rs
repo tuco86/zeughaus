@@ -1,48 +1,77 @@
-//! `zeughaus-runner ci ...`: checking a `.zeughaus-ci` folder, queueing a pipeline,
-//! reading their state, the forge token and OpenBao checks and the webhook
-//! intake.
+//! `zeughaus-ci [--state-dir DIR] <command>`: running the service, checking
+//! a `.zeughaus-ci` folder, queueing a pipeline, reading their state, and
+//! the forge token and OpenBao checks.
 //!
 //! ```text
-//! ci check [DIR]
-//! ci plan [DIR] <push|tag> <ref>
-//! ci plan [DIR] cron "<expr>"
-//! ci run <repo> <push|tag> <ref> [<sha>]
-//! ci run <repo> cron "<expr>"
-//! ci status [N]
-//! ci log <repo> <pipeline> <job> [--tail N]
-//! ci forge-check <repo>
-//! ci secrets-check
-//! ci hook --listen <addr>
+//! serve --listen <host:port> [--hook <host:port>]
+//! check [DIR]
+//! plan [DIR] <push|tag> <ref>
+//! plan [DIR] cron "<expr>"
+//! run <repo> <push|tag> <ref> [<sha>]
+//! run <repo> cron "<expr>"
+//! status [N]
+//! log <repo> <pipeline> <job> [--tail N]
+//! forge-check <repo>
+//! secrets-check
 //! ```
 //!
 //! `check` and `plan` read only the folder; the others read the state
-//! directory's `ci.toml`. None of them talks to a running runner: `run`
-//! drops an event into the inbox the scheduler drains.
+//! directory's `ci.toml`. Only `serve` is the service: `run` drops an event
+//! into the inbox its scheduler drains, and `status` and `log` read its
+//! records.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use super::CI_DIR;
-use super::channels::Channels;
-use super::config::CiConfig;
-use super::event::{self, CiEvent, EventKind};
-use super::excerpt;
-use super::header::JobDef;
-use super::pipeline::{self, Pattern};
-use super::scheduler::{self, JobStatus, PipelineStatus, place_name};
-use super::secrets::{self, Secrets};
-use super::streak;
+use zeughaus_link::credentials;
 
-const USAGE: &str = "usage: zeughaus-runner ci check [DIR] | plan [DIR] <push|tag> <ref> | \
-plan [DIR] cron \"<expr>\" | run <repo> <push|tag> <ref> [<sha>] | run <repo> cron \"<expr>\" | \
-status [N] | log <repo> <pipeline> <job> [--tail N] | forge-check <repo> | secrets-check | \
-hook --listen <addr>";
+use crate::CI_DIR;
+use crate::channels::Channels;
+use crate::config::CiConfig;
+use crate::event::{self, CiEvent, EventKind};
+use crate::excerpt;
+use crate::header::{self, JobDef};
+use crate::pipeline::{self, Pattern};
+use crate::scheduler::{self, JobStatus, PipelineStatus, place_name};
+use crate::secrets::{self, Secrets};
+use crate::streak;
 
-pub fn run(args: &[String], state_dir: &Path) -> ExitCode {
+const USAGE: &str = "usage: zeughaus-ci [--state-dir DIR] serve --listen <host:port> \
+[--hook <host:port>] | check [DIR] | plan [DIR] <push|tag> <ref> | plan [DIR] cron \"<expr>\" | \
+run <repo> <push|tag> <ref> [<sha>] | run <repo> cron \"<expr>\" | status [N] | \
+log <repo> <pipeline> <job> [--tail N] | forge-check <repo> | secrets-check";
+
+pub fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (state_dir, args) = match split_state_dir(&args) {
+        Ok(split) => split,
+        Err(e) => {
+            eprintln!("[ci] {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    run(args, &state_dir)
+}
+
+/// The leading `--state-dir <path>`, else the state directory every zeughaus
+/// process shares (`ZEUGHAUS_STATE_DIR` or the platform's default), and the
+/// arguments after it.
+fn split_state_dir(args: &[String]) -> Result<(PathBuf, &[String]), String> {
+    match args {
+        [flag, rest @ ..] if flag == "--state-dir" => match rest {
+            [dir, rest @ ..] => Ok((PathBuf::from(dir), rest)),
+            [] => Err("--state-dir needs a path argument".to_owned()),
+        },
+        _ => Ok((credentials::state_dir(), args)),
+    }
+}
+
+fn run(args: &[String], state_dir: &Path) -> ExitCode {
     let result = match args.first().map(String::as_str) {
+        Some("serve") => return crate::service::run(&args[1..], state_dir),
         Some("check") => check(&args[1..]),
         Some("plan") => plan(&args[1..]),
         Some("run") => queue(state_dir, &args[1..]),
@@ -50,9 +79,6 @@ pub fn run(args: &[String], state_dir: &Path) -> ExitCode {
         Some("log") => log(state_dir, &args[1..]),
         Some("forge-check") => forge_check(state_dir, &args[1..]),
         Some("secrets-check") => secrets_check(state_dir, &args[1..]),
-        Some("hook") => return super::hook::run(state_dir, &args[1..]),
-        // Internal: the program of a transcript terminal, started by `/ci`.
-        Some("replay") => return super::replay::run(&args[1..]),
         _ => Err(USAGE.to_owned()),
     };
     match result {
@@ -94,7 +120,7 @@ fn check(args: &[String]) -> Result<(), String> {
     let dir = match args {
         [] => CI_DIR,
         [dir] => dir.as_str(),
-        _ => return Err("usage: ci check [DIR]".to_owned()),
+        _ => return Err("usage: zeughaus-ci check [DIR]".to_owned()),
     };
     let (jobs, channels) = load_dir(Path::new(dir))?;
     for job in jobs {
@@ -108,7 +134,7 @@ fn check(args: &[String]) -> Result<(), String> {
             job.name,
             place_name(&job),
             triggers,
-            job.when_busy
+            header::when_busy_name(job.when_busy)
         );
     }
     for (name, patterns) in channels.names() {
@@ -147,7 +173,7 @@ fn parse_event(
         cron,
         actor: "manual".to_owned(),
         delivery: None,
-        received: super::now_secs(),
+        received: crate::now_secs(),
     })
 }
 
@@ -179,7 +205,7 @@ fn load_config(state_dir: &Path) -> Result<CiConfig, String> {
     CiConfig::load(state_dir)?.ok_or_else(|| {
         format!(
             "no {} in {}",
-            super::config::CONFIG_FILE,
+            crate::config::CONFIG_FILE,
             state_dir.display()
         )
     })
@@ -202,15 +228,15 @@ fn queue(state_dir: &Path, args: &[String]) -> Result<(), String> {
 
 /// The default branch of every configured repository first (green, or which
 /// jobs are red since when), then the newest `N` pipelines. The newest
-/// pipeline of each repository shows the run directory and the excerpt of
+/// pipeline of each repository shows the excerpt of
 /// every failed job; older ones keep to one line per job.
 fn status(state_dir: &Path, args: &[String]) -> Result<(), String> {
     let count = match args {
         [] => 10,
         [n] => n.parse().map_err(|_| format!("{n:?} is not a number"))?,
-        _ => return Err("usage: ci status [N]".to_owned()),
+        _ => return Err("usage: zeughaus-ci status [N]".to_owned()),
     };
-    let now = super::now_secs();
+    let now = crate::now_secs();
     let mut out = String::new();
     if let Some(config) = CiConfig::load(state_dir)? {
         for (name, repo) in &config.repos {
@@ -257,16 +283,14 @@ fn status(state_dir: &Path, args: &[String]) -> Result<(), String> {
         for job in &pipeline.jobs {
             let _ = writeln!(
                 out,
-                "  {:<20} {:<10} {}",
+                "  {:<20} {:<10} {:<14} {}",
                 job.def.name,
                 job.status.as_str(),
+                job.runner.as_deref().unwrap_or("-"),
                 job.note
             );
             if !newest || job.status != JobStatus::Failed {
                 continue;
-            }
-            if let Some(run_dir) = &job.run_dir {
-                let _ = writeln!(out, "    run {}", run_dir.display());
             }
             for line in job.excerpt.iter().flat_map(|e| e.lines()) {
                 let _ = writeln!(out, "    | {line}");
@@ -279,7 +303,7 @@ fn status(state_dir: &Path, args: &[String]) -> Result<(), String> {
 
 /// A job's log as plain text, whole or its last `N` lines.
 fn log(state_dir: &Path, args: &[String]) -> Result<(), String> {
-    const USAGE: &str = "usage: ci log <repo> <pipeline> <job> [--tail N]";
+    const USAGE: &str = "usage: zeughaus-ci log <repo> <pipeline> <job> [--tail N]";
     let (repo, number, job, tail) = match args {
         [repo, number, job] => (repo, number, job, None),
         [repo, number, job, flag, n] if flag == "--tail" => (
@@ -298,16 +322,14 @@ fn log(state_dir: &Path, args: &[String]) -> Result<(), String> {
         .parse::<u64>()
         .map_err(|_| format!("{number:?} is not a pipeline number"))?;
     let pipeline = scheduler::load_pipeline(state_dir, repo, number)?;
-    let record = pipeline
-        .jobs
-        .iter()
-        .find(|j| j.def.name == *job)
-        .ok_or_else(|| format!("{repo} #{number} has no job {job}"))?;
-    let run_dir = record
-        .run_dir
-        .as_ref()
-        .ok_or_else(|| format!("{repo} #{number} {job} never ran"))?;
-    let text = excerpt::read_log(run_dir)?;
+    if !pipeline.jobs.iter().any(|j| j.def.name == *job) {
+        return Err(format!("{repo} #{number} has no job {job}"));
+    }
+    let dir = scheduler::transcript_dir(state_dir, repo, number, job);
+    if !dir.join("wal").exists() {
+        return Err(format!("{repo} #{number} {job} has no transcript"));
+    }
+    let text = excerpt::read_log(&dir)?;
     let lines: Vec<&str> = text.lines().collect();
     let start = tail.map_or(0, |n| lines.len().saturating_sub(n));
     let mut out = lines[start..].join("\n");
@@ -323,7 +345,7 @@ fn print_out(text: &str) {
 
 fn forge_check(state_dir: &Path, args: &[String]) -> Result<(), String> {
     let [repo] = args else {
-        return Err("usage: ci forge-check <repo>".to_owned());
+        return Err("usage: zeughaus-ci forge-check <repo>".to_owned());
     };
     let config = load_config(state_dir)?;
     let repo_config = config
@@ -331,14 +353,14 @@ fn forge_check(state_dir: &Path, args: &[String]) -> Result<(), String> {
         .get(repo)
         .ok_or_else(|| format!("unknown repo {repo}"))?;
     let secrets = Secrets::new(config.secrets.clone(), state_dir);
-    println!("{}", super::forge::check(&secrets, repo_config)?);
+    println!("{}", crate::forge::check(&secrets, repo_config)?);
     Ok(())
 }
 
 /// Every secret `ci.toml` names, read from OpenBao once.
 fn secrets_check(state_dir: &Path, args: &[String]) -> Result<(), String> {
     if !args.is_empty() {
-        return Err("usage: ci secrets-check".to_owned());
+        return Err("usage: zeughaus-ci secrets-check".to_owned());
     }
     let config = load_config(state_dir)?;
     let secrets = Secrets::new(config.secrets.clone(), state_dir);

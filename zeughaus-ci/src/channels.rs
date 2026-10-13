@@ -15,10 +15,10 @@ use std::collections::HashSet;
 
 use serde::Deserialize;
 
-use super::CI_DIR;
-use super::config::valid_name;
-use super::event::{CiEvent, EventKind};
-use super::pipeline::Pattern;
+use crate::CI_DIR;
+use crate::config::valid_name;
+use crate::event::{CiEvent, EventKind};
+use crate::pipeline::Pattern;
 
 pub const CHANNELS_FILE: &str = "channels.toml";
 

@@ -12,8 +12,10 @@ description = "The headless zeughaus process that executes the node graph and ow
 zeughaus-core.workspace = true
 zeughaus-runtime.workspace = true
 # The runner<->editor protocol over weida and the credentials both ends present.
-# Shared with the editor so the two ends cannot disagree about it.
-zeughaus-link.workspace = true
+# Shared with the editor so the two ends cannot disagree about it. The `tokio`
+# feature adds the frame helpers of the enlist protocol this process speaks
+# to the CI.
+zeughaus-link = { workspace = true, features = ["tokio"] }
 # Every plugin the editor offers natively must be instantiable here: the editor
 # only draws a node, this process is the one that runs it. A node type missing
 # from the runner is a node that silently never executes.
@@ -51,22 +53,19 @@ tokio = { version = "1", features = [
     "sync",
     "time",
     "net",
+    # The enlist exchanges are tokio streams: frames and artifact bytes.
+    "io-util",
     # Stopping drains: the signal that used to kill this process now holds it
     # and waits for the live runs.
     "signal",
 ] }
-# CI: `ci.toml` and the `.zeughaus-ci` job headers, webhook signatures (hmac and sha2
-# share one `digest` major), the hook's HTTP intake, cron schedules in the
-# local time zone, and the basic-auth header a mirror fetch presents.
+# `enlist.toml`: the CI this runner enlists into and the machines it offers.
 toml.workspace = true
-hmac = "0.13"
-sha2 = "0.11"
-hex = "0.4"
+# The basic-auth header a mirror fetch presents.
 base64 = "0.23"
-tiny_http = "0.12"
-croner = "4"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Artifact sets leave and enter the runner as tar files.
+tar.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-# The restart signal's handler: an atomic flag the event loop reads.
+# The restart signal's handler and the `timeout` subcommand's process groups.
 libc = "0.2"

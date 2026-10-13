@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
-use super::CI_DIR;
-use super::event::{CiEvent, EventKind};
-use super::header::{JobDef, parse_job};
+use crate::CI_DIR;
+use crate::event::{CiEvent, EventKind};
+use crate::header::{JobDef, parse_job};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pattern {
@@ -181,7 +181,7 @@ fn validate(
             return Err(fail(format!("image `{image}` has no {CI_DIR}/{wanted}")));
         }
     }
-    if job.when_busy == super::header::WhenBusy::Freeze
+    if job.when_busy == zeughaus_link::enlist::WhenBusy::Freeze
         && job.image.is_none()
         && job.machine.is_none()
     {

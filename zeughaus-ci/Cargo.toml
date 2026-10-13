@@ -1,0 +1,42 @@
+[package]
+name = "zeughaus-ci"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "The zeughaus CI: schedules pipelines onto enlisted runners and shows them to editors"
+
+[dependencies]
+# Runners enlist and editors attach over weida, with the identities and the
+# wire types both ends share.
+weida.workspace = true
+zeughaus-link = { workspace = true, features = ["tokio"] }
+# Job transcripts are read-only terminals: the mux wire model, and fed
+# sessions that render the stored output.
+zeughaus-mux.workspace = true
+zeughaus-terminal.workspace = true
+tokio = { version = "1", features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "net",
+    "fs",
+    "io-util",
+] }
+serde.workspace = true
+serde_json = "1"
+# `ci.toml` and the `.zeughaus-ci` job headers, webhook signatures (hmac and
+# sha2 share one `digest` major), the hook's HTTP intake, cron schedules in
+# the local time zone, and the basic-auth header a mirror fetch presents.
+toml.workspace = true
+hmac = "0.13"
+sha2 = "0.11"
+hex = "0.4"
+base64 = "0.23"
+tiny_http = "0.12"
+croner = "4"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
