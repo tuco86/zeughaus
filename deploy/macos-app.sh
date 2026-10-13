@@ -9,9 +9,8 @@
 # deploy/macos/Info.plist plus an icns that render.py draws at the ten sizes
 # iconutil wants, around a release build of the editor.
 #
-# Only the editor. The runner is a headless process with no Dock presence; on
-# macOS it is started by hand or by a launchd agent of the user's making, and
-# the store (`spacetime start`) the same way.
+# Only the editor. The runner is a headless process with no Dock presence;
+# deploy/install-macos.sh installs it as a launchd agent next to this bundle.
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)

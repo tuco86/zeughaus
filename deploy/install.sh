@@ -66,8 +66,9 @@ for pid in $(pgrep -x zeughaus || true); do
 done
 say "done"
 
-# The CI runner (deploy/install-ci.sh) is a separate install; once it exists,
-# bring its binary and units up to date. Never waits for a sudo password.
-if id zeughaus-ci >/dev/null 2>&1; then
-    sh "$root/deploy/install-ci.sh" --update
+# The service runner (deploy/install-runner-user.sh) is a separate install;
+# once it exists, bring its binary and unit up to date. Never waits for a
+# sudo password.
+if id zeughaus >/dev/null 2>&1; then
+    sh "$root/deploy/install-runner-user.sh" --update --feed-addr 10.8.0.10:7444
 fi

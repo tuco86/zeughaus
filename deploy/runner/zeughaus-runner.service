@@ -1,9 +1,11 @@
 [Unit]
-Description=Zeughaus CI runner (executes the pipelines, owns their terminals)
+Description=Zeughaus runner of a service user (executes graphs and CI jobs, owns their terminals)
 
 [Service]
 Type=simple
-ExecStart=/usr/local/lib/zeughaus-ci/bin/zeughaus-runner --state-dir %h/state --keep-runs 20 --feed-addr 127.0.0.1:7444
+# @FEED_ADDR@ is filled in by the install script: a fixed address, so the
+# editors' `zeughaus.toml` and the CI keep naming this runner across restarts.
+ExecStart=/usr/local/lib/zeughaus/bin/zeughaus-runner --state-dir %h/state --keep-runs 20 --feed-addr @FEED_ADDR@
 # SIGUSR1 saves the workspace and execs the binary at the same path: an
 # installed update is picked up without touching a terminal or a running job.
 ExecReload=/bin/kill -USR1 $MAINPID
@@ -14,14 +16,13 @@ ExecReload=/bin/kill -USR1 $MAINPID
 # every job's shell down with a stop or restart; the next runner reattaches
 # them instead.
 KillMode=process
-# A fixed port, so the editors' `zeughaus.toml` keeps naming this runner
-# across restarts; a start that fails on it is retried.
+# A start that fails on the fixed port is retried.
 Restart=on-failure
 RestartSec=5s
 
 # Jobs build their own environment; this PATH only has to find what the
-# runner itself runs (sh, git, podman, ssh, curl).
-Environment=PATH=/usr/local/lib/zeughaus-ci/bin:/usr/local/bin:/usr/bin:/bin
+# runner itself runs (sh, git, podman, ssh, tar).
+Environment=PATH=/usr/local/lib/zeughaus/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target

@@ -1,0 +1,19 @@
+[Unit]
+Description=Zeughaus CI (schedules pipelines onto enlisted runners, webhook intake)
+
+[Service]
+Type=simple
+# The weida endpoint runners and editors dial (WireGuard only), and the
+# webhook intake Caddy forwards https://ci.doodleshnookie.net/hook/<repo> to.
+ExecStart=/usr/local/lib/zeughaus/bin/zeughaus-ci --state-dir %h/state serve --listen 10.8.0.1:7444 --hook 127.0.0.1:8686
+# Everything the CI knows is on disk under the state directory and runs
+# live on the runners, so an update is a plain restart.
+Restart=always
+RestartSec=5s
+
+# The CI itself runs git (mirrors), curl (forge statuses, OpenBao) and
+# systemd-creds (the sealed OpenBao credential).
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
