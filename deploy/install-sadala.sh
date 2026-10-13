@@ -11,6 +11,8 @@
 #   deploy/install-sadala.sh --setup --ci-toml <file>   first install
 #   deploy/install-sadala.sh                            update
 #
+# `--skip-build` installs the binaries already in target/aarch64-linux.
+#
 # An update builds, replaces both binaries, restarts the CI and reloads the
 # runner. Needs `sudo -n` on sadala.
 set -eu
@@ -25,15 +27,17 @@ out=$root/target/aarch64-linux/release
 
 say() { printf '[sadala] %s\n' "$*"; }
 usage() {
-    printf 'usage: %s [--setup --ci-toml <file>]\n' "$0" >&2
+    printf 'usage: %s [--skip-build] [--setup --ci-toml <file>]\n' "$0" >&2
     exit 2
 }
 
 setup=0
+skip_build=0
 ci_toml=
 while [ $# -gt 0 ]; do
     case "$1" in
     --setup) setup=1 ;;
+    --skip-build) skip_build=1 ;;
     --ci-toml)
         [ $# -ge 2 ] || usage
         ci_toml=$2
@@ -50,8 +54,12 @@ fi
 remote() { ssh -o BatchMode=yes "$host" "$@"; }
 upload() { scp -q -o BatchMode=yes "$1" "$host:$2"; }
 
-say "1/7 build"
-sh "$root/deploy/build-aarch64.sh"
+if [ "$skip_build" -eq 1 ]; then
+    say "1/7 build: skipped"
+else
+    say "1/7 build"
+    sh "$root/deploy/build-aarch64.sh"
+fi
 
 say "2/7 binaries"
 # Installed under a new name and renamed: the rename is atomic, so a runner
@@ -91,7 +99,7 @@ EOF
 
     say "4/7 OpenBao credential"
     upload "$root/deploy/ci/openbao.sh" /tmp/zh-openbao.sh
-    remote 'sudo -n sh /tmp/zh-openbao.sh; status=$?; rm -f /tmp/zh-openbao.sh; exit $status'
+    remote 'sudo -n sh /tmp/zh-openbao.sh; rc=$?; rm -f /tmp/zh-openbao.sh; exit $rc'
 else
     say "3/7 users: kept"
     say "4/7 OpenBao credential: kept"
