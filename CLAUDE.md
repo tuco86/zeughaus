@@ -162,7 +162,8 @@ secrets live in OpenBao (`secret/zeughaus/ci`, read with the AppRole that
 `zeughaus-ci run|status|log|forge-check|secrets-check` queues a pipeline,
 reads results, a failed job's excerpt and its log, and checks the forge
 token and every secret `ci.toml` names. `zeughaus-ci check [DIR]` and `plan
-[DIR] <push|tag> <ref>` validate a `.zeughaus-ci/` folder without a service.
+[DIR] <push|tag> <ref>` validate a `.zeughaus-ci/` folder without a service;
+`check` also places every job when the state directory has a `ci.toml`.
 
 Four runners enlist, each with an `<state-dir>/enlist.toml`
 (`deploy/runner/enlist.toml.example`: `ci` (the CI's pinned URL, the line in

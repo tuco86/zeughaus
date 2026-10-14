@@ -198,6 +198,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is gone. The enlist protocol is major 2: CI and every runner must be
   updated together. Old `ci/pipelines/<repo>/<n>.artifacts/` directories on
   the CI are no longer read or pruned and can be deleted by hand.
+- `zeughaus-ci check` places every job against the state directory's
+  `ci.toml` when there is one, so `when_busy = "freeze"` on a host job (a
+  `platform` or `machine` that is a runner) is refused there and not only
+  when a pipeline is set up; without `ci.toml` it warns about each `freeze`
+  job without an `image`.
 
 ### Removed
 

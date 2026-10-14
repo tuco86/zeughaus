@@ -15,10 +15,11 @@
 //! secrets-check
 //! ```
 //!
-//! `check` and `plan` read only the folder; the others read the state
-//! directory's `ci.toml`. Only `serve` is the service: `run` drops an event
-//! into the inbox its scheduler drains, and `status` and `log` read its
-//! records.
+//! `check` reads the folder, and the state directory's `ci.toml` when there
+//! is one, to place every job as a pipeline would; `plan` reads only the
+//! folder; the others read `ci.toml`. Only `serve` is the service: `run`
+//! drops an event into the inbox its scheduler drains, and `status` and
+//! `log` read its records.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -35,7 +36,7 @@ use crate::event::{self, CiEvent, EventKind};
 use crate::excerpt;
 use crate::header::{self, JobDef};
 use crate::pipeline::{self, Pattern};
-use crate::scheduler::{self, JobStatus, PipelineStatus, place_name};
+use crate::scheduler::{self, JobStatus, PipelineStatus, place_job, place_name};
 use crate::secrets::{self, Secrets};
 use crate::streak;
 
@@ -72,7 +73,7 @@ fn split_state_dir(args: &[String]) -> Result<(PathBuf, &[String]), String> {
 fn run(args: &[String], state_dir: &Path) -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("serve") => return crate::service::run(&args[1..], state_dir),
-        Some("check") => check(&args[1..]),
+        Some("check") => check(state_dir, &args[1..]),
         Some("plan") => plan(&args[1..]),
         Some("run") => queue(state_dir, &args[1..]),
         Some("status") => status(state_dir, &args[1..]),
@@ -116,13 +117,62 @@ fn load_dir(dir: &Path) -> Result<(Vec<JobDef>, Channels), String> {
     Ok((jobs, Channels::from_files(&files)?))
 }
 
-fn check(args: &[String]) -> Result<(), String> {
+/// Validates the folder as a pipeline would, placement included when the
+/// state directory has a `ci.toml`: whether `freeze` fits a job's `platform`
+/// or `machine` depends on what `ci.toml` maps it to.
+fn check(state_dir: &Path, args: &[String]) -> Result<(), String> {
     let dir = match args {
         [] => CI_DIR,
         [dir] => dir.as_str(),
         _ => return Err("usage: zeughaus-ci check [DIR]".to_owned()),
     };
-    let (jobs, channels) = load_dir(Path::new(dir))?;
+    let dir = Path::new(dir);
+    let (jobs, channels) = load_dir(dir)?;
+    let config = match CiConfig::load(state_dir) {
+        Ok(Some(config)) => Some(config),
+        Ok(None) => {
+            eprintln!(
+                "[ci] no {} in {}: placement not checked",
+                crate::config::CONFIG_FILE,
+                state_dir.display()
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("[ci] placement not checked: {e}");
+            None
+        }
+    };
+    match &config {
+        Some(config) => {
+            let problems: Vec<String> = jobs
+                .iter()
+                .filter_map(|job| {
+                    place_job(config, "check", job, |image| {
+                        let path = dir.join(format!("{image}.Containerfile"));
+                        std::fs::read_to_string(&path)
+                            .map_err(|e| format!("cannot read {}: {e}", path.display()))
+                    })
+                    .err()
+                })
+                .collect();
+            if !problems.is_empty() {
+                return Err(problems.join("\n"));
+            }
+        }
+        None => {
+            for job in jobs.iter().filter(|job| {
+                job.when_busy == zeughaus_link::enlist::WhenBusy::Freeze && job.image.is_none()
+            }) {
+                eprintln!(
+                    "[ci] warning: {CI_DIR}/{}: when_busy = \"freeze\" needs a container or a VM; \
+                     {} must name a VM in ci.toml",
+                    job.file,
+                    place_name(job)
+                );
+            }
+        }
+    }
     for job in jobs {
         let triggers = if job.on.is_empty() {
             format!("needs: {}", job.needs.join(", "))
