@@ -410,6 +410,7 @@ mod tests {
                 needs: Vec::new(),
                 image: None,
                 machine: None,
+                platform: None,
                 cache: Vec::new(),
                 secrets: Vec::new(),
                 when_busy: Default::default(),

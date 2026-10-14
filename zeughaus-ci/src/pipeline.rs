@@ -170,10 +170,15 @@ fn validate(
     if job.image.is_some() && job.machine.is_some() {
         return Err(fail("`image` and `machine` are mutually exclusive".into()));
     }
+    if job.platform.is_some() && job.machine.is_some() {
+        return Err(fail(
+            "`platform` and `machine` are mutually exclusive".into(),
+        ));
+    }
     // Whether a `.sh` job fits its machine depends on the machine's kind in
     // the runner's ci.toml; the scheduler checks that when the job starts.
-    if job.file.ends_with(".ps1") && job.machine.is_none() {
-        return Err(fail("a .ps1 job requires `machine`".into()));
+    if job.file.ends_with(".ps1") && job.machine.is_none() && job.platform.is_none() {
+        return Err(fail("a .ps1 job requires `machine` or `platform`".into()));
     }
     if let Some(image) = &job.image {
         let wanted = format!("{image}.Containerfile");
@@ -184,9 +189,10 @@ fn validate(
     if job.when_busy == zeughaus_link::enlist::WhenBusy::Freeze
         && job.image.is_none()
         && job.machine.is_none()
+        && job.platform.is_none()
     {
         return Err(fail(
-            "`when_busy = \"freeze\"` requires `image` or `machine`".into(),
+            "`when_busy = \"freeze\"` requires `image`, `machine` or `platform`".into(),
         ));
     }
     for pattern in &job.on {
@@ -372,6 +378,24 @@ mod tests {
     }
 
     #[test]
+    fn a_platform_places_ps1_freeze_and_image_jobs() {
+        let on = "on = [\"push main\"]";
+        let jobs = load(&[
+            file(
+                "win.ps1",
+                &format!("{on}\nplatform = \"windows-amd64\"\nwhen_busy = \"freeze\""),
+            ),
+            file(
+                "box.sh",
+                &format!("{on}\nplatform = \"linux-arm64\"\nimage = \"ubuntu\""),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(jobs[0].platform.as_deref(), Some("linux-arm64"));
+        assert_eq!(jobs[1].platform.as_deref(), Some("windows-amd64"));
+    }
+
+    #[test]
     fn validation_rules() {
         let on = "on = [\"push main\"]";
         let cases: Vec<(Vec<(String, String)>, &str)> = vec![
@@ -399,6 +423,17 @@ mod tests {
                 "mutually exclusive",
             ),
             (vec![file("a.ps1", on)], "requires `machine`"),
+            (
+                vec![file(
+                    "a.sh",
+                    &format!("{on}\nplatform = \"p\"\nmachine = \"w\""),
+                )],
+                "`platform` and `machine` are mutually exclusive",
+            ),
+            (
+                vec![file("a.sh", &format!("{on}\nplatform = \"P\""))],
+                "platform name `P`",
+            ),
             (
                 vec![file("a.sh", &format!("{on}\nimage = \"nope\""))],
                 "no .zeughaus-ci/nope.Containerfile",

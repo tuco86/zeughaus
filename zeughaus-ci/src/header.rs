@@ -30,6 +30,10 @@ pub struct JobDef {
     pub needs: Vec<String>,
     pub image: Option<String>,
     pub machine: Option<String>,
+    /// A platform of `ci.toml` `[platforms]`: the job runs where that platform
+    /// is built. Exclusive with `machine`.
+    #[serde(default)]
+    pub platform: Option<String>,
     pub cache: Vec<String>,
     pub secrets: Vec<String>,
     pub when_busy: WhenBusy,
@@ -48,6 +52,7 @@ struct JobHeader {
     needs: Vec<String>,
     image: Option<String>,
     machine: Option<String>,
+    platform: Option<String>,
     #[serde(default)]
     cache: Vec<String>,
     #[serde(default)]
@@ -128,6 +133,13 @@ pub fn parse_job(file_name: &str, text: &str) -> Result<Option<JobDef>, String> 
             "job name `{name}` must match [a-z0-9][a-z0-9-]*"
         )));
     }
+    if let Some(p) = &header.platform
+        && !valid_name(p)
+    {
+        return Err(fail(format!(
+            "platform name `{p}` must match [a-z0-9][a-z0-9-]*"
+        )));
+    }
     for path in &header.cache {
         check_cache(path).map_err(fail)?;
     }
@@ -165,6 +177,7 @@ pub fn parse_job(file_name: &str, text: &str) -> Result<Option<JobDef>, String> 
         needs: header.needs,
         image: header.image,
         machine: header.machine,
+        platform: header.platform,
         cache: header.cache,
         secrets: header.secrets,
         when_busy: header.when_busy,
@@ -248,6 +261,17 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(ok.timeout_minutes, 1440);
+    }
+
+    #[test]
+    fn platform_is_parsed_and_its_name_checked() {
+        let wrap = |body: &str| format!("# /// ci\n# on = [\"push main\"]\n# {body}\n# ///\n");
+        let job = parse_job("x.sh", &wrap("platform = \"linux-arm64\""))
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.platform.as_deref(), Some("linux-arm64"));
+        let err = parse_job("x.sh", &wrap("platform = \"Linux\"")).unwrap_err();
+        assert!(err.contains("platform name `Linux`"), "{err}");
     }
 
     #[test]

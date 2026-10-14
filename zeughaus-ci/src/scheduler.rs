@@ -1259,6 +1259,9 @@ impl Scheduler {
             ("CI_JOB".into(), job.name.clone()),
             ("CI_ACTOR".into(), pipeline.event.actor.clone()),
         ];
+        if let Some(platform) = &job.platform {
+            env.push(("CI_PLATFORM".into(), platform.clone()));
+        }
         if let Some(cron) = &pipeline.event.cron {
             env.push(("CI_CRON".into(), cron.clone()));
         }
@@ -1691,64 +1694,120 @@ fn failure_note(end: &RunEnd, timeout_minutes: u32) -> String {
     }
 }
 
-/// `host`, `image:<x>` or `machine:<x>`.
+/// `host`, `image:<x>`, `machine:<x>`, `platform:<p>` or `platform:<p> image:<x>`.
 pub fn place_name(job: &JobDef) -> String {
-    if let Some(image) = &job.image {
-        format!("image:{image}")
-    } else if let Some(machine) = &job.machine {
-        format!("machine:{machine}")
-    } else {
-        "host".to_owned()
+    match (&job.platform, &job.image, &job.machine) {
+        (Some(platform), Some(image), _) => format!("platform:{platform} image:{image}"),
+        (Some(platform), None, _) => format!("platform:{platform}"),
+        (None, Some(image), _) => format!("image:{image}"),
+        (None, None, Some(machine)) => format!("machine:{machine}"),
+        (None, None, None) => "host".to_owned(),
     }
 }
 
 /// Decides where a job runs: the runner and the place on it. A pure function
-/// of the config and the job, so a bad `machine` fails the pipeline when it
-/// is set up rather than when its job is assigned. `containerfile` reads the
-/// text of `<image>.Containerfile` at the pipeline's commit; the image tag
-/// follows that text, so a changed Containerfile builds a new image.
+/// of the config and the job, so a bad `machine` or `platform` fails the
+/// pipeline when it is set up rather than when its job is assigned.
+/// `containerfile` reads the text of `<image>.Containerfile` at the pipeline's
+/// commit; the image tag follows that text, so a changed Containerfile builds
+/// a new image.
+///
+/// The target is the runner or machine the job names: `ci.toml`'s
+/// `[platforms]` entry of its `platform`, else its `machine`. An image runs
+/// in a container on the target runner, or on the default runner when there
+/// is no target.
 pub fn place_job(
     config: &CiConfig,
     repo: &str,
     job: &JobDef,
     containerfile: impl Fn(&str) -> Result<String, String>,
 ) -> Result<(String, Place), String> {
+    /// What the job's `platform` or `machine` names.
+    enum Target<'a> {
+        /// Neither is set.
+        Default,
+        Runner(&'a str),
+        Machine {
+            name: &'a str,
+            runner: &'a str,
+        },
+    }
+
+    let fail = |msg: String| format!("{CI_DIR}/{}: {msg}", job.file);
+    let (name, what) = match (&job.platform, &job.machine) {
+        (Some(platform), _) => {
+            let target = config.platforms.get(platform).ok_or_else(|| {
+                fail(format!("platform {platform} is not in ci.toml [platforms]"))
+            })?;
+            (Some(target), format!("platform {platform} ({target})"))
+        }
+        (None, Some(machine)) => (Some(machine), format!("machine {machine}")),
+        (None, None) => (None, "the default placement".to_owned()),
+    };
+    let target = match name {
+        None => Target::Default,
+        Some(name) if config.runners.contains_key(name) => Target::Runner(name),
+        Some(name) => match config.runner_of_machine(name) {
+            Some(runner) => Target::Machine { name, runner },
+            None => {
+                return Err(fail(format!(
+                    "{what} is neither a runner nor a machine of one"
+                )));
+            }
+        },
+    };
     if let Some(image) = &job.image {
+        let runner = match target {
+            Target::Default => &config.default_runner,
+            Target::Runner(runner) => runner,
+            Target::Machine { .. } => {
+                return Err(fail(format!(
+                    "{what} is a Windows VM; an image needs a runner"
+                )));
+            }
+        };
         let text = containerfile(image)?;
         let digest = hex::encode(Sha256::digest(text.as_bytes()));
         let tag = format!("localhost/zci-{repo}-{image}:{}", &digest[..16]);
         return Ok((
-            config.default_runner.clone(),
+            runner.to_owned(),
             Place::Container {
                 image: image.clone(),
                 tag,
             },
         ));
     }
-    let Some(name) = &job.machine else {
-        return Ok((config.default_runner.clone(), Place::Host));
-    };
-    let fail = |msg: String| format!("{CI_DIR}/{}: {msg}", job.file);
     let is_ps1 = job.file.ends_with(".ps1");
-    if config.runners.contains_key(name) {
-        if is_ps1 {
-            return Err(fail(format!(
-                "machine {name} is a runner; a .ps1 job cannot run there"
-            )));
+    let (runner, place) = match target {
+        Target::Default => (config.default_runner.as_str(), Place::Host),
+        Target::Runner(runner) => {
+            if is_ps1 {
+                return Err(fail(format!(
+                    "{what} is a runner; a .ps1 job cannot run there"
+                )));
+            }
+            (runner, Place::Host)
         }
-        return Ok((name.clone(), Place::Host));
-    }
-    let Some(runner) = config.runner_of_machine(name) else {
-        return Err(fail(format!(
-            "machine {name} is neither a runner nor a machine of one"
-        )));
+        Target::Machine { name, runner } => {
+            if !is_ps1 {
+                return Err(fail(format!(
+                    "{what} is a Windows VM; it runs only .ps1 jobs"
+                )));
+            }
+            (
+                runner,
+                Place::Machine {
+                    name: name.to_owned(),
+                },
+            )
+        }
     };
-    if !is_ps1 {
+    if place == Place::Host && job.when_busy == WhenBusy::Freeze {
         return Err(fail(format!(
-            "machine {name} is a Windows VM; it runs only .ps1 jobs"
+            "{what} runs on the host of runner {runner}; when_busy = \"freeze\" needs a container or a machine"
         )));
     }
-    Ok((runner.to_owned(), Place::Machine { name: name.clone() }))
+    Ok((runner.to_owned(), place))
 }
 
 /// The text of `<image>.Containerfile` at `sha`.
@@ -1939,12 +1998,19 @@ mod tests {
         CiConfig::parse(&format!(
             "default_runner = \"tuco-pc\"\n\
              [runners.tuco-pc]\nfingerprint = \"{FP_1}\"\nmachines = [\"win11\"]\n\
-             [runners.atik]\nfingerprint = \"{FP_2}\"\n"
+             [runners.atik]\nfingerprint = \"{FP_2}\"\n\
+             [platforms]\nlinux-amd64 = \"tuco-pc\"\nlinux-arm64 = \"atik\"\n\
+             windows-amd64 = \"win11\"\n"
         ))
         .expect("a valid config")
     }
 
-    fn job(file: &str, image: Option<&str>, machine: Option<&str>) -> JobDef {
+    fn job(
+        file: &str,
+        image: Option<&str>,
+        machine: Option<&str>,
+        platform: Option<&str>,
+    ) -> JobDef {
         JobDef {
             name: "j".to_owned(),
             file: file.to_owned(),
@@ -1952,6 +2018,7 @@ mod tests {
             needs: Vec::new(),
             image: image.map(str::to_owned),
             machine: machine.map(str::to_owned),
+            platform: platform.map(str::to_owned),
             cache: Vec::new(),
             secrets: Vec::new(),
             when_busy: WhenBusy::Wait,
@@ -1970,7 +2037,7 @@ mod tests {
         let placed = place_job(
             &config(),
             "r",
-            &job("a.sh", None, Some("atik")),
+            &job("a.sh", None, Some("atik"), None),
             containerfile,
         );
         assert_eq!(placed, Ok(("atik".to_owned(), Place::Host)));
@@ -1981,7 +2048,7 @@ mod tests {
         let placed = place_job(
             &config(),
             "r",
-            &job("w.ps1", None, Some("win11")),
+            &job("w.ps1", None, Some("win11"), None),
             containerfile,
         );
         assert_eq!(
@@ -2000,7 +2067,7 @@ mod tests {
         let (runner, place) = place_job(
             &config(),
             "r",
-            &job("a.sh", Some("arch"), None),
+            &job("a.sh", Some("arch"), None, None),
             containerfile,
         )
         .unwrap();
@@ -2013,16 +2080,24 @@ mod tests {
         assert_eq!(stem, "localhost/zci-r-arch");
         assert_eq!(digest.len(), 16);
         // The tag follows the Containerfile's content.
-        let (_, other) = place_job(&config(), "r", &job("a.sh", Some("arch"), None), |_| {
-            Ok("FROM other\n".to_owned())
-        })
+        let (_, other) = place_job(
+            &config(),
+            "r",
+            &job("a.sh", Some("arch"), None, None),
+            |_| Ok("FROM other\n".to_owned()),
+        )
         .unwrap();
         assert_ne!(Place::Container { image, tag }, other);
     }
 
     #[test]
     fn no_machine_and_no_image_runs_on_the_default_runner() {
-        let placed = place_job(&config(), "r", &job("a.sh", None, None), containerfile);
+        let placed = place_job(
+            &config(),
+            "r",
+            &job("a.sh", None, None, None),
+            containerfile,
+        );
         assert_eq!(placed, Ok(("tuco-pc".to_owned(), Place::Host)));
     }
 
@@ -2030,12 +2105,15 @@ mod tests {
     fn a_job_that_does_not_fit_its_machine_is_an_error() {
         let cases = [
             (
-                job("a.ps1", None, Some("atik")),
+                job("a.ps1", None, Some("atik"), None),
                 "a .ps1 job cannot run there",
             ),
-            (job("a.sh", None, Some("win11")), "runs only .ps1 jobs"),
             (
-                job("a.sh", None, Some("nowhere")),
+                job("a.sh", None, Some("win11"), None),
+                "runs only .ps1 jobs",
+            ),
+            (
+                job("a.sh", None, Some("nowhere"), None),
                 "machine nowhere is neither a runner nor a machine of one",
             ),
         ];
@@ -2043,6 +2121,87 @@ mod tests {
             let err = place_job(&config(), "r", &def, containerfile).unwrap_err();
             assert!(err.contains(expected), "{err}");
         }
+    }
+
+    #[test]
+    fn a_platform_on_a_runner_runs_on_its_host() {
+        let placed = place_job(
+            &config(),
+            "r",
+            &job("a.sh", None, None, Some("linux-arm64")),
+            containerfile,
+        );
+        assert_eq!(placed, Ok(("atik".to_owned(), Place::Host)));
+    }
+
+    #[test]
+    fn a_platform_on_a_machine_runs_on_that_machine() {
+        let placed = place_job(
+            &config(),
+            "r",
+            &job("w.ps1", None, None, Some("windows-amd64")),
+            containerfile,
+        );
+        assert_eq!(
+            placed,
+            Ok((
+                "tuco-pc".to_owned(),
+                Place::Machine {
+                    name: "win11".to_owned()
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn a_platform_with_an_image_runs_the_container_on_the_platforms_runner() {
+        let (runner, place) = place_job(
+            &config(),
+            "r",
+            &job("a.sh", Some("arch"), None, Some("linux-arm64")),
+            containerfile,
+        )
+        .unwrap();
+        assert_eq!(runner, "atik");
+        assert!(matches!(place, Place::Container { .. }));
+    }
+
+    #[test]
+    fn a_platform_that_cannot_be_placed_is_an_error() {
+        let mut frozen = job("a.sh", None, None, Some("linux-arm64"));
+        frozen.when_busy = WhenBusy::Freeze;
+        let cases = [
+            (
+                job("a.sh", None, None, Some("plan9")),
+                "platform plan9 is not in ci.toml [platforms]",
+            ),
+            (
+                job("a.sh", Some("arch"), None, Some("windows-amd64")),
+                "platform windows-amd64 (win11) is a Windows VM; an image needs a runner",
+            ),
+            (
+                frozen,
+                "platform linux-arm64 (atik) runs on the host of runner atik; when_busy = \"freeze\" needs a container or a machine",
+            ),
+        ];
+        for (def, expected) in cases {
+            let err = place_job(&config(), "r", &def, containerfile).unwrap_err();
+            assert!(err.starts_with(".zeughaus-ci/a.sh: "), "{err}");
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn place_names_show_the_platform_and_its_image() {
+        assert_eq!(place_name(&job("a.sh", None, None, None)), "host");
+        assert_eq!(
+            place_name(&job("a.sh", None, None, Some("linux-arm64"))),
+            "platform:linux-arm64"
+        );
+        assert_eq!(
+            place_name(&job("a.sh", Some("arch"), None, Some("linux-arm64"))),
+            "platform:linux-arm64 image:arch"
+        );
     }
 
     #[test]
@@ -2124,7 +2283,7 @@ mod tests {
     }
 
     fn record(name: &str, needs: &[&str], runner: &str, status: JobStatus) -> JobRecord {
-        let mut def = job(&format!("{name}.sh"), None, None);
+        let mut def = job(&format!("{name}.sh"), None, None, None);
         def.name = name.to_owned();
         def.needs = needs.iter().map(|n| (*n).to_owned()).collect();
         if !needs.is_empty() {

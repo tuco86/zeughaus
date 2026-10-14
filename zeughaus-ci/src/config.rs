@@ -22,6 +22,9 @@ pub struct CiConfig {
     /// Runners that may enlist, by name.
     #[serde(default)]
     pub runners: BTreeMap<String, RunnerConfig>,
+    /// Platform name -> the runner or machine that builds it.
+    #[serde(default)]
+    pub platforms: BTreeMap<String, String>,
     #[serde(default)]
     pub repos: BTreeMap<String, RepoConfig>,
     /// Where the values of the secrets named below live.
@@ -226,6 +229,18 @@ impl CiConfig {
                 }
             }
         }
+        for (platform, target) in &self.platforms {
+            if !valid_name(platform) {
+                return Err(format!(
+                    "platform name `{platform}` must match [a-z0-9][a-z0-9-]*"
+                ));
+            }
+            if !self.runners.contains_key(target) && !machines.contains_key(target.as_str()) {
+                return Err(format!(
+                    "platform `{platform}` names `{target}`, which is neither a runner nor a machine of one"
+                ));
+            }
+        }
         if let Some(secrets) = &mut self.secrets {
             secrets.addr = secrets.addr.trim_end_matches('/').to_string();
             for (field, value) in [
@@ -404,6 +419,25 @@ forge = "none"
         )))
         .unwrap_err();
         assert!(err.contains("machine `m`"), "{err}");
+    }
+
+    #[test]
+    fn platforms_name_a_runner_or_a_machine() {
+        let text = with_runners(
+            "machines = [\"w\"]\n[platforms]\nlinux-amd64 = \"a\"\nwindows-amd64 = \"w\"\n",
+        );
+        let config = CiConfig::parse(&text).unwrap();
+        assert_eq!(config.platforms["linux-amd64"], "a");
+        assert_eq!(config.platforms["windows-amd64"], "w");
+
+        let err =
+            CiConfig::parse(&with_runners("[platforms]\nlinux-amd64 = \"nowhere\"\n")).unwrap_err();
+        assert!(
+            err.contains("platform `linux-amd64` names `nowhere`"),
+            "{err}"
+        );
+        let err = CiConfig::parse(&with_runners("[platforms]\nLinux = \"a\"\n")).unwrap_err();
+        assert!(err.contains("platform name `Linux`"), "{err}");
     }
 
     #[test]
