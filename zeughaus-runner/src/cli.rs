@@ -1,5 +1,6 @@
 //! The runner binary's subcommands: `trigger` and `hold` as a client of a
-//! running runner, and `timeout` as the deadline a host CI job runs under.
+//! running runner, `timeout` as the deadline a host CI job runs under and
+//! `release` as the tool that makes and checks signed release bundles.
 //!
 //! `trigger` and `hold` talk to the endpoint a runner printed at start
 //! (`[runner] weida endpoint weida://sha256:<fp>@host:port/`) with the client
@@ -11,6 +12,9 @@
 //! zeughaus-runner trigger <endpoint> <node-id> [payload]
 //! zeughaus-runner hold <endpoint> on|off
 //! zeughaus-runner timeout <seconds> -- <program> [args..]
+//! zeughaus-runner release keygen <file>
+//! zeughaus-runner release bundle --channel <c> --build <n> --sha <sha> --version <v> --out <dir> <file>...
+//! zeughaus-runner release verify <dir>
 //! ```
 
 use std::path::Path;
@@ -29,7 +33,10 @@ const USAGE: &str = "\
 usage: zeughaus-runner [--state-dir <dir>] [--feed-addr <host:port>] [--keep-runs <n>]
        zeughaus-runner trigger <endpoint> <node-id> [payload]
        zeughaus-runner hold <endpoint> on|off
-       zeughaus-runner timeout <seconds> -- <program> [args..]";
+       zeughaus-runner timeout <seconds> -- <program> [args..]
+       zeughaus-runner release keygen <file>
+       zeughaus-runner release bundle --channel <c> --build <n> --sha <sha> --version <v> --out <dir> <file>...
+       zeughaus-runner release verify <dir>";
 
 /// Runs `timeout` if the first argument names it. Checked before the serving
 /// flags are read and before `--state-dir` is stripped: everything after the
@@ -43,6 +50,33 @@ pub fn timeout(args: &[String]) -> Option<ExitCode> {
         Err(e) => {
             eprintln!("[timeout] {e}");
             ExitCode::from(125)
+        }
+    })
+}
+
+/// Runs `release` if the first argument names it. Checked early, like
+/// `timeout`: it neither serves nor takes the state directory's lock, so the
+/// CI's publish job can run it as the user whose runner holds that lock, and
+/// the serving flags are not read from its arguments.
+pub fn release(args: &[String]) -> Option<ExitCode> {
+    if args.first().map(String::as_str) != Some("release") {
+        return None;
+    }
+    let command = match crate::release::parse(&args[1..]) {
+        Ok(command) => command,
+        Err(e) => {
+            eprintln!("[release] {e}\n{USAGE}");
+            return Some(ExitCode::FAILURE);
+        }
+    };
+    Some(match command.run() {
+        Ok(line) => {
+            println!("{line}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("[release] {e}");
+            ExitCode::FAILURE
         }
     })
 }

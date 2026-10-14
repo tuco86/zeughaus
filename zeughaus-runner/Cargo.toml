@@ -65,6 +65,12 @@ toml.workspace = true
 base64 = "0.23"
 # Artifact sets leave and enter the runner as tar files.
 tar.workspace = true
+# Release bundles: a release's manifest is signed with Ed25519 (`ring`) and
+# lists every archive by size and SHA-256 (`sha2`, `hex`). `release bundle`
+# makes them in the CI, the updater checks them against the key compiled in.
+ring = "0.17"
+sha2 = "0.11"
+hex = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 # The restart signal's handler and the `timeout` subcommand's process groups.

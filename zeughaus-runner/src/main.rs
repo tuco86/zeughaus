@@ -18,10 +18,12 @@ mod files;
 mod graphs;
 mod jobs;
 mod mux;
+mod release;
 mod runner;
 mod runs;
 mod timeout;
 mod transport;
+mod update;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -90,6 +92,11 @@ fn main() -> ExitCode {
     // it must not read the serving flags, which the program after `--` may
     // have too.
     if let Some(code) = cli::timeout(&std::env::args().skip(1).collect::<Vec<_>>()) {
+        return code;
+    }
+    // Making and checking release bundles: a subcommand for the same reason,
+    // and one that must not take the state directory's lock.
+    if let Some(code) = cli::release(&std::env::args().skip(1).collect::<Vec<_>>()) {
         return code;
     }
     // Every shell and job inherits the runner's environment, which may name
@@ -323,6 +330,13 @@ fn main() -> ExitCode {
                     eprintln!("[enlist] no terminal mux, so no job can run here; not enlisting")
                 }
             }
+        }
+        // The updater has no use for the mux or for enlisting: it replaces
+        // files and asks the loop below for the restart. Only an
+        // `update.toml` turns it on.
+        #[cfg(unix)]
+        if let Ok(exe) = exe.as_ref() {
+            update::start(&state_dir, exe.clone());
         }
         if let Some(busy) = &busy_handle {
             match listener.replier(BUSY_PATH) {
@@ -693,6 +707,9 @@ fn lock_state_dir(state_dir: &std::path::Path) -> Result<std::fs::File, String> 
 /// the loop already wakes at least every `TICK`: a handler that sets an
 /// atomic is the whole mechanism, with no task, channel or runtime between
 /// the signal and the `exec`.
+///
+/// The self-updater asks for the same restart by setting the flag itself,
+/// once it has replaced the binary.
 #[cfg(unix)]
 mod restart_signal {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -725,6 +742,11 @@ mod restart_signal {
     /// Whether a restart was asked for since the last call.
     pub fn take() -> bool {
         REQUESTED.swap(false, Ordering::SeqCst)
+    }
+
+    /// Asks for the restart a `SIGUSR1` would.
+    pub fn request() {
+        REQUESTED.store(true, Ordering::SeqCst);
     }
 }
 
