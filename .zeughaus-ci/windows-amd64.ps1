@@ -44,10 +44,10 @@ $env:GIT_CONFIG_VALUE_0 = "Authorization: Basic $basic"
 $env:GIT_TERMINAL_PROMPT = '0'
 if (Test-Path (Join-Path $weida '.git')) {
     Run 'git' @('-C', $weida, 'fetch', '-q', $weidaUrl, 'main')
+    Run 'git' @('-C', $weida, 'checkout', '-q', '--force', '--detach', 'FETCH_HEAD')
 } else {
     Run 'git' @('clone', '-q', '--branch', 'main', $weidaUrl, $weida)
 }
-Run 'git' @('-C', $weida, 'checkout', '-q', '--force', '--detach', 'FETCH_HEAD')
 Remove-Item Env:GIT_CONFIG_COUNT, Env:GIT_CONFIG_KEY_0, Env:GIT_CONFIG_VALUE_0, Env:GIT_TERMINAL_PROMPT, Env:FORGEJO_READ_TOKEN -ErrorAction SilentlyContinue
 $basic = $null
 
