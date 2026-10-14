@@ -1,0 +1,15 @@
+# Release channels of zeughaus. The first channel whose `on` matches an
+# event names the pipeline's channel; publish.sh puts the build of a push to
+# main on `dev` (what installed runners update from), a nightly build on
+# `nightly` and a tagged one on `release`.
+[[channel]]
+name = "dev"
+on = ["push main"]
+
+[[channel]]
+name = "nightly"
+on = ["cron *"]
+
+[[channel]]
+name = "release"
+on = ["tag v*"]

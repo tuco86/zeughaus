@@ -1,7 +1,11 @@
 #!/bin/sh
 # Builds the editor and wraps it in Zeughaus.app (macOS).
 #
-#   deploy/macos-app.sh [destination]     default: ~/Applications
+#   deploy/macos-app.sh [destination [target-triple]]
+#
+# destination defaults to ~/Applications. With a target triple the editor is
+# built for it (`--target`), which is how one Apple silicon host builds both
+# macOS architectures.
 #
 # A macOS app has its icon and its name in the Info.plist of the bundle it
 # runs in; a plain binary has neither, which is why `cargo run` shows the
@@ -15,13 +19,20 @@ set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 dest=${1:-$HOME/Applications}
+triple=${2:-}
 app=$dest/Zeughaus.app
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)
 
 say() { printf '[deploy] %s\n' "$*"; }
 
 say "building the editor"
-cargo build --locked --release --manifest-path "$root/Cargo.toml" -p zeughaus
+if [ -n "$triple" ]; then
+    cargo build --locked --release --manifest-path "$root/Cargo.toml" -p zeughaus --target "$triple"
+    release=${CARGO_TARGET_DIR:-$root/target}/$triple/release
+else
+    cargo build --locked --release --manifest-path "$root/Cargo.toml" -p zeughaus
+    release=${CARGO_TARGET_DIR:-$root/target}/release
+fi
 
 say "icns"
 work=$(mktemp -d)
@@ -43,7 +54,7 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 sed "s|@VERSION@|$version|g" "$root/deploy/macos/Info.plist" >"$app/Contents/Info.plist"
 cp "$work/zeughaus.icns" "$app/Contents/Resources/zeughaus.icns"
-cp "${CARGO_TARGET_DIR:-$root/target}/release/zeughaus" "$app/Contents/MacOS/zeughaus"
+cp "$release/zeughaus" "$app/Contents/MacOS/zeughaus"
 # Ad-hoc signature: an unsigned binary that was copied around is killed on
 # launch by Gatekeeper on Apple silicon.
 codesign --force --sign - "$app" >/dev/null 2>&1 || say "codesign failed; the app may refuse to launch"

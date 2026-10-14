@@ -1,0 +1,24 @@
+#!/bin/sh
+# /// ci
+# on = ["push main", "tag v*", "cron 0 3 * * *"]
+# platform = "darwin-arm64"
+# cache = [".ci-cache"]
+# secrets = ["FORGEJO_READ_TOKEN"]
+# timeout_minutes = 120
+# ///
+# The darwin-arm64 release archive, built on atik's host: the editor as
+# Zeughaus.app and the runner. publish.sh bundles the archive; the updater
+# reads the app from it.
+set -eu
+
+. "$CI_WORKSPACE/.zeughaus-ci/build.sh"
+cargo_env
+. "$CI_WORKSPACE/.zeughaus-ci/weida.sh"
+
+triple=aarch64-apple-darwin
+stage_dir
+sh deploy/macos-app.sh "$stage" "$triple"
+cargo build --locked --release --target "$triple" -p zeughaus-runner
+cp "$CARGO_TARGET_DIR/$triple/release/zeughaus-runner" "$stage/"
+"$stage/zeughaus-runner" --help >/dev/null
+pack_tar

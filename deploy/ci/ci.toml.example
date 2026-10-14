@@ -21,6 +21,15 @@ fingerprint = "<fingerprint>"
 [runners.sadala]
 fingerprint = "<fingerprint>"
 
+# Which runner or machine builds a platform: a job with `platform = "<p>"`
+# runs there, in a container when it also names an `image`.
+[platforms]
+linux-amd64 = "tuco-pc"
+linux-arm64 = "atik"
+windows-amd64 = "win11"
+darwin-arm64 = "atik"
+darwin-amd64 = "atik"
+
 [secrets]
 addr = "http://10.8.0.1:8200"      # OpenBao on sadala over WireGuard
 mount = "secret"                   # KV v2
@@ -35,13 +44,13 @@ forge = "github"                   # github | forgejo | none
 slug = "Griasdi/Griasdi"
 api = "https://api.github.com"     # forgejo: https://git.doodleshnookie.net
 default_branch = "main"
-fetch_token = "GITHUB_TOKEN"       # secret name; omitted for public/local repos
+fetch_token = "GRIASDI_GITHUB_TOKEN" # secret name; omitted for public/local repos
 fetch_user = "x-access-token"
-status_token = "GITHUB_TOKEN"
+status_token = "GRIASDI_GITHUB_TOKEN"
 webhook_secret = "GRIASDI_WEBHOOK_SECRET"
 
 [repos.griasdi.grants]             # secret -> event patterns it is released to
-GITHUB_TOKEN = ["tag v*", "cron *"]
+GRIASDI_GITHUB_TOKEN = ["tag v*", "cron *"]
 
 # zeughaus itself, on Forgejo. The bot user `zeughaus-ci` is a collaborator
 # with write on zeughaus (fetch, statuses) and read on weida, the sibling
@@ -59,6 +68,8 @@ webhook_secret = "ZEUGHAUS_WEBHOOK_SECRET"
 
 [repos.zeughaus.grants]
 FORGEJO_READ_TOKEN = ["push *", "tag *", "cron *"]
+ZEUGHAUS_UPDATE_KEY = ["push main", "cron *", "tag v*"]
+ZEUGHAUS_GITHUB_TOKEN = ["push main", "cron *", "tag v*"]
 
 [repos.smoke]
 url = "/var/lib/zeughaus-ci/smoke.git"

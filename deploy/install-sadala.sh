@@ -142,6 +142,7 @@ upload "$unit" /tmp/zeughaus-runner.service
 rm -f "$unit"
 remote 'sudo -n sh -s' <<EOF
 set -eu
+install -d -o zeughaus -g zeughaus -m755 /var/www/zeughaus-updates
 if [ "$setup" -eq 1 ] && ! test -e $run_home/state/enlist.toml; then
     enlist=\$(mktemp)
     printf 'ci = "%s"\nname = "sadala"\n' "\$(cat $ci_home/state/endpoint)" >"\$enlist"

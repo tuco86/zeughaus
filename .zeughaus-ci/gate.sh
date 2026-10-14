@@ -1,6 +1,7 @@
 #!/bin/sh
 # /// ci
-# on = ["push *", "tag v*"]
+# on = ["push *", "tag v*", "cron 0 3 * * *"]
+# platform = "linux-amd64"
 # image = "arch"
 # cache = [".ci-cache"]
 # secrets = ["FORGEJO_READ_TOKEN"]
