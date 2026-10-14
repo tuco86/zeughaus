@@ -107,7 +107,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ZEUGHAUS_UPDATE_KEY` and `ZEUGHAUS_GITHUB_TOKEN`, live in OpenBao
   `secret/zeughaus/ci`. This replaces the macOS job that zipped
   `Zeughaus.app` for Apple silicon. `deploy/macos-app.sh` honours
-  `CARGO_TARGET_DIR` and takes an optional target triple.
+  `CARGO_TARGET_DIR` and takes an optional target triple. The runner builds
+  on Windows; it neither enlists there (an `enlist.toml` is reported and
+  ignored) nor offers `timeout`.
 - A CI gets a `CI <label>` section in the tab bar, one for each URL under `ci`
   in `zeughaus.toml`: a `Runners` tab
   with a table of the enlisted runners, the Windows VM, their
