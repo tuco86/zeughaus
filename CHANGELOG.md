@@ -28,10 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Not while the palette or a rename field is open.
 - CI: the service `zeughaus-ci` runs pipelines that
   a repository defines as scripts in `.zeughaus-ci/` (TOML headers: `on`, `needs`,
-  `image`, `machine`, `cache`, `secrets`, `when_busy`, `env`,
+  `image`, `machine`, `platform`, `cache`, `secrets`, `when_busy`, `env`,
   `timeout_minutes`) on the runners that enlist into it:
-  - jobs run on the host, in rootless podman containers, or in a managed
-    Windows VM;
+  - jobs run on the host, in rootless podman containers (Apple `container`
+    on macOS), or in a managed Windows VM;
   - pushes to a ref coalesce;
   - artifacts pass between jobs;
   - commit statuses go to GitHub or Forgejo;
@@ -70,10 +70,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (new `ci` event: editor and runner must be updated together). A push to
   the default branch without `.zeughaus-ci/` is recorded as `no-jobs` and
   posts an error on `zeughaus/pipeline`.
-- The CI builds `Zeughaus.app` for Apple silicon on the Mac `atik` for
-  every push to `main` and every `v*` tag (`.zeughaus-ci/macos.sh`) and
-  keeps it zipped as the job's artifact `Zeughaus-macos-arm64.zip`.
-  `deploy/macos-app.sh` honours `CARGO_TARGET_DIR`.
+- CI placement by platform: `[platforms]` in `ci.toml` maps a platform name
+  (`linux-amd64`, `darwin-arm64`, ...) to a runner or a Windows VM of one,
+  and a job's `platform` header key (exclusive with `machine`) runs it there;
+  with an `image` it runs in a container on that runner instead of the
+  default runner. `when_busy = "freeze"` on a placement that resolves to a
+  host is refused when the pipeline is set up. Jobs see `CI_PLATFORM`.
+- A runner on macOS runs container jobs in Apple's `container` (Homebrew
+  formula `container`) instead of podman, started on demand by the first job.
+  Its inputs are mounted writable and a job in it is not frozen while the
+  GPU is busy (the runner logs that it cannot).
+- `zeughaus-runner release keygen|bundle|verify` makes and checks signed
+  release bundles: per platform one `zeughaus-<version>-<platform>.tar.gz`
+  (`.zip` on Windows), a `manifest.json` and its Ed25519 signature
+  `manifest.sig`. The public key is compiled into the binary; the seed
+  comes from `ZEUGHAUS_UPDATE_KEY`.
+- A runner updates itself: with `<state-dir>/update.toml` (`channel`, and
+  `url`, default `https://zeughaus.doodleshnookie.net/updates`) it checks
+  the channel once a minute, and installs a build newer than its own after
+  verifying signature, size and SHA-256. It replaces itself and the editor
+  beside it (`zeughaus` next to it on Linux, `~/Applications/Zeughaus.app`
+  on macOS; never `zeughaus-ci`), sends running editors `SIGUSR1` and
+  restarts itself the way its own `SIGUSR1` does. Without the file nothing
+  changes. Runners that carry the CI (sadala and the service runner on
+  tuco-pc) have none, so a broken build cannot take down what would publish
+  its fix. Unix only.
+- zeughaus's own pipeline builds every platform and publishes it:
+  `.zeughaus-ci/` has one build job per platform (`linux-amd64` on tuco-pc,
+  `linux-arm64` in an Apple `container` on atik, `windows-amd64` in the
+  Windows VM, `darwin-arm64` and `darwin-amd64` on atik's host) and
+  `publish.sh` on sadala, which signs the five archives into a release. It
+  goes to `https://zeughaus.doodleshnookie.net/updates/<channel>/` and, for
+  the nightly cron and `v*` tags, to a GitHub release (`nightly-<date>` as a
+  prerelease, seven kept). Channels `dev` (push to `main`), `nightly` and
+  `release` (tag) are in `.zeughaus-ci/channels.toml`; two secrets,
+  `ZEUGHAUS_UPDATE_KEY` and `ZEUGHAUS_GITHUB_TOKEN`, live in OpenBao
+  `secret/zeughaus/ci`. This replaces the macOS job that zipped
+  `Zeughaus.app` for Apple silicon. `deploy/macos-app.sh` honours
+  `CARGO_TARGET_DIR` and takes an optional target triple.
 - A CI gets a `CI <label>` section in the tab bar, one for each URL under `ci`
   in `zeughaus.toml`: a `Runners` tab
   with a table of the enlisted runners, the Windows VM, their

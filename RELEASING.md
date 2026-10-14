@@ -82,6 +82,16 @@ git push origin main vX.Y.Z
 git push github main vX.Y.Z
 ```
 
+The push of `vX.Y.Z` to Forgejo starts the CI's `release` channel: the five
+platform archives are built, signed and published to
+`https://zeughaus.doodleshnookie.net/updates/release/`, and attached with
+`manifest.json`, `manifest.sig` and `SHA256SUMS` to the GitHub release
+`vX.Y.Z`, whose body is the `## [X.Y.Z]` section of `CHANGELOG.md` (step 3).
+The job fails when the tag is not `v` plus the workspace version, so the tag
+must be made on the commit that carries the release version. A version with
+a `-` becomes a prerelease. A second pipeline for the same tag replaces the
+release and keeps the tag. This does not publish to crates.io (step 6).
+
 ## 6. Publish
 
 A `third_party` crate goes out only when it changed, with its own version

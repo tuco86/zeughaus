@@ -566,6 +566,7 @@ results keyed by (pin, tier, sequence).
 | terminals | `<state-dir>/terminals/<id>/` (`spec.json`, `sock`, `shim.log`, a shell's `wal` and `wal.1`) per live terminal, `<state-dir>/workspace.json` for the tabs a restarted runner restores |
 | editor restart | `SIGUSR1` writes `<state-dir>/restore-<pid>.json` (window size and maximized state, active tab, focused pane and collapsed sections and groups by runner, cameras, node sizes, selection, an open palette with its input, a rename in progress, terminal scroll-back, nested views open in a section without a runner, the scratch document without a runner) and `exec`s the editor, which reads and deletes it through `ZEUGHAUS_RESTORE`. The window's position is not restored: a Wayland client can neither read nor set it |
 | deployment | `deploy/install.sh`: binaries in `~/.cargo/bin`, the systemd user unit `zeughaus-runner` (`KillMode=process`: the shims outlive the runner process; `reload` is `SIGUSR1`), and `~/.local/share/applications/net.doodleshnookie.Zeughaus.desktop` with its icon, which is how a Wayland compositor shows the editor's icon. Where `systemd-run --user --scope true` succeeds at start, the runner starts every shim in a transient scope of its own, so systemd-oomd, which kills whole cgroups, takes one terminal instead of the unit with every shell |
+| self-update | `<state-dir>/update.toml` (`channel`, optional `url`) turns the runner's updater on (section 14, **Releases and the updater**); it works in `<state-dir>/updates/<build>/`. Without the file nothing is checked or fetched |
 
 ## 12. Testing strategy
 
@@ -721,9 +722,10 @@ holds these keys:
 
 - `on`: `push <glob>`, `tag <glob>`, or `cron <5 fields>`;
 - `needs`: exactly one of `on` and `needs` is set;
-- `image` (a `.zeughaus-ci/<image>.Containerfile`) or `machine` (a runner or
-  a Windows VM of one, by name); neither means the host of the default
-  runner;
+- `image` (a `.zeughaus-ci/<image>.Containerfile`), `machine` (a runner or
+  a Windows VM of one, by name) or `platform` (a key of `ci.toml`
+  `[platforms]`, exclusive with `machine`); none means the host of the
+  default runner;
 - `cache`, `secrets`, `when_busy` (`wait`/`freeze`/`run`), `env`,
   `timeout_minutes`.
 
@@ -733,16 +735,26 @@ Files without a header are helpers. `zeughaus-ci check` validates a folder and
 event, plus every job whose `needs` are all selected.
 
 **Where a job runs** is decided once, when its pipeline is set up
-(`scheduler.rs`, `place`), and kept in the job's record as `runner` and
+(`scheduler.rs`, `place_job`), and kept in the job's record as `runner` and
 `place`. `ci.toml` names the runners: `default_runner` and one
 `[runners.<name>]` each with the `fingerprint` of the runner's own pinned
 URL, the `machines` it boots and the `wait_minutes` (15) a job waits for it.
+`[platforms]` maps a platform name (`[a-z0-9][a-z0-9-]*`, e.g.
+`linux-amd64`) to a runner or a machine of one; `ci.toml` is refused when a
+value is neither. A job's target is the `[platforms]` entry of its
+`platform` (a platform missing there fails the setup), else its `machine`,
+else none:
 
-- `machine = X` where `X` is a runner: that runner's host. The job is `.sh`.
-- `machine = X` where `X` is in some runner's `machines`: that machine on that
+- `image = I`: a container on the target runner, on the default runner when
+  there is no target. A target that is a Windows VM is an error.
+- the target is a runner: that runner's host. The job is `.sh`.
+- the target is a machine in some runner's `machines`: that machine on that
   runner. The job is `.ps1`.
-- `image = I`: a container on the default runner.
-- neither: the host of the default runner.
+- no target: the host of the default runner.
+
+`when_busy = "freeze"` must resolve to a container or a machine; a host
+placement is an error, since nothing can pause it. The job's environment has
+`CI_PLATFORM` when it has a `platform`.
 
 A name that is neither a runner nor a machine of one, or the wrong script
 kind, fails the pipeline's setup like an invalid header.
@@ -768,7 +780,8 @@ service has no HTTP listener and pipelines come from `run` and cron.
 **Channels** group a repository's pipelines (`channels.rs`).
 `.zeughaus-ci/channels.toml` lists `[[channel]]` tables of `name` and `on`
 patterns; the first channel whose `on` matches the event gets the pipeline
-(`release` on `tag v*`, `nightly` on `cron *`, `dev` on `push *`). Without
+(`release` on `tag v*`, `nightly` on `cron *`, `dev` on `push main` in
+zeughaus's own file). Without
 a match, or without the file, a push lands in a channel named after its
 branch, a tag in `tags`, a cron in `cron`, and records from before channels
 are grouped the same way. The channel is decided in setup and kept in the
@@ -795,7 +808,7 @@ little-endian length and a postcard body, at most `MAX_ENLIST_FRAME_BYTES`
   `<repo>.<number>.<job>` (`run_id`).
 - `Assign` carries everything the run needs and the runner has not: the
   repository URL and the fetch token, the commit, the script, the place, the
-  environment (`CI`, `CI_REPO`, `CI_REF`, `CI_SHA`, `CI_JOB`, ...), the
+  environment (`CI`, `CI_REPO`, `CI_REF`, `CI_SHA`, `CI_JOB`, `CI_PLATFORM`, ...), the
   granted secrets, the timeout, `when_busy` and the inputs. The runner adds
   the paths and the CPU count (`CI_WORKSPACE`, `CI_OUTPUT`, `CI_INPUTS`,
   `CI_CPUS`, `CARGO_BUILD_JOBS`).
@@ -847,7 +860,15 @@ job:
 - **Host:** directly, under `zeughaus-runner timeout <seconds> -- <program>`
   (a process group that gets `SIGTERM`, `SIGKILL` 60 s later, exit 124;
   macOS has no `timeout`).
-- **Container:** `podman run --rm -it` with the workspace at `/work`.
+- **Container:** `podman run --rm -it` with the workspace at `/work` and the
+  inputs read-only. On macOS the engine is Apple's `container` instead
+  (`stage::Engine`, chosen by the host OS, no setting): the launcher runs
+  `container system start --enable-kernel-install` when `container system
+  status` fails, builds the image if `container image inspect` does not know
+  its tag, and `container run --rm -it --init` with the same mounts. The
+  system is never stopped by the runner; every container is a VM of its own
+  that `--rm` removes. `container` has no read-only mount, so the inputs are
+  writable there.
 - **Machine:** over ssh, from a git bundle, in `W:\work\<repo>\<job>`.
 
 Host and container jobs time out inside `inner.sh`; a machine job on the
@@ -934,7 +955,9 @@ free again once the mean over `free_after_seconds` is below it. While busy,
 the CI assigns it only `when_busy = "run"` jobs. Running `freeze` jobs of that
 runner are paused, with `podman pause` for a container and HMP `stop` on the
 VM's `monitor.sock` for a machine, and resumed when it is free; the runner
-reports each as `Frozen`.
+reports each as `Frozen`. Apple's `container` cannot pause a container: on a
+macOS runner the attempt is logged (`cannot freeze: apple container cannot
+pause a container`) and the job runs on.
 
 The measurement can be overridden. `Busy` holds the GPU's verdict and a
 mode (`auto`, `busy`, `free`; `<state-dir>/ci/busy-mode` of the runner, so a
@@ -1002,8 +1025,10 @@ a CI takes no workspace, graph or feed of its own: only `/events`,
 **Disk.** The CI keeps the 200 newest pipeline records per channel, with
 their transcripts (running ones never go), and the 10 newest artifact sets
 per repository. A runner deletes workspaces beyond its `budget_gb` (50) least
-recently used first, through `podman unshare rm` because containers leave
-subordinate-uid files, removes image tags no pipeline uses, and keeps the 10
+recently used first, through `podman unshare rm` because podman containers
+leave subordinate-uid files (plain removal under Apple's `container`, whose
+virtiofs writes files the user owns), removes image tags no pipeline uses
+(`podman rmi`, `container image delete` on macOS), and keeps the 10
 newest artifact sets per repository.
 
 **Secrets** (`secrets.rs`) live in one OpenBao KV v2 document
@@ -1020,6 +1045,91 @@ which the forge redelivers. `zeughaus-ci secrets-check`, and every start of
 those its repository's `grants` release to the event. They travel in
 `Assign` to the runner the job is placed on and reach the job through files
 there.
+
+**Releases and the updater.** zeughaus's own `.zeughaus-ci/` produces the
+releases its installed runners follow. Per platform one build job, named
+after it, builds the editor and the runner in a full build on its own
+platform, with no cross compilation of Rust code except macOS's second
+architecture, and packs `zeughaus-<version>-<platform>.tar.gz` (`.zip` on
+Windows) into `CI_OUTPUT`, with the workspace version and `LICENSE-*` in a
+top directory `zeughaus-<version>-<platform>/`. The build number
+`CI_PIPELINE` is compiled in as `ZEUGHAUS_BUILD`; a binary made anywhere else
+has build 0.
+
+| job | `platform` | where (`[platforms]` of the production `ci.toml`) |
+|---|---|---|
+| `linux-amd64` | `linux-amd64` | tuco-pc, container `trixie`, `freeze` |
+| `linux-arm64` | `linux-arm64` | atik, the same Containerfile in an Apple `container` |
+| `windows-amd64` | `windows-amd64` | the `win11` VM, `freeze` |
+| `darwin-arm64` | `darwin-arm64` | atik's host; the editor as `Zeughaus.app` (`deploy/macos-app.sh`) and the runner |
+| `darwin-amd64` | `darwin-amd64` | atik's host, cross built (`--target x86_64-apple-darwin`) |
+| `publish` | - | `machine = "sadala"`, needs the gate and all five |
+
+The Linux archives also hold `zeughaus-ci`; the updater never installs it.
+`build.sh` (no header, so a helper) is sourced by the Unix build jobs and by
+`publish.sh`. The build jobs and the gate run on a push to `main`, a `v*`
+tag and the cron `0 3 * * *`; the gate also runs on every other push.
+
+`publish.sh` needs an aarch64 host: it extracts `zeughaus-runner` from the
+`linux-arm64` archive and runs `zeughaus-runner release bundle` over the
+five archives, then `release verify`. The directory it makes holds the
+archives, `manifest.json` (format 1: channel, build, version, commit, and
+per platform file, size and SHA-256), `manifest.sig` (the raw Ed25519
+signature of those exact bytes) and `SHA256SUMS`. Its channel follows the
+event (push `dev`, cron `nightly`, tag `release`; a tag must equal
+`v<version>`). It is copied to `/var/www/zeughaus-updates/<channel>/<build>/`
+(through a temporary name and a rename), `latest` is rewritten with the
+build number, and all but the two newest builds of the channel go. A rerun of
+an older pipeline leaves `latest` where it is. Caddy on sadala serves the
+directory at `https://zeughaus.doodleshnookie.net/updates/` (`handle_path
+/updates/*` with `file_server`, `latest` sent with `Cache-Control:
+no-cache`). For cron and tag events the bundle is also attached to a GitHub
+release of `tuco86/zeughaus`: `nightly-<date>` as a prerelease (the seven
+newest stay) for the cron, `v<version>` with the version's CHANGELOG section
+as its body for a tag, a prerelease when the version has a `-`. The two
+secrets this needs are in the OpenBao document next to the others and
+granted to `push main`, `cron *` and `tag v*`: `ZEUGHAUS_UPDATE_KEY` (64 hex
+characters, the Ed25519 seed from `zeughaus-runner release keygen`) and
+`ZEUGHAUS_GITHUB_TOKEN`. `publish.sh` reaches GitHub through a header file,
+never through argv.
+
+**What a runner trusts** is its own binary: the public key that signs
+releases is compiled in (`TRUSTED_KEYS` in `update/manifest.rs`), so a server
+that answers cannot make a runner install anything the CI's key did not
+sign. The signature is over the manifest, which binds the build number, the
+channel and the size and SHA-256 of every archive; an old release served as
+a new one, another channel's and a tampered archive are refused.
+
+**The updater** (`zeughaus-runner/src/update/`, unix only) starts with the
+runner when `<state-dir>/update.toml` exists. Its keys are `channel` and
+`url` (default `https://zeughaus.doodleshnookie.net/updates`); an unknown key
+or a malformed file is logged as `[update] <path>: <error>` and means no
+updater. One thread waits 10 s, then looks every 60 s at
+`<url>/<channel>/latest` with `curl`. A number above the binary's own build
+starts an attempt in `<state-dir>/updates/<build>/`: manifest and signature,
+then the archive of the host's platform (`linux-amd64`, `linux-arm64`,
+`darwin-arm64`, `darwin-amd64`), unpacked with `tar`. Nothing outside
+`updates/` changes before every check has passed. Then the runner file is
+replaced by a rename of a copy written next to it, together with the editor
+installed beside it: `zeughaus` in the runner's directory on Linux,
+`~/Applications/Zeughaus.app` on macOS (the bundle written as `.new`, the
+old one moved aside); where there is none, only the runner is replaced, and
+if one of the writes fails nothing is replaced. Editors are then sent
+`SIGUSR1`, which reopens them as they were (Linux: every process whose
+`/proc/<pid>/exe` is that file, or `(deleted)`, and whose `SigCgt` shows the
+handler, as `deploy/install.sh` checks; macOS: the pids `pgrep -f
+<app>/Contents/MacOS/zeughaus` finds), and the runner restarts itself through
+the same path as its own `SIGUSR1` (section 9). Every other directory under
+`updates/` is then removed; a failed attempt is logged as `[update] build
+<n>: <error>`, removed, and not retried by that process.
+
+The updater is off where `update.toml` is absent, and that is the setting for
+the CI's own hosts: sadala and the `tuco-pc` service runner have none, so a
+broken `dev` build cannot take down the CI or the runner that would build
+and publish its fix. They change by `deploy/install-sadala.sh` and
+`deploy/install.sh`. The runners of the user's own machines (`tuco-pc-hannes`,
+atik) follow `dev`. Windows has no updater; `release bundle` and `release
+verify` exist on every platform.
 
 ## 15. Not built
 

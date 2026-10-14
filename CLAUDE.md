@@ -22,7 +22,7 @@ build of the editor compiles and edits locally (it reaches no runner yet).
 
 ```
 zeughaus/              # binary: the iced editor; edits the graph and views results, never executes
-zeughaus-runner/       # binary: headless process that executes the graph, owns the terminals and runs the CI jobs it is assigned
+zeughaus-runner/       # binary: headless process that executes the graph, owns the terminals, runs the CI jobs it is assigned and can follow a release channel; `release` makes and checks signed bundles
 zeughaus-ci/           # binary: the CI service; schedules pipelines onto enlisted runners, webhook intake, stored transcripts
 zeughaus-core/         # Ty/Typed/Value, pins, ExecutableNode/DomainPlugin, settings, scalar wire encoding, graph document types
 zeughaus-runtime/      # GraphExecutor: topology, node instances, edge cache, dirty set, async work, node errors
@@ -167,7 +167,8 @@ token and every secret `ci.toml` names. `zeughaus-ci check [DIR]` and `plan
 Four runners enlist, each with an `<state-dir>/enlist.toml`
 (`deploy/runner/enlist.toml.example`: `ci` (the CI's pinned URL, the line in
 its `endpoint` file), `name`, `cpus`, `budget_gb`, and the optional tables
-`[containers]`, `[busy]` (nvidia-smi) and `[machines.<name>]` (a Windows
+`[containers]` (podman; Apple `container` on macOS, see below), `[busy]`
+(nvidia-smi) and `[machines.<name>]` (a Windows
 VM)). The CI pins each one by the fingerprint in its own `endpoint` file:
 
 | host | runner | enlisted as | installed by |
@@ -178,15 +179,31 @@ VM)). The CI pins each one by the fingerprint in its own `endpoint` file:
 | atik (macOS) | launchd agent `net.doodleshnookie.zeughaus-runner`, `10.8.0.7:7443`, log `~/Library/Logs/zeughaus-runner.log` | `atik` | `deploy/install-macos.sh` |
 
 In `ci.toml`, `default_runner` names the runner of every job without a
-`machine`; `[runners.<name>]` has its `fingerprint`, its `machines` (VMs
-it boots) and `wait_minutes` (15: a job whose runner is offline is skipped
-after that, not failed). A job header places a job: `machine = "<runner>"`
-runs on that runner's host (`.sh`), `machine = "<vm>"` on the VM of the
-runner that lists it (`.ps1`), `image = "<image>"` in a container of the
-default runner, and neither on the default runner's host. A runner that is
-not in `ci.toml` is refused. The Windows VM scripts (`vm/win11/`) are
+`machine` or `platform`; `[runners.<name>]` has its `fingerprint`, its
+`machines` (VMs it boots) and `wait_minutes` (15: a job whose runner is
+offline is skipped after that, not failed). `[platforms]` maps a platform
+name (`linux-amd64`, `darwin-arm64`, ...) to the runner or VM that builds
+it. A job header places a job: `machine = "<runner>"` runs on that runner's
+host (`.sh`), `machine = "<vm>"` on the VM of the runner that lists it
+(`.ps1`), `platform = "<p>"` the same through `[platforms]` (exclusive with
+`machine`), `image = "<image>"` in a container of the default runner, and
+neither on the default runner's host. `image` together with `platform` runs
+the container on the platform's runner, not on the default runner; a
+platform that names a VM cannot have an image. `when_busy = "freeze"` needs
+a container, a machine, or a platform that resolves to one: a host job
+cannot be frozen. The job sees its platform as `CI_PLATFORM`. A runner that
+is not in `ci.toml` is refused. The Windows VM scripts (`vm/win11/`) are
 installed under `/usr/local/lib/zeughaus/vm/win11` and booted and stopped by
 the `tuco-pc` runner.
+
+On macOS the runner's container engine is Apple's `container` (Homebrew
+formula `container`), not podman. The runner starts its system on demand
+(`container system start --enable-kernel-install`) and never stops it; each
+job container is a VM of its own that goes away with the job. The job's
+`inputs` are mounted writable, because `container` has no read-only mount,
+and a job in such a container cannot be frozen: the runner logs that it
+cannot and the job runs on. The runner offers containers only where
+`[containers]` is in its `enlist.toml` and `container --version` answers.
 
 Updates: `deploy/install-sadala.sh` (on atik: builds with
 `deploy/build-aarch64.sh` in a native arm64 container of colima's docker,
@@ -195,10 +212,61 @@ installs both binaries, restarts the CI and reloads the sadala runner;
 already built) and `deploy/install.sh` (tuco-pc, also the service runner);
 `deploy/install-macos.sh` on atik.
 
+A runner also follows a release channel by itself when
+`<state-dir>/update.toml` exists: `channel = "dev"` (`dev`, `nightly` or
+`release`) and optionally `url` (default
+`https://zeughaus.doodleshnookie.net/updates`). Once a minute it reads
+`<url>/<channel>/latest`, a CI build number. A build newer than its own
+(`ZEUGHAUS_BUILD` at compile time, the CI pipeline number; 0 for a build
+made anywhere else, so a `cargo install` is replaced by the first published
+one) is downloaded with `curl` into `<state-dir>/updates/<build>/`, its
+`manifest.json` checked against `manifest.sig` with the keys compiled in
+(`TRUSTED_KEYS`, `zeughaus-runner/src/update/manifest.rs`), then the
+archive for the host's platform against the size and SHA-256 the manifest
+gives. Only then it replaces itself by a rename, and the editor installed
+beside it: `zeughaus` in the runner's directory on Linux,
+`~/Applications/Zeughaus.app` on macOS, if there is one. `zeughaus-ci` is
+never replaced. Every running editor of that copy gets `SIGUSR1` (Linux: a
+process whose `exe` is that file or `(deleted)` and that catches it; macOS:
+`pgrep -f` on the app's binary), and the runner restarts the way its own
+`SIGUSR1` does. A failed attempt is logged as `[update] build <n>: <error>`
+and not tried again by that process. `tuco-pc-hannes` and atik have an
+`update.toml` with `channel = "dev"`; the `tuco-pc` service runner and
+sadala have none on purpose: the CI infrastructure stays on explicit
+deploys, so a broken `dev` build cannot take down the CI that would publish
+its fix. A runner built for Windows has no updater.
+
+`zeughaus-runner release keygen <file>|bundle|verify <dir>` makes the
+signing key (seed in a 0600 file, public half printed for `TRUSTED_KEYS`),
+bundles the platform archives into a signed release directory
+(`manifest.json`, `manifest.sig`, `SHA256SUMS`; the seed comes from
+`ZEUGHAUS_UPDATE_KEY`, never from an argument) and checks one.
+
 This repository is one of its repos: every push to Forgejo runs
-`.zeughaus-ci/gate.sh` (the gate below, in the `.zeughaus-ci/arch.Containerfile` image,
-against weida's `main` as the sibling checkout) and posts `zeughaus/gate`
-on the commit. Forgejo reaches the CI as the bot user `zeughaus-ci`
+`.zeughaus-ci/gate.sh` (the gate below, in the `.zeughaus-ci/arch.Containerfile`
+image, against weida's `main` as the sibling checkout) and posts
+`zeughaus/gate` on the commit. A push to `main`, a `v*` tag and the nightly
+cron (`0 3 * * *`) also run one build job per platform, each packing
+`zeughaus-<version>-<platform>.tar.gz` (`.zip` on Windows) into its output:
+`linux-amd64` (tuco-pc, in the `trixie` image) and `linux-arm64` (atik, the
+same image in an Apple `container`), `windows-amd64` (the `win11` VM),
+`darwin-arm64` and `darwin-amd64` (both on atik's host; the editor as
+`Zeughaus.app` through `deploy/macos-app.sh`). `.zeughaus-ci/build.sh` is
+their shared helper. `publish.sh` runs on sadala after the gate and all five,
+bundles and signs them (the `zeughaus-runner` of the `linux-arm64` archive is
+the tool) and publishes into `/var/www/zeughaus-updates/<channel>/<build>/`
+with `latest` naming the newest; the two newest builds of a channel stay.
+Caddy serves that directory as
+`https://zeughaus.doodleshnookie.net/updates/<channel>/{latest,<build>/}`
+(`handle_path /updates/*` in the site block, `latest` uncached). The channel
+follows the event: a push to `main` is `dev`, the cron `nightly`, a tag
+`release`; the last two also become a GitHub release (`nightly-<date>` as a
+prerelease, the seven newest kept; a tag `v<version>` with the CHANGELOG
+section as its body, and it must equal the workspace version). Two secrets
+in OpenBao `secret/zeughaus/ci` back it, granted to `push main`, `cron *`
+and `tag v*`: `ZEUGHAUS_UPDATE_KEY` (the signing seed) and
+`ZEUGHAUS_GITHUB_TOKEN` (contents write on `tuco86/zeughaus`).
+Forgejo reaches the CI as the bot user `zeughaus-ci`
 (write on zeughaus, read on weida); its tokens and the webhook secret are
 in OpenBao under `secret/zeughaus/ci`. A change to `.zeughaus-ci/` is checked with
 `zeughaus-ci check` before it is pushed. `DESIGN.md` section 14 describes how it
