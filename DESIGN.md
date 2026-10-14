@@ -832,7 +832,7 @@ own, after the runner is no longer held (`zeughaus-runner hold`):
    one), check the commit is there, pin it as `refs/ci/<n>`.
 2. Stage the inputs into `<run>/inputs/<need>/`: hard-linked from this
    runner's `ci/artifacts/<run>/` when the need ran here, else downloaded
-   from the CI and unpacked.
+   through the CI's relay into a temporary tar of its own and unpacked.
 3. Write the secrets as files under `$XDG_RUNTIME_DIR/zeughaus-ci/<run>/`
    (`ci/tmp/<run>` where there is no `XDG_RUNTIME_DIR`, as on macOS), which
    the launcher removes.
@@ -841,17 +841,19 @@ own, after the runner is no longer held (`zeughaus-runner hold`):
    `ci/assigned/<run>.json` (the assignment without secrets and fetch
    token) and send `Started`.
 5. Deliver the log every 200 ms from the offset of the last `Welcome`. When
-   the run ends and its log has stopped growing, hard-link a non-empty
-   `<run>/artifacts` into `ci/artifacts/<run>/` (on success) and send
-   `Finished { code, killed, timed_out, artifacts }`.
+   the run ends and its log has stopped growing, move a non-empty
+   `<run>/artifacts` to `ci/artifacts/<run>/` (on success), remove
+   `<run>/inputs` and send `Finished { code, killed, timed_out, artifacts }`.
 
 A failed run is not over for the runner: `inner.sh`/`launch.sh` writes
 `<run>/code`, which ends the wait and sends `Finished`, and execs a shell
 where the job ran. The failed run's terminal is that debug session on the
 runner, detached and attachable from the palette, and closes when the shell
-ends. For a machine job it is an ssh session in the guest. A run that fails
-before its shell (a checkout, an image build, the copy into the guest) keeps
-its terminal with the final screen, detached as well.
+ends; its `inputs/` is removed then, not before. For a machine job it is an
+ssh session in the guest, and the guest's run directory goes when it ends (on
+success, once the output is copied back). A run that fails before its shell
+(a checkout, an image build, the copy into the guest) keeps its terminal
+with the final screen, detached as well.
 
 The launcher checks the commit out into a persistent workspace
 `ci/work/<repo>/<job>` (cleaned except the `cache` paths) and starts the
@@ -875,14 +877,25 @@ Host and container jobs time out inside `inner.sh`; a machine job on the
 runner's own clock (`control.rs`), which counts only unfrozen seconds, writes
 `<run>/timeout` and kills the local ssh. `Kill` closes the run's terminal.
 
-**Artifacts** go through `CI_OUTPUT`. A runner keeps a successful run's set
-and hard-links it as `CI_INPUTS/<need>/` for a job of its own that needs it.
-For a job on another runner the CI asks `Upload { run }`: the runner packs the
-set into a tar and sends it on `/artifacts` (req/rep, one tar per exchange,
-`ArtifactRequest`/`ArtifactReply`, at most `MAX_ARTIFACT_BYTES`); the CI
-stores it as `ci/pipelines/<repo>/<n>.artifacts/<job>.tar`, and the job that
-needs it is not assigned before the file exists. The consuming runner
-downloads it on the same path. Only configured runners may use `/artifacts`.
+**Artifacts** go through `CI_OUTPUT`. An artifact set exists once, on the
+runner that made it, and only as long as a job needs it; there is no
+retention count on either side. A runner keeps a successful run's set and
+hard-links it as `CI_INPUTS/<need>/` for a job of its own that needs it. For a
+job on another runner, the CI is a relay: the consumer's runner opens
+`Download { run }` on `/artifacts` (req/rep, `ArtifactRequest`/`ArtifactReply`,
+at most `MAX_ARTIFACT_BYTES`), the CI checks that it is assigned a job that
+needs the run and sends the producing runner `Upload { run, transfer }`;
+that runner packs the set into a temporary tar and answers on an exchange of
+its own with `Upload { run, transfer, size }` and the bytes, which the CI
+streams into the waiting download as they arrive and never stores (or
+`Unavailable`, which fails the download at once; nothing for ten minutes
+fails it too). A consumer is assigned only while the producing runner is
+connected. Once every job that needs a set has ended (succeeded, failed or
+skipped), and at once for a set nobody needs, the CI sends the producing
+runner `DropArtifacts { run }`; a runner's `Hello` lists the sets it holds,
+and the CI drops each one no pending job needs, which covers a drop lost
+with a connection or a restart of the CI. Nothing else reads a finished set.
+Only configured runners may use `/artifacts`.
 Commit statuses (`zeughaus/<job>`) go from the CI to GitHub or Forgejo
 through `curl`, with the token on stdin.
 
@@ -925,8 +938,9 @@ forge hears `success`, so an offline Mac never turns a branch red), and
 waits while the runner is busy and its `when_busy` is not `run` (`runner <R>
 busy`), or while its workspace (one job of one repository per runner) or
 machine is in use. A container place on a runner that offers none, or a
-machine it does not list, fails the job. A job waiting for a need's
-artifacts on another runner says so.
+machine it does not list, fails the job. A job whose need's artifacts are on
+another runner waits for that runner like for its own (`waiting for runner
+<R> (artifacts of <need>)`, skipped after its `wait_minutes`).
 
 **Restarts.** The CI persists a record before acting, and a run lives on its
 runner, so either side may restart:
@@ -937,7 +951,8 @@ runner, so either side may restart:
   know, assigned before this connection, goes back to `Pending` and is
   assigned again; a `Running` job it does not know fails (`runner <R> lost
   the run`); a reported run the CI has no job for is told `Kill` and
-  `Forget`; a reported run that already ended is handled as `Finished`.
+  `Forget`; a reported run that already ended is handled as `Finished`;
+  every listed artifact set no pending job needs is told `DropArtifacts`.
   `Welcome.offsets` resume the output where the CI's copy ends.
 - A runner that is gone (`RunnerGone`) leaves its jobs alone. One that stays
   away past the job's timeout plus 15 minutes fails them (`runner <R> lost`);
@@ -1023,13 +1038,13 @@ a CI takes no workspace, graph or feed of its own: only `/events`,
 `/snapshot`, `/ci` and `/mux`.
 
 **Disk.** The CI keeps the 200 newest pipeline records per channel, with
-their transcripts (running ones never go), and the 10 newest artifact sets
-per repository. A runner deletes workspaces beyond its `budget_gb` (50) least
-recently used first, through `podman unshare rm` because podman containers
-leave subordinate-uid files (plain removal under Apple's `container`, whose
-virtiofs writes files the user owns), removes image tags no pipeline uses
-(`podman rmi`, `container image delete` on macOS), and keeps the 10
-newest artifact sets per repository.
+their transcripts (running ones never go), and no artifacts. A runner
+deletes workspaces beyond its `budget_gb` (50) least recently used first,
+through `podman unshare rm` because podman containers leave subordinate-uid
+files (plain removal under Apple's `container`, whose virtiofs writes files
+the user owns), removes image tags no pipeline uses (`podman rmi`,
+`container image delete` on macOS), deletes an artifact set when the CI
+drops it, and a run's `inputs/` when the run (or its debug shell) ends.
 
 **Secrets** (`secrets.rs`) live in one OpenBao KV v2 document
 (`[secrets]` in `ci.toml`, `secret/zeughaus/ci`); `ci.toml` only names

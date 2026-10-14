@@ -130,6 +130,25 @@ impl JobHost {
             .ok_or_else(|| format!("no live terminal for {}", run_dir.display()))?;
         self.mux.close_terminal(terminal)
     }
+
+    /// Whether the terminal of the run in `run_dir` still has a child: the
+    /// shell that follows a failed run, or the run itself. False once the
+    /// child ended or the terminal is gone.
+    pub fn run_child_alive(&self, run_dir: &Path) -> bool {
+        self.mux
+            .terminal_of_run(run_dir)
+            .and_then(|terminal| self.mux.session(terminal))
+            .is_some_and(|session| session.exit().is_none())
+    }
+
+    /// Every numeric directory under `<state-dir>/runs`.
+    pub fn run_dirs(&self) -> Vec<PathBuf> {
+        let runs = self.state_dir.join("runs");
+        run_ids(&runs)
+            .into_iter()
+            .map(|id| runs.join(id.to_string()))
+            .collect()
+    }
 }
 
 /// The numeric run directories under `runs`, newest id first. A name that is

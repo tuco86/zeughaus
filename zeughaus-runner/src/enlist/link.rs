@@ -131,6 +131,7 @@ async fn exchange(
         name: exec.config.name.clone(),
         offer: exec.offer(),
         runs: exec.reports(),
+        artifacts: exec.artifact_sets(),
     };
     if let Err(e) = write_frame(&mut request, &hello).await {
         return Ended::lost(format!("hello: {e}"));
@@ -223,7 +224,8 @@ fn dispatch(exec: &Arc<Executor>, command: ToRunner) {
     match command {
         ToRunner::Assign { assignment } => exec.assign(*assignment),
         ToRunner::Kill { run } => exec.kill(&run),
-        ToRunner::Upload { run } => exec.upload(run),
+        ToRunner::Upload { run, transfer } => exec.upload(run, transfer),
+        ToRunner::DropArtifacts { run } => exec.drop_artifacts(&run),
         ToRunner::Forget { run } => exec.forget(&run),
         ToRunner::Welcome { .. } | ToRunner::Refused { .. } => {
             eprintln!("[enlist] the CI repeated its answer to hello; ignored");

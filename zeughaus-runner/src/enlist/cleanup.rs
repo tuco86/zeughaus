@@ -1,17 +1,13 @@
 //! Disk housekeeping after a run: the workspace budget, container images
-//! nothing uses any more, and artifact sets of old pipelines.
+//! nothing uses any more, and the removal of trees a container job may have
+//! left files in.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
 
-use zeughaus_link::enlist::parse_run_id;
-
 use super::stage::Engine;
-
-/// Pipelines whose artifacts are kept per repository.
-pub const KEEP_ARTIFACTS: usize = 10;
 
 /// The workspaces under `ci/work/<repo>/<job>`.
 fn workspaces(state_dir: &Path) -> Vec<PathBuf> {
@@ -75,7 +71,7 @@ pub fn enforce_budget(state_dir: &Path, budget_gb: u64, in_use: &HashSet<PathBuf
         if in_use.contains(&ws) {
             continue;
         }
-        match remove_workspace(&ws) {
+        match remove_tree(&ws) {
             Ok(()) => {
                 eprintln!(
                     "[enlist] budget: removed {} ({} MiB)",
@@ -89,11 +85,14 @@ pub fn enforce_budget(state_dir: &Path, budget_gb: u64, in_use: &HashSet<PathBuf
     }
 }
 
-/// Removes a workspace. A podman container job leaves files owned by
-/// subordinate uids, which only the user namespace podman runs in may
-/// delete; Apple's `container` writes host-owned files over virtiofs, so a
-/// plain removal does.
-fn remove_workspace(ws: &Path) -> Result<(), String> {
+/// Removes a directory tree this runner made. A podman container job leaves
+/// files owned by subordinate uids, which only the user namespace podman
+/// runs in may delete; Apple's `container` writes host-owned files over
+/// virtiofs, so a plain removal does. A missing tree is not an error.
+pub fn remove_tree(ws: &Path) -> Result<(), String> {
+    if !ws.exists() {
+        return Ok(());
+    }
     if Engine::host() == Engine::Apple {
         return std::fs::remove_dir_all(ws).map_err(|e| e.to_string());
     }
@@ -164,76 +163,4 @@ pub fn prune_images(repo: &str, used: &HashSet<String>) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-}
-
-/// Keeps the artifact sets (`ci/artifacts/<run>`) of the newest `keep`
-/// pipelines of every repository, and always those of the runs in `live`.
-/// A directory that is not a run id is not ours and stays.
-pub fn prune_artifacts(state_dir: &Path, keep: usize, live: &HashSet<String>) {
-    let root = super::artifacts_dir(state_dir);
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return;
-    };
-    let mut by_repo: BTreeMap<String, Vec<(u64, PathBuf, String)>> = BTreeMap::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if let Some((repo, number, _)) = parse_run_id(&name) {
-            by_repo
-                .entry(repo)
-                .or_default()
-                .push((number, entry.path(), name));
-        }
-    }
-    for runs in by_repo.values() {
-        let mut numbers: Vec<u64> = runs.iter().map(|(number, _, _)| *number).collect();
-        numbers.sort_unstable_by(|a, b| b.cmp(a));
-        numbers.dedup();
-        let Some(&oldest_kept) = numbers.get(keep.saturating_sub(1)) else {
-            continue;
-        };
-        for (number, path, run) in runs {
-            if *number >= oldest_kept || live.contains(run) {
-                continue;
-            }
-            if let Err(e) = std::fs::remove_dir_all(path) {
-                eprintln!("[enlist] cannot remove {}: {e}", path.display());
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_the_newest_pipelines_keep_their_artifacts() {
-        let state = std::env::temp_dir().join(format!("zci-prune-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&state);
-        let root = crate::enlist::artifacts_dir(&state);
-        for number in 1..=4u64 {
-            std::fs::create_dir_all(root.join(format!("demo.{number}.build"))).unwrap();
-        }
-        std::fs::create_dir_all(root.join("other.1.build")).unwrap();
-        std::fs::create_dir_all(root.join("not-a-run")).unwrap();
-        let live = HashSet::from(["demo.1.build".to_owned()]);
-        prune_artifacts(&state, 2, &live);
-        let mut left: Vec<String> = std::fs::read_dir(&root)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        left.sort();
-        let _ = std::fs::remove_dir_all(&state);
-        assert_eq!(
-            left,
-            [
-                "demo.1.build",
-                "demo.3.build",
-                "demo.4.build",
-                "not-a-run",
-                "other.1.build"
-            ]
-        );
-    }
 }

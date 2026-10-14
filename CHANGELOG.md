@@ -187,6 +187,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   editors dial it. The service runner of the workstation is the Unix user
   `zeughaus` (formerly `zeughaus-ci`), installed by
   `deploy/install-runner-user.sh`.
+- CI artifacts are not retained: a set lives on the runner that made it
+  until the last job that needs it has ended, then the CI tells that runner
+  to delete it (`DropArtifacts`, and at each enlist for sets no pending job
+  needs). A job on another runner gets the set relayed through the CI,
+  which streams it without a copy on its disk and makes the job wait for the
+  producing runner like for its own. The consumer's `<run>/inputs` goes when
+  its run ends, or when the debug shell of a failed run exits, and a
+  Windows VM's guest run directory with it. `KEEP_ARTIFACTS` on both sides
+  is gone. The enlist protocol is major 2: CI and every runner must be
+  updated together. Old `ci/pipelines/<repo>/<n>.artifacts/` directories on
+  the CI are no longer read or pruned and can be deleted by hand.
 
 ### Removed
 
@@ -241,6 +252,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   list (attach it from the palette to look) and closes when the shell that
   followed the failure ends, also for runs a previous runner recorded; CI
   debug shells no longer sit in the tab bar.
+- Two jobs on one runner that need the same job's artifacts no longer
+  download into the same temporary tar, where the first to finish removed
+  the other's file.
 - An OSC 8 link whose URI contains `;` opens whole instead of cut at the
   first `;`: `third_party/` follows wezterm to e2a98e1b, which also fixes
   `zeughaus-wezterm-escape-parser` (now 0.1.1) building without `std`.

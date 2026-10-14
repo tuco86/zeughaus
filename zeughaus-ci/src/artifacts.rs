@@ -1,35 +1,81 @@
-//! The `/artifacts` service: runners hand a finished job's output directory
-//! to the CI as a tar when a job on another runner needs it, and fetch it
-//! again for that job.
+//! The `/artifacts` service: the CI relays a finished job's artifact set from
+//! the runner that holds it to the runner of a job that needs it, without a
+//! copy on this side.
 //!
-//! One exchange moves one tar. The request is one frame
-//! ([`ArtifactRequest`]); an upload's bytes follow it, a download's follow
-//! the reply frame ([`ArtifactReply`]).
+//! A consuming runner opens a `Download`; the CI asks the producing runner
+//! for the set with [`ToRunner::Upload`] under a transfer number, and that
+//! runner answers on an exchange of its own with `Upload` (the tar follows)
+//! or `Unavailable`. The upload's bytes are streamed into the waiting
+//! download's reply as they arrive. One exchange moves one tar; the request
+//! is one frame ([`ArtifactRequest`]), an upload's bytes follow it, a
+//! download's follow the reply frame ([`ArtifactReply`]).
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use weida::{IncomingRequest, Replier, TransferMeta};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::oneshot;
+use weida::{IncomingRequest, IncomingTransfer, Replier, TransferMeta};
 use zeughaus_link::enlist::{
-    ArtifactReply, ArtifactRequest, MAX_ARTIFACT_BYTES, parse_run_id, read_frame, write_frame,
+    ArtifactReply, ArtifactRequest, MAX_ARTIFACT_BYTES, ToRunner, parse_run_id, read_frame, run_id,
+    write_frame,
 };
 
 use crate::config::{CiConfig, valid_name};
-use crate::scheduler::{artifacts_dir, load_pipeline};
+use crate::runners::Runners;
+use crate::scheduler::{JobStatus, Pipeline, load_pipeline};
 use crate::transport::principal_of;
 
 /// Bytes moved per read or write.
 const CHUNK: usize = 256 << 10;
 
+/// How long a download waits for the producing runner to start its upload:
+/// it packs the set into a tar first, which for a gigabyte takes a while.
+const UPLOAD_WAIT: Duration = Duration::from_secs(600);
+
 pub struct ArtifactService {
     state_dir: PathBuf,
     config: Arc<CiConfig>,
+    runners: Arc<Runners>,
+    next_transfer: AtomicU64,
+    /// Downloads waiting for their upload, by transfer number.
+    waiting: Mutex<HashMap<u64, Waiting>>,
+}
+
+/// A download that asked a producing runner for a set.
+struct Waiting {
+    run: String,
+    runner: String,
+    offer: oneshot::Sender<Offer>,
+}
+
+/// What the producing runner answered.
+enum Offer {
+    /// `size` bytes of tar follow on `body`; `done` hears how the relay went.
+    Tar {
+        size: u64,
+        body: IncomingTransfer,
+        done: oneshot::Sender<Result<(), String>>,
+    },
+    Unavailable(String),
 }
 
 impl ArtifactService {
-    pub fn new(state_dir: PathBuf, config: Arc<CiConfig>) -> ArtifactService {
-        ArtifactService { state_dir, config }
+    pub fn new(
+        state_dir: PathBuf,
+        config: Arc<CiConfig>,
+        runners: Arc<Runners>,
+    ) -> ArtifactService {
+        ArtifactService {
+            state_dir,
+            config,
+            runners,
+            next_transfer: AtomicU64::new(0),
+            waiting: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Accepts exchanges until the replier goes away, which for this process
@@ -47,27 +93,6 @@ impl ArtifactService {
                 }
             }
         }
-    }
-
-    /// The tar of a run's output, for a run the pipeline records know. The
-    /// name came from a peer and is joined into a path, so it is checked
-    /// before and against the records after.
-    fn tar_of(&self, run: &str) -> Result<(PathBuf, Option<String>), String> {
-        let (repo, number, job) = parse_run_id(run).ok_or_else(|| format!("{run} is not a run"))?;
-        if !valid_name(&repo) || !valid_name(&job) {
-            return Err(format!("{run} is not a run"));
-        }
-        let pipeline = load_pipeline(&self.state_dir, &repo, number)
-            .map_err(|_| format!("{run} is not a known run"))?;
-        let record = pipeline
-            .jobs
-            .iter()
-            .find(|j| j.def.name == job)
-            .ok_or_else(|| format!("{run} is not a known run"))?;
-        Ok((
-            tar_path(&self.state_dir, &repo, number, &job),
-            record.runner.clone(),
-        ))
     }
 
     async fn exchange(&self, mut request: IncomingRequest) {
@@ -99,17 +124,25 @@ impl ArtifactService {
             }
         };
         let outcome = match first {
-            ArtifactRequest::Upload { run, size } => {
-                let stored = self.upload(&runner, &run, size, &mut body).await;
-                match stored {
-                    Ok(()) => write_frame(&mut reply, &ArtifactReply::Stored).await,
-                    Err(message) => {
-                        eprintln!("[ci] {runner}: upload of {run} refused: {message}");
-                        write_frame(&mut reply, &ArtifactReply::Error { message }).await
-                    }
-                }
+            ArtifactRequest::Upload {
+                run,
+                transfer,
+                size,
+            } => {
+                let relayed = self.upload(&runner, &run, transfer, size, body).await;
+                answer(&mut reply, &runner, &run, relayed).await
             }
-            ArtifactRequest::Download { run } => self.download(&run, &mut reply).await,
+            ArtifactRequest::Unavailable {
+                run,
+                transfer,
+                message,
+            } => {
+                let passed = self
+                    .take_waiting(&runner, &run, transfer)
+                    .map(|waiting| drop(waiting.offer.send(Offer::Unavailable(message))));
+                answer(&mut reply, &runner, &run, passed).await
+            }
+            ArtifactRequest::Download { run } => self.download(&runner, &run, &mut reply).await,
         };
         if let Err(e) = outcome {
             eprintln!("[ci] {runner}: artifact exchange failed: {e}");
@@ -117,94 +150,176 @@ impl ArtifactService {
         let _ = reply.finish();
     }
 
+    /// The waiting download `transfer`, when it asked `runner` for `run`.
+    fn take_waiting(&self, runner: &str, run: &str, transfer: u64) -> Result<Waiting, String> {
+        let mut waiting = lock(&self.waiting);
+        match waiting.get(&transfer) {
+            Some(w) if w.run == run && w.runner == runner => {}
+            _ => {
+                return Err(format!(
+                    "no download waits for {run} as transfer {transfer}"
+                ));
+            }
+        }
+        Ok(waiting.remove(&transfer).expect("checked above"))
+    }
+
+    /// Hands the upload's body to its download and waits until the download
+    /// has streamed it on.
     async fn upload(
         &self,
         runner: &str,
         run: &str,
+        transfer: u64,
         size: u64,
-        body: &mut weida::IncomingTransfer,
+        body: IncomingTransfer,
     ) -> Result<(), String> {
         if size > MAX_ARTIFACT_BYTES {
             return Err(format!("{size} bytes is more than {MAX_ARTIFACT_BYTES}"));
         }
-        let (tar, owner) = self.tar_of(run)?;
-        if owner.as_deref() != Some(runner) {
-            return Err(format!("{run} did not run on {runner}"));
+        let waiting = self.take_waiting(runner, run, transfer)?;
+        let (done, outcome) = oneshot::channel();
+        if waiting.offer.send(Offer::Tar { size, body, done }).is_err() {
+            return Err(format!("the download of {run} ended before the upload"));
         }
-        if let Some(parent) = tar.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-        }
-        let part = part_path(&tar);
-        let result = receive(body, size, &part).await;
-        if result.is_err() {
-            let _ = tokio::fs::remove_file(&part).await;
-            return result;
-        }
-        tokio::fs::rename(&part, &tar)
+        outcome
             .await
-            .map_err(|e| format!("cannot store {}: {e}", tar.display()))
+            .unwrap_or_else(|_| Err(format!("the download of {run} ended")))
     }
 
-    async fn download(&self, run: &str, reply: &mut weida::OutgoingTransfer) -> Result<(), String> {
-        let opened = match self.tar_of(run) {
-            Ok((tar, _)) => tokio::fs::File::open(&tar)
-                .await
-                .map_err(|_| format!("{run} has no artifacts here")),
-            Err(message) => Err(message),
-        };
-        let mut file = match opened {
-            Ok(file) => file,
+    /// Asks the runner that holds `run`'s set for it and streams its upload
+    /// into `reply`.
+    async fn download(
+        &self,
+        requester: &str,
+        run: &str,
+        reply: &mut weida::OutgoingTransfer,
+    ) -> Result<(), String> {
+        let producer = match self.producer_for(requester, run) {
+            Ok(producer) => producer,
             Err(message) => return write_frame(reply, &ArtifactReply::Error { message }).await,
         };
-        let size = file
-            .metadata()
-            .await
-            .map_err(|e| format!("cannot stat {run}: {e}"))?
-            .len();
-        write_frame(reply, &ArtifactReply::Sending { size }).await?;
-        let mut buf = vec![0u8; CHUNK];
-        let mut sent = 0u64;
-        while sent < size {
-            let n = file
-                .read(&mut buf)
-                .await
-                .map_err(|e| format!("cannot read {run}: {e}"))?;
-            if n == 0 {
-                return Err(format!("{run} shrank while it was sent"));
+        let transfer = self.next_transfer.fetch_add(1, Ordering::Relaxed);
+        let (offer, offered) = oneshot::channel();
+        lock(&self.waiting).insert(
+            transfer,
+            Waiting {
+                run: run.to_owned(),
+                runner: producer.clone(),
+                offer,
+            },
+        );
+        let asked = self.runners.send(
+            &producer,
+            ToRunner::Upload {
+                run: run.to_owned(),
+                transfer,
+            },
+        );
+        let offered = if asked {
+            Some(tokio::time::timeout(UPLOAD_WAIT, offered).await)
+        } else {
+            None
+        };
+        lock(&self.waiting).remove(&transfer);
+        let refused = |message: String| ArtifactReply::Error { message };
+        let (size, mut body, done) = match offered {
+            Some(Ok(Ok(Offer::Tar { size, body, done }))) => (size, body, done),
+            Some(Ok(Ok(Offer::Unavailable(message)))) => {
+                return write_frame(reply, &refused(format!("runner {producer}: {message}"))).await;
             }
-            reply
-                .write_all(&buf[..n])
-                .await
-                .map_err(|e| format!("cannot send {run}: {e}"))?;
-            sent += n as u64;
+            None => {
+                let message = format!("runner {producer}, which holds {run}, is not connected");
+                return write_frame(reply, &refused(message)).await;
+            }
+            Some(Ok(Err(_))) => {
+                let message = format!("the upload of {run} from runner {producer} was abandoned");
+                return write_frame(reply, &refused(message)).await;
+            }
+            Some(Err(_)) => {
+                let message = format!(
+                    "runner {producer} did not send {run} within {} minutes",
+                    UPLOAD_WAIT.as_secs() / 60
+                );
+                return write_frame(reply, &refused(message)).await;
+            }
+        };
+        let relayed = match write_frame(reply, &ArtifactReply::Sending { size }).await {
+            Ok(()) => relay(&mut body, size, reply).await,
+            Err(e) => Err(e),
+        };
+        let _ = done.send(relayed.clone());
+        relayed
+    }
+
+    /// The runner holding `run`'s set, when `requester` runs a job that needs
+    /// it. The name came from a peer and is joined into a path, so it is
+    /// checked before and against the records after.
+    fn producer_for(&self, requester: &str, run: &str) -> Result<String, String> {
+        let (repo, number, job) = parse_run_id(run).ok_or_else(|| format!("{run} is not a run"))?;
+        if !valid_name(&repo) || !valid_name(&job) {
+            return Err(format!("{run} is not a run"));
         }
-        Ok(())
+        let pipeline = load_pipeline(&self.state_dir, &repo, number)
+            .map_err(|_| format!("{run} is not a known run"))?;
+        producer_for(&pipeline, &job, requester, |run| {
+            self.runners.assigned_to(run)
+        })
     }
 }
 
-/// `<n>.artifacts/<job>.tar` of pipeline `number`.
-pub fn tar_path(state_dir: &Path, repo: &str, number: u64, job: &str) -> PathBuf {
-    artifacts_dir(state_dir, repo, number).join(format!("{job}.tar"))
+/// The runner that holds the set of `job` in `pipeline`, when `requester`
+/// is the runner of a job that needs it and is assigned that job now.
+fn producer_for(
+    pipeline: &Pipeline,
+    job: &str,
+    requester: &str,
+    assigned_to: impl Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    let run = run_id(&pipeline.repo, pipeline.number, job);
+    let record = pipeline
+        .jobs
+        .iter()
+        .find(|j| j.def.name == job)
+        .ok_or_else(|| format!("{run} is not a known run"))?;
+    let producer = match &record.runner {
+        Some(runner) if record.status == JobStatus::Succeeded && record.artifacts => runner,
+        _ => return Err(format!("{run} left no artifacts")),
+    };
+    let consumer = pipeline.jobs.iter().any(|j| {
+        j.def.needs.iter().any(|need| need == job)
+            && assigned_to(&run_id(&pipeline.repo, pipeline.number, &j.def.name)).as_deref()
+                == Some(requester)
+    });
+    if !consumer {
+        return Err(format!("runner {requester} runs no job that needs {run}"));
+    }
+    Ok(producer.clone())
 }
 
-fn part_path(tar: &Path) -> PathBuf {
-    let mut part = tar.as_os_str().to_owned();
-    part.push(".part");
-    PathBuf::from(part)
-}
-
-/// Writes exactly `size` bytes of `body` to `part`; a body that ends short
-/// is an error.
-async fn receive(
-    body: &mut (impl AsyncReadExt + Unpin),
-    size: u64,
-    part: &Path,
+/// The reply to an upload or an `Unavailable`.
+async fn answer(
+    reply: &mut weida::OutgoingTransfer,
+    runner: &str,
+    run: &str,
+    outcome: Result<(), String>,
 ) -> Result<(), String> {
-    let mut file = tokio::fs::File::create(part)
-        .await
-        .map_err(|e| format!("cannot create {}: {e}", part.display()))?;
+    match outcome {
+        Ok(()) => write_frame(reply, &ArtifactReply::Done).await,
+        Err(message) => {
+            eprintln!("[ci] {runner}: artifacts of {run} not relayed: {message}");
+            write_frame(reply, &ArtifactReply::Error { message }).await
+        }
+    }
+}
+
+/// Copies exactly `size` bytes of `body` to `out`; a body that ends short is
+/// an error.
+async fn relay(
+    body: &mut (impl AsyncRead + Unpin),
+    size: u64,
+    out: &mut (impl AsyncWrite + Unpin),
+) -> Result<(), String> {
     let mut buf = vec![0u8; CHUNK];
     let mut left = size;
     while left > 0 {
@@ -216,39 +331,35 @@ async fn receive(
         if n == 0 {
             return Err(format!("upload ended {left} bytes short"));
         }
-        file.write_all(&buf[..n])
+        out.write_all(&buf[..n])
             .await
-            .map_err(|e| format!("cannot write {}: {e}", part.display()))?;
+            .map_err(|e| format!("download failed: {e}"))?;
         left -= n as u64;
     }
-    file.flush()
+    out.flush()
         .await
-        .map_err(|e| format!("cannot write {}: {e}", part.display()))
+        .map_err(|e| format!("download failed: {e}"))
+}
+
+/// A poisoned lock still holds a consistent map: every critical section is a
+/// single insert, lookup or remove.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_tar_sits_in_the_pipelines_artifact_directory() {
-        let tar = tar_path(Path::new("/s"), "repo", 4, "build");
-        assert!(tar.ends_with("4.artifacts/build.tar"), "{}", tar.display());
-        assert!(part_path(&tar).ends_with("build.tar.part"));
-    }
-
     #[tokio::test]
     async fn a_short_upload_is_an_error_and_a_full_one_is_exact() {
-        let dir = std::env::temp_dir().join(format!("zeughaus-artifacts-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create");
-        let part = dir.join("a.tar.part");
-
+        let mut out = Vec::new();
         let mut body: &[u8] = b"0123456789";
-        assert!(receive(&mut body, 12, &part).await.is_err());
+        assert!(relay(&mut body, 12, &mut out).await.is_err());
 
+        let mut out = Vec::new();
         let mut body: &[u8] = b"0123456789";
-        receive(&mut body, 6, &part).await.expect("receive");
-        assert_eq!(std::fs::read(&part).expect("read"), b"012345");
-        let _ = std::fs::remove_dir_all(&dir);
+        relay(&mut body, 6, &mut out).await.expect("relay");
+        assert_eq!(out, b"012345");
     }
 }

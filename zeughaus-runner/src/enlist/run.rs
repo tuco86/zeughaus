@@ -27,7 +27,7 @@ use zeughaus_link::enlist::{
     run_id,
 };
 
-use super::cleanup::{self, KEEP_ARTIFACTS};
+use super::cleanup;
 use super::launch::{self, Launch, Target};
 use super::stage;
 use super::{
@@ -105,8 +105,15 @@ fn validate(a: &Assignment) -> Result<(), String> {
 }
 
 /// The run id as one path component of `<state>/ci/`.
-fn safe_run(run: &str) -> bool {
+pub(super) fn safe_run(run: &str) -> bool {
     !run.contains('/') && parse_run_id(run).is_some()
+}
+
+/// Removes a run's `inputs/`, which a container job may have left files in.
+fn remove_inputs(inputs: &Path) {
+    if let Err(e) = cleanup::remove_tree(inputs) {
+        eprintln!("[enlist] cannot remove {}: {e}", inputs.display());
+    }
 }
 
 impl Executor {
@@ -172,9 +179,9 @@ impl Executor {
         }
     }
 
-    /// The CI is done with `run`: its record and its delivery thread go. What
-    /// the run left (artifacts for a later job, its run directory) is
-    /// pruned by age, not here.
+    /// The CI is done with `run`: its record and its delivery thread go. The
+    /// artifact set stays until the CI's `DropArtifacts`, and the run's
+    /// inputs go with the run (or its debug shell), neither of them here.
     pub fn forget(&self, run: &str) {
         if let Some(ctl) = lock(&self.runs).remove(run) {
             ctl.forgotten.store(true, Ordering::SeqCst);
@@ -479,17 +486,9 @@ impl Executor {
         let a = &ctl.assignment;
         let timed_out = exit.code == Some(124) || run_dir.join("timeout").exists();
         let source = run_dir.join("artifacts");
-        let artifacts = exit.code == Some(0) && stage::has_entries(&source) && {
-            let dest = artifacts_dir(&self.state_dir).join(&a.run);
-            let _ = std::fs::remove_dir_all(&dest);
-            match stage::link_tree(&source, &dest) {
-                Ok(()) => true,
-                Err(e) => {
-                    eprintln!("[enlist] {}: artifacts not kept: {e}", a.run);
-                    false
-                }
-            }
-        };
+        let artifacts = exit.code == Some(0)
+            && stage::has_entries(&source)
+            && self.keep_artifacts(&a.run, &source);
         let end = RunEnd {
             code: exit.code,
             killed: exit.killed,
@@ -526,10 +525,78 @@ impl Executor {
             }
         );
         self.housekeeping(a);
+        self.release_inputs(run_dir);
     }
 
-    /// Disk housekeeping after a run: workspaces over budget, images and
-    /// artifacts of old pipelines.
+    /// Moves the artifacts of `run` out of its run directory to
+    /// `ci/artifacts/<run>`, so the set exists once on disk. Where a rename
+    /// is not possible the files are linked instead. False when the set was
+    /// not kept.
+    fn keep_artifacts(&self, run: &str, source: &Path) -> bool {
+        let dest = artifacts_dir(&self.state_dir).join(run);
+        if let Err(e) = cleanup::remove_tree(&dest) {
+            eprintln!("[enlist] {run}: cannot remove a stale artifact set: {e}");
+        }
+        if let Some(parent) = dest.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            eprintln!("[enlist] {run}: artifacts not kept: {e}");
+            return false;
+        }
+        let Err(e) = std::fs::rename(source, &dest) else {
+            return true;
+        };
+        eprintln!("[enlist] {run}: cannot move the artifacts ({e}); linking them");
+        match stage::link_tree(source, &dest) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("[enlist] {run}: artifacts not kept: {e}");
+                false
+            }
+        }
+    }
+
+    /// Removes the run's copy of its inputs once nothing reads it: at the end
+    /// of the run, or, when a shell follows a failure, when that shell ends.
+    /// A shell still open is waited for on a thread of its own.
+    fn release_inputs(self: &Arc<Self>, run_dir: &Path) {
+        let inputs = run_dir.join("inputs");
+        if !inputs.exists() {
+            return;
+        }
+        if !(run_dir.join("code").exists() && self.host.run_child_alive(run_dir)) {
+            remove_inputs(&inputs);
+            return;
+        }
+        let exec = Arc::clone(self);
+        let run_dir = run_dir.to_path_buf();
+        let spawned = std::thread::Builder::new()
+            .name("zeughaus-enlist-inputs".into())
+            .spawn(move || {
+                while exec.host.run_child_alive(&run_dir) {
+                    std::thread::sleep(RECOVERY_POLL);
+                }
+                remove_inputs(&run_dir.join("inputs"));
+            });
+        if let Err(e) = spawned {
+            // The sweep at the next start removes them.
+            eprintln!("[enlist] cannot start a thread to release inputs: {e}");
+        }
+    }
+
+    /// Releases the inputs of every run that has ended and still has them:
+    /// a runner restarted while a debug shell was open found them there. A
+    /// run without an exit record is still going, and its end releases them.
+    pub(super) fn sweep_inputs(self: &Arc<Self>) {
+        for run_dir in self.host.run_dirs() {
+            if run_dir.join("exit").exists() {
+                self.release_inputs(&run_dir);
+            }
+        }
+    }
+
+    /// Disk housekeeping after a run: workspaces over budget and container
+    /// images nothing uses any more.
     fn housekeeping(&self, finished: &Assignment) {
         let live: Vec<Arc<RunCtl>> = lock(&self.runs).values().cloned().collect();
         let active: Vec<&Arc<RunCtl>> = live
@@ -556,11 +623,6 @@ impl Executor {
                 .collect();
             cleanup::prune_images(&finished.repo, &used);
         }
-        let run_ids: HashSet<String> = active
-            .iter()
-            .map(|ctl| ctl.assignment.run.clone())
-            .collect();
-        cleanup::prune_artifacts(&self.state_dir, KEEP_ARTIFACTS, &run_ids);
     }
 
     /// Takes over the runs a previous process left: each one keeps being

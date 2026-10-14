@@ -1,5 +1,5 @@
-//! Disk housekeeping after a pipeline: old pipeline records, their
-//! transcripts and artifact tars. Workspaces and container images belong to
+//! Disk housekeeping after a pipeline: old pipeline records and their
+//! transcripts. Workspaces, container images and artifact sets belong to
 //! the runners.
 
 use std::collections::{HashMap, HashSet};
@@ -12,34 +12,24 @@ use crate::files::read_json;
 
 /// Pipeline records kept per repository and channel.
 const KEEP_PIPELINES: usize = 200;
-/// Pipelines whose artifacts are kept per repository.
-const KEEP_ARTIFACTS: usize = 10;
 
 /// Keeps the newest [`KEEP_PIPELINES`] pipeline records of every channel of
-/// `repo` (with their transcripts under `<n>.runs/`) and the newest
-/// [`KEEP_ARTIFACTS`] artifact directories (the `<job>.tar` files runners
-/// uploaded), and always those of the pipelines in `running`.
+/// `repo` (with their transcripts under `<n>.runs/`), and always those of the
+/// pipelines in `running`.
 pub fn prune_pipelines(state_dir: &Path, repo: &str, running: &HashSet<u64>) {
     let dir = crate::ci_dir(state_dir).join("pipelines").join(repo);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
     let mut by_channel: HashMap<String, Vec<u64>> = HashMap::new();
-    let mut artifacts = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if let Some(n) = name
             .strip_suffix(".json")
             .and_then(|n| n.parse::<u64>().ok())
+            && let Some(channel) = record_channel(&entry.path())
         {
-            if let Some(channel) = record_channel(&entry.path()) {
-                by_channel.entry(channel).or_default().push(n);
-            }
-        } else if let Some(n) = name
-            .strip_suffix(".artifacts")
-            .and_then(|n| n.parse::<u64>().ok())
-        {
-            artifacts.push((n, entry.path()));
+            by_channel.entry(channel).or_default().push(n);
         }
     }
     for mut numbers in by_channel.into_values() {
@@ -52,14 +42,6 @@ pub fn prune_pipelines(state_dir: &Path, repo: &str, running: &HashSet<u64>) {
             let _ = std::fs::remove_file(dir.join(format!("{n}.json")));
             let _ = std::fs::remove_dir_all(dir.join(format!("{n}.runs")));
         }
-    }
-    artifacts.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
-    for (_, path) in artifacts
-        .into_iter()
-        .skip(KEEP_ARTIFACTS)
-        .filter(|(n, _)| !running.contains(n))
-    {
-        let _ = std::fs::remove_dir_all(path);
     }
 }
 

@@ -212,6 +212,7 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
             let service = Arc::new(ArtifactService::new(
                 state_dir.to_path_buf(),
                 Arc::clone(&config),
+                Arc::clone(&runners),
             ));
             rt.spawn(service.accept(replier));
         }

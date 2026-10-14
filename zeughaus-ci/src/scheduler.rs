@@ -132,8 +132,9 @@ pub struct JobRecord {
     /// Where on that runner it runs.
     #[serde(default)]
     pub place: Option<Place>,
-    /// The run left artifacts, which its runner holds and uploads when a job
-    /// on another runner needs them.
+    /// The run left an artifact set, which its runner holds for the jobs
+    /// that need it. Cleared once the last of them has ended and the runner
+    /// was told to drop the set.
     #[serde(default)]
     pub artifacts: bool,
     /// The end of a failed run's log, before its debug shell (see
@@ -167,12 +168,6 @@ pub struct Pipeline {
 
 fn pipelines_dir(state_dir: &Path, repo: &str) -> PathBuf {
     crate::ci_dir(state_dir).join("pipelines").join(repo)
-}
-
-/// `<n>.artifacts`: the `<job>.tar` of every job whose artifacts a job on
-/// another runner needs, as that job's runner uploaded them.
-pub fn artifacts_dir(state_dir: &Path, repo: &str, number: u64) -> PathBuf {
-    pipelines_dir(state_dir, repo).join(format!("{number}.artifacts"))
 }
 
 /// Where a job's transcript is kept: `wal` in this directory is the CI's
@@ -333,10 +328,12 @@ fn next_number(state_dir: &Path, repo: &str) -> u64 {
 /// What the `/enlist` service tells the scheduler. `Output` frames never
 /// come this way: the service appends them to the transcript itself.
 pub enum Msg {
-    /// A runner connected and reports the runs it knows.
+    /// A runner connected and reports the runs it knows and the artifact
+    /// sets it holds.
     RunnerHello {
         name: String,
         runs: Vec<RunReport>,
+        artifacts: Vec<String>,
     },
     FromRunner {
         name: String,
@@ -526,6 +523,7 @@ impl Scheduler {
         }
         self.advance();
         self.lost_runners();
+        self.drop_artifacts();
         self.finish_pipelines();
     }
 
@@ -1098,8 +1096,12 @@ impl Scheduler {
         let job = &pipeline.jobs[ji];
         let name = job.def.name.clone();
 
+        let key = (pipeline.repo.clone(), pipeline.number, name.clone());
+        let ready = *self.ready_since.entry(key.clone()).or_insert(now);
+
         // Inputs: what a need left, from this runner's own disk when the need
-        // ran here, else from the CI once the need's runner uploaded it.
+        // ran here, else relayed by the CI from the need's runner, which has
+        // to be connected for that.
         let mut inputs = Vec::new();
         for need in &job.def.needs {
             let Some(needed) = pipeline.jobs.iter().find(|j| j.def.name == *need) else {
@@ -1109,13 +1111,27 @@ impl Scheduler {
                 continue;
             }
             let run = run_id(&pipeline.repo, pipeline.number, need);
-            let source = if needed.runner.as_deref() == Some(runner.as_str()) {
+            let producer = needed.runner.clone().unwrap_or_default();
+            let source = if producer == runner {
                 InputSource::Local { run }
             } else {
-                let tar = artifacts_dir(&self.state_dir, &pipeline.repo, pipeline.number)
-                    .join(format!("{need}.tar"));
-                if !tar.exists() {
-                    return self.set_waiting(pi, ji, format!("waiting for artifacts of {need}"));
+                if !self.runners.is_connected(&producer) {
+                    if !self.config.runners.contains_key(&producer) {
+                        return self.fail_job(
+                            pi,
+                            ji,
+                            format!("runner {producer}, which holds {need}'s artifacts, is not configured"),
+                            State::Error,
+                        );
+                    }
+                    if now.saturating_sub(ready) > self.wait_secs(&producer) {
+                        self.ready_since.remove(&key);
+                        self.skip_offline(pi, ji, &producer);
+                    } else {
+                        let note = format!("waiting for runner {producer} (artifacts of {need})");
+                        self.set_waiting(pi, ji, note);
+                    }
+                    return;
                 }
                 InputSource::Ci { run }
             };
@@ -1125,8 +1141,6 @@ impl Scheduler {
             });
         }
 
-        let key = (pipeline.repo.clone(), pipeline.number, name.clone());
-        let ready = *self.ready_since.entry(key.clone()).or_insert(now);
         let Some(view) = self.runners.view(&runner) else {
             if !self.config.runners.contains_key(&runner) {
                 return self.fail_job(
@@ -1292,15 +1306,21 @@ impl Scheduler {
 
     fn handle(&mut self, msg: Msg) {
         match msg {
-            Msg::RunnerHello { name, runs } => self.runner_hello(&name, runs),
+            Msg::RunnerHello {
+                name,
+                runs,
+                artifacts,
+            } => self.runner_hello(&name, runs, artifacts),
             Msg::RunnerGone { name } => eprintln!("[ci] runner {name} disconnected"),
             Msg::FromRunner { name, message } => self.on_runner_message(&name, message),
         }
     }
 
-    /// A runner (re)connected and says which runs it knows. That settles
-    /// every job that was active on it, and every run it still holds.
-    fn runner_hello(&mut self, name: &str, runs: Vec<RunReport>) {
+    /// A runner (re)connected and says which runs it knows and which artifact
+    /// sets it holds. That settles every job that was active on it, every run
+    /// it still holds, and drops every set no job will need: a `DropArtifacts`
+    /// lost with a connection or a restart of this process ends here.
+    fn runner_hello(&mut self, name: &str, runs: Vec<RunReport>, artifacts: Vec<String>) {
         let Some(view) = self.runners.view(name) else {
             return;
         };
@@ -1345,35 +1365,50 @@ impl Scheduler {
                 self.runners.send(name, ToRunner::Forget { run });
             }
         }
-        self.resend_uploads(name);
+        for run in artifacts {
+            if !self.set_wanted(name, &run) {
+                self.runners.send(name, ToRunner::DropArtifacts { run });
+            }
+        }
     }
 
-    /// Asks `runner` again for artifacts a job elsewhere is waiting for: the
-    /// upload may have been lost with a connection.
-    fn resend_uploads(&self, runner: &str) {
-        for pipeline in &self.running {
-            for job in &pipeline.jobs {
-                if job.status != JobStatus::Succeeded
-                    || !job.artifacts
-                    || job.runner.as_deref() != Some(runner)
-                {
+    /// Whether the artifact set of `run` that `runner` holds may still be
+    /// needed: its job has not been settled yet, or a job that needs it has
+    /// not ended.
+    fn set_wanted(&self, runner: &str, run: &str) -> bool {
+        let Some((pi, ji)) = self.locate(run) else {
+            return false;
+        };
+        let pipeline = &self.running[pi];
+        let job = &pipeline.jobs[ji];
+        job.runner.as_deref() == Some(runner)
+            && (!job.status.is_terminal()
+                || (job.artifacts && consumers_pending(pipeline, &job.def.name)))
+    }
+
+    /// Tells each runner to delete the artifact sets whose consumers have all
+    /// ended. A set whose runner is offline stays marked and is dropped when
+    /// it is connected again, or at its next hello.
+    fn drop_artifacts(&mut self) {
+        for pi in 0..self.running.len() {
+            let mut dropped = false;
+            for ji in 0..self.running[pi].jobs.len() {
+                let pipeline = &self.running[pi];
+                let job = &pipeline.jobs[ji];
+                if !job.artifacts || consumers_pending(pipeline, &job.def.name) {
                     continue;
                 }
-                let tar = artifacts_dir(&self.state_dir, &pipeline.repo, pipeline.number)
-                    .join(format!("{}.tar", job.def.name));
-                let wanted = pipeline.jobs.iter().any(|other| {
-                    other.def.needs.contains(&job.def.name)
-                        && other.runner.as_deref() != Some(runner)
-                        && matches!(other.status, JobStatus::Pending | JobStatus::Waiting)
-                });
-                if wanted && !tar.exists() {
-                    self.runners.send(
-                        runner,
-                        ToRunner::Upload {
-                            run: run_id(&pipeline.repo, pipeline.number, &job.def.name),
-                        },
-                    );
+                let Some(runner) = job.runner.clone() else {
+                    continue;
+                };
+                let run = self.run_of(pi, ji);
+                if self.runners.send(&runner, ToRunner::DropArtifacts { run }) {
+                    self.running[pi].jobs[ji].artifacts = false;
+                    dropped = true;
                 }
+            }
+            if dropped {
+                self.running[pi].save(&self.state_dir, &self.changes);
             }
         }
     }
@@ -1524,13 +1559,6 @@ impl Scheduler {
         self.post(&pipeline, &job, state, description);
 
         if let Some(runner) = record_runner {
-            let elsewhere = pipeline.jobs.iter().any(|other| {
-                other.def.needs.contains(&job) && other.runner.as_deref() != Some(runner.as_str())
-            });
-            if succeeded && end.artifacts && elsewhere {
-                self.runners
-                    .send(&runner, ToRunner::Upload { run: run.clone() });
-            }
             self.runners
                 .send(&runner, ToRunner::Forget { run: run.clone() });
         }
@@ -1828,6 +1856,14 @@ fn place_label(job: &JobRecord) -> String {
         Some(Place::Machine { name }) => format!("{runner}, machine:{name}"),
         Some(Place::Host) | None => runner.to_owned(),
     }
+}
+
+/// Whether a job of `pipeline` that needs `job` has not ended yet.
+fn consumers_pending(pipeline: &Pipeline, job: &str) -> bool {
+    pipeline
+        .jobs
+        .iter()
+        .any(|j| j.def.needs.iter().any(|need| need == job) && !j.status.is_terminal())
 }
 
 /// `git -C <dir> <args>`; stdout on success.
@@ -2322,7 +2358,7 @@ mod tests {
     }
 
     #[test]
-    fn an_input_from_another_runner_waits_for_its_upload() {
+    fn an_input_from_another_runner_waits_for_that_runner() {
         let state = scratch("remote-input");
         let mut s = scheduler(&state);
         let mut y = connect(&s.runners, "y", 0);
@@ -2330,12 +2366,13 @@ mod tests {
 
         s.advance();
         assert_eq!(s.running[0].jobs[1].status, JobStatus::Waiting);
-        assert_eq!(s.running[0].jobs[1].note, "waiting for artifacts of a");
+        assert_eq!(
+            s.running[0].jobs[1].note,
+            "waiting for runner x (artifacts of a)"
+        );
         assert!(y.try_recv().is_err());
 
-        let dir = artifacts_dir(&state, "view", 7);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.tar"), b"tar").unwrap();
+        let _x = connect(&s.runners, "x", 0);
         s.advance();
         assert_eq!(s.running[0].jobs[1].status, JobStatus::Starting);
         let assignment = assigned(&mut y);
@@ -2403,6 +2440,7 @@ mod tests {
         s.handle(Msg::RunnerHello {
             name: "y".to_owned(),
             runs: Vec::new(),
+            artifacts: Vec::new(),
         });
         assert_eq!(s.running[0].jobs[1].status, JobStatus::Pending);
         assert_eq!(s.runners.assigned_to("view.7.b"), None);
@@ -2413,6 +2451,7 @@ mod tests {
         s.handle(Msg::RunnerHello {
             name: "y".to_owned(),
             runs: Vec::new(),
+            artifacts: Vec::new(),
         });
         assert_eq!(s.running[0].jobs[1].status, JobStatus::Starting);
         let _ = std::fs::remove_dir_all(&state);
@@ -2429,6 +2468,7 @@ mod tests {
                 run: "view.9.zzz".to_owned(),
                 end: None,
             }],
+            artifacts: Vec::new(),
         });
         assert_eq!(
             y.try_recv().ok(),
@@ -2446,7 +2486,54 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_job_leaves_its_exit_and_asks_for_the_upload_another_runner_needs() {
+    fn a_hello_drops_the_sets_no_pending_job_needs() {
+        let state = scratch("held");
+        let mut s = scheduler(&state);
+        let mut x = connect(&s.runners, "x", 0);
+        let mut p = two_jobs("x");
+        p.jobs.push(record("c", &[], "x", JobStatus::Running));
+        s.running.push(p);
+        let mut done = two_jobs("x");
+        done.number = 8;
+        done.jobs[1].status = JobStatus::Succeeded;
+        s.running.push(done);
+        s.handle(Msg::RunnerHello {
+            name: "x".to_owned(),
+            runs: vec![RunReport {
+                run: "view.7.c".to_owned(),
+                end: None,
+            }],
+            artifacts: vec![
+                // `b` still needs it.
+                "view.7.a".to_owned(),
+                // Not settled yet: the end may still be on its way.
+                "view.7.c".to_owned(),
+                // Its consumer ended.
+                "view.8.a".to_owned(),
+                // A pipeline this process no longer runs.
+                "view.3.a".to_owned(),
+            ],
+        });
+        let mut sent = Vec::new();
+        while let Ok(message) = x.try_recv() {
+            sent.push(message);
+        }
+        assert_eq!(
+            sent,
+            [
+                ToRunner::DropArtifacts {
+                    run: "view.8.a".to_owned()
+                },
+                ToRunner::DropArtifacts {
+                    run: "view.3.a".to_owned()
+                },
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_finished_set_stays_until_its_last_consumer_ended() {
         let state = scratch("finished");
         let mut s = scheduler(&state);
         let mut x = connect(&s.runners, "x", 0);
@@ -2476,17 +2563,49 @@ mod tests {
         assert_eq!(std::fs::read_to_string(exit).unwrap(), "code=0\n");
         assert_eq!(
             x.try_recv().ok(),
-            Some(ToRunner::Upload {
-                run: "view.7.a".to_owned()
-            })
-        );
-        assert_eq!(
-            x.try_recv().ok(),
             Some(ToRunner::Forget {
                 run: "view.7.a".to_owned()
             })
         );
         assert_eq!(s.runners.assigned_to("view.7.a"), None);
+
+        // `b` has not run yet: the set stays.
+        s.drop_artifacts();
+        assert!(x.try_recv().is_err());
+
+        // Failed counts as ended as much as succeeded does.
+        s.running[0].jobs[1].status = JobStatus::Failed;
+        s.drop_artifacts();
+        assert_eq!(
+            x.try_recv().ok(),
+            Some(ToRunner::DropArtifacts {
+                run: "view.7.a".to_owned()
+            })
+        );
+        assert!(!s.running[0].jobs[0].artifacts);
+        s.drop_artifacts();
+        assert!(x.try_recv().is_err());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_set_whose_runner_is_offline_is_dropped_once_it_is_back() {
+        let state = scratch("drop-offline");
+        let mut s = scheduler(&state);
+        let mut p = two_jobs("x");
+        p.jobs[1].status = JobStatus::Skipped;
+        s.running.push(p);
+        s.drop_artifacts();
+        assert!(s.running[0].jobs[0].artifacts);
+        let mut x = connect(&s.runners, "x", 0);
+        s.drop_artifacts();
+        assert_eq!(
+            x.try_recv().ok(),
+            Some(ToRunner::DropArtifacts {
+                run: "view.7.a".to_owned()
+            })
+        );
+        assert!(!s.running[0].jobs[0].artifacts);
         let _ = std::fs::remove_dir_all(&state);
     }
 }

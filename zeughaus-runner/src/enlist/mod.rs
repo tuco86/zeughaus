@@ -7,6 +7,13 @@
 //! under `<state-dir>/ci/`: the assignment of every started run
 //! (`assigned/<run>.json`), its artifacts, the mirrors and the workspaces.
 //!
+//! Artifacts are kept once, on the runner that produced them
+//! (`artifacts/<run>`, moved out of the run's directory), until the CI
+//! sends `DropArtifacts`; a consumer on another runner gets them relayed
+//! through the CI, which stores nothing. A consumer's copy of its inputs
+//! (`inputs/` in the run directory, the guest's copy on a VM) goes with its
+//! run, or with the debug shell that follows a failed one.
+//!
 //! The connection is the runner's to keep: it dials the CI, says who it is and
 //! which runs it still knows, and redials with a growing delay when it is
 //! lost. What was not delivered meanwhile is delivered after the next
@@ -71,7 +78,8 @@ fn assigned_dir(state_dir: &Path) -> PathBuf {
     ci_dir(state_dir).join("assigned")
 }
 
-/// The artifact sets of finished runs, one directory per run id.
+/// The artifact sets of finished runs, one directory per run id. A set
+/// lives here, and only here, until the CI drops it.
 pub fn artifacts_dir(state_dir: &Path) -> PathBuf {
     ci_dir(state_dir).join("artifacts")
 }
@@ -86,7 +94,8 @@ fn work_dir(state_dir: &Path, repo: &str, job: &str) -> PathBuf {
     ci_dir(state_dir).join("work").join(repo).join(job)
 }
 
-/// Scratch space: secrets where there is no tmpfs, artifact tars in transit.
+/// Scratch space: secrets where there is no tmpfs, artifact tars in transit
+/// (`<run>.<n>.tar`).
 fn tmp_dir(state_dir: &Path) -> PathBuf {
     ci_dir(state_dir).join("tmp")
 }
@@ -180,6 +189,9 @@ pub struct Executor {
     link: Mutex<Link>,
     /// One lock per repository's mirror.
     mirrors: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Numbers the tar files in transit, so two transfers of one run never
+    /// share a file.
+    transfers: AtomicU64,
 }
 
 /// Starts enlisting: the executor's threads and the connection task. Called
@@ -243,11 +255,14 @@ pub fn start(
         runs: Mutex::new(HashMap::new()),
         link: Mutex::new(Link::default()),
         mirrors: Mutex::new(HashMap::new()),
+        transfers: AtomicU64::new(0),
     });
     if executor.containers || !executor.machines.is_empty() {
         control::thaw_everything(&executor);
     }
+    executor.clear_stale_tars();
     executor.recover();
+    executor.sweep_inputs();
     control::spawn(&executor);
     tokio::spawn(link::keep(Arc::clone(&executor)));
     Ok(Enlisted { busy })

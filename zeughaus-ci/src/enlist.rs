@@ -109,6 +109,7 @@ impl EnlistService {
             name,
             offer,
             runs,
+            artifacts,
         } = hello
         else {
             refuse(reply, "the first frame must be a hello").await;
@@ -150,6 +151,7 @@ impl EnlistService {
         let _ = self.scheduler.send(Msg::RunnerHello {
             name: name.clone(),
             runs,
+            artifacts,
         });
 
         let mut reader = tokio::spawn(read_runner(

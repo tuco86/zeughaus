@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::machine::MachineState;
 
 /// The protocol major a runner and the CI must share.
-pub const ENLIST_MAJOR: u32 = 1;
+pub const ENLIST_MAJOR: u32 = 2;
 
 /// The most one frame body may carry.
 pub const MAX_ENLIST_FRAME_BYTES: usize = 1 << 20;
@@ -25,12 +25,15 @@ pub const MAX_ARTIFACT_BYTES: u64 = 4 << 30;
 /// What a runner says to the CI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FromRunner {
-    /// First frame: who the runner is and which runs it still knows.
+    /// First frame: who the runner is, which runs it still knows and which
+    /// artifact sets it holds.
     Hello {
         major: u32,
         name: String,
         offer: Offer,
         runs: Vec<RunReport>,
+        /// Run ids of the artifact sets under the runner's `ci/artifacts/`.
+        artifacts: Vec<String>,
     },
     /// The busy state changed.
     Busy { state: MachineState },
@@ -77,7 +80,8 @@ pub struct RunEnd {
     pub code: Option<i32>,
     pub killed: bool,
     pub timed_out: bool,
-    /// The run left artifacts the runner still holds.
+    /// The run left an artifact set, which the runner holds until the CI
+    /// drops it.
     pub artifacts: bool,
 }
 
@@ -100,12 +104,18 @@ pub enum ToRunner {
     Kill {
         run: String,
     },
-    /// Send the run's artifacts on [`crate::ARTIFACTS_PATH`].
+    /// A job on another runner is downloading the run's artifacts now: send
+    /// them on [`crate::ARTIFACTS_PATH`] as `transfer`.
     Upload {
         run: String,
+        transfer: u64,
     },
     /// The CI is done with the run; drop what is kept of it.
     Forget {
+        run: String,
+    },
+    /// No job needs the run's artifact set any more: delete it.
+    DropArtifacts {
         run: String,
     },
 }
@@ -171,29 +181,42 @@ pub struct Input {
 pub enum InputSource {
     /// On this runner, from a run it executed.
     Local { run: String },
-    /// On the CI, downloaded on [`crate::ARTIFACTS_PATH`].
+    /// On the runner that executed `run`, relayed by the CI on
+    /// [`crate::ARTIFACTS_PATH`].
     Ci { run: String },
 }
 
 /// First frame of an [`crate::ARTIFACTS_PATH`] exchange.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArtifactRequest {
-    /// `size` raw bytes follow.
+    /// The producing runner answers [`ToRunner::Upload`]; `size` raw bytes
+    /// follow, which the CI streams to the waiting download.
     Upload {
         run: String,
+        transfer: u64,
         size: u64,
     },
-    Download {
+    /// The producing runner cannot send what `transfer` asked for.
+    Unavailable {
         run: String,
+        transfer: u64,
+        message: String,
     },
+    /// A consuming runner fetches `run`'s artifacts for a job it was assigned.
+    Download { run: String },
 }
 
 /// The CI's answer; after `Sending`, `size` raw bytes follow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArtifactReply {
-    Stored,
-    Sending { size: u64 },
-    Error { message: String },
+    /// An upload reached its download, or an `Unavailable` was passed on.
+    Done,
+    Sending {
+        size: u64,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// The id of a job's run. Repository and job names are `[a-z0-9][a-z0-9-]*`,

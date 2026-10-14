@@ -283,6 +283,7 @@ pub fn debug_ps1(run_id: &str) -> String {
 
 /// `launch.sh` for a Windows VM job: stage the run in the guest over ssh, run
 /// it there, copy its output back, and on failure open a shell in the guest.
+/// The guest's copy of the run is removed when the launcher ends.
 fn launch_sh_windows_vm(launch: &Launch<'_>) -> String {
     let Target::WindowsVm { ssh_host } = launch.target else {
         unreachable!("only Windows VM targets get here");
@@ -295,7 +296,20 @@ fn launch_sh_windows_vm(launch: &Launch<'_>) -> String {
     let scp_dir = format!("/W:/ci/runs/{id}");
     let host = sh_quote(ssh_host);
     let debug_marker = sh_path(&run.join("debug-shell"));
-    let mut out = preamble(launch, &format!("; rm -f {debug_marker}"));
+    // The guest's copy of the run (inputs, secrets, bundle, output) goes
+    // with the run however the launcher ends: after the copy-back, after the
+    // shell that follows a failure, or when the terminal is closed. Failure
+    // to remove is ignored, and a guest that does not answer is not waited
+    // for.
+    let remove_guest = sh_quote(&format!(
+        "Remove-Item -Recurse -Force -ErrorAction SilentlyContinue {guest}"
+    ));
+    let mut out = preamble(
+        launch,
+        &format!(
+            "; rm -f {debug_marker}; ssh -o ConnectTimeout=15 {host} {remove_guest} </dev/null >/dev/null 2>&1 || true"
+        ),
+    );
     let _ = write!(
         out,
         "run={run}\n\
