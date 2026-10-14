@@ -28,7 +28,10 @@ stage_dir() {
 }
 
 # The archive publish.sh bundles: `zeughaus-<version>-<platform>.tar.gz`.
+# Without extended attributes and, on macOS, without the `._` AppleDouble
+# files bsdtar adds for them: both land as junk on any other system.
 pack_tar() {
-    tar -C "$cache/stage" -czf "$CI_OUTPUT/zeughaus-$version-$CI_PLATFORM.tar.gz" \
+    COPYFILE_DISABLE=1 tar --no-xattrs -C "$cache/stage" \
+        -czf "$CI_OUTPUT/zeughaus-$version-$CI_PLATFORM.tar.gz" \
         "zeughaus-$version-$CI_PLATFORM"
 }
