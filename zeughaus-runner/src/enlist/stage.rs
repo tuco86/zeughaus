@@ -68,12 +68,39 @@ pub fn has_entries(dir: &Path) -> bool {
     std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
 }
 
-pub fn podman(args: &[&str]) -> Result<(), String> {
-    let output = Command::new("podman")
+/// The container engine of a host: Apple's `container` on macOS, rootless
+/// podman elsewhere. There is no setting; a host has one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Engine {
+    Podman,
+    Apple,
+}
+
+impl Engine {
+    pub fn host() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Apple
+        } else {
+            Self::Podman
+        }
+    }
+
+    pub fn program(self) -> &'static str {
+        match self {
+            Self::Podman => "podman",
+            Self::Apple => "container",
+        }
+    }
+}
+
+/// Runs `engine` with `args`; the error is its standard error.
+pub fn engine(engine: Engine, args: &[&str]) -> Result<(), String> {
+    let program = engine.program();
+    let output = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("cannot run podman: {e}"))?;
+        .map_err(|e| format!("cannot run {program}: {e}"))?;
     if output.status.success() {
         Ok(())
     } else {

@@ -13,6 +13,7 @@ use std::path::Path;
 use zeughaus_link::enlist::Assignment;
 
 use super::CI_DIR;
+use super::stage::Engine;
 
 /// Everything `launch.sh` needs that is not in the assignment.
 pub struct Launch<'a> {
@@ -31,9 +32,10 @@ pub struct Launch<'a> {
 pub enum Target<'a> {
     /// Directly on this machine, in `workspace`.
     Host { workspace: &'a Path },
-    /// In a rootless podman container built for `image` and tagged `tag`;
-    /// `workspace` is bind-mounted at /work.
+    /// In a rootless container of `engine` built for `image` and tagged
+    /// `tag`; `workspace` is bind-mounted at /work.
     Container {
+        engine: Engine,
         workspace: &'a Path,
         image: &'a str,
         tag: &'a str,
@@ -67,9 +69,10 @@ pub fn env_sh(vars: &[(String, String)]) -> String {
     })
 }
 
-/// `NAME=value` lines for `podman run --env-file`, which takes the rest of
-/// the line verbatim. Values never contain a newline: secrets holding one
-/// are refused when read, and the CI variables are names and paths.
+/// `NAME=value` lines for `podman run --env-file` and `container run
+/// --env-file`, which take the rest of the line verbatim. Values never
+/// contain a newline: secrets holding one are refused when read, and the CI
+/// variables are names and paths.
 pub fn env_file(vars: &[(String, String)]) -> String {
     vars.iter().fold(String::new(), |mut out, (key, value)| {
         let _ = writeln!(out, "{key}={value}");
@@ -153,27 +156,46 @@ pub fn launch_sh(launch: &Launch<'_>) -> String {
             );
         }
         Target::Container {
+            engine,
             image,
             tag,
             cpus,
             memory,
             ..
         } => {
-            let _ = write!(
-                out,
-                "podman image exists {tag} || podman build -t {tag} -f {file} {ctx} || exit 71\n\
-                 podman run --rm -it --init --name {name} --cpus {cpus} --memory {memory} \
-                 --env-file \"$secret_dir/env\" -v \"$ws:/work\" -v {run}:/ci/run \
-                 -v {inputs}:/ci/inputs:ro -w /work {tag} /bin/sh /ci/run/inner.sh\n\
-                 exit $?\n",
-                tag = sh_quote(tag),
-                file = sh_quote(&format!("{CI_DIR}/{image}.Containerfile")),
-                ctx = sh_quote(CI_DIR),
-                name = sh_quote(&format!("zci-{}", a.run)),
-                memory = sh_quote(memory),
-                run = sh_path(launch.run_dir),
-                inputs = sh_path(&launch.run_dir.join("inputs")),
-            );
+            let tag = sh_quote(tag);
+            let file = sh_quote(&format!("{CI_DIR}/{image}.Containerfile"));
+            let ctx = sh_quote(CI_DIR);
+            let name = sh_quote(&format!("zci-{}", a.run));
+            let memory = sh_quote(memory);
+            let run = sh_path(launch.run_dir);
+            let inputs = sh_path(&launch.run_dir.join("inputs"));
+            match engine {
+                Engine::Podman => {
+                    let _ = write!(
+                        out,
+                        "podman image exists {tag} || podman build -t {tag} -f {file} {ctx} || exit 71\n\
+                         podman run --rm -it --init --name {name} --cpus {cpus} --memory {memory} \
+                         --env-file \"$secret_dir/env\" -v \"$ws:/work\" -v {run}:/ci/run \
+                         -v {inputs}:/ci/inputs:ro -w /work {tag} /bin/sh /ci/run/inner.sh\n\
+                         exit $?\n",
+                    );
+                }
+                // `container` has no `:ro` on `-v`, so the inputs are writable.
+                // The system is started on demand and left running; every
+                // container is a VM of its own that `--rm` removes.
+                Engine::Apple => {
+                    let _ = write!(
+                        out,
+                        "container system status >/dev/null 2>&1 || container system start --enable-kernel-install || exit 71\n\
+                         container image inspect {tag} >/dev/null 2>&1 || container build -t {tag} -f {file} --cpus {cpus} --memory {memory} {ctx} || exit 71\n\
+                         container run --rm -it --init --name {name} --cpus {cpus} --memory {memory} \
+                         --env-file \"$secret_dir/env\" -v \"$ws:/work\" -v {run}:/ci/run \
+                         -v {inputs}:/ci/inputs -w /work {tag} /bin/sh /ci/run/inner.sh\n\
+                         exit $?\n",
+                    );
+                }
+            }
         }
         Target::WindowsVm { .. } => unreachable!("handled above"),
     }
@@ -429,30 +451,54 @@ mod tests {
         assert_eq!(code.as_deref(), Some("3\n"));
     }
 
-    #[test]
-    fn a_container_launcher_builds_the_image_and_names_the_run() {
+    fn container_script(engine: Engine) -> String {
         let a = assignment(Place::Container {
             image: "arch".to_owned(),
             tag: "localhost/zci-demo-arch:0123456789abcdef".to_owned(),
         });
         let workspace = PathBuf::from("/s/ci/work/demo/build");
-        let launch = Launch {
+        launch_sh(&Launch {
             assignment: &a,
             run_dir: Path::new("/s/runs/4"),
             secret_dir: Path::new("/run/zeughaus-ci/demo.7.build"),
             mirror: Path::new("/s/ci/mirrors/demo.git"),
             target: Target::Container {
+                engine,
                 workspace: &workspace,
                 image: "arch",
                 tag: "localhost/zci-demo-arch:0123456789abcdef",
                 cpus: 12,
                 memory: "24g",
             },
-        };
-        let script = launch_sh(&launch);
+        })
+    }
+
+    #[test]
+    fn a_container_launcher_builds_the_image_and_names_the_run() {
+        let script = container_script(Engine::Podman);
         assert!(script.contains("-f '.zeughaus-ci/arch.Containerfile' '.zeughaus-ci'"));
         assert!(script.contains("--name 'zci-demo.7.build'"));
         assert!(script.contains("'+refs/ci/7:refs/ci/head'"));
         assert!(script.contains("-e '/target'"));
+        assert!(script.contains("podman run --rm -it --init"));
+        assert!(script.contains("/ci/inputs:ro"));
+    }
+
+    /// Apple's `container` starts its system on demand and has no read-only
+    /// volume.
+    #[test]
+    fn an_apple_container_launcher_starts_the_system_and_mounts_inputs_writable() {
+        let script = container_script(Engine::Apple);
+        assert!(script.contains(
+            "container system status >/dev/null 2>&1 || container system start --enable-kernel-install || exit 71"
+        ));
+        assert!(
+            script.contains("container image inspect 'localhost/zci-demo-arch:0123456789abcdef'")
+        );
+        assert!(script.contains("container build -t 'localhost/zci-demo-arch:0123456789abcdef' -f '.zeughaus-ci/arch.Containerfile' --cpus 12 --memory '24g' '.zeughaus-ci'"));
+        assert!(script.contains("container run --rm -it --init --name 'zci-demo.7.build'"));
+        assert!(script.contains("-v '/s/runs/4/inputs':/ci/inputs -w /work"));
+        assert!(!script.contains("podman"));
+        assert!(!script.contains(":ro"));
     }
 }

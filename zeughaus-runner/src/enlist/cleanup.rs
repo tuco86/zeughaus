@@ -8,6 +8,8 @@ use std::time::SystemTime;
 
 use zeughaus_link::enlist::parse_run_id;
 
+use super::stage::Engine;
+
 /// Pipelines whose artifacts are kept per repository.
 pub const KEEP_ARTIFACTS: usize = 10;
 
@@ -87,9 +89,14 @@ pub fn enforce_budget(state_dir: &Path, budget_gb: u64, in_use: &HashSet<PathBuf
     }
 }
 
-/// Removes a workspace. A container job leaves files owned by subordinate
-/// uids, which only the user namespace podman runs in may delete.
+/// Removes a workspace. A podman container job leaves files owned by
+/// subordinate uids, which only the user namespace podman runs in may
+/// delete; Apple's `container` writes host-owned files over virtiofs, so a
+/// plain removal does.
 fn remove_workspace(ws: &Path) -> Result<(), String> {
+    if Engine::host() == Engine::Apple {
+        return std::fs::remove_dir_all(ws).map_err(|e| e.to_string());
+    }
     let unshare = Command::new("podman")
         .arg("unshare")
         .arg("rm")
@@ -109,12 +116,18 @@ fn remove_workspace(ws: &Path) -> Result<(), String> {
 }
 
 /// Removes this repository's CI image tags other than `used`, then the
-/// layers nothing references any more. A missing podman means there is
-/// nothing to prune.
+/// layers nothing references any more. A missing container engine means
+/// there is nothing to prune.
 pub fn prune_images(repo: &str, used: &HashSet<String>) {
+    let engine = Engine::host();
+    let program = engine.program();
     let prefix = format!("localhost/zci-{repo}-");
-    let Ok(output) = Command::new("podman")
-        .args(["images", "--format", "{{.Repository}}:{{.Tag}}"])
+    let list: &[&str] = match engine {
+        Engine::Podman => &["images", "--format", "{{.Repository}}:{{.Tag}}"],
+        Engine::Apple => &["image", "list", "--quiet"],
+    };
+    let Ok(output) = Command::new(program)
+        .args(list)
         .stderr(Stdio::null())
         .output()
     else {
@@ -129,8 +142,12 @@ pub fn prune_images(repo: &str, used: &HashSet<String>) {
         .map(str::to_owned)
         .collect();
     for tag in &stale {
-        let removed = Command::new("podman")
-            .args(["rmi", tag])
+        let remove: Vec<&str> = match engine {
+            Engine::Podman => vec!["rmi", tag],
+            Engine::Apple => vec!["image", "delete", tag],
+        };
+        let removed = Command::new(program)
+            .args(remove)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -138,8 +155,12 @@ pub fn prune_images(repo: &str, used: &HashSet<String>) {
             eprintln!("[enlist] removed image {tag}");
         }
     }
-    let _ = Command::new("podman")
-        .args(["image", "prune", "-f"])
+    let prune: &[&str] = match engine {
+        Engine::Podman => &["image", "prune", "-f"],
+        Engine::Apple => &["image", "prune"],
+    };
+    let _ = Command::new(program)
+        .args(prune)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();

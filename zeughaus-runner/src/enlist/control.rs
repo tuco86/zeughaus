@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use zeughaus_link::MachineState;
 use zeughaus_link::enlist::{FromRunner, Place, WhenBusy};
 
+use super::stage::Engine;
 use super::{Executor, RunCtl, lock, stage};
 
 const TICK: Duration = Duration::from_secs(1);
@@ -50,6 +51,7 @@ pub fn spawn(exec: &Arc<Executor>) {
 /// Resumes every container and VM a previous process may have frozen.
 pub fn thaw_everything(exec: &Executor) {
     if exec.containers
+        && Engine::host() == Engine::Podman
         && let Ok(output) = std::process::Command::new("podman")
             .args([
                 "ps",
@@ -64,7 +66,7 @@ pub fn thaw_everything(exec: &Executor) {
             .output()
     {
         for name in String::from_utf8_lossy(&output.stdout).lines() {
-            if let Err(e) = stage::podman(&["unpause", name]) {
+            if let Err(e) = stage::engine(Engine::Podman, &["unpause", name]) {
                 eprintln!("[enlist] cannot unpause {name}: {e}");
             }
         }
@@ -134,10 +136,16 @@ impl Executor {
                 .get(name)
                 .ok_or_else(|| format!("no machine {name}"))?
                 .freeze(freeze),
-            Place::Container { .. } => stage::podman(&[
-                if freeze { "pause" } else { "unpause" },
-                &format!("zci-{}", a.run),
-            ]),
+            Place::Container { .. } => match Engine::host() {
+                Engine::Podman => stage::engine(
+                    Engine::Podman,
+                    &[
+                        if freeze { "pause" } else { "unpause" },
+                        &format!("zci-{}", a.run),
+                    ],
+                ),
+                Engine::Apple => Err("apple container cannot pause a container".to_owned()),
+            },
             Place::Host => Err("a host job cannot be frozen".to_owned()),
         }
     }

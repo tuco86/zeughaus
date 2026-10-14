@@ -166,7 +166,8 @@ pub struct Executor {
     config: EnlistConfig,
     /// `CI_CPUS` of a host job.
     cpus: u32,
-    /// Whether `[containers]` is configured and podman answers.
+    /// Whether `[containers]` is configured and the host's container engine
+    /// answers.
     containers: bool,
     machines: BTreeMap<String, Arc<Vm>>,
     busy: Option<Arc<Busy>>,
@@ -203,9 +204,13 @@ pub fn start(
     .map_err(|e| format!("enlist: weida: {e}"))?;
     let tls = ClientTls::new(Trust::by_address()).with_identity(identity);
 
-    let containers = config.containers.is_some() && stage::podman(&["--version"]).is_ok();
+    let engine = stage::Engine::host();
+    let containers = config.containers.is_some() && stage::engine(engine, &["--version"]).is_ok();
     if config.containers.is_some() && !containers {
-        eprintln!("[enlist] [containers] is configured but podman does not answer; offering none");
+        eprintln!(
+            "[enlist] [containers] is configured but {} does not answer; offering none",
+            engine.program()
+        );
     }
     let machines: BTreeMap<String, Arc<Vm>> = config
         .machines

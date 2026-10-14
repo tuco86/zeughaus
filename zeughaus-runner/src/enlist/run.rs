@@ -315,6 +315,7 @@ impl Executor {
                 file_env.extend(secrets.iter().cloned());
                 stage::write_secret(&secret_dir.join("env"), &launch::env_file(&file_env))?;
                 Target::Container {
+                    engine: stage::Engine::host(),
                     workspace: &workspace,
                     image,
                     tag,
