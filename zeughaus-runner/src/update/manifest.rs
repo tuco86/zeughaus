@@ -18,7 +18,7 @@ use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::enlist::config::valid_name;
+use crate::names::valid_name;
 
 /// The manifest layout this binary reads and writes. A field added or
 /// changed is a new format: the parser refuses what it does not know.

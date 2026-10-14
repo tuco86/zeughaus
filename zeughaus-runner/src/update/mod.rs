@@ -43,7 +43,7 @@ mod unix {
     use serde::Deserialize;
 
     use super::manifest;
-    use crate::enlist::config::valid_name;
+    use crate::names::valid_name;
 
     /// `<state-dir>/update.toml`.
     const CONFIG_FILE: &str = "update.toml";

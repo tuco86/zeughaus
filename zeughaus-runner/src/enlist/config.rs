@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::names::valid_name;
+
 pub const CONFIG_FILE: &str = "enlist.toml";
 
 fn default_budget_gb() -> u64 {
@@ -186,15 +188,6 @@ pub fn load(state_dir: &Path) -> Result<Option<EnlistConfig>, String> {
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
     EnlistConfig::parse(&text).map(Some)
-}
-
-/// `[a-z0-9][a-z0-9-]*`
-pub fn valid_name(s: &str) -> bool {
-    let mut chars = s.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 #[cfg(test)]

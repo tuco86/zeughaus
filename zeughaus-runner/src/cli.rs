@@ -45,13 +45,21 @@ pub fn timeout(args: &[String]) -> Option<ExitCode> {
     if args.first().map(String::as_str) != Some("timeout") {
         return None;
     }
-    Some(match crate::timeout::parse(&args[1..]) {
+    #[cfg(unix)]
+    let code = match crate::timeout::parse(&args[1..]) {
         Ok(request) => ExitCode::from(crate::timeout::run(&request) as u8),
         Err(e) => {
             eprintln!("[timeout] {e}");
             ExitCode::from(125)
         }
-    })
+    };
+    // Only host CI jobs use it, and only a unix runner enlists.
+    #[cfg(not(unix))]
+    let code = {
+        eprintln!("[timeout] needs a unix host");
+        ExitCode::from(125)
+    };
+    Some(code)
 }
 
 /// Runs `release` if the first argument names it. Checked early, like

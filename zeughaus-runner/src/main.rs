@@ -12,15 +12,18 @@
 //! to several runners shows several documents side by side.
 
 mod cli;
+#[cfg(unix)]
 mod enlist;
 mod feed;
 mod files;
 mod graphs;
 mod jobs;
 mod mux;
+mod names;
 mod release;
 mod runner;
 mod runs;
+#[cfg(unix)]
 mod timeout;
 mod transport;
 mod update;
@@ -159,6 +162,7 @@ fn main() -> ExitCode {
     };
     // A malformed `enlist.toml` is refused before anything is bound: a runner
     // that silently stays out of the CI would leave its jobs waiting.
+    #[cfg(unix)]
     let enlist_config = match enlist::config::load(&state_dir) {
         Ok(config) => config,
         Err(e) => {
@@ -166,6 +170,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Jobs run in shells and containers this platform does not have.
+    #[cfg(not(unix))]
+    if state_dir.join("enlist.toml").exists() {
+        eprintln!("[runner] enlisting needs a unix host");
+    }
     // Said only when serving: a subcommand's output is read by scripts.
     #[cfg(unix)]
     {
@@ -253,6 +262,7 @@ fn main() -> ExitCode {
     let mut mux_service: Option<MuxService> = None;
     // The busy measurement of an enlisted runner that has one, reported to
     // editors as it changes.
+    #[cfg(unix)]
     let mut busy_handle: Option<Arc<enlist::busy::Busy>> = None;
     let (graphs, graph_rx, initial) = GraphService::load(&state_dir);
     // Registered with the other paths, answered once the loop below starts.
@@ -309,6 +319,7 @@ fn main() -> ExitCode {
         }
         // Enlisting makes this runner execute the CI's jobs as its own; without
         // an `enlist.toml` it does not dial anyone.
+        #[cfg(unix)]
         if let Some(config) = enlist_config {
             match &job_host {
                 Some(host) => match exe.as_ref() {
@@ -338,6 +349,7 @@ fn main() -> ExitCode {
         if let Ok(exe) = exe.as_ref() {
             update::start(&state_dir, exe.clone());
         }
+        #[cfg(unix)]
         if let Some(busy) = &busy_handle {
             match listener.replier(BUSY_PATH) {
                 Ok(replier) => {
@@ -368,6 +380,7 @@ fn main() -> ExitCode {
         Arc::clone(&snapshot),
         job_host.clone(),
     );
+    #[cfg(unix)]
     if let Some(busy) = &busy_handle {
         runner.report_machine(busy.state());
     }
@@ -492,6 +505,7 @@ fn main() -> ExitCode {
             fired |= runner.trigger(press.node_id, press.payload, press.external);
         }
 
+        #[cfg(unix)]
         if let Some(busy) = &busy_handle {
             runner.report_machine(busy.state());
         }

@@ -28,13 +28,13 @@ use zeughaus_link::enlist::{
 };
 
 use super::cleanup::{self, KEEP_ARTIFACTS};
-use super::config::valid_name;
 use super::launch::{self, Launch, Target};
 use super::stage;
 use super::{
     Executor, RunCtl, artifacts_dir, assigned_dir, git, lock, mirror_dir, now_secs, work_dir,
 };
 use crate::files::{read_json, write_atomic, write_json};
+use crate::names::valid_name;
 
 /// How often a run's log is looked at for new bytes.
 const LOG_POLL: Duration = Duration::from_millis(200);
