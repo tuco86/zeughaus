@@ -1039,7 +1039,11 @@ them, and any other opens on a press of its row: an open pipeline adds
 their `needs` (status glyph, name, and how long and where, or what it waits
 for; outlined by status), and for each failed job its excerpt from the cause
 line on and an `Open log` button. What a rerun or cancel came to is said in
-the toolbar. While the channel in front has something running, a
+the toolbar, and so is a CI that does not answer (an error, or no overview
+for 15 s): the views then show its last report. Up and Down move a cursor
+over the list in front, Enter opens or closes the pipeline under it, and
+Escape closes the transcript when no palette or rename takes it first. The
+list is at most 1200 px wide. While the channel in front has something running, a
 one-second clock moves its elapsed times. The cables between the cards are one
 `iced_nodegraph_sdf` primitive under them; nothing pans, zooms, moves or
 takes the wheel, so the list scrolls like any other. Pressing a job

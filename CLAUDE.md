@@ -106,7 +106,8 @@ and their machines and a locked group
 per repository with one tab per channel (pipelines one row each, newest on
 top and open with its jobs, failures with their cause and log excerpt,
 `Rerun` and `Cancel`; pressing a job shows its transcript read-only, live
-while it runs). The play/pause circle (filled when set by
+while it runs; Up/Down and Enter walk and open the list, Escape closes the
+transcript). The play/pause circle (filled when set by
 hand) sits on the section of the runner that has `[busy]` (`tuco-pc`) and
 cycles the busy mode through auto (the GPU measurement), busy and
 free. Channels come from `.zeughaus-ci/channels.toml`. Closing a graph's tab
