@@ -446,10 +446,15 @@ impl App {
             return Task::none();
         };
         // A pane of a CI section shows a transcript of that runner's: its
-        // terminal, replayed to this editor and never driven from it.
+        // terminal, replayed to this editor and never driven from it. Only
+        // its size follows the pane.
         let replay = pane.runner.ci_runner();
         let key = replay.clone().unwrap_or_else(|| pane.runner.clone());
         match action {
+            TerminalAction::Command(command @ zeughaus_mux::TerminalCommand::Resize(_)) => {
+                self.send_input(&key, terminal, command);
+                Task::none()
+            }
             TerminalAction::Command(_) | TerminalAction::TakeControl if replay.is_some() => {
                 Task::none()
             }
@@ -663,7 +668,7 @@ impl App {
     /// an unclaimed terminal, so its keys must go out. A viewer sees the same
     /// rows and gets the take-control shortcut instead of the keys. A
     /// `read_only` pane is never the controlling one, whoever holds the
-    /// lease: a transcript is looked at, not driven.
+    /// lease: a transcript is looked at, not driven, and only sized.
     pub(super) fn terminal_pane(
         &self,
         pane: Option<PaneRef>,
@@ -693,6 +698,7 @@ impl App {
             && pane.as_ref() == self.workspace.focused_pane();
         let widget = iced_terminal::Terminal::new(Arc::clone(view), terminal.0)
             .controlling(controlling)
+            .sizing(read_only)
             .focused(focused)
             .reserved(super::is_app_shortcut)
             .next_serial(serials.next())

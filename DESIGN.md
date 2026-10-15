@@ -1066,7 +1066,10 @@ the accent while it is open: the CI creates a
 from the stored `wal` every 200 ms and that ends with the `exit` file, and
 serves it on its own `/mux` through `zeughaus_terminal::serve::stream_terminal`,
 so the editor shows it through the ordinary terminal stream, live,
-read-only. The CI's mux has no workspace, no shells and ignores input. It
+read-only. The CI's mux has no workspace, no shells and ignores input except
+a resize: the transcript pane sizes the screen without controlling it
+(`iced_terminal::Terminal::sizing`), and the CI rewraps it to the pane that
+asked last, so it fills the pane and its lines wrap at the pane's edge. It
 keeps at most 16 transcript screens across editors and closes the least
 recently opened one first; an editor asks again for its open transcripts
 after the CI restarts. The section's ids are the editor's own

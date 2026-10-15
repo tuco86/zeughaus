@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A CI job's transcript fills its pane and wraps at the pane's edge: it
+  stayed at 80 by 24 cells, so its last line sat in the middle of a tall
+  pane and lines ran past the right edge of a narrow one. The pane now
+  sizes the transcript (the CI rewraps it to the pane that asked last).
+
 ### Removed
 
 - The `darwin-amd64` release archive: Apple's macOS releases after 26

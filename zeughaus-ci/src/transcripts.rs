@@ -4,9 +4,10 @@
 //! from the stored copy of the run's WAL (`<n>.runs/<job>/wal`, appended by
 //! `/enlist`). The CI has no workspace and no shells: its mux answers the
 //! control exchange with an empty topology, streams the screens it holds,
-//! and ignores input. At most [`MAX_TRANSCRIPTS`] screens stay open across
-//! all editors; opening one more closes the one used longest ago, which is
-//! cheap to open again.
+//! and ignores input except a resize, which rewraps the screen to the pane
+//! that asked last (one screen is shared by every editor that shows it). At
+//! most [`MAX_TRANSCRIPTS`] screens stay open across all editors; opening one
+//! more closes the one used longest ago, which is cheap to open again.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -17,8 +18,8 @@ use weida::{IncomingRequest, Replier, TransferMeta};
 use zeughaus_mux::message::ControlAttached;
 use zeughaus_mux::{
     Capability, CommandOutcome, CommandReply, ControlAttach, Dimensions, ErrorCode, ExitState,
-    MAJOR, MINOR, Message, RowFetch, RunnerIncarnation, ServerHello, TerminalAttach, TerminalId,
-    WireError, WorkspaceSnapshot,
+    MAJOR, MINOR, Message, RowFetch, RunnerIncarnation, ServerHello, TerminalAttach,
+    TerminalCommand, TerminalId, WireError, WorkspaceSnapshot,
 };
 use zeughaus_terminal::Session;
 use zeughaus_terminal::frames::{ReadError, read_frame, write_frame};
@@ -360,8 +361,9 @@ async fn control(
     }
 }
 
-/// Streams a transcript. Input is read and dropped: a transcript has no
-/// process to type into.
+/// Streams a transcript. A resize is applied, so the screen rewraps to the
+/// pane that asked last; other input is read and dropped: a transcript has
+/// no process to type into.
 async fn terminal(
     transcripts: &Transcripts,
     attach: TerminalAttach,
@@ -374,17 +376,23 @@ async fn terminal(
         .session(id)
         .ok_or_else(|| error(ErrorCode::UnknownTerminal, format!("no {id}")))?;
     let acked = AtomicU64::new(0);
+    let resize = |size| {
+        if let Err(e) = session.apply(&TerminalCommand::Resize(size)) {
+            eprintln!("[ci] {id}: resize refused: {e}");
+        }
+    };
     let streaming = stream_terminal(
         &session,
         &attach,
         &acked,
         reply,
-        || {},
+        || resize(attach.size),
         || !transcripts.exists(id),
     );
     let reading = async {
         loop {
             match read_frame(body).await {
+                Ok((_, Message::TerminalCommand(TerminalCommand::Resize(size)))) => resize(size),
                 Ok(_) => {}
                 Err(ReadError::Ended) | Err(ReadError::Io(_)) => return Ok(()),
                 Err(ReadError::Codec(e)) => {

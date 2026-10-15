@@ -96,6 +96,7 @@ where
     id: u64,
     on_action: Option<Box<dyn Fn(Action) -> Message + 'a>>,
     controlling: bool,
+    sizing: bool,
     focused: bool,
     /// Keys the application keeps even while this pane has the keyboard.
     reserved: Option<fn(&keyboard::Key, keyboard::Modifiers) -> bool>,
@@ -120,6 +121,7 @@ where
             id,
             on_action: None,
             controlling: false,
+            sizing: false,
             focused: false,
             reserved: None,
             next_serial: 1,
@@ -136,9 +138,17 @@ where
     }
 
     /// Whether this client holds the control lease. Only then do keys, mouse
-    /// reports and resizes travel.
+    /// reports and resizes travel (resizes also with [`Terminal::sizing`]).
     pub fn controlling(mut self, controlling: bool) -> Self {
         self.controlling = controlling;
+        self
+    }
+
+    /// Whether this pane sizes the terminal without controlling it. A screen
+    /// nobody types into (a recorded transcript) follows the pane it is shown
+    /// in; a viewer of a live terminal leaves its size to the controller.
+    pub fn sizing(mut self, sizing: bool) -> Self {
+        self.sizing = sizing;
         self
     }
 
@@ -1014,7 +1024,7 @@ where
         bounds: Rectangle,
         shell: &mut Shell<'_, Message>,
     ) {
-        if !self.controlling {
+        if !self.controlling && !self.sizing {
             state.pending_grid = None;
             return;
         }
