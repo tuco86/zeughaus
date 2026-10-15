@@ -901,31 +901,57 @@ struct Announced {
 /// runner's is kept as the runner: one fingerprint is one section key.
 #[cfg(not(target_arch = "wasm32"))]
 fn announced_peers(runner_urls: &[String], ci_urls: &[String]) -> Vec<Announced> {
-    let mut out: Vec<Announced> = Vec::new();
+    let mut out: Vec<(Announced, weida::EndpointAddr)> = Vec::new();
     for (urls, kind) in [(runner_urls, LinkKind::Runner), (ci_urls, LinkKind::Ci)] {
         for url in urls {
             let Ok(addr) = weida::EndpointAddr::parse(url) else {
                 continue;
             };
-            let Some(fingerprint) = addr.peer.map(|fp| fp.to_string()) else {
+            let Some(fingerprint) = addr.peer.as_ref().map(|fp| fp.to_string()) else {
                 continue;
             };
-            if let Some(first) = out.iter().find(|a| a.key.as_str() == fingerprint) {
+            if let Some((first, _)) = out.iter().find(|(a, _)| a.key.as_str() == fingerprint) {
                 if first.kind != kind {
                     eprintln!("[config] ci {url}: also listed as a runner, kept as the runner");
                 }
                 continue;
             }
-            // The host and the first eight hex digits after `sha256:`: enough
-            // to tell two peers on one host apart at a glance.
-            let short = fingerprint.get(7..15).unwrap_or(&fingerprint);
-            out.push(Announced {
-                key: RunnerKey::new(&fingerprint),
-                endpoint: Endpoint(url.clone()),
-                label: format!("{} {short}", addr.host),
-                kind,
-            });
+            out.push((
+                Announced {
+                    key: RunnerKey::new(&fingerprint),
+                    endpoint: Endpoint(url.clone()),
+                    label: String::new(),
+                    kind,
+                },
+                addr,
+            ));
         }
     }
-    out
+    // The host names a peer; two peers of one kind on one host are told
+    // apart by their port, and without one by the first eight hex digits of
+    // the key. A CI's section says `CI` already.
+    let labels: Vec<String> = out
+        .iter()
+        .map(|(announced, addr)| {
+            let shared = out
+                .iter()
+                .filter(|(other_announced, other)| {
+                    other_announced.kind == announced.kind && other.host == addr.host
+                })
+                .count()
+                > 1;
+            match (shared, addr.port) {
+                (false, _) => addr.host.clone(),
+                (true, Some(port)) => format!("{}:{port}", addr.host),
+                (true, None) => {
+                    let key = announced.key.as_str();
+                    format!("{} {}", addr.host, key.get(7..15).unwrap_or(key))
+                }
+            }
+        })
+        .collect();
+    out.into_iter()
+        .zip(labels)
+        .map(|((announced, _), label)| Announced { label, ..announced })
+        .collect()
 }

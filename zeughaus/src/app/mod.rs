@@ -36,7 +36,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use iced::keyboard;
-use iced::widget::{button, column, container, mouse_area, pane_grid, row, space, stack, text};
+use iced::widget::{
+    Column, Row, button, column, container, mouse_area, pane_grid, row, space, stack, text,
+};
 use iced::{Element, Event, Length, Point, Subscription, Task, Vector};
 use iced_nodegraph::{
     EdgeStyle, NodeGraph, NodeStatus, NodeStyle, Pattern, PinInfo, PinRef, PinStyle,
@@ -92,6 +94,8 @@ const TITLEBAR_HEIGHT: f32 = 30.0;
 const TITLEBAR_DRAG_THRESHOLD: f32 = 4.0;
 /// Width of the tab sidebar while the bar sits at the left edge.
 const SIDEBAR_WIDTH: f32 = 180.0;
+/// Gap between the status bar's entries, and its side padding.
+const STATUS_GAP: f32 = 16.0;
 
 /// A node rename in progress: which node, and what has been typed so far.
 struct Rename {
@@ -469,18 +473,18 @@ impl App {
     /// frames are flowing or the stream has stalled, and a number that climbs
     /// is the difference.
     #[cfg(not(target_arch = "wasm32"))]
-    fn runtime_text(&self) -> String {
+    fn runtime_segments(&self) -> Vec<String> {
         let links = self
             .runtime
             .links
             .values()
             .filter(|link| link.kind == runtime::LinkKind::Runner)
             .count();
-        let mut text = match links {
-            0 => " | no runner".to_string(),
-            1 => " | 1 runner".to_string(),
-            n => format!(" | {n} runners"),
-        };
+        let mut segments = vec![match links {
+            0 => "no runner".to_string(),
+            1 => "1 runner".to_string(),
+            n => format!("{n} runners"),
+        }];
         // Whether the graphs are the runners' current ones: a link that is
         // not attached leaves its graphs as they were last seen.
         if links > 0 {
@@ -491,7 +495,7 @@ impl App {
                 .filter(|link| link.kind == runtime::LinkKind::Runner && link.graph_live)
                 .count();
             if attached != links {
-                text.push_str(&format!(" | graph: {attached} of {links} attached"));
+                segments.push(format!("graph: {attached} of {links} attached"));
             }
         }
         // Whether values are arriving, not just whether a runner exists: the
@@ -505,16 +509,16 @@ impl App {
                 .filter(|link| link.kind == runtime::LinkKind::Runner && link.traffic_live)
                 .count();
             if live == links {
-                text.push_str(" | live");
+                segments.push("live".to_string());
             } else {
-                text.push_str(&format!(" | reconnecting ({live} of {links} live)"));
+                segments.push(format!("reconnecting ({live} of {links} live)"));
             }
         }
         if !self.runtime.feeds.is_empty() {
             let feeds = self.runtime.feeds.len();
             let plural = if feeds == 1 { "" } else { "s" };
-            text.push_str(&format!(
-                " | {feeds} feed{plural}, {} frames",
+            segments.push(format!(
+                "{feeds} feed{plural}, {} frames",
                 self.runtime.frames_received
             ));
         }
@@ -534,18 +538,18 @@ impl App {
                 })
                 .count();
             if attached == links {
-                text.push_str(" | mux: attached");
+                segments.push("terminals attached".to_string());
             } else {
-                text.push_str(&format!(" | mux: {attached} of {links} attached"));
+                segments.push(format!("terminals: {attached} of {links} attached"));
             }
         }
-        text
+        segments
     }
 
     // The wasm editor has no sync layer, so it has no runtime to report on.
     #[cfg(target_arch = "wasm32")]
-    fn runtime_text(&self) -> String {
-        String::new()
+    fn runtime_segments(&self) -> Vec<String> {
+        Vec::new()
     }
 
     /// The world point in the middle of what this window is showing.
@@ -1989,6 +1993,7 @@ impl App {
             sections,
             self.workspace.active_tab().cloned(),
             placement,
+            tab_glyphs(),
             marker,
             renaming,
             handlers,
@@ -2023,10 +2028,32 @@ impl App {
         &'a self,
         tabs: Option<Element<'a, Message, Theme>>,
     ) -> Element<'a, Message, Theme> {
-        let toggle = button(text("\u{2261}").size(14))
+        // The glyph shows where the tabs go on a press: a sidebar while they
+        // sit on top, a top strip while they sit at the left.
+        let (glyph, tip) = match self.workspace.placement {
+            iced_tabs::Placement::Top => (GLYPH_TABS_LEFT, "Move the tabs to the left"),
+            iced_tabs::Placement::Left => (GLYPH_TABS_TOP, "Move the tabs to the top"),
+        };
+        let toggle = button(placement_glyph(glyph))
             .padding([2, 8])
             .style(|theme: &Theme, status| button::text(theme.base(), status))
             .on_press(Message::Workspace(workspace::Message::TogglePlacement));
+        let toggle = iced::widget::tooltip(
+            toggle,
+            container(text(tip).size(12))
+                .padding([3, 6])
+                .style(|theme: &Theme| {
+                    let style = iced_tabs::Catalog::tooltip(theme);
+                    container::Style {
+                        background: style.background,
+                        text_color: Some(style.text),
+                        border: style.border,
+                        ..container::Style::default()
+                    }
+                }),
+            iced::widget::tooltip::Position::Bottom,
+        )
+        .gap(4);
         let mut controls = row![toggle]
             .spacing(4)
             .align_y(iced::Alignment::Center)
@@ -2043,17 +2070,21 @@ impl App {
             let corner = self.window_radius();
             controls = controls
                 .push(window_button(
-                    "\u{2013}",
+                    GLYPH_MINIMIZE,
                     Message::WindowMinimize,
                     |theme, status| button::text(theme.base(), status),
                 ))
                 .push(window_button(
-                    "\u{25A1}",
+                    if self.window_maximized {
+                        GLYPH_RESTORE
+                    } else {
+                        GLYPH_MAXIMIZE
+                    },
                     Message::WindowMaximize,
                     |theme, status| button::text(theme.base(), status),
                 ))
                 .push(window_button(
-                    "\u{00D7}",
+                    GLYPH_CLOSE_WINDOW,
                     Message::CloseRequested,
                     move |theme, status| {
                         let style = danger_on_hover(theme.base(), status, button::text);
@@ -2185,23 +2216,46 @@ impl App {
         // the answer to something the user just did, and a graph almost always
         // has something failing in it, which would leave the answer unread.
         let hint = self.hint.as_ref().map(|(text, _)| text.as_str());
-        let head = format!(
-            "  {} nodes | {} edges{}",
-            self.nodes.len(),
-            self.edges.len(),
-            self.runtime_text(),
-        );
-        let (status_text, error_color) = if let Some(hint) = hint {
-            (format!("{head} | {hint}"), self.theme.hint())
+        // The size of a graph says nothing about a terminal tab, so the
+        // counts are there only while the focused pane shows one.
+        let mut segments = Vec::new();
+        if let Some(graph) = self.workspace.focused_graph() {
+            let in_graph = |id: &NodeId| self.nodes.get(id).is_some_and(|n| n.parent == graph);
+            let nodes = self.nodes.values().filter(|n| n.parent == graph).count();
+            let edges = self
+                .edges
+                .iter()
+                .filter(|e| in_graph(&e.from_node) && in_graph(&e.to_node))
+                .count();
+            segments.push(format!(
+                "{nodes} {}",
+                if nodes == 1 { "node" } else { "nodes" }
+            ));
+            segments.push(format!(
+                "{edges} {}",
+                if edges == 1 { "edge" } else { "edges" }
+            ));
+        }
+        segments.extend(self.runtime_segments());
+        let mut line = Row::new()
+            .spacing(STATUS_GAP)
+            .align_y(iced::Alignment::Center);
+        for segment in segments {
+            line = line.push(text(segment).size(12).color(self.theme.muted()));
+        }
+        if let Some(hint) = hint {
+            line = line.push(text(hint).size(12).color(self.theme.hint()));
         } else if !error.is_empty() {
-            (format!("{head} | ERROR: {error}"), self.theme.error())
-        } else {
-            (head, self.theme.muted())
-        };
+            line = line.push(
+                text(format!("ERROR: {error}"))
+                    .size(12)
+                    .color(self.theme.error()),
+            );
+        }
 
-        container(text(status_text).size(12).color(error_color))
+        container(line)
             .width(Length::Fill)
-            .padding(4.0)
+            .padding([4.0, STATUS_GAP])
             .style(|theme: &Theme| container::Style {
                 background: Some(theme.chrome().into()),
                 border: iced::Border {
@@ -2452,34 +2506,38 @@ impl App {
             ng = ng.push_edge(edge_widget);
         }
 
-        container(ng)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+        // The hint layer is always there, empty once the graph has a node:
+        // the canvas keeps its place in the widget tree either way, so its
+        // state survives the first node. Text only, so every pointer event
+        // reaches the canvas below.
+        let mut hint = Column::new().spacing(4.0).align_x(iced::Alignment::Center);
+        if !self.nodes.values().any(|node| node.parent == graph) {
+            let shortcut = if cfg!(target_os = "macos") {
+                "Ctrl+Space or Cmd+Shift+P adds a node"
+            } else {
+                "Ctrl+Space adds a node"
+            };
+            hint = hint
+                .push(text("Empty graph").size(14).color(self.theme.muted()))
+                .push(text(shortcut).size(12).color(self.theme.muted()));
+        }
+        stack![
+            container(ng).width(Length::Fill).height(Length::Fill),
+            container(hint).center(Length::Fill),
+        ]
+        .into()
     }
 
     /// The command palette over whatever the window shows: it acts on the
     /// whole editor (tabs, panes, terminals, the graph), so it belongs to no
     /// single surface.
     fn palette_overlay(&self) -> Element<'_, Message, Theme> {
-        // The palette widget is written against iced's own theme type, so
-        // the overlay is handed the inner theme: one theme still decides
-        // what it looks like, through the bridge rather than through a
-        // second catalog.
-        let palette_view: Element<'_, Message, Theme> = iced::widget::themer(
-            Some(self.theme.base().clone()),
-            palette::view(
-                &self.palette_input,
-                &self.palette_commands,
-                self.palette_selected,
-            ),
+        palette::view(
+            &self.palette_input,
+            &self.theme,
+            &self.palette_commands,
+            self.palette_selected,
         )
-        .into();
-        container(palette_view)
-            .width(Length::Fill)
-            .padding(80.0)
-            .align_x(iced::Alignment::Center)
-            .into()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -2693,6 +2751,27 @@ fn unavailable<'a>(what: &'a str, why: &'a str) -> Element<'a, Message, Theme> {
 const GLYPH_SHELL: char = '\u{ea85}';
 const GLYPH_GRAPH: char = '\u{ebb9}';
 const GLYPH_GROUP: char = '\u{ea80}';
+
+/// The tab tree's own glyphs: codicons (chevrons, close) from the bundled
+/// Nerd Font, which the browser editor does not bundle, so it keeps the
+/// tree's Unicode defaults. A locked group says nothing extra: it has no
+/// colour dot and no close button to begin with.
+fn tab_glyphs() -> iced_tabs::Glyphs {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        iced_tabs::Glyphs {
+            font: Some(iced_terminal::FONT),
+            expanded: '\u{eab4}',
+            collapsed: '\u{eab6}',
+            close: '\u{ea76}',
+            locked: None,
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        iced_tabs::Glyphs::default()
+    }
+}
 #[cfg(not(target_arch = "wasm32"))]
 const GLYPH_FREE_MEASURED: char = '\u{f040d}';
 #[cfg(not(target_arch = "wasm32"))]
@@ -2842,18 +2921,53 @@ fn drop_overlay<'a>(
     .into()
 }
 
+/// Codicons of the window's own controls, drawn at the size a Mono Nerd
+/// Font needs for a glyph about 10 px wide.
+#[cfg(not(target_arch = "wasm32"))]
+const GLYPH_MINIMIZE: char = '\u{eaba}';
+#[cfg(not(target_arch = "wasm32"))]
+const GLYPH_MAXIMIZE: char = '\u{eab9}';
+#[cfg(not(target_arch = "wasm32"))]
+const GLYPH_RESTORE: char = '\u{eabb}';
+#[cfg(not(target_arch = "wasm32"))]
+const GLYPH_CLOSE_WINDOW: char = '\u{eab8}';
+#[cfg(not(target_arch = "wasm32"))]
+const WINDOW_GLYPH_SIZE: f32 = 17.0;
+/// The placement toggle: a sidebar, or a strip along the top.
+const GLYPH_TABS_LEFT: char = '\u{ebf3}';
+const GLYPH_TABS_TOP: char = '\u{ebf6}';
+
+/// The placement toggle's glyph. The browser editor does not bundle the
+/// icon font and shows a menu sign for both.
+fn placement_glyph(glyph: char) -> Element<'static, Message, Theme> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        text(glyph.to_string())
+            .font(iced_terminal::FONT)
+            .size(WINDOW_GLYPH_SIZE)
+            .line_height(1.0)
+            .into()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = glyph;
+        text("\u{2261}").size(14).into()
+    }
+}
+
 /// A titlebar button: minimize, maximize, close. Flat, so the bar reads as
 /// one strip and not as a row of boxes; as tall as the bar, so a hover fills
 /// it from edge to edge.
 #[cfg(not(target_arch = "wasm32"))]
 fn window_button(
-    glyph: &'static str,
+    glyph: char,
     message: Message,
     style: impl Fn(&Theme, button::Status) -> button::Style + 'static,
 ) -> Element<'static, Message, Theme> {
     button(
-        text(glyph)
-            .size(13)
+        text(glyph.to_string())
+            .font(iced_terminal::FONT)
+            .size(WINDOW_GLYPH_SIZE)
             .center()
             .width(Length::Fill)
             .height(Length::Fill),

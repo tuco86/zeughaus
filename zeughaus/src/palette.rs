@@ -1,5 +1,5 @@
 use iced::Element;
-use iced_palette::{Command, command, command_palette};
+use iced_palette::{Command, command, filter_commands, fuzzy_match};
 use zeughaus_core::NodeDefinition;
 use zeughaus_mux::{Axis, DetachedTerminal};
 use zeughaus_theme::Theme;
@@ -175,19 +175,300 @@ fn runner_commands(state: &RunnerState<'_>) -> Vec<Command<Message>> {
     commands
 }
 
-/// Render the command palette overlay.
+/// Width and list height of the panel, and the fixed height of one row: a
+/// title over a description, so a row with no description is as tall as one
+/// with it and the list does not jump while the query narrows it.
+const PANEL_WIDTH: f32 = 640.0;
+const LIST_HEIGHT: f32 = 440.0;
+const ROW_HEIGHT: f32 = 46.0;
+/// Distance from the top of the window to the panel.
+const PANEL_TOP: f32 = 80.0;
+const SP_2: f32 = 8.0;
+const SP_3: f32 = 12.0;
+const TEXT_MD: f32 = 14.0;
+const TEXT_SM: f32 = 12.0;
+/// How many characters of a title or a description a row shows. Text is
+/// never wrapped, so what does not fit is shortened in the middle: the end
+/// of a terminal's title (its directory) says as much as its start.
+const TITLE_CHARS: usize = 68;
+const DETAIL_CHARS: usize = 84;
+
+/// What a row shows of `text`: at most `max` characters, the middle replaced
+/// by an ellipsis, each paired with its index in `text` (`None` for the
+/// ellipsis) so match highlights survive the shortening.
+fn shorten(text: &str, max: usize) -> Vec<(char, Option<usize>)> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return chars
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| (c, Some(i)))
+            .collect();
+    }
+    let tail = max / 3;
+    let head = max - tail - 1;
+    let mut out: Vec<(char, Option<usize>)> = chars[..head]
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| (c, Some(i)))
+        .collect();
+    out.push(('\u{2026}', None));
+    let start = chars.len() - tail;
+    out.extend(
+        chars[start..]
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (c, Some(start + i))),
+    );
+    out
+}
+
+/// One unwrapped line of text with the characters the query matched drawn
+/// apart: in the accent colour, or underlined on the selected row, where the
+/// accent is the background.
+fn line<'a>(
+    text: &str,
+    query: &str,
+    max: usize,
+    size: f32,
+    color: Option<iced::Color>,
+    selected: bool,
+    theme: &Theme,
+) -> Element<'a, Message, Theme> {
+    use iced::widget::text::{Rich, Span};
+
+    let matched = fuzzy_match(query, text)
+        .map(|m| m.indices)
+        .unwrap_or_default();
+    let mut spans: Vec<Span<'a, (), iced::Font>> = Vec::new();
+    let mut run = String::new();
+    let mut run_matched = false;
+    let mut flush = |run: &mut String, matched: bool| {
+        if run.is_empty() {
+            return;
+        }
+        let mut span = Span::new(std::mem::take(run));
+        if let Some(color) = color {
+            span = span.color(color);
+        }
+        if matched {
+            span = if selected {
+                span.underline(true)
+            } else {
+                span.color(theme.accent())
+            };
+        }
+        spans.push(span);
+    };
+    for (c, original) in shorten(text, max) {
+        let hit = original.is_some_and(|i| matched.contains(&i));
+        if hit != run_matched {
+            flush(&mut run, run_matched);
+            run_matched = hit;
+        }
+        run.push(c);
+    }
+    flush(&mut run, run_matched);
+    Rich::with_spans(spans)
+        .size(size)
+        .wrapping(iced::widget::text::Wrapping::None)
+        .into()
+}
+
+/// The close control: the codicon glyph where the icon font is bundled, the
+/// word where it is not (the browser editor).
+fn close_button<'a>() -> Element<'a, Message, Theme> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let label = iced::widget::text("\u{ea76}")
+        .font(iced_terminal::FONT)
+        .size(TEXT_MD);
+    #[cfg(target_arch = "wasm32")]
+    let label = iced::widget::text("x").size(TEXT_SM);
+    iced::widget::button(label)
+        .padding([4.0, SP_2])
+        .on_press(Message::PaletteCancel)
+        .style(|theme: &Theme, status| {
+            let hovered = matches!(
+                status,
+                iced::widget::button::Status::Hovered | iced::widget::button::Status::Pressed
+            );
+            iced::widget::button::Style {
+                background: hovered.then(|| theme.extended().background.strong.color.into()),
+                text_color: if hovered {
+                    theme.extended().background.strong.text
+                } else {
+                    theme.muted()
+                },
+                border: iced::border::rounded(4.0),
+                ..Default::default()
+            }
+        })
+        .into()
+}
+
+/// Render the command palette: a full-window scrim, which a click dismisses,
+/// over one panel at the top.
 pub fn view<'a>(
     input: &str,
+    theme: &Theme,
     commands: &[Command<Message>],
     selected_index: usize,
-) -> Element<'a, Message, iced::Theme> {
-    command_palette(
-        input,
-        commands,
-        selected_index,
-        Message::PaletteInput,
-        Message::PaletteSelect,
-        Message::PaletteNavigate,
-        || Message::PaletteCancel,
+) -> Element<'a, Message, Theme> {
+    use iced::widget::{
+        Column, button, column, container, mouse_area, opaque, row, scrollable, text, text_input,
+    };
+    use iced::{Alignment, Border, Length, Padding, Shadow, Vector};
+
+    let filtered = filter_commands(input, commands);
+    let mut rows = Column::new().spacing(2.0).width(Length::Fill);
+    for (display_index, (original, _)) in filtered.iter().enumerate() {
+        let command = &commands[*original];
+        let selected = display_index == selected_index;
+        let extended = theme.extended();
+        let detail_color = if selected {
+            extended.primary.base.text.scale_alpha(0.75)
+        } else {
+            theme.muted()
+        };
+
+        let mut label = Column::new().width(Length::Fill).push(line(
+            &command.name,
+            input,
+            TITLE_CHARS,
+            TEXT_MD,
+            None,
+            selected,
+            theme,
+        ));
+        if let Some(description) = &command.description {
+            // Not highlighted: a fuzzy query scatters single letters over a
+            // sentence, which reads as noise.
+            label = label.push(line(
+                description,
+                "",
+                DETAIL_CHARS,
+                TEXT_SM,
+                Some(detail_color),
+                selected,
+                theme,
+            ));
+        }
+        let mut content = row![container(label).width(Length::Fill).clip(true)]
+            .spacing(SP_3)
+            .align_y(Alignment::Center);
+        if let Some(shortcut) = &command.shortcut {
+            content = content.push(text(shortcut.display()).size(TEXT_SM).color(detail_color));
+        }
+
+        let entry = button(content)
+            .on_press(Message::PaletteSelect(display_index))
+            .padding([0.0, SP_3])
+            .width(Length::Fill)
+            .height(ROW_HEIGHT)
+            .style(move |theme: &Theme, _status| {
+                let extended = theme.extended();
+                if selected {
+                    button::Style {
+                        background: Some(extended.primary.base.color.into()),
+                        text_color: extended.primary.base.text,
+                        border: iced::border::rounded(4.0),
+                        ..Default::default()
+                    }
+                } else {
+                    button::Style {
+                        text_color: extended.background.base.text,
+                        border: iced::border::rounded(4.0),
+                        ..Default::default()
+                    }
+                }
+            });
+        rows = rows.push(mouse_area(entry).on_enter(Message::PaletteNavigate(display_index)));
+    }
+    if filtered.is_empty() {
+        rows = rows.push(
+            container(
+                text("No matching command")
+                    .size(TEXT_SM)
+                    .color(theme.muted()),
+            )
+            .padding(SP_3),
+        );
+    }
+
+    let search = text_input("Type to search...", input)
+        .id(iced_palette::INPUT_ID)
+        .on_input(Message::PaletteInput)
+        .padding([SP_2, SP_3])
+        .size(TEXT_MD)
+        .width(Length::Fill);
+    let header = row![search, close_button()]
+        .spacing(SP_2)
+        .align_y(Alignment::Center);
+    let list = container(scrollable(rows).spacing(SP_2)).max_height(LIST_HEIGHT);
+    let panel = container(column![header, list].spacing(SP_2).padding(SP_2))
+        .max_width(PANEL_WIDTH)
+        .style(|theme: &Theme| container::Style {
+            background: Some(theme.chrome().into()),
+            border: Border {
+                color: theme.extended().background.strong.color,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            shadow: Shadow {
+                color: iced::Color::BLACK.scale_alpha(0.35),
+                offset: Vector::new(0.0, 4.0),
+                blur_radius: 16.0,
+            },
+            ..Default::default()
+        });
+    // `opaque` keeps a click on the panel's own padding from reaching the
+    // scrim and closing the palette.
+    mouse_area(
+        container(opaque(panel))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::Center)
+            .padding(Padding::ZERO.top(PANEL_TOP))
+            .style(|theme: &Theme| container::Style {
+                background: Some(
+                    theme
+                        .extended()
+                        .background
+                        .base
+                        .color
+                        .scale_alpha(0.6)
+                        .into(),
+                ),
+                ..Default::default()
+            }),
     )
+    .on_press(Message::PaletteCancel)
+    .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shorten;
+
+    fn shown(text: &str, max: usize) -> String {
+        shorten(text, max).into_iter().map(|(c, _)| c).collect()
+    }
+
+    #[test]
+    fn short_text_is_untouched() {
+        assert_eq!(shown("Graph / Auto Layout", 40), "Graph / Auto Layout");
+    }
+
+    #[test]
+    fn long_text_keeps_both_ends_within_the_limit() {
+        let title =
+            "Terminal / Attach 127.0.0.1 6fe884d4 / hannes@tuco-pc:/tmp/zh-agent/ci/work/gate";
+        let cut = shorten(title, 40);
+
+        assert_eq!(cut.len(), 40);
+        let text: String = cut.iter().map(|(c, _)| c).collect();
+        assert!(text.starts_with("Terminal / Attach"));
+        assert!(text.ends_with("work/gate"));
+        assert_eq!(cut.iter().filter(|(_, i)| i.is_none()).count(), 1);
+    }
 }

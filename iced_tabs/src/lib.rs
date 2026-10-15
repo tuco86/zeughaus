@@ -25,7 +25,8 @@ use iced_widget::core::{
 use iced_widget::core::{Clipboard, Shell, mouse, overlay, renderer};
 use iced_widget::text::Wrapping;
 use iced_widget::{
-    Button, Column, Row, Theme, button, container, mouse_area, scrollable, space, text, tooltip,
+    Button, Column, Row, Text, Theme, button, container, mouse_area, scrollable, space, text,
+    tooltip,
 };
 
 /// An element whose renderer defaults to iced's, as `iced::Element` does.
@@ -408,6 +409,7 @@ pub fn tree<'a, Id, G, S, Message, Theme>(
     sections: Vec<Section<'a, Id, G, S, Message, Theme>>,
     active: Option<Id>,
     placement: Placement,
+    glyphs: Glyphs,
     marker: Option<Marker<G, S>>,
     renaming: Option<(Id, Element<'a, Message, Theme>)>,
     handlers: Handlers<'a, Id, G, S, Message>,
@@ -427,6 +429,7 @@ where
         handlers: &handlers,
         active,
         placement,
+        glyphs,
         marker,
         renaming: RefCell::new(renaming),
         theme: PhantomData,
@@ -831,8 +834,34 @@ fn marks_section_end<G, S: PartialEq>(marker: Option<&Marker<G, S>>, section: &S
     matches!(marker, Some(Target::SectionEnd(s)) if s == section)
 }
 
-fn chevron(collapsed: bool) -> &'static str {
-    if collapsed { "\u{25B8}" } else { "\u{25BE}" }
+/// The glyphs the tree draws on its own buttons. The defaults are plain
+/// Unicode, which every font has; an app that bundles an icon font hands
+/// its own glyphs and the font.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Glyphs {
+    /// The font the glyphs are drawn in; `None` is the default font.
+    pub font: Option<Font>,
+    /// The chevron of an expanded section or group.
+    pub expanded: char,
+    /// The chevron of a collapsed one.
+    pub collapsed: char,
+    /// The close button of a tab and of an unlocked group.
+    pub close: char,
+    /// Drawn after a locked group's name. `None` draws nothing: a locked
+    /// group already shows no colour dot and no close button.
+    pub locked: Option<char>,
+}
+
+impl Default for Glyphs {
+    fn default() -> Self {
+        Glyphs {
+            font: None,
+            expanded: '\u{25BE}',
+            collapsed: '\u{25B8}',
+            close: '\u{00D7}',
+            locked: None,
+        }
+    }
 }
 
 /// The view pass state shared by every item of one tree.
@@ -840,6 +869,7 @@ struct Builder<'h, 'a, Id, G, S, Message, Theme> {
     handlers: &'h Handlers<'a, Id, G, S, Message>,
     active: Option<Id>,
     placement: Placement,
+    glyphs: Glyphs,
     marker: Option<Marker<G, S>>,
     /// Taken by the one tab it names.
     renaming: RefCell<Option<(Id, Element<'a, Message, Theme>)>>,
@@ -858,6 +888,28 @@ where
     <Theme as button::Catalog>::Class<'a>: From<button::StyleFn<'a, Theme>>,
     <Theme as container::Catalog>::Class<'a>: From<container::StyleFn<'a, Theme>>,
 {
+    /// One of the tree's own glyphs at `size`, in the glyphs' font.
+    fn glyph(&self, glyph: char, size: f32) -> Text<'a, Theme> {
+        let mut label = text(glyph.to_string()).size(size).line_height(1.0);
+        if let Some(font) = self.glyphs.font {
+            label = label.font(font);
+        }
+        label
+    }
+
+    /// The chevron of a section or group header.
+    fn chevron(&self, collapsed: bool) -> Text<'a, Theme> {
+        let glyphs = self.glyphs;
+        self.glyph(
+            if collapsed {
+                glyphs.collapsed
+            } else {
+                glyphs.expanded
+            },
+            12.0,
+        )
+    }
+
     fn section(
         &self,
         section: Section<'a, Id, G, S, Message, Theme>,
@@ -923,12 +975,9 @@ where
 
         let mut title = Row::new().spacing(4).align_y(Alignment::Center);
         title = title.push(
-            flat_button(
-                text(chevron(collapsed)).size(12).line_height(1.0),
-                text_color,
-            )
-            .padding([1, 3])
-            .on_press((self.handlers.on_toggle_section)(id.clone())),
+            flat_button(self.chevron(collapsed), text_color)
+                .padding([1, 3])
+                .on_press((self.handlers.on_toggle_section)(id.clone())),
         );
         title = title.push(
             container(text(shorten(label)).size(12).wrapping(Wrapping::None))
@@ -1091,12 +1140,9 @@ where
 
         let mut content = Row::new().spacing(4).align_y(Alignment::Center);
         content = content.push(
-            flat_button(
-                text(chevron(collapsed)).size(12).line_height(1.0),
-                text_color,
-            )
-            .padding([1, 3])
-            .on_press((handlers.on_toggle_group)(section.clone(), id.clone())),
+            flat_button(self.chevron(collapsed), text_color)
+                .padding([1, 3])
+                .on_press((handlers.on_toggle_group)(section.clone(), id.clone())),
         );
         if !locked {
             let dot = Color { a: 1.0, ..color };
@@ -1128,8 +1174,8 @@ where
             ),
         });
         if locked {
-            content = content.push(
-                container(text("locked").size(10).wrapping(Wrapping::None)).style(
+            if let Some(lock) = self.glyphs.locked {
+                content = content.push(container(self.glyph(lock, 12.0)).style(
                     move |theme: &Theme| container::Style {
                         text_color: Some(Color {
                             a: 0.6,
@@ -1137,11 +1183,11 @@ where
                         }),
                         ..container::Style::default()
                     },
-                ),
-            );
+                ));
+            }
         } else {
             content = content.push(
-                flat_button(text("\u{00D7}").size(14).line_height(1.0), text_color)
+                flat_button(self.glyph(self.glyphs.close, 14.0), text_color)
                     .padding([1, 4])
                     .on_press((handlers.on_dissolve_group)(section.clone(), id.clone())),
             );
@@ -1203,22 +1249,19 @@ where
             // frame.
             let close_class: <Theme as Catalog>::Class<'a> = <Theme as Catalog>::default();
             content = content.push(
-                flat_button(
-                    text("\u{00D7}").size(14).line_height(1.0),
-                    move |theme: &Theme| {
-                        Catalog::style(
-                            theme,
-                            &close_class,
-                            Status {
-                                selected,
-                                hovered: false,
-                                pressed: false,
-                                placement,
-                            },
-                        )
-                        .text
-                    },
-                )
+                flat_button(self.glyph(self.glyphs.close, 14.0), move |theme: &Theme| {
+                    Catalog::style(
+                        theme,
+                        &close_class,
+                        Status {
+                            selected,
+                            hovered: false,
+                            pressed: false,
+                            placement,
+                        },
+                    )
+                    .text
+                })
                 .padding([1, 4])
                 .on_press((self.handlers.on_close)(tab.id.clone())),
             );

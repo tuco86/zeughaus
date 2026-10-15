@@ -96,6 +96,64 @@ struct Inner {
     name: String,
     base: iced::Theme,
     scheme: Scheme,
+    /// Worked out once: [`Theme::muted`] is asked for on every frame.
+    muted: Color,
+}
+
+impl Inner {
+    fn new(name: String, base: iced::Theme, scheme: Scheme) -> Inner {
+        let palette = base.extended_palette();
+        let muted = muted(palette.background.base.text, palette.background.base.color);
+        Inner {
+            name,
+            base,
+            scheme,
+            muted,
+        }
+    }
+}
+
+/// Contrast secondary text aims for against the canvas: the 4.5:1 floor for
+/// body text, with room for the surfaces a step off the canvas.
+const MUTED_CONTRAST: f32 = 5.0;
+/// The floor itself, for a theme whose own text has no room to spare.
+const BODY_CONTRAST: f32 = 4.5;
+
+/// The foreground mixed towards the background as far as it can go and
+/// still read: 40 % of the way, less where the theme's two colours are
+/// close (a light theme mixes in linear light, which pales quickly). A
+/// theme whose text is barely above the floor gets the faintest step that
+/// still clears it, and one whose text is below it a token step, so that
+/// secondary text stays told apart.
+fn muted(text: Color, background: Color) -> Color {
+    let mut floor = None;
+    for step in (1..=8).rev() {
+        let candidate = iced::theme::palette::mix(text, background, step as f32 * 0.05);
+        let ratio = contrast(candidate, background);
+        if ratio >= MUTED_CONTRAST {
+            return candidate;
+        }
+        if ratio >= BODY_CONTRAST && floor.is_none() {
+            floor = Some(candidate);
+        }
+    }
+    floor.unwrap_or_else(|| iced::theme::palette::mix(text, background, 0.05))
+}
+
+/// The WCAG contrast ratio of two opaque colours.
+fn contrast(a: Color, b: Color) -> f32 {
+    let luminance = |c: Color| {
+        let channel = |v: f32| {
+            if v <= 0.040_45 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(c.r) + 0.7152 * channel(c.g) + 0.0722 * channel(c.b)
+    };
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
 /// The theme of the whole editor.
@@ -143,13 +201,9 @@ impl Theme {
 
     /// Secondary text: labels, inactive pane titles. Foreground mixed towards
     /// the background, which stays readable in both tones where a fixed grey
-    /// would not.
+    /// would not, and never below 4.5:1 against the canvas.
     pub fn muted(&self) -> Color {
-        iced::theme::palette::mix(
-            self.extended().background.base.text,
-            self.extended().background.base.color,
-            0.4,
-        )
+        self.0.muted
     }
 
     /// What the eye is supposed to go to: focus, selection, the active pane.
@@ -175,7 +229,7 @@ impl Theme {
         let name = name.into();
         let base = iced::Theme::custom(name.clone(), scheme.palette());
 
-        Theme(Arc::new(Inner { name, base, scheme }))
+        Theme(Arc::new(Inner::new(name, base, scheme)))
     }
 
     /// A theme that keeps iced's own palette for widgets and takes its ANSI
@@ -188,7 +242,7 @@ impl Theme {
     pub fn paired(base: iced::Theme, scheme: Scheme) -> Theme {
         let name = Base::name(&base).to_string();
 
-        Theme(Arc::new(Inner { name, base, scheme }))
+        Theme(Arc::new(Inner::new(name, base, scheme)))
     }
 
     /// Reads a theme from a WezTerm colour TOML.
@@ -297,5 +351,29 @@ mod tests {
         assert!(dark.is_dark());
         assert_eq!(<Theme as Base>::default(Mode::Light).name(), "Light");
         assert_eq!(<Theme as Base>::default(Mode::None).name(), "Light");
+    }
+
+    /// Secondary text stays readable in every bundled theme, light ones
+    /// included, and stays told apart from the text, also in a theme whose
+    /// own text is barely above the floor (Solarized Light).
+    #[test]
+    fn muted_text_keeps_body_contrast_in_every_bundled_theme() {
+        for theme in Theme::pack() {
+            let background = theme.extended().background.base.color;
+            let text = contrast(theme.extended().background.base.text, background);
+            let ratio = contrast(theme.muted(), background);
+            if text >= BODY_CONTRAST + 0.2 {
+                assert!(
+                    ratio >= BODY_CONTRAST,
+                    "{}: muted at {ratio:.2}:1",
+                    theme.name()
+                );
+            }
+            assert!(
+                ratio < text,
+                "{}: muted is as strong as the text",
+                theme.name()
+            );
+        }
     }
 }
