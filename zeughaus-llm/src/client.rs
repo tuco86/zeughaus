@@ -56,13 +56,14 @@ pub fn chat_completion(
 
     let url = join(base_url, "chat/completions");
     let started = Instant::now();
-    let response = ureq::post(&url)
+    let mut response = ureq::post(&url)
         .send_json(body)
         .map_err(|e| describe_error("chat/completions", e))?;
     let elapsed_secs = started.elapsed().as_secs_f64();
 
     let parsed: Json = response
-        .into_json()
+        .body_mut()
+        .read_json()
         .map_err(|e| format!("invalid JSON from LM Studio: {e}"))?;
 
     let content = parsed["choices"][0]["message"]["content"]
@@ -85,7 +86,8 @@ pub fn list_models(base_url: &str) -> Result<Vec<String>, String> {
     let parsed: Json = ureq::get(&url)
         .call()
         .map_err(|e| describe_error("models", e))?
-        .into_json()
+        .body_mut()
+        .read_json()
         .map_err(|e| format!("invalid JSON from LM Studio: {e}"))?;
 
     let models = parsed["data"]
@@ -114,11 +116,11 @@ pub fn chat_and_append(
 
 fn describe_error(endpoint: &str, err: ureq::Error) -> String {
     match err {
-        ureq::Error::Status(code, _) => {
+        ureq::Error::StatusCode(code) => {
             format!("LM Studio {endpoint} returned HTTP {code}")
         }
-        ureq::Error::Transport(t) => {
-            format!("cannot reach LM Studio at {endpoint}: {t} (is the server running?)")
+        other => {
+            format!("cannot reach LM Studio at {endpoint}: {other} (is the server running?)")
         }
     }
 }

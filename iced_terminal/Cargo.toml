@@ -17,8 +17,10 @@ iced.workspace = true
 # Both resolve to the same 0.14 build `iced` itself depends on.
 iced_wgpu = "0.14"
 iced_graphics = "0.14"
+# The major `iced_wgpu` 0.14 is built on: the pipeline is created on iced's
+# device, so a newer `wgpu` would be a second, incompatible one.
 wgpu = { version = "27.0", default-features = false, features = ["std", "wgsl"] }
-bytemuck = { version = "1.0", features = ["derive"] }
+bytemuck = { version = "1.25", features = ["derive"] }
 # Cell widths: a combining mark shares its base cell, a wide glyph owns two.
 # The runner counts cells the same way, so the two must agree.
 unicode-width = "0.2"
@@ -28,7 +30,7 @@ log = "0.4"
 zeughaus-mux.workspace = true
 # Blocks on the headless adapter request in the GPU smoke test. Nothing in
 # the crate itself is async.
-pollster = "0.4"
+pollster = "1.0"
 
 [[example]]
 name = "demo"

@@ -260,6 +260,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its first failed job; the buttons' tooltips name the keys.
 - An idle editor wakes once a second instead of ten times: the poll that
   commits settled settings edits runs every 100 ms only while an edit waits.
+- Dependencies: weida 0.1.0-alpha.7 (bounded fan-out and per-peer state,
+  zeroized key PEMs, rustls 0.23.46 for four TLS advisories), `ureq` 3,
+  `rfd` 0.17, `shlex` 2, `pollster` 1, `toml` 1.1 and every other crate at
+  its newest compatible release. `wgpu` stays at 27, the one iced 0.14
+  draws with.
 
 ### Removed
 

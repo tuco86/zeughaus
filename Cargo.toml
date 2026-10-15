@@ -56,7 +56,7 @@ zeughaus-job = { path = "zeughaus-job", version = "0.1.0-dev" }
 # constants and the credentials on disk. The QUIC transport itself lives in a
 # sibling checkout.
 zeughaus-link = { path = "zeughaus-link", version = "0.1.0-dev" }
-weida = { path = "../weida/crates/weida", version = "0.1.0-alpha.2" }
+weida = { path = "../weida/crates/weida", version = "0.1.0-alpha.7" }
 zeughaus-runner = { path = "zeughaus-runner", version = "0.1.0-dev" }
 # The CI service: pipelines from webhooks and cron, scheduled onto the runners
 # that enlist into it.
@@ -99,7 +99,7 @@ iced_palette = "0.1.1"
 
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
-toml = "1.0"
+toml = "1.1"
 
 # Profiles apply from the top-level workspace being built, so iced_nodegraph's
 # own `profile.dev` never applies here. Without this,

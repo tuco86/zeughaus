@@ -51,7 +51,7 @@ zeughaus-db.workspace = true
 # Frame datasets on disk. Native only: it writes files.
 zeughaus-record.workspace = true
 zeughaus-llm.workspace = true
-rfd = "0.15"
+rfd = "0.17"
 # `image` decodes/uploads raw RGBA frames (screen capture -> Display node).
 # `canvas` draws the node header's button symbols as paths.
 iced = { version = "0.14", features = ["advanced", "wgpu", "tokio", "image", "canvas"] }
@@ -102,7 +102,7 @@ png = "0.18"
 notify-rust = { version = "4.18", default-features = false, features = ["z-with-tokio"] }
 # A terminal hyperlink the user explicitly activated, opened by the
 # platform's handler (`xdg-open`, `open`, `start`).
-open = "5.3"
+open = "5.4"
 
 # macOS has no window icon at all: the one icon an app shows is the Dock's,
 # and a binary outside an `.app` bundle carries none. `NSApplication`'s
