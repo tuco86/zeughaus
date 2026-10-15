@@ -227,6 +227,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   says `locked`.
 - Secondary text keeps at least 4.5:1 contrast in every theme: in light
   themes it was as faint as 2:1.
+- Escape closes the log beside a CI list when no palette, rename or drag
+  takes it first. A job card says what a skipped or waiting job waits for
+  without repeating the pipeline's number.
+- A node the palette spawns goes to the nearest free spot around where it
+  was asked for, right of it first, instead of a header's height down the
+  diagonal over the last one's pins.
+- Terminal panes keep 8 px between the grid and the pane's sides and 4 px
+  above and below. The window's minimize, maximize (restore while
+  maximized) and close buttons and the tab bar's placement toggle are
+  codicons; the toggle shows where the tabs go and says so on hover.
 
 ### Removed
 

@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use iced::widget::container;
 use iced::{Element, Task};
 use zeughaus_theme::Theme;
 
@@ -23,7 +24,10 @@ const TERMINAL_FONT_SIZE: f32 = 16.0;
 
 /// Logical pixels between a terminal's grid and the pane's left and right
 /// edges, so the first and last column do not touch the pane border.
-const TERMINAL_PADDING: f32 = 1.0;
+const TERMINAL_PADDING: f32 = 8.0;
+/// Logical pixels above and below the grid, in the terminal's background,
+/// so the first row does not sit on the tab bar's edge.
+const TERMINAL_PADDING_Y: f32 = 4.0;
 
 /// Everything this editor holds about one runner's terminal multiplexer.
 ///
@@ -695,12 +699,20 @@ impl App {
             .font_size(TERMINAL_FONT_SIZE)
             .padding(TERMINAL_PADDING)
             .scale_factor(self.scale_factor);
-        match pane {
+        let widget: Element<'_, Message, Theme> = match pane {
             None => widget.into(),
             Some(pane) => widget
                 .on_action(move |action| Message::TerminalAction(pane.clone(), action))
                 .into(),
-        }
+        };
+        let background = self.theme.scheme().background;
+        container(widget)
+            .padding([TERMINAL_PADDING_Y, 0.0])
+            .style(move |_: &Theme| container::Style {
+                background: Some(background.into()),
+                ..container::Style::default()
+            })
+            .into()
     }
 }
 

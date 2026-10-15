@@ -199,6 +199,18 @@ impl Theme {
         self.extended().background.weak.color
     }
 
+    /// `color` as text: mixed towards the foreground just far enough to read
+    /// at 4.5:1 against the canvas. A status hue made for outlines is too
+    /// dark (or too light) to be read as a word; this keeps its hue.
+    pub fn readable(&self, color: Color) -> Color {
+        let text = self.extended().background.base.text;
+        let background = self.extended().background.base.color;
+        (0..=10)
+            .map(|step| iced::theme::palette::mix(color, text, step as f32 * 0.1))
+            .find(|candidate| contrast(*candidate, background) >= BODY_CONTRAST)
+            .unwrap_or(text)
+    }
+
     /// Secondary text: labels, inactive pane titles. Foreground mixed towards
     /// the background, which stays readable in both tones where a fixed grey
     /// would not, and never below 4.5:1 against the canvas.
@@ -351,6 +363,27 @@ mod tests {
         assert!(dark.is_dark());
         assert_eq!(<Theme as Base>::default(Mode::Light).name(), "Light");
         assert_eq!(<Theme as Base>::default(Mode::None).name(), "Light");
+    }
+
+    /// A status hue as a word reads in every bundled theme.
+    #[test]
+    fn readable_status_words_clear_the_body_floor() {
+        for theme in Theme::pack() {
+            let palette = theme.extended();
+            let background = palette.background.base.color;
+            if contrast(palette.background.base.text, background) < BODY_CONTRAST {
+                continue;
+            }
+            for hue in [
+                palette.success.base.color,
+                palette.danger.base.color,
+                palette.primary.base.color,
+                palette.warning.base.color,
+            ] {
+                let ratio = contrast(theme.readable(hue), background);
+                assert!(ratio >= BODY_CONTRAST, "{}: {ratio:.2}:1", theme.name());
+            }
+        }
     }
 
     /// Secondary text stays readable in every bundled theme, light ones

@@ -1104,6 +1104,27 @@ impl App {
             .is_some_and(ChannelState::ticking)
     }
 
+    /// Closes the log beside the CI list in front, if one is open: what
+    /// Escape does when nothing nearer took it.
+    pub(super) fn close_front_ci_log(&mut self) -> Task<Message> {
+        let Some(front) = self.workspace.active_tab().cloned() else {
+            return Task::none();
+        };
+        let Some(runner) = front.runner.ci_runner() else {
+            return Task::none();
+        };
+        let view = front.tab.0;
+        let open = self
+            .ci
+            .get(&runner)
+            .and_then(|client| client.views.get(&view))
+            .is_some_and(|state| state.transcript.is_some());
+        if !open {
+            return Task::none();
+        }
+        self.apply_ci(runner, CiMsg::CloseTranscript { view })
+    }
+
     /// A pipeline of `repo`'s `channel` changed. The pipeline is asked for
     /// again when a view shows that channel, and the overview always: a
     /// change is how a new pipeline, channel or status shows up.
@@ -1419,7 +1440,7 @@ impl App {
                 icon_button(glyph::CLOSE, None).on_press_with(move || {
                     Message::Ci(runner.clone(), CiMsg::CloseTranscript { view })
                 }),
-                "Close the log".to_owned(),
+                "Close the log (Escape)".to_owned(),
             ));
         }
 
@@ -1960,6 +1981,16 @@ fn job_pips<'a>(theme: &Theme, pipeline: &'a PipelineView) -> Element<'a, Messag
     .into()
 }
 
+/// A job's note without the ` (#<n>)` the CI ends it with for the forge,
+/// where it stands alone: inside its pipeline the number is said already.
+fn note(job: &JobView) -> &str {
+    let note = job.note.trim_end();
+    note.strip_suffix(')')
+        .and_then(|rest| rest.rsplit_once(" (#"))
+        .filter(|(_, number)| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(note, |(text, _)| text)
+}
+
 /// The second line of a job's card.
 fn job_detail(job: &JobView, now: u64) -> String {
     let tone = Tone::of(&job.status);
@@ -1981,7 +2012,7 @@ fn job_detail(job: &JobView, now: u64) -> String {
             Some(took) => took,
             None => place.to_owned(),
         },
-        Tone::Wait | Tone::Idle if !job.note.is_empty() => flatten(&job.note, NOTE_CHARS),
+        Tone::Wait | Tone::Idle if !job.note.is_empty() => flatten(note(job), NOTE_CHARS),
         Tone::Wait | Tone::Idle => job.status.clone(),
     }
 }
@@ -1994,7 +2025,7 @@ fn job_tip(job: &JobView) -> String {
     }
     if !job.note.is_empty() {
         words.push('\n');
-        words.push_str(&flatten(&job.note, usize::MAX));
+        words.push_str(&flatten(note(job), usize::MAX));
     }
     words.push_str("\nPress to open its log");
     words
@@ -2011,7 +2042,7 @@ fn failure_note(job: &JobView) -> String {
     };
     match job.code {
         Some(code) => format!("exit {code}{took}"),
-        None if !job.note.is_empty() => flatten(&job.note, NOTE_CHARS),
+        None if !job.note.is_empty() => flatten(note(job), NOTE_CHARS),
         None => format!("{}{took}", job.status),
     }
 }
@@ -2183,17 +2214,13 @@ impl Tone {
         }
     }
 
-    /// A status word: the hue mixed towards the foreground, since a border
-    /// colour is too dark to read as text on a dark theme; an idle one is
-    /// plain secondary text.
+    /// A status word: the hue made readable, since a border colour is too
+    /// dark to read as text on a dark theme and too light on a light one; an
+    /// idle one is plain secondary text.
     fn text(self, theme: &Theme) -> Color {
         match self {
             Tone::Idle => theme.muted(),
-            _ => iced::theme::palette::mix(
-                self.color(theme),
-                theme.extended().background.base.text,
-                0.25,
-            ),
+            _ => theme.readable(self.color(theme)),
         }
     }
 
@@ -2358,6 +2385,32 @@ mod tests {
         );
         // What fits is shown whole.
         assert_eq!(excerpt_lines("x\ny\n", Some("y"), 5), "x\ny");
+    }
+
+    #[test]
+    fn a_job_note_drops_the_pipeline_number_and_keeps_other_parentheses() {
+        let job = |note: &str| JobView {
+            name: "publish".to_owned(),
+            needs: Vec::new(),
+            place: String::new(),
+            status: "skipped".to_owned(),
+            note: note.to_owned(),
+            started: None,
+            finished: None,
+            code: None,
+            cause: None,
+            excerpt: None,
+        };
+        assert_eq!(
+            note(&job("skipped: gate failed (#4)")),
+            "skipped: gate failed"
+        );
+        assert_eq!(
+            note(&job("waiting for runner atik")),
+            "waiting for runner atik"
+        );
+        assert_eq!(note(&job("runner x (busy)")), "runner x (busy)");
+        assert_eq!(note(&job("odd (#)")), "odd (#)");
     }
 
     #[test]

@@ -301,34 +301,58 @@ impl App {
         self.spawn_node_into("graph.sub", Point::ORIGIN, NodeId(0), runner)
     }
 
-    /// `position`, or the first spot down-right of it that no node of the
-    /// graph being edited already starts at.
+    /// `position` if a new node there would cover no node of the graph
+    /// being edited, else the nearest spot on a grid of node-sized steps
+    /// around it that would not: nodes fill in around the point the palette
+    /// asked for instead of trailing off one side of the view.
     ///
-    /// Compares the top-left corners only: a node's drawn size is the widget's
-    /// business and depends on its content, while what makes a new node
-    /// unfindable is another node's header sitting on top of its own.
+    /// A node's drawn size is the widget's business and depends on its
+    /// content, so every node counts as at least a typical node's box, or
+    /// the size the user resized it to: a step of a header's height would
+    /// leave the new node's body over the last one's pins.
     pub(super) fn clear_spot(&self, position: Point) -> Point {
-        /// One header height plus a little, so a stepped node's title is
-        /// readable next to the one it stepped around.
-        const STEP: f32 = 32.0;
-        /// Closer than this counts as the same spot.
-        const TAKEN: f32 = 24.0;
+        /// The box a node is assumed to take: a typical node with a few pins.
+        const FOOTPRINT: iced::Size = iced::Size::new(220.0, 140.0);
+        /// Room between two nodes, enough for a cable to bend in.
+        const GAP: f32 = 40.0;
+        /// Grid steps tried in each direction: past that the node goes where
+        /// it was asked, rather than walking off into the distance.
+        const REACH: i32 = 4;
 
-        let mut spot = position;
-        // Bounded: a graph with a long diagonal of nodes stops stepping rather
-        // than walking the new node off the far edge of the world.
-        for _ in 0..16 {
-            let taken = self.nodes.values().any(|n| {
-                n.parent == self.current_graph
-                    && (n.position.x - spot.x).abs() < TAKEN
-                    && (n.position.y - spot.y).abs() < TAKEN
-            });
-            if !taken {
-                break;
-            }
-            spot = Point::new(spot.x + STEP, spot.y + STEP);
-        }
-        spot
+        let occupied: Vec<iced::Rectangle> = self
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.parent == self.current_graph)
+            .map(|(id, n)| {
+                let size = self.node_sizes.get(id).copied().unwrap_or(FOOTPRINT);
+                iced::Rectangle::new(
+                    n.position,
+                    iced::Size::new(
+                        size.width.max(FOOTPRINT.width),
+                        size.height.max(FOOTPRINT.height),
+                    ),
+                )
+            })
+            .collect();
+        let mut steps: Vec<(i32, i32)> = (-REACH..=REACH)
+            .flat_map(|row| (-REACH..=REACH).map(move |column| (row, column)))
+            .collect();
+        // Nearest first; at equal distance the column to the right, then the
+        // row below: the way dataflow reads.
+        steps.sort_by_key(|&(row, column)| (row * row + column * column, -column, -row));
+        steps
+            .into_iter()
+            .map(|(row, column)| {
+                Point::new(
+                    position.x + column as f32 * (FOOTPRINT.width + GAP),
+                    position.y + row as f32 * (FOOTPRINT.height + GAP),
+                )
+            })
+            .find(|spot| {
+                let wanted = iced::Rectangle::new(*spot, FOOTPRINT);
+                !occupied.iter().any(|taken| taken.intersects(&wanted))
+            })
+            .unwrap_or(position)
     }
 
     /// Creates a node of `type_id` inside `parent`, seeded with the defaults

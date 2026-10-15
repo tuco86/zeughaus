@@ -1342,11 +1342,24 @@ impl App {
                 }
             }
             Message::Escape => {
+                // Escape takes back the innermost thing first: an open
+                // palette or rename, and only then the log beside a CI list.
+                let claimed = self.palette_open
+                    || self.renaming.is_some()
+                    || self.workspace.renaming_group.is_some()
+                    || self.workspace.renaming_tab.is_some()
+                    || self.workspace.drag.is_some();
                 self.palette_close();
                 self.renaming = None;
                 self.workspace.renaming_group = None;
                 self.workspace.renaming_tab = None;
                 self.workspace.drag = None;
+                #[cfg(not(target_arch = "wasm32"))]
+                if !claimed {
+                    return self.close_front_ci_log();
+                }
+                #[cfg(target_arch = "wasm32")]
+                let _ = claimed;
             }
             Message::NodeTriggered { node_id } => {
                 // The press has to reach the one process that executes this
