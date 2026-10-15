@@ -82,6 +82,28 @@ pub enum CiReply {
 pub struct CiOverview {
     pub channels: Vec<ChannelView>,
     pub machines: Vec<MachineView>,
+    /// Events waiting for a pipeline, oldest first: behind a running
+    /// pipeline of the same ref, or not yet picked up.
+    #[serde(default)]
+    pub queued: Vec<QueuedView>,
+}
+
+/// An event that has no pipeline yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedView {
+    pub repo: String,
+    /// The channel its pipeline is expected in: that of the newest pipeline
+    /// of the same ref, else the one the event names without a
+    /// `channels.toml`. The pipeline's own channel is decided when it starts.
+    pub channel: String,
+    /// `push`, `tag` or `cron`.
+    pub event: String,
+    pub git_ref: String,
+    /// Pinned by a rerun or a webhook; `None` builds the ref's head.
+    pub sha: Option<String>,
+    pub actor: String,
+    /// Seconds since the UNIX epoch.
+    pub received: u64,
 }
 
 /// One channel of one repository and where its newest pipeline stands.
@@ -307,6 +329,15 @@ mod tests {
                             jobs: Vec::new(),
                         },
                     ],
+                    queued: vec![QueuedView {
+                        repo: "griasdi".to_owned(),
+                        channel: "dev".to_owned(),
+                        event: "push".to_owned(),
+                        git_ref: "main".to_owned(),
+                        sha: Some("abc".to_owned()),
+                        actor: "rerun of #6".to_owned(),
+                        received: 1,
+                    }],
                 },
             },
             CiReply::Pipelines {

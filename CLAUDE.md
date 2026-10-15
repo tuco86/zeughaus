@@ -38,7 +38,7 @@ zeughaus-capture/      # plugin: Screen Capture (xdg-desktop-portal on Wayland, 
 zeughaus-db/           # plugin: Database container, Table, Insert, Query, SQL; schemas drawn in the graph (SQLite)
 zeughaus-record/       # plugin: Recorder (frames + values to disk) and Player (the same dataset as a source)
 zeughaus-job/          # plugin: Job (a process in a runner-owned terminal, log per run under the state dir) and the ProcessHost trait the runner implements
-iced_terminal/         # the terminal widget: one wgpu primitive per pane, bundled ComicShannsMono Nerd Font
+iced_terminal/         # the terminal widget: one wgpu primitive per pane, bundled ComicShannsMono Nerd Font Mono (the editor bundles the Propo variant as its UI and icon face)
 iced_tabs/             # the tab tree the workspace shell uses: runner sections, groups, drop markers
 zeughaus-theme/        # the editor's theme: iced theme paired with a terminal colour scheme, catalogs for every widget, bundled pack, WezTerm scheme parser
 vm/win11/              # scripts: headless Windows 11 guest under QEMU/KVM, the service runner's `win11` machine (boot, toolchain, per-boot prepare.ps1)

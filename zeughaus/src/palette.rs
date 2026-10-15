@@ -138,7 +138,7 @@ fn runner_commands(state: &RunnerState<'_>) -> Vec<Command<Message>> {
                     ATTACH_COMMAND_ID,
                     format!("Terminal / Attach {} / {title}", runner.label),
                 )
-                .description("Show this terminal of the runner's in a new tab")
+                .description("Open this terminal of the runner in a new tab")
                 .action(Message::AttachTerminal(
                     runner.key.clone(),
                     detached.terminal,
@@ -149,7 +149,7 @@ fn runner_commands(state: &RunnerState<'_>) -> Vec<Command<Message>> {
                     CLOSE_COMMAND_ID,
                     format!("Terminal / Close {} / {title}", runner.label),
                 )
-                .description("Kill this terminal of the runner's and forget it")
+                .description("Kill this terminal on the runner and forget it")
                 .action(Message::CloseTerminal(
                     runner.key.clone(),
                     detached.terminal,
@@ -275,15 +275,9 @@ fn line<'a>(
         .into()
 }
 
-/// The close control: the codicon glyph where the icon font is bundled, the
-/// word where it is not (the browser editor).
+/// The close control: the codicon close glyph.
 fn close_button<'a>() -> Element<'a, Message, Theme> {
-    #[cfg(not(target_arch = "wasm32"))]
-    let label = iced::widget::text("\u{ea76}")
-        .font(iced_terminal::FONT)
-        .size(TEXT_MD);
-    #[cfg(target_arch = "wasm32")]
-    let label = iced::widget::text("x").size(TEXT_SM);
+    let label = iced::widget::text("\u{ea76}").size(TEXT_SM);
     iced::widget::button(label)
         .padding([4.0, SP_2])
         .on_press(Message::PaletteCancel)

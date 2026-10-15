@@ -117,6 +117,11 @@ pub enum Message {
     /// it is open, else the pipeline cursor of a CI list in front. Emitted
     /// for every such key, since the subscription cannot see either.
     KeyStep(isize),
+    /// A letter for the CI list in front: `r`, `l`, Shift+`c`. Emitted for
+    /// every such key no widget took; the CI view decides whether it is in
+    /// front.
+    #[cfg(not(target_arch = "wasm32"))]
+    CiShortcut(CiShortcut),
     // Spawning
     SpawnNode {
         type_id: String,
@@ -304,6 +309,16 @@ pub enum Message {
     // does; a subscription's map cannot capture a runner, so it names none.
     #[cfg(not(target_arch = "wasm32"))]
     CiPoll,
+}
+
+/// What a letter asks of the CI list in front.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CiShortcut {
+    Rerun,
+    Cancel,
+    /// The log of the first failed job, else of the first job.
+    OpenLog,
 }
 
 /// What one runner's CI views say.

@@ -1,9 +1,11 @@
-Comic Shanns -- the source face the bundled Nerd Fonts patch is built from.
-Retrieved from https://github.com/shannpersand/comic-shanns/blob/master/LICENSE
+Comic Shanns Mono -- the source face the bundled Nerd Fonts patch (v3.5.1,
+https://github.com/ryanoasis/nerd-fonts/releases/download/v3.5.1/ComicShannsMono.zip)
+is built from. The text below is the LICENSE.md of that release.
 
 MIT License
 
 Copyright (c) 2018 Shannon Miwa
+Copyright (c) 2023 Jesus Gonzalez
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

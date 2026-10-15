@@ -47,9 +47,10 @@ pub enum Placement {
 pub const MAX_LABEL_CHARS: usize = 32;
 
 /// The same at the left, where the bar is as narrow as the app makes it:
-/// what fits a sidebar of about 180 logical pixels at the labels' size,
-/// so a long label ends in an ellipsis instead of a glyph cut in half.
-pub const MAX_SIDEBAR_LABEL_CHARS: usize = 21;
+/// what fits a sidebar of about 180 logical pixels beside a close button,
+/// in a monospaced face at the labels' size, so a long label ends in an
+/// ellipsis instead of a glyph cut in half.
+pub const MAX_SIDEBAR_LABEL_CHARS: usize = 18;
 
 /// Thickness of the gap before every item, drawn in the marker colour when
 /// a drop would land there. The gap is always there, so showing the marker
@@ -855,6 +856,8 @@ pub struct Glyphs {
     /// Drawn after a locked group's name. `None` draws nothing: a locked
     /// group already shows no colour dot and no close button.
     pub locked: Option<char>,
+    /// The size a header control with a font of its own is drawn at.
+    pub control_size: f32,
 }
 
 impl Default for Glyphs {
@@ -865,6 +868,7 @@ impl Default for Glyphs {
             collapsed: '\u{25B8}',
             close: '\u{00D7}',
             locked: None,
+            control_size: 22.0,
         }
     }
 }
@@ -1017,8 +1021,8 @@ where
     }
 
     /// One header control: its label as a flat button, in its font if it
-    /// has one (a glyph is drawn larger than a word: an icon font's glyphs
-    /// fill a narrow cell, and at word size they read as specks), and its
+    /// has one (a glyph, drawn at the tree's [`Glyphs::control_size`]: an
+    /// icon is read as a shape and wants more size than a word), and its
     /// tooltip beside it on hover -- below the bar on top, to the right of
     /// it at the left.
     fn control(
@@ -1036,7 +1040,10 @@ where
         let mut label = text(label).wrapping(Wrapping::None);
         let padding = match font {
             Some(font) => {
-                label = label.font(font).size(22).line_height(1.0);
+                label = label
+                    .font(font)
+                    .size(self.glyphs.control_size)
+                    .line_height(1.0);
                 [2, 4]
             }
             None => {

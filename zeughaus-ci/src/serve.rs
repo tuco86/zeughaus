@@ -16,7 +16,7 @@ use zeughaus_link::ci::MAX_PIPELINES_PER_REQUEST;
 use zeughaus_link::enlist::Place;
 use zeughaus_link::{
     BusyMode, ChannelView, CiOverview, CiReply, CiRequest, JobView, MAX_CI_REPLY_BYTES,
-    MAX_CI_REQUEST_BYTES, MachineJob, MachineView, PipelineView,
+    MAX_CI_REQUEST_BYTES, MachineJob, MachineView, PipelineView, QueuedView,
 };
 use zeughaus_mux::TerminalId;
 
@@ -102,11 +102,16 @@ impl CiServer {
     }
 
     fn overview(&self) -> CiOverview {
-        // One pass over every record feeds both halves.
+        // One pass over every record feeds all three parts.
         let pipelines = load_pipelines(&self.state_dir);
+        let queued = event::queued(&self.state_dir)
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect::<Vec<_>>();
         CiOverview {
             channels: channel_views(&pipelines),
             machines: self.machine_views(&pipelines),
+            queued: queued_views(&pipelines, &queued),
         }
     }
 
@@ -302,6 +307,32 @@ fn channel_views(pipelines: &[Pipeline]) -> Vec<ChannelView> {
             channel,
             latest: pipeline.number,
             status: pipeline.status.as_str().to_owned(),
+        })
+        .collect()
+}
+
+/// The queued events, each in the channel of the newest pipeline that had
+/// its queue key (the same repository, kind, ref and cron), else in the
+/// channel its event names without a `channels.toml`.
+fn queued_views(pipelines: &[Pipeline], queued: &[event::CiEvent]) -> Vec<QueuedView> {
+    queued
+        .iter()
+        .map(|queued| {
+            let key = event::queue_key(queued);
+            let channel = pipelines
+                .iter()
+                .filter(|p| p.repo == queued.repo && p.key == key)
+                .max_by_key(|p| p.number)
+                .map_or_else(|| crate::channels::fallback(queued), Pipeline::channel);
+            QueuedView {
+                repo: queued.repo.clone(),
+                channel,
+                event: queued.kind.to_string(),
+                git_ref: queued.git_ref.clone(),
+                sha: queued.sha.clone(),
+                actor: queued.actor.clone(),
+                received: queued.received,
+            }
         })
         .collect()
 }
@@ -537,6 +568,25 @@ mod tests {
                 since: 1,
             },
         );
+    }
+
+    /// A queued event lands in the channel its ref's pipelines went to, so a
+    /// rerun of a `dev` pipeline shows under `dev`; a ref with none yet in
+    /// the channel its event names.
+    #[test]
+    fn a_queued_event_is_shown_in_the_channel_of_its_refs_pipelines() {
+        let mut dev = pipeline("griasdi", 4, "dev", PipelineStatus::Running, Vec::new());
+        dev.key = event::queue_key(&dev.event);
+        let mut rerun = dev.event.clone();
+        rerun.actor = "rerun of #4".to_owned();
+        let mut feature = dev.event.clone();
+        feature.git_ref = "feature/x".to_owned();
+        let shown = queued_views(&[dev], &[rerun, feature]);
+        let channels: Vec<(&str, &str)> = shown
+            .iter()
+            .map(|q| (q.channel.as_str(), q.actor.as_str()))
+            .collect();
+        assert_eq!(channels, [("dev", "rerun of #4"), ("feature/x", "test")]);
     }
 
     fn open(server: &CiServer, repo: &str, number: u64, job: &str) -> CiReply {

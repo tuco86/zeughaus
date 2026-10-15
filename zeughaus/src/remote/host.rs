@@ -68,9 +68,9 @@ enum Input {
 
 /// Runs the headless editor until it exits, then ends the process.
 pub(super) fn run(args: HostArgs) -> ! {
-    // The terminal grid is measured from its bundled font; a window gets it
-    // through the application builder, which this host does not use.
-    for bytes in iced_terminal::font_bytes() {
+    // The bundled faces: a window gets them through the application
+    // builder, which this host does not use.
+    for bytes in iced_terminal::font_bytes().chain([crate::font::UI_BYTES]) {
         font_system()
             .write()
             .expect("font system")
@@ -88,7 +88,7 @@ pub(super) fn run(args: HostArgs) -> ! {
     // pipelines (node graph, terminal) a screenshot is taken to check.
     let renderer = Executor::block_on(
         &executor,
-        <iced::Renderer as Headless>::new(iced::Font::DEFAULT, iced::Pixels(16.0), Some("wgpu")),
+        <iced::Renderer as Headless>::new(crate::font::UI, iced::Pixels(16.0), Some("wgpu")),
     );
     let Some(renderer) = renderer else {
         eprintln!("[remote] no wgpu adapter");

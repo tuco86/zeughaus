@@ -7,6 +7,8 @@ mod feed;
 // like `mux`: the browser editor has no transport to a runner.
 #[cfg(not(target_arch = "wasm32"))]
 mod graph_link;
+// The editor's bundled face, which is also its icon set.
+mod font;
 mod message;
 // The terminal path: the runner's mux, its shared workspace and one stream
 // per terminal. Native-only, for the same reason as `feed`.
@@ -87,7 +89,9 @@ fn main() -> iced::Result {
         .theme(|app: &App| app.theme())
         // Multisampling for meshes: the node header's symbols are paths, and
         // a diagonal stroke across a few pixels is jagged without it.
-        .antialiasing(true);
+        .antialiasing(true)
+        .font(font::UI_BYTES)
+        .default_font(font::UI);
     // The terminal's font is bundled, not looked up: a terminal grid needs
     // every glyph at one advance width, and whatever the host has installed
     // does not promise that. The wasm editor draws no terminal.

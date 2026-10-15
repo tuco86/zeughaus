@@ -1260,6 +1260,12 @@ impl App {
             Message::PaletteNavigate(idx) => {
                 self.palette_selected = idx;
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::CiShortcut(shortcut) => {
+                if !self.palette_open {
+                    return self.ci_shortcut(shortcut);
+                }
+            }
             Message::KeyStep(step) => {
                 if self.palette_open {
                     let count =
@@ -1916,11 +1922,11 @@ impl App {
                 let key = &section.key;
                 let mut controls: Vec<iced_tabs::Control<'_>> = Vec::new();
                 if !section.synthetic() {
-                    controls.push(header_control("shell", GLYPH_SHELL, "+ Shell", "New shell"));
-                    controls.push(header_control("graph", GLYPH_GRAPH, "+ Graph", "New graph"));
-                    controls.push(header_control("group", GLYPH_GROUP, "+ Group", "New group"));
+                    controls.push(header_control("shell", GLYPH_SHELL, "New shell"));
+                    controls.push(header_control("graph", GLYPH_GRAPH, "New graph"));
+                    controls.push(header_control("group", GLYPH_GROUP, "New group"));
                 } else if key.as_str() == RunnerKey::LOCAL {
-                    controls.push(header_control("graph", GLYPH_GRAPH, "+ Graph", "New graph"));
+                    controls.push(header_control("graph", GLYPH_GRAPH, "New graph"));
                 }
                 // The busy toggle sits on the runner section whose runner
                 // reports a busy-measuring machine; the CI section has none.
@@ -2585,7 +2591,10 @@ impl App {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        let events = iced::event::listen_with(|event, _status, id| {
+        let events = iced::event::listen_with(|event, status, id| {
+            // Only the CI letters ask whether a widget took the key.
+            #[cfg(target_arch = "wasm32")]
+            let _ = status;
             match event {
                 Event::Window(iced::window::Event::Opened { size, .. }) => {
                     return Some(Message::WindowOpened { id, size });
@@ -2612,6 +2621,25 @@ impl App {
                 }
                 if let Some(step) = tab_step(&key, modifiers) {
                     return Some(Message::Workspace(workspace::Message::CycleTab(step)));
+                }
+                // Letters no widget took (a text field or a terminal would
+                // have): the CI list in front acts on its cursor. Cancel
+                // asks for Shift, since it stops work.
+                #[cfg(not(target_arch = "wasm32"))]
+                if status == iced::event::Status::Ignored
+                    && let keyboard::Key::Character(c) = &key
+                {
+                    let shortcut = match (c.as_str(), modifiers) {
+                        ("r", m) if m.is_empty() => Some(crate::message::CiShortcut::Rerun),
+                        ("l", m) if m.is_empty() => Some(crate::message::CiShortcut::OpenLog),
+                        ("C" | "c", keyboard::Modifiers::SHIFT) => {
+                            Some(crate::message::CiShortcut::Cancel)
+                        }
+                        _ => None,
+                    };
+                    if let Some(shortcut) = shortcut {
+                        return Some(Message::CiShortcut(shortcut));
+                    }
                 }
 
                 // Ctrl+S = Save, Ctrl+O = Load
@@ -2676,11 +2704,18 @@ impl App {
         }
 
         // The runner list and the settings edits that have gone quiet are
-        // looked at on a steady cadence.
+        // looked at on a steady cadence: fine-grained only while an edit
+        // waits out its debounce, once a second otherwise, so an idle
+        // editor does not wake ten times a second to find nothing.
         #[cfg(not(target_arch = "wasm32"))]
-        subs.push(
-            iced::time::every(std::time::Duration::from_millis(100)).map(|_| Message::SyncPoll),
-        );
+        {
+            let period = if self.pending.is_empty() {
+                std::time::Duration::from_secs(1)
+            } else {
+                std::time::Duration::from_millis(100)
+            };
+            subs.push(iced::time::every(period).map(|_| Message::SyncPoll));
+        }
 
         // The CI views ask their runners again on a slow clock; a change
         // reaches them as an event at once.
@@ -2803,25 +2838,20 @@ fn unavailable<'a>(what: &'a str, why: &'a str) -> Element<'a, Message, Theme> {
 const GLYPH_SHELL: char = '\u{ea85}';
 const GLYPH_GRAPH: char = '\u{ebb9}';
 const GLYPH_GROUP: char = '\u{ea80}';
+/// What a header glyph is drawn at: about 14 px wide in the Propo face.
+const HEADER_GLYPH_SIZE: f32 = 16.0;
 
-/// The tab tree's own glyphs: codicons (chevrons, close) from the bundled
-/// Nerd Font, which the browser editor does not bundle, so it keeps the
-/// tree's Unicode defaults. A locked group says nothing extra: it has no
-/// colour dot and no close button to begin with.
+/// The tab tree's own glyphs: codicons (chevrons, close) of the editor's
+/// face. A locked group says nothing extra: it has no colour dot and no
+/// close button to begin with.
 fn tab_glyphs() -> iced_tabs::Glyphs {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        iced_tabs::Glyphs {
-            font: Some(iced_terminal::FONT),
-            expanded: '\u{eab4}',
-            collapsed: '\u{eab6}',
-            close: '\u{ea76}',
-            locked: None,
-        }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        iced_tabs::Glyphs::default()
+    iced_tabs::Glyphs {
+        font: Some(crate::font::UI),
+        expanded: '\u{eab4}',
+        collapsed: '\u{eab6}',
+        close: '\u{ea76}',
+        locked: None,
+        control_size: HEADER_GLYPH_SIZE,
     }
 }
 #[cfg(not(target_arch = "wasm32"))]
@@ -2834,25 +2864,14 @@ const GLYPH_FREE_SET: char = '\u{f040c}';
 const GLYPH_BUSY_SET: char = '\u{f03e5}';
 
 /// A section header control: a glyph with a tooltip that says what it does.
-/// The browser editor does not bundle the icon font and shows the word.
 fn header_control(
     key: &'static str,
     glyph: char,
-    word: &'static str,
     tip: &'static str,
 ) -> iced_tabs::Control<'static> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = word;
-        iced_tabs::Control::new(key, glyph.to_string())
-            .font(iced_terminal::FONT)
-            .tooltip(tip)
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = glyph;
-        iced_tabs::Control::new(key, word).tooltip(tip)
-    }
+    iced_tabs::Control::new(key, glyph.to_string())
+        .font(crate::font::UI)
+        .tooltip(tip)
 }
 
 /// The busy toggle: what the machine is, filled when set by hand, and in
@@ -2877,7 +2896,7 @@ fn busy_control(machine: zeughaus_link::MachineState) -> iced_tabs::Control<'sta
         ),
     };
     iced_tabs::Control::new("busy", glyph.to_string())
-        .font(iced_terminal::FONT)
+        .font(crate::font::UI)
         .tooltip(tip)
 }
 
@@ -2923,27 +2942,18 @@ fn pane_grip<'a>(title: String, pane: PaneRef) -> pane_grid::TitleBar<'a, Messag
     })
 }
 
-/// The status bar's error: the codicon error glyph before the words; the
-/// browser editor, without the icon font, says `Error:`.
+/// The status bar's error: the codicon error glyph before the words.
 fn status_error(error: &str, color: iced::Color) -> Element<'static, Message, Theme> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        row![
-            text('\u{ea87}'.to_string())
-                .font(iced_terminal::FONT)
-                .size(19)
-                .line_height(iced::widget::text::LineHeight::Absolute(12.0.into()))
-                .color(color),
-            text(error.to_owned()).size(12).color(color),
-        ]
-        .spacing(4)
-        .align_y(iced::Alignment::Center)
-        .into()
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        text(format!("Error: {error}")).size(12).color(color).into()
-    }
+    row![
+        text('\u{ea87}'.to_string())
+            .size(12)
+            .line_height(iced::widget::text::LineHeight::Absolute(12.0.into()))
+            .color(color),
+        text(error.to_owned()).size(12).color(color),
+    ]
+    .spacing(4)
+    .align_y(iced::Alignment::Center)
+    .into()
 }
 
 /// What covers a pane while something is dragged: it reports which side of
@@ -2996,8 +3006,7 @@ fn drop_overlay<'a>(
     .into()
 }
 
-/// Codicons of the window's own controls, drawn at the size a Mono Nerd
-/// Font needs for a glyph about 10 px wide.
+/// Codicons of the window's own controls, about 10 px wide.
 #[cfg(not(target_arch = "wasm32"))]
 const GLYPH_MINIMIZE: char = '\u{eaba}';
 #[cfg(not(target_arch = "wasm32"))]
@@ -3006,28 +3015,17 @@ const GLYPH_MAXIMIZE: char = '\u{eab9}';
 const GLYPH_RESTORE: char = '\u{eabb}';
 #[cfg(not(target_arch = "wasm32"))]
 const GLYPH_CLOSE_WINDOW: char = '\u{eab8}';
-#[cfg(not(target_arch = "wasm32"))]
-const WINDOW_GLYPH_SIZE: f32 = 17.0;
+const WINDOW_GLYPH_SIZE: f32 = 12.0;
 /// The placement toggle: a sidebar, or a strip along the top.
 const GLYPH_TABS_LEFT: char = '\u{ebf3}';
 const GLYPH_TABS_TOP: char = '\u{ebf6}';
 
-/// The placement toggle's glyph. The browser editor does not bundle the
-/// icon font and shows a menu sign for both.
+/// The placement toggle's glyph.
 fn placement_glyph(glyph: char) -> Element<'static, Message, Theme> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        text(glyph.to_string())
-            .font(iced_terminal::FONT)
-            .size(WINDOW_GLYPH_SIZE)
-            .line_height(1.0)
-            .into()
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = glyph;
-        text("\u{2261}").size(14).into()
-    }
+    text(glyph.to_string())
+        .size(WINDOW_GLYPH_SIZE)
+        .line_height(1.0)
+        .into()
 }
 
 /// A titlebar button: minimize, maximize, close. Flat, so the bar reads as
@@ -3041,7 +3039,6 @@ fn window_button(
 ) -> Element<'static, Message, Theme> {
     button(
         text(glyph.to_string())
-            .font(iced_terminal::FONT)
             .size(WINDOW_GLYPH_SIZE)
             .center()
             .width(Length::Fill)

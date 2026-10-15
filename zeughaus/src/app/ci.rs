@@ -30,7 +30,7 @@ use iced::{Alignment, Color, Element, Length, Padding, Point, Size, Task};
 use iced_nodegraph_sdf::Shape;
 use zeughaus_core::NodeId;
 use zeughaus_link::{
-    CiOverview, CiReply, CiRequest, JobView, MachineJob, MachineView, PipelineView,
+    CiOverview, CiReply, CiRequest, JobView, MachineJob, MachineView, PipelineView, QueuedView,
 };
 use zeughaus_mux::{
     Axis, GroupId, GroupSnapshot, PaneId, PaneNode, SplitId, TabId, TabSnapshot, TerminalId,
@@ -43,7 +43,7 @@ use super::layout::auto_cells;
 use super::runtime::LinkKind;
 use super::{App, unavailable};
 use crate::feed;
-use crate::message::{CiMsg, Message};
+use crate::message::{CiMsg, CiShortcut, Message};
 use crate::transport::Endpoint;
 use crate::workspace::{self, RunnerKey, Surface, TabRef};
 
@@ -61,6 +61,8 @@ const PAGE: u32 = 20;
 const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
 /// The widest a channel's list grows.
 const LIST_MAX_WIDTH: f32 = 1200.0;
+/// The advance of one letter of the editor's monospaced face, in ems.
+const GLYPH_ADVANCE: f32 = 0.55;
 
 /// The scrollable of a channel's list, which the cursor keys move.
 fn list_id(view: u64) -> iced::widget::Id {
@@ -1108,7 +1110,14 @@ impl App {
                 if let Some(state) = client.views.get_mut(&view) {
                     state.acted(number, cancel, result);
                 }
-                Task::none()
+                // A rerun shows up as a queued event in the next overview,
+                // which is asked for now rather than at the next tick.
+                if client.overview_pending {
+                    client.overview_again = true;
+                    Task::none()
+                } else {
+                    client.ask_overview(&key)
+                }
             }
         }
     }
@@ -1173,6 +1182,56 @@ impl App {
             ),
             _ => Task::none(),
         }
+    }
+
+    /// A letter in front of a CI list: rerun, cancel or open the log of the
+    /// pipeline under the cursor, the newest one while there is no cursor.
+    pub(super) fn ci_shortcut(&mut self, shortcut: CiShortcut) -> Task<Message> {
+        let Some(front) = self.workspace.active_tab().cloned() else {
+            return Task::none();
+        };
+        let Some(runner) = front.runner.ci_runner() else {
+            return Task::none();
+        };
+        let view = front.tab.0;
+        let Some(state) = self
+            .ci
+            .get(&runner)
+            .and_then(|client| client.views.get(&view))
+        else {
+            return Task::none();
+        };
+        let shown = match state.cursor {
+            Some(cursor) => state.pipelines.iter().find(|s| s.pipeline.number == cursor),
+            None => state.pipelines.first(),
+        };
+        let Some(pipeline) = shown.map(|s| &s.pipeline) else {
+            return Task::none();
+        };
+        let number = pipeline.number;
+        let message = match shortcut {
+            CiShortcut::Rerun => CiMsg::Rerun { view, number },
+            CiShortcut::Cancel if pipeline.finished.is_none() && pipeline.status == "running" => {
+                CiMsg::Cancel { view, number }
+            }
+            CiShortcut::Cancel => return Task::none(),
+            CiShortcut::OpenLog => {
+                let job = pipeline
+                    .jobs
+                    .iter()
+                    .find(|job| Tone::of(&job.status) == Tone::Bad)
+                    .or_else(|| pipeline.jobs.first());
+                let Some(job) = job else {
+                    return Task::none();
+                };
+                CiMsg::OpenJob {
+                    view,
+                    number,
+                    job: job.name.clone(),
+                }
+            }
+        };
+        self.apply_ci(runner, message)
     }
 
     /// Enter in front of a CI list opens or closes the pipeline under its
@@ -1560,7 +1619,13 @@ impl App {
             ));
         }
 
-        let body: Element<'a, Message, Theme> = if state.pipelines.is_empty() {
+        let queued: Vec<&'a QueuedView> = client
+            .overview
+            .iter()
+            .flat_map(|overview| &overview.queued)
+            .filter(|q| q.repo == state.repo && q.channel == state.channel)
+            .collect();
+        let body: Element<'a, Message, Theme> = if state.pipelines.is_empty() && queued.is_empty() {
             let why = match (&state.error, state.loaded) {
                 (Some(error), _) => error.as_str(),
                 (None, true) => "No pipelines in this channel yet.",
@@ -1568,20 +1633,22 @@ impl App {
             };
             unavailable(&state.channel, why)
         } else {
-            self.pipeline_list(runner, view, state)
+            self.pipeline_list(runner, view, state, queued)
         };
         column![toolbar, rule::horizontal(1), body].into()
     }
 
-    /// The pipelines of a channel, newest on top and separated by rules, and
-    /// at the end the button that loads older ones. A pipeline is one row
-    /// that says how it went; an open one adds its jobs, why the failed ones
-    /// failed, and what can be done about it.
+    /// The pipelines of a channel, newest on top and separated by rules, the
+    /// events still waiting for one above them, and at the end the button
+    /// that loads older ones. A pipeline is one row that says how it went;
+    /// an open one adds its jobs, why the failed ones failed, and what can
+    /// be done about it.
     fn pipeline_list<'a>(
         &'a self,
         runner: &'a RunnerKey,
         view: u64,
         state: &'a ChannelState,
+        queued: Vec<&'a QueuedView>,
     ) -> Element<'a, Message, Theme> {
         responsive(move |size| {
             let now = now();
@@ -1589,8 +1656,15 @@ impl App {
             // within reach of its subjects, not across the screen.
             let size = Size::new(size.width.min(LIST_MAX_WIDTH), size.height);
             let mut list = column![].width(Length::Fill).max_width(LIST_MAX_WIDTH);
-            for (at, shown) in state.pipelines.iter().enumerate() {
+            // Newest first, like the pipelines under them.
+            for (at, waiting) in queued.iter().rev().enumerate() {
                 if at > 0 {
+                    list = list.push(rule::horizontal(1));
+                }
+                list = list.push(self.queued_row(waiting, size, now));
+            }
+            for (at, shown) in state.pipelines.iter().enumerate() {
+                if at > 0 || !queued.is_empty() {
                     list = list.push(rule::horizontal(1));
                 }
                 list = list.push(self.pipeline_entry(runner, view, state, at, shown, size, now));
@@ -1671,15 +1745,15 @@ impl App {
         let muted = theme.muted();
         let tone = Tone::of(&pipeline.status);
         // Room for the subject: the pane less the icon, the times, the
-        // padding and a closed pipeline's glyph per job, at an average glyph
-        // of half the text size.
+        // padding and a closed pipeline's glyph per job, at the face's
+        // advance (Comic Shanns Mono is monospaced).
         let pips = if open {
             0.0
         } else {
             pipeline.jobs.len() as f32 * (TEXT_MD + SP_1) + 2.0 * SP_2
         };
         let room = (size.width - ICON_COLUMN - TIME_COLUMN - 4.0 * SP_4 - pips).max(120.0);
-        let chars = (room / (TEXT_MD * 0.5)) as usize;
+        let chars = (room / (TEXT_MD * GLYPH_ADVANCE)) as usize;
         let subject = if pipeline.subject.is_empty() {
             pipeline.note.as_str()
         } else {
@@ -1701,7 +1775,14 @@ impl App {
                 .push(Space::new().width(SP_2))
                 .push(job_pips(theme, pipeline));
         }
-        let mut lines = column![title, self.trigger_line(pipeline, chars)].spacing(SP_1);
+        let trigger = self.trigger_line(
+            &pipeline.event,
+            &pipeline.git_ref,
+            pipeline.sha.as_deref(),
+            &pipeline.actor,
+            chars,
+        );
+        let mut lines = column![title, trigger].spacing(SP_1);
         for job in pipeline
             .jobs
             .iter()
@@ -1749,10 +1830,64 @@ impl App {
         .into()
     }
 
-    /// `<branch> <commit> <who>`, each behind its glyph.
+    /// An event waiting for its pipeline: a clock, `Queued`, what it will
+    /// build, and how long it has waited. It is no button: there is nothing
+    /// to open yet.
+    fn queued_row<'a>(
+        &'a self,
+        queued: &'a QueuedView,
+        size: Size,
+        now: u64,
+    ) -> Element<'a, Message, Theme> {
+        let muted = self.theme.muted();
+        let room = (size.width - ICON_COLUMN - TIME_COLUMN - 4.0 * SP_4).max(120.0);
+        let chars = (room / (TEXT_MD * GLYPH_ADVANCE)) as usize;
+        let lines = column![
+            text("Queued").size(TEXT_MD).color(muted),
+            self.trigger_line(
+                &queued.event,
+                &queued.git_ref,
+                queued.sha.as_deref(),
+                &queued.actor,
+                chars,
+            ),
+        ]
+        .spacing(SP_1);
+        let waited = tip(
+            text(format!(
+                "waiting {}",
+                duration(now.saturating_sub(queued.received))
+            ))
+            .size(TEXT_SM)
+            .color(muted)
+            .wrapping(Wrapping::None),
+            local(queued.received),
+        );
+        container(
+            row![
+                container(tip(
+                    icon(glyph::WAITING, ICON_SIZE, muted),
+                    "Queued: starts when the running pipeline of its ref ends".to_owned(),
+                ))
+                .width(ICON_COLUMN),
+                container(lines).width(Length::Fill).clip(true),
+                container(waited).width(TIME_COLUMN).align_x(Alignment::End),
+            ]
+            .spacing(SP_3)
+            .align_y(Alignment::Start),
+        )
+        .padding([SP_3, SP_4])
+        .into()
+    }
+
+    /// `<branch> <commit> <who>`, each behind its glyph: what started a
+    /// pipeline or a queued event.
     fn trigger_line<'a>(
         &'a self,
-        pipeline: &'a PipelineView,
+        event: &str,
+        git_ref: &str,
+        sha: Option<&str>,
+        actor: &str,
         chars: usize,
     ) -> Element<'a, Message, Theme> {
         let muted = self.theme.muted();
@@ -1767,20 +1902,20 @@ impl App {
             .spacing(SP_1)
             .align_y(Alignment::Center)
         };
-        let (glyph, what) = match pipeline.event.as_str() {
-            "tag" => (glyph::TAG, pipeline.git_ref.clone()),
-            "cron" => (glyph::CRON, format!("nightly on {}", pipeline.git_ref)),
-            _ => (glyph::BRANCH, pipeline.git_ref.clone()),
+        let (glyph, what) = match event {
+            "tag" => (glyph::TAG, git_ref.to_owned()),
+            "cron" => (glyph::CRON, format!("nightly on {git_ref}")),
+            _ => (glyph::BRANCH, git_ref.to_owned()),
         };
         let mut line = row![part(glyph, fit(&what, chars / 2))]
             .spacing(SP_3)
             .align_y(Alignment::Center);
-        if let Some(sha) = pipeline.sha.as_deref() {
+        if let Some(sha) = sha {
             line = line.push(part(glyph::COMMIT, sha.get(..7).unwrap_or(sha).to_owned()));
         }
         // A cron's actor is `cron`, which the trigger already says.
-        if !pipeline.actor.is_empty() && pipeline.actor != pipeline.event {
-            line = line.push(part(glyph::PERSON, pipeline.actor.clone()));
+        if !actor.is_empty() && actor != event {
+            line = line.push(part(glyph::PERSON, actor.to_owned()));
         }
         line.into()
     }
@@ -1828,7 +1963,7 @@ impl App {
                     Message::Ci(runner.clone(), CiMsg::Rerun { view, number })
                 })
             },
-            "Run this commit again as a new pipeline".to_owned(),
+            "Run this commit again as a new pipeline (R)".to_owned(),
         )]
         .spacing(SP_2)
         .align_y(Alignment::Center);
@@ -1842,7 +1977,7 @@ impl App {
                         Message::Ci(runner.clone(), CiMsg::Cancel { view, number })
                     })
                 },
-                "Stop the running jobs and skip the rest".to_owned(),
+                "Stop the running jobs and skip the rest (Shift+C)".to_owned(),
             ));
         }
         if !pipeline.note.is_empty() && !pipeline.subject.is_empty() {
@@ -1891,16 +2026,19 @@ impl App {
             text(format!("{} failed", job.name)).size(TEXT_MD),
             text(failure_note(job)).size(TEXT_SM).color(theme.muted()),
             Space::new().width(Length::Fill),
-            action_button(glyph::LOG, "Open log").on_press_with(move || {
-                Message::Ci(
-                    runner.clone(),
-                    CiMsg::OpenJob {
-                        view,
-                        number,
-                        job: job.name.clone(),
-                    },
-                )
-            }),
+            tip(
+                action_button(glyph::LOG, "Open log").on_press_with(move || {
+                    Message::Ci(
+                        runner.clone(),
+                        CiMsg::OpenJob {
+                            view,
+                            number,
+                            job: job.name.clone(),
+                        },
+                    )
+                }),
+                "The whole log beside the list (L opens the first failed one)".to_owned(),
+            ),
         ]
         .spacing(SP_2)
         .align_y(Alignment::Center);
@@ -2058,16 +2196,11 @@ mod glyph {
     pub const WARNING: char = '\u{ea6c}';
 }
 
-/// The bundled face is a Mono Nerd Font, which squeezes every icon into one
-/// cell, about half an em wide: drawn at this many times the size, a glyph
-/// is as wide as the size asks for.
-const GLYPH_SCALE: f32 = 1.6;
-
-/// A glyph of the icon font, `size` pixels wide, on a line as tall.
+/// A glyph of the editor's face (its icons are Nerd Font glyphs), on a line
+/// exactly `size` tall so a row of glyphs and words aligns.
 fn glyph_text<'a>(glyph: char, size: f32) -> iced::widget::Text<'a, Theme> {
     text(glyph.to_string())
-        .font(iced_terminal::FONT)
-        .size(size * GLYPH_SCALE)
+        .size(size)
         .line_height(iced::widget::text::LineHeight::Absolute(size.into()))
 }
 
@@ -2615,6 +2748,7 @@ mod tests {
                 })
                 .collect(),
             machines: Vec::new(),
+            queued: Vec::new(),
         };
         let key = RunnerKey::new("sha256:ci");
         let mut client = CiClient::new(Endpoint("weida://ci/".to_owned()), "ci".to_owned());

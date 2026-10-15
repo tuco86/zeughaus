@@ -171,8 +171,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A shell keeps 20 000 rows of history in the runner; an editor caches 1 000
   rows per terminal around its viewport and fetches the rest on scroll.
 - A section header's `+ Shell`, `+ Graph` and `+ Group` are glyphs from the
-  bundled Nerd Font with tooltips; the browser editor, which does not
-  bundle the font, keeps the words. `iced_tabs` header controls are
+  bundled Nerd Font with tooltips. `iced_tabs` header controls are
   `Control`s with an optional font and tooltip.
 - Each runner holds its own graphs: it loads them from
   `<state-dir>/graphs/<id>.zgh` (one file per top-level graph), serves them
@@ -245,8 +244,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runners and pipelines as current.
 - The status bar names a failing node only while a graph is focused, behind
   an error glyph instead of `ERROR:`, in a colour that reads on the chrome.
-  Sidebar labels end in an ellipsis at 21 characters instead of a glyph cut
+  Sidebar labels end in an ellipsis at 18 characters instead of a glyph cut
   at the sidebar's edge.
+- The editor draws its chrome in the bundled ComicShannsMono Nerd Font
+  Propo (Nerd Fonts v3.5.1, MIT and SIL OFL 1.1, licenses in
+  `zeughaus/assets/fonts/`), the same face on every machine, in the browser
+  and headless; its icons come from the same face at their own width, so
+  the browser editor shows them too instead of words. The terminal face is
+  the v3.5.1 Mono variant.
+- A CI channel lists the events still waiting for a pipeline (behind a
+  running one of the same ref) as `Queued` rows on top, with how long they
+  have waited; a rerun shows up there at once. New `queued` in the CI
+  overview. In front of a CI list `R` reruns and Shift+`C` cancels the
+  pipeline under the cursor (the newest without one), `L` opens the log of
+  its first failed job; the buttons' tooltips name the keys.
+- An idle editor wakes once a second instead of ten times: the poll that
+  commits settled settings edits runs every 100 ms only while an edit waits.
 
 ### Removed
 
