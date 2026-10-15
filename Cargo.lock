@@ -2382,7 +2382,7 @@ dependencies = [
 
 [[package]]
 name = "iced_tabs"
-version = "0.3.0-dev"
+version = "0.2.1"
 dependencies = [
  "iced_runtime",
  "iced_widget",
@@ -2390,7 +2390,7 @@ dependencies = [
 
 [[package]]
 name = "iced_terminal"
-version = "0.3.0-dev"
+version = "0.2.1"
 dependencies = [
  "bytemuck",
  "iced",
@@ -7349,7 +7349,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus"
-version = "0.3.0-dev"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "console_error_panic_hook",
@@ -7393,7 +7393,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-capture"
-version = "0.3.0-dev"
+version = "0.2.1"
 dependencies = [
  "ashpd",
  "image",
@@ -7406,7 +7406,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-ci"
-version = "0.3.0-dev"
+version = "0.2.1"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -7427,7 +7427,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-core"
-version = "0.3.0-dev"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -7436,7 +7436,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-db"
-version = "0.3.0-dev"
+version = "0.2.1"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -7458,21 +7458,21 @@ version = "1.3.0"
 
 [[package]]
 name = "zeughaus-flow"
-version = "0.3.0-dev"
+version = "0.2.1"
 dependencies = [
  "zeughaus-core",
 ]
 
 [[package]]
 name = "zeughaus-graph"
-version = "0.3.0-dev"
+version = "0.2.1"
 dependencies = [
  "zeughaus-core",
 ]
 
 [[package]]
 name = "zeughaus-job"
-version = "0.3.0-dev"
+version = "0.2.1"
 dependencies = [
  "glob",
  "shlex 2.0.1",
@@ -7481,7 +7481,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-link"
-version = "0.3.0-dev"
+version = "0.2.1"
 dependencies = [
  "postcard",
  "serde",
@@ -7493,7 +7493,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-llm"
-version = "0.3.0-dev"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -7503,7 +7503,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-ml"
-version = "0.3.0-dev"
+version = "0.2.1"
 dependencies = [
  "serde",
  "zeughaus-core",
@@ -7511,7 +7511,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-mux"
-version = "0.3.0-dev"
+version = "0.2.1"
 dependencies = [
  "postcard",
  "serde",
@@ -7520,7 +7520,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-record"
-version = "0.3.0-dev"
+version = "0.2.1"
 dependencies = [
  "image",
  "serde_json",
@@ -7529,7 +7529,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-runner"
-version = "0.3.0-dev"
+version = "0.2.1"
 dependencies = [
  "base64 0.23.1",
  "hex",
@@ -7560,7 +7560,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-runtime"
-version = "0.3.0-dev"
+version = "0.2.1"
 dependencies = [
  "zeughaus-core",
  "zeughaus-transform",
@@ -7568,7 +7568,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-terminal"
-version = "0.3.0-dev"
+version = "0.2.1"
 dependencies = [
  "libc",
  "portable-pty",
@@ -7626,7 +7626,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-theme"
-version = "0.3.0-dev"
+version = "0.2.1"
 dependencies = [
  "iced",
  "iced_nodegraph",
@@ -7640,7 +7640,7 @@ dependencies = [
 
 [[package]]
 name = "zeughaus-transform"
-version = "0.3.0-dev"
+version = "0.2.1"
 dependencies = [
  "zeughaus-core",
 ]

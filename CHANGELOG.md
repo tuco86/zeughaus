@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-16
+
 ### Fixed
 
 - A CI job's transcript fills its pane and wraps at the pane's edge: it
@@ -373,6 +375,7 @@ First release on crates.io, licensed MIT OR Apache-2.0.
 - `weida`, `iced_palette` and the wezterm crates resolve from crates.io
   releases instead of git revisions.
 
-[Unreleased]: https://github.com/tuco86/zeughaus/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/tuco86/zeughaus/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/tuco86/zeughaus/releases/tag/v0.2.1
 [0.2.0]: https://github.com/tuco86/zeughaus/releases/tag/v0.2.0
 [0.1.0-alpha.1]: https://github.com/tuco86/zeughaus/releases/tag/v0.1.0-alpha.1
