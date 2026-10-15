@@ -62,6 +62,11 @@ const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
 /// The widest a channel's list grows.
 const LIST_MAX_WIDTH: f32 = 1200.0;
 
+/// The scrollable of a channel's list, which the cursor keys move.
+fn list_id(view: u64) -> iced::widget::Id {
+    iced::widget::Id::from(format!("ci-list-{view}"))
+}
+
 /// Set on a view's id for the split that holds its transcript and, with the
 /// next bit, for the pane of that transcript. Views, tabs and groups are
 /// numbered from a counter and never get near either bit.
@@ -1141,12 +1146,33 @@ impl App {
         self.ci.get_mut(&runner)?.views.get_mut(&front.tab.0)
     }
 
-    /// Up and Down in front of a CI list move its cursor.
+    /// Up and Down in front of a CI list move its cursor, and the list
+    /// follows it.
     pub(super) fn step_front_ci_cursor(&mut self, step: isize) -> Task<Message> {
-        if let Some(state) = self.front_channel() {
-            state.step(step);
+        let Some(view) = self.workspace.active_tab().map(|front| front.tab.0) else {
+            return Task::none();
+        };
+        let Some(state) = self.front_channel() else {
+            return Task::none();
+        };
+        state.step(step);
+        let count = state.pipelines.len();
+        let at = state.cursor.and_then(|cursor| {
+            state
+                .pipelines
+                .iter()
+                .position(|s| s.pipeline.number == cursor)
+        });
+        match at {
+            Some(at) if count > 1 => iced::widget::operation::snap_to(
+                list_id(view),
+                scrollable::RelativeOffset {
+                    x: None,
+                    y: Some(at as f32 / (count - 1) as f32),
+                },
+            ),
+            _ => Task::none(),
         }
-        Task::none()
     }
 
     /// Enter in front of a CI list opens or closes the pipeline under its
@@ -1585,6 +1611,7 @@ impl App {
                 );
             }
             scrollable(list)
+                .id(list_id(view))
                 .direction(scrollable::Direction::Vertical(
                     scrollable::Scrollbar::new().spacing(SP_1),
                 ))
