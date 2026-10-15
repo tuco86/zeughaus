@@ -21,6 +21,7 @@ use zeughaus_link::{
 use zeughaus_mux::TerminalId;
 
 use crate::config::{CiConfig, valid_name};
+use crate::event;
 use crate::runners::Runners;
 use crate::scheduler::{
     self, JobRecord, Pipeline, PipelineStatus, load_pipeline, load_pipelines, load_repo_pipelines,
@@ -78,6 +79,8 @@ impl CiServer {
                 self.transcripts.close(TerminalId(terminal));
                 CiReply::Closed
             }
+            CiRequest::Rerun { repo, number } => self.rerun(&repo, number),
+            CiRequest::Cancel { repo, number } => self.cancel(&repo, number),
         }
     }
 
@@ -176,6 +179,40 @@ impl CiServer {
             terminal: self.transcripts.open(repo, number, job).0,
         }
     }
+
+    /// Queues the event of pipeline `number` again, pinned to the sha it
+    /// ran for, so a branch that moved since does not change what runs.
+    fn rerun(&self, repo: &str, number: u64) -> CiReply {
+        let Some(pipeline) = self.record(repo, number) else {
+            return error("no such pipeline");
+        };
+        let mut event = pipeline.event.clone();
+        if pipeline.sha.is_some() {
+            event.sha = pipeline.sha.clone();
+        }
+        event.actor = format!("rerun of #{number}");
+        event.delivery = None;
+        event.received = crate::now_secs();
+        match event::write_inbox(&self.state_dir, &event) {
+            Ok(_) => CiReply::Accepted,
+            Err(e) => error(&e),
+        }
+    }
+
+    /// Leaves a cancel request for the scheduler, which acts on its next
+    /// tick.
+    fn cancel(&self, repo: &str, number: u64) -> CiReply {
+        let Some(pipeline) = self.record(repo, number) else {
+            return error("no such pipeline");
+        };
+        if pipeline.status != PipelineStatus::Running {
+            return error("the pipeline is not running");
+        }
+        match event::write_cancel(&self.state_dir, repo, number) {
+            Ok(()) => CiReply::Accepted,
+            Err(e) => error(&e),
+        }
+    }
 }
 
 fn error(message: &str) -> CiReply {
@@ -230,6 +267,8 @@ fn job_view(job: &JobRecord) -> JobView {
         started: job.started,
         finished: job.finished,
         code: job.code,
+        cause: job.cause(),
+        excerpt: job.excerpt.clone(),
     }
 }
 
@@ -458,6 +497,7 @@ mod tests {
             created: number,
             finished: None,
             jobs,
+            cancelled: false,
             channel: channel.to_owned(),
         }
     }
@@ -540,6 +580,8 @@ mod tests {
         failed.code = Some(3);
         failed.started = Some(10);
         failed.finished = Some(25);
+        failed.excerpt = Some("compiling\nerror: boom".to_owned());
+        failed.def.secrets = vec!["TOKEN".to_owned()];
         let record = pipeline(
             "view",
             3,
@@ -592,6 +634,17 @@ mod tests {
             ]
         );
         assert_eq!(view.jobs[1].needs, ["build"]);
+        // The cause is shown even for a job that holds secrets; a job that
+        // did not fail has none.
+        assert_eq!(view.jobs[1].cause.as_deref(), Some("error: boom"));
+        assert_eq!(
+            view.jobs[1].excerpt.as_deref(),
+            Some("compiling\nerror: boom")
+        );
+        assert_eq!(
+            (view.jobs[0].cause.clone(), view.jobs[0].excerpt.clone()),
+            (None, None)
+        );
         assert_eq!(
             (
                 view.jobs[1].code,
@@ -819,6 +872,71 @@ mod tests {
             );
         }
         assert!(!server.transcripts.exists(TerminalId(terminal)));
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_rerun_queues_the_same_event_pinned_to_the_recorded_sha() {
+        let state = scratch("rerun");
+        let mut record = pipeline("view", 4, "dev", PipelineStatus::Failed, Vec::new());
+        record.event.delivery = Some("abc".to_owned());
+        store(&state, &record);
+        let server = server(&state);
+
+        assert_eq!(
+            server.answer(CiRequest::Rerun {
+                repo: "view".to_owned(),
+                number: 4,
+            }),
+            CiReply::Accepted
+        );
+        event::drain_inbox(&state);
+        let queued = event::queued(&state);
+        assert_eq!(queued.len(), 1);
+        let queued = &queued[0].1;
+        assert_eq!(queued.sha, record.sha);
+        assert_eq!(queued.actor, "rerun of #4");
+        assert_eq!(queued.delivery, None);
+        assert_eq!(
+            (queued.kind, queued.git_ref.as_str(), queued.cron.as_ref()),
+            (record.event.kind, "main", None)
+        );
+
+        let unknown = |repo: &str, number| {
+            server.answer(CiRequest::Rerun {
+                repo: repo.to_owned(),
+                number,
+            })
+        };
+        assert_eq!(unknown("view", 9), error("no such pipeline"));
+        assert_eq!(unknown("../view", 4), error("no such pipeline"));
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_cancel_is_left_for_the_scheduler_when_the_pipeline_runs() {
+        let state = scratch("cancel");
+        store(
+            &state,
+            &pipeline("view", 1, "dev", PipelineStatus::Running, Vec::new()),
+        );
+        store(
+            &state,
+            &pipeline("view", 2, "dev", PipelineStatus::Succeeded, Vec::new()),
+        );
+        let server = server(&state);
+        let cancel = |number| {
+            server.answer(CiRequest::Cancel {
+                repo: "view".to_owned(),
+                number,
+            })
+        };
+
+        assert_eq!(cancel(1), CiReply::Accepted);
+        assert_eq!(event::drain_cancels(&state), [("view".to_owned(), 1)]);
+        assert_eq!(cancel(2), error("the pipeline is not running"));
+        assert_eq!(cancel(3), error("no such pipeline"));
+        assert!(event::drain_cancels(&state).is_empty());
         let _ = std::fs::remove_dir_all(&state);
     }
 }

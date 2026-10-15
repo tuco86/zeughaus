@@ -343,6 +343,28 @@ pub enum CiMsg {
     LoadOlder {
         view: u64,
     },
+    /// The user opened or closed a pipeline's row.
+    Toggle {
+        view: u64,
+        number: u64,
+    },
+    /// The user asked the CI to run a pipeline's commit again.
+    Rerun {
+        view: u64,
+        number: u64,
+    },
+    /// The user asked the CI to stop a running pipeline.
+    Cancel {
+        view: u64,
+        number: u64,
+    },
+    /// What the CI answered a rerun or a cancel.
+    Acted {
+        view: u64,
+        number: u64,
+        cancel: bool,
+        result: Result<(), String>,
+    },
 }
 
 #[cfg(test)]

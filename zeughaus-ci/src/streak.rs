@@ -4,11 +4,13 @@
 //!
 //! Computed from the pipeline records, so `ci status` and the scheduler see
 //! the same thing and a restart forgets nothing. Push and cron pipelines of
-//! the branch count; a job that a pipeline skipped or did not select says
-//! nothing about it, so the streak looks past that pipeline.
+//! the branch count; a job that a pipeline skipped or did not select
+//! says nothing about it, so the streak looks past that pipeline. A
+//! cancelled pipeline says nothing about the commit either and is left out
+//! whole.
 
 use crate::event::EventKind;
-use crate::scheduler::{JobStatus, Pipeline};
+use crate::scheduler::{JobStatus, Pipeline, PipelineStatus};
 
 /// One job of the default branch that failed in its latest result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,7 +45,9 @@ pub fn is_branch(pipeline: &Pipeline, branch: &str) -> bool {
 pub fn of_branch(pipelines: &[Pipeline], branch: &str) -> Streak {
     let mut branch_pipelines: Vec<&Pipeline> = pipelines
         .iter()
-        .filter(|p| is_branch(p, branch) && !p.jobs.is_empty())
+        .filter(|p| {
+            is_branch(p, branch) && !p.jobs.is_empty() && p.status != PipelineStatus::Cancelled
+        })
         .collect();
     branch_pipelines.sort_by_key(|p| std::cmp::Reverse(p.number));
 
@@ -203,6 +207,7 @@ mod tests {
                 job("publish", &[], publish),
             ],
             channel: String::new(),
+            cancelled: false,
         }
     }
 
@@ -243,5 +248,25 @@ mod tests {
         let streak = of_branch(&pipelines, "main");
         assert!(streak.red.is_empty());
         assert_eq!(streak.describe(0), "green");
+    }
+
+    #[test]
+    fn a_cancelled_pipeline_is_neither_red_nor_green() {
+        use JobStatus::{Failed, Skipped, Succeeded};
+        let mut cancelled = pipeline(3, "main", Failed, Skipped);
+        cancelled.status = PipelineStatus::Cancelled;
+        let mut green = pipeline(4, "main", Succeeded, Succeeded);
+        green.status = PipelineStatus::Cancelled;
+        let pipelines = vec![pipeline(1, "main", Failed, Skipped), cancelled];
+        let streak = of_branch(&pipelines, "main");
+        assert_eq!(streak.red.len(), 1);
+        assert_eq!(
+            (streak.red[0].since, streak.red[0].pipelines),
+            (1, 1),
+            "the cancelled pipeline neither extends the streak nor counts"
+        );
+        // It does not end a streak either.
+        let pipelines = vec![pipeline(1, "main", Failed, Skipped), green];
+        assert_eq!(of_branch(&pipelines, "main").red.len(), 1);
     }
 }

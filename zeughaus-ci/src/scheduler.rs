@@ -43,6 +43,8 @@ const LOST_GRACE_SECS: u64 = 900;
 const RED_REMINDER: Duration = Duration::from_secs(3600);
 /// Characters of a cause line an alert carries.
 const ALERT_CAUSE_CHARS: usize = 200;
+/// A job's note, and the forge's description, when its pipeline was cancelled.
+const CANCELLED: &str = "cancelled";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -100,6 +102,8 @@ pub enum PipelineStatus {
     Error,
     /// A push to the default branch whose commit has no `.zeughaus-ci/`.
     NoJobs,
+    /// Stopped on request; its unfinished jobs were killed or skipped.
+    Cancelled,
 }
 
 impl PipelineStatus {
@@ -110,6 +114,7 @@ impl PipelineStatus {
             PipelineStatus::Failed => "failed",
             PipelineStatus::Error => "error",
             PipelineStatus::NoJobs => "no-jobs",
+            PipelineStatus::Cancelled => "cancelled",
         }
     }
 }
@@ -143,6 +148,19 @@ pub struct JobRecord {
     pub excerpt: Option<String>,
 }
 
+impl JobRecord {
+    /// The line of a failed job's excerpt that says why it failed (see
+    /// [`excerpt::cause`]); `None` for a job that did not fail. It is the
+    /// job's output as it stands: a caller that shows it to people the job's
+    /// secrets are not for goes through [`shareable_cause`].
+    pub fn cause(&self) -> Option<String> {
+        if self.status != JobStatus::Failed {
+            return None;
+        }
+        self.excerpt.as_deref().and_then(excerpt::cause)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pipeline {
     pub repo: String,
@@ -164,6 +182,10 @@ pub struct Pipeline {
     /// See [`channels`]; empty in records from before channels existed.
     #[serde(default)]
     pub channel: String,
+    /// An editor cancelled the pipeline: its jobs are killed or skipped
+    /// and it ends as [`PipelineStatus::Cancelled`].
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 fn pipelines_dir(state_dir: &Path, repo: &str) -> PathBuf {
@@ -502,7 +524,12 @@ impl Scheduler {
                 "[ci] recovered {} #{} ({})",
                 pipeline.repo, pipeline.number, pipeline.event.git_ref
             );
+            let cancelled = pipeline.cancelled;
             self.running.push(pipeline);
+            if cancelled {
+                let pi = self.running.len() - 1;
+                self.apply_cancel(pi);
+            }
         }
     }
 
@@ -521,6 +548,7 @@ impl Scheduler {
         while let Ok(msg) = self.rx.try_recv() {
             self.handle(msg);
         }
+        self.cancel_requests();
         self.advance();
         self.lost_runners();
         self.drop_artifacts();
@@ -690,6 +718,7 @@ impl Scheduler {
             sha: None,
             subject: String::new(),
             status: PipelineStatus::Running,
+            cancelled: false,
             note: String::new(),
             created: crate::now_secs(),
             finished: None,
@@ -868,6 +897,8 @@ impl Scheduler {
                 .all(|j| j.status == JobStatus::Succeeded)
             {
                 PipelineStatus::Succeeded
+            } else if pipeline.cancelled {
+                PipelineStatus::Cancelled
             } else {
                 PipelineStatus::Failed
             };
@@ -926,6 +957,11 @@ impl Scheduler {
             for ji in 0..self.running[pi].jobs.len() {
                 let status = self.running[pi].jobs[ji].status;
                 if !matches!(status, JobStatus::Pending | JobStatus::Waiting) {
+                    continue;
+                }
+                if self.running[pi].cancelled {
+                    // A job put back to pending by a lost runner stays out.
+                    self.cancel_job(pi, ji);
                     continue;
                 }
                 let pipeline = &self.running[pi];
@@ -1021,6 +1057,10 @@ impl Scheduler {
 
     /// Marks a job failed, and says why.
     fn fail_job(&mut self, pi: usize, ji: usize, note: String, state: State) {
+        if self.running[pi].cancelled {
+            self.cancel_job(pi, ji);
+            return;
+        }
         let pipeline = &mut self.running[pi];
         let job = &mut pipeline.jobs[ji];
         eprintln!(
@@ -1058,6 +1098,65 @@ impl Scheduler {
             &name,
             State::Success,
             format!("skipped: {note} (#{})", pipeline.number),
+        );
+    }
+
+    // ------------------------------------------------------------ cancel
+
+    /// Cancels the running pipelines that editors asked to cancel. The
+    /// flag is saved before anything is done, so a restart finishes the
+    /// cancel. A pipeline that already ended is not running here and the
+    /// request is dropped.
+    fn cancel_requests(&mut self) {
+        for (repo, number) in event::drain_cancels(&self.state_dir) {
+            let Some(pi) = self
+                .running
+                .iter()
+                .position(|p| p.repo == repo && p.number == number)
+            else {
+                continue;
+            };
+            if !self.running[pi].cancelled {
+                self.running[pi].cancelled = true;
+                self.running[pi].save(&self.state_dir, &self.changes);
+                eprintln!("[ci] {repo} #{number}: cancelled");
+            }
+            self.apply_cancel(pi);
+        }
+    }
+
+    /// Kills every active job of a cancelled pipeline and skips the jobs
+    /// that never started. A killed job's end is recorded by
+    /// [`Scheduler::finish_job`].
+    fn apply_cancel(&mut self, pi: usize) {
+        for ji in 0..self.running[pi].jobs.len() {
+            let job = &self.running[pi].jobs[ji];
+            if job.status.is_active() {
+                if let Some(runner) = job.runner.clone() {
+                    let run = self.run_of(pi, ji);
+                    self.runners.send(&runner, ToRunner::Kill { run });
+                }
+            } else if !job.status.is_terminal() {
+                self.cancel_job(pi, ji);
+            }
+        }
+    }
+
+    /// Records a job of a cancelled pipeline as skipped, not failed.
+    fn cancel_job(&mut self, pi: usize, ji: usize) {
+        let pipeline = &mut self.running[pi];
+        let job = &mut pipeline.jobs[ji];
+        job.status = JobStatus::Skipped;
+        job.note = CANCELLED.to_owned();
+        job.finished = Some(crate::now_secs());
+        let name = job.def.name.clone();
+        pipeline.save(&self.state_dir, &self.changes);
+        let pipeline = self.running[pi].clone();
+        self.post(
+            &pipeline,
+            &name,
+            State::Error,
+            format!("{CANCELLED} (#{})", pipeline.number),
         );
     }
 
@@ -1356,6 +1455,14 @@ impl Scheduler {
                 }
                 if let Some(end) = report.end {
                     self.finish_job(pi, ji, end);
+                } else if self.running[pi].cancelled {
+                    // Cancelled while this runner was away: its kill was lost.
+                    self.runners.send(
+                        name,
+                        ToRunner::Kill {
+                            run: report.run.clone(),
+                        },
+                    );
                 }
             } else {
                 // A run nobody here waits for: stop it and let it go.
@@ -1529,6 +1636,8 @@ impl Scheduler {
                 format!("passed in {}m{}s", elapsed / 60, elapsed % 60),
                 None,
             )
+        } else if self.running[pi].cancelled {
+            (State::Error, CANCELLED.to_owned(), None)
         } else {
             (
                 State::Failure,
@@ -1537,9 +1646,12 @@ impl Scheduler {
             )
         };
 
+        let cancelled = !succeeded && self.running[pi].cancelled;
         let record = &mut self.running[pi].jobs[ji];
         record.status = if succeeded {
             JobStatus::Succeeded
+        } else if cancelled {
+            JobStatus::Skipped
         } else {
             JobStatus::Failed
         };
@@ -1551,7 +1663,7 @@ impl Scheduler {
         eprintln!("[ci] {repo} #{number} {job}: {note}");
         self.running[pi].save(&self.state_dir, &self.changes);
         let pipeline = self.running[pi].clone();
-        let description = if succeeded {
+        let description = if succeeded || cancelled {
             format!("{note} (#{number})")
         } else {
             self.failure_description(&pipeline, &job, &note)
@@ -1706,7 +1818,7 @@ fn shareable_cause(job: &JobRecord) -> Option<String> {
     if !job.def.secrets.is_empty() {
         return None;
     }
-    job.excerpt.as_deref().and_then(excerpt::cause)
+    job.cause()
 }
 
 fn failure_note(end: &RunEnd, timeout_minutes: u32) -> String {
@@ -1971,6 +2083,7 @@ mod tests {
             finished: None,
             jobs: Vec::new(),
             channel: channel.to_owned(),
+            cancelled: false,
         }
     }
 
@@ -2606,6 +2719,128 @@ mod tests {
             })
         );
         assert!(!s.running[0].jobs[0].artifacts);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_cancel_kills_the_active_job_and_skips_the_rest() {
+        let state = scratch("cancel");
+        let mut s = scheduler(&state);
+        let mut x = connect(&s.runners, "x", 0);
+        let mut p = pipeline("dev");
+        p.sha = Some("abc".to_owned());
+        p.jobs = vec![
+            record("a", &[], "x", JobStatus::Running),
+            record("b", &["a"], "x", JobStatus::Pending),
+            record("c", &[], "x", JobStatus::Waiting),
+            record("d", &[], "x", JobStatus::Succeeded),
+        ];
+        s.running.push(p);
+        s.runners.assign("view.7.a", "x");
+
+        // A request for a pipeline that is not running is dropped.
+        event::write_cancel(&state, "view", 99).unwrap();
+        event::write_cancel(&state, "view", 7).unwrap();
+        s.cancel_requests();
+        assert!(event::drain_cancels(&state).is_empty());
+
+        assert_eq!(
+            x.try_recv().ok(),
+            Some(ToRunner::Kill {
+                run: "view.7.a".to_owned()
+            })
+        );
+        assert!(x.try_recv().is_err());
+        let status = |s: &Scheduler| {
+            s.running[0]
+                .jobs
+                .iter()
+                .map(|j| j.status)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            status(&s),
+            [
+                JobStatus::Running,
+                JobStatus::Skipped,
+                JobStatus::Skipped,
+                JobStatus::Succeeded
+            ]
+        );
+        assert_eq!(s.running[0].jobs[1].note, "cancelled");
+        assert_eq!(s.running[0].jobs[2].note, "cancelled");
+        // The flag is on disk before the runner answers.
+        assert!(load_pipeline(&state, "view", 7).unwrap().cancelled);
+
+        // A job put back to pending meanwhile does not start again.
+        s.running[0].jobs[2].status = JobStatus::Pending;
+        s.advance();
+        assert_eq!(s.running[0].jobs[2].status, JobStatus::Skipped);
+        assert!(x.try_recv().is_err());
+
+        s.finish_pipelines();
+        assert_eq!(s.running.len(), 1);
+
+        s.handle(Msg::FromRunner {
+            name: "x".to_owned(),
+            message: FromRunner::Finished {
+                run: "view.7.a".to_owned(),
+                end: RunEnd {
+                    code: None,
+                    killed: true,
+                    timed_out: false,
+                    artifacts: false,
+                },
+            },
+        });
+        let a = &s.running[0].jobs[0];
+        assert_eq!(
+            (a.status, a.note.as_str()),
+            (JobStatus::Skipped, "cancelled")
+        );
+        assert_eq!(a.excerpt, None);
+
+        s.finish_pipelines();
+        assert!(s.running.is_empty());
+        let record = load_pipeline(&state, "view", 7).unwrap();
+        assert_eq!(record.status, PipelineStatus::Cancelled);
+        assert!(record.finished.is_some());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_cancelled_pipeline_is_finished_again_after_a_restart() {
+        let state = scratch("cancel-recover");
+        let mut s = scheduler(&state);
+        let mut p = pipeline("dev");
+        p.jobs = vec![
+            record("a", &[], "x", JobStatus::Running),
+            record("b", &["a"], "x", JobStatus::Pending),
+        ];
+        p.cancelled = true;
+        p.save(&state, &s.changes);
+
+        s.recover();
+        assert_eq!(s.running.len(), 1);
+        assert_eq!(s.running[0].jobs[1].status, JobStatus::Skipped);
+        assert_eq!(s.running[0].jobs[1].note, "cancelled");
+
+        // The runner still has the run when it connects again: it is killed.
+        let mut x = connect(&s.runners, "x", 0);
+        s.handle(Msg::RunnerHello {
+            name: "x".to_owned(),
+            runs: vec![RunReport {
+                run: "view.7.a".to_owned(),
+                end: None,
+            }],
+            artifacts: Vec::new(),
+        });
+        assert_eq!(
+            x.try_recv().ok(),
+            Some(ToRunner::Kill {
+                run: "view.7.a".to_owned()
+            })
+        );
         let _ = std::fs::remove_dir_all(&state);
     }
 }

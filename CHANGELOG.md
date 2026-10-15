@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   across every runner's section, wrapping at the ends, also while a
   terminal has the keyboard; its child (vim, tmux) no longer receives them.
   Not while the palette or a rename field is open.
+- CI: an editor can rerun a pipeline (its event again, pinned to the same
+  commit) and cancel a running one (jobs killed or skipped, the pipeline
+  ends as `cancelled`, no red alert); a failed job's cause line and log
+  excerpt are part of the pipeline view.
 - CI: the service `zeughaus-ci` runs pipelines that
   a repository defines as scripts in `.zeughaus-ci/` (TOML headers: `on`, `needs`,
   `image`, `machine`, `platform`, `cache`, `secrets`, `when_busy`, `env`,
@@ -203,6 +207,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `platform` or `machine` that is a runner) is refused there and not only
   when a pipeline is set up; without `ci.toml` it warns about each `freeze`
   job without an `image`.
+- A CI channel tab is a list of pipelines, one row each: status glyph, number
+  and commit subject, branch, commit and actor, each failed job's cause line,
+  duration and age, and while closed one glyph per job. The newest and the
+  running pipelines are open with their jobs as compact cards, `Rerun` and
+  `Cancel`, and every failed job's log excerpt with `Open log`; a press on a
+  row opens or closes it. The card whose log is open is tinted, waiting jobs
+  are amber. Channel tabs are titled with the channel alone, the Runners tab
+  shows a kind glyph, a state dot and `n of m online`. Status in the CI views
+  is a codicon glyph as well as a colour.
+- The command palette has two-line rows of one height (title, then the
+  description), a full-window scrim and a soft shadow, and says when nothing
+  matches; the status bar drops its pipes, counts the focused graph's nodes
+  and edges only while a graph is focused, and gets its plurals right; an
+  empty graph says how to add a node.
+- Runner sections are labelled with the host alone, adding the port (or the
+  start of the key) only where two runners share one host. The tab tree's
+  chevrons and close buttons are codicons, and a locked group no longer
+  says `locked`.
+- Secondary text keeps at least 4.5:1 contrast in every theme: in light
+  themes it was as faint as 2:1.
 
 ### Removed
 

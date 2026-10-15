@@ -147,6 +147,47 @@ pub fn queued(state_dir: &Path) -> Vec<(PathBuf, CiEvent)> {
     out
 }
 
+fn cancel_dir(state_dir: &Path) -> PathBuf {
+    ci_dir(state_dir).join("cancel")
+}
+
+/// Asks the scheduler to cancel pipeline `number` of `repo`: an empty file
+/// `<repo>.<number>`, which the scheduler removes when it has acted. A
+/// repository name holds no `.`, so the name splits unambiguously.
+pub fn write_cancel(state_dir: &Path, repo: &str, number: u64) -> Result<(), String> {
+    crate::files::write_atomic(&cancel_dir(state_dir).join(format!("{repo}.{number}")), b"")
+}
+
+/// Takes every pending cancel request, in name order. A file whose name
+/// is not `<repo>.<number>` is removed without a request.
+pub fn drain_cancels(state_dir: &Path) -> Vec<(String, u64)> {
+    let Ok(entries) = std::fs::read_dir(cancel_dir(state_dir)) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
+    paths.sort();
+    let mut out = Vec::new();
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        // A half-written `.tmp` file is the writer's; it is renamed next.
+        if name.ends_with(".tmp") {
+            continue;
+        }
+        if let Some((repo, number)) = name.rsplit_once('.')
+            && let Ok(number) = number.parse::<u64>()
+        {
+            out.push((repo.to_owned(), number));
+        }
+        if let Err(e) = std::fs::remove_file(&path) {
+            eprintln!("[ci] cannot remove {}: {e}", path.display());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +264,19 @@ mod tests {
             assert_eq!(kind.to_string().parse::<EventKind>().unwrap(), kind);
         }
         assert!("pull".parse::<EventKind>().is_err());
+    }
+
+    #[test]
+    fn cancel_requests_are_drained_once() {
+        let dir = temp("cancel");
+        write_cancel(&dir, "smoke", 7).unwrap();
+        write_cancel(&dir, "other-repo", 12).unwrap();
+        std::fs::write(cancel_dir(&dir).join("junk"), "").unwrap();
+        assert_eq!(
+            drain_cancels(&dir),
+            vec![("other-repo".to_owned(), 12), ("smoke".to_owned(), 7)]
+        );
+        assert!(drain_cancels(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

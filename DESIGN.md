@@ -294,8 +294,8 @@ with a transparent exterior and an opaque workspace. Maximizing removes
 the rounding and resize grips; restoring the window brings them back.
 The browser canvas stays rectangular.
 Below it are tabs of split panes (`iced_tabs::tree`, `pane_grid`). The tab
-bar has one section per connected runner, labelled with its host and the
-start of its fingerprint, plus `Local` (no runner: the scratch graphs) or
+bar has one section per connected runner, labelled with its host (and its
+port, or the start of its fingerprint, where two runners share one host), plus `Local` (no runner: the scratch graphs) or
 `Not running` (graphs whose runner is not connected), and after the runners
 a `CI <label>` section for each CI the editor dials (section 14). A runner section is
 that runner's shared workspace: loose tabs and one level of coloured,
@@ -1007,24 +1007,44 @@ configured runner in name order as `kind = "runner"` with `offline`, `online`,
 or `busy`/`free` (with ` (set)` when the mode is set by hand), then each
 machine the connected runners report as `kind = "windows-vm"`, each with the
 jobs active on it as `MachineJob { repo, channel, number, job }`), a
-channel's pipelines newest first by pages, one pipeline, and opens or
-closes a transcript. Every saved record is announced as
+channel's pipelines newest first by pages, one pipeline, opens or
+closes a transcript, and takes two actions, both answered `Accepted`:
+`Rerun { repo, number }` writes the pipeline's event to the inbox again,
+pinned to the recorded sha, with the actor `rerun of #<n>`; `Cancel { repo,
+number }` leaves `ci/cancel/<repo>.<n>` for the scheduler, which saves
+`cancelled` in the record, sends `Kill` to every active job and skips the
+rest (`cancelled`), records a killed job as skipped rather than failed, and
+ends the pipeline as `cancelled`: no red alert, error statuses
+`cancelled (#<n>)` on the forge, and the red streak ignores it. A failed
+job's `JobView` carries its `cause` line (the one the forge status shows,
+but also for jobs that hold secrets: editors are trusted peers and can
+open the transcript anyway) and the stored `excerpt`. Every saved record is announced as
 `RuntimeEvent::CiPipeline` on the `ci` topic. In the editor
 (`zeughaus/src/app/ci.rs`) each URL of `ci` is a link of its own, and its
 section `CI <label>` comes after the runners: a `Runners` tab with a table of the
-runners and machines, whose running jobs open their transcripts, then one locked group
-per repository with a tab per channel, `<channel>@<repo>`, whose accent
-dot is the tone of the channel's newest pipeline. A channel tab lists its
-pipelines in a scrollable, newest on top and separated by rules: per
-pipeline `#<n> push to <ref> <sha> by <actor>`, its status, its age (the
-local time on hover), the commit's subject (the CI reads it from its
-mirror when the pipeline starts, and once at start for records without
-one), its note, and its jobs as cards laid out by their `needs` and
-bordered by status. While the channel in front has something running, a
+runners and machines (kind glyph, name, state dot and word, running jobs),
+whose running jobs open their transcripts, then one locked group per
+repository with a tab per channel, titled with the channel (the group names
+the repository), whose accent dot is the tone of the channel's newest
+pipeline. A channel tab lists its pipelines in a scrollable, newest on top
+and separated by rules, one row each: a status glyph (codicons from the
+bundled Nerd Font, so status never rests on colour alone), `#<n>` and the
+commit's subject (the CI reads it from its mirror when the pipeline starts,
+and once at start for records without one), the branch, tag or cron, the
+commit and the actor, the cause line of each failed job, and the duration
+and age (the local time on hover). A closed row ends in one glyph per job.
+The newest pipeline and every running one are open unless the user closed
+them, and any other opens on a press of its row: an open pipeline adds
+`Rerun` and, while it runs, `Cancel`, its note, its jobs as cards laid out by
+their `needs` (status glyph, name, and how long and where, or what it waits
+for; outlined by status), and for each failed job its excerpt from the cause
+line on and an `Open log` button. What a rerun or cancel came to is said in
+the toolbar. While the channel in front has something running, a
 one-second clock moves its elapsed times. The cables between the cards are one
 `iced_nodegraph_sdf` primitive under them; nothing pans, zooms, moves or
 takes the wheel, so the list scrolls like any other. Pressing a job
-opens its transcript in a pane beside the list: the CI creates a
+opens its transcript in a pane beside the list, and its card is tinted with
+the accent while it is open: the CI creates a
 `Session::fed` (`zeughaus-terminal`), a screen that a follower task feeds
 from the stored `wal` every 200 ms and that ends with the `exit` file, and
 serves it on its own `/mux` through `zeughaus_terminal::serve::stream_terminal`,

@@ -44,6 +44,12 @@ pub enum CiRequest {
     },
     /// Closes a terminal [`CiRequest::OpenTranscript`] returned.
     CloseTranscript { terminal: u64 },
+    /// Queues a new pipeline for the event pipeline `number` ran for, pinned
+    /// to the sha it recorded. Answers [`CiReply::Accepted`].
+    Rerun { repo: String, number: u64 },
+    /// Stops a running pipeline: its jobs are killed, the rest skipped.
+    /// Answers [`CiReply::Accepted`], or an error when it is not running.
+    Cancel { repo: String, number: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -64,6 +70,9 @@ pub enum CiReply {
         terminal: u64,
     },
     Closed,
+    /// A [`CiRequest::Rerun`] or [`CiRequest::Cancel`] was taken; the
+    /// pipeline record changes later and is announced on `/events`.
+    Accepted,
     Error {
         message: String,
     },
@@ -122,6 +131,14 @@ pub struct JobView {
     pub started: Option<u64>,
     pub finished: Option<u64>,
     pub code: Option<i32>,
+    /// The line that says why a failed job failed (`panicked at`, `error[`,
+    /// `error:`, `FAILED`); `None` when it did not fail or nothing matches.
+    #[serde(default)]
+    pub cause: Option<String>,
+    /// The stored excerpt of a failed job: the lines before its exit marker,
+    /// escape-free.
+    #[serde(default)]
+    pub excerpt: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -201,6 +218,8 @@ mod tests {
                     started: Some(1_700_000_001),
                     finished: Some(1_700_000_020),
                     code: Some(0),
+                    cause: None,
+                    excerpt: None,
                 },
                 JobView {
                     name: "test".to_owned(),
@@ -211,6 +230,8 @@ mod tests {
                     started: None,
                     finished: None,
                     code: None,
+                    cause: Some("error: boom".to_owned()),
+                    excerpt: Some("error: boom".to_owned()),
                 },
             ],
         }
@@ -242,6 +263,14 @@ mod tests {
                 job: "build".to_owned(),
             },
             CiRequest::CloseTranscript { terminal: 12 },
+            CiRequest::Rerun {
+                repo: "griasdi".to_owned(),
+                number: 7,
+            },
+            CiRequest::Cancel {
+                repo: "griasdi".to_owned(),
+                number: 7,
+            },
         ];
         for request in requests {
             assert_eq!(CiRequest::decode(&request.encode()), Some(request));
@@ -289,6 +318,7 @@ mod tests {
             CiReply::Pipeline { pipeline: None },
             CiReply::Transcript { terminal: 9 },
             CiReply::Closed,
+            CiReply::Accepted,
             CiReply::Error {
                 message: "no such job".to_owned(),
             },
