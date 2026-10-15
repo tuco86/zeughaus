@@ -243,6 +243,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A CI view says when the CI does not answer (an error, or no report for
   15 s) and that what it shows is the last report, instead of showing stale
   runners and pipelines as current.
+- The status bar names a failing node only while a graph is focused, behind
+  an error glyph instead of `ERROR:`, in a colour that reads on the chrome.
+  Sidebar labels end in an ellipsis at 21 characters instead of a glyph cut
+  at the sidebar's edge.
 
 ### Removed
 

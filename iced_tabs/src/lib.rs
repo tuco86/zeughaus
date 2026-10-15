@@ -46,6 +46,11 @@ pub enum Placement {
 /// other tabs.
 pub const MAX_LABEL_CHARS: usize = 32;
 
+/// The same at the left, where the bar is as narrow as the app makes it:
+/// what fits a sidebar of about 180 logical pixels at the labels' size,
+/// so a long label ends in an ellipsis instead of a glyph cut in half.
+pub const MAX_SIDEBAR_LABEL_CHARS: usize = 21;
+
 /// Thickness of the gap before every item, drawn in the marker colour when
 /// a drop would land there. The gap is always there, so showing the marker
 /// never moves an item out from under the cursor.
@@ -980,9 +985,13 @@ where
                 .on_press((self.handlers.on_toggle_section)(id.clone())),
         );
         title = title.push(
-            container(text(shorten(label)).size(12).wrapping(Wrapping::None))
-                .width(self.fill_left())
-                .clip(true),
+            container(
+                text(shorten(label, self.label_limit()))
+                    .size(12)
+                    .wrapping(Wrapping::None),
+            )
+            .width(self.fill_left())
+            .clip(true),
         );
         let mut buttons = Row::new().spacing(4).align_y(Alignment::Center);
         for control in controls {
@@ -1165,9 +1174,13 @@ where
             Some(editor) => container(editor).width(self.fill_left()).into(),
             None => Element::from(
                 mouse_area(
-                    container(text(shorten(label)).size(12).wrapping(Wrapping::None))
-                        .width(self.fill_left())
-                        .clip(true),
+                    container(
+                        text(shorten(label, self.label_limit()))
+                            .size(12)
+                            .wrapping(Wrapping::None),
+                    )
+                    .width(self.fill_left())
+                    .clip(true),
                 )
                 .on_press(press.clone())
                 .on_double_click((handlers.on_rename_group)(section.clone(), id.clone())),
@@ -1240,9 +1253,13 @@ where
         let width = if fill { Length::Fill } else { Length::Shrink };
         content = content.push(match editor {
             Some(editor) => container(editor).width(width),
-            None => container(text(shorten(tab.label)).size(13).wrapping(Wrapping::None))
-                .width(width)
-                .clip(true),
+            None => container(
+                text(shorten(tab.label, self.label_limit()))
+                    .size(13)
+                    .wrapping(Wrapping::None),
+            )
+            .width(width)
+            .clip(true),
         });
         if tab.closable {
             // One class per tab: resolving it per draw would allocate every
@@ -1368,6 +1385,14 @@ where
         }
     }
 
+    /// How many characters of a label the bar shows before an ellipsis.
+    fn label_limit(&self) -> usize {
+        match self.placement {
+            Placement::Top => MAX_LABEL_CHARS,
+            Placement::Left => MAX_SIDEBAR_LABEL_CHARS,
+        }
+    }
+
     fn fill_left(&self) -> Length {
         match self.placement {
             Placement::Top => Length::Shrink,
@@ -1407,15 +1432,15 @@ fn container_style(style: Style) -> container::Style {
     }
 }
 
-/// `label` as shown: whole up to [`MAX_LABEL_CHARS`], else its first
-/// characters and an ellipsis, [`MAX_LABEL_CHARS`] in all.
-fn shorten(label: Cow<'_, str>) -> Cow<'_, str> {
-    if label.chars().nth(MAX_LABEL_CHARS).is_none() {
+/// `label` as shown: whole up to `limit` characters, else its first
+/// characters and an ellipsis, `limit` in all.
+fn shorten(label: Cow<'_, str>, limit: usize) -> Cow<'_, str> {
+    if label.chars().nth(limit).is_none() {
         return label;
     }
     let cut = label
         .char_indices()
-        .nth(MAX_LABEL_CHARS - 1)
+        .nth(limit.saturating_sub(1))
         .map_or(label.len(), |(at, _)| at);
     let mut short = label[..cut].trim_end().to_owned();
     short.push('\u{2026}');
@@ -1680,11 +1705,14 @@ mod tests {
     #[test]
     fn a_long_label_is_cut_to_the_limit_with_an_ellipsis() {
         let exact = "x".repeat(MAX_LABEL_CHARS);
-        assert!(matches!(shorten(Cow::Borrowed(&exact)), Cow::Borrowed(_)));
+        assert!(matches!(
+            shorten(Cow::Borrowed(&exact), MAX_LABEL_CHARS),
+            Cow::Borrowed(_)
+        ));
 
         // Multi-byte characters are counted as characters, never split.
         let long = "\u{00e4}".repeat(MAX_LABEL_CHARS + 1);
-        let short = shorten(Cow::Borrowed(&long));
+        let short = shorten(Cow::Borrowed(&long), MAX_LABEL_CHARS);
         assert_eq!(short.chars().count(), MAX_LABEL_CHARS);
         assert!(short.ends_with('\u{2026}'));
     }

@@ -2238,8 +2238,15 @@ impl App {
     fn status_bar(&self) -> Element<'_, Message, Theme> {
         // Node errors are not computed here -- they arrive with the
         // runtime's published state, like every other value.
+        let graph_focused = self.workspace.focused_graph().is_some();
         let error = {
-            let node_error = self.node_error_summary();
+            // A failing node is news in front of its graph; in a terminal or
+            // a CI tab it is noise that hides what matters there.
+            let node_error = if graph_focused {
+                self.node_error_summary()
+            } else {
+                String::new()
+            };
             if node_error.is_empty() {
                 self.last_error.clone()
             } else {
@@ -2278,13 +2285,16 @@ impl App {
             line = line.push(text(segment).size(12).color(self.theme.muted()));
         }
         if let Some(hint) = hint {
-            line = line.push(text(hint).size(12).color(self.theme.hint()));
-        } else if !error.is_empty() {
             line = line.push(
-                text(format!("ERROR: {error}"))
+                text(hint)
                     .size(12)
-                    .color(self.theme.error()),
+                    .color(self.theme.readable(self.theme.hint())),
             );
+        } else if !error.is_empty() {
+            line = line.push(status_error(
+                &error,
+                self.theme.readable(self.theme.error()),
+            ));
         }
 
         container(line)
@@ -2911,6 +2921,29 @@ fn pane_grip<'a>(title: String, pane: PaneRef) -> pane_grid::TitleBar<'a, Messag
         text_color: Some(theme.muted()),
         ..Default::default()
     })
+}
+
+/// The status bar's error: the codicon error glyph before the words; the
+/// browser editor, without the icon font, says `Error:`.
+fn status_error(error: &str, color: iced::Color) -> Element<'static, Message, Theme> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        row![
+            text('\u{ea87}'.to_string())
+                .font(iced_terminal::FONT)
+                .size(19)
+                .line_height(iced::widget::text::LineHeight::Absolute(12.0.into()))
+                .color(color),
+            text(error.to_owned()).size(12).color(color),
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center)
+        .into()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        text(format!("Error: {error}")).size(12).color(color).into()
+    }
 }
 
 /// What covers a pane while something is dragged: it reports which side of
