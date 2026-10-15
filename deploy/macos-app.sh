@@ -4,8 +4,7 @@
 #   deploy/macos-app.sh [destination [target-triple]]
 #
 # destination defaults to ~/Applications. With a target triple the editor is
-# built for it (`--target`), which is how one Apple silicon host builds both
-# macOS architectures.
+# built for it (`--target`).
 #
 # A macOS app has its icon and its name in the Info.plist of the bundle it
 # runs in; a plain binary has neither, which is why `cargo run` shows the

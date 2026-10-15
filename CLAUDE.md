@@ -253,9 +253,9 @@ cron (`0 3 * * *`) also run one build job per platform, each packing
 `zeughaus-<version>-<platform>.tar.gz` (`.zip` on Windows) into its output:
 `linux-amd64` (tuco-pc, in the `trixie` image) and `linux-arm64` (atik, the
 same image in an Apple `container`), `windows-amd64` (the `win11` VM),
-`darwin-arm64` and `darwin-amd64` (both on atik's host; the editor as
+`darwin-arm64` (atik's host; the editor as
 `Zeughaus.app` through `deploy/macos-app.sh`). `.zeughaus-ci/build.sh` is
-their shared helper. `publish.sh` runs on sadala after the gate and all five,
+their shared helper. `publish.sh` runs on sadala after the gate and all four,
 bundles and signs them (the `zeughaus-runner` of the `linux-arm64` archive is
 the tool) and publishes into `/var/www/zeughaus-updates/<channel>/<build>/`
 with `latest` naming the newest; the two newest builds of a channel stay.

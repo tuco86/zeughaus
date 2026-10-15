@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- The `darwin-amd64` release archive: Apple's macOS releases after 26
+  run on Apple silicon only. An Intel Mac runner logs that no release is
+  built for its platform and stops looking for updates; one built from
+  this version refuses a manifest that still lists `darwin-amd64`.
+
 ## [0.2.0] - 2026-10-15
 
 ### Added

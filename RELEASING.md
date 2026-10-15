@@ -82,7 +82,7 @@ git push origin main vX.Y.Z
 git push github main vX.Y.Z
 ```
 
-The push of `vX.Y.Z` to Forgejo starts the CI's `release` channel: the five
+The push of `vX.Y.Z` to Forgejo starts the CI's `release` channel: the four
 platform archives are built, signed and published to
 `https://zeughaus.doodleshnookie.net/updates/release/`, and attached with
 `manifest.json`, `manifest.sig` and `SHA256SUMS` to the GitHub release

@@ -21,12 +21,9 @@ else
     git clone -q --branch main "$url" "$weida"
 fi
 unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_TERMINAL_PROMPT FORGEJO_READ_TOKEN
-# Host jobs of one repo on one runner share the parent directory, so two of
-# them (darwin-arm64 and darwin-amd64 on atik) race for this link; BSD `ln
-# -sf` then fails with EEXIST. The loser builds against the winner's checkout,
-# fetched from the same branch moments apart.
+# Host jobs of one repo on one runner share the parent directory. The only
+# host job that builds is darwin-arm64, and a workspace runs one job at a time,
+# so nothing else writes this link meanwhile.
 link="$CI_WORKSPACE/../weida"
-if ! ln -sfn "$weida" "$link" 2>/dev/null; then
-    [ -d "$link/.git" ] || ln -sfn "$weida" "$link"
-fi
+ln -sfn "$weida" "$link"
 echo "weida $(git -C "$link" log --oneline -1)"

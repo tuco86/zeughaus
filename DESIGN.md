@@ -1101,8 +1101,8 @@ there.
 **Releases and the updater.** zeughaus's own `.zeughaus-ci/` produces the
 releases its installed runners follow. Per platform one build job, named
 after it, builds the editor and the runner in a full build on its own
-platform, with no cross compilation of Rust code except macOS's second
-architecture, and packs `zeughaus-<version>-<platform>.tar.gz` (`.zip` on
+platform, with no cross compilation of Rust code, and packs
+`zeughaus-<version>-<platform>.tar.gz` (`.zip` on
 Windows) into `CI_OUTPUT`, with the workspace version and `LICENSE-*` in a
 top directory `zeughaus-<version>-<platform>/`. The build number
 `CI_PIPELINE` is compiled in as `ZEUGHAUS_BUILD`; a binary made anywhere else
@@ -1114,8 +1114,7 @@ has build 0.
 | `linux-arm64` | `linux-arm64` | atik, the same Containerfile in an Apple `container` |
 | `windows-amd64` | `windows-amd64` | the `win11` VM, `freeze` |
 | `darwin-arm64` | `darwin-arm64` | atik's host; the editor as `Zeughaus.app` (`deploy/macos-app.sh`) and the runner |
-| `darwin-amd64` | `darwin-amd64` | atik's host, cross built (`--target x86_64-apple-darwin`) |
-| `publish` | - | `machine = "sadala"`, needs the gate and all five |
+| `publish` | - | `machine = "sadala"`, needs the gate and all four |
 
 The Linux archives also hold `zeughaus-ci`; the updater never installs it.
 `build.sh` (no header, so a helper) is sourced by the Unix build jobs and by
@@ -1124,7 +1123,7 @@ tag and the cron `0 3 * * *`; the gate also runs on every other push.
 
 `publish.sh` needs an aarch64 host: it extracts `zeughaus-runner` from the
 `linux-arm64` archive and runs `zeughaus-runner release bundle` over the
-five archives, then `release verify`. The directory it makes holds the
+four archives, then `release verify`. The directory it makes holds the
 archives, `manifest.json` (format 1: channel, build, version, commit, and
 per platform file, size and SHA-256), `manifest.sig` (the raw Ed25519
 signature of those exact bytes) and `SHA256SUMS`. Its channel follows the
@@ -1160,7 +1159,8 @@ updater. One thread waits 10 s, then looks every 60 s at
 `<url>/<channel>/latest` with `curl`. A number above the binary's own build
 starts an attempt in `<state-dir>/updates/<build>/`: manifest and signature,
 then the archive of the host's platform (`linux-amd64`, `linux-arm64`,
-`darwin-arm64`, `darwin-amd64`), unpacked with `tar`. Nothing outside
+`darwin-arm64`; an Intel Mac has none and logs that it does not update),
+unpacked with `tar`. Nothing outside
 `updates/` changes before every check has passed. Then the runner file is
 replaced by a rename of a copy written next to it, together with the editor
 installed beside it: `zeughaus` in the runner's directory on Linux,

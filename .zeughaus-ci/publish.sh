@@ -1,6 +1,6 @@
 #!/bin/bash
 # /// ci
-# needs = ["gate", "linux-amd64", "linux-arm64", "windows-amd64", "darwin-arm64", "darwin-amd64"]
+# needs = ["gate", "linux-amd64", "linux-arm64", "windows-amd64", "darwin-arm64"]
 # machine = "sadala"
 # cache = [".ci-cache"]
 # secrets = ["ZEUGHAUS_UPDATE_KEY", "ZEUGHAUS_GITHUB_TOKEN"]
@@ -10,7 +10,7 @@
 # GITHUB_REPO = "tuco86/zeughaus"
 # UPDATES_DIR = "/var/www/zeughaus-updates"
 # ///
-# Collects the five platform archives into one signed release bundle and
+# Collects the four platform archives into one signed release bundle and
 # publishes it: to the update channel the installed runners poll (Caddy
 # serves $UPDATES_DIR under /updates/), and for cron and tag events also as a
 # GitHub release. Runs no cargo: the bundling tool is the zeughaus-runner of
@@ -37,7 +37,7 @@ fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-platforms="linux-amd64 linux-arm64 windows-amd64 darwin-arm64 darwin-amd64"
+platforms="linux-amd64 linux-arm64 windows-amd64 darwin-arm64"
 mkdir "$work/files"
 for p in $platforms; do
     dir="$CI_INPUTS/$p"

@@ -26,8 +26,7 @@ pub const FORMAT: u32 = 1;
 
 /// The platforms a release has an archive for, as `<os>-<arch>` with the
 /// names the release uses (not those of `std::env::consts`).
-pub const PLATFORMS: [&str; 5] = [
-    "darwin-amd64",
+pub const PLATFORMS: [&str; 4] = [
     "darwin-arm64",
     "linux-amd64",
     "linux-arm64",
@@ -277,7 +276,6 @@ fn platform_of(os: &str, arch: &str) -> Option<&'static str> {
         ("linux", "x86_64") => "linux-amd64",
         ("linux", "aarch64") => "linux-arm64",
         ("macos", "aarch64") => "darwin-arm64",
-        ("macos", "x86_64") => "darwin-amd64",
         ("windows", "x86_64") => "windows-amd64",
         _ => return None,
     })
@@ -604,12 +602,12 @@ mod tests {
             ("linux", "x86_64", "linux-amd64"),
             ("linux", "aarch64", "linux-arm64"),
             ("macos", "aarch64", "darwin-arm64"),
-            ("macos", "x86_64", "darwin-amd64"),
             ("windows", "x86_64", "windows-amd64"),
         ] {
             assert_eq!(platform_of(os, arch), Some(platform));
             assert!(PLATFORMS.contains(&platform));
         }
+        assert_eq!(platform_of("macos", "x86_64"), None);
         assert_eq!(platform_of("linux", "riscv64"), None);
         assert_eq!(platform_of("freebsd", "x86_64"), None);
     }
