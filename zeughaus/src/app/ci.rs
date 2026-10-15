@@ -59,6 +59,8 @@ const PAGE: u32 = 20;
 /// How old the last overview may be before a view says the CI is silent:
 /// three rounds of the five-second clock.
 const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
+/// The widest a channel's list grows.
+const LIST_MAX_WIDTH: f32 = 1200.0;
 
 /// Set on a view's id for the split that holds its transcript and, with the
 /// next bit, for the pane of that transcript. Views, tabs and groups are
@@ -1557,7 +1559,10 @@ impl App {
     ) -> Element<'a, Message, Theme> {
         responsive(move |size| {
             let now = now();
-            let mut list = column![].width(Length::Fill);
+            // A wide window gets a list as wide as reads well, its times
+            // within reach of its subjects, not across the screen.
+            let size = Size::new(size.width.min(LIST_MAX_WIDTH), size.height);
+            let mut list = column![].width(Length::Fill).max_width(LIST_MAX_WIDTH);
             for (at, shown) in state.pipelines.iter().enumerate() {
                 if at > 0 {
                     list = list.push(rule::horizontal(1));
