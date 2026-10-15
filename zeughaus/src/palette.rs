@@ -306,6 +306,27 @@ fn close_button<'a>() -> Element<'a, Message, Theme> {
         .into()
 }
 
+/// The palette's list, which [`reveal`] scrolls.
+const LIST_ID: &str = "palette-list";
+
+/// Scrolls the palette's list so that entry `at` of `count` is in view: the
+/// list moves in step with the selection, which keeps the selected row near
+/// where the eye already is.
+pub fn reveal<T: Send + 'static>(at: usize, count: usize) -> iced::Task<T> {
+    let y = if count > 1 {
+        at as f32 / (count - 1) as f32
+    } else {
+        0.0
+    };
+    iced::widget::operation::snap_to(
+        LIST_ID,
+        iced::widget::scrollable::RelativeOffset {
+            x: None,
+            y: Some(y),
+        },
+    )
+}
+
 /// Render the command palette: a full-window scrim, which a click dismisses,
 /// over one panel at the top.
 pub fn view<'a>(
@@ -404,7 +425,7 @@ pub fn view<'a>(
     let header = row![search, close_button()]
         .spacing(SP_2)
         .align_y(Alignment::Center);
-    let list = container(scrollable(rows).spacing(SP_2)).max_height(LIST_HEIGHT);
+    let list = container(scrollable(rows).id(LIST_ID).spacing(SP_2)).max_height(LIST_HEIGHT);
     let panel = container(column![header, list].spacing(SP_2).padding(SP_2))
         .max_width(PANEL_WIDTH)
         .style(|theme: &Theme| container::Style {

@@ -166,6 +166,8 @@ struct ChannelState {
     acting: HashSet<u64>,
     /// What the last rerun or cancel came to.
     notice: Option<Notice>,
+    /// The pipeline the arrow keys are on, which Enter opens or closes.
+    cursor: Option<u64>,
 }
 
 /// The answer to a rerun or a cancel, said in the toolbar until the next.
@@ -307,7 +309,25 @@ impl ChannelState {
             toggled: HashSet::new(),
             acting: HashSet::new(),
             notice: None,
+            cursor: None,
         }
+    }
+
+    /// Moves the cursor `step` pipelines down the list (up when negative),
+    /// stopping at either end; a list without a cursor starts at its top.
+    fn step(&mut self, step: isize) {
+        let numbers: Vec<u64> = self.pipelines.iter().map(|s| s.pipeline.number).collect();
+        if numbers.is_empty() {
+            return;
+        }
+        let at = match self
+            .cursor
+            .and_then(|c| numbers.iter().position(|&n| n == c))
+        {
+            Some(at) => (at as isize + step).clamp(0, numbers.len() as isize - 1) as usize,
+            None => 0,
+        };
+        self.cursor = Some(numbers[at]);
     }
 
     /// Whether the pipeline at `at` in the list shows its jobs: the newest
@@ -1104,6 +1124,32 @@ impl App {
             .is_some_and(ChannelState::ticking)
     }
 
+    /// The channel view in front, if the tab in front is one.
+    fn front_channel(&mut self) -> Option<&mut ChannelState> {
+        let front = self.workspace.active_tab()?.clone();
+        let runner = front.runner.ci_runner()?;
+        self.ci.get_mut(&runner)?.views.get_mut(&front.tab.0)
+    }
+
+    /// Up and Down in front of a CI list move its cursor.
+    pub(super) fn step_front_ci_cursor(&mut self, step: isize) -> Task<Message> {
+        if let Some(state) = self.front_channel() {
+            state.step(step);
+        }
+        Task::none()
+    }
+
+    /// Enter in front of a CI list opens or closes the pipeline under its
+    /// cursor.
+    pub(super) fn toggle_front_ci_cursor(&mut self) -> Task<Message> {
+        if let Some(state) = self.front_channel()
+            && let Some(number) = state.cursor
+        {
+            state.toggle(number);
+        }
+        Task::none()
+    }
+
     /// Closes the log beside the CI list in front, if one is open: what
     /// Escape does when nothing nearer took it.
     pub(super) fn close_front_ci_log(&mut self) -> Task<Message> {
@@ -1517,10 +1563,11 @@ impl App {
         let pipeline = &shown.pipeline;
         let open = state.is_open(at, pipeline);
         let number = pipeline.number;
+        let cursor = state.cursor == Some(number);
         let row = button(self.pipeline_row(pipeline, open, size, now))
             .width(Length::Fill)
             .padding([SP_3, SP_4])
-            .style(row_style)
+            .style(move |theme: &Theme, status| row_style(theme, status, cursor))
             .on_press_with(move || Message::Ci(runner.clone(), CiMsg::Toggle { view, number }));
         if !open {
             return row.into();
@@ -2144,8 +2191,9 @@ fn secondary_style(theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
-/// A pipeline's row: flat, a shade lighter under the pointer.
-fn row_style(theme: &Theme, status: button::Status) -> button::Style {
+/// A pipeline's row: flat, a shade lighter under the pointer, and outlined
+/// in the accent while the arrow keys are on it.
+fn row_style(theme: &Theme, status: button::Status, cursor: bool) -> button::Style {
     let palette = theme.extended();
     let background = match status {
         button::Status::Hovered => Some(palette.background.weakest.color.into()),
@@ -2155,6 +2203,15 @@ fn row_style(theme: &Theme, status: button::Status) -> button::Style {
     button::Style {
         background,
         text_color: palette.background.base.text,
+        border: if cursor {
+            iced::Border {
+                color: palette.primary.base.color,
+                width: 1.0,
+                radius: RADIUS.into(),
+            }
+        } else {
+            iced::Border::default()
+        },
         ..button::Style::default()
     }
 }
@@ -2422,9 +2479,9 @@ mod tests {
     }
 
     /// The newest pipeline and running ones are open until the user closes
-    /// them; any other opens on demand.
+    /// them; any other opens on demand; the arrow keys walk the list.
     #[test]
-    fn a_pipeline_is_open_by_default_when_newest_or_running_and_toggles() {
+    fn pipelines_open_by_default_toggle_and_take_the_cursor() {
         let pipeline = |number: u64, status: &str, finished: Option<u64>| PipelineView {
             repo: "r".to_owned(),
             number,
@@ -2453,6 +2510,18 @@ mod tests {
         assert!(state.is_open(2, &old));
         state.toggle(7);
         assert!(!state.is_open(2, &old));
+
+        // The arrow keys start at the top and stop at either end.
+        state.pipelines = [newest, running, old].into_iter().map(Shown::new).collect();
+        state.step(1);
+        assert_eq!(state.cursor, Some(9));
+        state.step(1);
+        state.step(5);
+        assert_eq!(state.cursor, Some(7));
+        state.step(-1);
+        assert_eq!(state.cursor, Some(8));
+        state.step(-9);
+        assert_eq!(state.cursor, Some(9));
     }
 
     /// A repository taken out of the runner's configuration leaves the tab

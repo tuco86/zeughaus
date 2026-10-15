@@ -1244,6 +1244,12 @@ impl App {
                 }
             }
             Message::PaletteConfirm => {
+                if !self.palette_open {
+                    // Enter outside the palette opens or closes the pipeline
+                    // under a CI list's cursor.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    return self.toggle_front_ci_cursor();
+                }
                 if let Some(msg) = self.palette_confirm() {
                     return self.update(msg);
                 }
@@ -1253,6 +1259,21 @@ impl App {
             }
             Message::PaletteNavigate(idx) => {
                 self.palette_selected = idx;
+            }
+            Message::KeyStep(step) => {
+                if self.palette_open {
+                    let count =
+                        iced_palette::filter_commands(&self.palette_input, &self.palette_commands)
+                            .len();
+                    if count > 0 {
+                        let at = (self.palette_selected as isize + step).rem_euclid(count as isize);
+                        self.palette_selected = at as usize;
+                        return crate::palette::reveal(self.palette_selected, count);
+                    }
+                    return Task::none();
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                return self.step_front_ci_cursor(step);
             }
             Message::SpawnNode { type_id } => {
                 if self.current_graph == NodeId(0) {
@@ -2600,6 +2621,14 @@ impl App {
                     }
                     keyboard::Key::Named(keyboard::key::Named::Enter) => {
                         return Some(Message::PaletteConfirm);
+                    }
+                    keyboard::Key::Named(keyboard::key::Named::ArrowUp) if modifiers.is_empty() => {
+                        return Some(Message::KeyStep(-1));
+                    }
+                    keyboard::Key::Named(keyboard::key::Named::ArrowDown)
+                        if modifiers.is_empty() =>
+                    {
+                        return Some(Message::KeyStep(1));
                     }
                     _ => {}
                 }

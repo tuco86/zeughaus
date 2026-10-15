@@ -237,6 +237,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   above and below. The window's minimize, maximize (restore while
   maximized) and close buttons and the tab bar's placement toggle are
   codicons; the toggle shows where the tabs go and says so on hover.
+- Up and Down move the command palette's selection and keep it in view;
+  with the palette closed they walk a CI list in front (the row under the
+  cursor is outlined) and Enter opens or closes that pipeline.
 
 ### Removed
 

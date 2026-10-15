@@ -113,6 +113,10 @@ pub enum Message {
     PaletteConfirm,
     PaletteCancel,
     PaletteNavigate(usize),
+    /// Up (-1) or Down (+1) with no modifier: the palette's selection while
+    /// it is open, else the pipeline cursor of a CI list in front. Emitted
+    /// for every such key, since the subscription cannot see either.
+    KeyStep(isize),
     // Spawning
     SpawnNode {
         type_id: String,
