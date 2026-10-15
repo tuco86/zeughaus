@@ -240,6 +240,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Up and Down move the command palette's selection and keep it in view;
   with the palette closed they walk a CI list in front (the row under the
   cursor is outlined) and Enter opens or closes that pipeline.
+- A CI view says when the CI does not answer (an error, or no report for
+  15 s) and that what it shows is the last report, instead of showing stale
+  runners and pipelines as current.
 
 ### Removed
 

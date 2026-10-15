@@ -56,6 +56,9 @@ const RUNNERS: u64 = 1;
 /// Pipelines asked for at a time: a channel's first page, and each page
 /// "Load older" adds.
 const PAGE: u32 = 20;
+/// How old the last overview may be before a view says the CI is silent:
+/// three rounds of the five-second clock.
+const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Set on a view's id for the split that holds its transcript and, with the
 /// next bit, for the pane of that transcript. Views, tabs and groups are
@@ -131,6 +134,9 @@ pub(super) struct CiClient {
     /// change arrived meanwhile: a reply older than the last event would
     /// otherwise be the last word.
     fetching: HashMap<(String, u64), bool>,
+    /// When the last overview arrived: a CI that went away leaves its
+    /// request waiting, not failing, so the age is what tells.
+    last_overview: Option<std::time::Instant>,
 }
 
 /// A repository: its group in the tab bar and the views of its channels.
@@ -452,6 +458,7 @@ impl CiClient {
             repos: BTreeMap::new(),
             views: BTreeMap::new(),
             fetching: HashMap::new(),
+            last_overview: None,
         }
     }
 
@@ -571,6 +578,7 @@ impl CiClient {
         match result {
             Ok(overview) => {
                 self.error = None;
+                self.last_overview = Some(std::time::Instant::now());
                 // Sorted, so that the same channels get the same ids in every
                 // session: a restart brings the tab in front back.
                 let mut channels: Vec<(&str, &str)> = overview
@@ -1294,9 +1302,35 @@ impl App {
             return self.runners_view(runner, client);
         }
         match client.views.get(&view) {
-            Some(state) => self.channel_view(runner, view, state),
+            Some(state) => self.channel_view(runner, client, view, state),
             None => unavailable("CI", "This view is gone."),
         }
+    }
+
+    /// A warning glyph and the reason, while the CI does not answer and the
+    /// view shows what it last reported: its last error, or a report older
+    /// than a few rounds of the clock (a request to a CI that is gone waits
+    /// for the redial rather than failing). The detail is on hover.
+    fn stale<'a>(&'a self, client: &'a CiClient) -> Option<Element<'a, Message, Theme>> {
+        let detail = match (&client.error, client.last_overview) {
+            (Some(error), _) => error.clone(),
+            (None, Some(at)) if at.elapsed() > STALE_AFTER => {
+                format!("No answer for {}", duration(at.elapsed().as_secs()))
+            }
+            _ => return None,
+        };
+        let color = self.theme.readable(self.theme.hint());
+        Some(tip(
+            row![
+                icon(glyph::WARNING, TEXT_SM, color),
+                text("The CI does not answer: this is its last report")
+                    .size(TEXT_SM)
+                    .color(color),
+            ]
+            .spacing(SP_1)
+            .align_y(Alignment::Center),
+            detail,
+        ))
     }
 
     /// The machines the CI runs jobs on: a table under a toolbar, like a
@@ -1321,16 +1355,20 @@ impl App {
             .clone()
             .filter(|machine| !matches!(state_tone(&machine.status), Tone::Wait))
             .count();
-        let toolbar = row![
+        let mut toolbar = row![
             text("Runners").size(TEXT_MD),
             text(format!("{online} of {} online", runners.count()))
                 .size(TEXT_SM)
                 .color(muted),
+            Space::new().width(Length::Fill),
         ]
         .spacing(SP_3)
         .align_y(Alignment::Center)
         .padding([SP_2, SP_4])
         .height(TOOLBAR_HEIGHT);
+        if let Some(stale) = self.stale(client) {
+            toolbar = toolbar.push(stale);
+        }
         let head = |label: &'static str| text(label).size(TEXT_SM).color(muted);
         let mut table = column![
             row![
@@ -1441,6 +1479,7 @@ impl App {
     fn channel_view<'a>(
         &'a self,
         runner: &'a RunnerKey,
+        client: &'a CiClient,
         view: u64,
         state: &'a ChannelState,
     ) -> Element<'a, Message, Theme> {
@@ -1455,6 +1494,9 @@ impl App {
         .align_y(Alignment::Center)
         .padding([SP_2, SP_4])
         .height(TOOLBAR_HEIGHT);
+        if let Some(stale) = self.stale(client) {
+            toolbar = toolbar.push(stale);
+        }
         if let Some(notice) = &state.notice {
             let color = if notice.failed {
                 self.theme.error()
@@ -1981,6 +2023,7 @@ mod glyph {
     pub const VM: char = '\u{ea7a}';
     pub const CHEVRON_RIGHT: char = '\u{eab6}';
     pub const DOT: char = '\u{ea71}';
+    pub const WARNING: char = '\u{ea6c}';
 }
 
 /// The bundled face is a Mono Nerd Font, which squeezes every icon into one
