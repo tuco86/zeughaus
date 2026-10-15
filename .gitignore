@@ -9,3 +9,6 @@ recordings/
 
 # Agent working notes; DESIGN.md and CHANGELOG.md are the record.
 plan/
+
+# Headless review captures: screenshots are never committed.
+.impeccable/review/

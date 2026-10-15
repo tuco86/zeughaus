@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::watch;
-use wezterm_term::{Alert, AlertHandler, TerminalSize};
+use wezterm_term::{Alert, AlertHandler};
 use zeughaus_mux::input::MAX_TEXT_BYTES;
 use zeughaus_mux::{
     Controller, Dimensions, ExitState, RowData, StableRange, TerminalCommand, TerminalDelta,
@@ -743,13 +743,7 @@ impl Session {
                 // The model first: it rewraps and reports the damage. The
                 // kernel second: that is what wakes the child with SIGWINCH,
                 // and by then the screen it will draw into is the right one.
-                self.inner.model().terminal_mut().resize(TerminalSize {
-                    rows: size.rows as usize,
-                    cols: size.cols as usize,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                    dpi: 0,
-                });
+                self.inner.model().resize(*size);
                 match &self.inner.io {
                     Io::Local { master, .. } => master
                         .lock()

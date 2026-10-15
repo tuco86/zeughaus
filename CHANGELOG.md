@@ -263,6 +263,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A terminal resized between two lines of a child's output no longer
+  misplaces the next line. WezTerm's rewrap moved a cursor waiting in
+  column zero to the end of the row above (grid grew) or onto it (grid
+  shrank), so a plain log printed its next line's first letter at the right
+  edge and wrapped the rest (`ase 552 ok`), or over the previous line. The
+  cursor now stays in column zero; a shell repainted its prompt on
+  `SIGWINCH` and never showed it.
 - With the tab bar on top, tabs that do not fit are reachable: a thin
   scrollbar shows the overflow, the wheel scrolls the bar sideways, and
   the bar scrolls the active tab into view whenever it changes (also on

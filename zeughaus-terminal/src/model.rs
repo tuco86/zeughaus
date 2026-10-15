@@ -21,6 +21,8 @@
 use std::collections::VecDeque;
 use std::io::Write;
 
+use termwiz::escape::csi::{CSI, Cursor as CursorMove};
+use termwiz::escape::{Action, ControlCode};
 use termwiz::input::KeyboardEncoding;
 use wezterm_term::{CellAttributes, CellRef, Line, Screen, Terminal, TerminalSize};
 use zeughaus_mux::terminal::{MAX_COLS, MAX_LINK_BYTES, MAX_NOTIFICATION_BYTES, MAX_SPAN_BYTES};
@@ -140,6 +142,49 @@ impl Model {
             self.alt_screen = alt_screen;
             self.epoch += 1;
         }
+    }
+
+    /// Resizes the grid and rewraps the primary screen.
+    ///
+    /// A cursor in column zero of a row that does not continue the row above
+    /// is a child that ended a line and has not written the next one. WezTerm
+    /// reads every cursor that lands in column zero of a row below the first
+    /// as the tail of the row above and moves it there after a rewrap: to its
+    /// end when the grid grew, to the same column when it shrank. The child
+    /// knows nothing of that, so its next line starts at the right edge of
+    /// the previous one (the first letter there, the rest wrapped: `ase 552
+    /// ok`) or over it, and nothing repaints the damage: a shell redraws its
+    /// prompt on `SIGWINCH`, a build log does not.
+    ///
+    /// Such a cursor is therefore moved one column right for the resize,
+    /// which changes no cell and takes it out of that rule, and back to
+    /// column zero after it. Both moves are actions rather than bytes, so a
+    /// sequence the child's output left half-parsed is not disturbed.
+    pub(crate) fn resize(&mut self, size: Dimensions) {
+        let cursor = self.terminal.cursor_pos();
+        let waiting = cursor.x == 0
+            && !self.terminal.is_alt_screen_active()
+            && !self.continues_row_above(cursor.y);
+        if waiting {
+            self.terminal
+                .perform_actions(vec![Action::CSI(CSI::Cursor(CursorMove::Right(1)))]);
+        }
+        self.terminal.resize(terminal_size(size));
+        if waiting {
+            self.terminal
+                .perform_actions(vec![Action::Control(ControlCode::CarriageReturn)]);
+        }
+    }
+
+    /// Whether the screen row `y` is where the row above it wrapped to.
+    fn continues_row_above(&self, y: i64) -> bool {
+        let screen = self.terminal.screen();
+        let phys = screen.phys_row(y);
+        phys > 0
+            && screen
+                .lines_in_phys_range(phys - 1..phys)
+                .first()
+                .is_some_and(Line::last_cell_was_wrapped)
     }
 
     /// One keystroke. The legacy encodings are the terminal's own and reach
@@ -1008,5 +1053,62 @@ mod tests {
             vec![TerminalEvent::ControllerChanged(Some(controller.clone()))]
         );
         assert_eq!(fixture.head().controller, Some(controller));
+    }
+
+    /// Every non-empty row of the screen and its scrollback is one whole
+    /// "case N ok", the numbers consecutive.
+    fn assert_whole_case_lines(fixture: &Fixture, context: &str) {
+        let texts: Vec<String> = fixture
+            .head()
+            .rows
+            .iter()
+            .map(text_of)
+            .filter(|text| !text.is_empty())
+            .collect();
+        let mut previous: Option<u32> = None;
+        for text in &texts {
+            let number = text
+                .strip_prefix("case ")
+                .and_then(|rest| rest.strip_suffix(" ok"))
+                .and_then(|number| number.parse::<u32>().ok());
+            assert!(
+                number.is_some(),
+                "{context}: not a whole line: {text:?} in {texts:?}"
+            );
+            if let (Some(before), Some(now)) = (previous, number) {
+                assert_eq!(before + 1, now, "{context}: {texts:?}");
+            }
+            previous = number;
+        }
+    }
+
+    /// A child that has ended a line and not yet written the next one knows
+    /// nothing of a resize: its next line starts wherever the cursor is, so
+    /// the cursor has to stay in column zero of the row after the last line.
+    /// WezTerm moves it to the end of the row above (grid grew) or onto it
+    /// (grid shrank), which put the first letter of the next line at the
+    /// right edge of the previous one and wrapped the rest (`ase 552 ok`).
+    #[test]
+    fn a_resize_between_two_lines_does_not_move_the_next_one() {
+        let grids = [(80u16, 24u16), (120, 39), (142, 39), (60, 10), (120, 37)];
+        for from in grids {
+            for to in grids {
+                if from == to {
+                    continue;
+                }
+                let mut fixture = Fixture::new(from.0, from.1, 1000);
+                for n in 1..=60 {
+                    fixture.feed(&format!("case {n} ok\r\n"));
+                }
+                fixture.model.resize(Dimensions {
+                    cols: to.0,
+                    rows: to.1,
+                });
+                let cursor = fixture.head().cursor;
+                assert_eq!(cursor.x, 0, "{from:?} -> {to:?}: the cursor left column 0");
+                fixture.feed("case 61 ok\r\ncase 62 ok\r\n");
+                assert_whole_case_lines(&fixture, &format!("{from:?} -> {to:?}"));
+            }
+        }
     }
 }
