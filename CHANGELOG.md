@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- CI: a pipeline of an annotated tag runs, reports and releases the commit
+  the tag points at. It carried the tag object's sha from the forge's
+  push, which GitHub refused as a release target, so the `v0.2.0` and
+  `v0.2.1` releases reached the update channel but not GitHub.
+
 ## [0.2.1] - 2026-10-16
 
 ### Fixed

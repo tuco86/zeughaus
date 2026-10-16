@@ -840,26 +840,7 @@ impl Scheduler {
     ) -> Result<Option<Vec<Planned>>, String> {
         let mirror = self.fetch(name, repo)?;
         self.refresh_crons(name, &mirror);
-        let sha = match &event.sha {
-            Some(sha) => {
-                git(
-                    &mirror,
-                    &["cat-file", "-e", &format!("{sha}^{{commit}}")],
-                    &[],
-                )
-                .map_err(|_| format!("commit {sha} is not in the mirror"))?;
-                sha.clone()
-            }
-            None => {
-                let refname = match event.kind {
-                    EventKind::Tag => format!("refs/tags/{}^{{commit}}", event.git_ref),
-                    EventKind::Push | EventKind::Cron => {
-                        format!("refs/heads/{}^{{commit}}", event.git_ref)
-                    }
-                };
-                rev_parse(&mirror, &refname)?
-            }
-        };
+        let sha = event_commit(&mirror, event)?;
         pipeline.sha = Some(sha.clone());
         // Only shown, so a commit git cannot describe leaves it empty.
         pipeline.subject = git(&mirror, &["log", "-1", "--format=%s", &sha], &[])
@@ -2006,6 +1987,25 @@ fn rev_parse(mirror: &Path, rev: &str) -> Result<String, String> {
         .map_err(|_| format!("{rev} does not exist"))
 }
 
+/// The commit an event names. A forge reports an annotated tag's push with
+/// the tag object's sha, which is no commit: jobs check out, statuses and
+/// releases point at the commit it peels to.
+fn event_commit(mirror: &Path, event: &CiEvent) -> Result<String, String> {
+    match &event.sha {
+        Some(sha) => rev_parse(mirror, &format!("{sha}^{{commit}}"))
+            .map_err(|_| format!("commit {sha} is not in the mirror")),
+        None => {
+            let refname = match event.kind {
+                EventKind::Tag => format!("refs/tags/{}^{{commit}}", event.git_ref),
+                EventKind::Push | EventKind::Cron => {
+                    format!("refs/heads/{}^{{commit}}", event.git_ref)
+                }
+            };
+            rev_parse(mirror, &refname)
+        }
+    }
+}
+
 /// The `.zeughaus-ci/` files of a commit: (name, text) of every job or helper file,
 /// and the names of the Containerfiles.
 type CiFiles = (Vec<(String, String)>, Vec<String>);
@@ -2085,6 +2085,46 @@ mod tests {
             channel: channel.to_owned(),
             cancelled: false,
         }
+    }
+
+    #[test]
+    fn an_annotated_tag_event_runs_the_commit_it_points_at() {
+        let repo = scratch("peel");
+        let run = |args: &[&str]| {
+            git(
+                &repo,
+                args,
+                &[
+                    ("GIT_AUTHOR_NAME".to_owned(), "t".to_owned()),
+                    ("GIT_AUTHOR_EMAIL".to_owned(), "t@t".to_owned()),
+                    ("GIT_COMMITTER_NAME".to_owned(), "t".to_owned()),
+                    ("GIT_COMMITTER_EMAIL".to_owned(), "t@t".to_owned()),
+                ],
+            )
+            .expect("git")
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "release"]);
+        run(&["tag", "-a", "v1.0.0", "-m", "Release 1.0.0"]);
+        let commit = run(&["rev-parse", "HEAD"]).trim().to_owned();
+        let tag_object = run(&["rev-parse", "v1.0.0"]).trim().to_owned();
+        assert_ne!(
+            commit, tag_object,
+            "an annotated tag is an object of its own"
+        );
+
+        let mut event = pipeline("release").event;
+        event.kind = EventKind::Tag;
+        event.git_ref = "v1.0.0".to_owned();
+        // As the forge reports the push, and as `zeughaus-ci run` names it.
+        event.sha = Some(tag_object);
+        assert_eq!(event_commit(&repo, &event), Ok(commit.clone()));
+        event.sha = None;
+        assert_eq!(event_commit(&repo, &event), Ok(commit));
+
+        event.sha = Some("0".repeat(40));
+        assert!(event_commit(&repo, &event).is_err());
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
