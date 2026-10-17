@@ -324,15 +324,18 @@ bundles the platform archives into a signed release directory
 `ZEUGHAUS_UPDATE_KEY`, never from an argument) and checks one.
 
 This repository is one of its repos: every push to Forgejo runs
-`.zeughaus-ci/gate.sh` (the gate below, in the `.zeughaus-ci/arch.Containerfile`
+`.zeughaus-ci/gate.sh` (the gate below, in the `.zeughaus-ci/trixie.Containerfile`
 image, against weida's `main` as the sibling checkout) and posts
 `zeughaus/gate` on the commit. A push to `main`, a `v*` tag and the nightly
 cron (`0 3 * * *`) also run one build job per platform, each packing
 `zeughaus-<version>-<platform>.tar.gz` (`.zip` on Windows) into its output:
-`linux-amd64` (tuco-pc, in the `trixie` image) and `linux-arm64` (atik, the
+`linux-amd64` (tuco-pc, in the `trixie` image, after the gate in the same
+`linux` context, so it builds in the gate's warm workspace) and `linux-arm64` (atik, the
 same image in an Apple `container`), `windows-amd64` (the `wohnzimmer` runner's host),
 `darwin-arm64` (atik's host; the editor as
-`Zeughaus.app` through `deploy/macos-app.sh`). `.zeughaus-ci/build.sh` is
+`Zeughaus.app` through `deploy/macos-app.sh`). The `nightly` and `release`
+channels are `clean`: their pipelines start from empty workspaces.
+`.zeughaus-ci/build.sh` is
 their shared helper. `publish.sh` runs on sadala after the gate and all four,
 bundles and signs them (the `zeughaus-runner` of the `linux-arm64` archive is
 the tool) and publishes into `/var/www/zeughaus-updates/<channel>/<build>/`

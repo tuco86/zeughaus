@@ -2,7 +2,8 @@
 # /// ci
 # on = ["push *", "tag v*", "cron 0 3 * * *"]
 # platform = "linux-amd64"
-# image = "arch"
+# image = "trixie"
+# context = "linux"
 # cache = [".ci-cache"]
 # secrets = ["FORGEJO_READ_TOKEN"]
 # when_busy = "freeze"
