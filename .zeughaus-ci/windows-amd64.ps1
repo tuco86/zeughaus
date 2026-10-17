@@ -1,13 +1,12 @@
 # /// ci
 # on = ["push main", "tag v*", "cron 0 3 * * *"]
-# platform = "windows-amd64"
+# machine = "wohnzimmer"
 # cache = [".ci-cache"]
 # secrets = ["FORGEJO_READ_TOKEN"]
-# when_busy = "freeze"
 # timeout_minutes = 180
 # ///
-# The windows-amd64 release archive: editor and runner built in the Windows
-# VM, zipped into the job's output for publish.sh.
+# The windows-amd64 release archive: editor and runner built on the Windows
+# runner, zipped into the job's output for publish.sh.
 $ErrorActionPreference = 'Stop'
 
 # Runs a native command and ends the script with its exit code when it fails.
