@@ -380,6 +380,7 @@ forge = "none"
             cron: None,
             actor: "t".into(),
             delivery: None,
+            upload: None,
             received: 0,
         }
     }

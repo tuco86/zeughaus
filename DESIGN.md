@@ -780,7 +780,9 @@ scheduler moves each inbox file to
 `ci/queue/<repo>.<kind>.<hash(ref, cron)>.json`, overwriting what waits
 there. A newer push to a ref therefore replaces the one queued behind a
 running pipeline and never cancels the running one. Without `--hook` the
-service has no HTTP listener and pipelines come from `run` and cron.
+service has no HTTP listener and pipelines come from `run`, cron and try
+uploads (**Try runs**, whose events are keyed by upload: none replaces
+another).
 
 **Pipelines** (`scheduler.rs`, one thread):
 
@@ -847,7 +849,9 @@ pins the CI. Both sides log it: `[enlist] connected to <ci> as <name>`,
 own, after the runner is no longer held (`zeughaus-runner hold`):
 
 1. Fetch the mirror `ci/mirrors/<repo>.git` (the CI's own copy is a separate
-   one), check the commit is there, pin it as `refs/ci/<n>`.
+   one), check the commit is there, pin it as `refs/ci/<n>`. A try run has
+   no commit on the forge: it downloads its bundles into `<run>/bundles/`
+   instead (**Try runs**).
 2. Stage the inputs into `<run>/inputs/<need>/`: hard-linked from this
    runner's `ci/artifacts/<run>/` when the need ran here, else downloaded
    through the CI's relay into a temporary tar of its own and unpacked.
@@ -929,7 +933,9 @@ skipped), and at once for a set nobody needs, the CI sends the producing
 runner `DropArtifacts { run }`; a runner's `Hello` lists the sets it holds,
 and the CI drops each one no pending job needs, which covers a drop lost
 with a connection or a restart of the CI. Nothing else reads a finished set.
-Only configured runners may use `/artifacts`.
+Only configured runners may use `/artifacts`. `TryBundle { run, index }` is
+the one request the CI answers from its own disk: bundle `index` of a try
+run, to the runner that run is assigned to (**Try runs**).
 Commit statuses (`zeughaus/<job>`) go from the CI to GitHub or Forgejo
 through `curl`, with the token on stdin.
 
@@ -984,17 +990,77 @@ finds what the one before built, `cache` paths or not; every other job
 has the workspace of its own name. `load_jobs` refuses a context that is
 also a job's name, jobs of one context that differ in `image`, `machine`,
 `platform` or `cache`, and the name `zeughaus-try`, which no job or
-context may take. A pipeline keeps its context from its first job to its
-last (`workspace_wait`): while another pipeline's job is active in the
-workspace the job waits (`workspace <ws> in use by #<n>`), and so it does
-while an earlier job of its own pipeline has not ended (`waiting for <job>
-in context <ws>`) or another pipeline holds the context (`context <ws> held
-by #<n>`). The context goes to the pipeline that began in it (one of its
-jobs started), else to the oldest, so a younger pipeline never holds back an
-older one that has not begun and no two wait for each other. A job after one
-of its context that started gets `Checkout::Continue`, and in a pipeline
-whose channel is `clean` the first job to use a workspace gets
-`Checkout::Wipe` (`build_assignment`).
+context may take: it is the workspace of **Try runs**. A pipeline keeps its
+context from its first job to its last (`workspace_wait`): while another
+pipeline's job is active in the workspace the job waits (`workspace <ws> in
+use by #<n>`), and so it does while an earlier job of its own pipeline has not
+ended (`waiting for <job> in context <ws>`) or another pipeline holds the
+context (`context <ws> held by #<n>`). The context goes to the pipeline that
+began in it (one of its jobs started), else to the oldest, so a younger
+pipeline never holds back an older one that has not begun and no two wait for
+each other. A job after one of its context that started gets
+`Checkout::Continue`, and in a pipeline whose channel is `clean` the first job
+to use a workspace gets `Checkout::Wipe` (`build_assignment`).
+
+**Try runs** run a command on a runner of another host in the working trees of
+an editor's agent: uncommitted files and the sibling path dependencies of its
+checkout (`../weida`) included. The agent snapshots its checkout and each
+dependency as a commit without a parent (the tree `git add -A` sees; the
+main one also has the command as `.zeughaus-ci/zeughaus-try.sh`, `.ps1` for a
+Windows runner) and bundles each under one ref of `refs/zeughaus-try/`. The
+CI's `/try` service (`tryrun.rs`, wire types in `zeughaus_link::tryrun`) takes
+one exchange per run from an editor's key (a runner's is refused): a
+`TryUpload` frame, then the bundles as raw bytes, answered `Accepted { repo,
+number }` or `Refused { message }`.
+
+- The upload names the `origin` of the main checkout, the `target`, an
+  optional `image`, `timeout_minutes` (1 to 1440), the uploader (`actor`), the
+  command (`summary`) and the checkouts: directory name, commit and bundle
+  size, at most `MAX_TRY_DIRS` (8), each bundle at most `MAX_TRY_BUNDLE_BYTES`
+  (512 MiB). A name that is no plain name, a commit that is not 40 hex digits
+  and a size over the limit are refused before a byte is stored.
+- The repository is the `ci.toml` entry whose `url` names the same repository
+  as `origin` (compared in lowercase, without scheme, user, trailing `/` and
+  `.git`, an scp-style `host:path` as `host/path`), else the last segment of
+  the URL when that is a name no entry has: a try needs no entry in `ci.toml`.
+- The bundles are stored as `ci/try/<id>/<i>.bundle`, then `upload.json`; an
+  event of kind `try` with `upload = <id>` goes to the inbox, and the
+  exchange waits up to 30 s for the scheduler to write the pipeline's number
+  to `ci/try/<id>.number` (beside the directory, which goes at once with a
+  pipeline that does not start). A try posts no commit status, raises no red
+  alert and cannot be rerun: its trees were the uploader's. Its upload and
+  the image mirror below go when its pipeline ends; directories and number
+  files a week old are swept when the CI starts.
+
+`Scheduler::set_up_try` makes the pipeline: channel `try`, `sha` the main
+checkout's commit, the command's first line as subject, and one synthesised
+job, `try`: `zeughaus-try.sh` (`.ps1` on a Windows runner, where no image
+is possible), context `zeughaus-try`, the upload's timeout, `when_busy =
+"wait"`, no secrets, cache or needs. The `target` is a `[platforms]` key,
+else a runner or machine name, and `place_job` places the job on that
+runner's host, or in a container when the upload has an `image`, whose
+Containerfile is read from the snapshot's first bundle, fetched into the bare
+mirror `ci/mirrors/<repo>.try.git`. A target that is a Windows VM ends the
+pipeline as `error` (`try runs on a runner's host or in a container;
+<target> is the machine <vm>`): a VM's workspace is one bundle, copied into
+the guest. The context makes the tries of a repository take turns on a
+runner, in the order they came (**Contexts**).
+
+The assignment has no forge access and no secrets, `workspace = zeughaus-try`
+and an `Upload { dirs }`. The runner (`run.rs`) skips the mirror, downloads
+bundle `i` of each dir into `<run>/bundles/<i>.bundle` (`TryBundle`) and
+renders `launch.sh` (`launch.ps1` on Windows) with one block per dir: enter
+`<root>/<dir>` below the workspace, `git init` if new, `git fetch --prune` the
+bundle's `refs/zeughaus-try/*`, `git checkout --force --detach <sha>` and `git
+clean -ffdq`. There is no `-x`, so ignored files such as `target/` stay warm
+from one try to the next, and the main checkout's `../weida` is the sibling
+checkout of the same upload. Then it removes the bundles, touches
+`<root>/.zci-last-used` (the marker the runner's budget reads when there is
+no `.git` in the workspace) and starts the job in the main checkout:
+`CI_WORKSPACE` is `<root>/<main>` on the host, and in a container, which
+mounts the root at `/try`, `/try/<main>`. The runner refuses a try that has
+no checkouts, more than `MAX_TRY_DIRS`, a name or commit that is not plain, a
+machine place or a workspace other than `zeughaus-try`.
 
 **Restarts.** The CI persists a record before acting, and a run lives on its
 runner, so either side may restart:
@@ -1060,11 +1126,16 @@ overview (every channel with its newest pipeline, and the machines: every
 configured runner in name order as `kind = "runner"` with `offline`, `online`,
 or `busy`/`free` (with ` (set)` when the mode is set by hand), then each
 machine the connected runners report as `kind = "windows-vm"`, each with the
-jobs active on it as `MachineJob { repo, channel, number, job }`), a
-channel's pipelines newest first by pages, one pipeline, opens or
-closes a transcript, and takes two actions, both answered `Accepted`:
+jobs active on it as `MachineJob { repo, channel, number, job }`, and the
+`[platforms]` of `ci.toml` as (platform, target) pairs), a channel's pipelines
+newest first by pages, one pipeline, opens or closes a transcript, answers
+`Log { repo, number, job, tail }` with the last lines of a job's stored output
+as plain text (at most 5000 lines and 3 MiB, read from the end of its `wal`,
+`finished` once its `exit` exists) and takes two actions, both answered
+`Accepted`:
 `Rerun { repo, number }` writes the pipeline's event to the inbox again,
-pinned to the recorded sha, with the actor `rerun of #<n>`; `Cancel { repo,
+pinned to the recorded sha, with the actor `rerun of #<n>` (a try run is
+refused: its trees were the uploader's); `Cancel { repo,
 number }` leaves `ci/cancel/<repo>.<n>` for the scheduler, which saves
 `cancelled` in the record, sends `Kill` to every active job and skips the
 rest (`cancelled`), records a killed job as skipped rather than failed, and

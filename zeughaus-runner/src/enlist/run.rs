@@ -23,9 +23,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use zeughaus_job::{JobSpec, ProcessHost, RunExit, RunHandle, record_run_end};
 use zeughaus_link::enlist::{
-    Assignment, FromRunner, Input, InputSource, MAX_OUTPUT_CHUNK, Place, RunEnd, parse_run_id,
-    run_id,
+    Assignment, FromRunner, Input, InputSource, MAX_OUTPUT_CHUNK, Place, RunEnd, Upload,
+    parse_run_id, run_id,
 };
+use zeughaus_link::tryrun::{MAX_TRY_DIRS, TRY_WORKSPACE, valid_dir_name};
 
 use super::cleanup;
 use super::launch::{self, Launch, Target};
@@ -107,6 +108,44 @@ fn validate(a: &Assignment) -> Result<(), String> {
             "a Windows runner runs .ps1 jobs on its own host, not {}",
             a.file
         ));
+    }
+    match &a.upload {
+        Some(upload) => validate_upload(a, upload)?,
+        // Nothing else may check a job out into the try runs' workspace.
+        None if a.workspace == TRY_WORKSPACE => {
+            return Err(format!("{TRY_WORKSPACE:?} is the workspace of try runs"));
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+/// The working trees of a try run become directories below its workspace and
+/// their commits arguments of git: both are the CI's words.
+fn validate_upload(a: &Assignment, upload: &Upload) -> Result<(), String> {
+    if a.workspace != TRY_WORKSPACE {
+        return Err(format!(
+            "{:?} is not the workspace of try runs",
+            a.workspace
+        ));
+    }
+    // A machine's workspace is one bundle, copied into the guest.
+    if !matches!(a.place, Place::Host | Place::Container { .. }) {
+        return Err("a try run runs on a host or in a container".to_owned());
+    }
+    if upload.dirs.is_empty() || upload.dirs.len() > MAX_TRY_DIRS {
+        return Err(format!(
+            "{} checkouts are not in 1..={MAX_TRY_DIRS}",
+            upload.dirs.len()
+        ));
+    }
+    for dir in &upload.dirs {
+        if !valid_dir_name(&dir.dir) {
+            return Err(format!("{:?} is not a checkout directory name", dir.dir));
+        }
+        if dir.sha.is_empty() || !dir.sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!("{:?} is not a commit", dir.sha));
+        }
     }
     Ok(())
 }
@@ -224,7 +263,9 @@ impl Executor {
         }
         check_abort(ctl)?;
         let mirror = mirror_dir(&self.state_dir, &a.repo);
-        {
+        // A try run has its commits in bundles the CI stored, not on the
+        // forge.
+        if a.upload.is_none() {
             // Jobs of one pipeline start together, and two fetches into one
             // mirror refuse each other's ref updates. A commit is immutable:
             // one the mirror already holds needs no fetch at all.
@@ -244,6 +285,13 @@ impl Executor {
         check_abort(ctl)?;
 
         let run_dir = self.host.new_run_dir()?;
+        if let Some(upload) = &a.upload
+            && let Err(prep) = self.stage_bundles(ctl, upload, &run_dir)
+        {
+            let _ = std::fs::remove_dir_all(&run_dir);
+            return Err(prep);
+        }
+
         let secret_dir = match stage::secret_dir(&self.state_dir, &a.run) {
             Ok(dir) => dir,
             Err(e) => {
@@ -261,6 +309,17 @@ impl Executor {
                 Err(prep)
             }
         }
+    }
+
+    /// Downloads the bundles of a try run into `<run>/bundles/`.
+    fn stage_bundles(&self, ctl: &RunCtl, upload: &Upload, run_dir: &Path) -> Result<(), Prep> {
+        for (index, _) in (0u32..).zip(&upload.dirs) {
+            let dest = launch::bundle_file(run_dir, index);
+            self.fetch_try_bundle(&ctl.assignment.run, index, &dest)
+                .map_err(|e| Prep::Failed(format!("cannot download try bundle {index}: {e}")))?;
+            check_abort(ctl)?;
+        }
+        Ok(())
     }
 
     fn stage_and_spawn(
@@ -281,10 +340,19 @@ impl Executor {
         }
 
         let workspace = work_dir(&self.state_dir, &a.repo, &a.workspace);
+        // A try run starts in its main checkout, one of those below the
+        // workspace.
+        let main = a
+            .upload
+            .as_ref()
+            .and_then(|upload| upload.dirs.first())
+            .map(|dir| dir.dir.as_str());
         let (cpus, workspace_var, output_var, inputs_var) = match &a.place {
             Place::Host => (
                 self.cpus,
-                workspace.to_string_lossy().into_owned(),
+                main.map_or_else(|| workspace.clone(), |dir| workspace.join(dir))
+                    .to_string_lossy()
+                    .into_owned(),
                 run_dir.join("artifacts").to_string_lossy().into_owned(),
                 inputs.to_string_lossy().into_owned(),
             ),
@@ -297,7 +365,7 @@ impl Executor {
                     .ok_or_else(|| format!("runner {} offers no containers", self.config.name))?;
                 (
                     containers.cpus,
-                    "/work".to_owned(),
+                    main.map_or_else(|| "/work".to_owned(), |dir| format!("/try/{dir}")),
                     "/ci/run/artifacts".to_owned(),
                     "/ci/inputs".to_owned(),
                 )
@@ -1014,6 +1082,87 @@ mod tests {
             ..ok
         };
         assert!(validate(&shared).is_ok());
+    }
+
+    /// The working trees of a try run become directories below its
+    /// workspace and its commits arguments of git: nothing of them is used
+    /// before it is checked.
+    #[test]
+    fn a_try_run_is_checked_before_its_trees_become_paths() {
+        use zeughaus_link::enlist::{Checkout, UploadDir, WhenBusy};
+        let dir = |name: &str, sha: &str| UploadDir {
+            dir: name.to_owned(),
+            sha: sha.to_owned(),
+        };
+        let ok = Assignment {
+            run: "demo.9.try".to_owned(),
+            repo: "demo".to_owned(),
+            number: 9,
+            job: "try".to_owned(),
+            url: String::new(),
+            fetch_user: String::new(),
+            fetch_token: None,
+            sha: "a".repeat(40),
+            file: "zeughaus-try.sh".to_owned(),
+            interpreter: "sh".to_owned(),
+            place: Place::Host,
+            cache: Vec::new(),
+            env: Vec::new(),
+            secrets: Vec::new(),
+            timeout_minutes: 1,
+            when_busy: WhenBusy::Wait,
+            inputs: Vec::new(),
+            workspace: TRY_WORKSPACE.to_owned(),
+            checkout: Checkout::Clean,
+            upload: Some(Upload {
+                dirs: vec![dir("demo", &"a".repeat(40)), dir("weida", &"b".repeat(40))],
+            }),
+        };
+        assert!(validate(&ok).is_ok());
+        let container = Assignment {
+            place: Place::Container {
+                image: "trixie".to_owned(),
+                tag: "localhost/zci-demo-trixie:0123456789abcdef".to_owned(),
+            },
+            ..ok.clone()
+        };
+        assert!(validate(&container).is_ok());
+
+        let with = |dirs: Vec<UploadDir>| Assignment {
+            upload: Some(Upload { dirs }),
+            ..ok.clone()
+        };
+        for bad in [
+            with(Vec::new()),
+            with(
+                (0..=MAX_TRY_DIRS)
+                    .map(|i| dir(&format!("d{i}"), "ab12"))
+                    .collect(),
+            ),
+            with(vec![dir("../weida", "ab12")]),
+            with(vec![dir("a/b", "ab12")]),
+            with(vec![dir("demo", "main")]),
+            with(vec![dir("demo", "")]),
+            // Only the try runs' workspace holds their trees, and nothing
+            // else is checked out into it.
+            Assignment {
+                workspace: "build".to_owned(),
+                ..ok.clone()
+            },
+            Assignment {
+                upload: None,
+                ..ok.clone()
+            },
+            // A machine's workspace is one bundle, copied into the guest.
+            Assignment {
+                place: Place::Machine {
+                    name: "win11".to_owned(),
+                },
+                ..ok.clone()
+            },
+        ] {
+            assert!(validate(&bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

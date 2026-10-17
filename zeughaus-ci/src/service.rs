@@ -3,10 +3,10 @@
 //! intake.
 //!
 //! One weida listener carries every service: `/enlist` and `/artifacts` for
-//! runners; `/ci`, `/events`, `/snapshot` and `/mux` for editors. Trust is
-//! pinned keys in both directions. The listener lets in the editors under
-//! `<state-dir>/clients/` and the runners `ci.toml` names, and each service
-//! then admits only the kind of peer it is for.
+//! runners; `/ci`, `/events`, `/snapshot`, `/mux` and `/try` for editors.
+//! Trust is pinned keys in both directions. The listener lets in the editors
+//! under `<state-dir>/clients/` and the runners `ci.toml` names, and each
+//! service then admits only the kind of peer it is for.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -20,7 +20,7 @@ use weida::{
 };
 use zeughaus_link::{
     ARTIFACTS_PATH, CI_PATH, ENLIST_PATH, EVENTS_PATH, MUX_PATH, RuntimeEvent, SNAPSHOT_PATH,
-    TOPIC_CI, credentials,
+    TOPIC_CI, TRY_PATH, credentials,
 };
 
 use crate::artifacts::ArtifactService;
@@ -31,7 +31,7 @@ use crate::scheduler::{self, Alert, CiChange, Started};
 use crate::secrets::{self, Secrets};
 use crate::serve::{self, CiServer};
 use crate::transcripts::{self, Transcripts};
-use crate::{hook, transport};
+use crate::{hook, transport, tryrun};
 
 const USAGE: &str = "usage: zeughaus-ci serve --listen <host:port> [--hook <host:port>]";
 
@@ -249,6 +249,16 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
             ));
         }
         Err(e) => eprintln!("[ci] no mux service: {e}"),
+    }
+    match listener.replier(TRY_PATH) {
+        Ok(replier) => {
+            rt.spawn(tryrun::serve(
+                replier,
+                state_dir.to_path_buf(),
+                Arc::clone(&config),
+            ));
+        }
+        Err(e) => eprintln!("[ci] no try service: {e}"),
     }
     let publisher = match listener.publisher(EVENTS_PATH) {
         Ok(publisher) => Some(publisher),

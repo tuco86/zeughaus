@@ -20,10 +20,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeughaus_link::enlist::{
     Assignment, Checkout, FromRunner, Input, InputSource, Place, RunEnd, RunReport, ToRunner,
-    WhenBusy, parse_run_id, run_id,
+    Upload, WhenBusy, parse_run_id, run_id,
 };
+use zeughaus_link::tryrun::TRY_WORKSPACE;
 
-use crate::channels::{self, Channels};
+use crate::channels::{self, Channels, TRY_CHANNEL};
 use crate::config::{CiConfig, RepoConfig, RunnerOs};
 use crate::event::{self, CiEvent, EventKind};
 use crate::forge::{self, State, Status};
@@ -31,7 +32,7 @@ use crate::header::JobDef;
 use crate::runners::Runners;
 use crate::secrets::Secrets;
 use crate::streak::{self, Streak};
-use crate::{CI_DIR, cleanup, excerpt, pipeline};
+use crate::{CI_DIR, cleanup, excerpt, pipeline, tryrun};
 
 const TICK: Duration = Duration::from_secs(1);
 /// How often a repository's cron schedules are re-read without a push.
@@ -263,11 +264,12 @@ pub fn load_pipelines(state_dir: &Path) -> Vec<Pipeline> {
 /// Fills `subject` of stored records that predate the field, from each
 /// repository's mirror, one `git log` per repository and chunk of shas.
 /// Idempotent: a record that has a subject or whose commit the mirror no
-/// longer has is left alone, so a second run changes nothing.
+/// longer has is left alone, so a second run changes nothing. A try run's
+/// subject is its command line, and its commit is in no mirror.
 fn backfill_subjects(state_dir: &Path, changes: &Sender<CiChange>) {
     let mut pipelines: Vec<Pipeline> = load_pipelines(state_dir)
         .into_iter()
-        .filter(|p| p.subject.is_empty() && p.sha.is_some())
+        .filter(|p| p.subject.is_empty() && p.sha.is_some() && p.event.kind != EventKind::Try)
         .collect();
     pipelines.sort_by(|a, b| a.repo.cmp(&b.repo));
     for group in pipelines.chunk_by_mut(|a, b| a.repo == b.repo) {
@@ -514,6 +516,7 @@ impl Scheduler {
     /// connects, and that report settles the job.
     fn recover(&mut self) {
         backfill_subjects(&self.state_dir, &self.changes);
+        tryrun::remove_stale(&self.state_dir, tryrun::STALE_AFTER);
         for pipeline in load_pipelines(&self.state_dir) {
             if pipeline.status != PipelineStatus::Running {
                 continue;
@@ -560,6 +563,10 @@ impl Scheduler {
     }
 
     fn post(&self, pipeline: &Pipeline, job: &str, state: State, description: String) {
+        // The commit of a try run is a snapshot no forge has.
+        if pipeline.event.kind == EventKind::Try {
+            return;
+        }
         let (Some(sha), Some(repo)) = (&pipeline.sha, self.config.repos.get(&pipeline.repo)) else {
             return;
         };
@@ -694,6 +701,7 @@ impl Scheduler {
                     cron: Some(expr.clone()),
                     actor: "cron".to_owned(),
                     delivery: None,
+                    upload: None,
                     received: crate::now_secs(),
                 };
                 match event::write_inbox(&self.state_dir, &event) {
@@ -710,10 +718,13 @@ impl Scheduler {
     fn start_pipeline(&mut self, queue_file: &Path, event: CiEvent, key: String) {
         let _ = std::fs::remove_file(queue_file);
         let name = event.repo.clone();
-        let Some(repo) = self.config.repos.get(&name).cloned() else {
+        // A try run names its repository by its origin, which ci.toml need
+        // not list.
+        let repo = self.config.repos.get(&name).cloned();
+        if repo.is_none() && event.kind != EventKind::Try {
             eprintln!("[ci] event for unknown repo {name} dropped");
             return;
-        };
+        }
         let mut pipeline = Pipeline {
             repo: name.clone(),
             number: 0,
@@ -730,11 +741,18 @@ impl Scheduler {
             channel: channels::fallback(&event),
             clean: false,
         };
-        let setup = self.set_up(&name, &repo, &event, &mut pipeline);
+        let setup = match (event.kind, &repo) {
+            (EventKind::Try, _) => self.set_up_try(&event, &mut pipeline),
+            (_, Some(repo)) => self.set_up(&name, repo, &event, &mut pipeline),
+            // Dropped above.
+            (_, None) => return,
+        };
         let jobs = match setup {
             Ok(Some(jobs)) => jobs,
             Ok(None) => {
-                self.no_ci_folder(pipeline, &repo);
+                if let Some(repo) = &repo {
+                    self.no_ci_folder(pipeline, repo);
+                }
                 return;
             }
             Err(e) => {
@@ -750,6 +768,10 @@ impl Scheduler {
                     State::Error,
                     format!("{e} (#{})", pipeline.number),
                 );
+                // No job will read the upload of a try run that failed to
+                // start: its uploader hears the number, and the upload goes.
+                self.report_try(&pipeline);
+                self.drop_try(&pipeline);
                 return;
             }
         };
@@ -777,6 +799,7 @@ impl Scheduler {
             })
             .collect();
         pipeline.save(&self.state_dir, &self.changes);
+        self.report_try(&pipeline);
         eprintln!(
             "[ci] {name} #{} {} {} {}: {}",
             pipeline.number,
@@ -871,6 +894,121 @@ impl Scheduler {
         Ok(Some(planned))
     }
 
+    /// The pipeline of a try run: one job that runs the command of the
+    /// upload `event` names, in the working trees it holds (see [`tryrun`]).
+    /// The job is made here, not read from a `.zeughaus-ci/` folder: it runs
+    /// `zeughaus-try.sh` (`.ps1` on a Windows runner) of the snapshot, in the
+    /// workspace all tries of the repository share on their runner, so they
+    /// wait for one another there and keep what they built.
+    ///
+    /// The target is a `[platforms]` key, else a runner or a machine. A
+    /// machine is a Windows VM, whose workspace a run copies from one
+    /// bundle: tries run on the host of a runner or in a container on it.
+    fn set_up_try(
+        &self,
+        event: &CiEvent,
+        pipeline: &mut Pipeline,
+    ) -> Result<Option<Vec<Planned>>, String> {
+        let id = event
+            .upload
+            .as_deref()
+            .filter(|id| tryrun::valid_upload_id(id))
+            .ok_or("a try event carries no upload")?;
+        let upload = tryrun::read_upload(&self.state_dir, id)
+            .map_err(|_| format!("try upload {id} is gone"))?;
+        let main = upload
+            .dirs
+            .first()
+            .ok_or("a try upload carries no checkout")?;
+        pipeline.sha = Some(main.sha.clone());
+        pipeline.subject = tryrun::subject(&upload.summary);
+        pipeline.channel = TRY_CHANNEL.to_owned();
+        pipeline.clean = false;
+
+        let config = &self.config;
+        let target = upload.target.as_str();
+        let resolved = config.platforms.get(target).map_or(target, String::as_str);
+        if !config.runners.contains_key(resolved) && config.runner_of_machine(resolved).is_some() {
+            return Err(format!(
+                "try runs on a runner's host or in a container; {target} is the machine {resolved}"
+            ));
+        }
+        let windows_host = upload.image.is_none()
+            && config.runners.contains_key(resolved)
+            && config.runner_os(resolved) == RunnerOs::Windows;
+        let (file, interpreter) = if windows_host {
+            ("zeughaus-try.ps1", "powershell")
+        } else {
+            ("zeughaus-try.sh", "sh")
+        };
+        let mut def = JobDef {
+            name: "try".to_owned(),
+            file: file.to_owned(),
+            on: Vec::new(),
+            needs: Vec::new(),
+            image: upload.image.clone(),
+            machine: None,
+            platform: None,
+            context: Some(TRY_WORKSPACE.to_owned()),
+            cache: Vec::new(),
+            secrets: Vec::new(),
+            when_busy: WhenBusy::Wait,
+            env: BTreeMap::new(),
+            timeout_minutes: upload.timeout_minutes,
+            interpreter: interpreter.to_owned(),
+        };
+        if config.platforms.contains_key(target) {
+            def.platform = Some(target.to_owned());
+        } else {
+            def.machine = Some(target.to_owned());
+        }
+
+        // The image's Containerfile is the snapshot's own, which only its
+        // bundle has.
+        let mirror = tryrun::mirror_dir(&self.state_dir, &event.repo);
+        if upload.image.is_some() {
+            fetch_try_bundle(&mirror, &tryrun::bundle_path(&self.state_dir, id, 0))?;
+        }
+        let (runner, place) = place_job(config, &event.repo, &def, |image| {
+            containerfile_at(&mirror, &main.sha, image)
+        })?;
+        Ok(Some(vec![Planned { def, runner, place }]))
+    }
+
+    /// Tells the `/try` service which pipeline its upload became. The
+    /// record is on disk by now, so the uploader can ask for it at once.
+    fn report_try(&self, pipeline: &Pipeline) {
+        let Some(id) = tryrun::upload_of(pipeline) else {
+            return;
+        };
+        if let Err(e) = tryrun::write_number(&self.state_dir, id, pipeline.number) {
+            eprintln!("[ci] {} #{}: {e}", pipeline.repo, pipeline.number);
+        }
+    }
+
+    /// A try run is over, or never began: its upload goes, and so does the
+    /// mirror its image was read from unless another try of the repository
+    /// still runs. `pipeline` is no longer among the running ones.
+    fn drop_try(&self, pipeline: &Pipeline) {
+        let Some(id) = tryrun::upload_of(pipeline) else {
+            return;
+        };
+        tryrun::remove_upload(&self.state_dir, id);
+        let others = self
+            .running
+            .iter()
+            .any(|p| p.repo == pipeline.repo && p.event.kind == EventKind::Try);
+        if others {
+            return;
+        }
+        let mirror = tryrun::mirror_dir(&self.state_dir, &pipeline.repo);
+        if let Err(e) = std::fs::remove_dir_all(&mirror)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("[ci] cannot remove {}: {e}", mirror.display());
+        }
+    }
+
     fn finish_pipelines(&mut self) {
         let mut i = 0;
         while i < self.running.len() {
@@ -898,12 +1036,13 @@ impl Scheduler {
                 pipeline.number,
                 pipeline.status.as_str()
             );
-            if pipeline.status == PipelineStatus::Failed {
+            if pipeline.status == PipelineStatus::Failed && pipeline.event.kind != EventKind::Try {
                 self.alert_red(&pipeline);
             }
             self.ready_since.retain(|(repo, number, _), _| {
                 !(*repo == pipeline.repo && *number == pipeline.number)
             });
+            self.drop_try(&pipeline);
             self.housekeeping(&pipeline);
         }
     }
@@ -1368,7 +1507,9 @@ impl Scheduler {
     }
 
     /// What a runner needs to execute job `ji`: the forge access, the
-    /// environment and the secrets granted for the event.
+    /// environment and the secrets granted for the event. A try run has the
+    /// working trees of its upload instead of a commit to fetch, and
+    /// neither forge access nor secrets.
     fn build_assignment(
         &self,
         pipeline: &Pipeline,
@@ -1377,38 +1518,55 @@ impl Scheduler {
         inputs: Vec<Input>,
     ) -> Result<Assignment, String> {
         let job = &pipeline.jobs[ji].def;
-        let repo = self
-            .config
-            .repos
-            .get(&pipeline.repo)
-            .ok_or_else(|| format!("repo {} is no longer configured", pipeline.repo))?;
+        let repo = self.config.repos.get(&pipeline.repo);
         let sha = pipeline.sha.clone().unwrap_or_default();
-
-        // Secrets: only those granted for this event.
-        let mut secrets = Vec::new();
-        for name in &job.secrets {
-            if !repo.grants(name, &pipeline.event) {
-                return Err(format!(
-                    "secret {name} is not granted for {} {}",
-                    pipeline.event.kind, pipeline.event.git_ref
-                ));
+        let upload = match tryrun::upload_of(pipeline) {
+            Some(id) => {
+                let stored = tryrun::read_upload(&self.state_dir, id)
+                    .map_err(|_| format!("try upload {id} is gone"))?;
+                Some(Upload { dirs: stored.dirs })
             }
-            secrets.push((
-                name.clone(),
-                self.secrets.get(name).map_err(|e| e.to_string())?,
-            ));
-        }
-        let fetch_token = repo
-            .fetch_token
-            .as_ref()
-            .map(|name| self.secrets.get(name).map_err(|e| e.to_string()))
-            .transpose()?;
+            None => None,
+        };
+
+        let mut secrets = Vec::new();
+        let mut fetch_token = None;
+        let (url, fetch_user) = match (repo, &upload) {
+            (_, Some(_)) => (String::new(), String::new()),
+            (Some(repo), None) => {
+                // Secrets: only those granted for this event.
+                for name in &job.secrets {
+                    if !repo.grants(name, &pipeline.event) {
+                        return Err(format!(
+                            "secret {name} is not granted for {} {}",
+                            pipeline.event.kind, pipeline.event.git_ref
+                        ));
+                    }
+                    secrets.push((
+                        name.clone(),
+                        self.secrets.get(name).map_err(|e| e.to_string())?,
+                    ));
+                }
+                fetch_token = repo
+                    .fetch_token
+                    .as_ref()
+                    .map(|name| self.secrets.get(name).map_err(|e| e.to_string()))
+                    .transpose()?;
+                (repo.url.clone(), repo.fetch_user.clone())
+            }
+            (None, None) => {
+                return Err(format!("repo {} is no longer configured", pipeline.repo));
+            }
+        };
 
         let mut env: Vec<(String, String)> = vec![
             ("CI".into(), "true".into()),
             ("ZEUGHAUS_CI".into(), "1".into()),
             ("CI_REPO".into(), pipeline.repo.clone()),
-            ("CI_REPO_SLUG".into(), repo.slug.clone()),
+            (
+                "CI_REPO_SLUG".into(),
+                repo.map_or_else(String::new, |repo| repo.slug.clone()),
+            ),
             ("CI_EVENT".into(), pipeline.event.kind.to_string()),
             ("CI_REF".into(), pipeline.event.git_ref.clone()),
             ("CI_SHA".into(), sha.clone()),
@@ -1429,8 +1587,8 @@ impl Scheduler {
             repo: pipeline.repo.clone(),
             number: pipeline.number,
             job: job.name.clone(),
-            url: repo.url.clone(),
-            fetch_user: repo.fetch_user.clone(),
+            url,
+            fetch_user,
             fetch_token,
             sha,
             file: job.file.clone(),
@@ -1444,7 +1602,7 @@ impl Scheduler {
             inputs,
             workspace: job.workspace().to_owned(),
             checkout: checkout_of(pipeline, ji),
-            upload: None,
+            upload,
         })
     }
 
@@ -2019,6 +2177,27 @@ fn containerfile_at(mirror: &Path, sha: &str, image: &str) -> Result<String, Str
     )
 }
 
+/// Fetches a try run's first bundle into the bare repository `mirror`, made
+/// on first use: the Containerfile of the snapshot can then be read from it.
+fn fetch_try_bundle(mirror: &Path, bundle: &Path) -> Result<(), String> {
+    if !mirror.join("HEAD").exists() {
+        std::fs::create_dir_all(mirror)
+            .map_err(|e| format!("cannot create {}: {e}", mirror.display()))?;
+        git(mirror, &["init", "--bare", "-q"], &[])?;
+    }
+    git(
+        mirror,
+        &[
+            "fetch",
+            "-q",
+            &bundle.to_string_lossy(),
+            "+refs/zeughaus-try/*:refs/zeughaus-try/*",
+        ],
+        &[],
+    )
+    .map(|_| ())
+}
+
 /// Where a job runs, for people: its runner, then the container image or
 /// machine on it.
 fn place_label(job: &JobRecord) -> String {
@@ -2099,6 +2278,7 @@ fn event_commit(mirror: &Path, event: &CiEvent) -> Result<String, String> {
                 EventKind::Push | EventKind::Cron => {
                     format!("refs/heads/{}^{{commit}}", event.git_ref)
                 }
+                EventKind::Try => return Err("a try event carries its sha".to_owned()),
             };
             rev_parse(mirror, &refname)
         }
@@ -2138,6 +2318,11 @@ fn read_ci(mirror: &Path, sha: &str) -> Result<CiFiles, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use zeughaus_link::enlist::UploadDir;
+    use zeughaus_link::tryrun::TryUpload;
+
     use super::*;
 
     const FP_1: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
@@ -2173,6 +2358,7 @@ mod tests {
                 cron: None,
                 actor: "test".to_owned(),
                 delivery: None,
+                upload: None,
                 received: 0,
             },
             sha: None,
@@ -2891,6 +3077,399 @@ mod tests {
             assert_eq!(jobs, [("a", Some("box")), ("b", Some("box"))]);
         }
         let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    // ---- try runs
+
+    /// An upload the way the `/try` service leaves it, and the event that
+    /// names it. Every call is an upload of its own.
+    fn stored_try(
+        state: &Path,
+        repo: &str,
+        target: &str,
+        image: Option<&str>,
+        sha: &str,
+    ) -> CiEvent {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let id = format!("{:016x}", NEXT.fetch_add(1, Ordering::Relaxed));
+        let upload = TryUpload {
+            origin: format!("git@example.org:me/{repo}.git"),
+            target: target.to_owned(),
+            image: image.map(str::to_owned),
+            timeout_minutes: 30,
+            actor: "hannes@tuco-pc".to_owned(),
+            summary: "cargo test -p core\nsecond line".to_owned(),
+            dirs: vec![
+                UploadDir {
+                    dir: repo.to_owned(),
+                    sha: sha.to_owned(),
+                },
+                UploadDir {
+                    dir: "lib".to_owned(),
+                    sha: "b".repeat(40),
+                },
+            ],
+            sizes: vec![1, 1],
+        };
+        std::fs::create_dir_all(tryrun::upload_dir(state, &id)).unwrap();
+        tryrun::write_upload(state, &id, &upload).unwrap();
+        CiEvent {
+            repo: repo.to_owned(),
+            kind: EventKind::Try,
+            git_ref: "try".to_owned(),
+            sha: Some(sha.to_owned()),
+            cron: None,
+            actor: upload.actor,
+            delivery: None,
+            upload: Some(id),
+            received: 0,
+        }
+    }
+
+    /// One commit that holds `files`, in a repository of its own, bundled
+    /// the way a snapshot is: one ref under `refs/zeughaus-try/`. Returns
+    /// the bundle and the commit.
+    fn bundle_of(dir: &Path, files: &[(&str, &str)]) -> (PathBuf, String) {
+        let author = [
+            ("GIT_AUTHOR_NAME".to_owned(), "t".to_owned()),
+            ("GIT_AUTHOR_EMAIL".to_owned(), "t@t".to_owned()),
+            ("GIT_COMMITTER_NAME".to_owned(), "t".to_owned()),
+            ("GIT_COMMITTER_EMAIL".to_owned(), "t@t".to_owned()),
+        ];
+        let src = dir.join("src");
+        for (name, text) in files {
+            let path = src.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        git(&src, &["init", "-q", "-b", "main"], &author).unwrap();
+        git(&src, &["add", "-A"], &author).unwrap();
+        git(&src, &["commit", "-q", "-m", "zeughaus try"], &author).unwrap();
+        git(
+            &src,
+            &["update-ref", "refs/zeughaus-try/1-1", "HEAD"],
+            &author,
+        )
+        .unwrap();
+        let bundle = dir.join("0.bundle");
+        let to = bundle.to_string_lossy();
+        git(
+            &src,
+            &["bundle", "create", &to, "refs/zeughaus-try/1-1"],
+            &author,
+        )
+        .unwrap();
+        let sha = git(&src, &["rev-parse", "HEAD"], &[]).unwrap();
+        (bundle, sha.trim().to_owned())
+    }
+
+    #[test]
+    fn a_try_is_one_job_in_the_shared_workspace_of_the_runner_its_target_names() {
+        let state = scratch("try-place");
+        let s = scheduler_over(&state, Arc::new(config()));
+        let a40 = "a".repeat(40);
+        // (target, file, interpreter, runner, platform, machine)
+        for (target, file, interpreter, runner, platform, machine) in [
+            (
+                "wohnzimmer",
+                "zeughaus-try.ps1",
+                "powershell",
+                "wohnzimmer",
+                None,
+                Some("wohnzimmer"),
+            ),
+            ("atik", "zeughaus-try.sh", "sh", "atik", None, Some("atik")),
+            (
+                "linux-amd64",
+                "zeughaus-try.sh",
+                "sh",
+                "tuco-pc",
+                Some("linux-amd64"),
+                None,
+            ),
+        ] {
+            let event = stored_try(&state, "demo", target, None, &a40);
+            let mut p = pipeline("");
+            let planned = s
+                .set_up_try(&event, &mut p)
+                .expect("set up")
+                .expect("a job");
+            assert_eq!(planned.len(), 1, "{target}");
+            let (job, placed) = (&planned[0].def, planned[0].runner.as_str());
+            assert_eq!(
+                (
+                    job.name.as_str(),
+                    job.file.as_str(),
+                    job.interpreter.as_str()
+                ),
+                ("try", file, interpreter),
+                "{target}"
+            );
+            assert_eq!(placed, runner, "{target}");
+            assert_eq!(planned[0].place, Place::Host, "{target}");
+            assert_eq!(job.context.as_deref(), Some(TRY_WORKSPACE), "{target}");
+            assert_eq!(
+                (job.platform.as_deref(), job.machine.as_deref()),
+                (platform, machine),
+                "{target}"
+            );
+            assert!(job.on.is_empty() && job.needs.is_empty(), "{target}");
+            assert!(job.secrets.is_empty() && job.cache.is_empty(), "{target}");
+            assert_eq!((job.when_busy, job.timeout_minutes), (WhenBusy::Wait, 30));
+            assert_eq!(p.sha.as_deref(), Some(a40.as_str()), "{target}");
+            assert_eq!(
+                (p.subject.as_str(), p.channel.as_str(), p.clean),
+                ("cargo test -p core", "try", false),
+                "{target}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_try_does_not_run_in_a_vm_or_on_a_target_nobody_knows() {
+        let state = scratch("try-vm");
+        let s = scheduler_over(&state, Arc::new(config()));
+        let a40 = "a".repeat(40);
+        let set_up = |event: &CiEvent| {
+            s.set_up_try(event, &mut pipeline(""))
+                .err()
+                .expect("a pipeline that does not start")
+        };
+        // The Windows VM, by its platform and by its own name.
+        for target in ["windows-amd64", "win11"] {
+            assert_eq!(
+                set_up(&stored_try(&state, "demo", target, None, &a40)),
+                format!(
+                    "try runs on a runner's host or in a container; {target} is the machine win11"
+                )
+            );
+        }
+        let err = set_up(&stored_try(&state, "demo", "nowhere", None, &a40));
+        assert!(
+            err.contains("nowhere") && err.contains("neither a runner nor a machine"),
+            "{err}"
+        );
+        // An event with no upload, and one whose upload is gone.
+        let mut event = stored_try(&state, "demo", "atik", None, &a40);
+        let id = event.upload.take();
+        assert_eq!(set_up(&event), "a try event carries no upload");
+        event.upload = Some("fedcba9876543210".to_owned());
+        assert_eq!(set_up(&event), "try upload fedcba9876543210 is gone");
+        event.upload = id.map(|id| format!("../{id}"));
+        assert_eq!(set_up(&event), "a try event carries no upload");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// The image of a try is read from the snapshot's own Containerfile,
+    /// which only its bundle has; the mirror it is read from goes with the
+    /// last try of the repository.
+    #[test]
+    fn a_try_with_an_image_reads_its_containerfile_from_its_bundle() {
+        let state = scratch("try-image");
+        let (bundle, sha) = bundle_of(
+            &scratch("try-image-src"),
+            &[(".zeughaus-ci/trixie.Containerfile", "FROM debian:trixie\n")],
+        );
+        let mut s = scheduler_over(&state, Arc::new(config()));
+        let event = stored_try(&state, "demo", "linux-arm64", Some("trixie"), &sha);
+        let id = event.upload.clone().unwrap();
+        std::fs::copy(&bundle, tryrun::bundle_path(&state, &id, 0)).unwrap();
+
+        let mut p = pipeline("");
+        p.repo = "demo".to_owned();
+        p.event = event.clone();
+        let planned = s.set_up_try(&event, &mut p).unwrap().unwrap();
+        let digest = hex::encode(Sha256::digest(b"FROM debian:trixie\n"));
+        assert_eq!(planned[0].runner, "atik");
+        assert_eq!(
+            planned[0].place,
+            Place::Container {
+                image: "trixie".to_owned(),
+                tag: format!("localhost/zci-demo-trixie:{}", &digest[..16]),
+            }
+        );
+        assert_eq!(planned[0].def.file, "zeughaus-try.sh");
+        let mirror = tryrun::mirror_dir(&state, "demo");
+        assert!(mirror.join("HEAD").exists());
+
+        // A Windows runner has no containers, and a Containerfile the
+        // snapshot lacks is no image.
+        let on_windows = stored_try(&state, "demo", "wohnzimmer", Some("trixie"), &sha);
+        std::fs::copy(
+            &bundle,
+            tryrun::bundle_path(&state, on_windows.upload.as_deref().unwrap(), 0),
+        )
+        .unwrap();
+        let err = s.set_up_try(&on_windows, &mut pipeline("")).err().unwrap();
+        assert!(err.contains("needs a unix runner"), "{err}");
+        let missing = stored_try(&state, "demo", "atik", Some("arch"), &sha);
+        std::fs::copy(
+            &bundle,
+            tryrun::bundle_path(&state, missing.upload.as_deref().unwrap(), 0),
+        )
+        .unwrap();
+        assert!(s.set_up_try(&missing, &mut pipeline("")).is_err());
+
+        // Another try of the repository is still running: the mirror stays.
+        let mut other = pipeline("try");
+        other.repo = "demo".to_owned();
+        other.event.kind = EventKind::Try;
+        s.running.push(other);
+        s.drop_try(&p);
+        assert!(!tryrun::upload_dir(&state, &id).exists());
+        assert!(mirror.exists());
+        s.running.clear();
+        s.drop_try(&p);
+        assert!(!mirror.exists());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_try_that_cannot_start_ends_as_an_error_pipeline_its_uploader_hears_of() {
+        let state = scratch("try-error");
+        // `demo` is no repository of this CI: a try names its own.
+        let mut s = scheduler_over(&state, Arc::new(config()));
+        let event = stored_try(&state, "demo", "windows-amd64", None, &"a".repeat(40));
+        let id = event.upload.clone().unwrap();
+        let key = event::queue_key(&event);
+        s.start_pipeline(Path::new("/nonexistent/queue.json"), event, key);
+
+        assert!(s.running.is_empty());
+        let record = load_pipeline(&state, "demo", 1).expect("the record");
+        assert_eq!(record.status, PipelineStatus::Error);
+        assert_eq!(
+            record.note,
+            "try runs on a runner's host or in a container; windows-amd64 is the machine win11"
+        );
+        assert_eq!(
+            (record.channel(), record.event.kind),
+            ("try".to_owned(), EventKind::Try)
+        );
+        assert!(record.jobs.is_empty() && record.finished.is_some());
+        // The service learns the number from a file beside the upload, which
+        // is gone: nothing runs.
+        let number = std::fs::read_to_string(tryrun::number_path(&state, &id));
+        assert_eq!(number.as_deref().ok(), Some("1"));
+        assert!(!tryrun::upload_dir(&state, &id).exists());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// From the upload to the assignment to the cleaning up, with a second
+    /// try that waits for the workspace the first one holds.
+    #[test]
+    fn a_try_is_assigned_with_its_working_trees_and_cleans_up_after_itself() {
+        let state = scratch("try-run");
+        let mut s = scheduler(&state);
+        let mut x = connect(&s.runners, "x", 0);
+        let a40 = "a".repeat(40);
+        let start = |s: &mut Scheduler| {
+            let event = stored_try(&state, "demo", "x", None, &a40);
+            let id = event.upload.clone().unwrap();
+            let key = event::queue_key(&event);
+            s.start_pipeline(Path::new("/nonexistent/queue.json"), event, key);
+            id
+        };
+        let first = start(&mut s);
+        let second = start(&mut s);
+        assert_eq!(s.running.len(), 2);
+        let said = |id: &str| std::fs::read_to_string(tryrun::number_path(&state, id)).ok();
+        assert_eq!(said(&first).as_deref(), Some("1"));
+        assert_eq!(said(&second).as_deref(), Some("2"));
+
+        s.advance();
+        let a = assigned(&mut x);
+        assert_eq!(
+            (a.run.as_str(), a.job.as_str(), a.number),
+            ("demo.1.try", "try", 1)
+        );
+        assert_eq!(
+            (a.workspace.as_str(), a.checkout, a.timeout_minutes),
+            ("zeughaus-try", Checkout::Clean, 30)
+        );
+        // No forge, no secrets: the working trees come in bundles.
+        assert_eq!(
+            (
+                a.url.as_str(),
+                a.fetch_user.as_str(),
+                a.fetch_token.as_deref()
+            ),
+            ("", "", None)
+        );
+        assert!(a.secrets.is_empty() && a.inputs.is_empty() && a.cache.is_empty());
+        assert_eq!(
+            (a.file.as_str(), a.interpreter.as_str(), &a.place),
+            ("zeughaus-try.sh", "sh", &Place::Host)
+        );
+        assert_eq!(a.sha, a40);
+        let dirs: Vec<(&str, &str)> = a
+            .upload
+            .iter()
+            .flat_map(|upload| &upload.dirs)
+            .map(|d| (d.dir.as_str(), d.sha.as_str()))
+            .collect();
+        assert_eq!(
+            dirs,
+            [("demo", a40.as_str()), ("lib", "b".repeat(40).as_str())]
+        );
+        let env = |name: &str| {
+            a.env
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(
+            (env("CI_EVENT"), env("CI_REF"), env("CI_REPO")),
+            (Some("try"), Some("try"), Some("demo"))
+        );
+        assert_eq!(
+            (env("CI_REPO_SLUG"), env("CI_ACTOR")),
+            (Some(""), Some("hannes@tuco-pc"))
+        );
+
+        // The second try waits for the workspace every try of the repository
+        // shares on this runner.
+        let waiting = &s.running[1].jobs[0];
+        assert_eq!(
+            (waiting.status, waiting.note.as_str()),
+            (JobStatus::Waiting, "workspace zeughaus-try in use by #1")
+        );
+        assert!(x.try_recv().is_err());
+
+        let message = |message| Msg::FromRunner {
+            name: "x".to_owned(),
+            message,
+        };
+        s.handle(message(FromRunner::Started {
+            run: "demo.1.try".to_owned(),
+        }));
+        s.handle(message(FromRunner::Finished {
+            run: "demo.1.try".to_owned(),
+            end: RunEnd {
+                code: Some(0),
+                killed: false,
+                timed_out: false,
+                artifacts: false,
+            },
+        }));
+        s.finish_pipelines();
+        assert_eq!(s.running.len(), 1);
+        assert_eq!(
+            load_pipeline(&state, "demo", 1).unwrap().status,
+            PipelineStatus::Succeeded
+        );
+        assert!(!tryrun::upload_dir(&state, &first).exists());
+        assert!(tryrun::upload_dir(&state, &second).exists());
+
+        assert_eq!(
+            x.try_recv().ok(),
+            Some(ToRunner::Forget {
+                run: "demo.1.try".to_owned()
+            })
+        );
+        s.advance();
+        assert_eq!(assigned(&mut x).run, "demo.2.try");
         let _ = std::fs::remove_dir_all(&state);
     }
 

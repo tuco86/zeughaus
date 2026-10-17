@@ -13,6 +13,10 @@
 //! counter: two downloads of one producer's set on one runner never share a
 //! file. Nothing outlives its transfer except after a crash, and
 //! [`Executor::clear_stale_tars`] removes those at start.
+//!
+//! The bundles of a try run come the same way from the CI itself, which
+//! stored them (`TryBundle`), straight into the run's own directory: they go
+//! with it.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -245,19 +249,37 @@ impl Executor {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
+        let request = ArtifactRequest::Download {
+            run: run.to_owned(),
+        };
         let fetched = self
             .handle
-            .block_on(self.receive_tar(run, &tar))
+            .block_on(self.receive_file(request, &tar))
             .and_then(|()| unpack(&tar, dest));
         let _ = std::fs::remove_file(&tar);
         fetched
     }
 
-    async fn receive_tar(&self, run: &str, tar: &Path) -> Result<(), String> {
-        let (mut out, reply) = self.open_exchange().await?;
-        let request = ArtifactRequest::Download {
+    /// Fetches bundle `index` of the try run `run` from the CI, which stored
+    /// it when the run was uploaded, into the file `dest`. The directory of
+    /// `dest` is the run's own and goes with it, so a failed transfer leaves
+    /// nothing to clean up. Called on the thread that prepares a run.
+    pub fn fetch_try_bundle(&self, run: &str, index: u32, dest: &Path) -> Result<(), String> {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+        let request = ArtifactRequest::TryBundle {
             run: run.to_owned(),
+            index,
         };
+        self.handle.block_on(self.receive_file(request, dest))
+    }
+
+    /// Asks the CI's artifact service for what `request` names and streams
+    /// the bytes it answers with into the file `dest`.
+    async fn receive_file(&self, request: ArtifactRequest, dest: &Path) -> Result<(), String> {
+        let (mut out, reply) = self.open_exchange().await?;
         write_frame(&mut out, &request).await?;
         out.finish().map_err(|e| format!("finish: {e}"))?;
         let mut body = reply.recv().await.map_err(|e| format!("reply: {e}"))?;
@@ -265,7 +287,7 @@ impl Executor {
             Some(ArtifactReply::Sending { size }) => size,
             Some(ArtifactReply::Error { message }) => return Err(message),
             Some(ArtifactReply::Done) | None => {
-                return Err("the CI did not answer the download".to_owned());
+                return Err("the CI did not answer the request".to_owned());
             }
         };
         if size > MAX_ARTIFACT_BYTES {
@@ -273,8 +295,8 @@ impl Executor {
                 "{size} bytes is more than the {MAX_ARTIFACT_BYTES} allowed"
             ));
         }
-        let mut file = std::fs::File::create(tar)
-            .map_err(|e| format!("cannot create {}: {e}", tar.display()))?;
+        let mut file = std::fs::File::create(dest)
+            .map_err(|e| format!("cannot create {}: {e}", dest.display()))?;
         let mut buf = vec![0u8; CHUNK];
         let mut remaining = size;
         while remaining > 0 {

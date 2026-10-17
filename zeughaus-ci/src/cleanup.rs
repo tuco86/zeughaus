@@ -76,6 +76,7 @@ mod tests {
             cron: None,
             actor: "test".to_owned(),
             delivery: None,
+            upload: None,
             received: 0,
         };
         let record = serde_json::json!({ "channel": channel, "event": event, "number": n });

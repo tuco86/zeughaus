@@ -23,10 +23,10 @@ build of the editor compiles and edits locally (it reaches no runner yet).
 ```
 zeughaus/              # binary: the iced editor; edits the graph and views results, never executes
 zeughaus-runner/       # binary: headless process that executes the graph, owns the terminals, runs the CI jobs it is assigned and can follow a release channel; `release` makes and checks signed bundles
-zeughaus-ci/           # binary: the CI service; schedules pipelines onto enlisted runners, webhook intake, stored transcripts
+zeughaus-ci/           # binary: the CI service; schedules pipelines onto enlisted runners, webhook intake, try-run uploads, stored transcripts
 zeughaus-core/         # Ty/Typed/Value, pins, ExecutableNode/DomainPlugin, settings, scalar wire encoding, graph document types
 zeughaus-runtime/      # GraphExecutor: topology, node instances, edge cache, dirty set, async work, node errors
-zeughaus-link/         # the runner<->editor protocol over weida (graph, feed, events, snapshot, triggers, paths), the runner<->CI enlist protocol and the credentials both ends present
+zeughaus-link/         # the runner<->editor protocol over weida (graph, feed, events, snapshot, triggers, paths), the runner<->CI enlist protocol, the `/try` upload of working-tree snapshots and the credentials both ends present
 zeughaus-mux/          # terminal mux wire model: stable ids, workspace topology, rows/deltas, bounded codec, client-side TerminalView (pure, wasm too)
 zeughaus-terminal/     # the terminal engine: PTYs over portable-pty and a pinned wezterm-term in the runner, byte-fed sessions for the CI's transcripts (native only)
 zeughaus-transform/    # plugin: 35 math/logic/string/trig nodes, constants, Display
@@ -212,6 +212,28 @@ pipelines' jobs of it wait, the oldest first. `clean = true` on a
 `[[channel]]` of `.zeughaus-ci/channels.toml` makes the first job to use a
 workspace in that channel's pipelines start it from nothing, `cache` paths
 too.
+
+A try run executes a command on a runner from the uploader's working tree,
+uncommitted files and sibling path dependencies (`../weida`) included. The
+uploader sends the CI's `/try` path (editors' keys only, wire types in
+`zeughaus_link::tryrun`) a `TryUpload` and one git bundle per checkout, and
+the CI runs it as a pipeline of the `try` channel of the repository whose
+`ci.toml` `url` is the upload's `origin` (else one named after the URL's last
+segment; no `ci.toml` entry is needed): one job `try` that runs the
+snapshot's `.zeughaus-ci/zeughaus-try.sh` (`.ps1` on a Windows runner). The
+`target` is a `[platforms]` key, else a runner name; the job runs on that
+runner's host, or in a container when the upload names an `image` (a
+Containerfile of the snapshot's `.zeughaus-ci/`). A target that is a Windows
+VM ends the pipeline as `error`: `try runs on a runner's host or in a
+container; <target> is the machine <vm>`. All tries of a repository on one
+runner share the workspace `ci/work/<repo>/zeughaus-try` (the context
+`zeughaus-try`, a name no job or context may take) and take turns in it; each
+checkout is `<root>/<dir>`, updated from the run's bundles without cleaning
+ignored files, so `target/` stays warm and `../weida` is the sibling checkout.
+The bundles stay in `<state-dir>/ci/try/<id>/` on the CI until the pipeline
+ended and reach the runner on `/artifacts` (`TryBundle`). A try posts no
+forge status, raises no red alert and cannot be rerun; `/ci` answers a job's
+last lines as text (`Log`) and lists the `[platforms]`.
 
 The Windows runner `wohnzimmer` is the living-room PC, used by someone else
 at its console. Everything of zeughaus is under `C:\zeughaus`, readable by

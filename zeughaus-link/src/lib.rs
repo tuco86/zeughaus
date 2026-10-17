@@ -23,6 +23,7 @@
 //! | [`CI_PATH`] | req/rep | [`ci`]: channels, pipelines, machines, job transcripts |
 //! | [`ENLIST_PATH`] | one long exchange per runner | [`enlist`]: a runner takes assignments from the CI and streams output |
 //! | [`ARTIFACTS_PATH`] | one exchange per transfer | [`enlist::ArtifactRequest`]: a run's artifact tar |
+//! | [`TRY_PATH`] | one exchange per try run | [`tryrun`]: a working-tree snapshot and its bundles |
 //! | [`MUX_PATH`] | req/rep exchanges | the terminal mux (`zeughaus-mux`) |
 //! | [`GRAPH_PATH`] | one long exchange per editor | [`graph`]: the document, edits and changes |
 //!
@@ -38,6 +39,7 @@ pub mod feed;
 pub mod graph;
 pub mod machine;
 pub mod runs;
+pub mod tryrun;
 
 pub use ci::{
     ChannelView, CiOverview, CiReply, CiRequest, JobView, MAX_CI_REPLY_BYTES, MAX_CI_REQUEST_BYTES,
@@ -106,3 +108,8 @@ pub const ENLIST_PATH: &str = "/enlist";
 
 /// Req/Rep endpoint a run's artifact tar travels on, one exchange per transfer.
 pub const ARTIFACTS_PATH: &str = "/artifacts";
+
+/// The exchange an agent uploads a working-tree snapshot on: a
+/// [`tryrun::TryUpload`] frame and its bundles in, a [`tryrun::TryReply`]
+/// out. Served by the CI to editors' client keys, not to runners.
+pub const TRY_PATH: &str = "/try";

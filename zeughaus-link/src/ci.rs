@@ -50,6 +50,15 @@ pub enum CiRequest {
     /// Stops a running pipeline: its jobs are killed, the rest skipped.
     /// Answers [`CiReply::Accepted`], or an error when it is not running.
     Cancel { repo: String, number: u64 },
+    /// The tail of one job's stored output: at most `tail` lines, never more
+    /// than the CI's own cap. Answers [`CiReply::Log`], or an error when the
+    /// job has no output.
+    Log {
+        repo: String,
+        number: u64,
+        job: String,
+        tail: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -73,6 +82,12 @@ pub enum CiReply {
     /// A [`CiRequest::Rerun`] or [`CiRequest::Cancel`] was taken; the
     /// pipeline record changes later and is announced on `/events`.
     Accepted,
+    /// The last lines of a job's output; `finished` is false while the job
+    /// still runs and more may follow.
+    Log {
+        text: String,
+        finished: bool,
+    },
     Error {
         message: String,
     },
@@ -86,6 +101,10 @@ pub struct CiOverview {
     /// pipeline of the same ref, or not yet picked up.
     #[serde(default)]
     pub queued: Vec<QueuedView>,
+    /// The `[platforms]` of the CI's configuration: a platform name and the
+    /// runner or machine that builds it, for a client that picks a target.
+    #[serde(default)]
+    pub platforms: Vec<(String, String)>,
 }
 
 /// An event that has no pipeline yet.
@@ -293,6 +312,12 @@ mod tests {
                 repo: "griasdi".to_owned(),
                 number: 7,
             },
+            CiRequest::Log {
+                repo: "griasdi".to_owned(),
+                number: 7,
+                job: "build".to_owned(),
+                tail: 200,
+            },
         ];
         for request in requests {
             assert_eq!(CiRequest::decode(&request.encode()), Some(request));
@@ -338,6 +363,7 @@ mod tests {
                         actor: "rerun of #6".to_owned(),
                         received: 1,
                     }],
+                    platforms: vec![("linux-amd64".to_owned(), "tuco-pc".to_owned())],
                 },
             },
             CiReply::Pipelines {
@@ -350,6 +376,10 @@ mod tests {
             CiReply::Transcript { terminal: 9 },
             CiReply::Closed,
             CiReply::Accepted,
+            CiReply::Log {
+                text: "line\n".to_owned(),
+                finished: true,
+            },
             CiReply::Error {
                 message: "no such job".to_owned(),
             },
@@ -375,5 +405,14 @@ mod tests {
         let mut reply = CiReply::Closed.encode();
         reply.resize(MAX_CI_REPLY_BYTES + 1, b' ');
         assert!(CiReply::decode(&reply).is_none());
+    }
+
+    #[test]
+    fn an_overview_without_platforms_still_decodes() {
+        let old = br#"{"kind":"overview","overview":{"channels":[],"machines":[]}}"#;
+        match CiReply::decode(old) {
+            Some(CiReply::Overview { overview }) => assert!(overview.platforms.is_empty()),
+            other => panic!("{other:?}"),
+        }
     }
 }

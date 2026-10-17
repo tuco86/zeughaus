@@ -22,6 +22,7 @@ mod service;
 mod streak;
 mod transcripts;
 mod transport;
+mod tryrun;
 
 use std::path::{Path, PathBuf};
 

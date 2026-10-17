@@ -194,6 +194,7 @@ mod tests {
                 cron: None,
                 actor: "test".to_owned(),
                 delivery: None,
+                upload: None,
                 received: 0,
             },
             sha: Some(format!("{number:07}abcdef")),

@@ -5,12 +5,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
+use zeughaus_link::tryrun::TRY_WORKSPACE;
+
 use crate::CI_DIR;
 use crate::event::{CiEvent, EventKind};
 use crate::header::{JobDef, parse_job};
-
-/// The workspace of try runs, which no job or context may take.
-const TRY_WORKSPACE: &str = "zeughaus-try";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pattern {
@@ -345,6 +344,7 @@ mod tests {
             cron: cron.map(Into::into),
             actor: "t".into(),
             delivery: None,
+            upload: None,
             received: 0,
         }
     }

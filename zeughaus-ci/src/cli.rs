@@ -214,6 +214,7 @@ fn parse_event(
             };
             (EventKind::Cron, default_branch.to_owned(), None, Some(expr))
         }
+        ("try", _) => return Err("try events come from the /try service".to_owned()),
         _ => return Err(USAGE.to_owned()),
     };
     Ok(CiEvent {
@@ -224,6 +225,7 @@ fn parse_event(
         cron,
         actor: "manual".to_owned(),
         delivery: None,
+        upload: None,
         received: crate::now_secs(),
     })
 }

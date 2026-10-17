@@ -3,7 +3,8 @@
 //! An event is written to `ci/inbox/` by a webhook or `ci run`, then moved to
 //! `ci/queue/<key>.json` by the scheduler. The key is the repository, the
 //! event kind and the ref, so a newer event for the same ref replaces the one
-//! still waiting; a running pipeline is never cancelled by it.
+//! still waiting; a running pipeline is never cancelled by it. A try run's key
+//! is its upload instead, so no try replaces another.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -21,6 +22,8 @@ pub enum EventKind {
     Push,
     Tag,
     Cron,
+    /// A working-tree snapshot an editor's agent uploaded on `/try`.
+    Try,
 }
 
 impl fmt::Display for EventKind {
@@ -29,6 +32,7 @@ impl fmt::Display for EventKind {
             EventKind::Push => "push",
             EventKind::Tag => "tag",
             EventKind::Cron => "cron",
+            EventKind::Try => "try",
         })
     }
 }
@@ -41,7 +45,10 @@ impl FromStr for EventKind {
             "push" => Ok(EventKind::Push),
             "tag" => Ok(EventKind::Tag),
             "cron" => Ok(EventKind::Cron),
-            other => Err(format!("unknown event kind `{other}` (push, tag or cron)")),
+            "try" => Ok(EventKind::Try),
+            other => Err(format!(
+                "unknown event kind `{other}` (push, tag, cron or try)"
+            )),
         }
     }
 }
@@ -50,13 +57,17 @@ impl FromStr for EventKind {
 pub struct CiEvent {
     pub repo: String,
     pub kind: EventKind,
-    /// Branch or tag name without the `refs/` prefix.
+    /// Branch or tag name without the `refs/` prefix; `try` for a try run.
     pub git_ref: String,
     pub sha: Option<String>,
     /// The normalized cron expression of a cron event.
     pub cron: Option<String>,
     pub actor: String,
     pub delivery: Option<String>,
+    /// The id of the upload a try run carries, the directory
+    /// `ci/try/<upload>/` holds it; `None` for every other event.
+    #[serde(default)]
+    pub upload: Option<String>,
     /// Unix seconds.
     pub received: u64,
 }
@@ -80,8 +91,12 @@ pub fn write_inbox(state_dir: &Path, event: &CiEvent) -> Result<PathBuf, String>
     Ok(path)
 }
 
-/// `<repo>.<kind>.<first 12 hex of sha256(git_ref \n cron)>`.
+/// `<repo>.<kind>.<first 12 hex of sha256(git_ref \n cron)>`, and for a try
+/// run `<repo>.try.<upload>`: every try runs, none replaces another.
 pub fn queue_key(event: &CiEvent) -> String {
+    if let (EventKind::Try, Some(upload)) = (event.kind, &event.upload) {
+        return format!("{}.try.{upload}", event.repo);
+    }
     let mut hasher = Sha256::new();
     hasher.update(event.git_ref.as_bytes());
     hasher.update(b"\n");
@@ -201,6 +216,7 @@ mod tests {
             cron: None,
             actor: "manual".into(),
             delivery: None,
+            upload: None,
             received,
         }
     }
@@ -246,6 +262,25 @@ mod tests {
         assert_eq!(queue_key(&a).len(), "smoke.push.".len() + 12);
     }
 
+    /// Every try run is its own key, so none replaces another still queued;
+    /// an event that predates the field has no upload.
+    #[test]
+    fn a_try_runs_key_is_its_upload() {
+        let mut a = event("x", 0);
+        a.kind = EventKind::Try;
+        a.git_ref = "try".into();
+        a.upload = Some("0123456789abcdef".into());
+        let mut b = a.clone();
+        b.upload = Some("fedcba9876543210".into());
+        assert_eq!(queue_key(&a), "smoke.try.0123456789abcdef");
+        assert_ne!(queue_key(&a), queue_key(&b));
+
+        let mut old = serde_json::to_value(&a).unwrap();
+        assert!(old.as_object_mut().unwrap().remove("upload").is_some());
+        let old: CiEvent = serde_json::from_value(old).unwrap();
+        assert_eq!(old.upload, None);
+    }
+
     #[test]
     fn malformed_inbox_file_is_set_aside() {
         let dir = temp("bad");
@@ -260,7 +295,12 @@ mod tests {
 
     #[test]
     fn kind_round_trips() {
-        for kind in [EventKind::Push, EventKind::Tag, EventKind::Cron] {
+        for kind in [
+            EventKind::Push,
+            EventKind::Tag,
+            EventKind::Cron,
+            EventKind::Try,
+        ] {
             assert_eq!(kind.to_string().parse::<EventKind>().unwrap(), kind);
         }
         assert!("pull".parse::<EventKind>().is_err());

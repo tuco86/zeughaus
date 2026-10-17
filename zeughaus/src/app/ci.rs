@@ -2749,6 +2749,7 @@ mod tests {
                 .collect(),
             machines: Vec::new(),
             queued: Vec::new(),
+            platforms: Vec::new(),
         };
         let key = RunnerKey::new("sha256:ci");
         let mut client = CiClient::new(Endpoint("weida://ci/".to_owned()), "ci".to_owned());

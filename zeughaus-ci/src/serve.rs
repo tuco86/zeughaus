@@ -21,7 +21,8 @@ use zeughaus_link::{
 use zeughaus_mux::TerminalId;
 
 use crate::config::{CiConfig, valid_name};
-use crate::event;
+use crate::event::{self, EventKind};
+use crate::excerpt;
 use crate::runners::Runners;
 use crate::scheduler::{
     self, JobRecord, Pipeline, PipelineStatus, load_pipeline, load_pipelines, load_repo_pipelines,
@@ -29,6 +30,16 @@ use crate::scheduler::{
 };
 use crate::transcripts::Transcripts;
 use crate::transport::editor_principal;
+
+/// The most lines of a job's output one `Log` reply carries.
+const MAX_LOG_LINES: u32 = 5000;
+
+/// The most text one `Log` reply carries: the JSON around it and its escapes
+/// take the rest of [`MAX_CI_REPLY_BYTES`].
+const MAX_LOG_TEXT_BYTES: usize = 3 << 20;
+
+/// How much of a transcript's end a `Log` reply is made from.
+const LOG_READ_BYTES: usize = 8 << 20;
 
 pub struct CiServer {
     state_dir: PathBuf,
@@ -81,6 +92,12 @@ impl CiServer {
             }
             CiRequest::Rerun { repo, number } => self.rerun(&repo, number),
             CiRequest::Cancel { repo, number } => self.cancel(&repo, number),
+            CiRequest::Log {
+                repo,
+                number,
+                job,
+                tail,
+            } => self.log(&repo, number, &job, tail),
         }
     }
 
@@ -112,6 +129,12 @@ impl CiServer {
             channels: channel_views(&pipelines),
             machines: self.machine_views(&pipelines),
             queued: queued_views(&pipelines, &queued),
+            platforms: self
+                .config
+                .platforms
+                .iter()
+                .map(|(platform, target)| (platform.clone(), target.clone()))
+                .collect(),
         }
     }
 
@@ -191,6 +214,10 @@ impl CiServer {
         let Some(pipeline) = self.record(repo, number) else {
             return error("no such pipeline");
         };
+        // Its working trees are gone with the run: only the uploader has them.
+        if pipeline.event.kind == EventKind::Try {
+            return error("a try run cannot be rerun; start a new one");
+        }
         let mut event = pipeline.event.clone();
         if pipeline.sha.is_some() {
             event.sha = pipeline.sha.clone();
@@ -218,11 +245,60 @@ impl CiServer {
             Err(e) => error(&e),
         }
     }
+
+    /// The end of a job's stored output as plain text: at most `tail` lines,
+    /// and never more than a reply may carry. The transcript is read from
+    /// its end, so a job that wrote for hours costs what its last lines do.
+    fn log(&self, repo: &str, number: u64, job: &str, tail: u32) -> CiReply {
+        if !valid_name(repo) || !valid_name(job) {
+            return error("no such job");
+        }
+        let dir = transcript_dir(&self.state_dir, repo, number, job);
+        if !dir.join("wal").exists() {
+            return error(&format!("no output for {job} of #{number}"));
+        }
+        match excerpt::read_log_tail(&dir, LOG_READ_BYTES) {
+            Ok(text) => CiReply::Log {
+                text: last_lines(&text, tail.min(MAX_LOG_LINES) as usize, MAX_LOG_TEXT_BYTES)
+                    .to_owned(),
+                finished: dir.join("exit").exists(),
+            },
+            Err(e) => error(&e),
+        }
+    }
 }
 
 fn error(message: &str) -> CiReply {
     CiReply::Error {
         message: message.to_owned(),
+    }
+}
+
+/// The last `lines` lines of `text`, cut from the front to at most `max`
+/// bytes at the start of a line (inside the line when it alone is longer).
+fn last_lines(text: &str, lines: usize, max: usize) -> &str {
+    if lines == 0 {
+        return "";
+    }
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let start = body
+        .match_indices('\n')
+        .rev()
+        .nth(lines - 1)
+        .map_or(0, |(newline, _)| newline + 1);
+    let kept = &text[start..];
+    let Some(mut cut) = kept.len().checked_sub(max).filter(|&cut| cut > 0) else {
+        return kept;
+    };
+    while !kept.is_char_boundary(cut) {
+        cut += 1;
+    }
+    if kept.as_bytes()[cut - 1] == b'\n' {
+        return &kept[cut..];
+    }
+    match kept[cut..].find('\n') {
+        Some(newline) => &kept[cut + newline + 1..],
+        None => &kept[cut..],
     }
 }
 
@@ -465,7 +541,8 @@ mod tests {
             CiConfig::parse(&format!(
                 "default_runner = \"alpha\"\n\
                  [runners.alpha]\nfingerprint = \"{FINGERPRINT}\"\nmachines = [\"win11\"]\n\
-                 [runners.beta]\nfingerprint = \"{other}\"\n"
+                 [runners.beta]\nfingerprint = \"{other}\"\n\
+                 [platforms]\nlinux-amd64 = \"alpha\"\nwindows-amd64 = \"win11\"\n"
             ))
             .expect("a valid ci.toml"),
         )
@@ -520,6 +597,7 @@ mod tests {
                 cron: None,
                 actor: "test".to_owned(),
                 delivery: None,
+                upload: None,
                 received: 0,
             },
             sha: Some(format!("{number:040}")),
@@ -780,6 +858,13 @@ mod tests {
             status: status.to_owned(),
         };
         assert_eq!(
+            seen.platforms,
+            [
+                ("linux-amd64".to_owned(), "alpha".to_owned()),
+                ("windows-amd64".to_owned(), "win11".to_owned()),
+            ]
+        );
+        assert_eq!(
             seen.channels,
             [
                 channel("other", "dev", 1, "succeeded"),
@@ -990,5 +1075,81 @@ mod tests {
         assert_eq!(cancel(3), error("no such pipeline"));
         assert!(event::drain_cancels(&state).is_empty());
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_try_run_cannot_be_rerun() {
+        let state = scratch("rerun-try");
+        let mut record = pipeline("view", 4, "try", PipelineStatus::Failed, Vec::new());
+        record.event.kind = EventKind::Try;
+        record.event.git_ref = "try".to_owned();
+        record.event.upload = Some("0123456789abcdef".to_owned());
+        store(&state, &record);
+        let server = server(&state);
+        assert_eq!(
+            server.answer(CiRequest::Rerun {
+                repo: "view".to_owned(),
+                number: 4,
+            }),
+            error("a try run cannot be rerun; start a new one")
+        );
+        event::drain_inbox(&state);
+        assert!(event::queued(&state).is_empty());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_jobs_log_is_its_last_lines_and_says_whether_it_ended() {
+        let state = scratch("log");
+        let dir = transcript_dir(&state, "view", 3, "build");
+        std::fs::create_dir_all(&dir).expect("create the transcript directory");
+        let server = server(&state);
+        let ask = |repo: &str, job: &str, tail| {
+            server.answer(CiRequest::Log {
+                repo: repo.to_owned(),
+                number: 3,
+                job: job.to_owned(),
+                tail,
+            })
+        };
+        let log = |tail| match ask("view", "build", tail) {
+            CiReply::Log { text, finished } => (text, finished),
+            other => panic!("unexpected reply {other:?}"),
+        };
+
+        assert_eq!(ask("view", "build", 10), error("no output for build of #3"));
+        let mut wal =
+            zeughaus_terminal::wal::WalWriter::open(&dir.join("wal"), None).expect("open the WAL");
+        wal.append(1, b"\x1b[32mone\x1b[0m\r\ntwo\r\n")
+            .expect("append");
+        wal.append(2, b"three\r\nfour\r\n").expect("append");
+
+        // The escape sequences are gone, only the end is asked for, and the
+        // job still runs.
+        assert_eq!(log(2), ("three\nfour\n".to_owned(), false));
+        assert_eq!(log(100), ("one\ntwo\nthree\nfour\n".to_owned(), false));
+        assert_eq!(log(0), (String::new(), false));
+        std::fs::write(dir.join("exit"), "code=0\n").expect("write the exit record");
+        assert_eq!(log(1), ("four\n".to_owned(), true));
+
+        // Names that are no job read nothing.
+        assert_eq!(ask("../view", "build", 10), error("no such job"));
+        assert_eq!(ask("view", "../build", 10), error("no such job"));
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn the_last_lines_of_a_text_are_cut_at_a_line_start_within_the_byte_limit() {
+        assert_eq!(last_lines("a\nb\nc\n", 2, 100), "b\nc\n");
+        assert_eq!(last_lines("a\nb\nc", 2, 100), "b\nc");
+        assert_eq!(last_lines("a\nb", 5, 100), "a\nb");
+        assert_eq!(last_lines("a\nb\nc\n", 0, 100), "");
+        assert_eq!(last_lines("", 3, 100), "");
+        // Cut from the front to the next line start; inside a line when it
+        // alone is longer, at a character.
+        assert_eq!(last_lines("aaaa\nbb\ncc\n", 10, 6), "bb\ncc\n");
+        assert_eq!(last_lines("aaaa\nbb\ncc\n", 10, 5), "cc\n");
+        assert_eq!(last_lines("aaaa\nbb\ncc\n", 10, 100), "aaaa\nbb\ncc\n");
+        assert_eq!(last_lines("\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}", 1, 3), "\u{e9}");
     }
 }

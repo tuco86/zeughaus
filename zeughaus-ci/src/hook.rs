@@ -228,6 +228,7 @@ fn handle(
             cron: None,
             actor: actor.to_owned(),
             delivery: delivery.map(str::to_owned),
+            upload: None,
             received: now,
         }),
     )

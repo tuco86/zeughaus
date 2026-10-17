@@ -48,9 +48,12 @@ fn size_of(dir: &Path) -> u64 {
 }
 
 /// When a workspace was last checked out; one never touched counts as oldest.
+/// A repository's workspace has the marker in its `.git`; the root of a try
+/// run's checkouts is no repository and has it beside them.
 fn last_used(workspace: &Path) -> SystemTime {
-    std::fs::metadata(workspace.join(".git").join("zci-last-used"))
-        .and_then(|m| m.modified())
+    let modified = |marker: PathBuf| std::fs::metadata(marker).and_then(|m| m.modified());
+    modified(workspace.join(".git").join("zci-last-used"))
+        .or_else(|_| modified(workspace.join(".zci-last-used")))
         .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
@@ -163,4 +166,45 @@ pub fn prune_images(repo: &str, used: &HashSet<String>) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+    use std::time::Duration;
+
+    use super::*;
+
+    fn marked(path: &Path, secs: u64) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        File::create(path)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    /// A repository's workspace is as old as the marker in its `.git`, the
+    /// root of a try run's checkouts as the marker beside them, and a
+    /// workspace never checked out counts as the oldest.
+    #[test]
+    fn a_workspace_is_as_old_as_its_marker() {
+        let base = std::env::temp_dir().join(format!("zci-last-used-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        marked(&base.join("repo/.git/zci-last-used"), 100);
+        marked(&base.join("try/.zci-last-used"), 200);
+        marked(&base.join("both/.git/zci-last-used"), 300);
+        marked(&base.join("both/.zci-last-used"), 400);
+        std::fs::create_dir_all(base.join("never")).unwrap();
+        let secs = |ws: &str| {
+            last_used(&base.join(ws))
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        assert_eq!(secs("repo"), 100);
+        assert_eq!(secs("try"), 200);
+        assert_eq!(secs("both"), 300);
+        assert_eq!(secs("never"), 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

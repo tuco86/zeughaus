@@ -12,7 +12,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use zeughaus_link::enlist::{Assignment, Checkout};
+use zeughaus_link::enlist::{Assignment, Checkout, Upload};
 
 use super::CI_DIR;
 use super::stage::Engine;
@@ -161,6 +161,53 @@ fn enter_sh(a: &Assignment, workspace: &Path, mirror: &Path) -> String {
     out
 }
 
+/// The file bundle `index` of a try run is downloaded to, in the run's own
+/// directory, and the launcher checks out from.
+pub(super) fn bundle_file(run_dir: &Path, index: u32) -> std::path::PathBuf {
+    run_dir.join("bundles").join(format!("{index}.bundle"))
+}
+
+/// The directory name of a try run's main checkout, the first of its upload.
+fn main_dir(upload: &Upload) -> &str {
+    upload.dirs.first().map_or("", |dir| dir.dir.as_str())
+}
+
+/// The part of `launch.sh` of a try run that enters its working trees, in
+/// place of [`enter_sh`]. Every checkout of the upload is a directory of its
+/// own below `root`, the workspace all tries of the repository share: the
+/// main checkout is the first, and the path dependencies it reaches through
+/// `../` sit beside it. Each bundle holds one commit. `git clean` has no
+/// `-x`, so what an earlier try built there (`target/`) stays, and the ref
+/// an earlier bundle left is pruned. The bundles go as soon as they are in,
+/// and the script ends up in the main checkout.
+fn enter_try_sh(upload: &Upload, root: &Path, run_dir: &Path) -> String {
+    let mut out = format!("root={}\n", sh_path(root));
+    for (index, dir) in (0u32..).zip(&upload.dirs) {
+        let name = sh_quote(&dir.dir);
+        let _ = write!(
+            out,
+            "d=\"$root\"/{name}\n\
+             mkdir -p \"$d\" && cd \"$d\" || {{ printf '[zeughaus-ci] cannot enter %s\\n' \"$d\"; exit 70; }}\n\
+             [ -d .git ] || git init -q || exit 70\n\
+             git fetch -q --no-tags --prune {bundle} '+refs/zeughaus-try/*:refs/zeughaus-try/*' \
+             && git checkout -q --force --detach {sha} && git clean -ffdq \
+             || {{ printf '[zeughaus-ci] checkout of %s failed\\n' {name}; exit 70; }}\n",
+            bundle = sh_path(&bundle_file(run_dir, index)),
+            sha = sh_quote(&dir.sha),
+        );
+    }
+    let _ = write!(
+        out,
+        "rm -rf {bundles}\n\
+         touch \"$root/.zci-last-used\"\n\
+         ws=\"$root\"/{main}\n\
+         cd \"$ws\"\n",
+        bundles = sh_path(&run_dir.join("bundles")),
+        main = sh_quote(main_dir(upload)),
+    );
+    out
+}
+
 /// `launch.sh` for a job on this machine (host or container), or for a
 /// Windows VM job, which has its own launcher.
 pub fn launch_sh(launch: &Launch<'_>) -> String {
@@ -169,8 +216,16 @@ pub fn launch_sh(launch: &Launch<'_>) -> String {
         Target::Host { workspace } | Target::Container { workspace, .. } => *workspace,
         Target::WindowsVm { .. } => return launch_sh_windows_vm(launch),
     };
-    let mut out = preamble(launch, "");
-    out.push_str(&enter_sh(a, workspace, launch.mirror));
+    // A try run's bundles are deleted once they are checked out, and when
+    // the launcher ends before.
+    let drop_bundles = a.upload.as_ref().map_or_else(String::new, |_| {
+        format!("; rm -rf {}", sh_path(&launch.run_dir.join("bundles")))
+    });
+    let mut out = preamble(launch, &drop_bundles);
+    match &a.upload {
+        Some(upload) => out.push_str(&enter_try_sh(upload, workspace, launch.run_dir)),
+        None => out.push_str(&enter_sh(a, workspace, launch.mirror)),
+    }
     let inner = launch.run_dir.join("inner.sh");
     match &launch.target {
         Target::Host { .. } => {
@@ -203,14 +258,23 @@ pub fn launch_sh(launch: &Launch<'_>) -> String {
             let memory = sh_quote(memory);
             let run = sh_path(launch.run_dir);
             let inputs = sh_path(&launch.run_dir.join("inputs"));
+            // A try run mounts the root of its checkouts and starts in the
+            // main one.
+            let (mount, workdir) = match &a.upload {
+                Some(upload) => (
+                    "\"$root:/try\"",
+                    sh_quote(&format!("/try/{}", main_dir(upload))),
+                ),
+                None => ("\"$ws:/work\"", "/work".to_owned()),
+            };
             match engine {
                 Engine::Podman => {
                     let _ = write!(
                         out,
                         "podman image exists {tag} || podman build -t {tag} -f {file} {ctx} || exit 71\n\
                          podman run --rm -it --init --name {name} --cpus {cpus} --memory {memory} \
-                         --env-file \"$secret_dir/env\" -v \"$ws:/work\" -v {run}:/ci/run \
-                         -v {inputs}:/ci/inputs:ro -w /work {tag} /bin/sh /ci/run/inner.sh\n\
+                         --env-file \"$secret_dir/env\" -v {mount} -v {run}:/ci/run \
+                         -v {inputs}:/ci/inputs:ro -w {workdir} {tag} /bin/sh /ci/run/inner.sh\n\
                          exit $?\n",
                     );
                 }
@@ -223,8 +287,8 @@ pub fn launch_sh(launch: &Launch<'_>) -> String {
                         "container system status >/dev/null 2>&1 || container system start --enable-kernel-install || exit 71\n\
                          container image inspect {tag} >/dev/null 2>&1 || container build -t {tag} -f {file} --cpus {cpus} --memory {memory} {ctx} || exit 71\n\
                          container run --rm -it --init --name {name} --cpus {cpus} --memory {memory} \
-                         --env-file \"$secret_dir/env\" -v \"$ws:/work\" -v {run}:/ci/run \
-                         -v {inputs}:/ci/inputs -w /work {tag} /bin/sh /ci/run/inner.sh\n\
+                         --env-file \"$secret_dir/env\" -v {mount} -v {run}:/ci/run \
+                         -v {inputs}:/ci/inputs -w {workdir} {tag} /bin/sh /ci/run/inner.sh\n\
                          exit $?\n",
                     );
                 }
@@ -334,9 +398,50 @@ pub fn windows_powershell() -> String {
     format!(r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe")
 }
 
+/// The checkout of a try run in `launch.ps1`, as [`enter_try_sh`] does it in
+/// `launch.sh`: `$ws` is the root of the run's working trees on entry and the
+/// main checkout on exit.
+fn enter_try_ps1(upload: &Upload) -> String {
+    let mut out = String::from(
+        "$root = $ws\r\n\
+         $bundles = Join-Path $env:ZEUGHAUS_RUN_DIR 'bundles'\r\n",
+    );
+    for (index, dir) in upload.dirs.iter().enumerate() {
+        let check = format!(
+            "if ($LASTEXITCODE -ne 0) {{ Write-Host {}; exit 70 }}",
+            ps_quote(&format!("[zeughaus-ci] checkout of {} failed", dir.dir))
+        );
+        let _ = write!(
+            out,
+            "$d = Join-Path $root {name}\r\n\
+             New-Item -ItemType Directory -Force -Path $d | Out-Null\r\n\
+             Set-Location -LiteralPath $d\r\n\
+             if (-not (Test-Path -LiteralPath .git)) {{ git init -q; if ($LASTEXITCODE -ne 0) {{ Write-Host \"[zeughaus-ci] cannot enter $d\"; exit 70 }} }}\r\n\
+             git fetch -q --no-tags --prune (Join-Path $bundles '{index}.bundle') '+refs/zeughaus-try/*:refs/zeughaus-try/*'\r\n\
+             {check}\r\n\
+             git checkout -q --force --detach {sha}\r\n\
+             {check}\r\n\
+             git clean -ffdq\r\n\
+             {check}\r\n",
+            name = ps_quote(&dir.dir),
+            sha = ps_quote(&dir.sha),
+        );
+    }
+    let _ = write!(
+        out,
+        "Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $bundles\r\n\
+         New-Item -ItemType File -Force -Path (Join-Path $root '.zci-last-used') | Out-Null\r\n\
+         $ws = Join-Path $root {main}\r\n\
+         Set-Location -LiteralPath $ws\r\n",
+        main = ps_quote(main_dir(upload)),
+    );
+    out
+}
+
 /// `launch.ps1`: a host job on a Windows runner. The checkout into
 /// `workspace` (or, for a job that continues its context, the check that an
-/// earlier job of the pipeline left it), the secrets read into the session
+/// earlier job of the pipeline left it; for a try run, the checkouts of its
+/// upload below it), the secrets read into the session
 /// from `env.ps1` and deleted at once, the job under this runner's `timeout`,
 /// and on failure the exit code in `$env:ZEUGHAUS_RUN_DIR\code` and a shell
 /// in the workspace. The secret directory goes however the script ends.
@@ -351,24 +456,37 @@ pub fn launch_ps1(
     let path = |p: &Path| ps_quote(&p.to_string_lossy());
     let check = "if ($LASTEXITCODE -ne 0) { Write-Host '[zeughaus-ci] checkout failed'; exit 70 }";
     let n = a.number;
-    let checkout = match a.checkout {
-        Checkout::Continue => format!(
-            "$held = \"$(Get-Content -Raw -LiteralPath .git\\zci-context -ErrorAction SilentlyContinue)\".Trim()\r\n\
-             if ($held -ne '{n}') {{ Write-Host \"[zeughaus-ci] context workspace $ws no longer holds pipeline #{n}\"; exit 70 }}\r\n"
+    let (checkout, touch, drop_bundles) = match &a.upload {
+        // The bundles go when the launcher ends before they were checked out.
+        Some(upload) => (
+            enter_try_ps1(upload),
+            String::new(),
+            "Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath (Join-Path $env:ZEUGHAUS_RUN_DIR 'bundles')\r\n"
+                .to_owned(),
         ),
-        Checkout::Clean | Checkout::Wipe => format!(
-            "if (-not (Test-Path -LiteralPath .git)) {{ git init -q; if ($LASTEXITCODE -ne 0) {{ Write-Host \"[zeughaus-ci] cannot enter $ws\"; exit 70 }} }}\r\n\
-             git fetch -q --no-tags {mirror} '+refs/ci/{n}:refs/ci/head'\r\n\
-             {check}\r\n\
-             git checkout -q --force --detach refs/ci/head\r\n\
-             {check}\r\n\
-             git clean -ffdxq{excludes}\r\n\
-             {check}\r\n\
-             Set-Content -NoNewline -Path .git\\zci-context -Value '{n}'\r\n\
-             if (-not $?) {{ Write-Host '[zeughaus-ci] checkout failed'; exit 70 }}\r\n",
-            mirror = path(mirror),
-            excludes = clean_excludes(kept(a), ps_quote),
-        ),
+        None => {
+            let checkout = match a.checkout {
+                Checkout::Continue => format!(
+                    "$held = \"$(Get-Content -Raw -LiteralPath .git\\zci-context -ErrorAction SilentlyContinue)\".Trim()\r\n\
+                     if ($held -ne '{n}') {{ Write-Host \"[zeughaus-ci] context workspace $ws no longer holds pipeline #{n}\"; exit 70 }}\r\n"
+                ),
+                Checkout::Clean | Checkout::Wipe => format!(
+                    "if (-not (Test-Path -LiteralPath .git)) {{ git init -q; if ($LASTEXITCODE -ne 0) {{ Write-Host \"[zeughaus-ci] cannot enter $ws\"; exit 70 }} }}\r\n\
+                     git fetch -q --no-tags {mirror} '+refs/ci/{n}:refs/ci/head'\r\n\
+                     {check}\r\n\
+                     git checkout -q --force --detach refs/ci/head\r\n\
+                     {check}\r\n\
+                     git clean -ffdxq{excludes}\r\n\
+                     {check}\r\n\
+                     Set-Content -NoNewline -Path .git\\zci-context -Value '{n}'\r\n\
+                     if (-not $?) {{ Write-Host '[zeughaus-ci] checkout failed'; exit 70 }}\r\n",
+                    mirror = path(mirror),
+                    excludes = clean_excludes(kept(a), ps_quote),
+                ),
+            };
+            let touch = "New-Item -ItemType File -Force -Path .git\\zci-last-used | Out-Null\r\n";
+            (checkout, touch.to_owned(), String::new())
+        }
     };
     format!(
         "$secretDir = {secret}\r\n\
@@ -377,7 +495,7 @@ pub fn launch_ps1(
          New-Item -ItemType Directory -Force -Path $ws | Out-Null\r\n\
          Set-Location -LiteralPath $ws\r\n\
          {checkout}\
-         New-Item -ItemType File -Force -Path .git\\zci-last-used | Out-Null\r\n\
+         {touch}\
          $secrets = Join-Path $secretDir 'env.ps1'\r\n\
          . $secrets\r\n\
          Remove-Item -Force -LiteralPath $secrets\r\n\
@@ -392,6 +510,7 @@ pub fn launch_ps1(
          exit $rc\r\n\
          }} finally {{\r\n\
          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $secretDir\r\n\
+         {drop_bundles}\
          }}\r\n",
         secret = path(secret_dir),
         ws = path(workspace),
@@ -480,7 +599,7 @@ fn launch_sh_windows_vm(launch: &Launch<'_>) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use zeughaus_link::enlist::{Place, WhenBusy};
+    use zeughaus_link::enlist::{Place, Upload, UploadDir, WhenBusy};
 
     use super::*;
 
@@ -805,6 +924,346 @@ mod tests {
         // A workspace that was removed in between holds no context.
         std::fs::remove_dir_all(&ws).unwrap();
         assert_eq!(enter(Checkout::Continue, 7).0, Some(70));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn try_upload() -> Upload {
+        Upload {
+            dirs: vec![
+                UploadDir {
+                    dir: "zeughaus".to_owned(),
+                    sha: "a".repeat(40),
+                },
+                UploadDir {
+                    dir: "weida".to_owned(),
+                    sha: "b".repeat(40),
+                },
+            ],
+        }
+    }
+
+    fn try_assignment(place: Place) -> Assignment {
+        Assignment {
+            run: "demo.9.try".to_owned(),
+            number: 9,
+            job: "try".to_owned(),
+            file: "zeughaus-try.sh".to_owned(),
+            workspace: "zeughaus-try".to_owned(),
+            cache: Vec::new(),
+            upload: Some(try_upload()),
+            ..assignment(place)
+        }
+    }
+
+    fn try_launcher(a: &Assignment, target: Target<'_>) -> String {
+        launch_sh(&Launch {
+            assignment: a,
+            run_dir: Path::new("/s/runs/4"),
+            secret_dir: Path::new("/run/zeughaus-ci/demo.9.try"),
+            mirror: Path::new("/s/ci/mirrors/demo.git"),
+            target,
+        })
+    }
+
+    /// A try run has no commit to fetch from the mirror: every checkout of
+    /// its upload is fetched from its bundle and checked out in a directory of
+    /// its own below the workspace, and the job starts in the first.
+    #[test]
+    fn a_try_launcher_fetches_every_bundle_and_checks_out_every_commit() {
+        let workspace = PathBuf::from("/s/ci/work/demo/zeughaus-try");
+        let a = try_assignment(Place::Host);
+        let sh = try_launcher(
+            &a,
+            Target::Host {
+                workspace: &workspace,
+            },
+        );
+        assert!(sh.contains("root='/s/ci/work/demo/zeughaus-try'\n"), "{sh}");
+        for (index, dir, sha) in [(0, "zeughaus", "a"), (1, "weida", "b")] {
+            let sha = sha.repeat(40);
+            assert!(sh.contains(&format!("d=\"$root\"/'{dir}'\n")), "{dir}");
+            assert!(
+                sh.contains(&format!(
+                    "git fetch -q --no-tags --prune '/s/runs/4/bundles/{index}.bundle' \
+                     '+refs/zeughaus-try/*:refs/zeughaus-try/*' \
+                     && git checkout -q --force --detach '{sha}' && git clean -ffdq \
+                     || {{ printf '[zeughaus-ci] checkout of %s failed\\n' '{dir}'; exit 70; }}\n"
+                )),
+                "{dir}"
+            );
+        }
+        assert!(
+            sh.find("'zeughaus'").unwrap() < sh.find("'weida'").unwrap(),
+            "the main checkout first"
+        );
+        // The bundles go once they are in, and when the launcher ends before.
+        assert!(sh.contains("rm -rf '/s/runs/4/bundles'\ntouch \"$root/.zci-last-used\"\n"));
+        assert!(sh.contains("ws=\"$root\"/'zeughaus'\ncd \"$ws\"\n"));
+        assert!(sh.contains("cleanup() { rm -rf \"$secret_dir\"; rm -rf '/s/runs/4/bundles'; }"));
+        // No commit of the forge, no `-x`: what a build left stays.
+        for forbidden in [
+            "refs/ci/",
+            "git clean -ffdxq",
+            "zci-context",
+            ".git/zci-last-used",
+        ] {
+            assert!(!sh.contains(forbidden), "{forbidden}");
+        }
+        assert!(sh.contains("/bin/sh '/s/runs/4/inner.sh'"));
+
+        // In a container the root is mounted and the job starts in the main
+        // checkout, whatever the engine.
+        for engine in [Engine::Podman, Engine::Apple] {
+            let container = try_assignment(Place::Container {
+                image: "trixie".to_owned(),
+                tag: "localhost/zci-demo-trixie:0123456789abcdef".to_owned(),
+            });
+            let sh = try_launcher(
+                &container,
+                Target::Container {
+                    engine,
+                    workspace: &workspace,
+                    image: "trixie",
+                    tag: "localhost/zci-demo-trixie:0123456789abcdef",
+                    cpus: 4,
+                    memory: "8g",
+                },
+            );
+            assert!(
+                sh.contains("-v \"$root:/try\" -v '/s/runs/4':/ci/run"),
+                "{sh}"
+            );
+            assert!(sh.contains("-w '/try/zeughaus' "), "{sh}");
+            assert!(!sh.contains(":/work") && !sh.contains("-w /work"), "{sh}");
+            assert!(!sh.contains("$ws:"), "{sh}");
+            // The image is built from the main checkout's own folder.
+            let enters = sh.find("cd \"$ws\"\n").expect("enters the main checkout");
+            let builds = sh.find("-f '.zeughaus-ci/trixie.Containerfile' ");
+            assert!(builds.is_some_and(|builds| enters < builds), "{sh}");
+        }
+    }
+
+    #[test]
+    fn a_try_launcher_for_windows_checks_out_every_commit_too() {
+        let a = Assignment {
+            interpreter: "powershell".to_owned(),
+            file: "zeughaus-try.ps1".to_owned(),
+            ..try_assignment(Place::Host)
+        };
+        let ps1 = launch_ps1(
+            &a,
+            Path::new(r"C:\s\secret"),
+            Path::new(r"C:\s\mirror"),
+            Path::new(r"C:\s\work\demo\zeughaus-try"),
+            Path::new(r"C:\s\runner.exe"),
+        );
+        assert!(
+            ps1.contains(r"$ws = 'C:\s\work\demo\zeughaus-try'"),
+            "{ps1}"
+        );
+        assert!(ps1.contains("$root = $ws\r\n"));
+        for (index, dir, sha) in [(0, "zeughaus", "a"), (1, "weida", "b")] {
+            assert!(
+                ps1.contains(&format!("$d = Join-Path $root '{dir}'\r\n")),
+                "{dir}"
+            );
+            assert!(
+                ps1.contains(&format!(
+                    "git fetch -q --no-tags --prune (Join-Path $bundles '{index}.bundle') \
+                     '+refs/zeughaus-try/*:refs/zeughaus-try/*'\r\n"
+                )),
+                "{dir}"
+            );
+            assert!(
+                ps1.contains(&format!(
+                    "git checkout -q --force --detach '{}'\r\n",
+                    sha.repeat(40)
+                )),
+                "{dir}"
+            );
+            assert!(ps1.contains(&format!(
+                "if ($LASTEXITCODE -ne 0) {{ Write-Host '[zeughaus-ci] checkout of {dir} failed'; exit 70 }}"
+            )));
+        }
+        assert!(ps1.contains("git clean -ffdq\r\n"));
+        assert!(
+            ps1.contains("$ws = Join-Path $root 'zeughaus'\r\nSet-Location -LiteralPath $ws\r\n")
+        );
+        assert!(
+            ps1.contains("New-Item -ItemType File -Force -Path (Join-Path $root '.zci-last-used')")
+        );
+        // The bundles go once they are in, and when the launcher ends before.
+        assert!(ps1.contains(
+            "Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $bundles\r\n"
+        ));
+        assert!(ps1.contains(
+            "} finally {\r\n\
+             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $secretDir\r\n\
+             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath (Join-Path $env:ZEUGHAUS_RUN_DIR 'bundles')\r\n\
+             }\r\n"
+        ));
+        for forbidden in [
+            "refs/ci/",
+            "git clean -ffdxq",
+            "zci-context",
+            r".git\zci-last-used",
+        ] {
+            assert!(!ps1.contains(forbidden), "{forbidden}");
+        }
+    }
+
+    /// The shell side of a try run, run for real against bundles as the
+    /// agent makes them: each checkout lands in a directory of its own below
+    /// the root, a later try finds what an earlier one built there, and a
+    /// bundle that does not hold its commit ends the launcher with 70.
+    #[test]
+    fn a_try_enters_every_working_tree_from_its_bundle() {
+        use std::process::Command;
+
+        let base = std::env::temp_dir().join(format!("zci-launch-try-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (root, run_dir) = (base.join("root"), base.join("run"));
+        std::fs::create_dir_all(run_dir.join("bundles")).unwrap();
+
+        let git = |dir: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        // One snapshot of `name`: `files` written (None removes one), a
+        // commit without a parent of the whole tree, and a bundle of it
+        // under `refname` as `bundles/<index>.bundle`.
+        let snapshot = |name: &str, files: &[(&str, Option<&str>)], refname: &str, index: u32| {
+            let src = base.join("src").join(name);
+            std::fs::create_dir_all(&src).unwrap();
+            if !src.join(".git").exists() {
+                git(&src, &["init", "-q"]);
+            }
+            for (file, text) in files {
+                match text {
+                    Some(text) => std::fs::write(src.join(file), text).unwrap(),
+                    None => std::fs::remove_file(src.join(file)).unwrap(),
+                }
+            }
+            git(&src, &["add", "-A"]);
+            let tree = git(&src, &["write-tree"]);
+            let commit = git(&src, &["commit-tree", &tree, "-m", "zeughaus try"]);
+            git(&src, &["update-ref", refname, &commit]);
+            let bundle = bundle_file(&run_dir, index);
+            git(
+                &src,
+                &["bundle", "create", bundle.to_str().unwrap(), refname],
+            );
+            git(&src, &["update-ref", "-d", refname]);
+            commit
+        };
+        let upload = |app: &str, lib: &str| Upload {
+            dirs: vec![
+                UploadDir {
+                    dir: "app".to_owned(),
+                    sha: app.to_owned(),
+                },
+                UploadDir {
+                    dir: "lib".to_owned(),
+                    sha: lib.to_owned(),
+                },
+            ],
+        };
+        let enter = |upload: &Upload| {
+            let script = format!("{}pwd -P\n", enter_try_sh(upload, &root, &run_dir));
+            let output = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .output()
+                .expect("run sh");
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+            )
+        };
+        let read = |path: &str| std::fs::read_to_string(root.join(path)).ok();
+
+        // The first try: both trees come out of their bundles.
+        let app1 = snapshot(
+            "app",
+            &[
+                ("main.rs", Some("v1")),
+                ("old", Some("")),
+                (".gitignore", Some("target/\n")),
+            ],
+            "refs/zeughaus-try/1-1",
+            0,
+        );
+        let lib1 = snapshot("lib", &[("answer", Some("41"))], "refs/zeughaus-try/1-1", 1);
+        let (code, out) = enter(&upload(&app1, &lib1));
+        assert_eq!(code, Some(0), "{out}");
+        assert_eq!(read("app/main.rs").as_deref(), Some("v1"));
+        assert_eq!(read("lib/answer").as_deref(), Some("41"));
+        assert_eq!(
+            out.trim_end(),
+            std::fs::canonicalize(root.join("app"))
+                .unwrap()
+                .to_string_lossy(),
+            "the script ends in the main checkout"
+        );
+        assert!(!run_dir.join("bundles").exists(), "the bundles are gone");
+        assert!(root.join(".zci-last-used").exists());
+
+        // A build leaves its output in an ignored directory, and a stray file.
+        std::fs::create_dir_all(root.join("app/target")).unwrap();
+        std::fs::write(root.join("app/target/out"), "built").unwrap();
+        std::fs::write(root.join("app/stray"), "").unwrap();
+
+        // The next try, from other bundles: the snapshot replaces the trees
+        // (a deleted file goes, a stray one goes), the build output stays,
+        // and the ref of the first bundle is pruned.
+        std::fs::create_dir_all(run_dir.join("bundles")).unwrap();
+        let app2 = snapshot(
+            "app",
+            &[("main.rs", Some("v2")), ("old", None)],
+            "refs/zeughaus-try/2-1",
+            0,
+        );
+        let lib2 = snapshot("lib", &[("answer", Some("42"))], "refs/zeughaus-try/2-1", 1);
+        let (code, out) = enter(&upload(&app2, &lib2));
+        assert_eq!(code, Some(0), "{out}");
+        assert_eq!(read("app/main.rs").as_deref(), Some("v2"));
+        assert_eq!(read("lib/answer").as_deref(), Some("42"));
+        assert_eq!(read("app/old"), None);
+        assert_eq!(read("app/stray"), None);
+        assert_eq!(read("app/target/out").as_deref(), Some("built"));
+        let refs = git(&root.join("app"), &["for-each-ref", "--format=%(refname)"]);
+        assert_eq!(refs, "refs/zeughaus-try/2-1");
+
+        // A bundle that does not hold the commit ends it with 70, and says
+        // which checkout.
+        std::fs::create_dir_all(run_dir.join("bundles")).unwrap();
+        let lib3 = snapshot("lib", &[("answer", Some("43"))], "refs/zeughaus-try/3-1", 1);
+        std::fs::write(bundle_file(&run_dir, 0), "not a bundle").unwrap();
+        let (code, out) = enter(&upload(&app2, &lib3));
+        assert_eq!(code, Some(70), "{out}");
+        assert!(
+            out.contains("[zeughaus-ci] checkout of app failed"),
+            "{out}"
+        );
+        assert_eq!(
+            read("lib/answer").as_deref(),
+            Some("42"),
+            "nothing past it ran"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

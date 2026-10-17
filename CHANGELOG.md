@@ -27,6 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pipelines from nothing, `cache` paths included. This changes the enlist
   protocol to major 3: a runner built before is refused (`protocol 2 is not
   3`) until it is updated.
+- CI: a try run executes a command on a runner from an agent's working
+  tree, uncommitted files and sibling path dependencies included. An
+  editor's key uploads the snapshot as git bundles on the new `/try` path;
+  the CI runs it as a pipeline of the `try` channel on the host of the runner
+  (or in a container on it) that its `target` names, in a workspace all tries
+  of the repository share on that runner, so builds stay warm. A try needs no
+  entry in `ci.toml`, posts no forge status and cannot be rerun; a target
+  that is a Windows VM is refused. `/ci` also answers the last lines of a
+  job's output (`Log`) and lists the `[platforms]`.
 
 ### Fixed
 

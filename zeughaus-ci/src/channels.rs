@@ -24,6 +24,9 @@ use crate::pipeline::Pattern;
 
 pub const CHANNELS_FILE: &str = "channels.toml";
 
+/// The channel of every try run, whatever `channels.toml` says.
+pub const TRY_CHANNEL: &str = "try";
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
@@ -113,12 +116,14 @@ impl Channels {
     }
 }
 
-/// push `<branch>` -> `<branch>`, tag -> `tags`, cron -> `cron`.
+/// push `<branch>` -> `<branch>`, tag -> `tags`, cron -> `cron`, try run ->
+/// `try`.
 pub fn fallback(event: &CiEvent) -> String {
     match event.kind {
         EventKind::Push => event.git_ref.clone(),
         EventKind::Tag => "tags".to_owned(),
         EventKind::Cron => "cron".to_owned(),
+        EventKind::Try => TRY_CHANNEL.to_owned(),
     }
 }
 
@@ -135,6 +140,7 @@ mod tests {
             cron: cron.map(str::to_owned),
             actor: "test".to_owned(),
             delivery: None,
+            upload: None,
             received: 0,
         }
     }
@@ -201,6 +207,7 @@ on = ["tag v*"]
             channels.of(&event(EventKind::Cron, "main", Some("0 3 * * *"))),
             "cron"
         );
+        assert_eq!(channels.of(&event(EventKind::Try, "try", None)), "try");
     }
 
     #[test]

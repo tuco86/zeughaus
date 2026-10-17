@@ -1,6 +1,7 @@
 //! The `/artifacts` service: the CI relays a finished job's artifact set from
 //! the runner that holds it to the runner of a job that needs it, without a
-//! copy on this side.
+//! copy on this side, and hands a runner the bundles of the try run it was
+//! assigned.
 //!
 //! A consuming runner opens a `Download`; the CI asks the producing runner
 //! for the set with [`ToRunner::Upload`] under a transfer number, and that
@@ -8,7 +9,8 @@
 //! or `Unavailable`. The upload's bytes are streamed into the waiting
 //! download's reply as they arrive. One exchange moves one tar; the request
 //! is one frame ([`ArtifactRequest`]), an upload's bytes follow it, a
-//! download's follow the reply frame ([`ArtifactReply`]).
+//! download's follow the reply frame ([`ArtifactReply`]). A `TryBundle` is
+//! answered the same way, from the file the `/try` service stored.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,6 +30,7 @@ use crate::config::{CiConfig, valid_name};
 use crate::runners::Runners;
 use crate::scheduler::{JobStatus, Pipeline, load_pipeline};
 use crate::transport::principal_of;
+use crate::tryrun;
 
 /// Bytes moved per read or write.
 const CHUNK: usize = 256 << 10;
@@ -143,9 +146,8 @@ impl ArtifactService {
                 answer(&mut reply, &runner, &run, passed).await
             }
             ArtifactRequest::Download { run } => self.download(&runner, &run, &mut reply).await,
-            ArtifactRequest::TryBundle { run, .. } => {
-                let message = format!("unknown try run {run}");
-                write_frame(&mut reply, &ArtifactReply::Error { message }).await
+            ArtifactRequest::TryBundle { run, index } => {
+                self.try_bundle(&runner, &run, index, &mut reply).await
             }
         };
         if let Err(e) = outcome {
@@ -270,6 +272,59 @@ impl ArtifactService {
             self.runners.assigned_to(run)
         })
     }
+
+    /// Streams bundle `index` of the try run `run` into `reply`.
+    async fn try_bundle(
+        &self,
+        requester: &str,
+        run: &str,
+        index: u32,
+        reply: &mut weida::OutgoingTransfer,
+    ) -> Result<(), String> {
+        let (path, size) = match self.bundle_for(requester, run, index) {
+            Ok(found) => found,
+            Err(message) => return write_frame(reply, &ArtifactReply::Error { message }).await,
+        };
+        let mut file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(e) => {
+                let message = format!("cannot read bundle {index} of {run}: {e}");
+                return write_frame(reply, &ArtifactReply::Error { message }).await;
+            }
+        };
+        write_frame(reply, &ArtifactReply::Sending { size }).await?;
+        relay(&mut file, size, reply).await
+    }
+
+    /// The file and size of bundle `index` of the try run `run`, when
+    /// `requester` is the runner it is assigned to. The name came from a
+    /// peer and is joined into a path, so it is checked before and against
+    /// the records after.
+    fn bundle_for(&self, requester: &str, run: &str, index: u32) -> Result<(PathBuf, u64), String> {
+        let (repo, number, job) = parse_run_id(run).ok_or_else(|| format!("{run} is not a run"))?;
+        if !valid_name(&repo) || !valid_name(&job) {
+            return Err(format!("{run} is not a run"));
+        }
+        let pipeline = load_pipeline(&self.state_dir, &repo, number)
+            .map_err(|_| format!("{run} is not a known run"))?;
+        let id = tryrun::upload_of(&pipeline).ok_or_else(|| format!("{run} is not a try run"))?;
+        if self.runners.assigned_to(run).as_deref() != Some(requester) {
+            return Err(format!("runner {requester} is not assigned {run}"));
+        }
+        let upload = tryrun::read_upload(&self.state_dir, id)
+            .map_err(|_| format!("the upload of {run} is gone"))?;
+        if index as usize >= upload.dirs.len() {
+            return Err(format!(
+                "{run} has {} bundles, not {index}",
+                upload.dirs.len()
+            ));
+        }
+        let path = tryrun::bundle_path(&self.state_dir, id, index);
+        let size = std::fs::metadata(&path)
+            .map_err(|e| format!("cannot read bundle {index} of {run}: {e}"))?
+            .len();
+        Ok((path, size))
+    }
 }
 
 /// The runner that holds the set of `job` in `pipeline`, when `requester`
@@ -365,5 +420,83 @@ mod tests {
         let mut body: &[u8] = b"0123456789";
         relay(&mut body, 6, &mut out).await.expect("relay");
         assert_eq!(out, b"012345");
+    }
+
+    const FP: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
+    const UPLOAD: &str = "0123456789abcdef";
+
+    /// A service over a state directory that holds pipeline `demo` #3 (a try
+    /// run, or a push) with an upload of two bundles.
+    fn service_with(kind: &str) -> (ArtifactService, PathBuf) {
+        use zeughaus_link::enlist::UploadDir;
+        use zeughaus_link::tryrun::TryUpload;
+
+        let state = std::env::temp_dir().join(format!("zci-bundles-{kind}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let record = serde_json::json!({
+            "repo": "demo", "number": 3, "key": "", "sha": null, "status": "running",
+            "created": 0, "jobs": [],
+            "event": {
+                "repo": "demo", "kind": kind, "git_ref": "try", "sha": null, "cron": null,
+                "actor": "a", "delivery": null, "upload": UPLOAD, "received": 0,
+            },
+        });
+        crate::files::write_json(&state.join("ci/pipelines/demo/3.json"), &record).unwrap();
+        let dir = |name: &str| UploadDir {
+            dir: name.to_owned(),
+            sha: "a".repeat(40),
+        };
+        let upload = TryUpload {
+            origin: "git@example.org:me/demo.git".to_owned(),
+            target: "x".to_owned(),
+            image: None,
+            timeout_minutes: 5,
+            actor: "a".to_owned(),
+            summary: "true".to_owned(),
+            dirs: vec![dir("demo"), dir("lib")],
+            sizes: vec![5, 3],
+        };
+        std::fs::create_dir_all(tryrun::upload_dir(&state, UPLOAD)).unwrap();
+        std::fs::write(tryrun::bundle_path(&state, UPLOAD, 0), b"first").unwrap();
+        std::fs::write(tryrun::bundle_path(&state, UPLOAD, 1), b"lib").unwrap();
+        tryrun::write_upload(&state, UPLOAD, &upload).unwrap();
+        let config = CiConfig::parse(&format!(
+            "default_runner = \"x\"\n[runners.x]\nfingerprint = \"{FP}\"\n"
+        ))
+        .unwrap();
+        let service =
+            ArtifactService::new(state.clone(), Arc::new(config), Arc::new(Runners::new()));
+        (service, state)
+    }
+
+    /// A runner gets the bundles of the try run it is assigned, and of no
+    /// other run: not another runner's, not a push's, not a path.
+    #[test]
+    fn a_try_bundle_goes_only_to_the_runner_assigned_the_run() {
+        let (service, state) = service_with("try");
+        let run = "demo.3.try";
+        let path = |index| tryrun::bundle_path(&state, UPLOAD, index);
+
+        assert!(service.bundle_for("x", run, 0).is_err(), "not assigned yet");
+        service.runners.assign(run, "x");
+        assert_eq!(service.bundle_for("x", run, 0), Ok((path(0), 5)));
+        assert_eq!(service.bundle_for("x", run, 1), Ok((path(1), 3)));
+        assert!(service.bundle_for("x", run, 2).is_err(), "no third bundle");
+        assert!(service.bundle_for("y", run, 0).is_err(), "another runner");
+        for bad in ["demo.4.try", "../demo.3.try", "demo.3.../try", "demo", ""] {
+            assert!(service.bundle_for("x", bad, 0).is_err(), "{bad:?}");
+        }
+        service.runners.unassign(run);
+        assert!(
+            service.bundle_for("x", run, 0).is_err(),
+            "no longer assigned"
+        );
+        let _ = std::fs::remove_dir_all(&state);
+
+        // The same upload named by a pipeline that is no try run.
+        let (service, state) = service_with("push");
+        service.runners.assign(run, "x");
+        assert!(service.bundle_for("x", run, 0).is_err());
+        let _ = std::fs::remove_dir_all(&state);
     }
 }
