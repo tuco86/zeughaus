@@ -1,10 +1,18 @@
-# Installs the build toolchain into the golden image. Run over ssh by
-# `vm.sh toolchain` with the base image booted (PERSIST=1). Rust itself is
-# not installed here: CARGO_HOME and RUSTUP_HOME live on the cache disk
-# (W:), which does not exist in the golden image; prepare.ps1 runs
-# rustup-init on first use. Log: C:\zeughaus\toolchain.log
+# Installs the build toolchain: into the VM's golden image, run over ssh by
+# `vm.sh toolchain` with the base image booted (PERSIST=1), and onto a
+# Windows runner host by deploy/install-windows.sh. CARGO_HOME and
+# RUSTUP_HOME live under -CacheRoot: the cache disk (W:) in the VM, which
+# does not exist in the golden image, so prepare.ps1 runs rustup-init there
+# on first use; a host has its root already and gets Rust here.
+# Log: C:\zeughaus\toolchain.log
+param(
+    [string]$CacheRoot = 'W:',
+    # A machine someone also uses keeps its search indexer.
+    [switch]$Shared
+)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+New-Item -ItemType Directory -Path C:\zeughaus -Force | Out-Null
 Start-Transcript -Path C:\zeughaus\toolchain.log -Force
 
 $dl = 'C:\zeughaus\dl'
@@ -66,12 +74,21 @@ if (-not (Test-Path 'C:\Program Files\LLVM\bin\libclang.dll')) { throw 'LLVM is 
 Invoke-WebRequest -UseBasicParsing -OutFile C:\zeughaus\rustup-init.exe `
     -Uri 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe'
 
-# Rust state lives on the cache disk, so it survives the throwaway overlay.
-[Environment]::SetEnvironmentVariable('CARGO_HOME', 'W:\cargo', 'Machine')
-[Environment]::SetEnvironmentVariable('RUSTUP_HOME', 'W:\rustup', 'Machine')
+# Rust state lives under the cache root, so in the VM it survives the
+# throwaway overlay.
+$cargoHome = "$CacheRoot\cargo"
+$rustupHome = "$CacheRoot\rustup"
+[Environment]::SetEnvironmentVariable('CARGO_HOME', $cargoHome, 'Machine')
+[Environment]::SetEnvironmentVariable('RUSTUP_HOME', $rustupHome, 'Machine')
 $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-if (($machinePath -split ';') -notcontains 'W:\cargo\bin') {
-    [Environment]::SetEnvironmentVariable('Path', "W:\cargo\bin;$machinePath", 'Machine')
+if (($machinePath -split ';') -notcontains "$cargoHome\bin") {
+    [Environment]::SetEnvironmentVariable('Path', "$cargoHome\bin;$machinePath", 'Machine')
+}
+if ((Test-Path "$CacheRoot\") -and -not (Test-Path "$cargoHome\bin\rustup.exe")) {
+    $env:CARGO_HOME = $cargoHome
+    $env:RUSTUP_HOME = $rustupHome
+    & C:\zeughaus\rustup-init.exe -y --no-modify-path --default-toolchain stable --profile minimal
+    if ($LASTEXITCODE -ne 0) { throw "rustup-init exited $LASTEXITCODE" }
 }
 
 # Long paths for cargo target directories.
@@ -79,11 +96,13 @@ reg add HKLM\SYSTEM\CurrentControlSet\Control\FileSystem /v LongPathsEnabled /t 
 if ($LASTEXITCODE -ne 0) { throw 'reg add LongPathsEnabled failed' }
 
 # Defender and the indexer only slow builds down.
-Add-MpPreference -ExclusionPath 'W:\'
+Add-MpPreference -ExclusionPath "$CacheRoot\"
 foreach ($name in 'cargo.exe', 'rustc.exe', 'link.exe', 'cl.exe') {
     Add-MpPreference -ExclusionProcess $name
 }
-Set-Service WSearch -StartupType Disabled
+if (-not $Shared) {
+    Set-Service WSearch -StartupType Disabled
+}
 
 # Versions. The machine Path changed above, so look the tools up directly.
 & $gitExe --version

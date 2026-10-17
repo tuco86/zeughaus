@@ -18,7 +18,7 @@ label and boot task are all named `zeughaus`; the guest is `win11-ci`.
 | `autounattend.xml` | answer file: UEFI/GPT layout, virtio drivers, product key, Windows 11 Pro, no OOBE, local admin `zeughaus` |
 | `setup.ps1` | specialize pass, offline: sshd config, power/update policy, registers the boot task |
 | `firstboot.ps1` | boot task as SYSTEM: installs Win32-OpenSSH, activates, removes itself |
-| `toolchain.ps1` | golden image: MSVC Build Tools, Git, CMake, LLVM, rustup-init, Defender exclusions; run by `vm.sh toolchain` |
+| `toolchain.ps1` | golden image: MSVC Build Tools, Git, CMake, LLVM, rustup-init, Defender exclusions; run by `vm.sh toolchain`. `-CacheRoot` (default `W:`) holds Rust and is excluded from Defender, `-Shared` keeps the search indexer; `deploy/install-windows.sh --setup` runs it on a Windows runner host with `-CacheRoot C:\zeughaus -Shared` |
 | `prepare.ps1` | after every boot: brings the cache disk up as `W:`, cleans `W:\ci\runs`, installs Rust on `W:` when missing; the runner copies it into the guest and runs it |
 
 ## Host prerequisites
