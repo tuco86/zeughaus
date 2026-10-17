@@ -6,7 +6,9 @@
 //! lease count here is what keeps the idle stop away while a job is booting
 //! or running.
 
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -214,6 +216,7 @@ impl Vm {
     }
 
     /// Pauses (`stop`) or resumes (`cont`) every vCPU through the HMP monitor.
+    #[cfg(unix)]
     fn monitor(&self, command: &str) -> Result<(), String> {
         let path = self.config.dir.join("monitor.sock");
         let mut stream = UnixStream::connect(&path)
@@ -236,6 +239,12 @@ impl Vm {
             }
         }
         Ok(())
+    }
+
+    /// `enlist.toml` refuses machines on a host without unix sockets.
+    #[cfg(not(unix))]
+    fn monitor(&self, _command: &str) -> Result<(), String> {
+        Err("a VM monitor needs a unix host".to_owned())
     }
 
     /// `vm.sh <command>` with this machine's settings, output appended to
@@ -321,6 +330,7 @@ fn open_log(log: &Path) -> Result<std::fs::File, String> {
 }
 
 /// Whether `<dir>/qemu.pid` names a live process.
+#[cfg(unix)]
 fn qemu_alive(dir: &Path) -> bool {
     let Some(pid) = std::fs::read_to_string(dir.join("qemu.pid"))
         .ok()
@@ -330,6 +340,12 @@ fn qemu_alive(dir: &Path) -> bool {
     };
     // SAFETY: signal 0 checks for existence and delivers nothing.
     pid > 0 && unsafe { libc::kill(pid, 0) } == 0
+}
+
+/// `enlist.toml` refuses machines on a host without unix processes.
+#[cfg(not(unix))]
+fn qemu_alive(_dir: &Path) -> bool {
+    false
 }
 
 /// Whether a failed run's guest shell was opened within [`DEBUG_HOLD`] and

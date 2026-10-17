@@ -150,6 +150,14 @@ impl EnlistConfig {
                 "{CONFIG_FILE}: [containers] `cpus` must be at least 1"
             ));
         }
+        // A Windows runner runs its jobs on its own host: the container
+        // engines and the VMs a runner drives are unix tools.
+        if cfg!(not(unix)) && self.containers.is_some() {
+            return Err(format!("{CONFIG_FILE}: [containers] needs a unix host"));
+        }
+        if cfg!(not(unix)) && !self.machines.is_empty() {
+            return Err(format!("{CONFIG_FILE}: [machines] needs a unix host"));
+        }
         for (name, machine) in &self.machines {
             if !valid_name(name) {
                 return Err(format!(

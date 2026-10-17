@@ -101,6 +101,13 @@ fn validate(a: &Assignment) -> Result<(), String> {
     if a.file.is_empty() || a.file.contains('/') || a.file.starts_with('.') {
         return Err(format!("{:?} is not a job file name", a.file));
     }
+    // A Windows runner has neither containers nor machines, and no `sh`.
+    if cfg!(windows) && (a.place != Place::Host || a.interpreter != "powershell") {
+        return Err(format!(
+            "a Windows runner runs .ps1 jobs on its own host, not {}",
+            a.file
+        ));
+    }
     Ok(())
 }
 
@@ -345,25 +352,53 @@ impl Executor {
                 }
             }
             Place::Host => {
-                stage::write_secret(&secret_dir.join("env.sh"), &launch::env_sh(secrets))?;
+                if cfg!(windows) {
+                    stage::write_secret(&secret_dir.join("env.ps1"), &launch::env_ps1(secrets))?;
+                } else {
+                    stage::write_secret(&secret_dir.join("env.sh"), &launch::env_sh(secrets))?;
+                }
                 host_env = env;
                 Target::Host {
                     workspace: &workspace,
                 }
             }
         };
-        let rendered = launch::launch_sh(&Launch {
-            assignment: a,
-            run_dir,
-            secret_dir,
-            mirror,
-            target,
-        });
-        write(&run_dir.join("launch.sh"), &rendered)?;
-        if vm.is_none() {
-            let exe = matches!(a.place, Place::Host).then_some(self.exe.as_path());
-            write(&run_dir.join("inner.sh"), &launch::inner_sh(a, exe))?;
-        }
+        let (program, args) = if cfg!(windows) {
+            // `validate` let only host jobs through.
+            let script = run_dir.join("launch.ps1");
+            let rendered = launch::launch_ps1(a, secret_dir, mirror, &workspace, &self.exe);
+            write(&script, &rendered)?;
+            let args = [
+                "-NoLogo",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .chain([script.to_string_lossy().into_owned()])
+            .collect();
+            (launch::windows_powershell(), args)
+        } else {
+            let script = run_dir.join("launch.sh");
+            let rendered = launch::launch_sh(&Launch {
+                assignment: a,
+                run_dir,
+                secret_dir,
+                mirror,
+                target,
+            });
+            write(&script, &rendered)?;
+            if vm.is_none() {
+                let exe = matches!(a.place, Place::Host).then_some(self.exe.as_path());
+                write(&run_dir.join("inner.sh"), &launch::inner_sh(a, exe))?;
+            }
+            (
+                "/bin/sh".to_owned(),
+                vec![script.to_string_lossy().into_owned()],
+            )
+        };
         check_abort(ctl)?;
 
         // Booting takes minutes; the lease it takes is given back on any
@@ -373,8 +408,8 @@ impl Executor {
         }
         let spec = JobSpec {
             label: format!("{}/{} #{}", a.repo, a.job, a.number),
-            program: "/bin/sh".to_owned(),
-            args: vec![run_dir.join("launch.sh").to_string_lossy().into_owned()],
+            program,
+            args,
             env: host_env,
             cwd: Some(run_dir.to_path_buf()),
             run_dir: run_dir.to_path_buf(),
@@ -628,7 +663,9 @@ impl Executor {
     /// Takes over the runs a previous process left: each one keeps being
     /// delivered, and one without an end is waited for through its exit
     /// record, which the mux's adoption writes when the reattached terminal
-    /// ends.
+    /// ends. A run no terminal was reattached for (a Windows runner has no
+    /// shims, and a shim may have died with its host) ended with the
+    /// previous process and is recorded as killed.
     pub fn recover(self: &Arc<Self>) {
         let Ok(entries) = std::fs::read_dir(assigned_dir(&self.state_dir)) else {
             return;
@@ -669,6 +706,15 @@ impl Executor {
                 && let Some(vm) = self.machines.get(name)
             {
                 vm.adopt();
+            }
+            if read_exit_record(&run_dir).is_none() && !self.host.has_run(&run_dir) {
+                let exit = RunExit {
+                    code: None,
+                    killed: true,
+                };
+                if let Err(e) = record_run_end(&run_dir, exit, started, None, &[]) {
+                    eprintln!("[enlist] {run}: {e}");
+                }
             }
             let exec = Arc::clone(self);
             let spawned = std::thread::Builder::new()

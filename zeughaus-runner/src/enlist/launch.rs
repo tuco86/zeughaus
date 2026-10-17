@@ -1,11 +1,13 @@
 //! The scripts a CI job's terminal runs, rendered as text.
 //!
-//! `launch.sh` is the terminal's program on this machine for every kind of
+//! `launch.sh` is the terminal's program on a unix runner for every kind of
 //! job: it checks the commit out (on the host, or over ssh in the guest) and
 //! starts the job where it runs. `inner.sh` / `inner.ps1` is the job itself
 //! in its environment; on failure it records the exit code where
 //! [`JobHost`](crate::jobs::JobHost)'s wait finds it and becomes a shell in
-//! the same place, so a failed job is a terminal to debug in.
+//! the same place, so a failed job is a terminal to debug in. A Windows
+//! runner runs host jobs only, and `launch.ps1` does all of that in one
+//! script.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -278,6 +280,69 @@ pub fn debug_ps1(run_id: &str) -> String {
     format!(
         ". {env}\r\nSet-Location $env:CI_WORKSPACE\r\n",
         env = ps_quote(&format!(r"{}\env.ps1", guest_run_dir(run_id))),
+    )
+}
+
+/// The PowerShell of a Windows host, by path: the runner may run with a
+/// `PATH` that does not name it.
+pub fn windows_powershell() -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
+    format!(r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe")
+}
+
+/// `launch.ps1`: a host job on a Windows runner. The checkout into
+/// `workspace`, the secrets read into the session from `env.ps1` and deleted
+/// at once, the job under this runner's `timeout`, and on failure the exit
+/// code in `$env:ZEUGHAUS_RUN_DIR\code` and a shell in the workspace. The
+/// secret directory goes however the script ends.
+pub fn launch_ps1(
+    a: &Assignment,
+    secret_dir: &Path,
+    mirror: &Path,
+    workspace: &Path,
+    runner_exe: &Path,
+) -> String {
+    let secs = u64::from(a.timeout_minutes) * 60;
+    let path = |p: &Path| ps_quote(&p.to_string_lossy());
+    let check = "if ($LASTEXITCODE -ne 0) { Write-Host '[zeughaus-ci] checkout failed'; exit 70 }";
+    format!(
+        "$secretDir = {secret}\r\n\
+         try {{\r\n\
+         $ws = {ws}\r\n\
+         New-Item -ItemType Directory -Force -Path $ws | Out-Null\r\n\
+         Set-Location -LiteralPath $ws\r\n\
+         if (-not (Test-Path -LiteralPath .git)) {{ git init -q; if ($LASTEXITCODE -ne 0) {{ Write-Host \"[zeughaus-ci] cannot enter $ws\"; exit 70 }} }}\r\n\
+         git fetch -q --no-tags {mirror} '+refs/ci/{n}:refs/ci/head'\r\n\
+         {check}\r\n\
+         git checkout -q --force --detach refs/ci/head\r\n\
+         {check}\r\n\
+         git clean -ffdxq{excludes}\r\n\
+         {check}\r\n\
+         New-Item -ItemType File -Force -Path .git\\zci-last-used | Out-Null\r\n\
+         $secrets = Join-Path $secretDir 'env.ps1'\r\n\
+         . $secrets\r\n\
+         Remove-Item -Force -LiteralPath $secrets\r\n\
+         New-Item -ItemType Directory -Force -Path $env:CI_OUTPUT | Out-Null\r\n\
+         & {exe} timeout {secs} -- {interpreter} -NoLogo -NoProfile -ExecutionPolicy Bypass -File {file}\r\n\
+         $rc = $LASTEXITCODE\r\n\
+         if ($rc -eq 0) {{ exit 0 }}\r\n\
+         Set-Content -LiteralPath (Join-Path $env:ZEUGHAUS_RUN_DIR 'code') -Value $rc -Encoding ascii\r\n\
+         Write-Host ''\r\n\
+         Write-Host \"[zeughaus-ci] $env:CI_JOB exited $rc; a shell follows, exit it to end the run\"\r\n\
+         & {shell} -NoLogo -NoProfile -ExecutionPolicy Bypass\r\n\
+         exit $rc\r\n\
+         }} finally {{\r\n\
+         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $secretDir\r\n\
+         }}\r\n",
+        secret = path(secret_dir),
+        ws = path(workspace),
+        mirror = path(mirror),
+        n = a.number,
+        excludes = clean_excludes(&a.cache, ps_quote),
+        exe = path(runner_exe),
+        interpreter = ps_quote(&a.interpreter),
+        file = ps_quote(&format!(r"{CI_DIR}\{}", a.file)),
+        shell = ps_quote(&windows_powershell()),
     )
 }
 

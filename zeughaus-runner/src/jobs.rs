@@ -141,6 +141,13 @@ impl JobHost {
             .is_some_and(|session| session.exit().is_none())
     }
 
+    /// Whether a terminal of this process holds the run in `run_dir`: one
+    /// it started, or one reattached from a shim. A previous process's run
+    /// without either went with that process.
+    pub fn has_run(&self, run_dir: &Path) -> bool {
+        self.mux.terminal_of_run(run_dir).is_some()
+    }
+
     /// Every numeric directory under `<state-dir>/runs`.
     pub fn run_dirs(&self) -> Vec<PathBuf> {
         let runs = self.state_dir.join("runs");

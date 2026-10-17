@@ -170,6 +170,8 @@ impl Executor {
                 continue;
             }
             let _ = std::fs::write(run_dir.join("timeout"), b"");
+            // Machines exist on unix runners only.
+            #[cfg(unix)]
             if let Some(pid) = std::fs::read_to_string(run_dir.join("ssh.pid"))
                 .ok()
                 .and_then(|text| text.trim().parse::<libc::pid_t>().ok())

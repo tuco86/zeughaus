@@ -5,33 +5,39 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// `$XDG_RUNTIME_DIR/zeughaus-ci/<run>`, or `<state>/ci/tmp/<run>` without
-/// one (macOS has none): a tmpfs where it exists, mode 0700 either way.
+/// one (macOS and Windows have none): a tmpfs where it exists, mode 0700
+/// on unix. On Windows the state directory's ACL is what keeps others out.
 pub fn secret_dir(state_dir: &Path, run: &str) -> Result<PathBuf, String> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let root = std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|v| !v.is_empty())
         .map(|dir| PathBuf::from(dir).join("zeughaus-ci"))
         .unwrap_or_else(|| super::tmp_dir(state_dir));
     let dir = root.join(run);
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
         .create(&dir)
         .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("cannot restrict {}: {e}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("cannot restrict {}: {e}", dir.display()))?;
+    }
     Ok(dir)
 }
 
-/// Writes a file only its owner can read.
+/// Writes a file only its owner can read (on Windows: whom the state
+/// directory admits).
 pub fn write_secret(path: &Path, text: &str) -> Result<(), String> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options
         .open(path)
         .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
     file.write_all(text.as_bytes())
@@ -50,9 +56,13 @@ pub fn link_tree(from: &Path, to: &Path) -> std::io::Result<()> {
         if kind.is_dir() {
             link_tree(&source, &target)?;
         } else if kind.is_symlink() {
-            let link = std::fs::read_link(&source)?;
             let _ = std::fs::remove_file(&target);
-            std::os::unix::fs::symlink(link, &target)?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(std::fs::read_link(&source)?, &target)?;
+            // A symlink needs a privilege on Windows; the file it names is
+            // copied instead.
+            #[cfg(not(unix))]
+            std::fs::copy(&source, &target)?;
         } else {
             let _ = std::fs::remove_file(&target);
             if std::fs::hard_link(&source, &target).is_err() {
@@ -113,6 +123,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(unix)]
     fn a_linked_tree_shares_its_files_and_keeps_its_shape() {
         use std::os::unix::fs::MetadataExt;
         let base = std::env::temp_dir().join(format!("zci-link-{}", std::process::id()));

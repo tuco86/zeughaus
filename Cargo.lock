@@ -7542,6 +7542,7 @@ dependencies = [
  "tokio",
  "toml",
  "weida",
+ "windows-sys 0.61.2",
  "zeughaus-capture",
  "zeughaus-core",
  "zeughaus-db",
