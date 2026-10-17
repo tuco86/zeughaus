@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A runner on Windows enlists into the CI. It runs `.ps1` jobs on its own
+  host under its `timeout` subcommand, which a job object backs on
+  Windows, and a failed job leaves a PowerShell in its workspace. `ci.toml`
+  marks such a runner `os = "windows"`; the CI places only `.ps1` jobs
+  there and refuses a runner whose host is not the one configured.
+- `deploy/install-windows.sh` sets up a Windows runner host over ssh
+  (`C:\zeughaus` for its account only, the boot task, the firewall rule,
+  the toolchain) and builds and installs a commit there. The
+  `windows-amd64` release archive is built on such a host, `wohnzimmer`,
+  instead of the `win11` VM.
+
 ### Fixed
 
 - CI: a pipeline of an annotated tag runs, reports and releases the commit

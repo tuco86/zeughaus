@@ -41,8 +41,8 @@ zeughaus-job/          # plugin: Job (a process in a runner-owned terminal, log 
 iced_terminal/         # the terminal widget: one wgpu primitive per pane, bundled ComicShannsMono Nerd Font Mono (the editor bundles the Propo variant as its UI and icon face)
 iced_tabs/             # the tab tree the workspace shell uses: runner sections, groups, drop markers
 zeughaus-theme/        # the editor's theme: iced theme paired with a terminal colour scheme, catalogs for every widget, bundled pack, WezTerm scheme parser
-vm/win11/              # scripts: headless Windows 11 guest under QEMU/KVM, the service runner's `win11` machine (boot, toolchain, per-boot prepare.ps1)
-deploy/                # install.sh, systemd user unit for the runner, desktop entry template, macos-app.sh and the bundle's Info.plist; install-sadala.sh, install-runner-user.sh, install-macos.sh, build-aarch64.sh; runner/ (unit, ssh config, enlist.toml.example) and ci/ (CI unit, ci.toml.example, openbao.sh), macos/ (launchd agent)
+vm/win11/              # scripts: headless Windows 11 guest under QEMU/KVM, the service runner's `win11` machine (boot, toolchain, per-boot prepare.ps1); toolchain.ps1 also provisions a Windows runner host
+deploy/                # install.sh, systemd user unit for the runner, desktop entry template, macos-app.sh and the bundle's Info.plist; install-sadala.sh, install-runner-user.sh, install-macos.sh, install-windows.sh, build-aarch64.sh; runner/ (unit, ssh config, enlist.toml.example) and ci/ (CI unit, ci.toml.example, openbao.sh), macos/ (launchd agent), windows/ (host setup and install scripts)
 third_party/           # its own workspace: wezterm's terminal crates at the pinned revision, published as zeughaus-* packages
 ```
 
@@ -167,7 +167,7 @@ token and every secret `ci.toml` names. `zeughaus-ci check [DIR]` and `plan
 [DIR] <push|tag> <ref>` validate a `.zeughaus-ci/` folder without a service;
 `check` also places every job when the state directory has a `ci.toml`.
 
-Four runners enlist, each with an `<state-dir>/enlist.toml`
+Five runners enlist, each with an `<state-dir>/enlist.toml`
 (`deploy/runner/enlist.toml.example`: `ci` (the CI's pinned URL, the line in
 its `endpoint` file), `name`, `cpus`, `budget_gb`, and the optional tables
 `[containers]` (podman; Apple `container` on macOS, see below), `[busy]`
@@ -180,14 +180,17 @@ VM)). The CI pins each one by the fingerprint in its own `endpoint` file:
 | tuco-pc | user `hannes`, `10.8.0.10:7443` (a local drop-in of its unit sets `--feed-addr`) | `tuco-pc-hannes` | `deploy/install.sh` |
 | tuco-pc | user `zeughaus` (home `/var/lib/zeughaus`), `10.8.0.10:7444`; containers, the `win11` VM, GPU busy | `tuco-pc`, the default runner | `deploy/install-runner-user.sh --feed-addr 10.8.0.10:7444`; `deploy/install.sh` updates it |
 | atik (macOS) | launchd agent `net.doodleshnookie.zeughaus-runner`, `10.8.0.7:7443`, log `~/Library/Logs/zeughaus-runner.log` | `atik` | `deploy/install-macos.sh` |
+| wohnzimmer (Windows 10, LAN `10.0.0.13`) | user `zeughaus`, boot task `zeughaus-runner` (S4U), `10.8.0.12:7443`, state and log `C:\zeughaus\state` (`runner.log`) | `wohnzimmer`, `os = "windows"`, builds `windows-amd64` | `deploy/install-windows.sh [--setup] zeughaus@10.8.0.12` |
 
 In `ci.toml`, `default_runner` names the runner of every job without a
 `machine` or `platform`; `[runners.<name>]` has its `fingerprint`, its
+`os` (`unix` by default, or `windows`), its
 `machines` (VMs it boots) and `wait_minutes` (15: a job whose runner is
 offline is skipped after that, not failed). `[platforms]` maps a platform
 name (`linux-amd64`, `darwin-arm64`, ...) to the runner or VM that builds
 it. A job header places a job: `machine = "<runner>"` runs on that runner's
-host (`.sh`), `machine = "<vm>"` on the VM of the runner that lists it
+host (`.sh`, `.ps1` on a Windows runner), `machine = "<vm>"` on the VM of
+the runner that lists it
 (`.ps1`), `platform = "<p>"` the same through `[platforms]` (exclusive with
 `machine`), `image = "<image>"` in a container of the default runner, and
 neither on the default runner's host. `image` together with `platform` runs
@@ -195,9 +198,21 @@ the container on the platform's runner, not on the default runner; a
 platform that names a VM cannot have an image. `when_busy = "freeze"` needs
 a container, a machine, or a platform that resolves to one: a host job
 cannot be frozen. The job sees its platform as `CI_PLATFORM`. A runner that
-is not in `ci.toml` is refused. The Windows VM scripts (`vm/win11/`) are
+is not in `ci.toml`, or whose host is not the configured `os`, is refused.
+The Windows VM scripts (`vm/win11/`) are
 installed under `/usr/local/lib/zeughaus/vm/win11` and booted and stopped by
 the `tuco-pc` runner.
+
+The Windows runner `wohnzimmer` is the living-room PC, used by someone else
+at its console. Everything of zeughaus is under `C:\zeughaus`, readable by
+its account and SYSTEM only: `bin\` (binaries and the `runner.cmd` loop the
+boot task runs), `state\`, `src\` (the checkouts a deploy builds), `cargo\`
+and `rustup\`. Its WireGuard tunnel `sadala` (`C:\zeughaus\wg\sadala.conf`,
+the WireGuard for Windows service) gives it `10.8.0.12`; the firewall admits
+the runner from `10.8.0.0/24` only. It runs `.ps1` jobs on its host in
+`C:\zeughaus\state\ci\work\<repo>\<job>`, has no containers, machines,
+shims or updater: a restart (every deploy) ends its terminals and the job
+it runs.
 
 On macOS the runner's container engine is Apple's `container` (Homebrew
 formula `container`), not podman. The runner starts its system on demand
@@ -213,7 +228,9 @@ Updates: `deploy/install-sadala.sh` (on atik: builds with
 installs both binaries, restarts the CI and reloads the sadala runner;
 `--setup --ci-toml <file>` the first time, `--skip-build` to install what is
 already built) and `deploy/install.sh` (tuco-pc, also the service runner);
-`deploy/install-macos.sh` on atik.
+`deploy/install-macos.sh` on atik; `deploy/install-windows.sh` from a unix
+checkout for wohnzimmer (bundles HEAD and `../weida`'s HEAD, builds on the
+host).
 
 A runner also follows a release channel by itself when
 `<state-dir>/update.toml` exists: `channel = "dev"` (`dev`, `nightly` or
@@ -252,7 +269,7 @@ image, against weida's `main` as the sibling checkout) and posts
 cron (`0 3 * * *`) also run one build job per platform, each packing
 `zeughaus-<version>-<platform>.tar.gz` (`.zip` on Windows) into its output:
 `linux-amd64` (tuco-pc, in the `trixie` image) and `linux-arm64` (atik, the
-same image in an Apple `container`), `windows-amd64` (the `win11` VM),
+same image in an Apple `container`), `windows-amd64` (the `wohnzimmer` runner's host),
 `darwin-arm64` (atik's host; the editor as
 `Zeughaus.app` through `deploy/macos-app.sh`). `.zeughaus-ci/build.sh` is
 their shared helper. `publish.sh` runs on sadala after the gate and all four,

@@ -724,6 +724,7 @@ as `ci = ["<endpoint>"]` next to `remotes` in `zeughaus.toml`. In production:
 | tuco-pc | runner | `hannes` | `10.8.0.10:7443` | `tuco-pc-hannes` |
 | tuco-pc | runner: containers, Windows VM, GPU busy | `zeughaus` | `10.8.0.10:7444` | `tuco-pc` (default runner) |
 | atik (macOS) | runner, launchd agent | `uebelacker` | `10.8.0.7:7443` | `atik` |
+| wohnzimmer (Windows 10) | runner, boot task | `zeughaus` | `10.8.0.12:7443` | `wohnzimmer` (`os = "windows"`) |
 
 **Jobs are scripts.** Every `.sh`/`.ps1` file in `.zeughaus-ci/` with a TOML header
 between `# /// ci` and `# ///` is a job named after its file. The header
@@ -747,7 +748,8 @@ event, plus every job whose `needs` are all selected.
 (`scheduler.rs`, `place_job`), and kept in the job's record as `runner` and
 `place`. `ci.toml` names the runners: `default_runner` and one
 `[runners.<name>]` each with the `fingerprint` of the runner's own pinned
-URL, the `machines` it boots and the `wait_minutes` (15) a job waits for it.
+URL, its `os` (`unix`, or `windows`), the `machines` it boots and the
+`wait_minutes` (15) a job waits for it.
 `[platforms]` maps a platform name (`[a-z0-9][a-z0-9-]*`, e.g.
 `linux-amd64`) to a runner or a machine of one; `ci.toml` is refused when a
 value is neither. A job's target is the `[platforms]` entry of its
@@ -756,7 +758,8 @@ else none:
 
 - `image = I`: a container on the target runner, on the default runner when
   there is no target. A target that is a Windows VM is an error.
-- the target is a runner: that runner's host. The job is `.sh`.
+- the target is a runner: that runner's host. The job is `.sh`, or `.ps1`
+  on a Windows runner, which also takes no image.
 - the target is a machine in some runner's `machines`: that machine on that
   runner. The job is `.ps1`.
 - no target: the host of the default runner.
@@ -807,7 +810,8 @@ little-endian length and a postcard body, at most `MAX_ENLIST_FRAME_BYTES`
   (`os`, `arch`, `cpus`, whether it has `containers`, its `machines`) and a
   `RunReport` for each run in its `assigned/` directory. The CI checks the
   TLS principal against the `fingerprint` of the `[runners.*]` entry that
-  `name` names, and the major, and answers `Refused { message }` or
+  `name` names, the major, and that the runner's `os` is the host
+  `ci.toml` gives it (`windows` or not), and answers `Refused { message }` or
   `Welcome { major, offsets }`, where each offset is how many bytes of that
   run's output the CI already holds.
 - The runner then reports `Busy`, `Machine` (a machine's status), `Started`,
@@ -870,7 +874,15 @@ job:
 
 - **Host:** directly, under `zeughaus-runner timeout <seconds> -- <program>`
   (a process group that gets `SIGTERM`, `SIGKILL` 60 s later, exit 124;
-  macOS has no `timeout`).
+  macOS has no `timeout`). On a Windows runner `launch.ps1` replaces
+  `launch.sh` and `inner.sh`: the same checkout, the secrets dot-sourced from
+  `env.ps1` and deleted, the job under `timeout`, whose job object ends the
+  whole process tree at the deadline with 124 and when the launcher ends (a
+  closed terminal signals nothing on Windows), and on failure the `code`
+  file and a PowerShell in the workspace. The Windows runner has no shims:
+  it holds every process it starts in a job object of its own, so its
+  terminals and runs end with it, and a run a restarted runner finds no
+  terminal for is recorded as killed.
 - **Container:** `podman run --rm -it` with the workspace at `/work` and the
   inputs read-only. On macOS the engine is Apple's `container` instead
   (`stage::Engine`, chosen by the host OS, no setting): the launcher runs
@@ -1115,7 +1127,7 @@ has build 0.
 |---|---|---|
 | `linux-amd64` | `linux-amd64` | tuco-pc, container `trixie`, `freeze` |
 | `linux-arm64` | `linux-arm64` | atik, the same Containerfile in an Apple `container` |
-| `windows-amd64` | `windows-amd64` | the `win11` VM, `freeze` |
+| `windows-amd64` | - | `machine = "wohnzimmer"`, the Windows runner's host (the `windows-amd64` platform stays on the `win11` VM, which griasdi's job needs) |
 | `darwin-arm64` | `darwin-arm64` | atik's host; the editor as `Zeughaus.app` (`deploy/macos-app.sh`) and the runner |
 | `publish` | - | `machine = "sadala"`, needs the gate and all four |
 
