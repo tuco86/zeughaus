@@ -19,7 +19,7 @@ use zeughaus_link::enlist::{
     write_frame,
 };
 
-use crate::config::{CiConfig, valid_name};
+use crate::config::{CiConfig, RunnerOs, valid_name};
 use crate::now_secs;
 use crate::runners::{Connected, Runners};
 use crate::scheduler::{Msg, transcript_dir};
@@ -125,6 +125,25 @@ impl EnlistService {
         }
         if major != ENLIST_MAJOR {
             refuse(reply, &format!("protocol {major} is not {ENLIST_MAJOR}")).await;
+            return;
+        }
+        // The jobs placed on a runner are scripts for the host ci.toml says
+        // it has; a runner on another one would run none of them.
+        let windows = self.config.runner_os(&name) == RunnerOs::Windows;
+        if windows != (offer.os == "windows") {
+            let configured = if windows { "windows" } else { "unix" };
+            eprintln!(
+                "[ci] refused {name}: ci.toml says os = {configured}, it runs on {}",
+                offer.os
+            );
+            refuse(
+                reply,
+                &format!(
+                    "ci.toml says os = {configured}, this runner runs on {}",
+                    offer.os
+                ),
+            )
+            .await;
             return;
         }
 

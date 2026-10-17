@@ -73,12 +73,25 @@ fn default_wait_minutes() -> u32 {
 #[serde(deny_unknown_fields)]
 pub struct RunnerConfig {
     pub fingerprint: String,
+    /// What the runner's host is, which decides the jobs it runs there.
+    #[serde(default)]
+    pub os: RunnerOs,
     /// Machines (Windows VMs) this runner boots for jobs with `machine = <name>`.
     #[serde(default)]
     pub machines: Vec<String>,
     /// How long a job waits for this runner to connect before it is skipped.
     #[serde(default = "default_wait_minutes")]
     pub wait_minutes: u32,
+}
+
+/// A runner's host: unix runs `.sh` jobs and offers containers and VMs, a
+/// Windows runner runs `.ps1` jobs on its own host and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunnerOs {
+    #[default]
+    Unix,
+    Windows,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -154,6 +167,13 @@ impl CiConfig {
         self.runner_of_fingerprint(fingerprint).is_some()
     }
 
+    /// The host of runner `runner`; one that is not configured counts as unix.
+    pub fn runner_os(&self, runner: &str) -> RunnerOs {
+        self.runners
+            .get(runner)
+            .map_or(RunnerOs::Unix, |runner| runner.os)
+    }
+
     /// The runner that offers machine `machine`.
     pub fn runner_of_machine(&self, machine: &str) -> Option<&str> {
         self.runners
@@ -207,6 +227,11 @@ impl CiConfig {
             if runner.wait_minutes == 0 {
                 return Err(format!(
                     "runner `{name}`: `wait_minutes` must be at least 1"
+                ));
+            }
+            if runner.os == RunnerOs::Windows && !runner.machines.is_empty() {
+                return Err(format!(
+                    "runner `{name}`: a Windows runner boots no machines"
                 ));
             }
         }

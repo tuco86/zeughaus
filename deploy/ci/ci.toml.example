@@ -21,6 +21,12 @@ fingerprint = "<fingerprint>"
 [runners.sadala]
 fingerprint = "<fingerprint>"
 
+# A Windows host (deploy/install-windows.sh): it runs `.ps1` jobs on its own
+# host and offers no containers and no machines. Default: os = "unix".
+[runners.wohnzimmer]
+fingerprint = "<fingerprint>"
+os = "windows"
+
 # Which runner or machine builds a platform: a job with `platform = "<p>"`
 # runs there, in a container when it also names an `image`.
 [platforms]
@@ -28,7 +34,6 @@ linux-amd64 = "tuco-pc"
 linux-arm64 = "atik"
 windows-amd64 = "win11"
 darwin-arm64 = "atik"
-darwin-amd64 = "atik"
 
 [secrets]
 addr = "http://10.8.0.1:8200"      # OpenBao on sadala over WireGuard

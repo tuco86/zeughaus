@@ -24,7 +24,7 @@ use zeughaus_link::enlist::{
 };
 
 use crate::channels::{self, Channels};
-use crate::config::{CiConfig, RepoConfig};
+use crate::config::{CiConfig, RepoConfig, RunnerOs};
 use crate::event::{self, CiEvent, EventKind};
 use crate::forge::{self, State, Status};
 use crate::header::JobDef;
@@ -1887,6 +1887,11 @@ pub fn place_job(
                 )));
             }
         };
+        if config.runner_os(runner) == RunnerOs::Windows {
+            return Err(fail(format!(
+                "{what} is the Windows runner {runner}; an image needs a unix runner"
+            )));
+        }
         let text = containerfile(image)?;
         let digest = hex::encode(Sha256::digest(text.as_bytes()));
         let tag = format!("localhost/zci-{repo}-{image}:{}", &digest[..16]);
@@ -1901,14 +1906,7 @@ pub fn place_job(
     let is_ps1 = job.file.ends_with(".ps1");
     let (runner, place) = match target {
         Target::Default => (config.default_runner.as_str(), Place::Host),
-        Target::Runner(runner) => {
-            if is_ps1 {
-                return Err(fail(format!(
-                    "{what} is a runner; a .ps1 job cannot run there"
-                )));
-            }
-            (runner, Place::Host)
-        }
+        Target::Runner(runner) => (runner, Place::Host),
         Target::Machine { name, runner } => {
             if !is_ps1 {
                 return Err(fail(format!(
@@ -1923,6 +1921,21 @@ pub fn place_job(
             )
         }
     };
+    if place == Place::Host {
+        match (config.runner_os(runner), is_ps1) {
+            (RunnerOs::Unix, true) => {
+                return Err(fail(format!(
+                    "{what} is a runner; a .ps1 job cannot run there"
+                )));
+            }
+            (RunnerOs::Windows, false) => {
+                return Err(fail(format!(
+                    "{what} is the Windows runner {runner}; it runs only .ps1 jobs"
+                )));
+            }
+            _ => {}
+        }
+    }
     if place == Place::Host && job.when_busy == WhenBusy::Freeze {
         return Err(fail(format!(
             "{what} runs on the host of runner {runner}; when_busy = \"freeze\" needs a container or a machine"
@@ -2043,6 +2056,7 @@ mod tests {
 
     const FP_1: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
     const FP_2: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000002";
+    const FP_3: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000003";
 
     #[test]
     fn subjects_parse_with_empty_and_spaced_text() {
@@ -2188,6 +2202,7 @@ mod tests {
             "default_runner = \"tuco-pc\"\n\
              [runners.tuco-pc]\nfingerprint = \"{FP_1}\"\nmachines = [\"win11\"]\n\
              [runners.atik]\nfingerprint = \"{FP_2}\"\n\
+             [runners.wohnzimmer]\nfingerprint = \"{FP_3}\"\nos = \"windows\"\n\
              [platforms]\nlinux-amd64 = \"tuco-pc\"\nlinux-arm64 = \"atik\"\n\
              windows-amd64 = \"win11\"\n"
         ))
@@ -2304,6 +2319,31 @@ mod tests {
             (
                 job("a.sh", None, Some("nowhere"), None),
                 "machine nowhere is neither a runner nor a machine of one",
+            ),
+        ];
+        for (def, expected) in cases {
+            let err = place_job(&config(), "r", &def, containerfile).unwrap_err();
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_windows_runner_runs_only_ps1_jobs_on_its_host() {
+        let placed = place_job(
+            &config(),
+            "r",
+            &job("w.ps1", None, Some("wohnzimmer"), None),
+            containerfile,
+        );
+        assert_eq!(placed, Ok(("wohnzimmer".to_owned(), Place::Host)));
+        let cases = [
+            (
+                job("a.sh", None, Some("wohnzimmer"), None),
+                "Windows runner wohnzimmer; it runs only .ps1 jobs",
+            ),
+            (
+                job("a.sh", Some("arch"), Some("wohnzimmer"), None),
+                "an image needs a unix runner",
             ),
         ];
         for (def, expected) in cases {
