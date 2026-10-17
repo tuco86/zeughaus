@@ -55,6 +55,8 @@ tokio = { version = "1", features = [
     "net",
     # The enlist exchanges are tokio streams: frames and artifact bytes.
     "io-util",
+    # `mcp` speaks JSON-RPC on stdin and stdout.
+    "io-std",
     # Stopping drains: the signal that used to kill this process now holds it
     # and waits for the live runs.
     "signal",

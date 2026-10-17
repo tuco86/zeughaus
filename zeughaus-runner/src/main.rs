@@ -17,6 +17,7 @@ mod feed;
 mod files;
 mod graphs;
 mod jobs;
+mod mcp;
 mod mux;
 mod names;
 mod release;

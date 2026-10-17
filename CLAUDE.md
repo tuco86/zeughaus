@@ -22,7 +22,7 @@ build of the editor compiles and edits locally (it reaches no runner yet).
 
 ```
 zeughaus/              # binary: the iced editor; edits the graph and views results, never executes
-zeughaus-runner/       # binary: headless process that executes the graph, owns the terminals, runs the CI jobs it is assigned and can follow a release channel; `release` makes and checks signed bundles
+zeughaus-runner/       # binary: headless process that executes the graph, owns the terminals, runs the CI jobs it is assigned and can follow a release channel; `release` makes and checks signed bundles; `mcp` gives an agent the CI and try runs as tools
 zeughaus-ci/           # binary: the CI service; schedules pipelines onto enlisted runners, webhook intake, try-run uploads, stored transcripts
 zeughaus-core/         # Ty/Typed/Value, pins, ExecutableNode/DomainPlugin, settings, scalar wire encoding, graph document types
 zeughaus-runtime/      # GraphExecutor: topology, node instances, edge cache, dirty set, async work, node errors
@@ -133,6 +133,22 @@ its terminal for attaching, every run keeps a timestamped WAL in
 `zeughaus-runner hold <endpoint> on|off` do the same from a script, against
 the endpoint URL a runner prints at start; a triggered run's terminal lands
 in that runner's locked `Triggered` group.
+
+`zeughaus-runner [--state-dir <dir>] mcp [--ci <url>]` is an MCP server on
+stdio, for an agent that starts it as a tool server. It dials the CI that
+`--ci` names, else the first `ci = [..]` of `<state-dir>/zeughaus.toml`, with
+that directory's `client.pem`, so it is the same principal as an editor
+there; without either it still starts and every tool answers with what is
+missing. `ci_status`, `ci_pipelines`, `ci_pipeline`, `ci_log`, `ci_rerun`
+and `ci_cancel` read and control the CI's channels, pipelines and job
+output. `try_run` snapshots the checkout of the current directory (its
+commit, the changes to it and the untracked files that are not ignored) and
+the sibling checkouts its Cargo path dependencies point to, uploads them to
+the CI as git bundles, and waits for the `try` pipeline that runs a command
+on another host's runner (a platform of `ci.toml` or a runner name) from
+that snapshot; it answers with the result and the last 200 lines of output,
+or with how to pick the run up with `try_wait`. Nothing but protocol
+messages is written to its stdout.
 
 Every terminal lives in a shim process (`zeughaus-runner shim <dir>`, one
 per terminal under `<state-dir>/terminals/`), so shells and job runs

@@ -1,6 +1,8 @@
 //! The runner binary's subcommands: `trigger` and `hold` as a client of a
-//! running runner, `timeout` as the deadline a host CI job runs under and
-//! `release` as the tool that makes and checks signed release bundles.
+//! running runner, `timeout` as the deadline a host CI job runs under,
+//! `release` as the tool that makes and checks signed release bundles and
+//! `mcp` as the server that gives an agent the CI's pipelines and try runs
+//! as tools.
 //!
 //! `trigger` and `hold` talk to the endpoint a runner printed at start
 //! (`[runner] weida endpoint weida://sha256:<fp>@host:port/`) with the client
@@ -11,6 +13,7 @@
 //! ```text
 //! zeughaus-runner trigger <endpoint> <node-id> [payload]
 //! zeughaus-runner hold <endpoint> on|off
+//! zeughaus-runner mcp [--ci <url>]
 //! zeughaus-runner timeout <seconds> -- <program> [args..]
 //! zeughaus-runner release keygen <file>
 //! zeughaus-runner release bundle --channel <c> --build <n> --sha <sha> --version <v> --out <dir> <file>...
@@ -33,6 +36,7 @@ const USAGE: &str = "\
 usage: zeughaus-runner [--state-dir <dir>] [--feed-addr <host:port>] [--keep-runs <n>]
        zeughaus-runner trigger <endpoint> <node-id> [payload]
        zeughaus-runner hold <endpoint> on|off
+       zeughaus-runner mcp [--ci <url>]
        zeughaus-runner timeout <seconds> -- <program> [args..]
        zeughaus-runner release keygen <file>
        zeughaus-runner release bundle --channel <c> --build <n> --sha <sha> --version <v> --out <dir> <file>...
@@ -98,6 +102,9 @@ pub fn run(args: &[String], state_dir: &Path) -> Option<ExitCode> {
         }
     }
     let command = match positional.first().map(String::as_str) {
+        // A server, not a command: it runs until its input ends and writes
+        // nothing to stdout but protocol messages.
+        Some("mcp") => return Some(crate::mcp::run(&positional[1..], state_dir)),
         Some("trigger") => parse_trigger(&positional[1..]),
         Some("hold") => parse_hold(&positional[1..]),
         _ => {
@@ -221,7 +228,7 @@ fn parse_hold(args: &[String]) -> Result<Command, String> {
 }
 
 /// The URL of `path` on the announced root endpoint.
-fn url_of(endpoint: &str, path: &str) -> Result<String, String> {
+pub(crate) fn url_of(endpoint: &str, path: &str) -> Result<String, String> {
     let mut addr =
         EndpointAddr::parse(endpoint).map_err(|e| format!("endpoint {endpoint}: {e}"))?;
     addr.path = path.to_owned();

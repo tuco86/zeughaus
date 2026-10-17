@@ -707,6 +707,8 @@ prints the reply. `<endpoint>` is the pinned root URL a runner prints at
 start; the client identity comes from the state directory (`--state-dir`,
 `ZEUGHAUS_STATE_DIR`), so a script, a cron entry or a webhook relay is the
 same principal as an editor on that machine. No graph is involved.
+`zeughaus-runner mcp` is the subcommand that serves instead of asking once:
+see "The CI over MCP" in section 14.
 
 ## 14. CI: pipelines from a repository's `.zeughaus-ci/` folder
 
@@ -1192,6 +1194,59 @@ after the CI restarts. The section's ids are the editor's own
 (`SurfaceRef::Ci`), and it takes no structural command. An editor's link to
 a CI takes no workspace, graph or feed of its own: only `/events`,
 `/snapshot`, `/ci` and `/mux`.
+
+**The CI over MCP** (`zeughaus-runner/src/mcp/`). `zeughaus-runner
+[--state-dir <dir>] mcp [--ci <url>]` is one more client of `/ci`, for an
+agent: a Model Context Protocol server on stdin and stdout that the agent
+starts and keeps for its session. It executes nothing and holds no graph. It
+dials the CI that `--ci` names, else the first entry of `ci = [..]` in
+`<state-dir>/zeughaus.toml` (the editor's file, read without insisting on
+its other keys), which must pin a fingerprint, with that directory's
+`client.pem`: the CI sees the principal an editor of the directory is. With
+no CI or no key the server still starts and every tool call is a result
+flagged `isError` that names what is missing. `rpc.rs` is the JSON-RPC 2.0
+half, one message per line: `initialize` (the client's protocol revision
+when it is 2024-11-05, 2025-03-26 or 2025-06-18, else 2025-06-18), `ping`,
+`tools/list` and `tools/call`; notifications are ignored, an unknown method
+is `-32601` and a batch is refused. Every `tools/call` is a task of its
+own and the answers go through one locked writer, because an agent's
+subagents share the process and a call may wait for minutes; when stdin
+ends, the calls still running finish and answer, then the process exits 0.
+Logs go to stderr: stdout carries nothing but protocol.
+
+The tools (`tools.rs`) are `ci_status` (the overview and the `[platforms]`
+of `ci.toml`, which are what a `try_run` target resolves through),
+`ci_pipelines`, `ci_pipeline` (a failed job adds its `cause` and
+`excerpt`), `ci_log` (`CiRequest::Log`: the last lines of a job's stored
+output, 5000 at most, and whether the job has finished), `ci_rerun`,
+`ci_cancel`, `try_run` and `try_wait`; their answers are one fact per line
+in a fixed shape, and a CI that answers with an error, or not at all within
+30 s, is the tool's error.
+
+`try_run` runs a command on another runner from
+the working tree it is called in. `snapshot.rs` makes, for the checkout of
+the call and for each Cargo path dependency beside it (the packages of
+`cargo metadata` without a source whose manifest is outside the checkout;
+one that is not in a git checkout with the same parent directory is
+refused, because the runner lays the checkouts out side by side), one
+commit without a parent: in a temporary index, `HEAD`'s tree, then `git add
+-A`, so with every change and every untracked file the ignore rules do not
+exclude, and in the main checkout the two job files
+`.zeughaus-ci/zeughaus-try.sh` and `.ps1` that `cd` to the directory of the
+call and run the command. The checkout's own index, branch and refs are not
+touched. Each commit travels as a bundle of one ref, at most 512 MiB and at
+most 8 checkouts, in one exchange on `/try` (`TryUpload`, then the bundles
+as raw bytes, answered with `TryReply`); the CI's refusal is the tool's
+error. The CI numbers the pipeline of the channel `try`, and the tool looks
+at it every 2 s until it has finished or `wait_seconds` (540; at most 600,
+because the client's own limit for a call is 660 s) have passed since the
+call began, snapshot and upload included, and answers `<repo> #<n> try on
+<target>: <status> (<secs> s)`, what the CI says of the job and the last 200
+lines of its output; a run that is still going is answered with `still
+running after <s> s; call try_wait with repo=.. number=..`. `try_wait`
+waits from its own start. The `origin` remote names the repository (the
+CI matches it, so credentials in a remote's URL are cut before it is sent)
+and `actor` is `<user>@<host>`.
 
 **Disk.** The CI keeps the 200 newest pipeline records per channel, with
 their transcripts (running ones never go), and no artifacts. A runner

@@ -36,6 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entry in `ci.toml`, posts no forge status and cannot be rerun; a target
   that is a Windows VM is refused. `/ci` also answers the last lines of a
   job's output (`Log`) and lists the `[platforms]`.
+- `zeughaus-runner mcp` is a Model Context Protocol server on stdio that
+  gives an agent the CI as tools: its status, pipelines and job logs,
+  rerun and cancel, and `try_run`, which runs a command on another
+  host's runner from the agent's working tree (uncommitted and untracked
+  files and the sibling checkouts its Cargo path dependencies point to
+  included) and answers with the result and the end of the output. It
+  dials the first CI of `zeughaus.toml`, or `--ci`, with the state
+  directory's client key, the way an editor does.
 
 ### Fixed
 
