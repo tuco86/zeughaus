@@ -318,6 +318,13 @@ impl Runner {
         self.published.flush(self.seq, &self.snapshot);
     }
 
+    /// Tells editors something worth a desktop notification. Not state: no
+    /// snapshot carries it, and an editor that is not connected never sees it.
+    pub fn report_alert(&mut self, title: String, body: String) {
+        let seq = self.next_seq();
+        self.emit(TOPIC_MACHINE, RuntimeEvent::Alert { seq, title, body });
+    }
+
     /// Publishes one event on `topic`. A failure is reported once per distinct
     /// message: a broken publisher fails on every event, and a log line per
     /// event would bury everything else.

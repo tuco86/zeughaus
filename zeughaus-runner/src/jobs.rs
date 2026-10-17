@@ -50,6 +50,9 @@ pub struct JobHost {
     keep_runs: usize,
     /// Held: start nothing new, let the live runs finish.
     held: AtomicBool,
+    /// A maintenance task runs: counts as held, so no CI job or graph job
+    /// starts while a toolchain may be replaced under it.
+    maintaining: AtomicBool,
     /// Runs started here that have not been waited to their end.
     ///
     /// Shared with each run's handle rather than kept in the struct alone: the
@@ -67,12 +70,17 @@ impl JobHost {
             next_run: AtomicU64::new(next),
             keep_runs,
             held: AtomicBool::new(false),
+            maintaining: AtomicBool::new(false),
             live: Arc::new(AtomicU32::new(0)),
         }
     }
 
     pub fn hold(&self, held: bool) {
         self.held.store(held, Ordering::SeqCst);
+    }
+
+    pub fn set_maintaining(&self, on: bool) {
+        self.maintaining.store(on, Ordering::SeqCst);
     }
 
     pub fn live_runs(&self) -> u32 {
@@ -206,7 +214,7 @@ fn prune_runs(runs: &Path, keep: usize) {
 
 impl ProcessHost for JobHost {
     fn held(&self) -> bool {
-        self.held.load(Ordering::SeqCst)
+        self.held.load(Ordering::SeqCst) || self.maintaining.load(Ordering::SeqCst)
     }
 
     fn new_run_dir(&self) -> Result<PathBuf, String> {

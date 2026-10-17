@@ -1,8 +1,8 @@
 //! The runner binary's subcommands: `trigger` and `hold` as a client of a
-//! running runner, `timeout` as the deadline a host CI job runs under,
-//! `release` as the tool that makes and checks signed release bundles and
-//! `mcp` as the server that gives an agent the CI's pipelines and try runs
-//! as tools.
+//! running runner, `maintain` as a reader of its maintenance records,
+//! `timeout` as the deadline a host CI job runs under, `release` as the tool
+//! that makes and checks signed release bundles and `mcp` as the server that
+//! gives an agent the CI's pipelines and try runs as tools.
 //!
 //! `trigger` and `hold` talk to the endpoint a runner printed at start
 //! (`[runner] weida endpoint weida://sha256:<fp>@host:port/`) with the client
@@ -14,6 +14,7 @@
 //! zeughaus-runner trigger <endpoint> <node-id> [payload]
 //! zeughaus-runner hold <endpoint> on|off
 //! zeughaus-runner mcp [--ci <url>]
+//! zeughaus-runner maintain
 //! zeughaus-runner timeout <seconds> -- <program> [args..]
 //! zeughaus-runner release keygen <file>
 //! zeughaus-runner release bundle --channel <c> --build <n> --sha <sha> --version <v> --out <dir> <file>...
@@ -37,6 +38,7 @@ usage: zeughaus-runner [--state-dir <dir>] [--feed-addr <host:port>] [--keep-run
        zeughaus-runner trigger <endpoint> <node-id> [payload]
        zeughaus-runner hold <endpoint> on|off
        zeughaus-runner mcp [--ci <url>]
+       zeughaus-runner maintain
        zeughaus-runner timeout <seconds> -- <program> [args..]
        zeughaus-runner release keygen <file>
        zeughaus-runner release bundle --channel <c> --build <n> --sha <sha> --version <v> --out <dir> <file>...
@@ -107,6 +109,7 @@ pub fn run(args: &[String], state_dir: &Path) -> Option<ExitCode> {
         Some("mcp") => return Some(crate::mcp::run(&positional[1..], state_dir)),
         Some("trigger") => parse_trigger(&positional[1..]),
         Some("hold") => parse_hold(&positional[1..]),
+        Some("maintain") => return Some(maintain(&positional[1..], state_dir)),
         _ => {
             return match check_serve_args(&positional) {
                 Ok(ServeArgs::Serve) => None,
@@ -149,6 +152,25 @@ pub fn run(args: &[String], state_dir: &Path) -> Option<ExitCode> {
             ExitCode::FAILURE
         }
     })
+}
+
+/// `maintain`: prints the state of `<state-dir>/maintain.toml`'s tasks. It
+/// only reads files, so it runs beside a serving runner.
+fn maintain(args: &[String], state_dir: &Path) -> ExitCode {
+    if !args.is_empty() {
+        eprintln!("[runner] maintain takes no arguments\n{USAGE}");
+        return ExitCode::FAILURE;
+    }
+    match crate::maintain::report(state_dir) {
+        Ok(text) => {
+            println!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("[maintain] {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

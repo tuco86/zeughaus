@@ -75,11 +75,11 @@ pub enum RuntimeEvent {
         mode: BusyMode,
         busy: bool,
     },
-    /// A repository's default branch turned red, or has stayed red for an
-    /// hour and failed again. An editor shows it on the desktop. Only a
-    /// runner that runs CI sends it; it is not state, so no snapshot
-    /// carries it.
-    CiAlert {
+    /// Something an editor should tell its user without being asked: a
+    /// repository's default branch turned red or stayed red for an hour (the
+    /// CI), or a maintenance task failed (a runner). An editor shows it on
+    /// the desktop. It is not state, so no snapshot carries it.
+    Alert {
         seq: u64,
         title: String,
         body: String,
@@ -208,10 +208,12 @@ pub const TOPIC_EDGE: &str = "edge";
 /// wants both or neither.
 pub const TOPIC_ERROR: &str = "error";
 
-/// Topic of [`RuntimeEvent::Machine`].
+/// Topic of [`RuntimeEvent::Machine`], and of the [`RuntimeEvent::Alert`] a
+/// runner raises for a failed maintenance task.
 pub const TOPIC_MACHINE: &str = "machine";
 
-/// Topic of [`RuntimeEvent::CiAlert`] and [`RuntimeEvent::CiPipeline`].
+/// Topic of [`RuntimeEvent::CiPipeline`] and the CI's [`RuntimeEvent::Alert`]
+/// (a runner's alerts go out on [`TOPIC_MACHINE`]).
 pub const TOPIC_CI: &str = "ci";
 
 /// Largest event payload a subscriber reads. An event is a few identifiers and
@@ -275,7 +277,7 @@ mod tests {
                 mode: BusyMode::Busy,
                 busy: true,
             },
-            RuntimeEvent::CiAlert {
+            RuntimeEvent::Alert {
                 seq: 15,
                 title: "griasdi main is red (#138)".to_owned(),
                 body: "windows red since #138".to_owned(),

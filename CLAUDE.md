@@ -150,6 +150,19 @@ that snapshot; it answers with the result and the last 200 lines of output,
 or with how to pick the run up with `try_wait`. Nothing but protocol
 messages is written to its stdout.
 
+A runner also runs the tasks of `<state-dir>/maintain.toml` (`[[task]]` with
+`name`, `command` as an argv, `every_minutes` and `timeout_minutes`,
+default 30) by itself, one at a time and only while it is idle: each is a
+run in the locked `Triggered` group, and while it runs the runner counts as
+held, so a toolchain update never swaps files under a build. The file is read
+every minute, a symlink is fine, and without it nothing runs. A task that
+does not end with code 0 raises a desktop notification in every connected
+editor; its log is `<state-dir>/runs/<id>/wal`.
+`zeughaus-runner [--state-dir D] maintain` prints each task with its last
+result and age from `<state-dir>/maintain/<name>.json`. The wohnzimmer
+runner's file is `deploy/windows/maintain.toml`, which
+`deploy/install-windows.sh` copies on every run.
+
 Every terminal lives in a shim process (`zeughaus-runner shim <dir>`, one
 per terminal under `<state-dir>/terminals/`), so shells and job runs
 survive the runner. Under a systemd user manager each shim runs in a

@@ -576,6 +576,7 @@ results keyed by (pin, tier, sequence).
 | editor restart | `SIGUSR1` writes `<state-dir>/restore-<pid>.json` (window size and maximized state, active tab, focused pane and collapsed sections and groups by runner, cameras, node sizes, selection, an open palette with its input, a rename in progress, terminal scroll-back, nested views open in a section without a runner, the scratch document without a runner) and `exec`s the editor, which reads and deletes it through `ZEUGHAUS_RESTORE`. The window's position is not restored: a Wayland client can neither read nor set it |
 | deployment | `deploy/install.sh`: binaries in `~/.cargo/bin`, the systemd user unit `zeughaus-runner` (`KillMode=process`: the shims outlive the runner process; `reload` is `SIGUSR1`), and `~/.local/share/applications/net.doodleshnookie.Zeughaus.desktop` with its icon, which is how a Wayland compositor shows the editor's icon. Where `systemd-run --user --scope true` succeeds at start, the runner starts every shim in a transient scope of its own, so systemd-oomd, which kills whole cgroups, takes one terminal instead of the unit with every shell |
 | self-update | `<state-dir>/update.toml` (`channel`, optional `url`) turns the runner's updater on (section 14, **Releases and the updater**); it works in `<state-dir>/updates/<build>/`. Without the file nothing is checked or fetched |
+| maintenance | `<state-dir>/maintain.toml` (`[[task]]`: `name`, `command` argv, `every_minutes`, `timeout_minutes`, default 30) lists tasks the runner runs itself (section 13, **Maintenance**); `<state-dir>/maintain/<name>.json` records each one's last start. Without the file nothing runs |
 
 ## 12. Testing strategy
 
@@ -709,6 +710,25 @@ start; the client identity comes from the state directory (`--state-dir`,
 same principal as an editor on that machine. No graph is involved.
 `zeughaus-runner mcp` is the subcommand that serves instead of asking once:
 see "The CI over MCP" in section 14.
+
+**Maintenance** (`zeughaus-runner/src/maintain.rs`). One thread reads
+`<state-dir>/maintain.toml` every 60 s, after 30 s at start; a file that
+does not parse or hold (bad or duplicate name, empty `command`, a period
+outside 1 to 10080 minutes, a deadline outside 1 to 1440) is logged once as
+`[maintain] <path>: <error>` and no task runs. A task is due when
+`maintain/<name>.json` is missing or `every_minutes` have passed since its
+`started`. It runs only when the runner is not held and has no live run: as
+a run of the job host (`<exe> timeout <secs> -- <command..>`, label
+`maintain <name>`, working directory the home directory, `external`, so a
+terminal in the `Triggered` group that a failure keeps), one task at a time.
+While it runs the host counts as held: a CI `prepare` waits and a graph job
+is refused, so a toolchain update never swaps files under a build. A task
+that does not end with code 0 is logged as `[maintain] <name>: exited N |
+timed out | killed; log <run>/wal` and sent as `RuntimeEvent::Alert` on the
+`machine` topic, which every editor shows as a desktop notification.
+`zeughaus-runner maintain` prints one line per task from the files alone,
+so it runs beside the serving runner: `<name>  every <m> min  <never | ok |
+exit N | timed out | killed | running>  <age> ago  <run dir>`.
 
 ## 14. CI: pipelines from a repository's `.zeughaus-ci/` folder
 
@@ -967,7 +987,7 @@ it (`griasdi main: windows red since #138 (79e9035, 17 h, 13 pipelines); last
 publish #136`). A failed job in a streak that began in an earlier pipeline
 posts `red since #<n>: <cause>`. The pipeline that turns a job red, and
 every red pipeline once a job has been red for an hour, raise an alert: a
-line in the journal and `RuntimeEvent::CiAlert` on the `ci` topic, which
+line in the journal and `RuntimeEvent::Alert` on the `ci` topic, which
 every connected editor shows as a desktop notification. A push to the
 default branch whose commit has no `.zeughaus-ci/` is recorded as a
 `no-jobs` pipeline and posts an `error` on `zeughaus/pipeline`, naming a

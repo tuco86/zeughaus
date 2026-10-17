@@ -44,6 +44,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   included) and answers with the result and the end of the output. It
   dials the first CI of `zeughaus.toml`, or `--ci`, with the state
   directory's client key, the way an editor does.
+- A runner runs the periodic tasks of `<state-dir>/maintain.toml` by
+  itself (a toolchain update, a dotfiles pull), one at a time while it is
+  idle and holding off CI and graph jobs meanwhile, each as a terminal in
+  its `Triggered` group. A failed task raises a desktop notification in
+  every connected editor; `zeughaus-runner maintain` lists the last result
+  of each. The wohnzimmer runner updates its Rust toolchain this way.
 
 ### Fixed
 

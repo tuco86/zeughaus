@@ -73,5 +73,8 @@ git -C "$root" bundle create -q "$tmp/zeughaus.bundle" HEAD
 git -C "$weida" bundle create -q "$tmp/weida.bundle" HEAD
 scp -q -o BatchMode=yes "$tmp/zeughaus.bundle" "$tmp/weida.bundle" "$root/deploy/windows/install.ps1" \
     "$host:/C:/zeughaus/src/"
+# The runner reads its maintenance tasks again every minute, so a changed
+# file needs no restart.
+scp -q -o BatchMode=yes "$root/deploy/windows/maintain.toml" "$host:/C:/zeughaus/state/maintain.toml"
 run_ps1 'C:\zeughaus\src\install.ps1'
 say "done"

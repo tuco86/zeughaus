@@ -1,0 +1,8 @@
+# Maintenance tasks of the wohnzimmer runner; install-windows.sh copies this to
+# C:\zeughaus\state\maintain.toml. See zeughaus-runner/src/maintain.rs.
+
+[[task]]
+name = "rust"
+command = ['C:\zeughaus\cargo\bin\rustup.exe', 'update']
+every_minutes = 60
+timeout_minutes = 60

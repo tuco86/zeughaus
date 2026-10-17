@@ -17,6 +17,7 @@ mod feed;
 mod files;
 mod graphs;
 mod jobs;
+mod maintain;
 mod mcp;
 mod mux;
 mod names;
@@ -265,6 +266,8 @@ fn main() -> ExitCode {
     let mut publisher = None;
     // Jobs run in the mux, so a process without one has no host to offer them.
     let mut job_host: Option<Arc<JobHost>> = None;
+    // What a failed maintenance task asks the loop below to publish.
+    let (alert_tx, alert_rx) = std::sync::mpsc::channel::<maintain::Alert>();
     // Kept for the restart, which saves the workspace before it `exec`s.
     let mut mux_service: Option<MuxService> = None;
     // The busy measurement of an enlisted runner that has one, reported to
@@ -353,6 +356,11 @@ fn main() -> ExitCode {
         #[cfg(unix)]
         if let Ok(exe) = exe.as_ref() {
             update::start(&state_dir, exe.clone());
+        }
+        // Maintenance runs as the host's runs, so it needs the mux like a job
+        // does, and this binary's path for its `timeout` wrapper.
+        if let (Some(host), Ok(exe)) = (&job_host, exe.as_ref()) {
+            maintain::start(Arc::clone(host), state_dir.clone(), exe.clone(), alert_tx);
         }
         if let Some(busy) = &busy_handle {
             match listener.replier(BUSY_PATH) {
@@ -510,6 +518,9 @@ fn main() -> ExitCode {
 
         if let Some(busy) = &busy_handle {
             runner.report_machine(busy.state());
+        }
+        while let Ok(alert) = alert_rx.try_recv() {
+            runner.report_alert(alert.title, alert.body);
         }
 
         if had_changes || ticked || fired {

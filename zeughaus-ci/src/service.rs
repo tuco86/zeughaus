@@ -297,7 +297,7 @@ struct Events {
 impl Events {
     fn alert(&mut self, alert: Alert) {
         let seq = self.next_seq();
-        self.emit(RuntimeEvent::CiAlert {
+        self.emit(RuntimeEvent::Alert {
             seq,
             title: alert.title,
             body: alert.body,

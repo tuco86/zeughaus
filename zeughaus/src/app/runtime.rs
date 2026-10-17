@@ -363,7 +363,7 @@ impl App {
             }
             // Not state: nothing to keep, and the window being focused is
             // no reason to hold it back, since nothing on screen says it.
-            Traffic::Event(RuntimeEvent::CiAlert { title, body, .. }) => {
+            Traffic::Event(RuntimeEvent::Alert { title, body, .. }) => {
                 return super::terminal::notify_desktop(title, body);
             }
             // Not state either: the CI views ask the runner for the pipeline.
