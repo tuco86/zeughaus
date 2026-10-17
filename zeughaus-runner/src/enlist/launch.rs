@@ -12,7 +12,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use zeughaus_link::enlist::Assignment;
+use zeughaus_link::enlist::{Assignment, Checkout};
 
 use super::CI_DIR;
 use super::stage::Engine;
@@ -114,6 +114,53 @@ fn clean_excludes(cache: &[String], quote: fn(&str) -> String) -> String {
         .collect()
 }
 
+/// The `cache` paths a checkout keeps: a wipe keeps none.
+fn kept(a: &Assignment) -> &[String] {
+    match a.checkout {
+        Checkout::Wipe => &[],
+        Checkout::Clean | Checkout::Continue => &a.cache,
+    }
+}
+
+/// The part of `launch.sh` that enters the workspace and settles what is in
+/// it: the pipeline's commit checked out and the pipeline written to
+/// `.git/zci-context` (`Clean`, `Wipe`), or the check that an earlier job of
+/// the pipeline's context left it (`Continue`: the job after it finds what it
+/// built, and a workspace someone else took in between is refused).
+fn enter_sh(a: &Assignment, workspace: &Path, mirror: &Path) -> String {
+    let n = a.number;
+    let mut out = format!(
+        "ws={ws}\n\
+         mkdir -p \"$ws\" && cd \"$ws\" || {{ printf '[zeughaus-ci] cannot enter %s\\n' \"$ws\"; exit 70; }}\n",
+        ws = sh_path(workspace),
+    );
+    match a.checkout {
+        Checkout::Continue => {
+            let _ = writeln!(
+                out,
+                "[ \"$(cat .git/zci-context 2>/dev/null)\" = \"{n}\" ] || {{ printf '[zeughaus-ci] context workspace %s no longer holds pipeline #%s\\n' \"$ws\" {n}; exit 70; }}",
+            );
+        }
+        Checkout::Clean | Checkout::Wipe => {
+            let _ = write!(
+                out,
+                "[ -d .git ] || git init -q || exit 70\n\
+                 if ! {{ git fetch -q --no-tags {mirror} '+refs/ci/{n}:refs/ci/head' \
+                 && git checkout -q --force --detach refs/ci/head \
+                 && git clean -ffdxq{excludes} \
+                 && printf '%s\\n' {n} > .git/zci-context; }}; then\n\
+                 \tprintf '[zeughaus-ci] checkout failed\\n'\n\
+                 \texit 70\n\
+                 fi\n",
+                mirror = sh_path(mirror),
+                excludes = clean_excludes(kept(a), sh_quote),
+            );
+        }
+    }
+    out.push_str("touch .git/zci-last-used\n");
+    out
+}
+
 /// `launch.sh` for a job on this machine (host or container), or for a
 /// Windows VM job, which has its own launcher.
 pub fn launch_sh(launch: &Launch<'_>) -> String {
@@ -123,23 +170,7 @@ pub fn launch_sh(launch: &Launch<'_>) -> String {
         Target::WindowsVm { .. } => return launch_sh_windows_vm(launch),
     };
     let mut out = preamble(launch, "");
-    let _ = write!(
-        out,
-        "ws={ws}\n\
-         mkdir -p \"$ws\" && cd \"$ws\" || {{ printf '[zeughaus-ci] cannot enter %s\\n' \"$ws\"; exit 70; }}\n\
-         [ -d .git ] || git init -q || exit 70\n\
-         if ! {{ git fetch -q --no-tags {mirror} '+refs/ci/{n}:refs/ci/head' \
-         && git checkout -q --force --detach refs/ci/head \
-         && git clean -ffdxq{excludes}; }}; then\n\
-         \tprintf '[zeughaus-ci] checkout failed\\n'\n\
-         \texit 70\n\
-         fi\n\
-         touch .git/zci-last-used\n",
-        ws = sh_path(workspace),
-        mirror = sh_path(launch.mirror),
-        n = a.number,
-        excludes = clean_excludes(&a.cache, sh_quote),
-    );
+    out.push_str(&enter_sh(a, workspace, launch.mirror));
     let inner = launch.run_dir.join("inner.sh");
     match &launch.target {
         Target::Host { .. } => {
@@ -236,19 +267,40 @@ pub fn guest_run_dir(run_id: &str) -> String {
     format!(r"W:\ci\runs\{run_id}")
 }
 
-/// The guest workspace of a job: `W:\work\<repo>\<job>`.
-pub fn guest_workspace(repo: &str, job: &str) -> String {
-    format!(r"W:\work\{repo}\{job}")
+/// The guest workspace of a job: `W:\work\<repo>\<workspace>`.
+pub fn guest_workspace(repo: &str, workspace: &str) -> String {
+    format!(r"W:\work\{repo}\{workspace}")
 }
 
-/// `inner.ps1`: the checkout from the run's bundle, then the job.
+/// `inner.ps1`: the checkout from the run's bundle (or, for a job that
+/// continues its context, the check that an earlier job of the pipeline left
+/// the workspace), then the job.
 ///
 /// Its exit code is also written to `<guest run>\rc`: Windows OpenSSH
 /// reports 0 for a session with a terminal (`ssh -tt`) whatever the remote
 /// command exited with, so the launcher reads the file instead.
 pub fn inner_ps1(a: &Assignment) -> String {
     let run = guest_run_dir(&a.run);
-    let excludes = clean_excludes(&a.cache, ps_quote);
+    let n = a.number;
+    let checkout = match a.checkout {
+        Checkout::Continue => format!(
+            "$held = \"$(Get-Content -Raw -ErrorAction SilentlyContinue .git\\zci-context)\".Trim()\r\n\
+             if ($held -ne '{n}') {{ Write-Host \"[zeughaus-ci] context workspace $env:CI_WORKSPACE no longer holds pipeline #{n}\"; Finish 70 }}\r\n"
+        ),
+        Checkout::Clean | Checkout::Wipe => format!(
+            "if (-not (Test-Path .git)) {{ git init -q; if ($LASTEXITCODE -ne 0) {{ Finish 70 }} }}\r\n\
+             git fetch -q {bundle} '+refs/ci/{n}:refs/ci/head'\r\n\
+             if ($LASTEXITCODE -ne 0) {{ Write-Host '[zeughaus-ci] checkout failed'; Finish 70 }}\r\n\
+             git checkout -q --force --detach refs/ci/head\r\n\
+             if ($LASTEXITCODE -ne 0) {{ Write-Host '[zeughaus-ci] checkout failed'; Finish 70 }}\r\n\
+             git clean -ffdxq{excludes}\r\n\
+             if ($LASTEXITCODE -ne 0) {{ Write-Host '[zeughaus-ci] checkout failed'; Finish 70 }}\r\n\
+             Set-Content -NoNewline -Path .git\\zci-context -Value '{n}'\r\n\
+             if (-not $?) {{ Write-Host '[zeughaus-ci] checkout failed'; Finish 70 }}\r\n",
+            bundle = ps_quote(&format!(r"{run}\src.bundle")),
+            excludes = clean_excludes(kept(a), ps_quote),
+        ),
+    };
     format!(
         "$ErrorActionPreference = 'Stop'\r\n\
          function Finish([int]$code) {{ Set-Content -Path {rc} -Value $code -Encoding ascii; exit $code }}\r\n\
@@ -256,20 +308,12 @@ pub fn inner_ps1(a: &Assignment) -> String {
          New-Item -ItemType Directory -Force $env:CI_WORKSPACE, $env:CI_OUTPUT | Out-Null\r\n\
          Set-Location $env:CI_WORKSPACE\r\n\
          $ErrorActionPreference = 'Continue'\r\n\
-         if (-not (Test-Path .git)) {{ git init -q; if ($LASTEXITCODE -ne 0) {{ Finish 70 }} }}\r\n\
-         git fetch -q {bundle} '+refs/ci/{pipeline}:refs/ci/head'\r\n\
-         if ($LASTEXITCODE -ne 0) {{ Write-Host '[zeughaus-ci] checkout failed'; Finish 70 }}\r\n\
-         git checkout -q --force --detach refs/ci/head\r\n\
-         if ($LASTEXITCODE -ne 0) {{ Write-Host '[zeughaus-ci] checkout failed'; Finish 70 }}\r\n\
-         git clean -ffdxq{excludes}\r\n\
-         if ($LASTEXITCODE -ne 0) {{ Write-Host '[zeughaus-ci] checkout failed'; Finish 70 }}\r\n\
+         {checkout}\
          New-Item .git\\zci-last-used -ItemType File -Force | Out-Null\r\n\
          & powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File {file}\r\n\
          Finish $LASTEXITCODE\r\n",
         rc = ps_quote(&format!(r"{run}\rc")),
         env = ps_quote(&format!(r"{run}\env.ps1")),
-        bundle = ps_quote(&format!(r"{run}\src.bundle")),
-        pipeline = a.number,
         file = ps_quote(&format!(r"{CI_DIR}\{}", a.file)),
     )
 }
@@ -291,10 +335,11 @@ pub fn windows_powershell() -> String {
 }
 
 /// `launch.ps1`: a host job on a Windows runner. The checkout into
-/// `workspace`, the secrets read into the session from `env.ps1` and deleted
-/// at once, the job under this runner's `timeout`, and on failure the exit
-/// code in `$env:ZEUGHAUS_RUN_DIR\code` and a shell in the workspace. The
-/// secret directory goes however the script ends.
+/// `workspace` (or, for a job that continues its context, the check that an
+/// earlier job of the pipeline left it), the secrets read into the session
+/// from `env.ps1` and deleted at once, the job under this runner's `timeout`,
+/// and on failure the exit code in `$env:ZEUGHAUS_RUN_DIR\code` and a shell
+/// in the workspace. The secret directory goes however the script ends.
 pub fn launch_ps1(
     a: &Assignment,
     secret_dir: &Path,
@@ -305,19 +350,33 @@ pub fn launch_ps1(
     let secs = u64::from(a.timeout_minutes) * 60;
     let path = |p: &Path| ps_quote(&p.to_string_lossy());
     let check = "if ($LASTEXITCODE -ne 0) { Write-Host '[zeughaus-ci] checkout failed'; exit 70 }";
+    let n = a.number;
+    let checkout = match a.checkout {
+        Checkout::Continue => format!(
+            "$held = \"$(Get-Content -Raw -LiteralPath .git\\zci-context -ErrorAction SilentlyContinue)\".Trim()\r\n\
+             if ($held -ne '{n}') {{ Write-Host \"[zeughaus-ci] context workspace $ws no longer holds pipeline #{n}\"; exit 70 }}\r\n"
+        ),
+        Checkout::Clean | Checkout::Wipe => format!(
+            "if (-not (Test-Path -LiteralPath .git)) {{ git init -q; if ($LASTEXITCODE -ne 0) {{ Write-Host \"[zeughaus-ci] cannot enter $ws\"; exit 70 }} }}\r\n\
+             git fetch -q --no-tags {mirror} '+refs/ci/{n}:refs/ci/head'\r\n\
+             {check}\r\n\
+             git checkout -q --force --detach refs/ci/head\r\n\
+             {check}\r\n\
+             git clean -ffdxq{excludes}\r\n\
+             {check}\r\n\
+             Set-Content -NoNewline -Path .git\\zci-context -Value '{n}'\r\n\
+             if (-not $?) {{ Write-Host '[zeughaus-ci] checkout failed'; exit 70 }}\r\n",
+            mirror = path(mirror),
+            excludes = clean_excludes(kept(a), ps_quote),
+        ),
+    };
     format!(
         "$secretDir = {secret}\r\n\
          try {{\r\n\
          $ws = {ws}\r\n\
          New-Item -ItemType Directory -Force -Path $ws | Out-Null\r\n\
          Set-Location -LiteralPath $ws\r\n\
-         if (-not (Test-Path -LiteralPath .git)) {{ git init -q; if ($LASTEXITCODE -ne 0) {{ Write-Host \"[zeughaus-ci] cannot enter $ws\"; exit 70 }} }}\r\n\
-         git fetch -q --no-tags {mirror} '+refs/ci/{n}:refs/ci/head'\r\n\
-         {check}\r\n\
-         git checkout -q --force --detach refs/ci/head\r\n\
-         {check}\r\n\
-         git clean -ffdxq{excludes}\r\n\
-         {check}\r\n\
+         {checkout}\
          New-Item -ItemType File -Force -Path .git\\zci-last-used | Out-Null\r\n\
          $secrets = Join-Path $secretDir 'env.ps1'\r\n\
          . $secrets\r\n\
@@ -336,9 +395,6 @@ pub fn launch_ps1(
          }}\r\n",
         secret = path(secret_dir),
         ws = path(workspace),
-        mirror = path(mirror),
-        n = a.number,
-        excludes = clean_excludes(&a.cache, ps_quote),
         exe = path(runner_exe),
         interpreter = ps_quote(&a.interpreter),
         file = ps_quote(&format!(r"{CI_DIR}\{}", a.file)),
@@ -478,6 +534,9 @@ mod tests {
             timeout_minutes: 2,
             when_busy: WhenBusy::Wait,
             inputs: Vec::new(),
+            workspace: "build".to_owned(),
+            checkout: Checkout::Clean,
+            upload: None,
         }
     }
 
@@ -579,5 +638,173 @@ mod tests {
         assert!(script.contains("-v '/s/runs/4/inputs':/ci/inputs -w /work"));
         assert!(!script.contains("podman"));
         assert!(!script.contains(":ro"));
+    }
+
+    fn host_launcher(a: &Assignment) -> String {
+        let workspace = PathBuf::from("/s/ci/work/demo/linux");
+        launch_sh(&Launch {
+            assignment: a,
+            run_dir: Path::new("/s/runs/4"),
+            secret_dir: Path::new("/run/zeughaus-ci/demo.7.build"),
+            mirror: Path::new("/s/ci/mirrors/demo.git"),
+            target: Target::Host {
+                workspace: &workspace,
+            },
+        })
+    }
+
+    /// The three launchers that check a commit out: a host job on a unix
+    /// runner, a host job on a Windows runner and a job in a Windows VM.
+    fn launchers(a: &Assignment) -> [(&'static str, String); 3] {
+        let windows_host = launch_ps1(
+            a,
+            Path::new(r"C:\s\secret"),
+            Path::new(r"C:\s\mirror"),
+            Path::new(r"C:\s\work\demo\linux"),
+            Path::new(r"C:\s\runner.exe"),
+        );
+        [
+            ("launch.sh", host_launcher(a)),
+            ("launch.ps1", windows_host),
+            ("inner.ps1", inner_ps1(a)),
+        ]
+    }
+
+    #[test]
+    fn a_job_continuing_its_context_checks_the_workspace_and_fetches_nothing() {
+        let mut a = assignment(Place::Host);
+        a.checkout = Checkout::Continue;
+        for (name, script) in launchers(&a) {
+            for forbidden in ["git fetch", "git checkout", "git clean", "git init"] {
+                assert!(!script.contains(forbidden), "{name}: {forbidden}");
+            }
+            assert!(script.contains("zci-context"), "{name}");
+            assert!(script.contains("no longer holds pipeline #"), "{name}");
+            assert!(script.contains("70"), "{name}");
+            assert!(script.contains("zci-last-used"), "{name}");
+        }
+        let sh = host_launcher(&a);
+        assert!(sh.contains(r#"[ "$(cat .git/zci-context 2>/dev/null)" = "7" ]"#));
+        assert!(sh.contains("no longer holds pipeline #%s\\n' \"$ws\" 7; exit 70;"));
+    }
+
+    #[test]
+    fn a_checkout_leaves_the_pipeline_in_the_context_file() {
+        for checkout in [Checkout::Clean, Checkout::Wipe] {
+            let mut a = assignment(Place::Host);
+            a.checkout = checkout;
+            let [(_, sh), (_, windows_host), (_, guest)] = launchers(&a);
+            assert!(sh.contains("&& printf '%s\\n' 7 > .git/zci-context; }; then"));
+            for script in [windows_host, guest] {
+                assert!(
+                    script.contains(r"Set-Content -NoNewline -Path .git\zci-context -Value '7'")
+                );
+            }
+            for (name, script) in launchers(&a) {
+                assert!(script.contains("git fetch"), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_wipe_keeps_no_cache_path_and_a_clean_keeps_them() {
+        let mut a = assignment(Place::Host);
+        for (name, script) in launchers(&a) {
+            assert!(script.contains("git clean -ffdxq -e '/target'"), "{name}");
+        }
+        a.checkout = Checkout::Wipe;
+        for (name, script) in launchers(&a) {
+            assert!(script.contains("git clean -ffdxq"), "{name}");
+            assert!(!script.contains(" -e "), "{name}");
+        }
+    }
+
+    /// The shell side of a context, run for real: each job of a pipeline
+    /// finds the workspace as the one before left it, a job of another
+    /// pipeline is refused, and a clean checkout keeps only the cache paths.
+    #[test]
+    fn a_context_workspace_passes_from_one_job_to_the_next() {
+        let base = std::env::temp_dir().join(format!("zci-launch-context-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (mirror, ws) = (base.join("mirror"), base.join("ws"));
+        std::fs::create_dir_all(&mirror).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&mirror)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(mirror.join("tracked"), "x").unwrap();
+        git(&["add", "tracked"]);
+        git(&["commit", "-q", "-m", "c"]);
+        git(&["update-ref", "refs/ci/7", "HEAD"]);
+        git(&["update-ref", "refs/ci/8", "HEAD"]);
+
+        let enter = |checkout: Checkout, number: u64| {
+            let a = Assignment {
+                number,
+                checkout,
+                cache: vec![".ci-cache/".to_owned()],
+                ..assignment(Place::Host)
+            };
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(enter_sh(&a, &ws, &mirror))
+                .output()
+                .expect("run sh");
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+            )
+        };
+        let context = || std::fs::read_to_string(ws.join(".git/zci-context")).ok();
+
+        // The first job checks out and takes the workspace for pipeline 7.
+        assert_eq!(enter(Checkout::Clean, 7).0, Some(0));
+        assert!(ws.join("tracked").exists());
+        assert_eq!(context().as_deref(), Some("7\n"));
+        std::fs::create_dir_all(ws.join(".ci-cache")).unwrap();
+        std::fs::write(ws.join(".ci-cache/kept"), "").unwrap();
+        std::fs::write(ws.join("built"), "").unwrap();
+
+        // The next job of the context finds all of it.
+        assert_eq!(enter(Checkout::Continue, 7).0, Some(0));
+        assert!(ws.join("built").exists());
+
+        // A job of another pipeline is refused and leaves it alone.
+        let (code, out) = enter(Checkout::Continue, 8);
+        assert_eq!(code, Some(70));
+        assert!(
+            out.contains("context workspace") && out.contains("no longer holds pipeline #8"),
+            "{out}"
+        );
+        assert!(ws.join("built").exists());
+
+        // A clean checkout keeps the cache path and nothing else; a wipe not
+        // even that.
+        assert_eq!(enter(Checkout::Clean, 8).0, Some(0));
+        assert!(ws.join(".ci-cache/kept").exists());
+        assert!(!ws.join("built").exists());
+        assert_eq!(context().as_deref(), Some("8\n"));
+        assert_eq!(enter(Checkout::Wipe, 7).0, Some(0));
+        assert!(!ws.join(".ci-cache").exists());
+        assert_eq!(context().as_deref(), Some("7\n"));
+
+        // A workspace that was removed in between holds no context.
+        std::fs::remove_dir_all(&ws).unwrap();
+        assert_eq!(enter(Checkout::Continue, 7).0, Some(70));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

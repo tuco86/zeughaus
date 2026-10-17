@@ -187,9 +187,10 @@ fn check(state_dir: &Path, args: &[String]) -> Result<(), String> {
             header::when_busy_name(job.when_busy)
         );
     }
-    for (name, patterns) in channels.names() {
+    for (name, patterns, clean) in channels.names() {
         let on: Vec<String> = patterns.iter().map(Pattern::to_string).collect();
-        println!("channel {name}  on: {}", on.join(", "));
+        let clean = if clean { " (clean)" } else { "" };
+        println!("channel {name}{clean}  on: {}", on.join(", "));
     }
     Ok(())
 }

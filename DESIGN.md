@@ -736,6 +736,8 @@ holds these keys:
   a Windows VM of one, by name) or `platform` (a key of `ci.toml`
   `[platforms]`, exclusive with `machine`); none means the host of the
   default runner;
+- `context`: jobs of a pipeline that name the same one share a workspace and
+  run one after another (**Contexts**);
 - `cache`, `secrets`, `when_busy` (`wait`/`freeze`/`run`), `env`,
   `timeout_minutes`.
 
@@ -800,8 +802,10 @@ are grouped the same way. The channel is decided in setup and kept in the
 record; an invalid file fails the setup like an invalid job header. `check`
 lists the channels, `plan` starts with the one an event selects, and
 `status` shows it per pipeline. Retention counts per channel (**Disk**).
+`clean = true` on a channel marks the pipelines it gets `clean` (kept in the
+record): their jobs start every workspace from nothing (**Contexts**).
 
-**The enlist protocol** (`zeughaus-link/src/enlist.rs`, `ENLIST_MAJOR` 1) is
+**The enlist protocol** (`zeughaus-link/src/enlist.rs`, `ENLIST_MAJOR` 3) is
 one long exchange on `/enlist` (req/rep) per runner. Frames are a 4-byte
 little-endian length and a postcard body, at most `MAX_ENLIST_FRAME_BYTES`
 (1 MiB), refused before the body is allocated.
@@ -822,7 +826,8 @@ little-endian length and a postcard body, at most `MAX_ENLIST_FRAME_BYTES`
 - `Assign` carries everything the run needs and the runner has not: the
   repository URL and the fetch token, the commit, the script, the place, the
   environment (`CI`, `CI_REPO`, `CI_REF`, `CI_SHA`, `CI_JOB`, `CI_PLATFORM`, ...), the
-  granted secrets, the timeout, `when_busy` and the inputs. The runner adds
+  granted secrets, the timeout, `when_busy`, the inputs, the name of the
+  workspace and how to check it out (`Checkout`). The runner adds
   the paths and the CPU count (`CI_WORKSPACE`, `CI_OUTPUT`, `CI_INPUTS`,
   `CI_CPUS`, `CARGO_BUILD_JOBS`).
 - Output is the run's `wal` byte for byte. The CI appends a chunk when its
@@ -868,9 +873,17 @@ success, once the output is copied back). A run that fails before its shell
 (a checkout, an image build, the copy into the guest) keeps its terminal
 with the final screen, detached as well.
 
-The launcher checks the commit out into a persistent workspace
-`ci/work/<repo>/<job>` (cleaned except the `cache` paths) and starts the
-job:
+The launcher puts a persistent workspace `ci/work/<repo>/<workspace>`, named
+after the job or after its `context`, into the state the assignment's
+`checkout` asks for and starts the job in it. `Clean` (the default) checks
+the commit out and cleans the tree except the `cache` paths, `Wipe` does
+the same keeping no path, and both then write the pipeline's number to
+`.git/zci-context`. `Continue` neither fetches, checks out nor cleans: an
+earlier job of the pipeline's context left the workspace, and the launcher
+ends with exit 70 (`context workspace <ws> no longer holds pipeline #<n>`)
+when `.git/zci-context` does not name this pipeline, as it does not after
+the runner's budget removed the workspace or another pipeline's job took it
+in between. Then it starts the job:
 
 - **Host:** directly, under `zeughaus-runner timeout <seconds> -- <program>`
   (a process group that gets `SIGTERM`, `SIGKILL` 60 s later, exit 124;
@@ -892,7 +905,7 @@ job:
   system is never stopped by the runner; every container is a VM of its own
   that `--rm` removes. `container` has no read-only mount, so the inputs are
   writable there.
-- **Machine:** over ssh, from a git bundle, in `W:\work\<repo>\<job>`.
+- **Machine:** over ssh, from a git bundle, in `W:\work\<repo>\<workspace>`.
 
 Host and container jobs time out inside `inner.sh`; a machine job on the
 runner's own clock (`control.rs`), which counts only unfrozen seconds, writes
@@ -957,11 +970,31 @@ while its runner is not connected (`waiting for runner <R>`), is `Skipped`
 after the runner's `wait_minutes` without it (`runner <R> offline`; the
 forge hears `success`, so an offline Mac never turns a branch red), and
 waits while the runner is busy and its `when_busy` is not `run` (`runner <R>
-busy`), or while its workspace (one job of one repository per runner) or
-machine is in use. A container place on a runner that offers none, or a
-machine it does not list, fails the job. A job whose need's artifacts are on
-another runner waits for that runner like for its own (`waiting for runner
-<R> (artifacts of <need>)`, skipped after its `wait_minutes`).
+busy`), or while its workspace (one job at a time per repository and runner)
+or machine is in use, or its context is held (**Contexts**). A container place
+on a runner that offers none, or a machine it does not list, fails the job. A
+job whose need's artifacts are on another runner waits for that runner like
+for its own (`waiting for runner <R> (artifacts of <need>)`, skipped after its
+`wait_minutes`).
+
+**Contexts** let jobs of one pipeline share one warm workspace. Jobs with
+the same `context` use the workspace named after it and run one after
+another in the pipeline's record order (topological, ties by name), so each
+finds what the one before built, `cache` paths or not; every other job
+has the workspace of its own name. `load_jobs` refuses a context that is
+also a job's name, jobs of one context that differ in `image`, `machine`,
+`platform` or `cache`, and the name `zeughaus-try`, which no job or
+context may take. A pipeline keeps its context from its first job to its
+last (`workspace_wait`): while another pipeline's job is active in the
+workspace the job waits (`workspace <ws> in use by #<n>`), and so it does
+while an earlier job of its own pipeline has not ended (`waiting for <job>
+in context <ws>`) or another pipeline holds the context (`context <ws> held
+by #<n>`). The context goes to the pipeline that began in it (one of its
+jobs started), else to the oldest, so a younger pipeline never holds back an
+older one that has not begun and no two wait for each other. A job after one
+of its context that started gets `Checkout::Continue`, and in a pipeline
+whose channel is `clean` the first job to use a workspace gets
+`Checkout::Wipe` (`build_assignment`).
 
 **Restarts.** The CI persists a record before acting, and a run lives on its
 runner, so either side may restart:
@@ -1014,9 +1047,9 @@ stop` shuts it down after `idle_minutes` without a job. A guest shell opened
 within the last 24 hours (`<run>/debug-shell`, removed when the run's
 terminal closes) keeps it up and runs `.ps1` jobs. The launcher copies the
 bundle, the inputs and an `env.ps1` into the guest, checks the commit out in
-`W:\work\<repo>\<job>`, runs the job under `ssh -tt`, copies `out/` back and
-removes the run directory; a failure opens a shell in the guest. The runner
-reports each machine's status to the CI as `Machine`.
+`W:\work\<repo>\<workspace>`, runs the job under `ssh -tt`, copies `out/`
+back and removes the run directory; a failure opens a shell in the guest.
+The runner reports each machine's status to the CI as `Machine`.
 
 **The CI view.** `zeughaus-ci serve` is a weida peer for editors too: `/ci`
 (`CiRequest` -> `CiReply`, `zeughaus-link/src/ci.rs`, `serve.rs`), `/events`,

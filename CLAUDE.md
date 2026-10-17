@@ -203,6 +203,16 @@ The Windows VM scripts (`vm/win11/`) are
 installed under `/usr/local/lib/zeughaus/vm/win11` and booted and stopped by
 the `tuco-pc` runner.
 
+`context = "<c>"` in a job header makes the jobs of a pipeline that name it
+share one warm workspace, `ci/work/<repo>/<c>` instead of one per job, and run
+one after another in the order the pipeline lists them (they agree on
+`image`, `machine`, `platform` and `cache`, and a context is never a job's
+name). A pipeline keeps its context until its last job ended; other
+pipelines' jobs of it wait, the oldest first. `clean = true` on a
+`[[channel]]` of `.zeughaus-ci/channels.toml` makes the first job to use a
+workspace in that channel's pipelines start it from nothing, `cache` paths
+too.
+
 The Windows runner `wohnzimmer` is the living-room PC, used by someone else
 at its console. Everything of zeughaus is under `C:\zeughaus`, readable by
 its account and SYSTEM only: `bin\` (binaries and the `runner.cmd` loop the
@@ -210,7 +220,7 @@ boot task runs), `state\`, `src\` (the checkouts a deploy builds), `cargo\`
 and `rustup\`. Its WireGuard tunnel `sadala` (`C:\zeughaus\wg\sadala.conf`,
 the WireGuard for Windows service) gives it `10.8.0.12`; the firewall admits
 the runner from `10.8.0.0/24` only. It runs `.ps1` jobs on its host in
-`C:\zeughaus\state\ci\work\<repo>\<job>`, has no containers, machines,
+`C:\zeughaus\state\ci\work\<repo>\<workspace>`, has no containers, machines,
 shims or updater: a restart (every deploy) ends its terminals and the job
 it runs.
 

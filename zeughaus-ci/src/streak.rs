@@ -161,6 +161,7 @@ mod tests {
                 image: None,
                 machine: None,
                 platform: None,
+                context: None,
                 cache: Vec::new(),
                 secrets: Vec::new(),
                 when_busy: WhenBusy::Wait,
@@ -208,6 +209,7 @@ mod tests {
             ],
             channel: String::new(),
             cancelled: false,
+            clean: false,
         }
     }
 

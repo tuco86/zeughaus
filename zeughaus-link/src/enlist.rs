@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::machine::MachineState;
 
 /// The protocol major a runner and the CI must share.
-pub const ENLIST_MAJOR: u32 = 2;
+pub const ENLIST_MAJOR: u32 = 3;
 
 /// The most one frame body may carry.
 pub const MAX_ENLIST_FRAME_BYTES: usize = 1 << 20;
@@ -142,6 +142,44 @@ pub struct Assignment {
     pub timeout_minutes: u32,
     pub when_busy: WhenBusy,
     pub inputs: Vec<Input>,
+    /// The directory name of the job's workspace under `ci/work/<repo>/`: the
+    /// job's name, or the name of the context it shares with other jobs.
+    /// Empty in an assignment a runner persisted before the field existed.
+    #[serde(default)]
+    pub workspace: String,
+    #[serde(default)]
+    pub checkout: Checkout,
+    /// A snapshot of working trees in place of a commit of the repository.
+    #[serde(default)]
+    pub upload: Option<Upload>,
+}
+
+/// What the launcher does to the workspace before the job runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Checkout {
+    /// Fetch, checkout, `git clean -ffdxq` keeping the `cache` paths.
+    #[default]
+    Clean,
+    /// The same without keeping any path: a clean channel's first use.
+    Wipe,
+    /// No fetch, no checkout, no clean: an earlier job of this pipeline's
+    /// context left the workspace; `.git/zci-context` must name this pipeline.
+    Continue,
+}
+
+/// The working trees a try run executes in, in place of a checkout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Upload {
+    /// `dirs[0]` is the main checkout; a dir's index is its bundle's index.
+    pub dirs: Vec<UploadDir>,
+}
+
+/// One checkout of an [`Upload`]: its directory name and the commit its
+/// bundle holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadDir {
+    pub dir: String,
+    pub sha: String,
 }
 
 /// Where a job's process runs.
@@ -204,6 +242,8 @@ pub enum ArtifactRequest {
     },
     /// A consuming runner fetches `run`'s artifacts for a job it was assigned.
     Download { run: String },
+    /// A runner fetches bundle `index` of the try run `run` it was assigned.
+    TryBundle { run: String, index: u32 },
 }
 
 /// The CI's answer; after `Sending`, `size` raw bytes follow.
@@ -294,6 +334,37 @@ where
         .map_err(|e| format!("decode frame: {e}"))
 }
 
+#[cfg(test)]
+fn sample_assignment() -> Assignment {
+    Assignment {
+        run: "r.1.j".to_owned(),
+        repo: "r".to_owned(),
+        number: 1,
+        job: "j".to_owned(),
+        url: String::new(),
+        fetch_user: String::new(),
+        fetch_token: None,
+        sha: "ab".to_owned(),
+        file: "j.sh".to_owned(),
+        interpreter: "sh".to_owned(),
+        place: Place::Host,
+        cache: vec![".cache".to_owned()],
+        env: Vec::new(),
+        secrets: Vec::new(),
+        timeout_minutes: 1,
+        when_busy: WhenBusy::Wait,
+        inputs: Vec::new(),
+        workspace: "box".to_owned(),
+        checkout: Checkout::Continue,
+        upload: Some(Upload {
+            dirs: vec![UploadDir {
+                dir: "zeughaus".to_owned(),
+                sha: "ab".repeat(20),
+            }],
+        }),
+    }
+}
+
 #[cfg(all(test, feature = "tokio"))]
 mod tests {
     use super::*;
@@ -330,6 +401,26 @@ mod tests {
         let mut r: &[u8] = &[1, 0];
         assert!(read_frame::<_, ToRunner>(&mut r).await.is_err());
     }
+
+    #[tokio::test]
+    async fn an_assignment_with_a_context_and_an_upload_round_trips() {
+        let msg = ToRunner::Assign {
+            assignment: Box::new(sample_assignment()),
+        };
+        let request = ArtifactRequest::TryBundle {
+            run: "r.1.j".to_owned(),
+            index: 1,
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &msg).await.unwrap();
+        write_frame(&mut buf, &request).await.unwrap();
+        let mut r: &[u8] = &buf;
+        assert_eq!(read_frame::<_, ToRunner>(&mut r).await.unwrap(), Some(msg));
+        assert_eq!(
+            read_frame::<_, ArtifactRequest>(&mut r).await.unwrap(),
+            Some(request)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -360,5 +451,20 @@ mod id_tests {
         let h: H = serde_json::from_str(r#"{"when_busy":"freeze"}"#).unwrap();
         assert_eq!(h.when_busy, WhenBusy::Freeze);
         assert_eq!(WhenBusy::default(), WhenBusy::Wait);
+    }
+
+    /// A runner persists its assignments as JSON (`assigned/<run>.json`), so
+    /// one written before contexts must still load.
+    #[test]
+    fn an_assignment_from_before_contexts_still_loads() {
+        let mut old = serde_json::to_value(sample_assignment()).unwrap();
+        let fields = old.as_object_mut().unwrap();
+        for key in ["workspace", "checkout", "upload"] {
+            assert!(fields.remove(key).is_some(), "{key}");
+        }
+        let loaded: Assignment = serde_json::from_value(old).unwrap();
+        assert_eq!(loaded.workspace, "");
+        assert_eq!(loaded.checkout, Checkout::Clean);
+        assert_eq!(loaded.upload, None);
     }
 }

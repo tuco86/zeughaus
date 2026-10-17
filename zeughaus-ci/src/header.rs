@@ -34,6 +34,11 @@ pub struct JobDef {
     /// is built. Exclusive with `machine`.
     #[serde(default)]
     pub platform: Option<String>,
+    /// A name shared by jobs that run one after another in one workspace,
+    /// named after the context, instead of one workspace each. Such jobs
+    /// have equal `image`, `machine`, `platform` and `cache`.
+    #[serde(default)]
+    pub context: Option<String>,
     pub cache: Vec<String>,
     pub secrets: Vec<String>,
     pub when_busy: WhenBusy,
@@ -41,6 +46,14 @@ pub struct JobDef {
     pub timeout_minutes: u32,
     /// `sh` or `bash` for `.sh` jobs, `powershell` for `.ps1` jobs.
     pub interpreter: String,
+}
+
+impl JobDef {
+    /// The directory name of the job's workspace on a runner: its context,
+    /// else its own name.
+    pub fn workspace(&self) -> &str {
+        self.context.as_deref().unwrap_or(&self.name)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,6 +66,7 @@ struct JobHeader {
     image: Option<String>,
     machine: Option<String>,
     platform: Option<String>,
+    context: Option<String>,
     #[serde(default)]
     cache: Vec<String>,
     #[serde(default)]
@@ -140,6 +154,13 @@ pub fn parse_job(file_name: &str, text: &str) -> Result<Option<JobDef>, String> 
             "platform name `{p}` must match [a-z0-9][a-z0-9-]*"
         )));
     }
+    if let Some(c) = &header.context
+        && !valid_name(c)
+    {
+        return Err(fail(format!(
+            "context name `{c}` must match [a-z0-9][a-z0-9-]*"
+        )));
+    }
     for path in &header.cache {
         check_cache(path).map_err(fail)?;
     }
@@ -178,6 +199,7 @@ pub fn parse_job(file_name: &str, text: &str) -> Result<Option<JobDef>, String> 
         image: header.image,
         machine: header.machine,
         platform: header.platform,
+        context: header.context,
         cache: header.cache,
         secrets: header.secrets,
         when_busy: header.when_busy,
@@ -272,6 +294,21 @@ mod tests {
         assert_eq!(job.platform.as_deref(), Some("linux-arm64"));
         let err = parse_job("x.sh", &wrap("platform = \"Linux\"")).unwrap_err();
         assert!(err.contains("platform name `Linux`"), "{err}");
+    }
+
+    #[test]
+    fn a_context_names_the_workspace_and_is_checked() {
+        let wrap = |body: &str| format!("# /// ci\n# on = [\"push main\"]\n# {body}\n# ///\n");
+        let alone = parse_job("gate.sh", &wrap("")).unwrap().unwrap();
+        assert_eq!(alone.context, None);
+        assert_eq!(alone.workspace(), "gate");
+        let shared = parse_job("gate.sh", &wrap("context = \"linux\""))
+            .unwrap()
+            .unwrap();
+        assert_eq!(shared.context.as_deref(), Some("linux"));
+        assert_eq!(shared.workspace(), "linux");
+        let err = parse_job("gate.sh", &wrap("context = \"Linux\"")).unwrap_err();
+        assert!(err.contains("context name `Linux`"), "{err}");
     }
 
     #[test]

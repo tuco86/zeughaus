@@ -90,8 +90,9 @@ fn mirror_dir(state_dir: &Path, repo: &str) -> PathBuf {
         .join(format!("{repo}.git"))
 }
 
-fn work_dir(state_dir: &Path, repo: &str, job: &str) -> PathBuf {
-    ci_dir(state_dir).join("work").join(repo).join(job)
+/// A workspace's directory: a job's, or the context several jobs share.
+fn work_dir(state_dir: &Path, repo: &str, workspace: &str) -> PathBuf {
+    ci_dir(state_dir).join("work").join(repo).join(workspace)
 }
 
 /// Scratch space: secrets where there is no tmpfs, artifact tars in transit

@@ -6,6 +6,8 @@
 //! [[channel]]
 //! name = "release"
 //! on = ["tag v*"]
+//! # every job of a pipeline in this channel starts from an empty workspace
+//! clean = true
 //! ```
 //!
 //! An event no channel matches lands in a channel named after what it is
@@ -34,11 +36,20 @@ struct File {
 struct Def {
     name: String,
     on: Vec<String>,
+    #[serde(default)]
+    clean: bool,
 }
 
 /// A repository's channels in file order.
 #[derive(Debug, Clone, Default)]
-pub struct Channels(Vec<(String, Vec<Pattern>)>);
+pub struct Channels(Vec<Entry>);
+
+#[derive(Debug, Clone)]
+struct Entry {
+    name: String,
+    on: Vec<Pattern>,
+    clean: bool,
+}
 
 impl Channels {
     /// From the files `read_ci` returned; no channels.toml is no channels.
@@ -69,7 +80,11 @@ impl Channels {
                 .map(|p| Pattern::parse_grant(p))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| fail(format!("channel `{}`: {e}", def.name)))?;
-            channels.push((def.name, patterns));
+            channels.push(Entry {
+                name: def.name,
+                on: patterns,
+                clean: def.clean,
+            });
         }
         Ok(Channels(channels))
     }
@@ -78,12 +93,23 @@ impl Channels {
     pub fn of(&self, event: &CiEvent) -> String {
         self.0
             .iter()
-            .find(|(_, patterns)| patterns.iter().any(|p| p.matches(event)))
-            .map_or_else(|| fallback(event), |(name, _)| name.clone())
+            .find(|entry| entry.on.iter().any(|p| p.matches(event)))
+            .map_or_else(|| fallback(event), |entry| entry.name.clone())
     }
 
-    pub fn names(&self) -> impl Iterator<Item = (&str, &[Pattern])> {
-        self.0.iter().map(|(n, p)| (n.as_str(), p.as_slice()))
+    /// Whether `channel` is a channel of the file marked `clean`; a name
+    /// only [`fallback`] made up is not.
+    pub fn is_clean(&self, channel: &str) -> bool {
+        self.0
+            .iter()
+            .any(|entry| entry.clean && entry.name == channel)
+    }
+
+    /// Name, patterns and `clean` flag of every channel in file order.
+    pub fn names(&self) -> impl Iterator<Item = (&str, &[Pattern], bool)> {
+        self.0
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.on.as_slice(), entry.clean))
     }
 }
 
@@ -186,6 +212,32 @@ on = ["tag v*"]
     }
 
     #[test]
+    fn clean_marks_a_channel_and_no_fallback() {
+        let channels = load(
+            r#"
+[[channel]]
+name = "nightly"
+on = ["cron *"]
+clean = true
+[[channel]]
+name = "dev"
+on = ["push main"]
+"#,
+        )
+        .unwrap();
+        assert!(channels.is_clean("nightly"));
+        assert!(!channels.is_clean("dev"));
+        // Named after a branch no channel matched: nothing marked it.
+        assert!(!channels.is_clean("feature/x"));
+        assert!(!Channels::default().is_clean("nightly"));
+        let listed: Vec<(&str, bool)> = channels
+            .names()
+            .map(|(name, _, clean)| (name, clean))
+            .collect();
+        assert_eq!(listed, [("nightly", true), ("dev", false)]);
+    }
+
+    #[test]
     fn invalid_files_are_rejected_with_the_prefix() {
         let cases = [
             (
@@ -197,6 +249,10 @@ on = ["tag v*"]
             (
                 "pattern",
                 "[[channel]]\nname = \"a\"\non = [\"branch main\"]\n",
+            ),
+            (
+                "clean type",
+                "[[channel]]\nname = \"a\"\non = [\"push *\"]\nclean = \"yes\"\n",
             ),
         ];
         for (what, text) in cases {

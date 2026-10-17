@@ -481,6 +481,7 @@ mod tests {
                 image: None,
                 machine: None,
                 platform: None,
+                context: None,
                 cache: Vec::new(),
                 secrets: Vec::new(),
                 when_busy: Default::default(),
@@ -529,6 +530,7 @@ mod tests {
             finished: None,
             jobs,
             cancelled: false,
+            clean: false,
             channel: channel.to_owned(),
         }
     }

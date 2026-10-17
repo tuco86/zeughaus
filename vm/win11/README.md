@@ -79,11 +79,11 @@ for a live VM).
 disk with `discard=unmap`. The disk outlives every overlay. `prepare.ps1`
 initializes it on first use (GPT, NTFS, label `CICACHE`, letter `W:`) and
 trims it after each boot, which returns freed space to the qcow2. Layout:
-`W:\work\<repo>\<job>` workspaces, `W:\ci\runs\<id>` per run (wiped at each
-boot), `W:\cargo` and `W:\rustup` (`CARGO_HOME`, `RUSTUP_HOME`, set
-machine-wide by `toolchain.ps1`). Below 20 % free space `prepare.ps1`
-deletes every workspace's `target` directory. A `PERSIST=1` boot, used to
-change the golden image, gets no cache disk.
+`W:\work\<repo>\<workspace>` workspaces (named after a job or its `context`),
+`W:\ci\runs\<id>` per run (wiped at each boot), `W:\cargo` and `W:\rustup`
+(`CARGO_HOME`, `RUSTUP_HOME`, set machine-wide by `toolchain.ps1`). Below
+20 % free space `prepare.ps1` deletes every workspace's `target` directory.
+A `PERSIST=1` boot, used to change the golden image, gets no cache disk.
 
 ## What the unattended install does
 

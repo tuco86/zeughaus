@@ -90,7 +90,7 @@ fn check_abort(ctl: &RunCtl) -> Result<(), Prep> {
 
 /// The assignment is the CI's, and its names become paths here.
 fn validate(a: &Assignment) -> Result<(), String> {
-    let names_ok = valid_name(&a.repo) && valid_name(&a.job);
+    let names_ok = valid_name(&a.repo) && valid_name(&a.job) && valid_name(&a.workspace);
     if !names_ok || a.run != run_id(&a.repo, a.number, &a.job) {
         return Err(format!("malformed assignment for run {:?}", a.run));
     }
@@ -109,6 +109,15 @@ fn validate(a: &Assignment) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// An assignment a runner persisted before workspaces had names ran in the
+/// job's own.
+fn named_workspace(mut assignment: Assignment) -> Assignment {
+    if assignment.workspace.is_empty() {
+        assignment.workspace = assignment.job.clone();
+    }
+    assignment
 }
 
 /// The run id as one path component of `<state>/ci/`.
@@ -271,7 +280,7 @@ impl Executor {
             check_abort(ctl)?;
         }
 
-        let workspace = work_dir(&self.state_dir, &a.repo, &a.job);
+        let workspace = work_dir(&self.state_dir, &a.repo, &a.workspace);
         let (cpus, workspace_var, output_var, inputs_var) = match &a.place {
             Place::Host => (
                 self.cpus,
@@ -298,7 +307,7 @@ impl Executor {
                 let guest = launch::guest_run_dir(&a.run);
                 (
                     vm.cpus(),
-                    launch::guest_workspace(&a.repo, &a.job),
+                    launch::guest_workspace(&a.repo, &a.workspace),
                     format!(r"{guest}\out"),
                     format!(r"{guest}\in"),
                 )
@@ -640,7 +649,13 @@ impl Executor {
             .collect();
         let in_use: HashSet<PathBuf> = active
             .iter()
-            .map(|ctl| work_dir(&self.state_dir, &ctl.assignment.repo, &ctl.assignment.job))
+            .map(|ctl| {
+                work_dir(
+                    &self.state_dir,
+                    &ctl.assignment.repo,
+                    &ctl.assignment.workspace,
+                )
+            })
             .collect();
         cleanup::enforce_budget(&self.state_dir, self.config.budget_gb, &in_use);
         if self.containers && matches!(finished.place, Place::Container { .. }) {
@@ -688,6 +703,7 @@ impl Executor {
                 started,
                 end,
             } = assigned;
+            let assignment = named_workspace(assignment);
             let run = assignment.run.clone();
             let ended = end.is_some();
             let ctl = Arc::new(RunCtl::new(assignment));
@@ -940,7 +956,7 @@ mod tests {
 
     #[test]
     fn an_assignment_is_checked_before_its_names_become_paths() {
-        use zeughaus_link::enlist::WhenBusy;
+        use zeughaus_link::enlist::{Checkout, WhenBusy};
         let ok = Assignment {
             run: "demo.7.build".to_owned(),
             repo: "demo".to_owned(),
@@ -959,6 +975,9 @@ mod tests {
             timeout_minutes: 1,
             when_busy: WhenBusy::Wait,
             inputs: Vec::new(),
+            workspace: "build".to_owned(),
+            checkout: Checkout::Clean,
+            upload: None,
         };
         assert!(validate(&ok).is_ok());
         for bad in [
@@ -975,11 +994,54 @@ mod tests {
                 ..ok.clone()
             },
             Assignment {
+                workspace: "../x".to_owned(),
+                ..ok.clone()
+            },
+            Assignment {
+                workspace: String::new(),
+                ..ok.clone()
+            },
+            Assignment {
                 sha: "main".to_owned(),
                 ..ok.clone()
             },
         ] {
             assert!(validate(&bad).is_err(), "{bad:?}");
         }
+        // A context names the workspace of several jobs.
+        let shared = Assignment {
+            workspace: "linux".to_owned(),
+            ..ok
+        };
+        assert!(validate(&shared).is_ok());
+    }
+
+    #[test]
+    fn an_assignment_from_before_workspaces_ran_in_the_jobs_own() {
+        let mut old = Assignment {
+            run: "demo.7.build".to_owned(),
+            repo: "demo".to_owned(),
+            number: 7,
+            job: "build".to_owned(),
+            url: String::new(),
+            fetch_user: String::new(),
+            fetch_token: None,
+            sha: "ab12".to_owned(),
+            file: "build.sh".to_owned(),
+            interpreter: "/bin/sh".to_owned(),
+            place: Place::Host,
+            cache: Vec::new(),
+            env: Vec::new(),
+            secrets: Vec::new(),
+            timeout_minutes: 1,
+            when_busy: zeughaus_link::enlist::WhenBusy::Wait,
+            inputs: Vec::new(),
+            workspace: String::new(),
+            checkout: Default::default(),
+            upload: None,
+        };
+        assert_eq!(named_workspace(old.clone()).workspace, "build");
+        old.workspace = "linux".to_owned();
+        assert_eq!(named_workspace(old).workspace, "linux");
     }
 }

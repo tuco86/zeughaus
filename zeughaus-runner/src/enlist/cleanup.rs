@@ -9,7 +9,7 @@ use std::time::SystemTime;
 
 use super::stage::Engine;
 
-/// The workspaces under `ci/work/<repo>/<job>`.
+/// The workspaces under `ci/work/<repo>/<workspace>`.
 fn workspaces(state_dir: &Path) -> Vec<PathBuf> {
     let work = super::ci_dir(state_dir).join("work");
     let Ok(repos) = std::fs::read_dir(&work) else {

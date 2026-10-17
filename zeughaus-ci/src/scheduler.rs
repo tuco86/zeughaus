@@ -19,8 +19,8 @@ use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeughaus_link::enlist::{
-    Assignment, FromRunner, Input, InputSource, Place, RunEnd, RunReport, ToRunner, WhenBusy,
-    parse_run_id, run_id,
+    Assignment, Checkout, FromRunner, Input, InputSource, Place, RunEnd, RunReport, ToRunner,
+    WhenBusy, parse_run_id, run_id,
 };
 
 use crate::channels::{self, Channels};
@@ -186,6 +186,10 @@ pub struct Pipeline {
     /// and it ends as [`PipelineStatus::Cancelled`].
     #[serde(default)]
     pub cancelled: bool,
+    /// The pipeline's channel is marked `clean` (see [`channels`]): the first
+    /// job to use a workspace starts it from nothing, `cache` paths too.
+    #[serde(default)]
+    pub clean: bool,
 }
 
 fn pipelines_dir(state_dir: &Path, repo: &str) -> PathBuf {
@@ -724,6 +728,7 @@ impl Scheduler {
             finished: None,
             jobs: Vec::new(),
             channel: channels::fallback(&event),
+            clean: false,
         };
         let setup = self.set_up(&name, &repo, &event, &mut pipeline);
         let jobs = match setup {
@@ -847,7 +852,9 @@ impl Scheduler {
             .map(|subject| subject.trim().to_owned())
             .unwrap_or_default();
         let (files, containerfiles) = read_ci(&mirror, &sha)?;
-        pipeline.channel = Channels::from_files(&files)?.of(event);
+        let channels = Channels::from_files(&files)?;
+        pipeline.channel = channels.of(event);
+        pipeline.clean = channels.is_clean(&pipeline.channel);
         // git has no empty directories: nothing listed is no folder.
         if files.is_empty() && containerfiles.is_empty() {
             return Ok(None);
@@ -913,15 +920,71 @@ impl Scheduler {
 
     // ------------------------------------------------------------ jobs
 
-    /// Whether a job of `repo` named `job` is active on `runner` in any
-    /// pipeline: one workspace, one job at a time.
-    fn workspace_busy(&self, repo: &str, job: &str, runner: &str) -> bool {
-        self.running.iter().any(|p| {
-            p.repo == repo
-                && p.jobs.iter().any(|j| {
-                    j.def.name == job && j.status.is_active() && j.runner.as_deref() == Some(runner)
-                })
-        })
+    /// What keeps job `ji` of pipeline `pi` out of its workspace on `runner`,
+    /// `None` when it may take it. The workspace is the job's context, else
+    /// its own name, per repository and runner, and one job at a time is
+    /// active in it.
+    ///
+    /// The jobs of a context also run in the order of their pipeline's
+    /// record, and a pipeline keeps the context from its first job to its
+    /// last, so that each finds the workspace as the one before left it. It
+    /// goes to the pipeline that began in it, else to the oldest one: a
+    /// younger pipeline never holds back an older one that has not begun, so
+    /// no two pipelines wait for each other.
+    fn workspace_wait(&self, pi: usize, ji: usize, runner: &str) -> Option<String> {
+        let pipeline = &self.running[pi];
+        let job = &pipeline.jobs[ji];
+        let ws = job.def.workspace();
+        let shares = |p: &Pipeline, k: &JobRecord| {
+            p.repo == pipeline.repo
+                && k.def.workspace() == ws
+                && k.runner.as_deref() == Some(runner)
+        };
+        let for_job = |name: &str| format!("waiting for {name} in context {ws}");
+
+        for (qi, q) in self.running.iter().enumerate() {
+            let active = q
+                .jobs
+                .iter()
+                .enumerate()
+                .find(|&(ki, k)| (qi, ki) != (pi, ji) && shares(q, k) && k.status.is_active());
+            if let Some((_, k)) = active {
+                return Some(if qi == pi {
+                    for_job(&k.def.name)
+                } else {
+                    format!("workspace {ws} in use by #{}", q.number)
+                });
+            }
+        }
+        // Taking turns is for the jobs of a context; any other job only
+        // needs the workspace itself to be free.
+        job.def.context.as_ref()?;
+        if let Some(earlier) = pipeline.jobs[..ji]
+            .iter()
+            .find(|k| shares(pipeline, k) && !k.status.is_terminal())
+        {
+            return Some(for_job(&earlier.def.name));
+        }
+        // A pipeline that began in the context keeps it to its last job: an
+        // older one that has not begun waits, else each would wait for the
+        // other.
+        let began = pipeline
+            .jobs
+            .iter()
+            .any(|k| shares(pipeline, k) && k.started.is_some());
+        self.running
+            .iter()
+            .enumerate()
+            .filter(|&(qi, _)| qi != pi)
+            .find_map(|(_, q)| {
+                let open = q
+                    .jobs
+                    .iter()
+                    .any(|k| shares(q, k) && !k.status.is_terminal());
+                let holds = q.jobs.iter().any(|k| shares(q, k) && k.started.is_some());
+                (open && (holds || (!began && q.number < pipeline.number)))
+                    .then(|| format!("context {ws} held by #{}", q.number))
+            })
     }
 
     fn machine_busy(&self, machine: &str) -> bool {
@@ -1260,8 +1323,8 @@ impl Scheduler {
         if view.busy.is_some_and(|state| state.busy) && job.def.when_busy != WhenBusy::Run {
             return self.set_waiting(pi, ji, format!("runner {runner} busy"));
         }
-        if self.workspace_busy(&pipeline.repo, &name, &runner) {
-            return;
+        if let Some(note) = self.workspace_wait(pi, ji, &runner) {
+            return self.set_waiting(pi, ji, note);
         }
         if let Place::Machine { name } = &place
             && self.machine_busy(name)
@@ -1379,6 +1442,9 @@ impl Scheduler {
             timeout_minutes: job.timeout_minutes,
             when_busy: job.when_busy,
             inputs,
+            workspace: job.workspace().to_owned(),
+            checkout: checkout_of(pipeline, ji),
+            upload: None,
         })
     }
 
@@ -1964,6 +2030,26 @@ fn place_label(job: &JobRecord) -> String {
     }
 }
 
+/// How the launcher treats the workspace of job `ji`: it continues where an
+/// earlier job of the same context in this pipeline left it, else starts it
+/// from nothing in a clean channel, else cleans it keeping the `cache` paths.
+fn checkout_of(pipeline: &Pipeline, ji: usize) -> Checkout {
+    let job = &pipeline.jobs[ji];
+    let continues = job.def.context.is_some()
+        && pipeline.jobs[..ji].iter().any(|earlier| {
+            earlier.def.context == job.def.context
+                && earlier.runner == job.runner
+                && earlier.started.is_some()
+        });
+    if continues {
+        Checkout::Continue
+    } else if pipeline.clean {
+        Checkout::Wipe
+    } else {
+        Checkout::Clean
+    }
+}
+
 /// Whether a job of `pipeline` that needs `job` has not ended yet.
 fn consumers_pending(pipeline: &Pipeline, job: &str) -> bool {
     pipeline
@@ -2098,6 +2184,7 @@ mod tests {
             jobs: Vec::new(),
             channel: channel.to_owned(),
             cancelled: false,
+            clean: false,
         }
     }
 
@@ -2223,6 +2310,7 @@ mod tests {
             image: image.map(str::to_owned),
             machine: machine.map(str::to_owned),
             platform: platform.map(str::to_owned),
+            context: None,
             cache: Vec::new(),
             secrets: Vec::new(),
             when_busy: WhenBusy::Wait,
@@ -2472,6 +2560,10 @@ mod tests {
             ))
             .expect("a valid config"),
         );
+        scheduler_over(state, config)
+    }
+
+    fn scheduler_over(state: &Path, config: Arc<CiConfig>) -> Scheduler {
         let (_tx, rx) = std::sync::mpsc::channel();
         let (alerts, _) = std::sync::mpsc::channel();
         let (changes, _) = std::sync::mpsc::channel();
@@ -2548,6 +2640,273 @@ mod tests {
             Ok(ToRunner::Assign { assignment }) => assignment,
             other => panic!("expected an assignment, got {other:?}"),
         }
+    }
+
+    /// Pipeline `number` whose jobs, in this order, share the context `c` on
+    /// runner `x`; those past pending have started.
+    fn in_context(number: u64, jobs: &[(&str, JobStatus)]) -> Pipeline {
+        let mut p = pipeline("dev");
+        p.number = number;
+        p.repo = "view".to_owned();
+        p.sha = Some("abc".to_owned());
+        p.jobs = jobs
+            .iter()
+            .map(|&(name, status)| {
+                let mut job = record(name, &[], "x", status);
+                job.def.context = Some("c".to_owned());
+                job.started =
+                    (!matches!(status, JobStatus::Pending | JobStatus::Waiting)).then_some(1);
+                job
+            })
+            .collect();
+        p
+    }
+
+    #[test]
+    fn a_context_is_held_from_the_first_job_that_started_to_the_last_that_ended() {
+        use JobStatus::{Pending, Succeeded};
+        let state = scratch("context-held");
+        let mut s = scheduler(&state);
+        let mut x = connect(&s.runners, "x", 0);
+        // #1 ran its `a` and has its `b` to go; #2 has not begun.
+        s.running
+            .push(in_context(1, &[("a", Succeeded), ("b", Pending)]));
+        s.running
+            .push(in_context(2, &[("a", Pending), ("b", Pending)]));
+
+        s.assign(1, 0);
+        let second_a = &s.running[1].jobs[0];
+        assert_eq!(second_a.status, JobStatus::Waiting);
+        assert_eq!(second_a.note, "context c held by #1");
+        assert!(x.try_recv().is_err());
+
+        // #1's `b` is next in its context and continues in its workspace.
+        s.assign(0, 1);
+        let b = assigned(&mut x);
+        assert_eq!(b.run, "view.1.b");
+        assert_eq!(
+            (b.workspace.as_str(), b.checkout),
+            ("c", Checkout::Continue)
+        );
+
+        // While it runs the workspace is in use, which is what #2 is told.
+        s.assign(1, 0);
+        assert_eq!(s.running[1].jobs[0].note, "workspace c in use by #1");
+        assert!(x.try_recv().is_err());
+
+        // Once it ended #1 holds nothing, and #2 starts from a clean checkout.
+        s.running[0].jobs[1].status = Succeeded;
+        s.assign(1, 0);
+        let a = assigned(&mut x);
+        assert_eq!(a.run, "view.2.a");
+        assert_eq!((a.workspace.as_str(), a.checkout), ("c", Checkout::Clean));
+        assert_eq!(s.running[1].jobs[0].status, JobStatus::Starting);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn the_oldest_pipeline_takes_a_context_nobody_began_in() {
+        use JobStatus::Pending;
+        let state = scratch("context-order");
+        let mut s = scheduler(&state);
+        let mut x = connect(&s.runners, "x", 0);
+        s.running
+            .push(in_context(3, &[("a", Pending), ("b", Pending)]));
+        s.running.push(in_context(4, &[("a", Pending)]));
+
+        // #3 has not begun either, but it is older.
+        s.assign(1, 0);
+        assert_eq!(s.running[1].jobs[0].note, "context c held by #3");
+        // Its own `b` takes its turn after its `a`.
+        s.assign(0, 1);
+        assert_eq!(s.running[0].jobs[1].note, "waiting for a in context c");
+        assert!(x.try_recv().is_err());
+        // #4 is younger and has not begun: it never holds #3 back.
+        s.assign(0, 0);
+        assert_eq!(assigned(&mut x).run, "view.3.a");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_younger_pipeline_that_began_keeps_the_context_from_an_older_one() {
+        use JobStatus::{Pending, Succeeded};
+        let state = scratch("context-began");
+        let mut s = scheduler(&state);
+        let mut x = connect(&s.runners, "x", 0);
+        s.running.push(in_context(3, &[("a", Pending)]));
+        s.running
+            .push(in_context(4, &[("a", Succeeded), ("b", Pending)]));
+
+        s.assign(0, 0);
+        assert_eq!(s.running[0].jobs[0].note, "context c held by #4");
+        assert!(x.try_recv().is_err());
+        // #4 goes on with its `b`: the older #3 that has not begun does not
+        // hold back the pipeline that holds the context.
+        s.assign(1, 1);
+        let b = assigned(&mut x);
+        assert_eq!(
+            (b.run.as_str(), b.checkout),
+            ("view.4.b", Checkout::Continue)
+        );
+        // When #4's last job ended, the context is free again.
+        s.running[1].jobs[1].status = Succeeded;
+        s.assign(0, 0);
+        assert_eq!(assigned(&mut x).run, "view.3.a");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_job_without_a_context_waits_only_for_the_workspace_of_its_own_name() {
+        use JobStatus::{Pending, Running};
+        let state = scratch("own-workspace");
+        let mut s = scheduler(&state);
+        let mut x = connect(&s.runners, "x", 0);
+        let mut older = pipeline("dev");
+        older.number = 1;
+        older.repo = "view".to_owned();
+        older.sha = Some("abc".to_owned());
+        older.jobs = vec![record("a", &[], "x", Running)];
+        let mut newer = older.clone();
+        newer.number = 2;
+        newer.jobs = vec![
+            record("a", &[], "x", Pending),
+            record("b", &[], "x", Pending),
+        ];
+        s.running.push(older);
+        s.running.push(newer);
+
+        s.assign(1, 0);
+        assert_eq!(s.running[1].jobs[0].status, JobStatus::Waiting);
+        assert_eq!(s.running[1].jobs[0].note, "workspace a in use by #1");
+        s.assign(1, 1);
+        let b = assigned(&mut x);
+        assert_eq!(b.run, "view.2.b");
+        assert_eq!((b.workspace.as_str(), b.checkout), ("b", Checkout::Clean));
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn the_checkout_follows_the_context_and_the_channel() {
+        use JobStatus::{Pending, Skipped, Succeeded};
+        let mut p = in_context(1, &[("a", Succeeded), ("b", Pending)]);
+        assert_eq!(checkout_of(&p, 0), Checkout::Clean);
+        assert_eq!(checkout_of(&p, 1), Checkout::Continue);
+
+        // A clean channel wipes the workspace once, then the context goes on.
+        p.clean = true;
+        assert_eq!(checkout_of(&p, 0), Checkout::Wipe);
+        assert_eq!(checkout_of(&p, 1), Checkout::Continue);
+
+        // Nothing started before it, or somewhere else: nothing to continue.
+        p.jobs[0].status = Skipped;
+        p.jobs[0].started = None;
+        assert_eq!(checkout_of(&p, 1), Checkout::Wipe);
+        p.jobs[0].started = Some(1);
+        p.jobs[0].runner = Some("y".to_owned());
+        assert_eq!(checkout_of(&p, 1), Checkout::Wipe);
+
+        // A job without a context owns its workspace.
+        p.jobs[0].runner = Some("x".to_owned());
+        p.jobs[1].def.context = None;
+        p.clean = false;
+        assert_eq!(checkout_of(&p, 1), Checkout::Clean);
+    }
+
+    #[test]
+    fn a_clean_pipeline_wipes_where_it_begins_and_its_context_continues() {
+        use JobStatus::{Pending, Succeeded};
+        let state = scratch("context-clean");
+        let mut s = scheduler(&state);
+        let mut x = connect(&s.runners, "x", 0);
+        let mut p = in_context(5, &[("a", Pending), ("b", Pending)]);
+        p.clean = true;
+        s.running.push(p);
+
+        s.assign(0, 0);
+        assert_eq!(assigned(&mut x).checkout, Checkout::Wipe);
+        s.running[0].jobs[0].status = Succeeded;
+        s.assign(0, 1);
+        assert_eq!(assigned(&mut x).checkout, Checkout::Continue);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A repository with a clean `nightly` channel and two jobs in the
+    /// context `box`, read the way a pipeline is set up.
+    #[test]
+    fn setting_up_keeps_the_context_and_marks_a_clean_pipeline() {
+        let origin = scratch("setup-origin");
+        let state = scratch("setup-state");
+        let author = [
+            ("GIT_AUTHOR_NAME".to_owned(), "t".to_owned()),
+            ("GIT_AUTHOR_EMAIL".to_owned(), "t@t".to_owned()),
+            ("GIT_COMMITTER_NAME".to_owned(), "t".to_owned()),
+            ("GIT_COMMITTER_EMAIL".to_owned(), "t@t".to_owned()),
+        ];
+        let ci = origin.join(CI_DIR);
+        std::fs::create_dir_all(&ci).unwrap();
+        for name in ["a", "b"] {
+            std::fs::write(
+                ci.join(format!("{name}.sh")),
+                "# /// ci\n# on = [\"push *\", \"cron 0 3 * * *\"]\n# context = \"box\"\n# ///\necho\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            ci.join("channels.toml"),
+            "[[channel]]\nname = \"nightly\"\non = [\"cron *\"]\nclean = true\n",
+        )
+        .unwrap();
+        git(&origin, &["init", "-q", "-b", "main"], &author).unwrap();
+        git(&origin, &["add", "."], &author).unwrap();
+        git(&origin, &["commit", "-q", "-m", "ci"], &author).unwrap();
+
+        let config = Arc::new(
+            CiConfig::parse(&format!(
+                "default_runner = \"x\"\n\
+                 [runners.x]\nfingerprint = \"{FP_1}\"\n\
+                 [repos.view]\nurl = \"{}\"\n",
+                origin.display()
+            ))
+            .expect("a valid config"),
+        );
+        let mut s = scheduler_over(&state, Arc::clone(&config));
+        let repo = config.repos["view"].clone();
+        for (kind, cron, channel, clean) in [
+            (EventKind::Push, None, "main", false),
+            (EventKind::Cron, Some("0 3 * * *"), "nightly", true),
+        ] {
+            let mut p = pipeline("");
+            p.event.kind = kind;
+            p.event.cron = cron.map(str::to_owned);
+            let event = p.event.clone();
+            let planned = s
+                .set_up("view", &repo, &event, &mut p)
+                .expect("set up")
+                .expect("a CI folder");
+            assert_eq!((p.channel.as_str(), p.clean), (channel, clean));
+            let jobs: Vec<(&str, Option<&str>)> = planned
+                .iter()
+                .map(|j| (j.def.name.as_str(), j.def.context.as_deref()))
+                .collect();
+            assert_eq!(jobs, [("a", Some("box")), ("b", Some("box"))]);
+        }
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_pipeline_record_from_before_clean_channels_still_loads() {
+        let mut p = pipeline("nightly");
+        p.clean = true;
+        let json = serde_json::to_value(&p).unwrap();
+        assert!(
+            serde_json::from_value::<Pipeline>(json.clone())
+                .unwrap()
+                .clean
+        );
+        let mut old = json;
+        assert!(old.as_object_mut().unwrap().remove("clean").is_some());
+        assert!(!serde_json::from_value::<Pipeline>(old).unwrap().clean);
     }
 
     #[test]

@@ -143,6 +143,10 @@ impl ArtifactService {
                 answer(&mut reply, &runner, &run, passed).await
             }
             ArtifactRequest::Download { run } => self.download(&runner, &run, &mut reply).await,
+            ArtifactRequest::TryBundle { run, .. } => {
+                let message = format!("unknown try run {run}");
+                write_frame(&mut reply, &ArtifactReply::Error { message }).await
+            }
         };
         if let Err(e) = outcome {
             eprintln!("[ci] {runner}: artifact exchange failed: {e}");

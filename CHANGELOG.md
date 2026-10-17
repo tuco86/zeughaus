@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the toolchain) and builds and installs a commit there. The
   `windows-amd64` release archive is built on such a host, `wohnzimmer`,
   instead of the `win11` VM.
+- CI: jobs of one pipeline that name the same `context` in their header
+  share one warm workspace and run one after another, each finding what the
+  one before built. A pipeline keeps its context until its last job ended;
+  other pipelines' jobs of it wait their turn, the oldest first. A channel
+  marked `clean = true` in `channels.toml` starts every workspace of its
+  pipelines from nothing, `cache` paths included. This changes the enlist
+  protocol to major 3: a runner built before is refused (`protocol 2 is not
+  3`) until it is updated.
 
 ### Fixed
 
