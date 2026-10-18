@@ -20,7 +20,6 @@
 //! GUI detached; only [`Session::kill`] and the runner's process exit end a
 //! child (`TERMINAL_MUX_ARCHITECTURE_PLAN.md`, "Authority and lifetime").
 
-use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -140,7 +139,7 @@ pub enum TerminalHost {
 #[derive(Debug, Clone)]
 pub struct ShimHost {
     pub program: PathBuf,
-    pub args: Vec<OsString>,
+    pub args: Vec<std::ffi::OsString>,
     pub root: PathBuf,
 }
 
