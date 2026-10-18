@@ -18,6 +18,7 @@ export ZEUGHAUS_BUILD="$CI_PIPELINE"
 
 step cargo build --locked --release -p zeughaus -p zeughaus-runner -p zeughaus-ci
 stage_dir
+stage_linux_share
 for bin in zeughaus zeughaus-runner zeughaus-ci; do
     cp "$CARGO_TARGET_DIR/release/$bin" "$stage/"
 done

@@ -4,7 +4,7 @@
 //! that makes and checks signed release bundles, `mcp` as the server that
 //! gives an agent the CI's pipelines and try runs as tools, `ci` as the
 //! answer to a script that asks that CI about a checkout or a commit, and
-//! `version` and `update` for the self-updater.
+//! `version`, `update` and `install` for the self-updater.
 //!
 //! `trigger` and `hold` talk to the endpoint a runner printed at start
 //! (`[runner] weida endpoint weida://sha256:<fp>@host:port/`) with the client
@@ -25,6 +25,7 @@
 //! zeughaus-runner release verify <dir>
 //! zeughaus-runner version
 //! zeughaus-runner update status|rollback
+//! zeughaus-runner install <desktop|macos|service|windows> [--channel <c>] [--feed-addr <a>] [--bin-dir <dir>] [--from <dir>] [--no-service]
 //! ```
 
 use std::path::Path;
@@ -52,7 +53,8 @@ usage: zeughaus-runner [--state-dir <dir>] [--feed-addr <host:port>] [--keep-run
        zeughaus-runner release bundle --channel <c> --build <n> --sha <sha> --version <v> --out <dir> <file>...
        zeughaus-runner release verify <dir>
        zeughaus-runner version
-       zeughaus-runner update status|rollback";
+       zeughaus-runner update status|rollback
+       zeughaus-runner install <desktop|macos|service|windows> [--channel <c>] [--feed-addr <a>] [--bin-dir <dir>] [--from <dir>] [--no-service]";
 
 /// Runs `timeout` if the first argument names it. Checked before the serving
 /// flags are read and before `--state-dir` is stripped: everything after the
@@ -134,6 +136,18 @@ pub fn run(args: &[String], state_dir: &Path) -> Option<ExitCode> {
             return Some(ExitCode::SUCCESS);
         }
         Some("update") => return Some(update(&positional[1..], state_dir)),
+        Some("install") => {
+            return Some(match crate::install::run(&positional[1..], state_dir) {
+                Ok(line) => {
+                    println!("{line}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("[install] {e}");
+                    ExitCode::FAILURE
+                }
+            });
+        }
         _ => {
             return match check_serve_args(&positional) {
                 Ok(ServeArgs::Serve) => None,

@@ -29,7 +29,7 @@ free_after_seconds = 300
 # CI's `runners.<name>.machines`).
 [machines.win11]
 kind = "windows-vm"
-script = "/usr/local/lib/zeughaus/vm/win11/vm.sh"
+script = "/var/lib/zeughaus/lib/vm/win11/vm.sh"
 dir = "/var/lib/zeughaus/vm/win11"
 ssh_host = "win11-ci"
 cpus = 8

@@ -3,9 +3,11 @@ Description=Zeughaus runner of a service user (executes graphs and CI jobs, owns
 
 [Service]
 Type=simple
-# @FEED_ADDR@ is filled in by the install script: a fixed address, so the
-# editors' `zeughaus.toml` and the CI keep naming this runner across restarts.
-ExecStart=/usr/local/lib/zeughaus/bin/zeughaus-runner --state-dir %h/state --keep-runs 20 --feed-addr @FEED_ADDR@
+# `zeughaus-runner install service` fills in the binary directory (~/bin,
+# owned by this user, so the runner can update itself) and the feed address:
+# a fixed one, so the editors' `zeughaus.toml` and the CI keep naming this
+# runner across restarts.
+ExecStart=@BINDIR@/zeughaus-runner --state-dir %h/state --keep-runs 20 --feed-addr @FEED_ADDR@
 # SIGUSR1 saves the workspace and execs the binary at the same path: an
 # installed update is picked up without touching a terminal or a running job.
 ExecReload=/bin/kill -USR1 $MAINPID
@@ -22,7 +24,7 @@ RestartSec=5s
 
 # Jobs build their own environment; this PATH only has to find what the
 # runner itself runs (sh, git, podman, ssh, tar).
-Environment=PATH=/usr/local/lib/zeughaus/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=@BINDIR@:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target

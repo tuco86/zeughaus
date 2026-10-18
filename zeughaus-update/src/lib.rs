@@ -159,9 +159,14 @@ fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-/// Starts the updater's thread. It confirms a build on trial once it has run
-/// [`CONFIRM_AFTER`], with or without `update.toml`, and follows the channel
-/// that file names.
+/// The hook that writes a profile's install files from the unpacked release
+/// it is given (`install.toml` names the profile).
+pub type Refresh = Box<dyn FnOnce(&Path) + Send>;
+
+/// Starts the updater's thread. Once per build it writes the host's install
+/// files from that build's release (`refresh`); it confirms a build on trial
+/// once it has run [`CONFIRM_AFTER`], with or without `update.toml`, and
+/// follows the channel that file names.
 ///
 /// `exe` is this binary's path as resolved at start, the file an update
 /// replaces. `may_restart` says whether an update may begin now (it ends in
@@ -173,6 +178,7 @@ pub fn start(
     product: Product,
     may_restart: Box<dyn Fn() -> bool + Send>,
     request_restart: Box<dyn Fn() + Send>,
+    refresh: Refresh,
 ) {
     let started = Instant::now();
     let own = manifest::own_build();
@@ -211,6 +217,7 @@ pub fn start(
     let spawned = std::thread::Builder::new()
         .name("zeughaus-update".into())
         .spawn(move || {
+            refresh_once(&state_dir, own, refresh);
             // A build on trial is confirmed before anything replaces it: the
             // previous build kept for its rollback must be one that ran.
             let trial = matches!(
@@ -230,6 +237,42 @@ pub fn start(
         });
     if let Err(e) = spawned {
         eprintln!("[update] cannot start: {e}");
+    }
+}
+
+/// Runs `refresh` with the release of `own`, the first time `own` runs after
+/// the updater installed it on a host that `install` set up. Its release
+/// stays under `updates/<own>/` for this.
+fn refresh_once(state_dir: &Path, own: u64, refresh: Refresh) {
+    if own == 0 || !state_dir.join(host::INSTALL_FILE).exists() {
+        return;
+    }
+    let due = matches!(
+        state::load(state_dir),
+        Ok(Some(state)) if state.installed == own && state.refreshed != own
+    );
+    let Some(platform) = manifest::host_platform().filter(|_| due) else {
+        return;
+    };
+    let from = state_dir
+        .join("updates")
+        .join(own.to_string())
+        .join("staging")
+        .join(manifest::stem(env!("CARGO_PKG_VERSION"), platform));
+    if from.is_dir() {
+        refresh(&from);
+    } else {
+        eprintln!(
+            "[install] no release of build {own} at {}; install files left as they are",
+            from.display()
+        );
+    }
+    let recorded = state::modify(state_dir, |state| {
+        state.refreshed = own;
+        (true, ())
+    });
+    if let Err(e) = recorded {
+        eprintln!("[update] {e}");
     }
 }
 
@@ -1270,6 +1313,44 @@ mod tests {
             );
             std::fs::write(fx.path(CONFIG_FILE), "channel = \"dev\"\n").unwrap();
             assert_eq!(load(&fx.root).unwrap().unwrap().channel, "dev");
+        }
+
+        #[test]
+        fn an_installed_build_refreshes_the_install_files_once() {
+            let fx = Fixture::new("refresh-once");
+            let state_dir = fx.state_dir();
+            let Some(platform) = manifest::host_platform() else {
+                return;
+            };
+            let release = state_dir
+                .join("updates/7/staging")
+                .join(manifest::stem(env!("CARGO_PKG_VERSION"), platform));
+            std::fs::create_dir_all(&release).unwrap();
+            let trial = State {
+                installed: 7,
+                previous: 3,
+                ..State::default()
+            };
+            state::save(&state_dir, &trial).unwrap();
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let hook = || -> Refresh {
+                let seen = std::sync::Arc::clone(&seen);
+                Box::new(move |from: &Path| seen.lock().unwrap().push(from.to_path_buf()))
+            };
+
+            // A host `install` did not set up has no files to refresh.
+            refresh_once(&state_dir, 7, hook());
+            assert!(seen.lock().unwrap().is_empty());
+
+            std::fs::write(state_dir.join(host::INSTALL_FILE), "").unwrap();
+            // Not the build that was installed.
+            refresh_once(&state_dir, 3, hook());
+            assert!(seen.lock().unwrap().is_empty());
+
+            refresh_once(&state_dir, 7, hook());
+            refresh_once(&state_dir, 7, hook());
+            assert_eq!(*seen.lock().unwrap(), vec![release]);
+            assert_eq!(fx.state().refreshed, 7);
         }
     }
 }

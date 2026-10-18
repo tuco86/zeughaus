@@ -212,6 +212,10 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
             zeughaus_update::Product::Ci,
             Box::new(|| true),
             Box::new(move || restart(&exe)),
+            Box::new({
+                let state_dir = state_dir.to_path_buf();
+                move |from: &Path| crate::install::refresh(&state_dir, from)
+            }),
         ),
         Err(e) => eprintln!("[ci] not updating: this executable cannot be located: {e}"),
     }

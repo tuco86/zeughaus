@@ -16,6 +16,7 @@ mod enlist;
 mod feed;
 mod files;
 mod graphs;
+mod install;
 mod jobs;
 mod maintain;
 mod mcp;
@@ -376,6 +377,10 @@ fn main() -> ExitCode {
                 zeughaus_update::Product::Runner,
                 may_restart,
                 Box::new(restart_signal::request),
+                Box::new({
+                    let state_dir = state_dir.clone();
+                    move |from: &std::path::Path| install::refresh(&state_dir, from)
+                }),
             );
         }
         // Maintenance runs as the host's runs, so it needs the mux like a job

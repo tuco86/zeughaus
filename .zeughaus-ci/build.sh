@@ -65,6 +65,34 @@ stage_dir() {
     cp LICENSE-MIT LICENSE-APACHE "$stage/"
 }
 
+# Copies repository files into the archive's share/, under their paths in
+# the repository; `install` and every update read them from there.
+stage_share() {
+    for f in "$@"; do
+        mkdir -p "$stage/share/$(dirname "$f")"
+        cp "$CI_WORKSPACE/$f" "$stage/share/$f"
+    done
+}
+
+# What a Linux host installs besides the binaries: the desktop profile's
+# unit, menu entry and icon, the service runner's unit, ssh config and VM
+# scripts, and the CI's unit.
+stage_linux_share() {
+    stage_share \
+        deploy/zeughaus-runner.service \
+        deploy/net.doodleshnookie.Zeughaus.desktop \
+        zeughaus/assets/icon/zeughaus.svg \
+        deploy/runner/zeughaus-runner.service \
+        deploy/runner/ssh_config \
+        deploy/ci/zeughaus-ci.service \
+        vm/win11/vm.sh \
+        vm/win11/autounattend.xml \
+        vm/win11/setup.ps1 \
+        vm/win11/firstboot.ps1 \
+        vm/win11/toolchain.ps1 \
+        vm/win11/prepare.ps1
+}
+
 # The archive publish.sh bundles: `zeughaus-<version>-<platform>.tar.gz`.
 # Without extended attributes and, on macOS, without the `._` AppleDouble
 # files bsdtar adds for them: both land as junk on any other system.

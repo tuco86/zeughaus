@@ -1,10 +1,171 @@
-//! What `install` left on a host for the updater: `<state-dir>/install.toml`
-//! names the profile the host was installed as, so a new build can rewrite
-//! the same files, and the writes `install` and the refresh share.
+//! What `install` puts on a host and leaves for the updater.
+//!
+//! A release archive carries the files a host needs besides the binaries
+//! (units, desktop entry, VM scripts) under `share/`, at their paths in the
+//! repository. `install <profile>` writes them where the profile wants them
+//! and records the profile in `<state-dir>/install.toml`, so every new build
+//! the updater installs can write them again from its own release.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
+
+use crate::Product;
+use crate::replace::{Replacement, replace_all};
+
+/// One file of a release's `share/` and where a profile puts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStep {
+    /// The path in the repository, and under `share/`.
+    pub share: &'static str,
+    pub to: PathBuf,
+    /// Unix permission bits.
+    pub mode: u32,
+}
+
+/// A [`FileStep`] read and rendered, ready to be written.
+pub struct Rendered {
+    pub to: PathBuf,
+    pub bytes: Vec<u8>,
+    pub mode: u32,
+}
+
+/// Reads every step's file from the unpacked release at `from` and replaces
+/// each `(placeholder, value)` in it. Nothing is written: a release that
+/// lacks a file is refused before anything changes.
+pub fn render_files(
+    from: &Path,
+    steps: &[FileStep],
+    values: &[(&str, &str)],
+) -> Result<Vec<Rendered>, String> {
+    steps
+        .iter()
+        .map(|step| {
+            let path = from.join("share").join(step.share);
+            let text = std::fs::read_to_string(&path)
+                .map_err(|_| format!("the release has no share/{}", step.share))?;
+            Ok(Rendered {
+                to: step.to.clone(),
+                bytes: render(&text, values).into_bytes(),
+                mode: step.mode,
+            })
+        })
+        .collect()
+}
+
+/// `text` with every placeholder replaced by its value.
+pub fn render(text: &str, values: &[(&str, &str)]) -> String {
+    values
+        .iter()
+        .fold(text.to_owned(), |text, (placeholder, value)| {
+            text.replace(placeholder, value)
+        })
+}
+
+/// Writes what [`render_files`] made; answers the paths that changed.
+pub fn write_rendered(files: &[Rendered]) -> Result<Vec<PathBuf>, String> {
+    let mut changed = Vec::new();
+    for file in files {
+        if write_if_changed(&file.to, &file.bytes, file.mode)? {
+            changed.push(file.to.clone());
+        }
+    }
+    Ok(changed)
+}
+
+/// Copies the binary `from` over `to` by a rename, keeping the one it
+/// replaces as `<to>.previous`.
+pub fn install_binary(from: &Path, to: &Path) -> Result<(), String> {
+    replace_all(&[Replacement::new(
+        from.to_path_buf(),
+        to.to_path_buf(),
+        false,
+    )])
+}
+
+/// The same for an app bundle (a directory, copied with `ditto`).
+pub fn install_bundle(from: &Path, to: &Path) -> Result<(), String> {
+    replace_all(&[Replacement::new(from.to_path_buf(), to.to_path_buf(), true)])
+}
+
+/// The build the release at `from` was published as, from what its binary
+/// answers to `version`.
+pub fn release_build(from: &Path, product: Product) -> Result<u64, String> {
+    let binary = from.join(product.file_name());
+    let output = Command::new(&binary)
+        .arg("version")
+        .output()
+        .map_err(|e| format!("cannot run {}: {e}", binary.display()))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.trim()
+        .rsplit_once(" build ")
+        .and_then(|(_, build)| build.parse().ok())
+        .filter(|_| output.status.success())
+        .ok_or_else(|| format!("{} version: {}", binary.display(), text.trim()))
+}
+
+/// `systemctl --user <args>`.
+pub fn systemctl(args: &[&str]) -> Result<(), String> {
+    let output = Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .output()
+        .map_err(|e| format!("cannot run systemctl: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "systemctl --user {}: {}",
+            args.join(" "),
+            crate::stderr_of(&output)
+        ))
+    }
+}
+
+/// Enables `unit` of the user's manager and `verb`s it (`reload` or
+/// `restart`) when it runs, else starts it. Answers what it did.
+pub fn start_or(unit: &str, verb: &str) -> Result<&'static str, String> {
+    systemctl(&["daemon-reload"])?;
+    systemctl(&["enable", unit])?;
+    if systemctl(&["is-active", "--quiet", unit]).is_ok() {
+        systemctl(&[verb, unit])?;
+        Ok(if verb == "reload" {
+            "reloaded"
+        } else {
+            "restarted"
+        })
+    } else {
+        systemctl(&["start", unit])?;
+        Ok("started")
+    }
+}
+
+/// `$HOME`, which every profile writes under.
+pub fn home_dir() -> Result<PathBuf, String> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .ok_or_else(|| "HOME is not set to an absolute path".to_owned())
+}
+
+/// `$XDG_CONFIG_HOME`, else `~/.config`.
+pub fn config_home(home: &Path) -> PathBuf {
+    xdg("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"))
+}
+
+/// `$XDG_DATA_HOME`, else `~/.local/share`.
+pub fn data_home(home: &Path) -> PathBuf {
+    xdg("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local/share"))
+}
+
+/// An XDG directory variable; the spec ignores one that is not absolute.
+fn xdg(var: &str) -> Option<PathBuf> {
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+}
 
 /// `<state-dir>/install.toml`.
 pub const INSTALL_FILE: &str = "install.toml";

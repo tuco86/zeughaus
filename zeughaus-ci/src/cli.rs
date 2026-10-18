@@ -15,6 +15,7 @@
 //! secrets-check
 //! version
 //! update status|rollback
+//! install ci [--channel C] [--from DIR] [--no-service]
 //! ```
 //!
 //! `check` reads the folder, and the state directory's `ci.toml` when there
@@ -46,7 +47,7 @@ const USAGE: &str = "usage: zeughaus-ci [--state-dir DIR] serve --listen <host:p
 [--hook <host:port>] | check [DIR] | plan [DIR] <push|tag> <ref> | plan [DIR] cron \"<expr>\" | \
 run <repo> <push|tag> <ref> [<sha>] | run <repo> cron \"<expr>\" | status [N] | \
 log <repo> <pipeline> <job> [--tail N] | forge-check <repo> | secrets-check | version | \
-update status|rollback";
+update status|rollback | install ci [--channel C] [--from DIR] [--no-service]";
 
 pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -98,6 +99,9 @@ fn run(args: &[String], state_dir: &Path) -> ExitCode {
                 zeughaus_update::command(&args[1..], state_dir, &exe, zeughaus_update::Product::Ci)
             })
             .map(|text| println!("{text}")),
+        Some("install") => {
+            crate::install::run(&args[1..], state_dir).map(|line| println!("{line}"))
+        }
         _ => Err(USAGE.to_owned()),
     };
     match result {

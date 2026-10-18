@@ -13,6 +13,7 @@ mod files;
 mod forge;
 mod header;
 mod hook;
+mod install;
 mod manual;
 mod pipeline;
 mod runners;

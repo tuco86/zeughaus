@@ -29,6 +29,11 @@ foreach ($file in 'zeughaus.exe', 'zeughaus-runner.exe') {
     Copy-Item (Join-Path $env:CARGO_TARGET_DIR "release\$file") $stage
 }
 Copy-Item 'LICENSE-MIT', 'LICENSE-APACHE' $stage
+# What `install windows` and every update write besides the binaries, under
+# its path in the repository.
+$share = Join-Path $stage 'share\deploy\windows'
+New-Item -ItemType Directory -Force -Path $share | Out-Null
+Copy-Item (Join-Path $env:CI_WORKSPACE 'deploy\windows\maintain.toml') $share
 Run (Join-Path $stage 'zeughaus-runner.exe') @('--help')
 
 # Windows' bsdtar rather than Compress-Archive: Windows PowerShell 5.1 writes
