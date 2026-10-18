@@ -1417,15 +1417,25 @@ top directory `zeughaus-<version>-<platform>/`. The build number
 `cargo_env`: it changes with every pipeline and would rebuild every unit
 that reads it in the shared workspace. A binary made anywhere else has
 build 0. Per platform one check job, `check-<platform>`, `needs` the build
-job, so it runs in the workspace the build left, at the same place, and
-finds the build's `target/` warm: it runs `cargo clippy --workspace
+job, so it runs in the workspace the build left, at the same place: it runs
+`cargo clippy --workspace
 --all-targets -- -D warnings` and `cargo test --workspace` (`check_platform`
 in `build.sh`; `windows.ps1` for the Windows jobs), and on `linux-amd64`
 also `cargo fmt --check` and `cargo check --target wasm32-unknown-unknown -p
-zeughaus`. Every OS therefore passes the gate. The jobs of a platform share
+zeughaus`. Every OS therefore passes the gate. The build is a release build
+and the check a dev one, so they share the workspace's cargo home and
+checkouts but no compiled units: the order puts the archive out early (the
+CI moves it towards `publish` while the checks run) and skips the check of a
+platform whose build broke. Every command runs as a step that prints
+`== <command>: <s> s` (`step` in `build.sh`, `Run` in `windows.ps1`), which
+`ci_timing` reads. The toolchain is pinned in `rust-toolchain.toml` and the
+image's `FROM` tag, so all places build with one compiler. The jobs of a
+platform share
 their place and so their workspace; `secrets = ["FORGEJO_READ_TOKEN"]` on
-all of them is for the fetch of weida's `main`, which `weida.sh` skips when
-`CI_SIBLINGS` holds a `weida` checkout (a manual run).
+all of them is for the fetch of weida's `main`; a manual run fetches the
+`weida` of `CI_SIBLINGS` instead. Either way it is checked out in
+`.ci-cache/weida` and `../weida` links there, one stable path for cargo's
+fingerprints.
 
 |platform|build job and check job|where (`[platforms]` of the production `ci.toml`)|
 |---|---|---|
