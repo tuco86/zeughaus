@@ -26,6 +26,7 @@
 //! * `control`: the clock of this runner: busy state, freezing, machine
 //!   status and the VM timeout.
 //! * `artifacts`: the artifact sets that cross to and from the CI, streamed.
+//! * `prefetch`: the sets fetched before their job is assigned.
 //! * `launch`, `machine`, `busy`, `git`, `cleanup`, `stage`: what a run is
 //!   rendered from and housekeeping.
 
@@ -39,6 +40,7 @@ mod git;
 mod launch;
 mod link;
 mod machine;
+mod prefetch;
 mod run;
 mod stage;
 
@@ -189,6 +191,8 @@ pub struct Executor {
     link: Mutex<Link>,
     /// One lock per repository's mirror.
     mirrors: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// The sets fetched for jobs that are not assigned yet.
+    prefetches: prefetch::Prefetches,
 }
 
 /// Starts enlisting: the executor's threads and the connection task. Called
@@ -252,9 +256,15 @@ pub fn start(
         runs: Mutex::new(HashMap::new()),
         link: Mutex::new(Link::default()),
         mirrors: Mutex::new(HashMap::new()),
+        prefetches: prefetch::Prefetches::default(),
     });
     if executor.containers || !executor.machines.is_empty() {
         control::thaw_everything(&executor);
+    }
+    // An earlier process fetched sets early for jobs it knew of; a job
+    // assigned now fetches its inputs itself.
+    if let Err(e) = cleanup::remove_tree(&prefetch::prefetch_dir(state_dir)) {
+        eprintln!("[enlist] cannot empty the early fetches: {e}");
     }
     executor.recover();
     executor.sweep_inputs();

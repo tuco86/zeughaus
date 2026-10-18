@@ -97,6 +97,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   began and ended and how many bytes moved, or why it failed, in the job's
   record. This changes the enlist protocol to major 4: a runner built
   before is refused until it is updated.
+- CI: the artifacts of a job that ended are fetched early. A job that needs
+  them and is placed on another runner no longer waits until it starts to
+  have them downloaded: while it still waits for its other needs, the CI
+  tells its runner to fetch them at once. The job moves them in when it
+  starts, or fetches them itself if that failed, so a final step that needs
+  the builds of several platforms finds most of its inputs on its runner
+  when the slowest build ends. A job that is skipped or cancelled before it
+  starts has what was fetched for it deleted.
 
 ### Removed
 

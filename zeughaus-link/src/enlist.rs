@@ -152,6 +152,18 @@ pub enum ToRunner {
     DropArtifacts {
         run: String,
     },
+    /// The job `consumer` will run on this runner and has not been assigned
+    /// yet, and the run `run` left the set its need `need` is: fetch it now,
+    /// as `consumer` will ask for it when it starts.
+    Prefetch {
+        run: String,
+        consumer: String,
+        need: String,
+    },
+    /// The job `consumer` will not run here: delete what was fetched for it.
+    DropPrefetch {
+        consumer: String,
+    },
 }
 
 /// One job for one runner.
@@ -621,6 +633,31 @@ mod tests {
                 panic!("not a transfer report");
             };
             assert_eq!((run.as_str(), need.as_str(), got), ("r.2.c", "a", event));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_prefetch_commands_round_trip() {
+        let commands = [
+            ToRunner::Prefetch {
+                run: "r.2.a".to_owned(),
+                consumer: "r.2.c".to_owned(),
+                need: "a".to_owned(),
+            },
+            ToRunner::DropPrefetch {
+                consumer: "r.2.c".to_owned(),
+            },
+        ];
+        let mut buf = Vec::new();
+        for command in &commands {
+            write_frame(&mut buf, command).await.unwrap();
+        }
+        let mut r: &[u8] = &buf;
+        for command in commands {
+            assert_eq!(
+                read_frame::<_, ToRunner>(&mut r).await.unwrap(),
+                Some(command)
+            );
         }
     }
 }

@@ -851,7 +851,8 @@ little-endian length and a postcard body, at most `MAX_ENLIST_FRAME_BYTES`
   `MAX_OUTPUT_CHUNK`), `Frozen`, `Finished { run, end }` and `Transfer { run,
   need, event }` (an input of the run `run` moving to this runner: `Started`,
   `Done { bytes }` or `Failed { message }`); the CI sends `Assign`, `Kill`,
-  `Upload` and `Forget`. A run is named `<repo>.<number>.<job>` (`run_id`).
+  `Upload`, `Prefetch { run, consumer, need }`, `DropPrefetch { consumer }`
+  and `Forget`. A run is named `<repo>.<number>.<job>` (`run_id`).
 - `Assign` carries everything the run needs and the runner has not: the
   repository URL and the fetch token, the commit, the script, the place, the
   environment (`CI`, `CI_REPO`, `CI_REF`, `CI_SHA`, `CI_JOB`, `CI_PLATFORM`, ...), the
@@ -881,8 +882,9 @@ own, after the runner is no longer held (`zeughaus-runner hold`):
    instead (**Try runs**).
 2. Stage the inputs into `<run>/inputs/<need>/`, one thread per input:
    hard-linked from this runner's `ci/artifacts/<run>/` when the need ran
-   here, else downloaded through the CI's relay and unpacked as the chunks
-   arrive, reported to the CI as a `Transfer`.
+   here, else moved from what the runner fetched early (**Artifacts**), else
+   downloaded through the CI's relay and unpacked as the chunks arrive,
+   reported to the CI as a `Transfer`.
 3. Write the secrets as files under `$XDG_RUNTIME_DIR/zeughaus-ci/<run>/`
    (`ci/tmp/<run>` where there is no `XDG_RUNTIME_DIR`, as on macOS), which
    the launcher removes.
@@ -964,12 +966,23 @@ it sends and the consumer unpacks while it receives, a short queue between
 the thread that works on files and the task that moves the bytes. Every hop
 refuses a running total above `MAX_ARTIFACT_BYTES`, and a body that ends
 without the 0 is a broken transfer. A consumer is assigned only while the
-producing runner is connected. Once every job that needs a set has ended
-(succeeded, failed or skipped), and at once for a set nobody needs, the CI
-sends the producing runner `DropArtifacts { run }`; a runner's `Hello` lists
-the sets it holds, and the CI drops each one no pending job needs, which
-covers a drop lost with a connection or a restart of the CI. Nothing else
-reads a finished set.
+producing runner is connected. A set does not wait for its consumer: when
+a job that left one ends and a job that needs it is still pending on another
+runner (waiting for its other needs, or for its runner), the CI sends that
+runner `Prefetch { run, consumer, need }`. The runner downloads the set as
+the consumer's input into `ci/prefetch/<consumer>/<need>/` on a thread of its
+own and reports it as a `Transfer`; the check on `Download` then admits the
+runner of any job that needs the set and has not ended, not only of one that
+is assigned it. The consumer's staging claims the fetch once: it moves the
+set into `inputs/`, waits for it if it is still going, and downloads again if
+it failed. A job that ends without being assigned (skipped, cancelled or
+failed) after a fetch began gets its runner a `DropPrefetch { consumer }`;
+`Forget`, a failed staging and the start of a runner remove what is left.
+Once every job that needs a set has ended (succeeded, failed or skipped), and
+at once for a set nobody needs, the CI sends the producing runner
+`DropArtifacts { run }`; a runner's `Hello` lists the sets it holds, and the
+CI drops each one no pending job needs, which covers a drop lost with a
+connection or a restart of the CI. Nothing else reads a finished set.
 Only configured runners may use `/artifacts`. `TryBundle { run, index }` is
 the one request the CI answers from its own disk: bundle `index` of a try
 run, to the runner that run is assigned to (**Try runs**).

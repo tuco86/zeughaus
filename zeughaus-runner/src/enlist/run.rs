@@ -203,6 +203,7 @@ impl Executor {
                         };
                         eprintln!("[enlist] {run}: {message}");
                         lock(&exec.runs).remove(&run);
+                        exec.drop_prefetch(&run);
                         exec.send(FromRunner::StartFailed { run, message });
                     }
                 }
@@ -211,6 +212,7 @@ impl Executor {
             // Called from the connection's task: nothing here may block.
             eprintln!("[enlist] cannot start a thread for the assignment: {e}");
             lock(&self.runs).remove(&run);
+            self.drop_prefetch(&run);
             let tx = lock(&self.link).tx.clone();
             if let Some(tx) = tx {
                 let _ = tx.try_send(FromRunner::StartFailed {
@@ -244,6 +246,8 @@ impl Executor {
         if safe_run(run) {
             let _ = std::fs::remove_file(assigned_dir(&self.state_dir).join(format!("{run}.json")));
         }
+        // What was fetched early for the run and never staged.
+        self.drop_prefetch(run);
     }
 
     /// Everything up to and including the start of the process.
@@ -614,6 +618,10 @@ impl Executor {
             InputSource::Ci { run } => {
                 if !safe_run(run) {
                     return Err(Prep::Failed(format!("{run:?} is not a run")));
+                }
+                // A set the CI had this runner fetch before the run started.
+                if self.claim_prefetch(consumer, &input.need, &dest)? {
+                    return Ok(());
                 }
                 self.fetch_input(consumer, &input.need, run, &dest)
                     .map_err(|e| format!("cannot fetch inputs of {}: {e}", input.need))?;

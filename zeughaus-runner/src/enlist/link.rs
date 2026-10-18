@@ -225,7 +225,13 @@ fn dispatch(exec: &Arc<Executor>, command: ToRunner) {
         ToRunner::Assign { assignment } => exec.assign(*assignment),
         ToRunner::Kill { run } => exec.kill(&run),
         ToRunner::Upload { run, transfer } => exec.upload(run, transfer),
+        ToRunner::Prefetch {
+            run,
+            consumer,
+            need,
+        } => exec.prefetch(run, consumer, need),
         ToRunner::DropArtifacts { run } => exec.drop_artifacts(&run),
+        ToRunner::DropPrefetch { consumer } => exec.drop_prefetch(&consumer),
         ToRunner::Forget { run } => exec.forget(&run),
         ToRunner::Welcome { .. } | ToRunner::Refused { .. } => {
             eprintln!("[enlist] the CI repeated its answer to hello; ignored");

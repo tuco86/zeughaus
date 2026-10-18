@@ -333,8 +333,9 @@ impl ArtifactService {
     }
 }
 
-/// The runner that holds the set of `job` in `pipeline`, when `requester`
-/// is the runner of a job that needs it and is assigned that job now.
+/// The runner that holds the set of `job` in `pipeline`, when a job that
+/// needs it is assigned to `requester` now, or is placed on it and has not
+/// ended: the runner fetches the set early, before that job is assigned.
 fn producer_for(
     pipeline: &Pipeline,
     job: &str,
@@ -353,11 +354,14 @@ fn producer_for(
     };
     let consumer = pipeline.jobs.iter().any(|j| {
         j.def.needs.iter().any(|need| need == job)
-            && assigned_to(&run_id(&pipeline.repo, pipeline.number, &j.def.name)).as_deref()
+            && (assigned_to(&run_id(&pipeline.repo, pipeline.number, &j.def.name)).as_deref()
                 == Some(requester)
+                || (!j.status.is_terminal() && j.runner.as_deref() == Some(requester)))
     });
     if !consumer {
-        return Err(format!("runner {requester} runs no job that needs {run}"));
+        return Err(format!(
+            "runner {requester} has no unfinished job that needs {run}"
+        ));
     }
     Ok(producer.clone())
 }
@@ -458,6 +462,70 @@ mod tests {
         let err = relay(&mut body, &mut out, 9).await.unwrap_err();
         assert!(err.contains("more than 9 bytes"), "{err}");
         assert_eq!(out, chunks(&[b"0123"], false).await);
+    }
+
+    /// Pipeline `demo` #1: `a` ran on `x` and left artifacts; `b` needs it
+    /// and is placed on `y`, in `status`.
+    fn needs_a(status: &str) -> Pipeline {
+        let def = |name: &str, needs: &[&str]| {
+            serde_json::json!({
+                "name": name, "file": format!("{name}.sh"), "on": [], "needs": needs,
+                "image": null, "machine": null, "cache": [], "secrets": [],
+                "when_busy": "wait", "env": {}, "timeout_minutes": 5, "interpreter": "sh",
+            })
+        };
+        serde_json::from_value(serde_json::json!({
+            "repo": "demo", "number": 1, "key": "", "sha": null, "status": "running",
+            "created": 0,
+            "event": {
+                "repo": "demo", "kind": "push", "git_ref": "main", "sha": null, "cron": null,
+                "actor": "a", "delivery": null, "received": 0,
+            },
+            "jobs": [
+                { "def": def("a", &[]), "status": "succeeded", "runner": "x", "artifacts": true },
+                { "def": def("b", &["a"]), "status": status, "runner": "y" },
+            ],
+        }))
+        .unwrap()
+    }
+
+    /// A set goes to the runner of a job that needs it and has not ended,
+    /// handed over or not (that runner fetches it early), and to no other.
+    #[test]
+    fn a_set_goes_to_the_runner_of_a_job_that_needs_it_and_has_not_ended() {
+        let unassigned = |_: &str| None;
+        for status in ["pending", "waiting", "starting", "running", "frozen"] {
+            let pipeline = needs_a(status);
+            assert_eq!(
+                producer_for(&pipeline, "a", "y", unassigned),
+                Ok("x".to_owned()),
+                "{status}"
+            );
+            let err = producer_for(&pipeline, "a", "z", unassigned).unwrap_err();
+            assert!(
+                err.contains("no unfinished job that needs"),
+                "{status}: {err}"
+            );
+        }
+        for status in ["succeeded", "failed", "skipped"] {
+            let pipeline = needs_a(status);
+            assert!(
+                producer_for(&pipeline, "a", "y", unassigned).is_err(),
+                "a job that ended asks for nothing ({status})"
+            );
+        }
+
+        // A job handed to a runner is served as before, whichever runner it
+        // was placed on.
+        let handed_to_z = |run: &str| (run == "demo.1.b").then(|| "z".to_owned());
+        assert_eq!(
+            producer_for(&needs_a("starting"), "a", "z", handed_to_z),
+            Ok("x".to_owned())
+        );
+        // The set must exist: a job that left none has nothing to send.
+        let mut none = needs_a("pending");
+        none.jobs[0].artifacts = false;
+        assert!(producer_for(&none, "a", "y", unassigned).is_err());
     }
 
     const FP: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000001";

@@ -1193,6 +1193,7 @@ impl Scheduler {
                     pipeline.jobs[ji].note = note.clone();
                     pipeline.jobs[ji].finished = Some(crate::now_secs());
                     pipeline.save(&self.state_dir, &self.changes);
+                    self.drop_prefetch(pi, ji);
                     let pipeline = self.running[pi].clone();
                     self.post(&pipeline, &name, State::Error, note);
                     continue;
@@ -1275,6 +1276,7 @@ impl Scheduler {
         job.finished = Some(crate::now_secs());
         let name = job.def.name.clone();
         pipeline.save(&self.state_dir, &self.changes);
+        self.drop_prefetch(pi, ji);
         let pipeline = self.running[pi].clone();
         let description = self.failure_description(&pipeline, &name, &note);
         self.post(&pipeline, &name, state, description);
@@ -1295,6 +1297,7 @@ impl Scheduler {
         job.finished = Some(crate::now_secs());
         let name = job.def.name.clone();
         pipeline.save(&self.state_dir, &self.changes);
+        self.drop_prefetch(pi, ji);
         let pipeline = self.running[pi].clone();
         self.post(
             &pipeline,
@@ -1354,6 +1357,7 @@ impl Scheduler {
         job.finished = Some(crate::now_secs());
         let name = job.def.name.clone();
         pipeline.save(&self.state_dir, &self.changes);
+        self.drop_prefetch(pi, ji);
         let pipeline = self.running[pi].clone();
         self.post(
             &pipeline,
@@ -1761,7 +1765,13 @@ impl Scheduler {
                 };
                 let record = &mut self.running[pi].jobs[ji];
                 record.status = JobStatus::Running;
-                record.started = Some(crate::now_secs());
+                let now = crate::now_secs();
+                record.started = Some(now);
+                // The runner stages every input before it starts the program:
+                // a transfer still open lost the report of its end.
+                for transfer in record.transfers.iter_mut().filter(|t| t.finished.is_none()) {
+                    transfer.finished = Some(now);
+                }
                 record.note.clear();
                 let job = record.def.name.clone();
                 self.running[pi].save(&self.state_dir, &self.changes);
@@ -1938,6 +1948,11 @@ impl Scheduler {
         record.artifacts = succeeded && end.artifacts;
         eprintln!("[ci] {repo} #{number} {job}: {note}");
         self.running[pi].save(&self.state_dir, &self.changes);
+        if let Some(runner) = &record_runner
+            && self.running[pi].jobs[ji].artifacts
+        {
+            self.prefetch_for_consumers(pi, ji, runner);
+        }
         let pipeline = self.running[pi].clone();
         let description = if succeeded || cancelled {
             format!("{note} (#{number})")
@@ -1951,6 +1966,48 @@ impl Scheduler {
                 .send(&runner, ToRunner::Forget { run: run.clone() });
         }
         self.runners.unassign(&run);
+    }
+
+    /// Tells the runner of every job that waits for the set job `ji` just
+    /// left, and is placed on another runner than `producer`, to fetch it
+    /// now: that job is assigned only when its other needs have ended, and
+    /// the set moves meanwhile. A runner that is not connected is not told;
+    /// its job fetches when it starts.
+    fn prefetch_for_consumers(&self, pi: usize, ji: usize, producer: &str) {
+        let pipeline = &self.running[pi];
+        let need = &pipeline.jobs[ji].def.name;
+        let run = run_id(&pipeline.repo, pipeline.number, need);
+        for consumer in &pipeline.jobs {
+            let waiting = matches!(consumer.status, JobStatus::Pending | JobStatus::Waiting);
+            let Some(runner) = consumer.runner.as_deref() else {
+                continue;
+            };
+            if !waiting || runner == producer || !consumer.def.needs.contains(need) {
+                continue;
+            }
+            self.runners.send(
+                runner,
+                ToRunner::Prefetch {
+                    run: run.clone(),
+                    consumer: run_id(&pipeline.repo, pipeline.number, &consumer.def.name),
+                    need: need.clone(),
+                },
+            );
+        }
+    }
+
+    /// Tells the runner of job `ji`, which ended without being handed over,
+    /// to delete what it fetched early for it: nothing will ask for it now.
+    fn drop_prefetch(&self, pi: usize, ji: usize) {
+        let job = &self.running[pi].jobs[ji];
+        if job.assigned.is_some() || job.transfers.is_empty() {
+            return;
+        }
+        if let Some(runner) = &job.runner {
+            let consumer = self.run_of(pi, ji);
+            self.runners
+                .send(runner, ToRunner::DropPrefetch { consumer });
+        }
     }
 
     // ------------------------------------------------------------ red default branch
@@ -3642,6 +3699,184 @@ mod tests {
         s.running[0].jobs[1].status = JobStatus::Failed;
         s.handle(report("y", "a", TransferEvent::Started));
         assert_eq!(transfers(&s), all);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_started_job_has_no_transfer_left_open() {
+        let state = scratch("started-transfers");
+        let mut s = scheduler(&state);
+        let mut p = two_jobs("x");
+        p.jobs[1].status = JobStatus::Starting;
+        p.jobs[1].assigned = Some(5);
+        // The report of this transfer's end never arrived.
+        p.jobs[1].transfers.push(TransferRecord {
+            need: "a".to_owned(),
+            started: 6,
+            finished: None,
+            bytes: None,
+            error: None,
+        });
+        s.running.push(p);
+        s.runners.assign("view.7.b", "y");
+        s.handle(Msg::FromRunner {
+            name: "y".to_owned(),
+            message: FromRunner::Started {
+                run: "view.7.b".to_owned(),
+            },
+        });
+        let b = &s.running[0].jobs[1];
+        assert_eq!(b.status, JobStatus::Running);
+        assert!(b.transfers[0].finished.is_some());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    fn finished(runner: &str, run: &str, artifacts: bool) -> Msg {
+        Msg::FromRunner {
+            name: runner.to_owned(),
+            message: FromRunner::Finished {
+                run: run.to_owned(),
+                end: RunEnd {
+                    code: Some(0),
+                    killed: false,
+                    timed_out: false,
+                    artifacts,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn a_succeeded_need_is_fetched_early_by_the_runner_of_a_pending_consumer() {
+        let state = scratch("prefetch");
+        let mut s = scheduler(&state);
+        let mut x = connect(&s.runners, "x", 0);
+        let mut y = connect(&s.runners, "y", 0);
+        // `a` runs on x. `b` and `g` wait for it on y; the rest must not be
+        // told to fetch: `c` runs on x, where the set is linked, `d` was
+        // handed its inputs already, `e` needs nothing and `f`'s runner is
+        // not connected.
+        let mut p = two_jobs("x");
+        p.jobs[0].status = JobStatus::Running;
+        p.jobs[0].artifacts = false;
+        p.jobs.extend([
+            record("c", &["a"], "x", JobStatus::Pending),
+            record("d", &["a"], "y", JobStatus::Starting),
+            record("e", &[], "y", JobStatus::Pending),
+            record("f", &["a"], "z", JobStatus::Pending),
+            record("g", &["a"], "y", JobStatus::Waiting),
+        ]);
+        s.running.push(p);
+        s.runners.assign("view.7.a", "x");
+
+        s.handle(finished("x", "view.7.a", true));
+        let early = |consumer: &str| ToRunner::Prefetch {
+            run: "view.7.a".to_owned(),
+            consumer: consumer.to_owned(),
+            need: "a".to_owned(),
+        };
+        assert_eq!(y.try_recv().ok(), Some(early("view.7.b")));
+        assert_eq!(y.try_recv().ok(), Some(early("view.7.g")));
+        assert!(y.try_recv().is_err());
+        // The producer's runner is only told the CI is done with the run.
+        assert_eq!(
+            x.try_recv().ok(),
+            Some(ToRunner::Forget {
+                run: "view.7.a".to_owned()
+            })
+        );
+        assert!(x.try_recv().is_err());
+
+        // A run that left no set has nothing to fetch.
+        let mut none = two_jobs("x");
+        none.number = 8;
+        none.jobs[0].status = JobStatus::Running;
+        none.jobs[0].artifacts = false;
+        s.running.push(none);
+        s.runners.assign("view.8.a", "x");
+        s.handle(finished("x", "view.8.a", false));
+        assert!(y.try_recv().is_err());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn what_was_fetched_early_for_a_job_that_never_ran_is_dropped() {
+        let state = scratch("drop-prefetch");
+        let mut s = scheduler(&state);
+        let mut y = connect(&s.runners, "y", 0);
+        let fetched = TransferRecord {
+            need: "a".to_owned(),
+            started: 1,
+            finished: Some(2),
+            bytes: Some(3),
+            error: None,
+        };
+        // `a` left a set and `b` took it early; `c` failed, so `b` is skipped.
+        // `d` waits for `c` alone and fetched nothing.
+        let mut p = two_jobs("x");
+        p.jobs[0].artifacts = true;
+        p.jobs.push(record("c", &[], "x", JobStatus::Failed));
+        p.jobs[1].def.needs.push("c".to_owned());
+        p.jobs[1].transfers.push(fetched.clone());
+        p.jobs.push(record("d", &["c"], "y", JobStatus::Pending));
+        s.running.push(p);
+        s.advance();
+        assert_eq!(s.running[0].jobs[1].status, JobStatus::Skipped);
+        assert_eq!(s.running[0].jobs[3].status, JobStatus::Skipped);
+        assert_eq!(
+            y.try_recv().ok(),
+            Some(ToRunner::DropPrefetch {
+                consumer: "view.7.b".to_owned()
+            })
+        );
+        assert!(y.try_recv().is_err(), "`d` fetched nothing");
+
+        // A cancelled pipeline skips its pending jobs the same way.
+        let mut p = two_jobs("x");
+        p.number = 8;
+        p.jobs[1].transfers.push(fetched.clone());
+        s.running.push(p);
+        s.running[1].cancelled = true;
+        s.apply_cancel(1);
+        assert_eq!(
+            y.try_recv().ok(),
+            Some(ToRunner::DropPrefetch {
+                consumer: "view.8.b".to_owned()
+            })
+        );
+
+        // So does a job that fails before it is handed over, and one whose
+        // runner stayed away; a job that was handed over keeps what it has.
+        let mut p = two_jobs("x");
+        p.number = 9;
+        p.jobs[1].transfers.push(fetched.clone());
+        s.running.push(p);
+        s.fail_job(2, 1, "secret g is not granted".to_owned(), State::Error);
+        assert_eq!(
+            y.try_recv().ok(),
+            Some(ToRunner::DropPrefetch {
+                consumer: "view.9.b".to_owned()
+            })
+        );
+        let mut p = two_jobs("x");
+        p.number = 10;
+        p.jobs[1].transfers.push(fetched.clone());
+        s.running.push(p);
+        s.skip_offline(3, 1, "y");
+        assert_eq!(
+            y.try_recv().ok(),
+            Some(ToRunner::DropPrefetch {
+                consumer: "view.10.b".to_owned()
+            })
+        );
+        let mut p = two_jobs("x");
+        p.number = 11;
+        p.jobs[1].status = JobStatus::Starting;
+        p.jobs[1].assigned = Some(5);
+        p.jobs[1].transfers.push(fetched);
+        s.running.push(p);
+        s.fail_job(4, 1, "cannot fetch inputs of a".to_owned(), State::Error);
+        assert!(y.try_recv().is_err());
         let _ = std::fs::remove_dir_all(&state);
     }
 
