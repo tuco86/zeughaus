@@ -42,6 +42,16 @@ function Run([string]$Command, [string[]]$Arguments = @()) {
     }
 }
 
+# The body of a small text file. Caddy serves `latest` and SHA256SUMS without
+# a text content type, for which Invoke-WebRequest answers bytes.
+function Get-Text([string]$Uri) {
+    $content = (Invoke-WebRequest -UseBasicParsing -Uri $Uri).Content
+    if ($content -is [byte[]]) {
+        $content = [Text.Encoding]::UTF8.GetString($content)
+    }
+    return $content
+}
+
 $bin = Join-Path $Root 'bin'
 $exe = Join-Path $bin 'zeughaus-runner.exe'
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("zeughaus-bootstrap-" + [Guid]::NewGuid().ToString('N'))
@@ -49,11 +59,11 @@ New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 
 try {
     Write-Host "[deploy] channel $Channel at $Url"
-    $build = ((Invoke-WebRequest -UseBasicParsing -Uri "$Url/$Channel/latest").Content).Trim()
+    $build = (Get-Text "$Url/$Channel/latest").Trim()
     if (-not $build) {
         throw "$Url/$Channel/latest is empty"
     }
-    $sums = (Invoke-WebRequest -UseBasicParsing -Uri "$Url/$Channel/$build/SHA256SUMS").Content
+    $sums = Get-Text "$Url/$Channel/$build/SHA256SUMS"
     $line = $sums -split "`n" |
         ForEach-Object { $_.Trim() } |
         Where-Object { $_ -match '-windows-amd64\.zip$' } |
