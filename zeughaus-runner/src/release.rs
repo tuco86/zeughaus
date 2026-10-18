@@ -9,7 +9,7 @@
 //! The CI's publish job runs `bundle` over the archives the platform jobs
 //! built and publishes the directory it makes; `verify` is what anyone who
 //! downloaded a copy runs before trusting it. Both end in
-//! [`crate::update::manifest`], so what `bundle` signs is what an updater
+//! [`zeughaus_update::manifest`], so what `bundle` signs is what an updater
 //! reads. The signing key's seed is never an argument: it comes from the
 //! environment, where a process listing does not show it.
 
@@ -17,9 +17,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use ring::rand::{SecureRandom, SystemRandom};
+use zeughaus_update::manifest::{self, Artifact, FORMAT, Manifest};
 
 use crate::files::write_atomic;
-use crate::update::manifest::{self, Artifact, FORMAT, Manifest};
 
 /// The environment variable that holds the signing key's seed: 64 hex
 /// characters, as `keygen` writes them.

@@ -26,7 +26,6 @@ mod runner;
 mod runs;
 mod timeout;
 mod transport;
-mod update;
 #[cfg(windows)]
 mod winjob;
 
@@ -355,7 +354,7 @@ fn main() -> ExitCode {
         // `update.toml` turns it on.
         #[cfg(unix)]
         if let Ok(exe) = exe.as_ref() {
-            update::start(&state_dir, exe.clone());
+            zeughaus_update::start(&state_dir, exe.clone(), Box::new(restart_signal::request));
         }
         // Maintenance runs as the host's runs, so it needs the mux like a job
         // does, and this binary's path for its `timeout` wrapper.

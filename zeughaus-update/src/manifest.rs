@@ -8,7 +8,7 @@
 //! not by the server that answered.
 //!
 //! Built on every platform: `release bundle` and `release verify` are
-//! subcommands wherever this binary runs, only the updater is unix-only.
+//! subcommands wherever the runner runs.
 
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -18,7 +18,7 @@ use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::names::valid_name;
+use crate::valid_channel;
 
 /// The manifest layout this binary reads and writes. A field added or
 /// changed is a new format: the parser refuses what it does not know.
@@ -164,7 +164,7 @@ pub fn parse(bytes: &[u8]) -> Result<Manifest, String> {
             manifest.format
         ));
     }
-    if !valid_name(&manifest.channel) {
+    if !valid_channel(&manifest.channel) {
         return Err(format!(
             "manifest: channel `{}` must match [a-z0-9][a-z0-9-]*",
             manifest.channel
@@ -266,7 +266,6 @@ pub fn platform_of_archive(version: &str, file: &str) -> Result<&'static str, St
 
 /// The platform this binary runs on, as the release names it; `None` for a
 /// host no archive is built for.
-#[cfg_attr(not(unix), allow(dead_code))]
 pub fn host_platform() -> Option<&'static str> {
     platform_of(std::env::consts::OS, std::env::consts::ARCH)
 }
@@ -284,7 +283,6 @@ fn platform_of(os: &str, arch: &str) -> Option<&'static str> {
 /// The CI pipeline number this binary was built by (`ZEUGHAUS_BUILD` at
 /// compile time); 0 for a build made anywhere else, which is older than every
 /// published one.
-#[cfg_attr(not(unix), allow(dead_code))]
 pub fn own_build() -> u64 {
     build_from(option_env!("ZEUGHAUS_BUILD"))
 }

@@ -16,6 +16,7 @@ members = [
     "zeughaus-link",
     "zeughaus-runner",
     "zeughaus-ci",
+    "zeughaus-update",
     "zeughaus-mux",
     "zeughaus-terminal",
     "zeughaus-job",
@@ -61,6 +62,9 @@ zeughaus-runner = { path = "zeughaus-runner", version = "0.3.0-dev" }
 # The CI service: pipelines from webhooks and cron, scheduled onto the runners
 # that enlist into it.
 zeughaus-ci = { path = "zeughaus-ci", version = "0.3.0-dev" }
+# The self-updater both binaries that follow a release channel share: the
+# signed manifest, the install of a published build and its rollback.
+zeughaus-update = { path = "zeughaus-update", version = "0.3.0-dev" }
 # The terminal multiplexer's wire model, shared by runner and editor (wasm
 # included): pure types and a bounded codec, nothing that opens a PTY or draws.
 zeughaus-mux = { path = "zeughaus-mux", version = "0.3.0-dev" }

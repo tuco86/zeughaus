@@ -1,4 +1,4 @@
-//! The self-updater: a runner that follows a release channel and installs
+//! The self-updater: a process that follows a release channel and installs
 //! what the CI publishes there.
 //!
 //! `<state-dir>/update.toml` turns it on; without the file nothing runs:
@@ -31,6 +31,15 @@ pub mod manifest;
 #[cfg(unix)]
 pub use self::unix::start;
 
+/// `[a-z0-9][a-z0-9-]*`: a channel names a directory under the release URL.
+fn valid_channel(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
 #[cfg(unix)]
 mod unix {
     use std::ffi::OsString;
@@ -43,7 +52,7 @@ mod unix {
     use serde::Deserialize;
 
     use super::manifest;
-    use crate::names::valid_name;
+    use crate::valid_channel;
 
     /// `<state-dir>/update.toml`.
     const CONFIG_FILE: &str = "update.toml";
@@ -81,7 +90,7 @@ mod unix {
     impl UpdateConfig {
         fn parse(text: &str) -> Result<UpdateConfig, String> {
             let mut config: UpdateConfig = toml::from_str(text).map_err(|e| e.to_string())?;
-            if !valid_name(&config.channel) {
+            if !valid_channel(&config.channel) {
                 return Err(format!(
                     "channel `{}` must match [a-z0-9][a-z0-9-]*",
                     config.channel
@@ -114,8 +123,9 @@ mod unix {
     }
 
     /// Starts the updater if `<state-dir>/update.toml` asks for one. `exe` is
-    /// this binary's path as resolved at start, the file an update replaces.
-    pub fn start(state_dir: &Path, exe: PathBuf) {
+    /// this binary's path as resolved at start, the file an update replaces;
+    /// `request_restart` asks the process to restart into it.
+    pub fn start(state_dir: &Path, exe: PathBuf, request_restart: Box<dyn Fn() + Send>) {
         let config = match load(state_dir) {
             Ok(Some(config)) => config,
             Ok(None) => return,
@@ -140,6 +150,7 @@ mod unix {
             keys: manifest::TRUSTED_KEYS.to_vec(),
             own: manifest::own_build(),
             config,
+            request_restart,
         };
         eprintln!(
             "[update] following {} at {}, running build {}",
@@ -167,6 +178,8 @@ mod unix {
         keys: Vec<[u8; 32]>,
         /// The build this binary was made by; 0 when the CI did not make it.
         own: u64,
+        /// Asks the process to restart into the build just installed.
+        request_restart: Box<dyn Fn() + Send>,
     }
 
     impl Updater {
@@ -222,7 +235,7 @@ mod unix {
                     if let Some(editor) = &installed.editor {
                         editor.restart();
                     }
-                    crate::restart_signal::request();
+                    (self.request_restart)();
                 }
                 Err(e) => {
                     eprintln!("[update] build {build}: {e}");
@@ -795,6 +808,7 @@ mod unix {
                         home: None,
                         keys: vec![manifest::public_key(&SEED)],
                         own: 3,
+                        request_restart: Box::new(|| {}),
                     }
                 }
 
