@@ -13,6 +13,8 @@
 //! log <repo> <pipeline> <job> [--tail N]
 //! forge-check <repo>
 //! secrets-check
+//! version
+//! update status|rollback
 //! ```
 //!
 //! `check` reads the folder, and the state directory's `ci.toml` when there
@@ -43,7 +45,8 @@ use crate::streak;
 const USAGE: &str = "usage: zeughaus-ci [--state-dir DIR] serve --listen <host:port> \
 [--hook <host:port>] | check [DIR] | plan [DIR] <push|tag> <ref> | plan [DIR] cron \"<expr>\" | \
 run <repo> <push|tag> <ref> [<sha>] | run <repo> cron \"<expr>\" | status [N] | \
-log <repo> <pipeline> <job> [--tail N] | forge-check <repo> | secrets-check";
+log <repo> <pipeline> <job> [--tail N] | forge-check <repo> | secrets-check | version | \
+update status|rollback";
 
 pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -80,6 +83,21 @@ fn run(args: &[String], state_dir: &Path) -> ExitCode {
         Some("log") => log(state_dir, &args[1..]),
         Some("forge-check") => forge_check(state_dir, &args[1..]),
         Some("secrets-check") => secrets_check(state_dir, &args[1..]),
+        // What the updater runs a new binary with before it trusts it.
+        Some("version") if args.len() == 1 => {
+            println!(
+                "{} build {}",
+                env!("CARGO_PKG_VERSION"),
+                zeughaus_update::manifest::own_build()
+            );
+            Ok(())
+        }
+        Some("update") => std::env::current_exe()
+            .map_err(|e| format!("this executable cannot be located: {e}"))
+            .and_then(|exe| {
+                zeughaus_update::command(&args[1..], state_dir, &exe, zeughaus_update::Product::Ci)
+            })
+            .map(|text| println!("{text}")),
         _ => Err(USAGE.to_owned()),
     };
     match result {

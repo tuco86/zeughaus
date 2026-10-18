@@ -7423,6 +7423,7 @@ dependencies = [
  "zeughaus-link",
  "zeughaus-mux",
  "zeughaus-terminal",
+ "zeughaus-update",
 ]
 
 [[package]]

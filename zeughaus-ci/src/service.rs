@@ -76,6 +76,26 @@ pub fn run(args: &[String], state_dir: &Path) -> ExitCode {
     }
 }
 
+/// Replaces this process with `exe`, same arguments, after an update
+/// replaced the file. The listeners are close-on-exec, so the new image binds
+/// the same ports. Returns only when that failed; the CI then carries on.
+#[cfg(unix)]
+fn restart(exe: &Path) {
+    use std::os::unix::process::CommandExt;
+
+    eprintln!("[ci] restarting");
+    let e = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    eprintln!("[ci] restart failed: {e}");
+}
+
+/// No process image to replace: the service is started again by hand.
+#[cfg(not(unix))]
+fn restart(_exe: &Path) {
+    eprintln!("[ci] a new build is installed; start the service again to run it");
+}
+
 /// Everything a bound listener keeps alive: dropping any of them stops
 /// accepting.
 struct Bound {
@@ -143,6 +163,14 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
     std::fs::create_dir_all(state_dir)
         .map_err(|e| format!("cannot create {}: {e}", state_dir.display()))?;
     eprintln!("[ci] state dir {}", state_dir.display());
+    // Resolved now: after an update replaced the file, only this path names
+    // the new binary.
+    let exe = std::env::current_exe();
+    // A build on trial counts this start, and the one that failed to come up
+    // too often is replaced by the previous build before anything is bound.
+    if let Ok(exe) = &exe {
+        zeughaus_update::boot(state_dir, exe, zeughaus_update::Product::Ci);
+    }
 
     let secrets = Secrets::new(config.secrets.clone(), state_dir);
     match secrets::check(&secrets, &config) {
@@ -176,6 +204,17 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
     eprintln!("[ci] endpoint {}", bound.url);
     credentials::write_endpoint(state_dir, &bound.url)
         .map_err(|e| format!("cannot write the endpoint file: {e}"))?;
+    // Every pipeline is on disk, so an update is a plain restart.
+    match exe {
+        Ok(exe) => zeughaus_update::start(
+            state_dir,
+            exe.clone(),
+            zeughaus_update::Product::Ci,
+            Box::new(|| true),
+            Box::new(move || restart(&exe)),
+        ),
+        Err(e) => eprintln!("[ci] not updating: this executable cannot be located: {e}"),
+    }
 
     // `Publisher::publish` is synchronous, but every weida handle was created
     // on this runtime and quinn's driver has to be reachable from this thread.

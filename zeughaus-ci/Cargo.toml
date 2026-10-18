@@ -40,3 +40,6 @@ base64 = "0.23"
 tiny_http = "0.12"
 croner = "4"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# The CI follows a release channel like the runners: it replaces its own
+# binary and restarts into it.
+zeughaus-update.workspace = true
