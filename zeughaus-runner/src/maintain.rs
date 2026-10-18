@@ -13,8 +13,8 @@
 //!
 //! One thread reads the file once a minute (a symlink into a dotfiles
 //! checkout is fine, and an edit needs no restart), and runs a due task as a
-//! run of the job host: a terminal in the `Triggered` group with a WAL under
-//! `<state-dir>/runs/<id>`, kept for attaching when it fails. Tasks run one
+//! run of the job host: a terminal in the `Triggered` group while it runs,
+//! with a WAL under `<state-dir>/runs/<id>` that outlives it. Tasks run one
 //! at a time, and only when this runner is idle: while one runs the host
 //! counts as held, so CI prepares wait and graph jobs are refused, and a
 //! toolchain update never swaps files under a build.
@@ -366,7 +366,6 @@ fn start_run(
         env: vec![("ZEUGHAUS_MAINTAIN".to_owned(), task.name.clone())],
         cwd: home(),
         run_dir,
-        keep_on_failure: true,
         started: state.started,
         artifacts: Vec::new(),
         external: true,

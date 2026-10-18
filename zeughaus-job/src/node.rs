@@ -27,7 +27,6 @@ pub struct JobNode {
     env: Vec<(String, String)>,
     cwd: String,
     artifacts: Vec<String>,
-    keep_on_failure: bool,
     /// A press taken through the parameter channel, spent by the next execute.
     armed: bool,
     /// The text the press carried, if any; spent with it.
@@ -49,7 +48,6 @@ impl JobNode {
             env: Vec::new(),
             cwd: String::new(),
             artifacts: Vec::new(),
-            keep_on_failure: true,
             armed: false,
             payload: None,
             external: false,
@@ -141,7 +139,6 @@ impl ExecutableNode for JobNode {
                 env,
                 cwd: cwd.clone(),
                 run_dir: run_dir.clone(),
-                keep_on_failure: self.keep_on_failure,
                 started,
                 artifacts: self.artifacts.clone(),
                 external,
@@ -170,7 +167,6 @@ impl ExecutableNode for JobNode {
             SettingDef::new("env", "").placeholder("KEY=VALUE KEY2=\"a b\""),
             SettingDef::new("cwd", "").placeholder("(the runner's directory)"),
             SettingDef::new("artifacts", "").placeholder("globs relative to cwd"),
-            SettingDef::new("keep_on_failure", "true"),
         ]
     }
 
@@ -194,17 +190,6 @@ impl ExecutableNode for JobNode {
             "env" => self.env = parse_env(text)?,
             "cwd" => self.cwd = text.clone(),
             "artifacts" => self.artifacts = words("artifacts", text)?,
-            "keep_on_failure" => {
-                self.keep_on_failure = match text.trim() {
-                    "" | "true" => true,
-                    "false" => false,
-                    other => {
-                        return Err(ZeughausError::InvalidParameter(format!(
-                            "keep_on_failure: '{other}' is neither true nor false"
-                        )));
-                    }
-                }
-            }
             _ => {}
         }
         Ok(())
@@ -680,6 +665,23 @@ mod tests {
         );
         // Blank is the runner's own directory, not a directory named "".
         assert_eq!(spec.cwd, None);
+    }
+
+    /// A graph saved while the node still had a `keep_on_failure` setting
+    /// loads: the row is ignored whatever its text, and no longer listed.
+    #[test]
+    fn a_saved_keep_on_failure_row_is_ignored() {
+        let host = FakeHost::new(ok_exit());
+        let mut node = job(&host);
+        for text in ["true", "false", "sometimes"] {
+            node.set_parameter("keep_on_failure", Value::new(text.to_string()))
+                .expect("a removed setting is not refused");
+        }
+        assert!(
+            node.settings()
+                .iter()
+                .all(|setting| &*setting.name != "keep_on_failure")
+        );
     }
 
     #[test]

@@ -11,9 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A runner on Windows enlists into the CI. It runs `.ps1` jobs on its own
   host under its `timeout` subcommand, which a job object backs on
-  Windows, and a failed job leaves a PowerShell in its workspace. `ci.toml`
-  marks such a runner `os = "windows"`; the CI places only `.ps1` jobs
-  there and refuses a runner whose host is not the one configured.
+  Windows. `ci.toml` marks such a runner `os = "windows"`; the CI places
+  only `.ps1` jobs there and refuses a runner whose host is not the one
+  configured.
 - `deploy/install-windows.sh` sets up a Windows runner host over ssh
   (`C:\zeughaus` for its account only, the boot task, the firewall rule,
   the toolchain) and builds and installs a commit there. The
@@ -56,6 +56,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A runner's locked `Triggered` group, and a CI section's group of a
   repository without channels, is shown only while it holds a tab: it no
   longer sits empty in the tab bar between runs.
+- A run ends when its program ends. The terminal of a `Job` node's run, of
+  a CI job and of a maintenance task closes with its program whatever the
+  exit code, and the exit code is the program's; the WAL under
+  `<state-dir>/runs/<id>/`, and the CI's transcript, is what a failure
+  leaves. No shell follows a failed run any more, on a host, in a
+  container, in the Windows VM or on a Windows runner, so the VM no longer
+  stays up for a day after a failure and a CI job's excerpt is the last 40
+  lines of its output. A restarted runner closes the terminals of the runs
+  it finds recorded as ended.
+
+### Removed
+
+- The `Job` node's `keep_on_failure` setting. A saved graph that still has
+  it loads, and the row is ignored.
 
 ### Fixed
 

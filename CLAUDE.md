@@ -126,9 +126,10 @@ terminal someone else drives, `Ctrl+Shift+C`/`V` copy and paste,
 `Cmd+T`/`C`/`V`/`Escape`; left Option is Meta, right Option composes), and
 `Ctrl`+click opens a terminal's hyperlink. A
 `Job` node runs its
-`command` line when its `run` pin fires or it is pressed; a failed run keeps
-its terminal for attaching, every run keeps a timestamped WAL in
-`<state-dir>/runs/<id>/wal`, and every shell one in its shim directory.
+`command` line when its `run` pin fires or it is pressed; its terminal lives
+as long as the program (the run ends with the program's exit code), every run
+keeps a timestamped WAL in `<state-dir>/runs/<id>/wal`, and every shell one
+in its shim directory.
 `zeughaus-runner trigger <endpoint> <node-id> [payload]` and
 `zeughaus-runner hold <endpoint> on|off` do the same from a script, against
 the endpoint URL a runner prints at start; a triggered run's terminal lands

@@ -143,8 +143,7 @@ pub struct JobRecord {
     /// was told to drop the set.
     #[serde(default)]
     pub artifacts: bool,
-    /// The end of a failed run's log, before its debug shell (see
-    /// [`excerpt`]).
+    /// The end of a failed run's log (see [`excerpt`]).
     #[serde(default)]
     pub excerpt: Option<String>,
 }

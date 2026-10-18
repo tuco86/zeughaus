@@ -2,11 +2,11 @@
 //! and the `/hold` service that stops it starting new ones.
 //!
 //! A run is a terminal this process owns. It has no pane until an editor
-//! attaches one, its PTY bytes are teed to `<state-dir>/runs/<id>/wal` as they
-//! are parsed, each chunk with the time it was read, and its exit record is
-//! written beside them. That is what makes a failed job a terminal to attach
-//! to rather than a log to read: the screen the child left behind survives
-//! the child.
+//! attaches one while the run is going, its PTY bytes are teed to
+//! `<state-dir>/runs/<id>/wal` as they are parsed, each chunk with the time it
+//! was read, and its exit record is written beside them. The terminal ends
+//! with the program, whatever its exit code: what the run said is read from
+//! its WAL.
 //!
 //! Run ids come from the state directory rather than from a counter that
 //! starts at zero, so a restarted runner cannot hand out an id whose directory
@@ -94,15 +94,11 @@ impl JobHost {
     /// for them. They count as live, so a draining stop waits for them too.
     pub fn adopt_runs(&self) {
         for (terminal, run) in self.mux.restored_runs() {
-            // Recorded already: it ended under the previous runner. A failure
-            // goes out of sight as it would have there, and a shell that
-            // followed it closes its terminal when it ends.
+            // Recorded already: the run is over, and its terminal shows
+            // nothing its WAL does not hold.
             if run.run_dir.join("exit").exists() {
-                if !exited_clean(&run.run_dir) {
-                    self.mux.hide_terminal(terminal);
-                }
-                if run.run_dir.join("code").exists() {
-                    close_after_shell(self.mux.clone(), terminal);
+                if let Err(e) = self.mux.close_terminal(terminal) {
+                    eprintln!("[runner] cannot close an ended run's terminal: {e}");
                 }
                 continue;
             }
@@ -110,7 +106,6 @@ impl JobHost {
             let handle = Box::new(Run {
                 mux: self.mux.clone(),
                 terminal,
-                code_file: run.run_dir.join("code"),
                 live: Arc::clone(&self.live),
             });
             eprintln!("[runner] adopted run {}", run.run_dir.display());
@@ -137,16 +132,6 @@ impl JobHost {
             .terminal_of_run(run_dir)
             .ok_or_else(|| format!("no live terminal for {}", run_dir.display()))?;
         self.mux.close_terminal(terminal)
-    }
-
-    /// Whether the terminal of the run in `run_dir` still has a child: the
-    /// shell that follows a failed run, or the run itself. False once the
-    /// child ended or the terminal is gone.
-    pub fn run_child_alive(&self, run_dir: &Path) -> bool {
-        self.mux
-            .terminal_of_run(run_dir)
-            .and_then(|terminal| self.mux.session(terminal))
-            .is_some_and(|session| session.exit().is_none())
     }
 
     /// Whether a terminal of this process holds the run in `run_dir`: one
@@ -252,30 +237,15 @@ impl ProcessHost for JobHost {
             OwnedPlacement::Detached
         };
 
-        let (program, args, mut env) = if spec.keep_on_failure && cfg!(unix) {
-            // The wrapper runs the program, and on failure records the code
-            // where `wait` finds it and becomes the user's shell in the same
-            // directory and environment. On success it exits 0 like the
-            // program did.
-            let mut args = vec![
-                "-c".to_string(),
-                KEEP_SHELL.to_string(),
-                "zeughaus-job".to_string(),
-                spec.program,
-            ];
-            args.extend(spec.args);
-            ("/bin/sh".to_string(), args, spec.env)
-        } else {
-            (spec.program, spec.args, spec.env)
-        };
+        let mut env = spec.env;
         env.push((
             "ZEUGHAUS_RUN_DIR".to_string(),
             spec.run_dir.to_string_lossy().into_owned(),
         ));
         let profile = Profile {
             label: spec.label,
-            program: Some(PathBuf::from(program)),
-            args,
+            program: Some(PathBuf::from(spec.program)),
+            args: spec.args,
             cwd: spec.cwd,
             env,
             scrollback_rows: RUN_SCROLLBACK_ROWS,
@@ -287,22 +257,10 @@ impl ProcessHost for JobHost {
         Ok(Box::new(Run {
             mux: self.mux.clone(),
             terminal,
-            code_file: spec.run_dir.join("code"),
             live: Arc::clone(&self.live),
         }))
     }
 }
-
-/// The shell script a `keep_on_failure` run is started through: `$0` is a
-/// name for error messages, `$@` the program and its arguments. The code
-/// file is what tells `wait` that the run is over while the shell that
-/// replaced it lives on; it is written before the shell so the two cannot
-/// be observed in the wrong order.
-const KEEP_SHELL: &str = r##""$@"; rc=$?
-if [ "$rc" -eq 0 ]; then exit 0; fi
-printf '%s\n' "$rc" > "$ZEUGHAUS_RUN_DIR/code"
-printf '\n[zeughaus] exit %s; a shell follows\n' "$rc"
-exec "${SHELL:-/bin/sh}""##;
 
 /// Decrements the live count however the wait ended, panic included: a count
 /// left standing would make a draining runner wait forever.
@@ -318,9 +276,6 @@ impl Drop for LiveGuard {
 struct Run {
     mux: MuxService,
     terminal: TerminalId,
-    /// Written by the wrapper when the program failed and a shell took its
-    /// place; the run is over even though the terminal's child is not.
-    code_file: PathBuf,
     live: Arc<AtomicU32>,
 }
 
@@ -329,7 +284,6 @@ impl RunHandle for Run {
         let Run {
             mux,
             terminal,
-            code_file,
             live,
         } = *self;
         let _guard = LiveGuard(live);
@@ -343,17 +297,6 @@ impl RunHandle for Run {
                     killed: true,
                 };
             };
-            if let Some(code) = std::fs::read_to_string(&code_file)
-                .ok()
-                .and_then(|text| text.trim().parse::<i32>().ok())
-            {
-                mux.hide_terminal(terminal);
-                close_after_shell(mux, terminal);
-                return RunExit {
-                    code: Some(code),
-                    killed: false,
-                };
-            }
             if let Some(exit) = session.exit() {
                 let run = match exit {
                     ExitState::Exited { code } => RunExit {
@@ -375,53 +318,17 @@ impl RunHandle for Run {
                         killed: false,
                     },
                 };
-                // A run that succeeded has nothing left to look at: its log
-                // is on disk, and its terminal would otherwise sit among the
-                // detached ones for the life of the runner. A failed one
-                // keeps its screen among the detached terminals, where
-                // someone attaches it to look; the `Triggered` group is for
-                // runs that are still going.
-                if run.code == Some(0) {
-                    if let Err(e) = mux.close_terminal(terminal) {
-                        eprintln!("[runner] cannot close a finished run's terminal: {e}");
-                    }
-                } else {
-                    mux.hide_terminal(terminal);
+                // The run is over and its log is on disk, whatever the
+                // outcome: the terminal would otherwise stay for the life of
+                // the runner, in the locked group or among the detached ones,
+                // showing what the WAL holds.
+                if let Err(e) = mux.close_terminal(terminal) {
+                    eprintln!("[runner] cannot close a finished run's terminal: {e}");
                 }
                 return run;
             }
             std::thread::sleep(POLL);
         }
-    }
-}
-
-/// Closes `terminal` once the shell that followed a failed run has ended.
-///
-/// The shell is there to look around in the run's environment; once it is
-/// gone, the screen shows nothing the log under the run directory does not,
-/// and a terminal left behind for every red build piles up in the
-/// `Triggered` group for the life of the runner and across its restarts.
-/// A terminal someone closed first, or a mux shutting down, ends the wait.
-fn close_after_shell(mux: MuxService, terminal: TerminalId) {
-    let spawned = std::thread::Builder::new()
-        .name(format!("zh-run-close-{}", terminal.0))
-        .spawn(move || {
-            loop {
-                let Some(session) = mux.session(terminal) else {
-                    return;
-                };
-                if session.exit().is_some() {
-                    break;
-                }
-                drop(session);
-                std::thread::sleep(POLL);
-            }
-            if let Err(e) = mux.close_terminal(terminal) {
-                eprintln!("[runner] cannot close a failed run's terminal: {e}");
-            }
-        });
-    if let Err(e) = spawned {
-        eprintln!("[runner] no thread to close a failed run's terminal: {e}");
     }
 }
 
@@ -508,13 +415,11 @@ mod tests {
 
     /// Configure a `job.run` node for `sh -c <script>`, press it, and run
     /// its deferred work to the end as the host loop would.
-    fn run_script(plugin: &JobPlugin, script: &str, keep: bool) -> HashMap<String, Value> {
+    fn run_script(plugin: &JobPlugin, script: &str) -> HashMap<String, Value> {
         let mut node = plugin.create_node("job.run").expect("job.run exists");
         // Single quotes group the script into one argument; the scripts here
         // contain none themselves.
         node.set_parameter("command", Value::new(format!("/bin/sh -c '{script}'")))
-            .unwrap();
-        node.set_parameter("keep_on_failure", Value::new(keep.to_string()))
             .unwrap();
         node.set_parameter(
             "fire",
@@ -533,9 +438,8 @@ mod tests {
     }
 
     /// The run's output once it contains `needle`, or as it is after five
-    /// seconds. A run is over when its child exited or the wrapper wrote
-    /// `code`, and what it printed just before can still be on its way into
-    /// the WAL; the CI's excerpt waits for its marker the same way.
+    /// seconds. A run is over when its child exited, and what it printed just
+    /// before can still be on its way into the WAL.
     fn output_with(run_dir: &Path, needle: &str) -> String {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -549,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn a_run_is_logged_and_only_a_failed_one_keeps_its_terminal() {
+    fn a_failed_run_records_its_code_and_closes_its_terminal() {
         let state_dir = fresh_state_dir("e2e");
         let mux = MuxService::new(
             crate::mux::incarnation(),
@@ -563,20 +467,18 @@ mod tests {
         ));
         let plugin = JobPlugin::new(Arc::clone(&host) as Arc<dyn ProcessHost>);
 
-        // First run: fails with 3. Its terminal is the first the mux hands
-        // out and must still be there -- with a shell in it, since the run
-        // keeps on failure: the child has not exited even though the run is
-        // over and reported.
+        // First run: fails with 3. The run is over with its program, so its
+        // terminal, the first the mux handed out, is gone, and the exit record
+        // and the WAL say what happened.
         let outputs = run_script(
             &plugin,
             "echo marker-one got=$ZEUGHAUS_PAYLOAD in=$ZEUGHAUS_RUN_DIR; exit 3",
-            true,
         );
         assert_eq!(outputs["failed"].downcast_ref::<i64>(), Some(&3));
         assert!(!outputs.contains_key("ok"));
         let run_dir = PathBuf::from(outputs["dir"].downcast_ref::<String>().unwrap());
         assert_eq!(run_dir, state_dir.join("runs").join("1"));
-        let log = output_with(&run_dir, "a shell follows");
+        let log = output_with(&run_dir, "marker-one got=payload-text in=");
         assert!(
             log.contains("marker-one got=payload-text in="),
             "log was: {log:?}"
@@ -585,59 +487,32 @@ mod tests {
             log.contains(&format!("in={}", run_dir.display())),
             "log was: {log:?}"
         );
-        assert!(log.contains("a shell follows"), "log was: {log:?}");
         let exit = std::fs::read_to_string(run_dir.join("exit")).unwrap();
         assert!(
             exit.starts_with("code=3\nkilled=false\n"),
             "exit was: {exit:?}"
         );
-        let kept = mux
-            .session(TerminalId(1))
-            .expect("the failed run's terminal");
-        assert!(kept.exit().is_none(), "the shell should still be running");
+        assert!(!run_dir.join("code").exists());
+        assert!(
+            mux.session(TerminalId(1)).is_none(),
+            "the failed run's terminal is closed"
+        );
         assert_eq!(host.live_runs(), 0);
 
-        // Second run: succeeds. Its terminal is closed, the log stays, and no
-        // code file was written because the wrapper exited with the program.
-        let outputs = run_script(&plugin, "echo marker-two", true);
+        // Second run: succeeds, and ends the same way.
+        let outputs = run_script(&plugin, "echo marker-two");
         assert_eq!(outputs["ok"].downcast_ref::<bool>(), Some(&true));
         let run_dir = PathBuf::from(outputs["dir"].downcast_ref::<String>().unwrap());
         assert_eq!(run_dir, state_dir.join("runs").join("2"));
         assert!(output_with(&run_dir, "marker-two").contains("marker-two"));
         assert!(!run_dir.join("code").exists());
         assert!(mux.session(TerminalId(2)).is_none());
-        assert!(mux.session(TerminalId(1)).is_some());
-
-        // Third run: fails without keeping. The terminal stays with its
-        // final screen, but nothing runs in it any more.
-        let outputs = run_script(&plugin, "exit 7", false);
-        assert_eq!(outputs["failed"].downcast_ref::<i64>(), Some(&7));
-        let dead = mux.session(TerminalId(3)).expect("the terminal is kept");
-        assert!(dead.exit().is_some());
-
-        // Ending the shell that followed the first failure closes its
-        // terminal: the log holds everything it showed.
-        kept.apply(&zeughaus_mux::TerminalCommand::Text {
-            serial: 1,
-            text: "exit\r".to_string(),
-        })
-        .unwrap();
-        drop(kept);
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while mux.session(TerminalId(1)).is_some() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the failed run's terminal outlived its shell"
-            );
-            std::thread::sleep(POLL);
-        }
-        assert!(mux.session(TerminalId(3)).is_some());
 
         // A restarted host continues the numbering past what is on disk.
         let restarted = JobHost::new(mux, state_dir.clone(), DEFAULT_KEEP_RUNS);
         assert_eq!(
             restarted.new_run_dir().unwrap(),
-            state_dir.join("runs").join("4")
+            state_dir.join("runs").join("3")
         );
 
         let _ = std::fs::remove_dir_all(&state_dir);

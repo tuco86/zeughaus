@@ -13,12 +13,9 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use super::config::VmConfig;
-
-/// How long a failed run's debug shell keeps the VM up after it was opened.
-const DEBUG_HOLD: Duration = Duration::from_secs(24 * 3600);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Power {
@@ -32,8 +29,6 @@ struct Inner {
     power: Power,
     leases: u32,
     last_release: Instant,
-    /// Failed runs whose terminal may hold a shell in the guest.
-    debug_runs: Vec<PathBuf>,
 }
 
 pub struct Vm {
@@ -61,7 +56,6 @@ impl Vm {
                 power,
                 leases: 0,
                 last_release: Instant::now(),
-                debug_runs: Vec::new(),
             }),
             changed: Condvar::new(),
         })
@@ -151,14 +145,8 @@ impl Vm {
         inner.last_release = Instant::now();
     }
 
-    /// A failed run whose terminal may open a shell in the guest.
-    pub fn add_debug_run(&self, run_dir: PathBuf) {
-        self.lock().debug_runs.push(run_dir);
-    }
-
-    /// Stops the VM once nothing has used it for `idle_minutes` and no
-    /// debug shell is open in it. The stop runs on a thread of its own:
-    /// an ACPI power-off takes up to two minutes.
+    /// Stops the VM once nothing has used it for `idle_minutes`. The stop runs
+    /// on a thread of its own: an ACPI power-off takes up to two minutes.
     pub fn tick(self: &Arc<Self>) {
         let mut inner = self.lock();
         if inner.power == Power::Ready && !qemu_alive(&self.config.dir) {
@@ -168,13 +156,8 @@ impl Vm {
             self.changed.notify_all();
             return;
         }
-        inner.debug_runs.retain(|run| debug_shell_open(run));
         let idle = Duration::from_secs(self.config.idle_minutes * 60);
-        if inner.power != Power::Ready
-            || inner.leases > 0
-            || !inner.debug_runs.is_empty()
-            || inner.last_release.elapsed() < idle
-        {
+        if inner.power != Power::Ready || inner.leases > 0 || inner.last_release.elapsed() < idle {
             return;
         }
         inner.power = Power::Stopping;
@@ -346,16 +329,4 @@ fn qemu_alive(dir: &Path) -> bool {
 #[cfg(not(unix))]
 fn qemu_alive(_dir: &Path) -> bool {
     false
-}
-
-/// Whether a failed run's guest shell was opened within [`DEBUG_HOLD`] and
-/// has not ended: the launcher removes the marker when it exits.
-fn debug_shell_open(run_dir: &Path) -> bool {
-    std::fs::metadata(run_dir.join("debug-shell"))
-        .and_then(|m| m.modified())
-        .is_ok_and(|at| {
-            SystemTime::now()
-                .duration_since(at)
-                .is_ok_and(|age| age < DEBUG_HOLD)
-        })
 }

@@ -571,7 +571,7 @@ results keyed by (pin, tier, sequence).
 | capture backend | the portal is used when `WAYLAND_DISPLAY` is set |
 | paths inside nodes | `db.database` `path` and `record.writer` `dir` are settings, resolved against the runner's working directory |
 | LLM endpoint | the `base_url` setting on each conversation node (default `http://localhost:1234/v1`) |
-| runs | `<state-dir>/runs/<run-id>/` holds `wal` (a run from before the WAL: `log`), `exit`, `code` and `artifacts/` of every job run this runner executed; `--keep-runs <n>` (default 50) is how many successful runs stay, pruned when a run starts; failed runs and runs without an exit record are never pruned |
+| runs | `<state-dir>/runs/<run-id>/` holds `wal` (a run from before the WAL: `log`), `exit` and `artifacts/` of every job run this runner executed; `--keep-runs <n>` (default 50) is how many successful runs stay, pruned when a run starts; failed runs and runs without an exit record are never pruned |
 | terminals | `<state-dir>/terminals/<id>/` (`spec.json`, `sock`, `shim.log`, a shell's `wal` and `wal.1`) per live terminal, `<state-dir>/workspace.json` for the tabs a restarted runner restores |
 | editor restart | `SIGUSR1` writes `<state-dir>/restore-<pid>.json` (window size and maximized state, active tab, focused pane and collapsed sections and groups by runner, cameras, node sizes, selection, an open palette with its input, a rename in progress, terminal scroll-back, nested views open in a section without a runner, the scratch document without a runner) and `exec`s the editor, which reads and deletes it through `ZEUGHAUS_RESTORE`. The window's position is not restored: a Wayland client can neither read nor set it |
 | deployment | `deploy/install.sh`: binaries in `~/.cargo/bin`, the systemd user unit `zeughaus-runner` (`KillMode=process`: the shims outlive the runner process; `reload` is `SIGUSR1`), and `~/.local/share/applications/net.doodleshnookie.Zeughaus.desktop` with its icon, which is how a Wayland compositor shows the editor's icon. Where `systemd-run --user --scope true` succeeds at start, the runner starts every shim in a transient scope of its own, so systemd-oomd, which kills whole cgroups, takes one terminal instead of the unit with every shell |
@@ -611,13 +611,15 @@ results keyed by (pin, tier, sequence).
 
 A `job.run` node (`zeughaus-job`) executes a process with a beginning and an
 end -- a CI step, an all-night agent session -- as a terminal the runner
-owns. A failed job is therefore a terminal to attach to, not a log to read.
+owns, which an editor can attach while the process runs. The terminal ends
+with the process, and what it said is in the run's WAL.
 
 **The node.** Settings `command` (program and arguments on one line, split
 like a shell splits words -- quotes group, nothing expands, no shell runs),
 `env` (`KEY=VALUE` words, added to the runner's environment), `cwd` (empty:
-the runner's), `artifacts` (globs relative to `cwd`), `keep_on_failure`
-(default `true`); a malformed setting is `InvalidParameter`. Pins: `run`
+the runner's), `artifacts` (globs relative to `cwd`); a malformed setting is
+`InvalidParameter`, and a setting the node no longer has (`keep_on_failure`
+in an old graph) is ignored. Pins: `run`
 (trigger) and `cwd: Str` (state; wired, it wins over the setting, which is
 how a checkout upstream hands its directory on) in; `ok: Bool`,
 `failed: Int` (the exit code, `-1` for a signal or a kill) and `dir: Str`
@@ -642,15 +644,10 @@ pane whose PTY bytes are appended to the WAL before they are parsed, by the
 shim that holds the PTY. The node defers the wait to the blocking pool; when
 the child exits, `exit` is written (`code`, `killed`, `started`, `finished`),
 declared artifacts are copied under `artifacts/`, and the outputs are
-delivered like any async result. A run that exited 0 closes its terminal;
-every other outcome keeps it until someone closes it. With
-`keep_on_failure` (Unix) the program runs under a five-line `/bin/sh`
-wrapper that, on a non-zero exit, writes the code to `<run_dir>/code` and
-`exec`s `$SHELL` in the same directory and environment: the run is reported
-from the code file while the shell lives on in the terminal, which is what
-makes a failed job a place to look rather than a screen to read. When that
-shell ends, the terminal closes; the WAL holds what it showed. A restarted
-runner does the same for the terminals of recorded runs with a code file.
+delivered like any async result. A run is over when its program is, with the
+program's exit code, and its terminal closes whatever the outcome; the WAL
+holds what it showed. A restarted runner closes the terminals of recorded
+runs the same way.
 Readers go through `jobs::run_output`, which also reads the raw `log` of a
 run from before the WAL.
 The `flow.all` node is the fan-in: it fires once every wired input has
@@ -701,9 +698,7 @@ through weida only: no HTTP listener and no polling in the runner.
 locked `Triggered` group, which only the runner fills and from which no tab
 is dragged and which exists only while it holds a tab (the next run creates
 it again); a press from an editor leaves its run detached. The group shows
-runs that are still going: a failed run's terminal moves to the detached
-list ("Terminal / Attach" in the palette), shell and all, unless a client
-attached it somewhere else.
+runs that are still going: a run's terminal closes when its program ends.
 `zeughaus-runner hold <endpoint> on|off` asks `/hold` and
 prints the reply. `<endpoint>` is the pinned root URL a runner prints at
 start; the client identity comes from the state directory (`--state-dir`,
@@ -721,7 +716,7 @@ outside 1 to 10080 minutes, a deadline outside 1 to 1440) is logged once as
 `started`. It runs only when the runner is not held and has no live run: as
 a run of the job host (`<exe> timeout <secs> -- <command..>`, label
 `maintain <name>`, working directory the home directory, `external`, so a
-terminal in the `Triggered` group that a failure keeps), one task at a time.
+terminal in the `Triggered` group while it runs), one task at a time.
 While it runs the host counts as held: a CI `prepare` waits and a graph job
 is refused, so a toolchain update never swaps files under a build. A task
 that does not end with code 0 is logged as `[maintain] <name>: exited N |
@@ -890,15 +885,13 @@ own, after the runner is no longer held (`zeughaus-runner hold`):
    `<run>/artifacts` to `ci/artifacts/<run>/` (on success), remove
    `<run>/inputs` and send `Finished { code, killed, timed_out, artifacts }`.
 
-A failed run is not over for the runner: `inner.sh`/`launch.sh` writes
-`<run>/code`, which ends the wait and sends `Finished`, and execs a shell
-where the job ran. The failed run's terminal is that debug session on the
-runner, detached and attachable from the palette, and closes when the shell
-ends; its `inputs/` is removed then, not before. For a machine job it is an
-ssh session in the guest, and the guest's run directory goes when it ends (on
-success, once the output is copied back). A run that fails before its shell
-(a checkout, an image build, the copy into the guest) keeps its terminal
-with the final screen, detached as well.
+A run is over when its program is. `inner.sh` replaces itself with the job
+and `launch.sh` ends with its exit code (70 for a checkout that failed, 71
+for an image build, 75 for the copy into the guest), so a failed run's
+terminal closes like a successful one's and nothing waits behind it: the log
+is the record, `Finished` follows once it has settled, and `<run>/inputs`
+goes with the run. For a machine job the guest's run directory goes when the
+launcher ends (on success, once the output is copied back).
 
 The launcher puts a persistent workspace `ci/work/<repo>/<workspace>`, named
 after the job or after its `context`, into the state the assignment's
@@ -918,8 +911,8 @@ in between. Then it starts the job:
   `launch.sh` and `inner.sh`: the same checkout, the secrets dot-sourced from
   `env.ps1` and deleted, the job under `timeout`, whose job object ends the
   whole process tree at the deadline with 124 and when the launcher ends (a
-  closed terminal signals nothing on Windows), and on failure the `code`
-  file and a PowerShell in the workspace. The Windows runner has no shims:
+  closed terminal signals nothing on Windows), and the script's exit code is
+  the job's. The Windows runner has no shims:
   it holds every process it starts in a job object of its own, so its
   terminals and runs end with it, and a run a restarted runner finds no
   terminal for is recorded as killed.
@@ -963,10 +956,10 @@ Commit statuses (`zeughaus/<job>`) go from the CI to GitHub or Forgejo
 through `curl`, with the token on stdin.
 
 **A failure says why.** When a run ends, the CI reads the end of its stored
-WAL, removes the escape sequences (`excerpt.rs`) and keeps the 40 lines
-before the launcher's `[zeughaus-ci] <job> exited <code>` marker: the job's
-own last words, not the debug shell's. The excerpt goes into the job's
-record. The commit status carries its first line that looks like a cause
+WAL, removes the escape sequences (`excerpt.rs`) and keeps the last 40
+lines, trailing blank ones dropped: the job's own last words. The excerpt
+goes into the job's record. The commit status carries its first line that
+looks like a cause
 (`panicked at`, then `error[`, `error:`, `FAILED`) instead of the bare exit
 code, unless the job holds secrets, whose output stays on the CI. `zeughaus-ci
 status` prints the excerpt under every failed job of each repository's
@@ -1130,14 +1123,13 @@ while free, a pause circle while busy, filled when the mode is set by hand.
 A runner without `[busy]` reports no machine and has no control.
 
 **Machines** (`machine.rs`, a runner's `[machines.<name>]`) are Windows VMs
-(`kind = "windows-vm"`). One is booted on the first job that needs it (`vm.sh
-run`, then `prepare.ps1` in the guest). It runs one job at a time, and `vm.sh
-stop` shuts it down after `idle_minutes` without a job. A guest shell opened
-within the last 24 hours (`<run>/debug-shell`, removed when the run's
-terminal closes) keeps it up and runs `.ps1` jobs. The launcher copies the
-bundle, the inputs and an `env.ps1` into the guest, checks the commit out in
-`W:\work\<repo>\<workspace>`, runs the job under `ssh -tt`, copies `out/`
-back and removes the run directory; a failure opens a shell in the guest.
+(`kind = "windows-vm"`) that run `.ps1` jobs. One is booted on the first job
+that needs it (`vm.sh run`, then `prepare.ps1` in the guest). It runs one job
+at a time, and `vm.sh stop` shuts it down after `idle_minutes` without a job.
+The launcher copies the bundle, the inputs and an `env.ps1` into the
+guest, checks the commit out in `W:\work\<repo>\<workspace>`, runs the job
+under `ssh -tt`, copies `out/` back after a success and removes the run
+directory whatever the outcome; its exit code is the job's.
 The runner reports each machine's status to the CI as `Machine`.
 
 **The CI view.** `zeughaus-ci serve` is a weida peer for editors too: `/ci`
@@ -1276,7 +1268,7 @@ through `podman unshare rm` because podman containers leave subordinate-uid
 files (plain removal under Apple's `container`, whose virtiofs writes files
 the user owns), removes image tags no pipeline uses (`podman rmi`,
 `container image delete` on macOS), deletes an artifact set when the CI
-drops it, and a run's `inputs/` when the run (or its debug shell) ends.
+drops it, and a run's `inputs/` when the run ends.
 
 **Secrets** (`secrets.rs`) live in one OpenBao KV v2 document
 (`[secrets]` in `ci.toml`, `secret/zeughaus/ci`); `ci.toml` only names

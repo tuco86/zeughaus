@@ -3,9 +3,7 @@
 //!
 //! A run's output is the PTY's bytes as the terminal received them, colours,
 //! cursor movement and progress bars included. [`plain_text`] reduces that
-//! to the lines a reader would see; the excerpt is the tail before the
-//! launcher's `[zeughaus-ci] <job> exited <code>` marker, so the shell that
-//! follows a failure never ends up in it.
+//! to the lines a reader would see; the excerpt is the last of them.
 
 use std::path::Path;
 
@@ -14,8 +12,6 @@ pub const EXCERPT_LINES: usize = 40;
 /// Bytes read from the end of a log for an excerpt: 40 lines of a build
 /// with long paths and colour codes fit many times over.
 const TAIL_BYTES: usize = 256 * 1024;
-/// The prefix of every line the launcher prints itself.
-const MARKER: &str = "[zeughaus-ci] ";
 /// What a cause line looks like, in order of preference: a panic or a
 /// compiler error says more than the `error: test failed` or
 /// `test result: FAILED` cargo prints after it.
@@ -89,19 +85,10 @@ fn skip_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     }
 }
 
-fn is_marker(line: &str) -> bool {
-    line.trim_start().starts_with(MARKER) && line.contains(" exited ")
-}
-
-/// The last [`EXCERPT_LINES`] lines before the last exit marker, trailing
-/// blank lines dropped; the end of the text when there is no marker.
+/// The last [`EXCERPT_LINES`] lines of `text`, trailing blank lines dropped.
 pub fn excerpt(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
-    let end = lines
-        .iter()
-        .rposition(|l| is_marker(l))
-        .unwrap_or(lines.len());
-    let mut body = &lines[..end];
+    let mut body = lines.as_slice();
     while let Some((last, rest)) = body.split_last()
         && last.trim().is_empty()
     {
@@ -130,9 +117,8 @@ pub fn cause(excerpt: &str) -> Option<String> {
 
 /// The excerpt of the failed run whose transcript is in `dir`, also written
 /// to `<dir>/excerpt`. The transcript is complete when the runner reports
-/// the run finished, so a missing exit marker means none was printed (a
-/// launcher that failed before the job) and the excerpt is the end of the
-/// log. `None` when the output cannot be read.
+/// the run finished, so the excerpt is the end of the log. `None` when the
+/// output cannot be read.
 pub fn extract(dir: &Path) -> Option<String> {
     let text = plain_text(&run_output_tail(dir, TAIL_BYTES).ok()?);
     let excerpt = excerpt(&text);
@@ -188,9 +174,9 @@ mod tests {
     }
 
     #[test]
-    fn excerpt_ends_before_the_last_marker_and_keeps_forty_lines() {
+    fn excerpt_keeps_the_last_forty_lines_and_drops_trailing_blank_ones() {
         let mut text: String = (0..60).map(|i| format!("line {i}\n")).collect();
-        text.push_str("\n\n[zeughaus-ci] windows exited 101; a shell follows\nPS W:\\> dir\n");
+        text.push_str("\n\n");
         let excerpt = excerpt(&text);
         let lines: Vec<&str> = excerpt.lines().collect();
         assert_eq!(lines.len(), EXCERPT_LINES);
@@ -198,8 +184,10 @@ mod tests {
         assert_eq!(lines.last(), Some(&"line 59"));
     }
 
+    /// A line the launcher printed itself (a failed checkout) is the end of
+    /// the log like any other.
     #[test]
-    fn excerpt_without_a_marker_is_the_end_of_the_log() {
+    fn a_launcher_line_at_the_end_stays_in_the_excerpt() {
         let excerpt = excerpt("one\n[zeughaus-ci] checkout failed\n\n");
         assert_eq!(excerpt, "one\n[zeughaus-ci] checkout failed");
     }

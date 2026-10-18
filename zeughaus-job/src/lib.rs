@@ -3,10 +3,10 @@
 //! A job is a graph node because that is where its configuration already
 //! belongs: what to start, with which arguments, environment and working
 //! directory, and which files to keep afterwards. The runner executes it in
-//! the mux it already owns, so a failed job is a terminal to attach to rather
-//! than a log to read -- and that is exactly why the mux stays argv-free: no
-//! `TopologyCommand` ever carries a command line, because the command line
-//! lives in this node's settings and reaches the runner as a graph change.
+//! the mux it already owns, so a running job is a terminal to attach to --
+//! and that is exactly why the mux stays argv-free: no `TopologyCommand`
+//! ever carries a command line, because the command line lives in this node's
+//! settings and reaches the runner as a graph change.
 //!
 //! The plugin does not know how to start anything. It declares
 //! [`ProcessHost`], and the runner implements it over its mux service. The
@@ -39,10 +39,6 @@ pub struct JobSpec {
     /// The directory this run's WAL, exit record and artifacts go into,
     /// already created by [`ProcessHost::new_run_dir`].
     pub run_dir: PathBuf,
-    /// After a non-zero exit, leave a shell in the run's terminal with the
-    /// same working directory and environment, so the failure can be looked
-    /// at where it happened. A host that cannot do that ignores it.
-    pub keep_on_failure: bool,
     /// When the run started, in unix seconds: what its exit record says,
     /// whichever process ends up writing it.
     pub started: u64,

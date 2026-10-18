@@ -176,7 +176,7 @@ pub struct JobView {
     /// `error:`, `FAILED`); `None` when it did not fail or nothing matches.
     #[serde(default)]
     pub cause: Option<String>,
-    /// The stored excerpt of a failed job: the lines before its exit marker,
+    /// The stored excerpt of a failed job: the end of its output,
     /// escape-free.
     #[serde(default)]
     pub excerpt: Option<String>,

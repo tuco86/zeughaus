@@ -12,7 +12,7 @@
 //! sends `DropArtifacts`; a consumer on another runner gets them relayed
 //! through the CI, which stores nothing. A consumer's copy of its inputs
 //! (`inputs/` in the run directory, the guest's copy on a VM) goes with its
-//! run, or with the debug shell that follows a failed one.
+//! run.
 //!
 //! The connection is the runner's to keep: it dials the CI, says who it is and
 //! which runs it still knows, and redials with a growing delay when it is

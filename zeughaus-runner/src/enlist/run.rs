@@ -236,7 +236,7 @@ impl Executor {
 
     /// The CI is done with `run`: its record and its delivery thread go. The
     /// artifact set stays until the CI's `DropArtifacts`, and the run's
-    /// inputs go with the run (or its debug shell), neither of them here.
+    /// inputs go with the run, neither of them here.
     pub fn forget(&self, run: &str) {
         if let Some(ctl) = lock(&self.runs).remove(run) {
             ctl.forgotten.store(true, Ordering::SeqCst);
@@ -420,10 +420,6 @@ impl Executor {
                 git::bundle(mirror, a.number, &run_dir.join("src.bundle"))?;
                 stage::write_secret(&secret_dir.join("env.ps1"), &launch::env_ps1(&remote_env))?;
                 write(&run_dir.join("vm").join("inner.ps1"), &launch::inner_ps1(a))?;
-                write(
-                    &run_dir.join("vm").join("debug.ps1"),
-                    &launch::debug_ps1(&a.run),
-                )?;
                 Target::WindowsVm {
                     ssh_host: ssh_host.as_deref().unwrap_or_default(),
                 }
@@ -490,7 +486,6 @@ impl Executor {
             env: host_env,
             cwd: Some(run_dir.to_path_buf()),
             run_dir: run_dir.to_path_buf(),
-            keep_on_failure: false,
             started,
             artifacts: Vec::new(),
             external: true,
@@ -611,9 +606,6 @@ impl Executor {
             && let Some(vm) = self.machines.get(name)
         {
             vm.release();
-            if exit.code != Some(0) {
-                vm.add_debug_run(run_dir.to_path_buf());
-            }
         }
         if !ctl.forgotten.load(Ordering::SeqCst) {
             let assigned = Assigned {
@@ -637,7 +629,7 @@ impl Executor {
             }
         );
         self.housekeeping(a);
-        self.release_inputs(run_dir);
+        remove_inputs(&run_dir.join("inputs"));
     }
 
     /// Moves the artifacts of `run` out of its run directory to
@@ -668,41 +660,14 @@ impl Executor {
         }
     }
 
-    /// Removes the run's copy of its inputs once nothing reads it: at the end
-    /// of the run, or, when a shell follows a failure, when that shell ends.
-    /// A shell still open is waited for on a thread of its own.
-    fn release_inputs(self: &Arc<Self>, run_dir: &Path) {
-        let inputs = run_dir.join("inputs");
-        if !inputs.exists() {
-            return;
-        }
-        if !(run_dir.join("code").exists() && self.host.run_child_alive(run_dir)) {
-            remove_inputs(&inputs);
-            return;
-        }
-        let exec = Arc::clone(self);
-        let run_dir = run_dir.to_path_buf();
-        let spawned = std::thread::Builder::new()
-            .name("zeughaus-enlist-inputs".into())
-            .spawn(move || {
-                while exec.host.run_child_alive(&run_dir) {
-                    std::thread::sleep(RECOVERY_POLL);
-                }
-                remove_inputs(&run_dir.join("inputs"));
-            });
-        if let Err(e) = spawned {
-            // The sweep at the next start removes them.
-            eprintln!("[enlist] cannot start a thread to release inputs: {e}");
-        }
-    }
-
-    /// Releases the inputs of every run that has ended and still has them:
-    /// a runner restarted while a debug shell was open found them there. A
-    /// run without an exit record is still going, and its end releases them.
-    pub(super) fn sweep_inputs(self: &Arc<Self>) {
+    /// Removes the inputs of every run that has ended and still has them: a
+    /// process that stopped between a run's exit record and the removal left
+    /// them there. A run without an exit record is still going, and its end
+    /// removes them.
+    pub(super) fn sweep_inputs(&self) {
         for run_dir in self.host.run_dirs() {
             if run_dir.join("exit").exists() {
-                self.release_inputs(&run_dir);
+                remove_inputs(&run_dir.join("inputs"));
             }
         }
     }

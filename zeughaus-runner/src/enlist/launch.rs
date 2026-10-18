@@ -3,9 +3,8 @@
 //! `launch.sh` is the terminal's program on a unix runner for every kind of
 //! job: it checks the commit out (on the host, or over ssh in the guest) and
 //! starts the job where it runs. `inner.sh` / `inner.ps1` is the job itself
-//! in its environment; on failure it records the exit code where
-//! [`JobHost`](crate::jobs::JobHost)'s wait finds it and becomes a shell in
-//! the same place, so a failed job is a terminal to debug in. A Windows
+//! in its environment. Every script ends with the job's exit code, and the
+//! terminal closes with it: nothing stays behind a failed job. A Windows
 //! runner runs host jobs only, and `launch.ps1` does all of that in one
 //! script.
 
@@ -229,9 +228,8 @@ pub fn launch_sh(launch: &Launch<'_>) -> String {
     let inner = launch.run_dir.join("inner.sh");
     match &launch.target {
         Target::Host { .. } => {
-            // Read into this shell and deleted at once: the job and its
-            // debug shell inherit the values, and no file holds them while
-            // a failed run's shell stays open for days.
+            // Read into this shell and deleted at once: the job inherits the
+            // values, and no file holds them while it runs.
             let _ = write!(
                 out,
                 "set -a\n\
@@ -299,7 +297,8 @@ pub fn launch_sh(launch: &Launch<'_>) -> String {
     out
 }
 
-/// `inner.sh`: the job in its environment, then a shell if it failed.
+/// `inner.sh`: the job in its environment. The job replaces the script, so
+/// the script's exit code is the job's.
 ///
 /// A host job (`runner_exe` is this runner's path) is timed by the runner's
 /// own `timeout` subcommand, because macOS has no coreutils one; a container
@@ -318,11 +317,7 @@ pub fn inner_sh(a: &Assignment, runner_exe: Option<&Path>) -> String {
     format!(
         "cd \"$CI_WORKSPACE\" || exit 70\n\
          mkdir -p \"$CI_OUTPUT\"\n\
-         {run}; rc=$?\n\
-         [ \"$rc\" -eq 0 ] && exit 0\n\
-         printf '%s\\n' \"$rc\" > \"$ZEUGHAUS_RUN_DIR/code\"\n\
-         printf '\\n[zeughaus-ci] %s exited %s; a shell follows, exit it to end the run\\n' \"$CI_JOB\" \"$rc\"\n\
-         if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi\n",
+         exec {run}\n",
     )
 }
 
@@ -382,15 +377,6 @@ pub fn inner_ps1(a: &Assignment) -> String {
     )
 }
 
-/// `debug.ps1`: the job's environment and workspace, for the shell that
-/// follows a failure.
-pub fn debug_ps1(run_id: &str) -> String {
-    format!(
-        ". {env}\r\nSet-Location $env:CI_WORKSPACE\r\n",
-        env = ps_quote(&format!(r"{}\env.ps1", guest_run_dir(run_id))),
-    )
-}
-
 /// The PowerShell of a Windows host, by path: the runner may run with a
 /// `PATH` that does not name it.
 pub fn windows_powershell() -> String {
@@ -442,9 +428,9 @@ fn enter_try_ps1(upload: &Upload) -> String {
 /// `workspace` (or, for a job that continues its context, the check that an
 /// earlier job of the pipeline left it; for a try run, the checkouts of its
 /// upload below it), the secrets read into the session
-/// from `env.ps1` and deleted at once, the job under this runner's `timeout`,
-/// and on failure the exit code in `$env:ZEUGHAUS_RUN_DIR\code` and a shell
-/// in the workspace. The secret directory goes however the script ends.
+/// from `env.ps1` and deleted at once, and the job under this runner's
+/// `timeout`, whose exit code is the script's. The secret directory goes
+/// however the script ends.
 pub fn launch_ps1(
     a: &Assignment,
     secret_dir: &Path,
@@ -501,13 +487,7 @@ pub fn launch_ps1(
          Remove-Item -Force -LiteralPath $secrets\r\n\
          New-Item -ItemType Directory -Force -Path $env:CI_OUTPUT | Out-Null\r\n\
          & {exe} timeout {secs} -- {interpreter} -NoLogo -NoProfile -ExecutionPolicy Bypass -File {file}\r\n\
-         $rc = $LASTEXITCODE\r\n\
-         if ($rc -eq 0) {{ exit 0 }}\r\n\
-         Set-Content -LiteralPath (Join-Path $env:ZEUGHAUS_RUN_DIR 'code') -Value $rc -Encoding ascii\r\n\
-         Write-Host ''\r\n\
-         Write-Host \"[zeughaus-ci] $env:CI_JOB exited $rc; a shell follows, exit it to end the run\"\r\n\
-         & {shell} -NoLogo -NoProfile -ExecutionPolicy Bypass\r\n\
-         exit $rc\r\n\
+         exit $LASTEXITCODE\r\n\
          }} finally {{\r\n\
          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath $secretDir\r\n\
          {drop_bundles}\
@@ -517,12 +497,11 @@ pub fn launch_ps1(
         exe = path(runner_exe),
         interpreter = ps_quote(&a.interpreter),
         file = ps_quote(&format!(r"{CI_DIR}\{}", a.file)),
-        shell = ps_quote(&windows_powershell()),
     )
 }
 
 /// `launch.sh` for a Windows VM job: stage the run in the guest over ssh, run
-/// it there, copy its output back, and on failure open a shell in the guest.
+/// it there and copy its output back. The script's exit code is the job's.
 /// The guest's copy of the run is removed when the launcher ends.
 fn launch_sh_windows_vm(launch: &Launch<'_>) -> String {
     let Target::WindowsVm { ssh_host } = launch.target else {
@@ -535,26 +514,24 @@ fn launch_sh_windows_vm(launch: &Launch<'_>) -> String {
     // PowerShell, the guest's default shell.
     let scp_dir = format!("/W:/ci/runs/{id}");
     let host = sh_quote(ssh_host);
-    let debug_marker = sh_path(&run.join("debug-shell"));
     // The guest's copy of the run (inputs, secrets, bundle, output) goes
-    // with the run however the launcher ends: after the copy-back, after the
-    // shell that follows a failure, or when the terminal is closed. Failure
-    // to remove is ignored, and a guest that does not answer is not waited
-    // for.
+    // with the run however the launcher ends: after the copy-back, on a
+    // failure, or when the terminal is closed. Failure to remove is ignored,
+    // and a guest that does not answer is not waited for.
     let remove_guest = sh_quote(&format!(
         "Remove-Item -Recurse -Force -ErrorAction SilentlyContinue {guest}"
     ));
     let mut out = preamble(
         launch,
         &format!(
-            "; rm -f {debug_marker}; ssh -o ConnectTimeout=15 {host} {remove_guest} </dev/null >/dev/null 2>&1 || true"
+            "; ssh -o ConnectTimeout=15 {host} {remove_guest} </dev/null >/dev/null 2>&1 || true"
         ),
     );
     let _ = write!(
         out,
         "run={run}\n\
          ssh {host} {mkdir} </dev/null || exit 75\n\
-         scp -q \"$run/vm/inner.ps1\" \"$run/vm/debug.ps1\" \"$run/src.bundle\" \"$secret_dir/env.ps1\" {host}:{dest} || exit 75\n\
+         scp -q \"$run/vm/inner.ps1\" \"$run/src.bundle\" \"$secret_dir/env.ps1\" {host}:{dest} || exit 75\n\
          scp -q -r \"$run/inputs\" {host}:{dest_in} || exit 75\n\
          exec 3<&0\n\
          ssh -tt {host} {inner} <&3 &\n\
@@ -567,12 +544,7 @@ fn launch_sh_windows_vm(launch: &Launch<'_>) -> String {
          [ -e \"$run/timeout\" ] && rc=124\n\
          if [ \"$rc\" -eq 0 ]; then\n\
          \tscp -q -r {host}:{dest_out} \"$run/artifacts\" || rc=74\n\
-         \t[ \"$rc\" -eq 0 ] && exit 0\n\
          fi\n\
-         printf '%s\\n' \"$rc\" > \"$run/code\"\n\
-         printf '\\n[zeughaus-ci] %s exited %s; a shell in the guest follows\\n' {job} \"$rc\"\n\
-         touch {debug_marker}\n\
-         ssh -tt {host} {debug} <&3\n\
          exit $rc\n",
         run = sh_path(run),
         mkdir = sh_quote(&format!(
@@ -587,10 +559,6 @@ fn launch_sh_windows_vm(launch: &Launch<'_>) -> String {
         inner = sh_quote(&format!(
             r"powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File {guest}\inner.ps1"
         )),
-        debug = sh_quote(&format!(
-            r"powershell -NoLogo -NoExit -ExecutionPolicy Bypass -File {guest}\debug.ps1"
-        )),
-        job = sh_quote(&launch.assignment.job),
     );
     out
 }
@@ -671,9 +639,10 @@ mod tests {
     }
 
     /// The rendered `inner.sh` of a host job runs the job under the given
-    /// timeout program and reports a failure as the code file.
+    /// timeout program and ends with the job's exit code: no shell follows a
+    /// failure, and nothing is written for the runner to look for.
     #[test]
-    fn a_failed_host_job_leaves_its_code_where_the_wait_finds_it() {
+    fn a_failed_host_job_exits_with_its_code() {
         let base = std::env::temp_dir().join(format!("zci-launch-inner-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let ws = base.join("ws");
@@ -690,22 +659,121 @@ mod tests {
             .status()
             .unwrap();
         let a = assignment(Place::Host);
-        let script = inner_sh(&a, Some(&stub))
-            // The shell that follows a failure would wait for input.
-            .replace("if command -v bash", "exit 0; if command -v bash");
         let output = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg(script)
+            .arg(inner_sh(&a, Some(&stub)))
             .env("CI_WORKSPACE", &ws)
             .env("CI_OUTPUT", base.join("out"))
             .env("CI_JOB", "build")
             .env("ZEUGHAUS_RUN_DIR", &run)
             .output()
             .expect("run sh");
-        let code = std::fs::read_to_string(run.join("code")).ok();
+        let wrote_code = run.join("code").exists();
         let _ = std::fs::remove_dir_all(&base);
         assert!(String::from_utf8_lossy(&output.stdout).contains("ran"));
-        assert_eq!(code.as_deref(), Some("3\n"));
+        assert_eq!(output.status.code(), Some(3));
+        assert!(!wrote_code);
+    }
+
+    /// The shell side of a Windows VM job, run for real against stand-ins for
+    /// `ssh` and `scp`: the launcher ends with the guest's exit code, copies
+    /// the output back only after a success, and opens no second session
+    /// after a failure.
+    #[test]
+    fn a_vm_job_ends_with_the_guests_exit_code_and_opens_no_shell() {
+        let base = std::env::temp_dir().join(format!("zci-launch-vm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (bin, run, secret) = (base.join("bin"), base.join("run"), base.join("secret"));
+        for dir in [&bin, &run, &secret] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        // `ssh` logs its arguments and answers the read of the guest's exit
+        // code with `$STUB_GUEST_RC`; `scp` only logs.
+        let log = base.join("log");
+        for (name, body) in [
+            (
+                "ssh",
+                "printf '%s\\n' \"ssh $*\" >> \"$STUB_LOG\"\n\
+                 case \"$*\" in *Get-Content*) printf '%s\\n' \"$STUB_GUEST_RC\" ;; esac\n",
+            ),
+            ("scp", "printf '%s\\n' \"scp $*\" >> \"$STUB_LOG\"\n"),
+        ] {
+            let path = bin.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+            std::process::Command::new("chmod")
+                .arg("+x")
+                .arg(&path)
+                .status()
+                .unwrap();
+        }
+        let a = assignment(Place::Machine {
+            name: "win11".to_owned(),
+        });
+        let script = launch_sh(&Launch {
+            assignment: &a,
+            run_dir: &run,
+            secret_dir: &secret,
+            mirror: Path::new("/s/ci/mirrors/demo.git"),
+            target: Target::WindowsVm { ssh_host: "win11" },
+        });
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let launch = |guest_rc: &str| {
+            let _ = std::fs::remove_file(&log);
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&script)
+                .env("PATH", &path)
+                .env("STUB_LOG", &log)
+                .env("STUB_GUEST_RC", guest_rc)
+                .output()
+                .expect("run sh");
+            (
+                output.status.code(),
+                std::fs::read_to_string(&log).unwrap_or_default(),
+            )
+        };
+
+        let (code, calls) = launch("3");
+        assert_eq!(code, Some(3), "{calls}");
+        assert_eq!(calls.matches("ssh -tt").count(), 1, "{calls}");
+        assert!(
+            !calls.contains("debug.ps1") && !calls.contains("-NoExit"),
+            "{calls}"
+        );
+        assert!(
+            !calls.contains("demo.7.build/out"),
+            "a failed run copies nothing back: {calls}"
+        );
+        assert!(!run.join("code").exists());
+
+        let (code, calls) = launch("0");
+        assert_eq!(code, Some(0), "{calls}");
+        assert!(
+            calls.contains("scp -q -r win11:/W:/ci/runs/demo.7.build/out"),
+            "{calls}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A Windows host job ends with its exit code, and nothing follows it.
+    #[test]
+    fn a_windows_host_launcher_ends_with_the_jobs_exit_code() {
+        let ps1 = launch_ps1(
+            &assignment(Place::Host),
+            Path::new(r"C:\s\secret"),
+            Path::new(r"C:\s\mirror"),
+            Path::new(r"C:\s\work\demo\linux"),
+            Path::new(r"C:\s\runner.exe"),
+        );
+        assert!(
+            ps1.contains("-File '.zeughaus-ci\\build.sh'\r\nexit $LASTEXITCODE\r\n} finally {\r\n"),
+            "{ps1}"
+        );
+        assert!(!ps1.contains("shell"), "{ps1}");
     }
 
     fn container_script(engine: Engine) -> String {
