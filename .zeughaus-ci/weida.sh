@@ -1,14 +1,18 @@
 # Sourced by the jobs that build the workspace; no header, so not a job.
 # The caller sets `cache` and holds FORGEJO_READ_TOKEN, which this unsets.
 #
-# The workspace builds weida from the sibling checkout `../weida`. A manual
-# run brings its own in CI_SIBLINGS; otherwise it is weida's main branch, as
-# on the workstation, kept in the cache and fetched with the read-only token,
-# which travels in the environment, not in argv.
+# The workspace builds weida from the sibling checkout `../weida`, which is
+# always a link to `$cache/weida`: one stable path, so cargo's fingerprints
+# do not see the sources move between trees of different mtimes. A manual
+# run fetches the weida it brings in CI_SIBLINGS into that checkout;
+# otherwise it is weida's main branch, as on the workstation, fetched with
+# the read-only token, which travels in the environment, not in argv.
+weida="$cache/weida"
 if [ -n "${CI_SIBLINGS:-}" ] && [ -d "$CI_SIBLINGS/weida/.git" ]; then
-    weida="$CI_SIBLINGS/weida"
+    [ -d "$weida/.git" ] || git init -q "$weida"
+    git -C "$weida" fetch -q "$CI_SIBLINGS/weida" HEAD
+    git -C "$weida" checkout -q --force --detach FETCH_HEAD
 else
-    weida="$cache/weida"
     url=https://git.doodleshnookie.net/tuco86/weida.git
     export GIT_CONFIG_COUNT=1
     export GIT_CONFIG_KEY_0=http.extraHeader

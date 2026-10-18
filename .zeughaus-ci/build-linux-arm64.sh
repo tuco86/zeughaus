@@ -16,10 +16,10 @@ cargo_env
 export ZEUGHAUS_BUILD="$CI_PIPELINE"
 . "$CI_WORKSPACE/.zeughaus-ci/weida.sh"
 
-cargo build --locked --release -p zeughaus -p zeughaus-runner -p zeughaus-ci
+step cargo build --locked --release -p zeughaus -p zeughaus-runner -p zeughaus-ci
 stage_dir
 for bin in zeughaus zeughaus-runner zeughaus-ci; do
     cp "$CARGO_TARGET_DIR/release/$bin" "$stage/"
 done
 "$stage/zeughaus-runner" --help >/dev/null
-pack_tar
+step pack_tar

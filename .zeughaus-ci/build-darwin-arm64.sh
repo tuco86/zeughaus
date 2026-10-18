@@ -17,8 +17,8 @@ export ZEUGHAUS_BUILD="$CI_PIPELINE"
 
 triple=aarch64-apple-darwin
 stage_dir
-sh deploy/macos-app.sh "$stage" "$triple"
-cargo build --locked --release --target "$triple" -p zeughaus-runner
+step sh deploy/macos-app.sh "$stage" "$triple"
+step cargo build --locked --release --target "$triple" -p zeughaus-runner
 cp "$CARGO_TARGET_DIR/$triple/release/zeughaus-runner" "$stage/"
 "$stage/zeughaus-runner" --help >/dev/null
-pack_tar
+step pack_tar

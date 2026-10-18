@@ -456,3 +456,5 @@ invocation per workspace at a time; long runs get a generous timeout.
   `zeughaus-core::document`, runtime traffic in `zeughaus-link`, terminals
   in `zeughaus-mux`. Changing a wire type means changing both ends in one
   commit.
+- The Rust toolchain is pinned in `rust-toolchain.toml`; bumping it also
+  changes the `FROM` tag of `.zeughaus-ci/trixie.Containerfile`.

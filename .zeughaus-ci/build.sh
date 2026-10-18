@@ -12,7 +12,20 @@ cargo_env() {
     export CARGO_TERM_COLOR=always
 }
 
-step() { printf '\n== %s\n' "$*"; "$@"; }
+# Runs one command as a visible, timed step. Its failure returns the
+# command's code, so under `set -e` the job stops there; the `if` only
+# switches `set -e` off for the command's own body.
+step() {
+    printf '\n== %s\n' "$*"
+    step_start=$(date +%s)
+    if "$@"; then
+        printf '== %s: %s s\n' "$*" "$(( $(date +%s) - step_start ))"
+    else
+        step_code=$?
+        printf '== %s failed after %s s\n' "$*" "$(( $(date +%s) - step_start ))"
+        return "$step_code"
+    fi
+}
 
 # clippy and the tests: what every platform checks.
 check_platform() {

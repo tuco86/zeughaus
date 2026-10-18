@@ -3,9 +3,9 @@
 # links (pipewire through bindgen, xcb for scrap, wayland and xkbcommon for
 # winit) and the gate's toolchain parts (clippy, rustfmt, the wasm target).
 # The same file serves amd64 under podman and arm64 under Apple `container`.
-# A changed file is a new image tag; the rust image tag is resolved when the
-# image is built.
-FROM docker.io/library/rust:1-trixie
+# A changed file is a new image tag. The rust tag equals the channel of
+# rust-toolchain.toml; change both together.
+FROM docker.io/library/rust:1.99.1-trixie
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

@@ -9,30 +9,38 @@ $ErrorActionPreference = 'Stop'
 function Run([string]$Command, [string[]]$Arguments = @()) {
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
+    $clock = [Diagnostics.Stopwatch]::StartNew()
     try {
         & $Command @Arguments 2>&1 | ForEach-Object { Write-Host "$_" }
         $code = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previous
     }
+    $seconds = [int][Math]::Round($clock.Elapsed.TotalSeconds)
     if ($code -ne 0) {
+        Write-Host "== $Command $($Arguments -join ' ') failed after $seconds s"
         Write-Host "$Command $($Arguments -join ' ') failed with exit code $code"
         exit $code
     }
+    Write-Host "== $Command $($Arguments -join ' '): $seconds s"
 }
 
 $cache = Join-Path $env:CI_WORKSPACE '.ci-cache'
 $env:CARGO_TARGET_DIR = Join-Path $cache 'target'
 
-# A manual run brings its own weida in CI_SIBLINGS; otherwise it is weida's
-# main branch, as weida.sh does for the Unix jobs, kept in the cache and
-# fetched with the read-only token, which travels in the environment, not in
-# argv.
-$source = $null
-if ($env:CI_SIBLINGS -and (Test-Path (Join-Path (Join-Path $env:CI_SIBLINGS 'weida') '.git'))) {
-    $source = Join-Path $env:CI_SIBLINGS 'weida'
+# `$cache\weida` is always the weida checkout, as weida.sh does for the Unix
+# jobs. A manual run fetches the weida it brings in CI_SIBLINGS into it;
+# otherwise it is weida's main branch, fetched with the read-only token,
+# which travels in the environment, not in argv.
+$source = Join-Path $cache 'weida'
+$sibling = if ($env:CI_SIBLINGS) { Join-Path $env:CI_SIBLINGS 'weida' } else { $null }
+if ($sibling -and (Test-Path (Join-Path $sibling '.git'))) {
+    if (-not (Test-Path (Join-Path $source '.git'))) {
+        Run 'git' @('init', '-q', $source)
+    }
+    Run 'git' @('-C', $source, 'fetch', '-q', $sibling, 'HEAD')
+    Run 'git' @('-C', $source, 'checkout', '-q', '--force', '--detach', 'FETCH_HEAD')
 } else {
-    $source = Join-Path $cache 'weida'
     $weidaUrl = 'https://git.doodleshnookie.net/tuco86/weida.git'
     $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("zeughaus-ci:$($env:FORGEJO_READ_TOKEN)"))
     $env:GIT_CONFIG_COUNT = '1'
