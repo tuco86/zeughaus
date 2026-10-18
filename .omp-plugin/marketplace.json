@@ -10,7 +10,7 @@
     {
       "name": "zeughaus-ci",
       "source": "./omp-plugin",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "description": "zeughaus-ci in omp: the checkout's CI at session start, push watching, the CI skill"
     }
   ]

@@ -640,9 +640,8 @@ export default function zeughausCi(pi: Pi): void {
   pi.on("before_agent_start", async (event, ctx) => {
     if (!isMain(ctx) || !Array.isArray(event.systemPrompt)) return undefined;
     const text = block(await contextFor(ctx.cwd));
-    if (text === undefined || event.systemPrompt.some((entry) => entry.includes(OPEN))) {
-      return undefined;
-    }
+    // Exact match: AGENTS.md and the skill mention the tag, so a substring test would skip the block.
+    if (text === undefined || event.systemPrompt.includes(text)) return undefined;
     return { systemPrompt: [...event.systemPrompt, text] };
   });
 
