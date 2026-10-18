@@ -137,15 +137,6 @@ pub fn read_log(dir: &Path) -> Result<String, String> {
         .map_err(|e| format!("cannot read the output of {}: {e}", dir.display()))
 }
 
-/// The end of a run's output as plain text: what the last `max` bytes of the
-/// transcript say, from the first line that starts inside them. Unlike
-/// [`read_log`] it never holds more than `max` bytes of a long log.
-pub fn read_log_tail(dir: &Path, max: usize) -> Result<String, String> {
-    run_output_tail(dir, max)
-        .map(|bytes| plain_text(&bytes))
-        .map_err(|e| format!("cannot read the output of {}: {e}", dir.display()))
-}
-
 /// The last `max` bytes of the transcript, from the first line that starts
 /// inside them: a cut through a character or an escape sequence would
 /// otherwise open the text.

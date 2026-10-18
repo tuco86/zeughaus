@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use zeughaus_link::ci::{MAX_PIPELINES_PER_REQUEST, MAX_TIMING_LINES, TIMING_READ_BYTES};
+use zeughaus_link::ci::{LineSpan, MAX_PIPELINES_PER_REQUEST, MAX_TIMING_LINES, TIMING_READ_BYTES};
 use zeughaus_link::manual::{MAX_MANUAL_JOBS, RunReply};
 use zeughaus_link::{
     CiOverview, CiReply, CiRequest, JobTiming, JobView, PipelineView, TransferView,
@@ -151,12 +151,18 @@ impl Toolbox {
     }
 
     async fn log(&self, args: LogArgs) -> Result<String, String> {
+        let lines = match (&args.lines, args.tail) {
+            (Some(_), Some(_)) => return Err("give tail or lines, not both".to_owned()),
+            (Some(lines), None) => LineSpan::parse_list(lines)?,
+            (None, _) => Vec::new(),
+        };
         let request = CiRequest::Log {
             repo: self.repo_or_checkout(args.repo).await?,
             number: args.number,
             job: args.job,
             tail: args.tail.unwrap_or(DEFAULT_TAIL).clamp(1, MAX_TAIL),
             timestamps: args.timestamps.unwrap_or(false),
+            lines,
         };
         match self.client.ci(request).await? {
             CiReply::Log { text, finished } => Ok(log_text(&text, finished)),
@@ -530,6 +536,7 @@ struct LogArgs {
     job: String,
     tail: Option<u32>,
     timestamps: Option<bool>,
+    lines: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -857,8 +864,9 @@ fn transfer_line(transfer: &TransferView, assigned: Option<u64>) -> String {
 }
 
 /// `ci_timing` with a job: how much output it has and how long it spans,
-/// then the lines that the longest pauses follow, each with when it began
-/// (seconds after the job's first output) and how long it stood.
+/// then the lines that the longest pauses follow, each with its number (for
+/// `ci_log`'s `lines`), when it began (seconds after the job's first output)
+/// and how long it stood.
 fn job_timing_text(repo: &str, number: u64, job: &str, timing: &JobTiming) -> String {
     let seconds = |ms: u64| ms as f64 / 1000.0;
     let mut text = format!(
@@ -881,9 +889,16 @@ fn job_timing_text(repo: &str, number: u64, job: &str, timing: &JobTiming) -> St
             "the {} lines followed by the longest pauses, in output order:\n",
             timing.slowest.len()
         ));
+        let width = timing
+            .slowest
+            .iter()
+            .map(|line| line.line.to_string().len())
+            .max()
+            .unwrap_or(1);
         for line in &timing.slowest {
             text.push_str(&format!(
-                "  +{:.1} s  {:.1} s  {}\n",
+                "  {:>width$}| +{:.1} s  {:.1} s  {}\n",
+                line.line,
                 seconds(line.at_ms),
                 seconds(line.took_ms),
                 line.text
@@ -995,7 +1010,9 @@ fn definitions() -> Vec<Value> {
         ),
         tool(
             "ci_log",
-            "The last lines of one job's output in a pipeline, live while the job runs.",
+            "One job's output in a pipeline, live while the job runs: its last lines, or the \
+             lines you name like read does. Every line starts with its number; numbers count \
+             the lines that have text.",
             json!({
                 "repo": repo,
                 "number": number,
@@ -1010,11 +1027,18 @@ fn definitions() -> Vec<Value> {
                     "default": DEFAULT_TAIL,
                     "description": "How many lines from the end.",
                 },
+                "lines": {
+                    "type": "string",
+                    "description": "Lines to show instead of the last ones: 120-180, 120+40 \
+                                    (40 lines from 120), 120- (to the end), -60 (the last \
+                                    60), comma-joined like 1-20,400-420. Not together with \
+                                    tail.",
+                },
                 "timestamps": {
                     "type": "boolean",
                     "default": false,
                     "description": "Prefix every line with the seconds since the job's first \
-                                    output.",
+                                    output; ci_timing names the slowest lines by number.",
                 },
             }),
             &["number", "job"],
@@ -1025,7 +1049,8 @@ fn definitions() -> Vec<Value> {
             "Where a pipeline's time went. Without job: each job's assignment, start and end \
              relative to the pipeline's creation, its staging time and the inputs it received. \
              With job: the lines of that job's output that the longest pauses follow, with \
-             when each began and how long it stood.",
+             when each began and how long it stood. Each line comes with its number for \
+             ci_log's lines.",
             json!({
                 "repo": repo,
                 "number": number,
@@ -1237,6 +1262,7 @@ mod tests {
         assert_eq!(log["required"], json!(["number", "job"]));
         assert_eq!(log["properties"]["timestamps"]["type"], "boolean");
         assert_eq!(log["properties"]["timestamps"]["default"], false);
+        assert_eq!(log["properties"]["lines"]["type"], "string");
         let timing = schema(&definitions, "ci_timing");
         assert_eq!(timing["required"], json!(["number"]));
         assert_eq!(timing["properties"]["top"]["default"], 15);
@@ -1474,27 +1500,28 @@ mod tests {
 
     #[test]
     fn the_lines_a_jobs_longest_pauses_follow_come_with_when_and_how_long() {
-        let line = |at_ms, took_ms, text: &str| TimedLine {
+        let line = |line, at_ms, took_ms, text: &str| TimedLine {
+            line,
             at_ms,
             took_ms,
             text: text.to_owned(),
         };
         let mut timing = JobTiming {
-            lines: 4,
+            lines: 14,
             span_ms: 40_000,
             slowest: vec![
-                line(200, 30_000, "compiling a"),
-                line(31_000, 9_040, "link"),
+                line(2, 200, 30_000, "compiling a"),
+                line(12, 31_000, 9_040, "link"),
             ],
             finished: false,
             truncated: false,
         };
         assert_eq!(
             job_timing_text("demo", 7, "build", &timing),
-            "demo #7 build: 4 lines over 40.0 s of output, still running\n\
+            "demo #7 build: 14 lines over 40.0 s of output, still running\n\
              the 2 lines followed by the longest pauses, in output order:\n\
-             \x20 +0.2 s  30.0 s  compiling a\n\
-             \x20 +31.0 s  9.0 s  link\n"
+             \x20  2| +0.2 s  30.0 s  compiling a\n\
+             \x20 12| +31.0 s  9.0 s  link\n"
         );
 
         // A job that ended, of whose output only the end was read.
@@ -1503,7 +1530,7 @@ mod tests {
         let text = job_timing_text("demo", 7, "build", &timing);
         assert!(
             text.starts_with(
-                "demo #7 build: 4 lines over 40.0 s of output\n\
+                "demo #7 build: 14 lines over 40.0 s of output\n\
                  (only the last 64 MiB of output were read)\n\
                  the 2 lines followed"
             ),
@@ -1600,6 +1627,20 @@ mod tests {
                 .err()
                 .unwrap();
             assert!(err.contains(expected), "{arguments}: {err}");
+        }
+        // A bad line selection is the agent's to fix, before the CI is asked.
+        for (arguments, expected) in [
+            (
+                json!({ "repo": "r", "number": 1, "job": "j", "tail": 5, "lines": "1-2" }),
+                "give tail or lines, not both",
+            ),
+            (
+                json!({ "repo": "r", "number": 1, "job": "j", "lines": "0-3" }),
+                "lines: line numbers count from 1 in \"0-3\"",
+            ),
+        ] {
+            let err = tools.call("ci_log", arguments.clone()).await.err().unwrap();
+            assert_eq!(err, expected, "{arguments}");
         }
         let err = tools
             .call("ci_status", json!({ "repo": "x" }))
@@ -1828,11 +1869,13 @@ mod tests {
                         job,
                         tail,
                         timestamps,
+                        lines,
                         ..
                     } => CiReply::Log {
                         text: format!(
-                            "{}job {job}, {tail} lines\ntest result: ok. 1 passed\n",
-                            if timestamps { "[+     0.0s] " } else { "" }
+                            "{}job {job}, {tail} lines, {} spans\ntest result: ok. 1 passed\n",
+                            if timestamps { "[+     0.0s] " } else { "" },
+                            lines.len()
                         ),
                         finished: true,
                     },
@@ -1844,6 +1887,7 @@ mod tests {
                             lines: 3,
                             span_ms: 31_200,
                             slowest: vec![TimedLine {
+                                line: 7,
                                 at_ms: 0,
                                 took_ms: 30_000,
                                 text: format!("{job}: asked for {top}"),
@@ -2206,7 +2250,7 @@ mod tests {
                 "demo #1 build: 3 lines over 31.2 s of output, still running\n\
              (only the last 64 MiB of output were read)\n\
              the 1 lines followed by the longest pauses, in output order:\n\
-             \x20 +0.0 s  30.0 s  build: asked for 15\n"
+             \x20 7| +0.0 s  30.0 s  build: asked for 15\n"
             );
             assert_eq!(
                 ci.seen.asked.lock().unwrap().last(),
@@ -2234,7 +2278,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn ci_log_asks_for_timestamps_only_when_told_to() {
+        async fn ci_log_passes_timestamps_and_lines_only_when_told_to() {
             let ci = fake_ci("stamps", 0, None).await;
             let tools = toolbox_for(&ci);
             let log = |extra: Value| {
@@ -2247,7 +2291,10 @@ mod tests {
             };
 
             let plain = log(json!({})).await.expect("log");
-            assert_eq!(plain, "job build, 200 lines\ntest result: ok. 1 passed\n");
+            assert_eq!(
+                plain,
+                "job build, 200 lines, 0 spans\ntest result: ok. 1 passed\n"
+            );
             assert!(matches!(
                 ci.seen.asked.lock().unwrap().last(),
                 Some(CiRequest::Log {
@@ -2260,7 +2307,7 @@ mod tests {
             let stamped = log(json!({ "timestamps": true })).await.expect("log");
             assert_eq!(
                 stamped,
-                "[+     0.0s] job build, 200 lines\ntest result: ok. 1 passed\n"
+                "[+     0.0s] job build, 200 lines, 0 spans\ntest result: ok. 1 passed\n"
             );
             assert!(matches!(
                 ci.seen.asked.lock().unwrap().last(),
@@ -2269,6 +2316,33 @@ mod tests {
                     ..
                 })
             ));
+
+            let ranged = log(json!({ "lines": "5-9,-2" })).await.expect("log");
+            assert_eq!(
+                ranged,
+                "job build, 200 lines, 2 spans\ntest result: ok. 1 passed\n"
+            );
+            match ci.seen.asked.lock().unwrap().last() {
+                Some(CiRequest::Log { lines, .. }) => assert_eq!(
+                    lines,
+                    &[
+                        LineSpan::Range {
+                            first: 5,
+                            last: Some(9)
+                        },
+                        LineSpan::Last { count: 2 },
+                    ]
+                ),
+                other => panic!("{other:?}"),
+            }
+
+            // Both a tail and lines: refused before the CI is asked.
+            let asked = ci.seen.asked.lock().unwrap().len();
+            let err = log(json!({ "tail": 5, "lines": "1-2" }))
+                .await
+                .expect_err("tail and lines");
+            assert_eq!(err, "give tail or lines, not both");
+            assert_eq!(ci.seen.asked.lock().unwrap().len(), asked);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2355,7 +2429,10 @@ mod tests {
                 .await
                 .expect("log");
             // Asked for more than the CI gives: asked for what it gives.
-            assert_eq!(log, "job build, 5000 lines\ntest result: ok. 1 passed\n");
+            assert_eq!(
+                log,
+                "job build, 5000 lines, 0 spans\ntest result: ok. 1 passed\n"
+            );
 
             let err = tools
                 .call("ci_rerun", json!({ "repo": "demo", "number": 1 }))

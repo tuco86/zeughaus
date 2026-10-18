@@ -145,8 +145,9 @@ that directory's `client.pem`, so it is the same principal as an editor
 there; without either it still starts and every tool answers with what is
 missing. `ci_status`, `ci_pipelines`, `ci_pipeline`, `ci_log`, `ci_rerun`
 and `ci_cancel` read and control the CI's channels, pipelines and job
-output (`ci_log` can start every line with the seconds since the job's
-first output); `ci_wait` waits until a pipeline (by number, or by the sha of
+output (`ci_log` shows the last lines or the line ranges asked for, each
+with its number and, on request, the seconds since the job's first
+output); `ci_wait` waits until a pipeline (by number, or by the sha of
 the commit just pushed) or one job of it has settled; `ci_timing` says where
 a pipeline's time went (for each job when it was assigned, started and ended
 after the pipeline was created, its staging time and the inputs that moved

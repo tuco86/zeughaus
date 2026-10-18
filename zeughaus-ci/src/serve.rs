@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use weida::{Replier, TransferMeta};
 use zeughaus_link::ci::{
-    MAX_ORIGIN_BYTES, MAX_PIPELINES_PER_REQUEST, MAX_TIMING_LINES, TIMING_READ_BYTES,
+    LineSpan, MAX_ORIGIN_BYTES, MAX_PIPELINES_PER_REQUEST, MAX_TIMING_LINES, TIMING_READ_BYTES,
 };
 use zeughaus_link::enlist::Place;
 use zeughaus_link::{
@@ -52,9 +52,6 @@ const FIND_RECORDS: usize = 500;
 
 /// What a `Find` or `Repo` answers to a `sha` that is not 4 to 40 hex digits.
 const BAD_SHA: &str = "sha must be 4 to 40 hex digits";
-
-/// How much of a transcript's end a `Log` reply is made from.
-const LOG_READ_BYTES: usize = 8 << 20;
 
 /// The longest line of output a `Timing` reply carries, in characters.
 const TIMING_TEXT_CHARS: usize = 200;
@@ -118,7 +115,8 @@ impl CiServer {
                 job,
                 tail,
                 timestamps,
-            } => self.log(&repo, number, &job, tail, timestamps),
+                lines,
+            } => self.log(&repo, number, &job, tail, timestamps, &lines),
             CiRequest::Timing {
                 repo,
                 number,
@@ -405,11 +403,20 @@ impl CiServer {
         }
     }
 
-    /// The end of a job's stored output as plain text: at most `tail` lines,
-    /// and never more than a reply may carry. The transcript is read from
-    /// its end, so a job that wrote for hours costs what its last lines do.
-    /// With `timestamps` every line starts with when it began.
-    fn log(&self, repo: &str, number: u64, job: &str, tail: u32, timestamps: bool) -> CiReply {
+    /// A job's stored output as numbered plain text: the last `tail` lines,
+    /// or the `lines` asked for, never more than a reply may carry. The
+    /// transcript is read from its end, so a job that wrote for hours costs
+    /// what its last [`TIMING_READ_BYTES`] do. With `timestamps` every line
+    /// also says when it began.
+    fn log(
+        &self,
+        repo: &str,
+        number: u64,
+        job: &str,
+        tail: u32,
+        timestamps: bool,
+        lines: &[LineSpan],
+    ) -> CiReply {
         if !valid_name(repo) || !valid_name(job) {
             return error("no such job");
         }
@@ -417,18 +424,21 @@ impl CiServer {
         if !dir.join("wal").exists() {
             return error(&format!("no output for {job} of #{number}"));
         }
-        let lines = tail.min(MAX_LOG_LINES) as usize;
-        let text = if timestamps {
-            timestamped_tail(&dir, LOG_READ_BYTES, lines)
-        } else {
-            excerpt::read_log_tail(&dir, LOG_READ_BYTES)
+        // Read the same way in both modes, so a line keeps its number
+        // whether or not timestamps were asked for.
+        let output = match timed_tail(&dir, TIMING_READ_BYTES) {
+            Ok(output) => output,
+            Err(e) => return error(&e),
         };
-        match text {
-            Ok(text) => CiReply::Log {
-                text: last_lines(&text, lines, MAX_LOG_TEXT_BYTES).to_owned(),
-                finished: dir.join("exit").exists(),
-            },
-            Err(e) => error(&e),
+        let keep_end = lines.is_empty();
+        let last = [LineSpan::Last {
+            count: tail.min(MAX_LOG_LINES),
+        }];
+        let spans = if keep_end { &last[..] } else { lines };
+        let picked = pick_lines(output.lines.len(), spans);
+        CiReply::Log {
+            text: numbered(&output, &picked, timestamps, keep_end),
+            finished: dir.join("exit").exists(),
         }
     }
 
@@ -557,34 +567,6 @@ fn place_at(place: &Place) -> String {
     }
 }
 
-/// The last `lines` lines of `text`, cut from the front to at most `max`
-/// bytes at the start of a line (inside the line when it alone is longer).
-fn last_lines(text: &str, lines: usize, max: usize) -> &str {
-    if lines == 0 {
-        return "";
-    }
-    let body = text.strip_suffix('\n').unwrap_or(text);
-    let start = body
-        .match_indices('\n')
-        .rev()
-        .nth(lines - 1)
-        .map_or(0, |(newline, _)| newline + 1);
-    let kept = &text[start..];
-    let Some(mut cut) = kept.len().checked_sub(max).filter(|&cut| cut > 0) else {
-        return kept;
-    };
-    while !kept.is_char_boundary(cut) {
-        cut += 1;
-    }
-    if kept.as_bytes()[cut - 1] == b'\n' {
-        return &kept[cut..];
-    }
-    match kept[cut..].find('\n') {
-        Some(newline) => &kept[cut + newline + 1..],
-        None => &kept[cut..],
-    }
-}
-
 /// The lines of a transcript's last bytes, with the times they began.
 struct TimedTail {
     /// Microseconds since the UNIX epoch and the text of each line that has
@@ -616,18 +598,114 @@ fn timed_tail(dir: &Path, max: usize) -> Result<TimedTail, String> {
     })
 }
 
-/// The last `keep` lines of the transcript in `dir` that its last `max`
-/// bytes hold, each as `[+<seconds since the job's first output>s] <text>`.
-fn timestamped_tail(dir: &Path, max: usize, keep: usize) -> Result<String, String> {
-    let tail = timed_tail(dir, max)?;
-    let origin = tail.origin.unwrap_or(0);
-    let from = tail.lines.len().saturating_sub(keep);
-    let mut text = String::new();
-    for (at, line) in &tail.lines[from..] {
-        let seconds = at.saturating_sub(origin) as f64 / 1e6;
-        text.push_str(&format!("[+{seconds:>8.1}s] {line}\n"));
+/// The lines `spans` select out of `total`, as 0-based indices: ascending,
+/// each once. A part past the end selects nothing; a range that runs past
+/// it ends there.
+fn pick_lines(total: usize, spans: &[LineSpan]) -> Vec<usize> {
+    let mut picked = Vec::new();
+    for span in spans {
+        let (first, last) = match *span {
+            LineSpan::Range { first, last } => (
+                (first as usize).max(1),
+                last.map_or(total, |last| (last as usize).min(total)),
+            ),
+            LineSpan::Last { count } => (total.saturating_sub(count as usize) + 1, total),
+        };
+        if first <= last {
+            picked.extend(first - 1..last);
+        }
     }
-    Ok(text)
+    picked.sort_unstable();
+    picked.dedup();
+    picked
+}
+
+/// The lines of `tail` at `picked` (from [`pick_lines`]) as text, each as
+/// `<number>| <text>` with the numbers right-aligned to the widest one
+/// shown, with `timestamps` as `<number>| [+<seconds>s] <text>` (seconds
+/// since the job's first output), and `...` between lines that are not
+/// adjacent. At most [`MAX_LOG_LINES`] lines and [`MAX_LOG_TEXT_BYTES`]:
+/// `keep_end` (a tail) drops lines from the front, otherwise lines are
+/// dropped from the end and a note says where to continue.
+fn numbered(tail: &TimedTail, picked: &[usize], timestamps: bool, keep_end: bool) -> String {
+    let mut text = String::new();
+    if tail.truncated {
+        text.push_str(&format!(
+            "(only the last {} MiB of output were read; line numbers count from there)\n",
+            TIMING_READ_BYTES >> 20
+        ));
+    }
+    let Some(&widest) = picked.last() else {
+        text.push_str(&format!(
+            "(no such lines: the output has {} lines)\n",
+            tail.lines.len()
+        ));
+        return text;
+    };
+    let digits = |index: usize| (index + 1).to_string().len();
+    // What a line costs, measured with the widest number of all picked
+    // lines; the stamp `[+    65.8s] ` is 13 bytes.
+    let width = digits(widest);
+    let stamp = if timestamps { 13 } else { 0 };
+    let cost = |k: usize| {
+        let gap = k > 0 && picked[k - 1] + 1 != picked[k];
+        width + 2 + stamp + tail.lines[picked[k]].1.len() + 1 + if gap { 4 } else { 0 }
+    };
+    let max_lines = MAX_LOG_LINES as usize;
+    let mut bytes = 0;
+    let (from, to) = if keep_end {
+        let mut from = picked.len();
+        while from > 0 && picked.len() - from < max_lines {
+            let more = cost(from - 1);
+            if from < picked.len() && bytes + more > MAX_LOG_TEXT_BYTES {
+                break;
+            }
+            bytes += more;
+            from -= 1;
+        }
+        (from, picked.len())
+    } else {
+        let mut to = 0;
+        while to < picked.len() && to < max_lines {
+            let more = cost(to);
+            if to > 0 && bytes + more > MAX_LOG_TEXT_BYTES {
+                break;
+            }
+            bytes += more;
+            to += 1;
+        }
+        (0, to)
+    };
+    let kept = &picked[from..to];
+    let width = kept.last().map_or(1, |&last| digits(last));
+    let origin = tail.origin.unwrap_or(0);
+    for (k, &index) in kept.iter().enumerate() {
+        if k > 0 && kept[k - 1] + 1 != index {
+            text.push_str("...\n");
+        }
+        let (at, line) = &tail.lines[index];
+        // A single line longer than a reply is cut at a character.
+        let mut end = line.len().min(MAX_LOG_TEXT_BYTES);
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        let line = &line[..end];
+        let number = index + 1;
+        if timestamps {
+            let seconds = at.saturating_sub(origin) as f64 / 1e6;
+            text.push_str(&format!("{number:>width$}| [+{seconds:>8.1}s] {line}\n"));
+        } else {
+            text.push_str(&format!("{number:>width$}| {line}\n"));
+        }
+    }
+    if to < picked.len() {
+        text.push_str(&format!(
+            "(cut at {} lines; continue with lines={}-)\n",
+            kept.len(),
+            picked[to] + 1
+        ));
+    }
+    text
 }
 
 /// A job's lines as how long each stood: the `top` lines (clamped to
@@ -660,6 +738,7 @@ fn job_timing(tail: &TimedTail, end: u64, finished: bool, top: u32) -> JobTiming
         slowest: order
             .into_iter()
             .map(|i| TimedLine {
+                line: u32::try_from(i + 1).unwrap_or(u32::MAX),
                 at_ms: lines[i].0.saturating_sub(origin.unwrap_or(0)) / 1000,
                 took_ms: took[i] / 1000,
                 text: lines[i].1.chars().take(TIMING_TEXT_CHARS).collect(),
@@ -1234,18 +1313,104 @@ mod tests {
     }
 
     #[test]
-    fn the_last_lines_of_a_text_are_cut_at_a_line_start_within_the_byte_limit() {
-        assert_eq!(last_lines("a\nb\nc\n", 2, 100), "b\nc\n");
-        assert_eq!(last_lines("a\nb\nc", 2, 100), "b\nc");
-        assert_eq!(last_lines("a\nb", 5, 100), "a\nb");
-        assert_eq!(last_lines("a\nb\nc\n", 0, 100), "");
-        assert_eq!(last_lines("", 3, 100), "");
-        // Cut from the front to the next line start; inside a line when it
-        // alone is longer, at a character.
-        assert_eq!(last_lines("aaaa\nbb\ncc\n", 10, 6), "bb\ncc\n");
-        assert_eq!(last_lines("aaaa\nbb\ncc\n", 10, 5), "cc\n");
-        assert_eq!(last_lines("aaaa\nbb\ncc\n", 10, 100), "aaaa\nbb\ncc\n");
-        assert_eq!(last_lines("\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}", 1, 3), "\u{e9}");
+    fn line_spans_pick_each_line_once_in_order_and_stop_at_the_end() {
+        let range = |first, last| LineSpan::Range { first, last };
+        assert_eq!(pick_lines(10, &[range(3, Some(5))]), [2, 3, 4]);
+        assert_eq!(pick_lines(10, &[range(8, None)]), [7, 8, 9]);
+        assert_eq!(pick_lines(10, &[LineSpan::Last { count: 2 }]), [8, 9]);
+        assert_eq!(pick_lines(3, &[LineSpan::Last { count: 50 }]), [0, 1, 2]);
+        // Overlapping and unordered spans give each line once, in order.
+        assert_eq!(
+            pick_lines(
+                10,
+                &[
+                    LineSpan::Last { count: 1 },
+                    range(3, Some(6)),
+                    range(2, Some(4))
+                ]
+            ),
+            [1, 2, 3, 4, 5, 9]
+        );
+        // Past the end: nothing, or up to the end.
+        assert!(pick_lines(10, &[range(11, None)]).is_empty());
+        assert_eq!(pick_lines(10, &[range(9, Some(20))]), [8, 9]);
+        assert!(pick_lines(10, &[LineSpan::Last { count: 0 }]).is_empty());
+        assert!(pick_lines(0, &[LineSpan::Last { count: 5 }]).is_empty());
+        // A zero only a hand-made request can carry counts as line 1.
+        assert_eq!(pick_lines(10, &[range(0, Some(2))]), [0, 1]);
+    }
+
+    /// `count` lines of `text`, half a second apart from the first output.
+    fn output(count: usize, text: impl Fn(usize) -> String, truncated: bool) -> TimedTail {
+        TimedTail {
+            lines: (0..count)
+                .map(|i| (1_000_000 + i as u64 * 500_000, text(i)))
+                .collect(),
+            origin: Some(1_000_000),
+            truncated,
+        }
+    }
+
+    #[test]
+    fn numbered_lines_align_their_numbers_and_mark_gaps() {
+        let letters = output(12, |i| ((b'a' + i as u8) as char).to_string(), false);
+        assert_eq!(
+            numbered(&letters, &[0, 1, 4], false, false),
+            "1| a\n2| b\n...\n5| e\n"
+        );
+        // The width is that of the widest number shown.
+        assert_eq!(
+            numbered(&letters, &[8, 9, 10, 11], false, true),
+            " 9| i\n10| j\n11| k\n12| l\n"
+        );
+        assert_eq!(
+            numbered(&letters, &[1, 10], true, false),
+            " 2| [+     0.5s] b\n...\n11| [+     5.0s] k\n"
+        );
+        assert_eq!(
+            numbered(&letters, &[], false, false),
+            "(no such lines: the output has 12 lines)\n"
+        );
+        let cut = output(2, |_| "x".to_owned(), true);
+        assert_eq!(
+            numbered(&cut, &[0, 1], false, true),
+            "(only the last 64 MiB of output were read; line numbers count from there)\n\
+             1| x\n2| x\n"
+        );
+    }
+
+    #[test]
+    fn numbered_lines_stop_at_the_reply_limits_from_the_side_that_matters() {
+        let max = MAX_LOG_LINES as usize;
+        let many = output(max + 3, |_| "x".to_owned(), false);
+        let all: Vec<usize> = (0..max + 3).collect();
+
+        // Asked for lines: the first ones, and where to go on.
+        let head = numbered(&many, &all, false, false);
+        let rows: Vec<&str> = head.lines().collect();
+        assert_eq!(rows.len(), max + 1);
+        assert_eq!(rows[0], "   1| x");
+        assert_eq!(rows[max - 1], "5000| x");
+        assert_eq!(rows[max], "(cut at 5000 lines; continue with lines=5001-)");
+
+        // A tail: the last ones, nothing said.
+        let tail = numbered(&many, &all, false, true);
+        let rows: Vec<&str> = tail.lines().collect();
+        assert_eq!(rows.len(), max);
+        assert_eq!(rows[0], "   4| x");
+        assert_eq!(rows[max - 1], "5003| x");
+
+        // Long lines hit the byte limit before the line limit.
+        let wide = output(4000, |_| "y".repeat(1000), false);
+        let all: Vec<usize> = (0..4000).collect();
+        let tail = numbered(&wide, &all, false, true);
+        assert!(tail.len() <= MAX_LOG_TEXT_BYTES, "{}", tail.len());
+        assert!(tail.ends_with(&format!("4000| {}\n", "y".repeat(1000))));
+        assert!(!tail.starts_with("   1|"));
+        let head = numbered(&wide, &all, false, false);
+        assert!(head.len() <= MAX_LOG_TEXT_BYTES + 100, "{}", head.len());
+        assert!(head.starts_with("   1| y"));
+        assert!(head.contains("; continue with lines="));
     }
 
     /// Tests that touch the filesystem, network, processes or real time: the
@@ -2203,38 +2368,59 @@ mod tests {
             let dir = transcript_dir(&state, "view", 3, "build");
             std::fs::create_dir_all(&dir).expect("create the transcript directory");
             let server = server(&state);
-            let ask = |repo: &str, job: &str, tail| {
+            let ask = |repo: &str, job: &str, tail, lines: Vec<LineSpan>| {
                 server.answer(CiRequest::Log {
                     repo: repo.to_owned(),
                     number: 3,
                     job: job.to_owned(),
                     tail,
                     timestamps: false,
+                    lines,
                 })
             };
-            let log = |tail| match ask("view", "build", tail) {
+            let log = |tail, lines| match ask("view", "build", tail, lines) {
                 CiReply::Log { text, finished } => (text, finished),
                 other => panic!("unexpected reply {other:?}"),
             };
 
-            assert_eq!(ask("view", "build", 10), error("no output for build of #3"));
+            assert_eq!(
+                ask("view", "build", 10, Vec::new()),
+                error("no output for build of #3")
+            );
             let mut wal = zeughaus_terminal::wal::WalWriter::open(&dir.join("wal"), None)
                 .expect("open the WAL");
             wal.append(1, b"\x1b[32mone\x1b[0m\r\ntwo\r\n")
                 .expect("append");
             wal.append(2, b"three\r\nfour\r\n").expect("append");
 
-            // The escape sequences are gone, only the end is asked for, and the
-            // job still runs.
-            assert_eq!(log(2), ("three\nfour\n".to_owned(), false));
-            assert_eq!(log(100), ("one\ntwo\nthree\nfour\n".to_owned(), false));
-            assert_eq!(log(0), (String::new(), false));
+            // The escape sequences are gone, only the end is asked for, every
+            // line has its number, and the job still runs.
+            assert_eq!(
+                log(2, Vec::new()),
+                ("3| three\n4| four\n".to_owned(), false)
+            );
+            assert_eq!(
+                log(100, Vec::new()),
+                ("1| one\n2| two\n3| three\n4| four\n".to_owned(), false)
+            );
+            // Lines asked for by number replace the tail.
+            let middle = vec![LineSpan::Range {
+                first: 2,
+                last: Some(3),
+            }];
+            assert_eq!(log(1, middle), ("2| two\n3| three\n".to_owned(), false));
             std::fs::write(dir.join("exit"), "code=0\n").expect("write the exit record");
-            assert_eq!(log(1), ("four\n".to_owned(), true));
+            assert_eq!(log(1, Vec::new()), ("4| four\n".to_owned(), true));
 
             // Names that are no job read nothing.
-            assert_eq!(ask("../view", "build", 10), error("no such job"));
-            assert_eq!(ask("view", "../build", 10), error("no such job"));
+            assert_eq!(
+                ask("../view", "build", 10, Vec::new()),
+                error("no such job")
+            );
+            assert_eq!(
+                ask("view", "../build", 10, Vec::new()),
+                error("no such job")
+            );
             let _ = std::fs::remove_dir_all(&state);
         }
 
@@ -2250,6 +2436,7 @@ mod tests {
                 job: "build".to_owned(),
                 tail,
                 timestamps: true,
+                lines: Vec::new(),
             }) {
                 CiReply::Log { text, finished } => (text, finished),
                 other => panic!("unexpected reply {other:?}"),
@@ -2269,18 +2456,21 @@ mod tests {
             assert_eq!(
                 log(100),
                 (
-                    "[+     0.0s] one\n[+     0.0s] slow\n[+     1.5s] two\n[+    65.8s] three\n"
+                    "1| [+     0.0s] one\n2| [+     0.0s] slow\n3| [+     1.5s] two\n\
+                     4| [+    65.8s] three\n"
                         .to_owned(),
                     false
                 )
             );
             assert_eq!(
                 log(2),
-                ("[+     1.5s] two\n[+    65.8s] three\n".to_owned(), false)
+                (
+                    "3| [+     1.5s] two\n4| [+    65.8s] three\n".to_owned(),
+                    false
+                )
             );
-            assert_eq!(log(0), (String::new(), false));
             std::fs::write(dir.join("exit"), "code=0\n").expect("write the exit record");
-            assert_eq!(log(1), ("[+    65.8s] three\n".to_owned(), true));
+            assert_eq!(log(1), ("4| [+    65.8s] three\n".to_owned(), true));
             let _ = std::fs::remove_dir_all(&state);
         }
 
@@ -2339,11 +2529,13 @@ mod tests {
                 two.slowest,
                 vec![
                     TimedLine {
+                        line: 2,
                         at_ms: 200,
                         took_ms: 30_000,
                         text: "compiling a".to_owned()
                     },
                     TimedLine {
+                        line: 4,
                         at_ms: 31_000,
                         took_ms: 9_000,
                         text: "link".to_owned()

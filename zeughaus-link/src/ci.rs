@@ -29,6 +29,9 @@ pub const MAX_TIMING_LINES: u32 = 100;
 /// more.
 pub const TIMING_READ_BYTES: usize = 64 << 20;
 
+/// The most spans one [`CiRequest::Log`] may name.
+pub const MAX_LOG_SPANS: usize = 32;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CiRequest {
@@ -63,11 +66,12 @@ pub enum CiRequest {
     /// Stops a running pipeline: its jobs are killed, the rest skipped.
     /// Answers [`CiReply::Accepted`], or an error when it is not running.
     Cancel { repo: String, number: u64 },
-    /// The tail of one job's stored output: at most `tail` lines, never more
-    /// than the CI's own cap. With `timestamps` every line starts with the
-    /// seconds since the job's first output (`[+     1.5s] text`) and a line
-    /// with no text is left out. Answers [`CiReply::Log`], or an error when
-    /// the job has no output.
+    /// One job's stored output, never more lines than the CI's own cap:
+    /// the last `tail` lines, or with `lines` those lines instead. Every
+    /// line starts with its number ([`LineSpan`] counts them). With
+    /// `timestamps` the number is followed by the seconds since the job's
+    /// first output (`[+     1.5s] text`). Answers [`CiReply::Log`], or an
+    /// error when the job has no output.
     Log {
         repo: String,
         number: u64,
@@ -75,6 +79,8 @@ pub enum CiRequest {
         tail: u32,
         #[serde(default)]
         timestamps: bool,
+        #[serde(default)]
+        lines: Vec<LineSpan>,
     },
     /// Where a job's time went: the `top` lines of its output (clamped to
     /// `1..=`[`MAX_TIMING_LINES`]) that the longest pauses follow, from the
@@ -96,6 +102,83 @@ pub enum CiRequest {
         sha: Option<String>,
         jobs: bool,
     },
+}
+
+/// Lines of a job's output, counted from 1 over the lines that have text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "span", rename_all = "snake_case")]
+pub enum LineSpan {
+    /// Lines `first..=last`; `last: None` runs to the end.
+    Range { first: u32, last: Option<u32> },
+    /// The last `count` lines.
+    Last { count: u32 },
+}
+
+impl LineSpan {
+    /// Parses the line selection `read` takes: comma-separated `N-M`, `N+K`
+    /// (K lines from N), `N-` and `N` (to the end), `-K` (the last K). The
+    /// error is meant to be shown as is.
+    pub fn parse_list(text: &str) -> Result<Vec<LineSpan>, String> {
+        if text.trim().is_empty() {
+            return Err("lines: nothing selected".to_owned());
+        }
+        let parts: Vec<&str> = text.split(',').map(str::trim).collect();
+        if parts.len() > MAX_LOG_SPANS {
+            return Err(format!("lines: at most {MAX_LOG_SPANS} ranges"));
+        }
+        parts.into_iter().map(Self::parse_one).collect()
+    }
+
+    fn parse_one(part: &str) -> Result<LineSpan, String> {
+        let unreadable =
+            || format!("lines: cannot read \"{part}\"; use 120-180, 120+40, 120-, -60");
+        let number = |text: &str| {
+            let text = text.trim();
+            if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(unreadable());
+            }
+            text.parse::<u32>().map_err(|_| unreadable())
+        };
+        let line = |text: &str| match number(text)? {
+            0 => Err(format!("lines: line numbers count from 1 in \"{part}\"")),
+            n => Ok(n),
+        };
+        let count = |text: &str| match number(text)? {
+            0 => Err(unreadable()),
+            n => Ok(n),
+        };
+        if let Some(rest) = part.strip_prefix('-') {
+            return Ok(LineSpan::Last {
+                count: count(rest)?,
+            });
+        }
+        if let Some((first, more)) = part.split_once('+') {
+            let first = line(first)?;
+            let last = first.checked_add(count(more)? - 1).ok_or_else(unreadable)?;
+            return Ok(LineSpan::Range {
+                first,
+                last: Some(last),
+            });
+        }
+        if let Some((first, last)) = part.split_once('-') {
+            let first = line(first)?;
+            if last.trim().is_empty() {
+                return Ok(LineSpan::Range { first, last: None });
+            }
+            let last = number(last)?;
+            if last < first {
+                return Err(format!("lines: {last} comes before {first} in \"{part}\""));
+            }
+            return Ok(LineSpan::Range {
+                first,
+                last: Some(last),
+            });
+        }
+        Ok(LineSpan::Range {
+            first: line(part)?,
+            last: None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -266,6 +349,9 @@ pub struct JobTiming {
 /// One line of a job's output and how long it stood last.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimedLine {
+    /// Its number, counted from 1 as [`CiRequest::Log`] counts.
+    #[serde(default)]
+    pub line: u32,
     /// Milliseconds from the job's first output to this line's.
     pub at_ms: u64,
     /// Milliseconds from this line to the next one; for the last line, to
@@ -478,6 +564,7 @@ mod tests {
                 job: "build".to_owned(),
                 tail: 200,
                 timestamps: false,
+                lines: Vec::new(),
             },
             CiRequest::Log {
                 repo: "griasdi".to_owned(),
@@ -485,6 +572,17 @@ mod tests {
                 job: "build".to_owned(),
                 tail: 50,
                 timestamps: true,
+                lines: vec![
+                    LineSpan::Range {
+                        first: 5,
+                        last: Some(9),
+                    },
+                    LineSpan::Range {
+                        first: 400,
+                        last: None,
+                    },
+                    LineSpan::Last { count: 2 },
+                ],
             },
             CiRequest::Timing {
                 repo: "griasdi".to_owned(),
@@ -569,6 +667,7 @@ mod tests {
                     lines: 3,
                     span_ms: 31_200,
                     slowest: vec![TimedLine {
+                        line: 2,
                         at_ms: 0,
                         took_ms: 30_000,
                         text: "sleeping".to_owned(),
@@ -621,14 +720,85 @@ mod tests {
     }
 
     #[test]
-    fn a_log_request_without_timestamps_still_decodes() {
+    fn a_log_request_without_timestamps_or_lines_still_decodes() {
         let old = br#"{"kind":"log","repo":"griasdi","number":7,"job":"build","tail":200}"#;
         match CiRequest::decode(old) {
             Some(CiRequest::Log {
-                tail, timestamps, ..
-            }) => assert_eq!((tail, timestamps), (200, false)),
+                tail,
+                timestamps,
+                lines,
+                ..
+            }) => assert_eq!((tail, timestamps, lines), (200, false, Vec::new())),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_timed_line_without_a_number_decodes_as_zero() {
+        let old: TimedLine = serde_json::from_str(r#"{"at_ms":5,"took_ms":7,"text":"x"}"#).unwrap();
+        assert_eq!(old.line, 0);
+    }
+
+    fn range(first: u32, last: Option<u32>) -> LineSpan {
+        LineSpan::Range { first, last }
+    }
+
+    #[test]
+    fn line_selections_parse_like_read() {
+        assert_eq!(
+            LineSpan::parse_list("120-180"),
+            Ok(vec![range(120, Some(180))])
+        );
+        assert_eq!(
+            LineSpan::parse_list("120+40"),
+            Ok(vec![range(120, Some(159))])
+        );
+        assert_eq!(LineSpan::parse_list("7+1"), Ok(vec![range(7, Some(7))]));
+        assert_eq!(LineSpan::parse_list("120-"), Ok(vec![range(120, None)]));
+        assert_eq!(LineSpan::parse_list("120"), Ok(vec![range(120, None)]));
+        assert_eq!(
+            LineSpan::parse_list("-60"),
+            Ok(vec![LineSpan::Last { count: 60 }])
+        );
+        assert_eq!(
+            LineSpan::parse_list(" 1-20, 400+5 ,-3"),
+            Ok(vec![
+                range(1, Some(20)),
+                range(400, Some(404)),
+                LineSpan::Last { count: 3 }
+            ])
+        );
+    }
+
+    #[test]
+    fn bad_line_selections_say_what_is_wrong() {
+        assert_eq!(
+            LineSpan::parse_list("  "),
+            Err("lines: nothing selected".to_owned())
+        );
+        assert_eq!(
+            LineSpan::parse_list("0-3"),
+            Err("lines: line numbers count from 1 in \"0-3\"".to_owned())
+        );
+        assert_eq!(
+            LineSpan::parse_list("1-5,9-4"),
+            Err("lines: 4 comes before 9 in \"9-4\"".to_owned())
+        );
+        for bad in ["abc", "1-x", "-0", "5+0", "+5", "1-2-3", "1,,2"] {
+            let part = if bad == "1,,2" { "" } else { bad };
+            assert_eq!(
+                LineSpan::parse_list(bad),
+                Err(format!(
+                    "lines: cannot read \"{part}\"; use 120-180, 120+40, 120-, -60"
+                )),
+                "{bad}"
+            );
+        }
+        let many = vec!["1"; MAX_LOG_SPANS + 1].join(",");
+        assert_eq!(
+            LineSpan::parse_list(&many),
+            Err("lines: at most 32 ranges".to_owned())
+        );
     }
 
     #[test]
