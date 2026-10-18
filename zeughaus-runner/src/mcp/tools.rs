@@ -1,4 +1,4 @@
-//! The ten tools, the schemas an agent sees and the text they answer with.
+//! The nine tools, the schemas an agent sees and the text they answer with.
 //!
 //! The text is for a model, so it is short, one fact per line and in a shape
 //! that is the same every time. The functions that build it take the records
@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use zeughaus_link::ci::{MAX_PIPELINES_PER_REQUEST, MAX_TIMING_LINES, TIMING_READ_BYTES};
-use zeughaus_link::tryrun::TryReply;
+use zeughaus_link::manual::{MAX_MANUAL_JOBS, RunReply};
 use zeughaus_link::{
     CiOverview, CiReply, CiRequest, JobTiming, JobView, PipelineView, TransferView,
 };
@@ -23,12 +23,13 @@ use super::snapshot;
 use crate::names::valid_name;
 
 const INSTRUCTIONS: &str = "zeughaus is this person's CI: its runners are the machines they own. \
-try_run executes a command on another host's zeughaus runner (Windows, macOS or a Linux container) \
-from the current working tree, with its uncommitted files and the sibling checkouts its Cargo path \
-dependencies need, and answers with the result and the end of the output; ci_status lists the \
-targets it accepts, and with the other ci_* tools the CI's channels, pipelines and logs; ci_wait \
-waits for a pipeline, or one job of it, to settle, also for the pipeline a push is about to start; \
-ci_timing says where the time of a pipeline, or of one job's output, went.";
+run_jobs runs named jobs of the repository's pipeline (for example build-windows-amd64 and \
+check-windows-amd64) from the current working tree, uncommitted files and sibling path \
+dependencies included, in the same warm workspace the pipeline uses at that job's place, so the \
+build is incremental; it is the way to build, test or debug on another platform. ci_wait waits \
+for a pipeline or one job, also for the pipeline a push is about to start; ci_status, \
+ci_pipelines, ci_pipeline and ci_log show the CI's state and output; ci_timing says where the \
+time went.";
 
 /// Pipelines listed when the call gives no limit.
 const DEFAULT_PIPELINES: u32 = 10;
@@ -36,21 +37,14 @@ const DEFAULT_PIPELINES: u32 = 10;
 const DEFAULT_TAIL: u32 = 200;
 /// The most lines of output one call returns; the CI cuts there too.
 const MAX_TAIL: u32 = 5000;
-/// Lines of output the report of a try run ends with.
-const REPORT_LINES: u32 = 200;
 /// Lines `ci_timing` names when the call gives no count.
 const DEFAULT_TOP: u32 = 15;
-const DEFAULT_TIMEOUT_MINUTES: u32 = 60;
-const MAX_TIMEOUT_MINUTES: u32 = 1440;
-/// How long a call waits for a try run when it is not told.
+/// How long a call waits for a manual run when it is not told.
 const DEFAULT_WAIT_SECONDS: u64 = 540;
 /// The most a call waits: the client's own timeout for a tool call is 660 s.
 const MAX_WAIT_SECONDS: u64 = 600;
 /// Pause between two looks at a running pipeline.
 const POLL: Duration = Duration::from_secs(2);
-/// How long a pipeline that was just accepted may be missing from the CI's
-/// records.
-const RECORD_GRACE: Duration = Duration::from_secs(10);
 /// How long a wait keeps looking at a CI that does not answer before it
 /// gives up on it: a restart or a dropped link is over by then.
 const ERROR_GRACE: Duration = Duration::from_secs(60);
@@ -173,29 +167,27 @@ impl Toolbox {
         accepted(self.client.ci(request).await?)
     }
 
-    async fn try_run(&self, args: TryRunArgs) -> Result<String, String> {
+    /// Snapshots the working tree, uploads it with the names of the jobs to
+    /// run and, once the CI has numbered the pipeline, waits for it as
+    /// `ci_wait` does with what is left of the call's time.
+    async fn run_jobs(&self, args: RunJobsArgs) -> Result<String, String> {
         let started = Instant::now();
-        if !valid_name(&args.target) {
+        if !(1..=MAX_MANUAL_JOBS).contains(&args.jobs.len()) {
             return Err(format!(
-                "target {:?} is not a platform or runner name; ci_status lists them",
-                args.target
+                "jobs has {} entries; it must have 1 to {MAX_MANUAL_JOBS}",
+                args.jobs.len()
             ));
         }
-        if let Some(image) = &args.image
-            && !valid_name(image)
-        {
-            return Err(format!(
-                "image {image:?} is not an image name: .zeughaus-ci/<image>.Containerfile"
-            ));
-        }
-        let timeout_minutes = args.timeout_minutes.unwrap_or(DEFAULT_TIMEOUT_MINUTES);
-        if !(1..=MAX_TIMEOUT_MINUTES).contains(&timeout_minutes) {
-            return Err(format!(
-                "timeout_minutes is {timeout_minutes}; it must be 1 to {MAX_TIMEOUT_MINUTES}"
-            ));
-        }
-        if args.command.trim().is_empty() {
-            return Err("command is empty".to_owned());
+        for (index, name) in args.jobs.iter().enumerate() {
+            if !valid_name(name) {
+                return Err(format!(
+                    "{name:?} is not a job name: the file of .zeughaus-ci/ without its \
+                     extension, lowercase letters, digits and -"
+                ));
+            }
+            if args.jobs[..index].contains(name) {
+                return Err(format!("job {name} is named twice"));
+            }
         }
         let wait = wait_for(args.wait_seconds);
         // The snapshot and its upload cost time and bytes: do not make them
@@ -203,41 +195,30 @@ impl Toolbox {
         self.client.configured()?;
 
         let path = checkout_path(args.path.as_deref())?;
-        let command = args.command.clone();
-        let snapshot = tokio::task::spawn_blocking(move || snapshot::take(&path, &command))
+        let snapshot = tokio::task::spawn_blocking(move || snapshot::take(&path))
             .await
             .map_err(|e| format!("the snapshot failed: {e}"))??;
-        let upload = snapshot.upload(&args.target, args.image.as_deref(), timeout_minutes);
-        let reply = self.client.try_upload(&upload, &snapshot.bundles).await?;
+        let upload = snapshot.upload(&args.jobs);
+        let reply = self
+            .client
+            .manual_upload(&upload, &snapshot.bundles)
+            .await?;
         // The bundles are on the CI now.
         drop(snapshot);
         match reply {
-            TryReply::Accepted { repo, number } => {
-                self.wait(
-                    &repo,
-                    number,
-                    Some(&args.target),
-                    started,
-                    wait,
-                    RECORD_GRACE,
-                )
+            RunReply::Accepted { repo, number } => {
+                let left = wait.saturating_sub(started.elapsed()).as_secs().max(1);
+                self.ci_wait(CiWaitArgs {
+                    repo,
+                    number: Some(number),
+                    sha: None,
+                    job: None,
+                    wait_seconds: Some(left),
+                })
                 .await
             }
-            TryReply::Refused { message } => Err(message),
+            RunReply::Refused { message } => Err(message),
         }
-    }
-
-    async fn try_wait(&self, args: TryWaitArgs) -> Result<String, String> {
-        let wait = wait_for(args.wait_seconds);
-        self.wait(
-            &args.repo,
-            args.number,
-            None,
-            Instant::now(),
-            wait,
-            Duration::ZERO,
-        )
-        .await
     }
 
     /// Looks at a pipeline, named by its number or by the sha of its commit,
@@ -334,75 +315,6 @@ impl Toolbox {
         }
     }
 
-    /// Looks at the pipeline until it has finished or `wait` has passed since
-    /// `started`, and says where it stands. A pipeline missing from the CI's
-    /// records is an error once `grace` has passed, and so is a CI that has
-    /// not answered for the length of `error_grace`.
-    async fn wait(
-        &self,
-        repo: &str,
-        number: u64,
-        target: Option<&str>,
-        started: Instant,
-        wait: Duration,
-        grace: Duration,
-    ) -> Result<String, String> {
-        self.client.configured()?;
-        let deadline = started + wait;
-        let missing_until = Instant::now() + grace;
-        let mut latest: Option<PipelineView> = None;
-        let mut last_error = None;
-        let mut failing_since: Option<Instant> = None;
-        loop {
-            match self.look(repo, number).await {
-                Ok(Some(view)) if view.finished.is_some() => {
-                    return Ok(self.report(&view, target).await);
-                }
-                Ok(Some(view)) => {
-                    latest = Some(view);
-                    last_error = None;
-                    failing_since = None;
-                }
-                Ok(None) if Instant::now() >= missing_until => {
-                    return Err(format!("no pipeline {repo} #{number}"));
-                }
-                Ok(None) => failing_since = None,
-                // A CI that restarts or a link that drops is not the end of
-                // the run: look again for a while.
-                Err(e) => {
-                    let since = *failing_since.get_or_insert_with(Instant::now);
-                    if since.elapsed() >= self.error_grace {
-                        return Err(unreachable_text(
-                            &e,
-                            &format!("{repo} #{number}"),
-                            "try_wait",
-                        ));
-                    }
-                    last_error = Some(e);
-                }
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-            tokio::time::sleep(self.poll.min(deadline - now)).await;
-        }
-        match (latest, last_error) {
-            (Some(view), _) => Ok(running_text(
-                &view,
-                target,
-                now(),
-                started.elapsed().as_secs(),
-            )),
-            (None, Some(e)) => Err(unreachable_text(
-                &e,
-                &format!("{repo} #{number}"),
-                "try_wait",
-            )),
-            (None, None) => Err(format!("no pipeline {repo} #{number}")),
-        }
-    }
-
     /// The newest pipeline of any channel whose commit id starts with `sha`;
     /// `None` while there is none.
     async fn find(&self, repo: &str, sha: &str) -> Result<Option<PipelineView>, String> {
@@ -433,25 +345,6 @@ impl Toolbox {
             .await?
             .ok_or_else(|| format!("no pipeline {repo} #{number}"))
     }
-
-    /// The result of a finished try run: how it ended and the end of its
-    /// output.
-    async fn report(&self, view: &PipelineView, target: Option<&str>) -> String {
-        let log = match try_job(view) {
-            Some(job) => {
-                let request = CiRequest::Log {
-                    repo: view.repo.clone(),
-                    number: view.number,
-                    job: job.name.clone(),
-                    tail: REPORT_LINES,
-                    timestamps: false,
-                };
-                Some(self.client.ci(request).await)
-            }
-            None => None,
-        };
-        report_text(view, target, now(), log)
-    }
 }
 
 impl Tools for Toolbox {
@@ -476,8 +369,7 @@ impl Tools for Toolbox {
             "ci_rerun" => self.rerun(arguments_of(arguments)?).await,
             "ci_cancel" => self.cancel(arguments_of(arguments)?).await,
             "ci_wait" => self.ci_wait(arguments_of(arguments)?).await,
-            "try_run" => self.try_run(arguments_of(arguments)?).await,
-            "try_wait" => self.try_wait(arguments_of(arguments)?).await,
+            "run_jobs" => self.run_jobs(arguments_of(arguments)?).await,
             other => Err(format!(
                 "unknown tool {other:?}; the tools are {}",
                 definitions()
@@ -533,20 +425,9 @@ struct TimingArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TryRunArgs {
-    target: String,
-    command: String,
+struct RunJobsArgs {
+    jobs: Vec<String>,
     path: Option<String>,
-    image: Option<String>,
-    timeout_minutes: Option<u32>,
-    wait_seconds: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TryWaitArgs {
-    repo: String,
-    number: u64,
     wait_seconds: Option<u64>,
 }
 
@@ -593,7 +474,7 @@ fn wait_for(seconds: Option<u64>) -> Duration {
     )
 }
 
-/// The directory a try run is taken from: the call's `path`, else the
+/// The directory a manual run is taken from: the call's `path`, else the
 /// process's working directory.
 fn checkout_path(path: Option<&str>) -> Result<PathBuf, String> {
     let cwd =
@@ -906,95 +787,6 @@ fn job_timing_text(repo: &str, number: u64, job: &str, timing: &JobTiming) -> St
     text
 }
 
-/// The job a try run is about: the one named `try`, else the first.
-fn try_job(pipeline: &PipelineView) -> Option<&JobView> {
-    pipeline
-        .jobs
-        .iter()
-        .find(|job| job.name == "try")
-        .or_else(|| pipeline.jobs.first())
-}
-
-/// `<repo> #<n> try on <target>: <status> (<secs> s)`. `target` is what the
-/// caller asked for; without it the place of the job says where it runs.
-fn header(pipeline: &PipelineView, target: Option<&str>, now: u64) -> String {
-    let seconds = pipeline
-        .finished
-        .unwrap_or(now)
-        .saturating_sub(pipeline.created);
-    let place = target
-        .map(str::to_owned)
-        .or_else(|| try_job(pipeline).map(|job| job.place.clone()))
-        .filter(|place| !place.is_empty());
-    let on = place.map_or_else(String::new, |place| format!(" on {place}"));
-    format!(
-        "{} #{} try{on}: {} ({seconds} s)",
-        pipeline.repo, pipeline.number, pipeline.status
-    )
-}
-
-/// A finished try run: the header, what the CI says about it, and the end
-/// of its output as `log` returned it (`None` when it has no job).
-fn report_text(
-    pipeline: &PipelineView,
-    target: Option<&str>,
-    now: u64,
-    log: Option<Result<CiReply, String>>,
-) -> String {
-    let mut text = header(pipeline, target, now);
-    text.push('\n');
-    if !pipeline.note.is_empty() {
-        text.push_str(&format!("note: {}\n", one_line(&pipeline.note)));
-    }
-    if let Some(job) = try_job(pipeline) {
-        let mut facts = Vec::new();
-        if let Some(code) = job.code.filter(|code| *code != 0) {
-            facts.push(format!("exit code {code}"));
-        }
-        let note = one_line(&job.note);
-        if !note.is_empty() {
-            facts.push(note);
-        }
-        if !facts.is_empty() {
-            text.push_str(&format!("{}: {}\n", job.name, facts.join("; ")));
-        }
-        if let Some(cause) = &job.cause {
-            text.push_str(&format!("cause: {}\n", one_line(cause)));
-        }
-    }
-    match log {
-        Some(Ok(CiReply::Log { text: output, .. })) => {
-            text.push_str(&format!("--- last {REPORT_LINES} lines ---\n"));
-            text.push_str(output.trim_end_matches('\n'));
-            text.push('\n');
-        }
-        Some(Ok(other)) => text.push_str(&format!("--- no output: {} ---\n", unexpected(&other))),
-        Some(Err(e)) => text.push_str(&format!("--- no output: {e} ---\n")),
-        None => {}
-    }
-    text
-}
-
-/// A try run that has not finished when the call stops waiting.
-fn running_text(
-    pipeline: &PipelineView,
-    target: Option<&str>,
-    now: u64,
-    waited_seconds: u64,
-) -> String {
-    let mut text = header(pipeline, target, now);
-    text.push('\n');
-    for job in &pipeline.jobs {
-        text.push_str(&job_line(job));
-        text.push('\n');
-    }
-    text.push_str(&format!(
-        "still running after {waited_seconds} s; call try_wait with repo={} number={}\n",
-        pipeline.repo, pipeline.number
-    ));
-    text
-}
-
 /// The first seven characters of a commit id, `-` when there is none.
 fn short(sha: Option<&str>) -> &str {
     match sha {
@@ -1042,8 +834,7 @@ fn definitions() -> Vec<Value> {
             "ci_status",
             "The CI at a glance: every channel with its newest pipeline and status, every \
              runner and machine with its state and the jobs on it, the events waiting in the \
-             queue, and the platforms (name -> runner or machine) that try_run targets resolve \
-             through. Start here.",
+             queue, and the platforms (name -> runner or machine). Start here.",
             json!({}),
             &[],
             true,
@@ -1051,13 +842,13 @@ fn definitions() -> Vec<Value> {
         tool(
             "ci_pipelines",
             "A channel's pipelines, newest first, one line each: #number status event ref \
-             sha subject (actor). Try runs are in the channel `try`.",
+             sha subject (actor).",
             json!({
                 "repo": repo,
                 "channel": {
                     "type": "string",
                     "description": "Channel name as ci_status lists it, for example dev, \
-                                    nightly, release or try.",
+                                    nightly or release.",
                 },
                 "limit": {
                     "type": "integer",
@@ -1087,8 +878,7 @@ fn definitions() -> Vec<Value> {
                 "number": number,
                 "job": {
                     "type": "string",
-                    "description": "Job name as ci_pipeline lists it. The job of a try run \
-                                    is `try`.",
+                    "description": "Job name as ci_pipeline lists it.",
                 },
                 "tail": {
                     "type": "integer",
@@ -1159,7 +949,7 @@ fn definitions() -> Vec<Value> {
         tool(
             "ci_rerun",
             "Queue the pipeline's event again, pinned to the commit it ran for. Answers \
-             `accepted`. A try run cannot be rerun: start a new one with try_run.",
+             `accepted`. A manual run cannot be rerun: start a new one with run_jobs.",
             json!({ "repo": repo, "number": number }),
             &["repo", "number"],
             false,
@@ -1173,66 +963,35 @@ fn definitions() -> Vec<Value> {
             false,
         ),
         tool(
-            "try_run",
-            "Run a command on another host's zeughaus runner from the current working tree. \
-             The checkout at `path` is snapshotted as it is on disk (its commit, the \
-             changes to it, and untracked files that are not ignored), together with the \
-             sibling checkouts its Cargo path dependencies point to (../name), uploaded to the \
-             CI and run there as a pipeline of the channel `try`. Tries of one repository run \
-             one after another on a runner, and build output stays warm between them. \
-             Answers with `<repo> #<n> try on <target>: <status> (<secs> s)` and the last 200 \
-             lines of output, or, when the run is still going after wait_seconds, how to \
-             continue with try_wait.",
+            "run_jobs",
+            "Run jobs of this repository's pipeline from the current working tree, each in the \
+             warm workspace of its place, where the pipeline builds too, so builds and tests \
+             are incremental. The checkout at `path` is snapshotted as it is on disk (its \
+             commit, the changes to it, untracked files that are not ignored) with the sibling \
+             checkouts its Cargo path dependencies point to. Only the named jobs run; a need \
+             on a job that is not named is dropped, and no secrets are given. Answers as \
+             ci_wait does once the run has settled, or says how to continue with ci_wait.",
             json!({
-                "target": {
-                    "type": "string",
-                    "description": "Where to run: a platform from ci_status (for example \
-                                    linux-arm64, darwin-arm64, windows-amd64) or a runner \
-                                    name (for example atik, wohnzimmer).",
-                },
-                "command": {
-                    "type": "string",
-                    "description": "The command line: sh on Unix runners and in containers, \
-                                    PowerShell on Windows runners. It runs in the directory \
-                                    of the snapshot that `path` is in.",
+                "jobs": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "maxItems": MAX_MANUAL_JOBS,
+                    "description": "Job names: the files of .zeughaus-ci/ without extension, \
+                                    e.g. build-windows-amd64.",
                 },
                 "path": {
                     "type": "string",
-                    "description": "A directory inside the checkout to run from. Default: \
+                    "description": "A directory inside the checkout to snapshot. Default: \
                                     the working directory of this server.",
-                },
-                "image": {
-                    "type": "string",
-                    "description": "Run in a container built from \
-                                    .zeughaus-ci/<image>.Containerfile of the snapshot \
-                                    instead of on the runner's host.",
-                },
-                "timeout_minutes": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": MAX_TIMEOUT_MINUTES,
-                    "default": DEFAULT_TIMEOUT_MINUTES,
-                    "description": "The run is killed after this long.",
                 },
                 "wait_seconds": wait(
                     "How long this call may take in all, snapshot and upload included. A \
-                     run that has not finished by then is picked up with try_wait."
+                     run that has not settled by then is picked up with ci_wait."
                 ),
             }),
-            &["target", "command"],
+            &["jobs"],
             false,
-        ),
-        tool(
-            "try_wait",
-            "Wait for a try run started by try_run, which names its repo and number, and \
-             answer as try_run does.",
-            json!({
-                "repo": repo,
-                "number": number,
-                "wait_seconds": wait("How long to wait for the run to finish."),
-            }),
-            &["repo", "number"],
-            true,
         ),
     ]
 }
@@ -1269,9 +1028,9 @@ mod tests {
     use weida::TransferMeta;
     use zeughaus_link::enlist::UploadDir;
     use zeughaus_link::enlist::{read_frame, write_frame};
-    use zeughaus_link::tryrun::TryUpload;
+    use zeughaus_link::manual::{RunReply, RunUpload};
     use zeughaus_link::{
-        CI_PATH, ChannelView, MachineJob, MachineView, QueuedView, TRY_PATH, TimedLine,
+        CI_PATH, ChannelView, MANUAL_PATH, MachineJob, MachineView, QueuedView, TimedLine,
     };
 
     use super::*;
@@ -1298,9 +1057,9 @@ mod tests {
         PipelineView {
             repo: "demo".to_owned(),
             number: 7,
-            channel: "try".to_owned(),
-            event: "try".to_owned(),
-            git_ref: "try".to_owned(),
+            channel: "dev".to_owned(),
+            event: "manual".to_owned(),
+            git_ref: "main".to_owned(),
             sha: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
             actor: "hannes@tuco-pc".to_owned(),
             subject: "cargo test".to_owned(),
@@ -1313,7 +1072,7 @@ mod tests {
     }
 
     #[test]
-    fn there_are_ten_tools_and_each_takes_an_object() {
+    fn there_are_nine_tools_and_each_takes_an_object() {
         let definitions = definitions();
         let names: Vec<&str> = definitions
             .iter()
@@ -1330,8 +1089,7 @@ mod tests {
                 "ci_wait",
                 "ci_rerun",
                 "ci_cancel",
-                "try_run",
-                "try_wait"
+                "run_jobs"
             ]
         );
         for tool in &definitions {
@@ -1353,11 +1111,13 @@ mod tests {
                 .find(|tool| tool["name"] == name)
                 .unwrap_or_else(|| panic!("no tool {name}"))["inputSchema"]
         }
-        let run = schema(&definitions, "try_run");
-        assert_eq!(run["required"], json!(["target", "command"]));
+        let run = schema(&definitions, "run_jobs");
+        assert_eq!(run["required"], json!(["jobs"]));
+        assert_eq!(run["properties"]["jobs"]["minItems"], 1);
+        assert_eq!(run["properties"]["jobs"]["maxItems"], 16);
         assert_eq!(run["properties"]["wait_seconds"]["default"], 540);
         assert_eq!(run["properties"]["wait_seconds"]["maximum"], 600);
-        assert_eq!(run["properties"]["timeout_minutes"]["default"], 60);
+        assert_eq!(definitions[8]["annotations"]["readOnlyHint"], false);
         let log = schema(&definitions, "ci_log");
         assert_eq!(log["required"], json!(["repo", "number", "job"]));
         assert_eq!(log["properties"]["timestamps"]["type"], "boolean");
@@ -1380,7 +1140,7 @@ mod tests {
                 },
                 ChannelView {
                     repo: "zeughaus".to_owned(),
-                    channel: "try".to_owned(),
+                    channel: "nightly".to_owned(),
                     latest: 9,
                     status: "running".to_owned(),
                 },
@@ -1392,9 +1152,9 @@ mod tests {
                     status: "free".to_owned(),
                     jobs: vec![MachineJob {
                         repo: "zeughaus".to_owned(),
-                        channel: "try".to_owned(),
+                        channel: "nightly".to_owned(),
                         number: 9,
-                        job: "try".to_owned(),
+                        job: "build".to_owned(),
                     }],
                 },
                 MachineView {
@@ -1420,8 +1180,8 @@ mod tests {
         };
         assert_eq!(
             status_text(&overview, 1_000),
-            "channels\n  zeughaus/dev #123 succeeded\n  zeughaus/try #9 running\n\
-             machines\n  tuco-pc runner free [zeughaus#9/try]\n  win11 windows-vm off\n\
+            "channels\n  zeughaus/dev #123 succeeded\n  zeughaus/nightly #9 running\n\
+             machines\n  tuco-pc runner free [zeughaus#9/build]\n  win11 windows-vm off\n\
              queued\n  zeughaus/dev push main abcdef0 (rerun of #6) 100 s ago\n\
              platforms\n  linux-amd64 -> tuco-pc\n  windows-amd64 -> wohnzimmer\n"
         );
@@ -1483,85 +1243,6 @@ mod tests {
         view.actor.clear();
         view.sha = None;
         assert_eq!(pipeline_line(&view), "#7 failed push main -");
-    }
-
-    #[test]
-    fn a_finished_try_run_reports_how_it_ended_and_the_end_of_its_output() {
-        let log = |text: &str| {
-            Some(Ok(CiReply::Log {
-                text: text.to_owned(),
-                finished: true,
-            }))
-        };
-        let ok = pipeline(
-            "succeeded",
-            Some(1_012),
-            vec![job("try", "succeeded", "agent", "")],
-        );
-        assert_eq!(
-            report_text(
-                &ok,
-                Some("agent"),
-                5_000,
-                log("test result: ok. 1 passed\n")
-            ),
-            "demo #7 try on agent: succeeded (12 s)\n\
-             --- last 200 lines ---\n\
-             test result: ok. 1 passed\n"
-        );
-
-        let mut failed_job = job("try", "failed", "wohnzimmer", "exited with 101");
-        failed_job.code = Some(101);
-        failed_job.cause = Some("thread 'x' panicked at src/lib.rs:3".to_owned());
-        let failed = pipeline("failed", Some(1_042), vec![failed_job]);
-        // Without the target of the call, the job's place says where.
-        assert_eq!(
-            report_text(&failed, None, 5_000, log("a\nb")),
-            "demo #7 try on wohnzimmer: failed (42 s)\n\
-             try: exit code 101; exited with 101\n\
-             cause: thread 'x' panicked at src/lib.rs:3\n\
-             --- last 200 lines ---\n\
-             a\nb\n"
-        );
-
-        // A pipeline that never got a job, and a log that cannot be had.
-        let mut refused = pipeline("error", Some(1_001), Vec::new());
-        refused.note = "try runs on a runner's host or in a container".to_owned();
-        assert_eq!(
-            report_text(&refused, Some("win11"), 5_000, None),
-            "demo #7 try on win11: error (1 s)\n\
-             note: try runs on a runner's host or in a container\n"
-        );
-        assert_eq!(
-            report_text(
-                &ok,
-                None,
-                5_000,
-                Some(Err("no output for try of #7".to_owned()))
-            ),
-            "demo #7 try on agent: succeeded (12 s)\n\
-             --- no output: no output for try of #7 ---\n"
-        );
-    }
-
-    #[test]
-    fn a_try_run_that_is_still_going_says_how_to_continue() {
-        let running = pipeline(
-            "running",
-            None,
-            vec![job(
-                "try",
-                "waiting",
-                "agent",
-                "context zeughaus-try held by #6",
-            )],
-        );
-        assert_eq!(
-            running_text(&running, Some("agent"), 1_541, 541),
-            "demo #7 try on agent: running (541 s)\n\
-             \x20 try waiting agent context zeughaus-try held by #6\n\
-             still running after 541 s; call try_wait with repo=demo number=7\n"
-        );
     }
 
     #[test]
@@ -1645,7 +1326,7 @@ mod tests {
         assert_eq!(
             timing_text(&going),
             concat!(
-                "demo/try #7 running try try 0123456 cargo test (hannes@tuco-pc)\n",
+                "demo/dev #7 running manual main 0123456 cargo test (hannes@tuco-pc)\n",
                 "created 12:30:00 UTC, running\n",
                 "  a                    running   assigned +0 s started +2 s ended - staging 2 s ran -\n",
                 "  b                    pending   assigned - started - ended - staging - ran -\n",
@@ -1731,8 +1412,7 @@ mod tests {
             ("ci_rerun", json!({ "repo": "r", "number": 1 })),
             ("ci_cancel", json!({ "repo": "r", "number": 1 })),
             ("ci_wait", json!({ "repo": "r", "number": 1 })),
-            ("try_run", json!({ "target": "t", "command": "true" })),
-            ("try_wait", json!({ "repo": "r", "number": 1 })),
+            ("run_jobs", json!({ "jobs": ["build-x"] })),
         ] {
             let err = tools.call(name, arguments).await.expect_err(name);
             assert!(err.starts_with("no CI configured"), "{name}: {err}");
@@ -1744,41 +1424,31 @@ mod tests {
         let tools = toolbox_without_a_ci();
         let unknown = tools.call("ci_nothing", json!({})).await.err().unwrap();
         assert!(unknown.contains("unknown tool \"ci_nothing\""), "{unknown}");
-        assert!(unknown.contains("try_run"), "{unknown}");
+        assert!(unknown.contains("run_jobs"), "{unknown}");
 
+        let many: Vec<String> = (0..=MAX_MANUAL_JOBS).map(|i| format!("job-{i}")).collect();
         for (arguments, expected) in [
-            (json!({ "command": "true" }), "missing field `target`"),
+            (json!({}), "missing field `jobs`"),
+            (json!({ "jobs": ["a"], "wait": 1 }), "unknown field `wait`"),
+            (json!({ "jobs": "a" }), "invalid type"),
             (
-                json!({ "target": "t", "command": "true", "wait": 1 }),
-                "unknown field `wait`",
-            ),
-            (
-                json!({ "target": "t", "command": "true", "timeout_minutes": "5" }),
+                json!({ "jobs": ["a"], "wait_seconds": "5" }),
                 "invalid type",
             ),
             (
-                json!({ "target": "Windows 10", "command": "true" }),
-                "is not a platform or runner name",
+                json!({ "jobs": [] }),
+                "jobs has 0 entries; it must have 1 to 16",
             ),
             (
-                json!({ "target": "t", "command": "true", "image": "a/b" }),
-                "is not an image name",
+                json!({ "jobs": many }),
+                "jobs has 17 entries; it must have 1 to 16",
             ),
-            (
-                json!({ "target": "t", "command": "true", "timeout_minutes": 0 }),
-                "it must be 1 to 1440",
-            ),
-            (
-                json!({ "target": "t", "command": "true", "timeout_minutes": 1441 }),
-                "it must be 1 to 1440",
-            ),
-            (
-                json!({ "target": "t", "command": "  \n" }),
-                "command is empty",
-            ),
+            (json!({ "jobs": ["Build Windows"] }), "is not a job name"),
+            (json!({ "jobs": ["a/b"] }), "is not a job name"),
+            (json!({ "jobs": ["a", "b", "a"] }), "job a is named twice"),
         ] {
             let err = tools
-                .call("try_run", arguments.clone())
+                .call("run_jobs", arguments.clone())
                 .await
                 .err()
                 .unwrap();
@@ -1803,7 +1473,7 @@ mod tests {
     /// What the fake CI below was asked.
     #[derive(Default)]
     struct Seen {
-        uploads: Mutex<Vec<(TryUpload, Vec<Vec<u8>>)>>,
+        uploads: Mutex<Vec<(RunUpload, Vec<Vec<u8>>)>>,
         asked: Mutex<Vec<CiRequest>>,
         /// Looks at the pipeline before it is finished.
         running_looks: AtomicU32,
@@ -1811,7 +1481,7 @@ mod tests {
         finds: AtomicU32,
     }
 
-    /// A weida listener that answers `/ci` and `/try` the way the CI does,
+    /// A weida listener that answers `/ci` and `/manual` the way the CI does,
     /// with a pipeline that runs for `running_looks` looks, then ends as
     /// `outcome`.
     struct FakeCi {
@@ -1837,9 +1507,9 @@ mod tests {
         let seen = Arc::new(Seen::default());
         let ci = transport.listener().replier(CI_PATH).expect("/ci");
         tokio::spawn(serve_ci(ci, Arc::clone(&seen), running_looks));
-        let try_run = transport.listener().replier(TRY_PATH).expect("/try");
-        tokio::spawn(serve_try(
-            try_run,
+        let manual = transport.listener().replier(MANUAL_PATH).expect("/manual");
+        tokio::spawn(serve_manual(
+            manual,
             Arc::clone(&seen),
             refuse.map(str::to_owned),
         ));
@@ -1855,9 +1525,9 @@ mod tests {
     fn pipeline_one(seen: &Seen, running_looks: u32) -> PipelineView {
         let looks = seen.running_looks.fetch_add(1, Ordering::Relaxed);
         let mut view = if looks < running_looks {
-            pipeline("running", None, vec![job("try", "running", "agent", "")])
+            pipeline("running", None, vec![job("build", "running", "agent", "")])
         } else {
-            let mut done = job("try", "succeeded", "agent", "");
+            let mut done = job("build", "succeeded", "agent", "");
             done.code = Some(0);
             pipeline("succeeded", Some(1_007), vec![done])
         };
@@ -1947,15 +1617,15 @@ mod tests {
         }
     }
 
-    async fn serve_try(replier: weida::Replier, seen: Arc<Seen>, refuse: Option<String>) {
+    async fn serve_manual(replier: weida::Replier, seen: Arc<Seen>, refuse: Option<String>) {
         while let Ok(mut request) = replier.accept().await {
             let mut body = request.take_body();
-            let upload: TryUpload = read_frame(&mut body)
+            let upload: RunUpload = read_frame(&mut body)
                 .await
                 .expect("frame")
                 .expect("an upload");
             let reply = match &refuse {
-                Some(message) => TryReply::Refused {
+                Some(message) => RunReply::Refused {
                     message: message.clone(),
                 },
                 None => {
@@ -1970,7 +1640,7 @@ mod tests {
                     body.read_to_end(&mut rest).await.expect("the end");
                     assert!(rest.is_empty());
                     seen.uploads.lock().unwrap().push((upload, bundles));
-                    TryReply::Accepted {
+                    RunReply::Accepted {
                         repo: "demo".to_owned(),
                         number: 1,
                     }
@@ -2011,23 +1681,21 @@ mod tests {
         dir
     }
 
-    /// The whole of a try run against a CI that is not the real one: the
-    /// snapshot is taken from a directory, uploaded, and the pipeline looked
-    /// at until it has ended, then its output is fetched.
+    /// The whole of a manual run against a CI that is not the real one: the
+    /// snapshot is taken from a directory, uploaded, and the pipeline the CI
+    /// numbered is waited for.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_try_run_uploads_the_snapshot_and_reports_the_pipeline() {
+    async fn a_manual_run_uploads_the_snapshot_and_waits_for_the_pipeline() {
         let ci = fake_ci("run", 2, None).await;
         let tools = toolbox_for(&ci);
         let dir = checkout("run");
 
         let text = tools
             .call(
-                "try_run",
+                "run_jobs",
                 json!({
-                    "target": "agent",
-                    "command": "test -f note.txt && cargo test",
+                    "jobs": ["build-x", "check-x"],
                     "path": dir.join("sub"),
-                    "timeout_minutes": 5,
                     "wait_seconds": 30,
                 }),
             )
@@ -2035,20 +1703,18 @@ mod tests {
             .expect("the run");
 
         assert!(
-            text.starts_with("demo #1 try on agent: succeeded (7 s)\n"),
+            text.starts_with("demo/dev #1 succeeded manual main 0123456"),
             "{text}"
         );
-        assert!(text.contains("--- last 200 lines ---\n"), "{text}");
-        assert!(text.contains("test result: ok. 1 passed\n"), "{text}");
+        assert!(text.contains("\n  build succeeded agent\n"), "{text}");
+        assert!(!text.contains("still running"), "{text}");
 
         let uploads = ci.seen.uploads.lock().unwrap();
         assert_eq!(uploads.len(), 1);
         let (upload, bundles) = &uploads[0];
         assert_eq!(upload.origin, "git@example.invalid:o/demo.git");
-        assert_eq!(upload.target, "agent");
-        assert_eq!(upload.image, None);
-        assert_eq!(upload.timeout_minutes, 5);
-        assert_eq!(upload.summary, "test -f note.txt && cargo test");
+        assert_eq!(upload.jobs, ["build-x", "check-x"]);
+        assert_eq!(upload.summary, "working tree");
         assert_eq!(upload.dirs.len(), 1);
         assert_eq!(upload.dirs[0].dir, "demo");
         assert_eq!(bundles.len(), 1);
@@ -2059,50 +1725,41 @@ mod tests {
             "{:?}",
             String::from_utf8_lossy(&bundles[0][..20])
         );
-        // The pipeline was looked at while it ran, then its log was asked for
-        // as the job that ran.
+        // The pipeline was looked at while it ran and once when it was done,
+        // and nothing else was asked.
         assert_eq!(ci.seen.running_looks.load(Ordering::Relaxed), 3);
-        let asked = ci.seen.asked.lock().unwrap();
-        assert!(matches!(
-            asked.last(),
-            Some(CiRequest::Log { job, tail: 200, .. }) if job == "try"
-        ));
+        assert!(
+            ci.seen
+                .asked
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|asked| matches!(asked, CiRequest::Pipeline { number: 1, .. }))
+        );
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_try_run_that_outlasts_the_wait_can_be_waited_for_again() {
+    async fn a_manual_run_that_outlasts_the_wait_says_how_to_continue() {
         let ci = fake_ci("again", 1_000, None).await;
         let tools = toolbox_for(&ci);
         let dir = checkout("again");
 
         let text = tools
             .call(
-                "try_run",
-                json!({
-                    "target": "agent",
-                    "command": "cargo test",
-                    "path": dir,
-                    "wait_seconds": 0,
-                }),
+                "run_jobs",
+                json!({ "jobs": ["build-x"], "path": dir, "wait_seconds": 1 }),
             )
             .await
             .expect("still running is not an error");
-        assert!(text.starts_with("demo #1 try on agent: running"), "{text}");
         assert!(
-            text.ends_with("still running after 0 s; call try_wait with repo=demo number=1\n"),
+            text.starts_with("demo/dev #1 running manual main"),
             "{text}"
         );
-
-        // try_wait with a pipeline the CI does not know is an error at once.
-        let err = tools
-            .call(
-                "try_wait",
-                json!({ "repo": "demo", "number": 2, "wait_seconds": 5 }),
-            )
-            .await
-            .expect_err("unknown pipeline");
-        assert_eq!(err, "no pipeline demo #2");
+        assert!(
+            text.ends_with("still running after 1 s; call ci_wait again with repo=demo number=1\n"),
+            "{text}"
+        );
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
@@ -2116,14 +1773,14 @@ mod tests {
         let started = Instant::now();
         let err = tools
             .call(
-                "try_wait",
+                "ci_wait",
                 json!({ "repo": "demo", "number": 3, "wait_seconds": 30 }),
             )
             .await
             .expect_err("the CI fails");
         assert_eq!(
             err,
-            "the scheduler is restarting (the pipeline is demo #3; try_wait asks again)"
+            "the scheduler is restarting (the pipeline is demo #3; ci_wait asks again)"
         );
         assert!(
             started.elapsed() < Duration::from_secs(10),
@@ -2143,7 +1800,7 @@ mod tests {
             .await
             .expect("the pipeline finishes");
         assert!(
-            text.starts_with("demo/try #1 succeeded try try 0123456"),
+            text.starts_with("demo/dev #1 succeeded manual main 0123456"),
             "{text}"
         );
         assert!(!text.contains("still running"), "{text}");
@@ -2214,7 +1871,7 @@ mod tests {
             )
             .await
             .expect("the pipeline appears and finishes");
-        assert!(text.starts_with("demo/try #1 succeeded"), "{text}");
+        assert!(text.starts_with("demo/dev #1 succeeded"), "{text}");
         let find = CiRequest::Find {
             repo: "demo".to_owned(),
             sha: "deadbeef".to_owned(),
@@ -2278,7 +1935,7 @@ mod tests {
             .expect("the pipeline");
         assert!(
             text.starts_with(
-                "demo/try #1 succeeded try try 0123456 cargo test (hannes@tuco-pc)\n\
+                "demo/dev #1 succeeded manual main 0123456 cargo test (hannes@tuco-pc)\n\
                  created 00:16:40 UTC, took 7 s\n"
             ),
             "{text}"
@@ -2292,7 +1949,7 @@ mod tests {
         // With one the CI is asked, for 15 lines unless told otherwise and
         // for no more than it gives.
         let timing = |extra: Value| {
-            let mut arguments = json!({ "repo": "demo", "number": 1, "job": "try" });
+            let mut arguments = json!({ "repo": "demo", "number": 1, "job": "build" });
             arguments
                 .as_object_mut()
                 .unwrap()
@@ -2302,24 +1959,24 @@ mod tests {
         let text = timing(json!({})).await.expect("the job's pauses");
         assert_eq!(
             text,
-            "demo #1 try: 3 lines over 31.2 s of output, still running\n\
+            "demo #1 build: 3 lines over 31.2 s of output, still running\n\
              (only the last 64 MiB of output were read)\n\
              the 1 lines followed by the longest pauses, in output order:\n\
-             \x20 +0.0 s  30.0 s  try: asked for 15\n"
+             \x20 +0.0 s  30.0 s  build: asked for 15\n"
         );
         assert_eq!(
             ci.seen.asked.lock().unwrap().last(),
             Some(&CiRequest::Timing {
                 repo: "demo".to_owned(),
                 number: 1,
-                job: "try".to_owned(),
+                job: "build".to_owned(),
                 top: 15,
             })
         );
         let text = timing(json!({ "top": 1000 })).await.expect("clamped");
-        assert!(text.contains("try: asked for 100\n"), "{text}");
+        assert!(text.contains("build: asked for 100\n"), "{text}");
         let text = timing(json!({ "top": 0 })).await.expect("clamped");
-        assert!(text.contains("try: asked for 1\n"), "{text}");
+        assert!(text.contains("build: asked for 1\n"), "{text}");
 
         // The CI's refusal is the tool's error.
         let err = tools
@@ -2337,7 +1994,7 @@ mod tests {
         let ci = fake_ci("stamps", 0, None).await;
         let tools = toolbox_for(&ci);
         let log = |extra: Value| {
-            let mut arguments = json!({ "repo": "demo", "number": 1, "job": "try" });
+            let mut arguments = json!({ "repo": "demo", "number": 1, "job": "build" });
             arguments
                 .as_object_mut()
                 .unwrap()
@@ -2346,7 +2003,7 @@ mod tests {
         };
 
         let plain = log(json!({})).await.expect("log");
-        assert_eq!(plain, "job try, 200 lines\ntest result: ok. 1 passed\n");
+        assert_eq!(plain, "job build, 200 lines\ntest result: ok. 1 passed\n");
         assert!(matches!(
             ci.seen.asked.lock().unwrap().last(),
             Some(CiRequest::Log {
@@ -2359,7 +2016,7 @@ mod tests {
         let stamped = log(json!({ "timestamps": true })).await.expect("log");
         assert_eq!(
             stamped,
-            "[+     0.0s] job try, 200 lines\ntest result: ok. 1 passed\n"
+            "[+     0.0s] job build, 200 lines\ntest result: ok. 1 passed\n"
         );
         assert!(matches!(
             ci.seen.asked.lock().unwrap().last(),
@@ -2371,23 +2028,23 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_cis_refusal_of_an_upload_is_the_tools_error() {
+    async fn the_cis_refusal_of_a_run_is_the_tools_error() {
         let ci = fake_ci(
             "refuse",
             0,
-            Some("no repository matches git@example.invalid:o/demo.git"),
+            Some("git@example.invalid:o/demo.git is no repository of ci.toml"),
         )
         .await;
         let tools = toolbox_for(&ci);
         let dir = checkout("refuse");
         let err = tools
-            .call(
-                "try_run",
-                json!({ "target": "agent", "command": "true", "path": dir }),
-            )
+            .call("run_jobs", json!({ "jobs": ["build-x"], "path": dir }))
             .await
             .expect_err("refused");
-        assert_eq!(err, "no repository matches git@example.invalid:o/demo.git");
+        assert_eq!(
+            err,
+            "git@example.invalid:o/demo.git is no repository of ci.toml"
+        );
         assert!(ci.seen.uploads.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
@@ -2403,13 +2060,11 @@ mod tests {
         let client = Client::new(link);
         let bundle = std::env::temp_dir().join(format!("zeughaus-mcp-big-{}", std::process::id()));
         std::fs::write(&bundle, vec![7u8; SIZE]).unwrap();
-        let upload = TryUpload {
+        let upload = RunUpload {
             origin: "x".to_owned(),
-            target: "agent".to_owned(),
-            image: None,
-            timeout_minutes: 1,
             actor: "a@b".to_owned(),
             summary: "s".to_owned(),
+            jobs: vec!["build-x".to_owned()],
             dirs: vec![UploadDir {
                 dir: "x".to_owned(),
                 sha: "0".repeat(40),
@@ -2418,13 +2073,13 @@ mod tests {
         };
 
         let reply = client
-            .try_upload(&upload, std::slice::from_ref(&bundle))
+            .manual_upload(&upload, std::slice::from_ref(&bundle))
             .await
             .expect("a refusal is an answer");
 
         assert_eq!(
             reply,
-            TryReply::Refused {
+            RunReply::Refused {
                 message: "no repository matches x".to_owned()
             }
         );
@@ -2442,20 +2097,20 @@ mod tests {
             .await
             .expect("pipeline");
         assert!(
-            text.starts_with("demo/try #1 succeeded try try 0123456"),
+            text.starts_with("demo/dev #1 succeeded manual main 0123456"),
             "{text}"
         );
-        assert!(text.contains("\n  try succeeded agent\n"), "{text}");
+        assert!(text.contains("\n  build succeeded agent\n"), "{text}");
 
         let log = tools
             .call(
                 "ci_log",
-                json!({ "repo": "demo", "number": 1, "job": "try", "tail": 9_999 }),
+                json!({ "repo": "demo", "number": 1, "job": "build", "tail": 9_999 }),
             )
             .await
             .expect("log");
         // Asked for more than the CI gives: asked for what it gives.
-        assert_eq!(log, "job try, 5000 lines\ntest result: ok. 1 passed\n");
+        assert_eq!(log, "job build, 5000 lines\ntest result: ok. 1 passed\n");
 
         let err = tools
             .call("ci_rerun", json!({ "repo": "demo", "number": 1 }))

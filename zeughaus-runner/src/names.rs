@@ -1,6 +1,7 @@
 //! The one shape of a name the CI hands out and the runner accepts: runner,
-//! machine, repository, job, context and channel names. They become path
-//! components and container names, so the shape is kept narrow on purpose.
+//! machine, repository, job, image, workspace and channel names. They become
+//! path components and container names, so the shape is kept narrow on
+//! purpose.
 
 /// `[a-z0-9][a-z0-9-]*`
 pub fn valid_name(s: &str) -> bool {

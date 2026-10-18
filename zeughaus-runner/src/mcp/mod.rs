@@ -1,9 +1,9 @@
-//! `zeughaus-runner mcp`: the CI and try runs as tools of an agent.
+//! `zeughaus-runner mcp`: the CI and manual job runs as tools of an agent.
 //!
 //! A Model Context Protocol server on stdio, started by the agent that uses
 //! it and living as long as its session. It executes nothing and holds no
 //! graph: it asks the CI, over weida, what an editor would ask it, and
-//! uploads a working tree for a try run. It dials the CI given with
+//! uploads a working tree for a manual job run. It dials the CI given with
 //! `--ci <url>`, else the first entry of `ci = [..]` in the state
 //! directory's `zeughaus.toml`, as the principal of that directory's
 //! `client.pem`: the same one an editor on this machine is.
@@ -16,8 +16,8 @@
 //! stderr.
 //!
 //! - [`rpc`]: the JSON-RPC framing and the calls running in parallel;
-//! - [`tools`]: the ten tools and the text they answer with;
-//! - [`client`]: the CI's `/ci` and `/try` exchanges;
+//! - [`tools`]: the nine tools and the text they answer with;
+//! - [`client`]: the CI's `/ci` and `/manual` exchanges;
 //! - [`snapshot`]: a working tree and its path dependencies as git bundles.
 
 mod client;
@@ -122,7 +122,7 @@ mod tests {
         assert!(parse_args(&args(&["--feed-addr", "x"])).is_err());
     }
 
-    /// What the agent sees of a runner that has no CI: ten tools, and an
+    /// What the agent sees of a runner that has no CI: nine tools, and an
     /// error with the reason from every call.
     #[tokio::test]
     async fn a_session_without_a_ci_lists_the_tools_and_explains_every_call() {
@@ -159,7 +159,7 @@ mod tests {
         };
 
         assert_eq!(by_id(1)["result"]["serverInfo"]["name"], "zeughaus");
-        assert_eq!(by_id(2)["result"]["tools"].as_array().unwrap().len(), 10);
+        assert_eq!(by_id(2)["result"]["tools"].as_array().unwrap().len(), 9);
         let status = &by_id(3)["result"];
         assert_eq!(status["isError"], true);
         let text = status["content"][0]["text"].as_str().unwrap();

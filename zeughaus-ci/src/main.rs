@@ -13,6 +13,7 @@ mod files;
 mod forge;
 mod header;
 mod hook;
+mod manual;
 mod pipeline;
 mod runners;
 mod scheduler;
@@ -22,7 +23,6 @@ mod service;
 mod streak;
 mod transcripts;
 mod transport;
-mod tryrun;
 
 use std::path::{Path, PathBuf};
 

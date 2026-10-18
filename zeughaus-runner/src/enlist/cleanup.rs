@@ -47,13 +47,11 @@ fn size_of(dir: &Path) -> u64 {
     total
 }
 
-/// When a workspace was last checked out; one never touched counts as oldest.
-/// A repository's workspace has the marker in its `.git`; the root of a try
-/// run's checkouts is no repository and has it beside them.
+/// When a workspace was last checked out: the marker every checkout touches
+/// in the workspace's `.git`. A workspace without it counts as the oldest.
 fn last_used(workspace: &Path) -> SystemTime {
-    let modified = |marker: PathBuf| std::fs::metadata(marker).and_then(|m| m.modified());
-    modified(workspace.join(".git").join("zci-last-used"))
-        .or_else(|_| modified(workspace.join(".zci-last-used")))
+    std::fs::metadata(workspace.join(".git").join("zci-last-used"))
+        .and_then(|marker| marker.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
@@ -183,17 +181,14 @@ mod tests {
             .unwrap();
     }
 
-    /// A repository's workspace is as old as the marker in its `.git`, the
-    /// root of a try run's checkouts as the marker beside them, and a
-    /// workspace never checked out counts as the oldest.
+    /// A workspace is as old as the marker in its `.git`; one without it,
+    /// whatever lies beside its `.git`, counts as the oldest.
     #[test]
     fn a_workspace_is_as_old_as_its_marker() {
         let base = std::env::temp_dir().join(format!("zci-last-used-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         marked(&base.join("repo/.git/zci-last-used"), 100);
-        marked(&base.join("try/.zci-last-used"), 200);
-        marked(&base.join("both/.git/zci-last-used"), 300);
-        marked(&base.join("both/.zci-last-used"), 400);
+        marked(&base.join("beside/.zci-last-used"), 200);
         std::fs::create_dir_all(base.join("never")).unwrap();
         let secs = |ws: &str| {
             last_used(&base.join(ws))
@@ -202,8 +197,7 @@ mod tests {
                 .as_secs()
         };
         assert_eq!(secs("repo"), 100);
-        assert_eq!(secs("try"), 200);
-        assert_eq!(secs("both"), 300);
+        assert_eq!(secs("beside"), 0);
         assert_eq!(secs("never"), 0);
         let _ = std::fs::remove_dir_all(&base);
     }

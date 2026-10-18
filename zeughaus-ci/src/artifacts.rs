@@ -1,6 +1,6 @@
 //! The `/artifacts` service: the CI relays a finished job's artifact set from
 //! the runner that holds it to the runner of a job that needs it, without a
-//! copy on this side, and hands a runner the bundles of the try run it was
+//! copy on this side, and hands a runner the bundles of the manual run it was
 //! assigned.
 //!
 //! A consuming runner opens a `Download`; the CI asks the producing runner
@@ -11,8 +11,8 @@
 //! consumer unpacks while the set moves. One exchange moves one set; the
 //! request is one frame ([`ArtifactRequest`]), an upload's chunks follow it,
 //! a download's follow the reply frame ([`ArtifactReply`]), framed as
-//! `zeughaus_link::enlist` describes. A `TryBundle` is answered the same way,
-//! from the file the `/try` service stored.
+//! `zeughaus_link::enlist` describes. A `ManualBundle` is answered the same way,
+//! from the file the `/manual` service stored.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -29,10 +29,10 @@ use zeughaus_link::enlist::{
 };
 
 use crate::config::{CiConfig, valid_name};
+use crate::manual;
 use crate::runners::Runners;
 use crate::scheduler::{JobStatus, Pipeline, load_pipeline};
 use crate::transport::principal_of;
-use crate::tryrun;
 
 /// How long a download waits for the producing runner to open its upload. The
 /// producer packs while it sends, so this is the time to be told, to connect
@@ -141,8 +141,8 @@ impl ArtifactService {
                 answer(&mut reply, &runner, &run, passed).await
             }
             ArtifactRequest::Download { run } => self.download(&runner, &run, &mut reply).await,
-            ArtifactRequest::TryBundle { run, index } => {
-                self.try_bundle(&runner, &run, index, &mut reply).await
+            ArtifactRequest::ManualBundle { run, index } => {
+                self.manual_bundle(&runner, &run, index, &mut reply).await
             }
         };
         if let Err(e) = outcome {
@@ -264,8 +264,8 @@ impl ArtifactService {
         })
     }
 
-    /// Streams bundle `index` of the try run `run` into `reply` as chunks.
-    async fn try_bundle(
+    /// Streams bundle `index` of the manual run `run` into `reply` as chunks.
+    async fn manual_bundle(
         &self,
         requester: &str,
         run: &str,
@@ -307,7 +307,7 @@ impl ArtifactService {
             .map_err(|e| format!("download failed: {e}"))
     }
 
-    /// The file of bundle `index` of the try run `run`, when `requester` is
+    /// The file of bundle `index` of the manual run `run`, when `requester` is
     /// the runner it is assigned to. The name came from a peer and is joined
     /// into a path, so it is checked before and against the records after.
     fn bundle_for(&self, requester: &str, run: &str, index: u32) -> Result<PathBuf, String> {
@@ -317,11 +317,12 @@ impl ArtifactService {
         }
         let pipeline = load_pipeline(&self.state_dir, &repo, number)
             .map_err(|_| format!("{run} is not a known run"))?;
-        let id = tryrun::upload_of(&pipeline).ok_or_else(|| format!("{run} is not a try run"))?;
+        let id =
+            manual::upload_of(&pipeline).ok_or_else(|| format!("{run} is not a manual run"))?;
         if self.runners.assigned_to(run).as_deref() != Some(requester) {
             return Err(format!("runner {requester} is not assigned {run}"));
         }
-        let upload = tryrun::read_upload(&self.state_dir, id)
+        let upload = manual::read_upload(&self.state_dir, id)
             .map_err(|_| format!("the upload of {run} is gone"))?;
         if index as usize >= upload.dirs.len() {
             return Err(format!(
@@ -329,7 +330,7 @@ impl ArtifactService {
                 upload.dirs.len()
             ));
         }
-        Ok(tryrun::bundle_path(&self.state_dir, id, index))
+        Ok(manual::bundle_path(&self.state_dir, id, index))
     }
 }
 
@@ -470,7 +471,7 @@ mod tests {
         let def = |name: &str, needs: &[&str]| {
             serde_json::json!({
                 "name": name, "file": format!("{name}.sh"), "on": [], "needs": needs,
-                "image": null, "machine": null, "cache": [], "secrets": [],
+                "image": null, "machine": null, "secrets": [],
                 "when_busy": "wait", "env": {}, "timeout_minutes": 5, "interpreter": "sh",
             })
         };
@@ -531,11 +532,11 @@ mod tests {
     const FP: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
     const UPLOAD: &str = "0123456789abcdef";
 
-    /// A service over a state directory that holds pipeline `demo` #3 (a try
-    /// run, or a push) with an upload of two bundles.
+    /// A service over a state directory that holds pipeline `demo` #3 (a
+    /// manual run, or a push) with an upload of two bundles.
     fn service_with(kind: &str) -> (ArtifactService, PathBuf) {
         use zeughaus_link::enlist::UploadDir;
-        use zeughaus_link::tryrun::TryUpload;
+        use zeughaus_link::manual::RunUpload;
 
         let state = std::env::temp_dir().join(format!("zci-bundles-{kind}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&state);
@@ -543,7 +544,7 @@ mod tests {
             "repo": "demo", "number": 3, "key": "", "sha": null, "status": "running",
             "created": 0, "jobs": [],
             "event": {
-                "repo": "demo", "kind": kind, "git_ref": "try", "sha": null, "cron": null,
+                "repo": "demo", "kind": kind, "git_ref": "main", "sha": null, "cron": null,
                 "actor": "a", "delivery": null, "upload": UPLOAD, "received": 0,
             },
         });
@@ -552,20 +553,18 @@ mod tests {
             dir: name.to_owned(),
             sha: "a".repeat(40),
         };
-        let upload = TryUpload {
+        let upload = RunUpload {
             origin: "git@example.org:me/demo.git".to_owned(),
-            target: "x".to_owned(),
-            image: None,
-            timeout_minutes: 5,
             actor: "a".to_owned(),
             summary: "true".to_owned(),
+            jobs: vec!["build".to_owned()],
             dirs: vec![dir("demo"), dir("lib")],
             sizes: vec![5, 3],
         };
-        std::fs::create_dir_all(tryrun::upload_dir(&state, UPLOAD)).unwrap();
-        std::fs::write(tryrun::bundle_path(&state, UPLOAD, 0), b"first").unwrap();
-        std::fs::write(tryrun::bundle_path(&state, UPLOAD, 1), b"lib").unwrap();
-        tryrun::write_upload(&state, UPLOAD, &upload).unwrap();
+        std::fs::create_dir_all(manual::upload_dir(&state, UPLOAD)).unwrap();
+        std::fs::write(manual::bundle_path(&state, UPLOAD, 0), b"first").unwrap();
+        std::fs::write(manual::bundle_path(&state, UPLOAD, 1), b"lib").unwrap();
+        manual::write_upload(&state, UPLOAD, &upload).unwrap();
         let config = CiConfig::parse(&format!(
             "default_runner = \"x\"\n[runners.x]\nfingerprint = \"{FP}\"\n"
         ))
@@ -575,13 +574,13 @@ mod tests {
         (service, state)
     }
 
-    /// A runner gets the bundles of the try run it is assigned, and of no
+    /// A runner gets the bundles of the manual run it is assigned, and of no
     /// other run: not another runner's, not a push's, not a path.
     #[test]
-    fn a_try_bundle_goes_only_to_the_runner_assigned_the_run() {
-        let (service, state) = service_with("try");
-        let run = "demo.3.try";
-        let path = |index| tryrun::bundle_path(&state, UPLOAD, index);
+    fn a_manual_bundle_goes_only_to_the_runner_assigned_the_run() {
+        let (service, state) = service_with("manual");
+        let run = "demo.3.build";
+        let path = |index| manual::bundle_path(&state, UPLOAD, index);
 
         assert!(service.bundle_for("x", run, 0).is_err(), "not assigned yet");
         service.runners.assign(run, "x");
@@ -589,7 +588,13 @@ mod tests {
         assert_eq!(service.bundle_for("x", run, 1), Ok(path(1)));
         assert!(service.bundle_for("x", run, 2).is_err(), "no third bundle");
         assert!(service.bundle_for("y", run, 0).is_err(), "another runner");
-        for bad in ["demo.4.try", "../demo.3.try", "demo.3.../try", "demo", ""] {
+        for bad in [
+            "demo.4.build",
+            "../demo.3.build",
+            "demo.3.../build",
+            "demo",
+            "",
+        ] {
             assert!(service.bundle_for("x", bad, 0).is_err(), "{bad:?}");
         }
         service.runners.unassign(run);
@@ -599,7 +604,7 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&state);
 
-        // The same upload named by a pipeline that is no try run.
+        // The same upload named by a pipeline that is no manual run.
         let (service, state) = service_with("push");
         service.runners.assign(run, "x");
         assert!(service.bundle_for("x", run, 0).is_err());

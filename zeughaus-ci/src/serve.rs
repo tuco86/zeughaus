@@ -231,8 +231,8 @@ impl CiServer {
             return error("no such pipeline");
         };
         // Its working trees are gone with the run: only the uploader has them.
-        if pipeline.event.kind == EventKind::Try {
-            return error("a try run cannot be rerun; start a new one");
+        if pipeline.event.kind == EventKind::Manual {
+            return error("a manual run cannot be rerun; start a new one");
         }
         let mut event = pipeline.event.clone();
         if pipeline.sha.is_some() {
@@ -743,8 +743,7 @@ mod tests {
                 image: None,
                 machine: None,
                 platform: None,
-                context: None,
-                cache: Vec::new(),
+                ignored_keys: Vec::new(),
                 channels: Vec::new(),
                 secrets: Vec::new(),
                 when_busy: Default::default(),
@@ -1152,9 +1151,9 @@ mod tests {
             store(&state, &record);
         };
         with_sha(2, "dev", "abcdef0123456789abcdef0123456789abcdef01");
-        // A rerun of the same commit, and a try run of another one.
+        // A rerun of the same commit, and a manual run of another one.
         with_sha(9, "release", "abcdef0123456789abcdef0123456789abcdef01");
-        with_sha(10, "try", "1234567890abcdef1234567890abcdef12345678");
+        with_sha(10, "nightly", "1234567890abcdef1234567890abcdef12345678");
         let server = server(&state);
         let find = |sha: &str| match server.answer(CiRequest::Find {
             repo: "view".to_owned(),
@@ -1166,7 +1165,7 @@ mod tests {
 
         assert_eq!(find("abcdef0"), Some((9, "release".to_owned())));
         assert_eq!(find("ABCD"), Some((9, "release".to_owned())));
-        assert_eq!(find("1234"), Some((10, "try".to_owned())));
+        assert_eq!(find("1234"), Some((10, "nightly".to_owned())));
         assert_eq!(find("ffff"), None);
 
         for bad in ["abc", "xyz1", "", &"a".repeat(41)] {
@@ -1312,11 +1311,11 @@ mod tests {
     }
 
     #[test]
-    fn a_try_run_cannot_be_rerun() {
-        let state = scratch("rerun-try");
-        let mut record = pipeline("view", 4, "try", PipelineStatus::Failed, Vec::new());
-        record.event.kind = EventKind::Try;
-        record.event.git_ref = "try".to_owned();
+    fn a_manual_run_cannot_be_rerun() {
+        let state = scratch("rerun-manual");
+        let mut record = pipeline("view", 4, "dev", PipelineStatus::Failed, Vec::new());
+        record.event.kind = EventKind::Manual;
+        record.event.git_ref = "main".to_owned();
         record.event.upload = Some("0123456789abcdef".to_owned());
         store(&state, &record);
         let server = server(&state);
@@ -1325,7 +1324,7 @@ mod tests {
                 repo: "view".to_owned(),
                 number: 4,
             }),
-            error("a try run cannot be rerun; start a new one")
+            error("a manual run cannot be rerun; start a new one")
         );
         event::drain_inbox(&state);
         assert!(event::queued(&state).is_empty());

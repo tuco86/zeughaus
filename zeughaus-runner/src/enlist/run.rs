@@ -26,7 +26,7 @@ use zeughaus_link::enlist::{
     Assignment, FromRunner, Input, InputSource, MAX_OUTPUT_CHUNK, Place, RunEnd, Upload,
     parse_run_id, run_id,
 };
-use zeughaus_link::tryrun::{MAX_TRY_DIRS, TRY_WORKSPACE, valid_dir_name};
+use zeughaus_link::manual::{MAX_MANUAL_DIRS, valid_dir_name};
 
 use super::cleanup;
 use super::launch::{self, Launch, Target};
@@ -91,9 +91,15 @@ fn check_abort(ctl: &RunCtl) -> Result<(), Prep> {
 
 /// The assignment is the CI's, and its names become paths here.
 fn validate(a: &Assignment) -> Result<(), String> {
-    let names_ok = valid_name(&a.repo) && valid_name(&a.job) && valid_name(&a.workspace);
+    let names_ok = valid_name(&a.repo) && valid_name(&a.job);
     if !names_ok || a.run != run_id(&a.repo, a.number, &a.job) {
         return Err(format!("malformed assignment for run {:?}", a.run));
+    }
+    // The workspace is named after the place, so the image or machine name
+    // becomes a path component as well.
+    let workspace = a.place.workspace();
+    if !valid_name(&workspace) {
+        return Err(format!("{workspace:?} is not a workspace name"));
     }
     if a.sha.is_empty() || !a.sha.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!("{:?} is not a commit", a.sha));
@@ -109,33 +115,23 @@ fn validate(a: &Assignment) -> Result<(), String> {
             a.file
         ));
     }
-    match &a.upload {
-        Some(upload) => validate_upload(a, upload)?,
-        // Nothing else may check a job out into the try runs' workspace.
-        None if a.workspace == TRY_WORKSPACE => {
-            return Err(format!("{TRY_WORKSPACE:?} is the workspace of try runs"));
-        }
-        None => {}
+    if let Some(upload) = &a.upload {
+        validate_upload(a, upload)?;
     }
     Ok(())
 }
 
-/// The working trees of a try run become directories below its workspace and
-/// their commits arguments of git: both are the CI's words.
+/// The names of a manual run's sibling checkouts become directories below its
+/// workspace and the commits of all its checkouts arguments of git: both are
+/// the CI's words.
 fn validate_upload(a: &Assignment, upload: &Upload) -> Result<(), String> {
-    if a.workspace != TRY_WORKSPACE {
-        return Err(format!(
-            "{:?} is not the workspace of try runs",
-            a.workspace
-        ));
-    }
     // A machine's workspace is one bundle, copied into the guest.
     if !matches!(a.place, Place::Host | Place::Container { .. }) {
-        return Err("a try run runs on a host or in a container".to_owned());
+        return Err("a manual run runs on a host or in a container".to_owned());
     }
-    if upload.dirs.is_empty() || upload.dirs.len() > MAX_TRY_DIRS {
+    if upload.dirs.is_empty() || upload.dirs.len() > MAX_MANUAL_DIRS {
         return Err(format!(
-            "{} checkouts are not in 1..={MAX_TRY_DIRS}",
+            "{} checkouts are not in 1..={MAX_MANUAL_DIRS}",
             upload.dirs.len()
         ));
     }
@@ -150,13 +146,17 @@ fn validate_upload(a: &Assignment, upload: &Upload) -> Result<(), String> {
     Ok(())
 }
 
-/// An assignment a runner persisted before workspaces had names ran in the
-/// job's own.
-fn named_workspace(mut assignment: Assignment) -> Assignment {
-    if assignment.workspace.is_empty() {
-        assignment.workspace = assignment.job.clone();
+/// What `CI_SIBLINGS` names in a manual run: the directory of the workspace
+/// that holds its sibling checkouts, at the path the job sees it. Only a host
+/// and a container get here: `validate` refuses an upload for a machine.
+fn siblings_var(place: &Place, workspace: &Path) -> String {
+    match place {
+        Place::Container { .. } => format!("/work/{}", launch::SIBLINGS_DIR),
+        Place::Host | Place::Machine { .. } => workspace
+            .join(launch::SIBLINGS_DIR)
+            .to_string_lossy()
+            .into_owned(),
     }
-    assignment
 }
 
 /// The run id as one path component of `<state>/ci/`.
@@ -267,7 +267,7 @@ impl Executor {
         }
         check_abort(ctl)?;
         let mirror = mirror_dir(&self.state_dir, &a.repo);
-        // A try run has its commits in bundles the CI stored, not on the
+        // A manual run has its commits in bundles the CI stored, not on the
         // forge.
         if a.upload.is_none() {
             // Jobs of one pipeline start together, and two fetches into one
@@ -315,7 +315,7 @@ impl Executor {
         }
     }
 
-    /// Downloads the bundles of a try run into `<run>/bundles/`.
+    /// Downloads the bundles of a manual run into `<run>/bundles/`.
     fn stage_bundles(
         self: &Arc<Self>,
         ctl: &RunCtl,
@@ -324,8 +324,12 @@ impl Executor {
     ) -> Result<(), Prep> {
         for (index, _) in (0u32..).zip(&upload.dirs) {
             let dest = launch::bundle_file(run_dir, index);
-            self.fetch_try_bundle(&ctl.assignment.run, index, &dest)
-                .map_err(|e| Prep::Failed(format!("cannot download try bundle {index}: {e}")))?;
+            self.fetch_manual_bundle(&ctl.assignment.run, index, &dest)
+                .map_err(|e| {
+                    Prep::Failed(format!(
+                        "cannot download bundle {index} of the manual run: {e}"
+                    ))
+                })?;
             check_abort(ctl)?;
         }
         Ok(())
@@ -346,20 +350,12 @@ impl Executor {
         self.stage_inputs(&a.run, &inputs, &a.inputs)?;
         check_abort(ctl)?;
 
-        let workspace = work_dir(&self.state_dir, &a.repo, &a.workspace);
-        // A try run starts in its main checkout, one of those below the
-        // workspace.
-        let main = a
-            .upload
-            .as_ref()
-            .and_then(|upload| upload.dirs.first())
-            .map(|dir| dir.dir.as_str());
+        let place_dir = a.place.workspace();
+        let workspace = work_dir(&self.state_dir, &a.repo, &place_dir);
         let (cpus, workspace_var, output_var, inputs_var) = match &a.place {
             Place::Host => (
                 self.cpus,
-                main.map_or_else(|| workspace.clone(), |dir| workspace.join(dir))
-                    .to_string_lossy()
-                    .into_owned(),
+                workspace.to_string_lossy().into_owned(),
                 run_dir.join("artifacts").to_string_lossy().into_owned(),
                 inputs.to_string_lossy().into_owned(),
             ),
@@ -372,7 +368,7 @@ impl Executor {
                     .ok_or_else(|| format!("runner {} offers no containers", self.config.name))?;
                 (
                     containers.cpus,
-                    main.map_or_else(|| "/work".to_owned(), |dir| format!("/try/{dir}")),
+                    "/work".to_owned(),
                     "/ci/run/artifacts".to_owned(),
                     "/ci/inputs".to_owned(),
                 )
@@ -382,7 +378,7 @@ impl Executor {
                 let guest = launch::guest_run_dir(&a.run);
                 (
                     vm.cpus(),
-                    launch::guest_workspace(&a.repo, &a.workspace),
+                    launch::guest_workspace(&a.repo, &place_dir),
                     format!(r"{guest}\out"),
                     format!(r"{guest}\in"),
                 )
@@ -396,6 +392,10 @@ impl Executor {
             ("CI_CPUS".to_owned(), cpus.to_string()),
             ("CARGO_BUILD_JOBS".to_owned(), cpus.to_string()),
         ]);
+        // The other checkouts of a manual run, for a job that links to them.
+        if a.upload.is_some() {
+            env.push(("CI_SIBLINGS".to_owned(), siblings_var(&a.place, &workspace)));
+        }
 
         let write = |path: &Path, text: &str| write_atomic(path, text.as_bytes());
         // Owned here because the launcher's target borrows them.
@@ -746,7 +746,7 @@ impl Executor {
                 work_dir(
                     &self.state_dir,
                     &ctl.assignment.repo,
-                    &ctl.assignment.workspace,
+                    &ctl.assignment.place.workspace(),
                 )
             })
             .collect();
@@ -796,7 +796,6 @@ impl Executor {
                 started,
                 end,
             } = assigned;
-            let assignment = named_workspace(assignment);
             let run = assignment.run.clone();
             let ended = end.is_some();
             let ctl = Arc::new(RunCtl::new(assignment));
@@ -975,6 +974,8 @@ fn read_exit_record(run_dir: &Path) -> Option<RunExit> {
 
 #[cfg(test)]
 mod tests {
+    use zeughaus_link::enlist::{Checkout, UploadDir, WhenBusy};
+
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
@@ -1047,10 +1048,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_assignment_is_checked_before_its_names_become_paths() {
-        use zeughaus_link::enlist::{Checkout, WhenBusy};
-        let ok = Assignment {
+    fn assignment() -> Assignment {
+        Assignment {
             run: "demo.7.build".to_owned(),
             repo: "demo".to_owned(),
             number: 7,
@@ -1062,16 +1061,26 @@ mod tests {
             file: "build.sh".to_owned(),
             interpreter: "/bin/sh".to_owned(),
             place: Place::Host,
-            cache: Vec::new(),
             env: Vec::new(),
             secrets: Vec::new(),
             timeout_minutes: 1,
             when_busy: WhenBusy::Wait,
             inputs: Vec::new(),
-            workspace: "build".to_owned(),
             checkout: Checkout::Clean,
             upload: None,
-        };
+        }
+    }
+
+    fn container(image: &str) -> Place {
+        Place::Container {
+            image: image.to_owned(),
+            tag: format!("localhost/zci-demo-{image}:0123456789abcdef"),
+        }
+    }
+
+    #[test]
+    fn an_assignment_is_checked_before_its_names_become_paths() {
+        let ok = assignment();
         assert!(validate(&ok).is_ok());
         for bad in [
             Assignment {
@@ -1087,71 +1096,58 @@ mod tests {
                 ..ok.clone()
             },
             Assignment {
-                workspace: "../x".to_owned(),
-                ..ok.clone()
-            },
-            Assignment {
-                workspace: String::new(),
-                ..ok.clone()
-            },
-            Assignment {
                 sha: "main".to_owned(),
+                ..ok.clone()
+            },
+            // The workspace is named after the place, so its image or
+            // machine name is a path component.
+            Assignment {
+                place: container("../x"),
+                ..ok.clone()
+            },
+            Assignment {
+                place: Place::Machine {
+                    name: "x/y".to_owned(),
+                },
                 ..ok.clone()
             },
         ] {
             assert!(validate(&bad).is_err(), "{bad:?}");
         }
-        // A context names the workspace of several jobs.
-        let shared = Assignment {
-            workspace: "linux".to_owned(),
+        let in_container = Assignment {
+            place: container("trixie"),
             ..ok
         };
-        assert!(validate(&shared).is_ok());
+        assert!(validate(&in_container).is_ok());
     }
 
-    /// The working trees of a try run become directories below its
-    /// workspace and its commits arguments of git: nothing of them is used
+    /// The names of a manual run's checkouts become directories below its
+    /// workspace and their commits arguments of git: nothing of them is used
     /// before it is checked.
     #[test]
-    fn a_try_run_is_checked_before_its_trees_become_paths() {
-        use zeughaus_link::enlist::{Checkout, UploadDir, WhenBusy};
+    fn a_manual_run_is_checked_before_its_trees_become_paths() {
         let dir = |name: &str, sha: &str| UploadDir {
             dir: name.to_owned(),
             sha: sha.to_owned(),
         };
         let ok = Assignment {
-            run: "demo.9.try".to_owned(),
-            repo: "demo".to_owned(),
+            run: "demo.9.check".to_owned(),
             number: 9,
-            job: "try".to_owned(),
-            url: String::new(),
-            fetch_user: String::new(),
-            fetch_token: None,
+            job: "check".to_owned(),
             sha: "a".repeat(40),
-            file: "zeughaus-try.sh".to_owned(),
+            file: "check.sh".to_owned(),
             interpreter: "sh".to_owned(),
-            place: Place::Host,
-            cache: Vec::new(),
-            env: Vec::new(),
-            secrets: Vec::new(),
-            timeout_minutes: 1,
-            when_busy: WhenBusy::Wait,
-            inputs: Vec::new(),
-            workspace: TRY_WORKSPACE.to_owned(),
-            checkout: Checkout::Clean,
             upload: Some(Upload {
                 dirs: vec![dir("demo", &"a".repeat(40)), dir("weida", &"b".repeat(40))],
             }),
+            ..assignment()
         };
         assert!(validate(&ok).is_ok());
-        let container = Assignment {
-            place: Place::Container {
-                image: "trixie".to_owned(),
-                tag: "localhost/zci-demo-trixie:0123456789abcdef".to_owned(),
-            },
+        let in_container = Assignment {
+            place: container("trixie"),
             ..ok.clone()
         };
-        assert!(validate(&container).is_ok());
+        assert!(validate(&in_container).is_ok());
 
         let with = |dirs: Vec<UploadDir>| Assignment {
             upload: Some(Upload { dirs }),
@@ -1160,7 +1156,7 @@ mod tests {
         for bad in [
             with(Vec::new()),
             with(
-                (0..=MAX_TRY_DIRS)
+                (0..=MAX_MANUAL_DIRS)
                     .map(|i| dir(&format!("d{i}"), "ab12"))
                     .collect(),
             ),
@@ -1168,16 +1164,6 @@ mod tests {
             with(vec![dir("a/b", "ab12")]),
             with(vec![dir("demo", "main")]),
             with(vec![dir("demo", "")]),
-            // Only the try runs' workspace holds their trees, and nothing
-            // else is checked out into it.
-            Assignment {
-                workspace: "build".to_owned(),
-                ..ok.clone()
-            },
-            Assignment {
-                upload: None,
-                ..ok.clone()
-            },
             // A machine's workspace is one bundle, copied into the guest.
             Assignment {
                 place: Place::Machine {
@@ -1190,32 +1176,18 @@ mod tests {
         }
     }
 
+    /// `CI_SIBLINGS` is a directory of the workspace, as the job sees the
+    /// workspace: the host's path, or `/work` in a container.
     #[test]
-    fn an_assignment_from_before_workspaces_ran_in_the_jobs_own() {
-        let mut old = Assignment {
-            run: "demo.7.build".to_owned(),
-            repo: "demo".to_owned(),
-            number: 7,
-            job: "build".to_owned(),
-            url: String::new(),
-            fetch_user: String::new(),
-            fetch_token: None,
-            sha: "ab12".to_owned(),
-            file: "build.sh".to_owned(),
-            interpreter: "/bin/sh".to_owned(),
-            place: Place::Host,
-            cache: Vec::new(),
-            env: Vec::new(),
-            secrets: Vec::new(),
-            timeout_minutes: 1,
-            when_busy: zeughaus_link::enlist::WhenBusy::Wait,
-            inputs: Vec::new(),
-            workspace: String::new(),
-            checkout: Default::default(),
-            upload: None,
-        };
-        assert_eq!(named_workspace(old.clone()).workspace, "build");
-        old.workspace = "linux".to_owned();
-        assert_eq!(named_workspace(old).workspace, "linux");
+    fn the_siblings_are_a_directory_of_the_workspace() {
+        let workspace = Path::new("work").join("demo").join("host");
+        assert_eq!(
+            Path::new(&siblings_var(&Place::Host, &workspace)),
+            workspace.join(".zci-siblings")
+        );
+        assert_eq!(
+            siblings_var(&container("trixie"), &workspace),
+            "/work/.zci-siblings"
+        );
     }
 }

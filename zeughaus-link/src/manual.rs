@@ -1,9 +1,9 @@
-//! The `/try` exchange: a working-tree snapshot on its way to the CI, which
-//! runs it as a `try` pipeline on a runner.
+//! The `/manual` exchange: a working-tree snapshot on its way to the CI,
+//! which runs named jobs of the repository's pipeline from it.
 //!
-//! One exchange per run on [`crate::TRY_PATH`]: a [`TryUpload`] frame, then
-//! the bundles as raw bytes (`sizes[i]` each, in `dirs` order), then the
-//! uploader finishes its side; the CI answers with one [`TryReply`] frame.
+//! One exchange per run on [`crate::MANUAL_PATH`]: a [`RunUpload`] frame,
+//! then the bundles as raw bytes (`sizes[i]` each, in `dirs` order), then the
+//! uploader finishes its side; the CI answers with one [`RunReply`] frame.
 //! Frames are those of [`crate::enlist`]: a 4-byte little-endian length and a
 //! postcard body.
 
@@ -11,44 +11,38 @@ use serde::{Deserialize, Serialize};
 
 use crate::enlist::UploadDir;
 
-/// The workspace directory every try run of one repository shares on a
-/// runner, so tries run one after another and keep their build output warm.
-pub const TRY_WORKSPACE: &str = "zeughaus-try";
-
 /// The largest bundle the CI accepts for one checkout.
-pub const MAX_TRY_BUNDLE_BYTES: u64 = 512 << 20;
+pub const MAX_MANUAL_BUNDLE_BYTES: u64 = 512 << 20;
 
 /// The most checkouts (the main one and its sibling path dependencies) one
-/// try run carries.
-pub const MAX_TRY_DIRS: usize = 8;
+/// manual run carries.
+pub const MAX_MANUAL_DIRS: usize = 8;
 
-/// First frame of a `/try` exchange; the bundles follow as raw bytes,
+/// The most jobs one manual run names.
+pub const MAX_MANUAL_JOBS: usize = 16;
+
+/// First frame of a `/manual` exchange; the bundles follow as raw bytes,
 /// `sizes[i]` each.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TryUpload {
+pub struct RunUpload {
     /// `git remote get-url origin` of the main checkout; the CI names the
     /// repository by it.
     pub origin: String,
-    /// A `[platforms]` key of the CI's configuration, else a runner name.
-    pub target: String,
-    /// A Containerfile in the snapshot's `.zeughaus-ci/`: run in a container
-    /// built from it instead of on the host.
-    pub image: Option<String>,
-    /// `1..=1440`.
-    pub timeout_minutes: u32,
     /// `<user>@<hostname>` of whoever uploads.
     pub actor: String,
-    /// The command line; the pipeline's subject.
+    /// The subject of the main checkout's commit; the pipeline's subject.
     pub summary: String,
+    /// The jobs of the snapshot's `.zeughaus-ci/` to run, by name.
+    pub jobs: Vec<String>,
     /// The main checkout first, then its sibling checkouts.
     pub dirs: Vec<UploadDir>,
     /// One bundle size in bytes per dir.
     pub sizes: Vec<u64>,
 }
 
-/// The CI's answer to a [`TryUpload`] and its bundles.
+/// The CI's answer to a [`RunUpload`] and its bundles.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TryReply {
+pub enum RunReply {
     /// The run is a pipeline now: `number` in `repo`.
     Accepted {
         repo: String,
@@ -104,13 +98,14 @@ mod tests {
     async fn an_upload_and_its_reply_travel_as_frames() {
         use crate::enlist::{read_frame, write_frame};
 
-        let upload = TryUpload {
+        let upload = RunUpload {
             origin: "git@github.com:griasdi/griasdi.git".to_owned(),
-            target: "wohnzimmer".to_owned(),
-            image: None,
-            timeout_minutes: 60,
             actor: "hannes@tuco-pc".to_owned(),
-            summary: "cargo test".to_owned(),
+            summary: "fix the build".to_owned(),
+            jobs: vec![
+                "build-windows-amd64".to_owned(),
+                "check-windows-amd64".to_owned(),
+            ],
             dirs: vec![
                 UploadDir {
                     dir: "griasdi".to_owned(),
@@ -123,7 +118,7 @@ mod tests {
             ],
             sizes: vec![10, 20],
         };
-        let reply = TryReply::Accepted {
+        let reply = RunReply::Accepted {
             repo: "griasdi".to_owned(),
             number: 3,
         };

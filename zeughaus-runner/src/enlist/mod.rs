@@ -92,7 +92,8 @@ fn mirror_dir(state_dir: &Path, repo: &str) -> PathBuf {
         .join(format!("{repo}.git"))
 }
 
-/// A workspace's directory: a job's, or the context several jobs share.
+/// A workspace's directory: `workspace` is `Place::workspace`, the one a
+/// repository's jobs at a place share on this runner.
 fn work_dir(state_dir: &Path, repo: &str, workspace: &str) -> PathBuf {
     ci_dir(state_dir).join("work").join(repo).join(workspace)
 }

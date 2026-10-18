@@ -3,8 +3,8 @@
 //! An event is written to `ci/inbox/` by a webhook or `ci run`, then moved to
 //! `ci/queue/<key>.json` by the scheduler. The key is the repository, the
 //! event kind and the ref, so a newer event for the same ref replaces the one
-//! still waiting; a running pipeline is never cancelled by it. A try run's key
-//! is its upload instead, so no try replaces another.
+//! still waiting; a running pipeline is never cancelled by it. A manual run's
+//! key is its upload instead, so no manual run replaces another.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -22,8 +22,9 @@ pub enum EventKind {
     Push,
     Tag,
     Cron,
-    /// A working-tree snapshot an editor's agent uploaded on `/try`.
-    Try,
+    /// A working-tree snapshot an editor's agent uploaded on `/manual`, to
+    /// run named jobs of the repository's pipeline from.
+    Manual,
 }
 
 impl fmt::Display for EventKind {
@@ -32,7 +33,7 @@ impl fmt::Display for EventKind {
             EventKind::Push => "push",
             EventKind::Tag => "tag",
             EventKind::Cron => "cron",
-            EventKind::Try => "try",
+            EventKind::Manual => "manual",
         })
     }
 }
@@ -45,9 +46,9 @@ impl FromStr for EventKind {
             "push" => Ok(EventKind::Push),
             "tag" => Ok(EventKind::Tag),
             "cron" => Ok(EventKind::Cron),
-            "try" => Ok(EventKind::Try),
+            "manual" => Ok(EventKind::Manual),
             other => Err(format!(
-                "unknown event kind `{other}` (push, tag, cron or try)"
+                "unknown event kind `{other}` (push, tag, cron or manual)"
             )),
         }
     }
@@ -57,15 +58,16 @@ impl FromStr for EventKind {
 pub struct CiEvent {
     pub repo: String,
     pub kind: EventKind,
-    /// Branch or tag name without the `refs/` prefix; `try` for a try run.
+    /// Branch or tag name without the `refs/` prefix; the repository's
+    /// default branch for a manual run.
     pub git_ref: String,
     pub sha: Option<String>,
     /// The normalized cron expression of a cron event.
     pub cron: Option<String>,
     pub actor: String,
     pub delivery: Option<String>,
-    /// The id of the upload a try run carries, the directory
-    /// `ci/try/<upload>/` holds it; `None` for every other event.
+    /// The id of the upload a manual run carries, the directory
+    /// `ci/manual/<upload>/` holds it; `None` for every other event.
     #[serde(default)]
     pub upload: Option<String>,
     /// Unix seconds.
@@ -91,11 +93,11 @@ pub fn write_inbox(state_dir: &Path, event: &CiEvent) -> Result<PathBuf, String>
     Ok(path)
 }
 
-/// `<repo>.<kind>.<first 12 hex of sha256(git_ref \n cron)>`, and for a try
-/// run `<repo>.try.<upload>`: every try runs, none replaces another.
+/// `<repo>.<kind>.<first 12 hex of sha256(git_ref \n cron)>`, and for a manual
+/// run `<repo>.manual.<upload>`: every manual run runs, none replaces another.
 pub fn queue_key(event: &CiEvent) -> String {
-    if let (EventKind::Try, Some(upload)) = (event.kind, &event.upload) {
-        return format!("{}.try.{upload}", event.repo);
+    if let (EventKind::Manual, Some(upload)) = (event.kind, &event.upload) {
+        return format!("{}.manual.{upload}", event.repo);
     }
     let mut hasher = Sha256::new();
     hasher.update(event.git_ref.as_bytes());
@@ -262,17 +264,16 @@ mod tests {
         assert_eq!(queue_key(&a).len(), "smoke.push.".len() + 12);
     }
 
-    /// Every try run is its own key, so none replaces another still queued;
-    /// an event that predates the field has no upload.
+    /// Every manual run is its own key, so none replaces another still
+    /// queued; an event that predates the field has no upload.
     #[test]
-    fn a_try_runs_key_is_its_upload() {
+    fn a_manual_runs_key_is_its_upload() {
         let mut a = event("x", 0);
-        a.kind = EventKind::Try;
-        a.git_ref = "try".into();
+        a.kind = EventKind::Manual;
         a.upload = Some("0123456789abcdef".into());
         let mut b = a.clone();
         b.upload = Some("fedcba9876543210".into());
-        assert_eq!(queue_key(&a), "smoke.try.0123456789abcdef");
+        assert_eq!(queue_key(&a), "smoke.manual.0123456789abcdef");
         assert_ne!(queue_key(&a), queue_key(&b));
 
         let mut old = serde_json::to_value(&a).unwrap();
@@ -299,7 +300,7 @@ mod tests {
             EventKind::Push,
             EventKind::Tag,
             EventKind::Cron,
-            EventKind::Try,
+            EventKind::Manual,
         ] {
             assert_eq!(kind.to_string().parse::<EventKind>().unwrap(), kind);
         }

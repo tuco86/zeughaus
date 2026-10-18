@@ -1,5 +1,5 @@
 //! The two exchanges the tools have with the CI: a JSON question on `/ci`
-//! and a try run's upload on `/try`.
+//! and a manual run's upload on `/manual`.
 //!
 //! The CI is reached the way an editor reaches it: the pinned URL names its
 //! fingerprint, and this machine's client key is what the CI admits. One
@@ -23,8 +23,8 @@ use weida::{
     TransferMeta, Trust,
 };
 use zeughaus_link::enlist::{read_frame, write_frame};
-use zeughaus_link::tryrun::{TryReply, TryUpload};
-use zeughaus_link::{CI_PATH, CiReply, CiRequest, MAX_CI_REPLY_BYTES, TRY_PATH, credentials};
+use zeughaus_link::manual::{RunReply, RunUpload};
+use zeughaus_link::{CI_PATH, CiReply, CiRequest, MANUAL_PATH, MAX_CI_REPLY_BYTES, credentials};
 
 /// How long a first dial may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -34,7 +34,7 @@ const CI_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the CI may take to answer an upload once all of it was sent. It
 /// waits up to 30 s for its scheduler to number the pipeline.
-const TRY_REPLY_TIMEOUT: Duration = Duration::from_secs(90);
+const MANUAL_REPLY_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// How long to look for the CI's refusal after an upload broke off: a CI
 /// that refuses a request says why and stops reading.
@@ -164,17 +164,17 @@ impl Client {
 
     /// Uploads a snapshot: the frame, then `bundles` in order, then waits for
     /// the CI to say what became of it.
-    pub async fn try_upload(
+    pub async fn manual_upload(
         &self,
-        upload: &TryUpload,
+        upload: &RunUpload,
         bundles: &[PathBuf],
-    ) -> Result<TryReply, String> {
-        let (requester, url) = self.requester(TRY_PATH).await?;
+    ) -> Result<RunReply, String> {
+        let (requester, url) = self.requester(MANUAL_PATH).await?;
         let reply = exchange(&requester, upload, bundles)
             .await
             .map_err(|e| format!("upload to {url}: {e}"));
         if reply.is_err() {
-            self.forget(TRY_PATH).await;
+            self.forget(MANUAL_PATH).await;
         }
         reply
     }
@@ -228,12 +228,12 @@ impl Client {
     }
 }
 
-/// One `/try` exchange.
+/// One `/manual` exchange.
 async fn exchange(
     requester: &Requester,
-    upload: &TryUpload,
+    upload: &RunUpload,
     bundles: &[PathBuf],
-) -> Result<TryReply, String> {
+) -> Result<RunReply, String> {
     // With every connection down weida waits for a redial, which may be long.
     let (mut out, reply) =
         tokio::time::timeout(CONNECT_TIMEOUT, requester.open(TransferMeta::default()))
@@ -245,17 +245,17 @@ async fn exchange(
         // breaks the stream under the writer. Its answer says why.
         let refusal = tokio::time::timeout(REFUSAL_TIMEOUT, read_reply(reply)).await;
         return match refusal {
-            Ok(Ok(refused @ TryReply::Refused { .. })) => Ok(refused),
+            Ok(Ok(refused @ RunReply::Refused { .. })) => Ok(refused),
             _ => Err(e),
         };
     }
     out.finish().map_err(|e| format!("finish: {e}"))?;
-    tokio::time::timeout(TRY_REPLY_TIMEOUT, read_reply(reply))
+    tokio::time::timeout(MANUAL_REPLY_TIMEOUT, read_reply(reply))
         .await
         .map_err(|_| {
             format!(
                 "the CI gave no answer within {} s",
-                TRY_REPLY_TIMEOUT.as_secs()
+                MANUAL_REPLY_TIMEOUT.as_secs()
             )
         })?
 }
@@ -263,7 +263,7 @@ async fn exchange(
 /// The frame, then each bundle as raw bytes, exactly as many as `sizes` said.
 async fn send(
     out: &mut OutgoingTransfer,
-    upload: &TryUpload,
+    upload: &RunUpload,
     bundles: &[PathBuf],
 ) -> Result<(), String> {
     write_frame(out, upload).await?;
@@ -318,9 +318,9 @@ async fn read_chunk(
     .map_err(|e| format!("read: {e}"))?
 }
 
-async fn read_reply(reply: ReplyStream) -> Result<TryReply, String> {
+async fn read_reply(reply: ReplyStream) -> Result<RunReply, String> {
     let mut body = reply.recv().await.map_err(|e| format!("reply: {e}"))?;
-    read_frame::<_, TryReply>(&mut body)
+    read_frame::<_, RunReply>(&mut body)
         .await?
         .ok_or_else(|| "the CI ended the exchange without an answer".to_owned())
 }
@@ -417,17 +417,15 @@ mod tests {
         let client = Client::new(Err("no CI configured: add ci = [..] to x".to_owned()));
         let asked = client.ci(CiRequest::Overview).await.expect_err("no CI");
         assert!(asked.starts_with("no CI configured"), "{asked}");
-        let upload = TryUpload {
+        let upload = RunUpload {
             origin: "o".to_owned(),
-            target: "t".to_owned(),
-            image: None,
-            timeout_minutes: 1,
             actor: "a@b".to_owned(),
             summary: "s".to_owned(),
+            jobs: vec!["j".to_owned()],
             dirs: Vec::new(),
             sizes: Vec::new(),
         };
-        let sent = client.try_upload(&upload, &[]).await.expect_err("no CI");
+        let sent = client.manual_upload(&upload, &[]).await.expect_err("no CI");
         assert!(sent.starts_with("no CI configured"), "{sent}");
         client.shutdown().await;
     }

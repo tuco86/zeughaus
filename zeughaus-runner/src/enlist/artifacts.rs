@@ -16,9 +16,9 @@
 //! and writing files overlaps with moving bytes, and neither runner needs the
 //! disk space of a second copy.
 //!
-//! The bundles of a try run come the same way from the CI itself, which
-//! stored them (`TryBundle`), straight into the run's own directory: they go
-//! with it.
+//! The bundles of a manual run come the same way from the CI itself, which
+//! stored them (`ManualBundle`), straight into the run's own directory: they
+//! go with it.
 
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
@@ -267,11 +267,11 @@ impl Executor {
         unpacked.map(|()| bytes)
     }
 
-    /// Fetches bundle `index` of the try run `run` from the CI, which stored
+    /// Fetches bundle `index` of the manual run `run` from the CI, which stored
     /// it when the run was uploaded, into the file `dest`. The directory of
     /// `dest` is the run's own and goes with it, so a failed transfer leaves
     /// nothing to clean up. Called on the thread that prepares a run.
-    pub fn fetch_try_bundle(
+    pub fn fetch_manual_bundle(
         self: &Arc<Self>,
         run: &str,
         index: u32,
@@ -281,7 +281,7 @@ impl Executor {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
-        let request = ArtifactRequest::TryBundle {
+        let request = ArtifactRequest::ManualBundle {
             run: run.to_owned(),
             index,
         };

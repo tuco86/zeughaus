@@ -1,4 +1,4 @@
-//! A working tree as the git bundles a try run uploads.
+//! A working tree as the git bundles a manual run uploads.
 //!
 //! The CI takes one bundle per checkout. Each holds one commit without a
 //! parent whose tree is what the checkout contains right now: the files of
@@ -9,9 +9,9 @@
 //!
 //! The checkout of the call is the main one. A Cargo path dependency outside
 //! it is another checkout the build needs; it is snapshotted the same way
-//! when it sits beside the main one, because the runner lays the checkouts
-//! out as siblings in one workspace and `../name` paths must still reach
-//! each other there.
+//! when it sits beside the main one, because the runner puts such checkouts
+//! in one directory (`CI_SIBLINGS`) by their directory name, which the
+//! `../name` paths of the build resolve against.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -22,17 +22,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 use zeughaus_link::enlist::UploadDir;
-use zeughaus_link::tryrun::{MAX_TRY_BUNDLE_BYTES, MAX_TRY_DIRS, TryUpload, valid_dir_name};
+use zeughaus_link::manual::{MAX_MANUAL_BUNDLE_BYTES, MAX_MANUAL_DIRS, RunUpload, valid_dir_name};
 
 /// Where the bundled commit is named while `git bundle` reads it.
-const BUNDLE_REF: &str = "refs/zeughaus-try";
+const BUNDLE_REF: &str = "refs/zci-manual";
 
 /// The author and committer of a snapshot commit.
 const IDENTITY: [(&str, &str); 4] = [
-    ("GIT_AUTHOR_NAME", "zeughaus-try"),
-    ("GIT_AUTHOR_EMAIL", "try@zeughaus.invalid"),
-    ("GIT_COMMITTER_NAME", "zeughaus-try"),
-    ("GIT_COMMITTER_EMAIL", "try@zeughaus.invalid"),
+    ("GIT_AUTHOR_NAME", "zeughaus-manual"),
+    ("GIT_AUTHOR_EMAIL", "manual@zeughaus.invalid"),
+    ("GIT_COMMITTER_NAME", "zeughaus-manual"),
+    ("GIT_COMMITTER_EMAIL", "manual@zeughaus.invalid"),
 ];
 
 /// The longest summary a pipeline carries as its subject.
@@ -57,15 +57,14 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// The first frame of the `/try` exchange for this snapshot.
-    pub fn upload(&self, target: &str, image: Option<&str>, timeout_minutes: u32) -> TryUpload {
-        TryUpload {
+    /// The first frame of the `/manual` exchange for this snapshot: a run of
+    /// `jobs` of the repository's pipeline.
+    pub fn upload(&self, jobs: &[String]) -> RunUpload {
+        RunUpload {
             origin: self.origin.clone(),
-            target: target.to_owned(),
-            image: image.map(str::to_owned),
-            timeout_minutes,
             actor: self.actor.clone(),
             summary: self.summary.clone(),
+            jobs: jobs.to_vec(),
             dirs: self.dirs.clone(),
             sizes: self.sizes.clone(),
         }
@@ -73,37 +72,30 @@ impl Snapshot {
 }
 
 /// Snapshots the checkout `path` is in, and the checkouts its Cargo path
-/// dependencies need, for a run of `command` from `path`.
+/// dependencies need.
 ///
 /// Blocking: runs git and cargo. Call it on the blocking pool.
-pub fn take(path: &Path, command: &str) -> Result<Snapshot, String> {
+pub fn take(path: &Path) -> Result<Snapshot, String> {
     if !path.is_dir() {
         return Err(format!("{} is not a directory", path.display()));
     }
     let root = toplevel(path)?;
-    let sub = git(path, &[], &["rev-parse", "--show-prefix"], None)?
-        .trim_end_matches(['\n', '\r'])
-        .to_owned();
     let origin = git(&root, &[], &["remote", "get-url", "origin"], None)
         .map(|url| without_credentials(url.trim()))
         .ok()
         .filter(|url| !url.is_empty())
-        .ok_or("try needs an origin remote to name the repository")?;
+        .ok_or("a manual run needs an origin remote to name the repository")?;
 
     let mut checkouts = vec![root.clone()];
     checkouts.extend(siblings(&root)?);
-    if checkouts.len() > MAX_TRY_DIRS {
+    if checkouts.len() > MAX_MANUAL_DIRS {
         return Err(format!(
-            "a try run carries at most {MAX_TRY_DIRS} checkouts and this one needs {}",
+            "a manual run carries at most {MAX_MANUAL_DIRS} checkouts and this one needs {}",
             checkouts.len()
         ));
     }
 
     let temp = TempDir::new()?;
-    let scripts = [
-        ("zeughaus-try.sh", sh_script(command, &sub)),
-        ("zeughaus-try.ps1", ps1_script(command, &sub)),
-    ];
     let mut dirs = Vec::with_capacity(checkouts.len());
     let mut bundles = Vec::with_capacity(checkouts.len());
     let mut sizes = Vec::with_capacity(checkouts.len());
@@ -114,22 +106,20 @@ pub fn take(path: &Path, command: &str) -> Result<Snapshot, String> {
             .filter(|name| valid_dir_name(name))
             .ok_or_else(|| {
                 format!(
-                    "the directory name of {} is not one a try run can carry: letters, digits, \
-                     `.`, `_` and `-`, at most 100 characters",
+                    "the directory name of {} is not one a manual run can carry: letters, \
+                     digits, `.`, `_` and `-`, at most 100 characters",
                     checkout.display()
                 )
             })?;
-        // Only the main checkout gets the scripts: they run there.
-        let own_scripts = if index == 0 { &scripts[..] } else { &[] };
-        let sha = commit(checkout, temp.path(), index, own_scripts)
-            .map_err(|e| format!("snapshot of {dir}: {e}"))?;
+        let sha =
+            commit(checkout, temp.path(), index).map_err(|e| format!("snapshot of {dir}: {e}"))?;
         let bundle = temp.path().join(format!("{index}.bundle"));
         let size =
             write_bundle(checkout, &sha, &bundle).map_err(|e| format!("bundle of {dir}: {e}"))?;
-        if size > MAX_TRY_BUNDLE_BYTES {
+        if size > MAX_MANUAL_BUNDLE_BYTES {
             return Err(format!(
-                "the bundle of {dir} is {size} bytes and a try run takes at most \
-                 {MAX_TRY_BUNDLE_BYTES}"
+                "the bundle of {dir} is {size} bytes and a manual run takes at most \
+                 {MAX_MANUAL_BUNDLE_BYTES}"
             ));
         }
         dirs.push(UploadDir {
@@ -142,7 +132,7 @@ pub fn take(path: &Path, command: &str) -> Result<Snapshot, String> {
     Ok(Snapshot {
         origin,
         actor: actor(),
-        summary: summary(command),
+        summary: summary(&root),
         dirs,
         bundles,
         sizes,
@@ -151,14 +141,9 @@ pub fn take(path: &Path, command: &str) -> Result<Snapshot, String> {
 }
 
 /// One commit without a parent whose tree is `dir`'s working tree: `HEAD`'s
-/// files with every change, plus the untracked files not ignored, plus
-/// `scripts` under `.zeughaus-ci/`. Returns its id.
-fn commit(
-    dir: &Path,
-    temp: &Path,
-    index: usize,
-    scripts: &[(&str, String)],
-) -> Result<String, String> {
+/// files with every change, plus the untracked files not ignored. Returns
+/// its id.
+fn commit(dir: &Path, temp: &Path, index: usize) -> Result<String, String> {
     let index_file = temp.join(format!("index-{index}"));
     let in_temp_index = [("GIT_INDEX_FILE", index_file.as_os_str())];
     let unborn = git(
@@ -175,21 +160,6 @@ fn commit(
         None,
     )?;
     git(dir, &in_temp_index, &["add", "-A"], None)?;
-    for (name, text) in scripts {
-        let blob = git(
-            dir,
-            &[],
-            &["hash-object", "-w", "--stdin"],
-            Some(text.as_bytes()),
-        )?;
-        let entry = format!("100644,{},.zeughaus-ci/{name}", blob.trim());
-        git(
-            dir,
-            &in_temp_index,
-            &["update-index", "--add", "--cacheinfo", &entry],
-            None,
-        )?;
-    }
     let tree = git(dir, &in_temp_index, &["write-tree"], None)?;
     let identity: Vec<(&str, &OsStr)> = IDENTITY
         .iter()
@@ -198,7 +168,7 @@ fn commit(
     let sha = git(
         dir,
         &identity,
-        &["commit-tree", tree.trim(), "-m", "zeughaus try"],
+        &["commit-tree", tree.trim(), "-m", "zeughaus manual run"],
         None,
     )?;
     Ok(sha.trim().to_owned())
@@ -359,53 +329,21 @@ fn without_credentials(url: &str) -> String {
     format!("{scheme}://{host}{path}")
 }
 
-/// The job file of a try run on a Unix runner or in a container.
-///
-/// `sub` is the directory the call came from inside the checkout, with a
-/// trailing slash, or empty at the root. `$CI_WORKSPACE` is the main
-/// checkout.
-fn sh_script(command: &str, sub: &str) -> String {
-    let mut text = String::from("#!/bin/sh\n");
-    if !sub.is_empty() {
-        let escaped = sub
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('$', "\\$")
-            .replace('`', "\\`");
-        text.push_str(&format!("cd \"$CI_WORKSPACE/{escaped}\" || exit 70\n"));
-    }
-    text.push_str(command);
-    text.push('\n');
-    text
-}
-
-/// The job file of a try run on a Windows runner's host.
-fn ps1_script(command: &str, sub: &str) -> String {
-    let mut text = String::new();
-    if !sub.is_empty() {
-        text.push_str(&format!(
-            "Set-Location -LiteralPath (Join-Path $env:CI_WORKSPACE '{}')\n",
-            sub.replace('\'', "''")
-        ));
-    }
-    text.push_str(command);
-    text.push_str("\nexit $LASTEXITCODE\n");
-    text
-}
-
-/// The command as the one line a pipeline shows as its subject.
-fn summary(command: &str) -> String {
-    let joined = command
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("; ");
-    if joined.chars().count() > SUMMARY_CHARS {
-        let kept: String = joined.chars().take(SUMMARY_CHARS).collect();
-        format!("{kept}...")
-    } else {
-        joined
+/// The subject a pipeline shows for the run: the first line of `root`'s
+/// `HEAD` commit message, or `working tree` when it has no commit. Cut to
+/// [`SUMMARY_CHARS`].
+fn summary(root: &Path) -> String {
+    let subject = git(root, &[], &["log", "-1", "--format=%s"], None)
+        .ok()
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty());
+    match subject {
+        Some(text) if text.chars().count() > SUMMARY_CHARS => {
+            let kept: String = text.chars().take(SUMMARY_CHARS).collect();
+            format!("{kept}...")
+        }
+        Some(text) => text,
+        None => "working tree".to_owned(),
     }
 }
 
@@ -455,7 +393,7 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> Result<TempDir, String> {
         let path = std::env::temp_dir().join(format!(
-            "zeughaus-try-{}-{}",
+            "zeughaus-manual-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
@@ -596,7 +534,7 @@ mod tests {
         fx(&dir, &["config", "gpg.program", "false"]);
         let status_before = fx(&dir, &["status", "--porcelain"]);
 
-        let snapshot = take(&dir, "cargo test").expect("snapshot");
+        let snapshot = take(&dir).expect("snapshot");
 
         assert_eq!(snapshot.origin, "git@github.com:Griasdi/griasdi.git");
         assert_eq!(snapshot.dirs.len(), 1);
@@ -607,16 +545,7 @@ mod tests {
             .lines()
             .map(str::to_owned)
             .collect();
-        assert_eq!(
-            files,
-            [
-                ".gitignore",
-                ".zeughaus-ci/zeughaus-try.ps1",
-                ".zeughaus-ci/zeughaus-try.sh",
-                "tracked.txt",
-                "untracked.txt",
-            ]
-        );
+        assert_eq!(files, [".gitignore", "tracked.txt", "untracked.txt",]);
         assert_eq!(fx(&dir, &["show", &format!("{sha}:tracked.txt")]), "two");
         // No parent and no signature.
         let object = fx(&dir, &["cat-file", "-p", sha]);
@@ -640,7 +569,7 @@ mod tests {
                 "-q",
                 "--no-tags",
                 &bundle,
-                "+refs/zeughaus-try/*:refs/zeughaus-try/*",
+                "+refs/zci-manual/*:refs/zci-manual/*",
             ],
         );
         fx(&runner, &["checkout", "-q", "--force", "--detach", sha]);
@@ -651,12 +580,9 @@ mod tests {
         assert!(runner.join("untracked.txt").is_file());
         assert!(!runner.join("ignored").exists());
 
-        let upload = snapshot.upload("wohnzimmer", Some("trixie"), 30);
-        assert_eq!(upload.target, "wohnzimmer");
-        assert_eq!(upload.image.as_deref(), Some("trixie"));
-        assert_eq!(upload.timeout_minutes, 30);
-        assert_eq!(upload.summary, "cargo test");
-        assert_eq!(upload.dirs, snapshot.dirs);
+        let upload = snapshot.upload(&["build-x".to_owned(), "check-x".to_owned()]);
+        assert_eq!(upload.jobs, ["build-x", "check-x"]);
+        assert_eq!(upload.summary, "first");
         assert_eq!(
             upload.sizes,
             [std::fs::metadata(&snapshot.bundles[0]).unwrap().len()]
@@ -675,15 +601,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         fx(&dir, &["init", "-q"]);
         write(dir.join("a.txt"), "a\n");
-        let refused = take(&dir, "true").err().expect("no origin");
-        assert_eq!(refused, "try needs an origin remote to name the repository");
+        let refused = take(&dir).err().expect("no origin");
+        assert_eq!(
+            refused,
+            "a manual run needs an origin remote to name the repository"
+        );
 
         // With one, a repository that has no commit yet still snapshots.
         fx(
             &dir,
             &["remote", "add", "origin", "https://u:secret@host/o/r.git"],
         );
-        let snapshot = take(&dir, "true").expect("unborn HEAD");
+        let snapshot = take(&dir).expect("unborn HEAD");
+        assert_eq!(snapshot.upload(&[]).summary, "working tree");
         assert_eq!(snapshot.origin, "https://host/o/r.git");
         let files = fx(
             &dir,
@@ -695,77 +625,45 @@ mod tests {
     #[test]
     fn a_path_outside_a_checkout_is_refused() {
         let base = Scratch::new("outside");
-        let err = take(&base.0, "true").err().expect("not a repository");
+        let err = take(&base.0).err().expect("not a repository");
         assert!(err.contains("is not inside a git checkout"), "{err}");
-        let err = take(&base.0.join("missing"), "true")
-            .err()
-            .expect("missing");
+        let err = take(&base.0.join("missing")).err().expect("missing");
         assert!(err.contains("is not a directory"), "{err}");
     }
 
     #[test]
-    fn the_scripts_run_from_the_directory_the_call_came_from() {
-        assert_eq!(
-            sh_script("cargo test --lib", ""),
-            "#!/bin/sh\ncargo test --lib\n"
-        );
-        assert_eq!(
-            sh_script("cargo test --lib", "crates/foo/"),
-            "#!/bin/sh\ncd \"$CI_WORKSPACE/crates/foo/\" || exit 70\ncargo test --lib\n"
-        );
-        // Nothing in a directory name reaches the shell as syntax.
-        assert_eq!(
-            sh_script("true", "a\"b$c`d\\e/"),
-            "#!/bin/sh\ncd \"$CI_WORKSPACE/a\\\"b\\$c\\`d\\\\e/\" || exit 70\ntrue\n"
-        );
-        assert_eq!(
-            ps1_script("cargo test", ""),
-            "cargo test\nexit $LASTEXITCODE\n"
-        );
-        assert_eq!(
-            ps1_script("cargo test", "crates/it's/"),
-            "Set-Location -LiteralPath (Join-Path $env:CI_WORKSPACE 'crates/it''s/')\n\
-             cargo test\nexit $LASTEXITCODE\n"
-        );
-    }
-
-    #[test]
-    fn the_scripts_in_the_snapshot_name_the_subdirectory() {
+    fn a_sub_directory_call_snapshots_the_whole_checkout() {
         let base = Scratch::new("sub");
         let dir = base.0.join("proj");
         repo(
             &dir,
             Some("https://example.invalid/o/proj.git"),
-            &[("crates/foo/a.txt", "a\n")],
+            &[("crates/foo/a.txt", "a\n"), ("top.txt", "t\n")],
         );
-        let snapshot = take(&dir.join("crates/foo"), "cargo test").expect("snapshot");
+        let snapshot = take(&dir.join("crates/foo")).expect("snapshot");
+        assert_eq!(snapshot.dirs[0].dir, "proj");
         let sha = &snapshot.dirs[0].sha;
-        assert_eq!(
-            fx(
-                &dir,
-                &["show", &format!("{sha}:.zeughaus-ci/zeughaus-try.sh")]
-            ),
-            "#!/bin/sh\ncd \"$CI_WORKSPACE/crates/foo/\" || exit 70\ncargo test"
-        );
-        assert!(
-            fx(
-                &dir,
-                &["show", &format!("{sha}:.zeughaus-ci/zeughaus-try.ps1")]
-            )
-            .starts_with("Set-Location -LiteralPath (Join-Path $env:CI_WORKSPACE 'crates/foo/')")
-        );
+        assert_eq!(fx(&dir, &["show", &format!("{sha}:top.txt")]), "t");
     }
 
     #[test]
-    fn the_command_is_one_line_in_the_pipelines_subject() {
-        assert_eq!(summary("cargo test"), "cargo test");
-        assert_eq!(
-            summary("  cargo fmt\n\n  cargo test  \n"),
-            "cargo fmt; cargo test"
+    fn the_subject_is_the_head_commits_or_working_tree() {
+        let base = Scratch::new("summary");
+        let dir = base.0.join("proj");
+        repo(&dir, None, &[("a.txt", "a\n")]);
+        assert_eq!(summary(&dir), "first");
+        fx(
+            &dir,
+            &["commit", "-q", "--allow-empty", "-m", &"x".repeat(500)],
         );
-        let long = summary(&"x".repeat(500));
+        let long = summary(&dir);
         assert_eq!(long.chars().count(), SUMMARY_CHARS + 3);
         assert!(long.ends_with("..."));
+
+        let fresh = base.0.join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        fx(&fresh, &["init", "-q"]);
+        assert_eq!(summary(&fresh), "working tree");
     }
 
     #[test]
@@ -796,7 +694,7 @@ mod tests {
             Some("https://example.invalid/o/app.git"),
             Some("../../../util"),
         );
-        let err = take(&app, "cargo test").err().expect("not a sibling");
+        let err = take(&app).err().expect("not a sibling");
         assert!(
             err.starts_with("path dependency ") && err.contains("is not a sibling checkout of"),
             "{err}"
@@ -817,28 +715,25 @@ mod tests {
             Some("../util"),
         );
 
-        let snapshot = take(&app, "cargo test").expect("snapshot");
+        let snapshot = take(&app).expect("snapshot");
 
         let names: Vec<&str> = snapshot.dirs.iter().map(|d| d.dir.as_str()).collect();
         assert_eq!(names, ["app", "util"]);
         assert_eq!(snapshot.bundles.len(), 2);
-        assert_eq!(snapshot.upload("t", None, 1).sizes.len(), 2);
+        assert_eq!(snapshot.upload(&["x".to_owned()]).sizes.len(), 2);
         let sha = &snapshot.dirs[1].sha;
         assert_eq!(
             fx(&util, &["show", &format!("{sha}:src/lib.rs")]),
             "pub fn answer() -> u32 { 42 }"
         );
-        // Only the main checkout has the scripts.
-        let util_files = fx(&util, &["ls-tree", "-r", "--name-only", sha]);
-        assert!(!util_files.contains(".zeughaus-ci"), "{util_files}");
     }
 
     #[test]
-    fn a_directory_name_a_try_run_cannot_carry_is_refused() {
+    fn a_directory_name_a_manual_run_cannot_carry_is_refused() {
         let base = Scratch::new("names");
         let dir = base.0.join("with space");
         repo(&dir, Some("https://example.invalid/o/r.git"), &[("a", "a")]);
-        let err = take(&dir, "true").err().expect("invalid name");
-        assert!(err.contains("not one a try run can carry"), "{err}");
+        let err = take(&dir).err().expect("invalid name");
+        assert!(err.contains("not one a manual run can carry"), "{err}");
     }
 }

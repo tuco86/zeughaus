@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::machine::MachineState;
 
 /// The protocol major a runner and the CI must share.
-pub const ENLIST_MAJOR: u32 = 4;
+pub const ENLIST_MAJOR: u32 = 5;
 
 /// The most one frame body may carry.
 pub const MAX_ENLIST_FRAME_BYTES: usize = 1 << 20;
@@ -182,17 +182,11 @@ pub struct Assignment {
     pub file: String,
     pub interpreter: String,
     pub place: Place,
-    pub cache: Vec<String>,
     pub env: Vec<(String, String)>,
     pub secrets: Vec<(String, String)>,
     pub timeout_minutes: u32,
     pub when_busy: WhenBusy,
     pub inputs: Vec<Input>,
-    /// The directory name of the job's workspace under `ci/work/<repo>/`: the
-    /// job's name, or the name of the context it shares with other jobs.
-    /// Empty in an assignment a runner persisted before the field existed.
-    #[serde(default)]
-    pub workspace: String,
     #[serde(default)]
     pub checkout: Checkout,
     /// A snapshot of working trees in place of a commit of the repository.
@@ -203,17 +197,16 @@ pub struct Assignment {
 /// What the launcher does to the workspace before the job runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Checkout {
-    /// Fetch, checkout, `git clean -ffdxq` keeping the `cache` paths.
+    /// Fetch, `checkout --force`, then `git clean -ffd`: ignored files such
+    /// as `target/` stay.
     #[default]
     Clean,
-    /// The same without keeping any path: a clean channel's first use.
+    /// The same with `git clean -ffdx`: nothing stays. A clean channel's
+    /// first use of a workspace in a pipeline.
     Wipe,
-    /// No fetch, no checkout, no clean: an earlier job of this pipeline's
-    /// context left the workspace; `.git/zci-context` must name this pipeline.
-    Continue,
 }
 
-/// The working trees a try run executes in, in place of a checkout.
+/// The working trees a manual run executes in, in place of a checkout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Upload {
     /// `dirs[0]` is the main checkout; a dir's index is its bundle's index.
@@ -238,6 +231,19 @@ pub enum Place {
     Container { image: String, tag: String },
     /// On a machine behind the runner (a VM).
     Machine { name: String },
+}
+
+impl Place {
+    /// The directory name of the workspace a repository's jobs at this place
+    /// share on their runner: pipeline jobs and manual runs build in it one
+    /// at a time and find what the one before left.
+    pub fn workspace(&self) -> String {
+        match self {
+            Place::Host => "host".to_owned(),
+            Place::Container { image, .. } => format!("image-{image}"),
+            Place::Machine { name } => format!("machine-{name}"),
+        }
+    }
 }
 
 /// What a job does while its runner is busy.
@@ -285,8 +291,9 @@ pub enum ArtifactRequest {
     },
     /// A consuming runner fetches `run`'s artifacts for a job it was assigned.
     Download { run: String },
-    /// A runner fetches bundle `index` of the try run `run` it was assigned.
-    TryBundle { run: String, index: u32 },
+    /// A runner fetches bundle `index` of the manual run `run` it was
+    /// assigned.
+    ManualBundle { run: String, index: u32 },
 }
 
 /// The CI's answer; after `Sending`, the chunks of the set follow.
@@ -463,14 +470,12 @@ fn sample_assignment() -> Assignment {
         file: "j.sh".to_owned(),
         interpreter: "sh".to_owned(),
         place: Place::Host,
-        cache: vec![".cache".to_owned()],
         env: Vec::new(),
         secrets: Vec::new(),
         timeout_minutes: 1,
         when_busy: WhenBusy::Wait,
         inputs: Vec::new(),
-        workspace: "box".to_owned(),
-        checkout: Checkout::Continue,
+        checkout: Checkout::Wipe,
         upload: Some(Upload {
             dirs: vec![UploadDir {
                 dir: "zeughaus".to_owned(),
@@ -522,7 +527,7 @@ mod tests {
         let msg = ToRunner::Assign {
             assignment: Box::new(sample_assignment()),
         };
-        let request = ArtifactRequest::TryBundle {
+        let request = ArtifactRequest::ManualBundle {
             run: "r.1.j".to_owned(),
             index: 1,
         };
@@ -693,16 +698,18 @@ mod id_tests {
     }
 
     /// A runner persists its assignments as JSON (`assigned/<run>.json`), so
-    /// one written before contexts must still load.
+    /// one written before places named workspaces, or before checkouts and
+    /// uploads, must still load.
     #[test]
-    fn an_assignment_from_before_contexts_still_loads() {
+    fn an_assignment_from_an_older_runner_still_loads() {
         let mut old = serde_json::to_value(sample_assignment()).unwrap();
         let fields = old.as_object_mut().unwrap();
-        for key in ["workspace", "checkout", "upload"] {
+        for key in ["checkout", "upload"] {
             assert!(fields.remove(key).is_some(), "{key}");
         }
+        fields.insert("workspace".to_owned(), "linux".into());
+        fields.insert("cache".to_owned(), serde_json::json!([".cache"]));
         let loaded: Assignment = serde_json::from_value(old).unwrap();
-        assert_eq!(loaded.workspace, "");
         assert_eq!(loaded.checkout, Checkout::Clean);
         assert_eq!(loaded.upload, None);
     }

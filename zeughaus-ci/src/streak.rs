@@ -29,12 +29,14 @@ pub struct Red {
 pub struct Streak {
     pub red: Vec<Red>,
     /// The newest pipeline in which every deploy job (one without `on`, run
-    /// only because what it needs ran) succeeded, and those jobs.
+    /// only because what it needs ran, that no other job needs) succeeded,
+    /// and those jobs.
     pub last_deploy: Option<(u64, Vec<String>)>,
 }
 
 /// Whether `pipeline` ran for `branch` itself: a push to it or a cron
-/// schedule, which runs at its head.
+/// schedule, which runs at its head. A manual run has the default branch as
+/// its ref and is neither: what it ran is a working tree no branch holds.
 pub fn is_branch(pipeline: &Pipeline, branch: &str) -> bool {
     pipeline.event.git_ref == branch
         && matches!(pipeline.event.kind, EventKind::Push | EventKind::Cron)
@@ -88,7 +90,12 @@ pub fn of_branch(pipelines: &[Pipeline], branch: &str) -> Streak {
     }
 
     let last_deploy = branch_pipelines.iter().find_map(|p| {
-        let deploy: Vec<_> = p.jobs.iter().filter(|j| j.def.on.is_empty()).collect();
+        let needed = |name: &str| p.jobs.iter().any(|j| j.def.needs.iter().any(|n| n == name));
+        let deploy: Vec<_> = p
+            .jobs
+            .iter()
+            .filter(|j| j.def.on.is_empty() && !needed(&j.def.name))
+            .collect();
         (!deploy.is_empty() && deploy.iter().all(|j| j.status == JobStatus::Succeeded)).then(|| {
             (
                 p.number,
@@ -161,8 +168,7 @@ mod tests {
                 image: None,
                 machine: None,
                 platform: None,
-                context: None,
-                cache: Vec::new(),
+                ignored_keys: Vec::new(),
                 channels: Vec::new(),
                 secrets: Vec::new(),
                 when_busy: WhenBusy::Wait,
@@ -184,7 +190,16 @@ mod tests {
         }
     }
 
+    fn needing(mut record: JobRecord, need: &str) -> JobRecord {
+        record.def.needs = vec![need.to_owned()];
+        record
+    }
+
     fn pipeline(number: u64, git_ref: &str, windows: JobStatus, publish: JobStatus) -> Pipeline {
+        let after_windows = match windows {
+            JobStatus::Succeeded => JobStatus::Succeeded,
+            _ => JobStatus::Skipped,
+        };
         Pipeline {
             repo: "griasdi".to_owned(),
             number,
@@ -209,7 +224,10 @@ mod tests {
             jobs: vec![
                 job("check", &["push *"], JobStatus::Succeeded),
                 job("windows", &["push *"], windows),
-                job("publish", &[], publish),
+                // Runs because `windows` ran, and `publish` needs it: not a
+                // deploy job of its own.
+                needing(job("check-windows", &[], after_windows), "windows"),
+                needing(job("publish", &[], publish), "check-windows"),
             ],
             channel: String::new(),
             cancelled: false,
@@ -274,5 +292,15 @@ mod tests {
         // It does not end a streak either.
         let pipelines = vec![pipeline(1, "main", Failed, Skipped), green];
         assert_eq!(of_branch(&pipelines, "main").red.len(), 1);
+    }
+
+    #[test]
+    fn a_manual_run_of_the_default_branch_is_none_of_its_pipelines() {
+        use JobStatus::{Failed, Skipped, Succeeded};
+        let mut manual = pipeline(2, "main", Failed, Skipped);
+        manual.event.kind = EventKind::Manual;
+        let pipelines = vec![pipeline(1, "main", Succeeded, Succeeded), manual];
+        assert!(!is_branch(&pipelines[1], "main"));
+        assert!(of_branch(&pipelines, "main").red.is_empty());
     }
 }

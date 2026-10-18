@@ -22,11 +22,11 @@ build of the editor compiles and edits locally (it reaches no runner yet).
 
 ```
 zeughaus/              # binary: the iced editor; edits the graph and views results, never executes
-zeughaus-runner/       # binary: headless process that executes the graph, owns the terminals, runs the CI jobs it is assigned and can follow a release channel; `release` makes and checks signed bundles; `mcp` gives an agent the CI and try runs as tools
-zeughaus-ci/           # binary: the CI service; schedules pipelines onto enlisted runners, webhook intake, try-run uploads, stored transcripts
+zeughaus-runner/       # binary: headless process that executes the graph, owns the terminals, runs the CI jobs it is assigned and can follow a release channel; `release` makes and checks signed bundles; `mcp` gives an agent the CI and manual job runs as tools
+zeughaus-ci/           # binary: the CI service; schedules pipelines onto enlisted runners, webhook intake, manual-run uploads, stored transcripts
 zeughaus-core/         # Ty/Typed/Value, pins, ExecutableNode/DomainPlugin, settings, scalar wire encoding, graph document types
 zeughaus-runtime/      # GraphExecutor: topology, node instances, edge cache, dirty set, async work, node errors
-zeughaus-link/         # the runner<->editor protocol over weida (graph, feed, events, snapshot, triggers, paths), the runner<->CI enlist protocol, the `/try` upload of working-tree snapshots and the credentials both ends present
+zeughaus-link/         # the runner<->editor protocol over weida (graph, feed, events, snapshot, triggers, paths), the runner<->CI enlist protocol, the `/manual` upload of working-tree snapshots and the credentials both ends present
 zeughaus-mux/          # terminal mux wire model: stable ids, workspace topology, rows/deltas, bounded codec, client-side TerminalView (pure, wasm too)
 zeughaus-terminal/     # the terminal engine: PTYs over portable-pty and a pinned wezterm-term in the runner, byte-fed sessions for the CI's transcripts (native only)
 zeughaus-transform/    # plugin: 35 math/logic/string/trig nodes, constants, Display
@@ -150,15 +150,14 @@ the commit just pushed) or one job of it has settled; `ci_timing` says where
 a pipeline's time went (for each job when it was assigned, started and ended
 after the pipeline was created, its staging time and the inputs that moved
 to it) or, for one job, which lines of its output the longest pauses follow,
-from the time the terminal WAL keeps for every chunk. `try_run` snapshots the
-checkout of the current directory (its
-commit, the changes to it and the untracked files that are not ignored) and
-the sibling checkouts its Cargo path dependencies point to, uploads them to
-the CI as git bundles, and waits for the `try` pipeline that runs a command
-on another host's runner (a platform of `ci.toml` or a runner name) from
-that snapshot; it answers with the result and the last 200 lines of output,
-or with how to pick the run up with `try_wait`. Nothing but protocol
-messages is written to its stdout.
+from the time the terminal WAL keeps for every chunk. `run_jobs` snapshots
+the checkout of the current directory (its commit, the changes to it and
+the untracked files that are not ignored) and the sibling checkouts its
+Cargo path dependencies point to, uploads them to the CI as git bundles
+with the names of jobs of the repository's pipeline, and answers as
+`ci_wait` does once that manual pipeline has settled, or with how to
+continue with `ci_wait`. Nothing but protocol messages is written to its
+stdout.
 
 A runner also runs the tasks of `<state-dir>/maintain.toml` (`[[task]]` with
 `name`, `command` as an argv, `every_minutes` and `timeout_minutes`,
@@ -242,37 +241,34 @@ The Windows VM scripts (`vm/win11/`) are
 installed under `/usr/local/lib/zeughaus/vm/win11` and booted and stopped by
 the `tuco-pc` runner.
 
-`context = "<c>"` in a job header makes the jobs of a pipeline that name it
-share one warm workspace, `ci/work/<repo>/<c>` instead of one per job, and run
-one after another in the order the pipeline lists them (they agree on
-`image`, `machine`, `platform` and `cache`, and a context is never a job's
-name). A pipeline keeps its context until its last job ended; other
-pipelines' jobs of it wait, the oldest first. `clean = true` on a
-`[[channel]]` of `.zeughaus-ci/channels.toml` makes the first job to use a
-workspace in that channel's pipelines start it from nothing, `cache` paths
-too.
+A repository's jobs at one place share one warm workspace on their runner:
+`ci/work/<repo>/host` on the runner's host, `ci/work/<repo>/image-<image>`
+in a container of that image, `ci/work/<repo>/machine-<vm>` on a VM.
+Pipeline jobs and manual runs build in it one at a time, the oldest first
+(by pipeline number, then the job's place in the pipeline); order between
+jobs is their `needs`. A checkout fetches, checks out with `--force` and
+runs `git clean -ffd`, so ignored files such as `target/` stay. `clean =
+true` on a `[[channel]]` of `.zeughaus-ci/channels.toml` makes the first job
+of that channel's pipelines at each place start from nothing (`git clean
+-ffdx`). The header keys `context` and `cache` still parse and do nothing;
+`zeughaus-ci check` warns about them.
 
-A try run executes a command on a runner from the uploader's working tree,
-uncommitted files and sibling path dependencies (`../weida`) included. The
-uploader sends the CI's `/try` path (editors' keys only, wire types in
-`zeughaus_link::tryrun`) a `TryUpload` and one git bundle per checkout, and
-the CI runs it as a pipeline of the `try` channel of the repository whose
-`ci.toml` `url` is the upload's `origin` (else one named after the URL's last
-segment; no `ci.toml` entry is needed): one job `try` that runs the
-snapshot's `.zeughaus-ci/zeughaus-try.sh` (`.ps1` on a Windows runner). The
-`target` is a `[platforms]` key, else a runner name; the job runs on that
-runner's host, or in a container when the upload names an `image` (a
-Containerfile of the snapshot's `.zeughaus-ci/`). A target that is a Windows
-VM ends the pipeline as `error`: `try runs on a runner's host or in a
-container; <target> is the machine <vm>`. All tries of a repository on one
-runner share the workspace `ci/work/<repo>/zeughaus-try` (the context
-`zeughaus-try`, a name no job or context may take) and take turns in it; each
-checkout is `<root>/<dir>`, updated from the run's bundles without cleaning
-ignored files, so `target/` stays warm and `../weida` is the sibling checkout.
-The bundles stay in `<state-dir>/ci/try/<id>/` on the CI until the pipeline
-ended and reach the runner on `/artifacts` (`TryBundle`). A try posts no
-forge status, raises no red alert and cannot be rerun; `/ci` answers a job's
-last lines as text (`Log`) and lists the `[platforms]`.
+A manual run executes named jobs of a repository's pipeline from the
+uploader's working tree, uncommitted files and sibling path dependencies
+(`../weida`) included. The uploader sends the CI's `/manual` path (editors'
+keys only, wire types in `zeughaus_link::manual`) a `RunUpload` with the job
+names and one git bundle per checkout; the upload's `origin` must be the
+`url` of a repository of `ci.toml`. The CI reads `.zeughaus-ci/` of the
+snapshot and runs the named jobs as a pipeline in the channel a push of the
+default branch selects: a need on a job that is not named is dropped, no
+job gets secrets, and a job on a Windows VM ends the pipeline as `error`.
+Each job runs in the workspace of its place, where the pipeline builds too:
+the main checkout is the workspace itself, the siblings are under
+`<workspace>/.zci-siblings/<dir>` (`CI_SIBLINGS`), and the bundles stay in
+`<state-dir>/ci/manual/<id>/` on the CI until the pipeline ended and reach
+the runner on `/artifacts` (`ManualBundle`). A manual run posts no forge
+status, raises no red alert and cannot be rerun; `/ci` answers a job's last
+lines as text (`Log`) and lists the `[platforms]`.
 
 The Windows runner `wohnzimmer` is the living-room PC, used by someone else
 at its console. Everything of zeughaus is under `C:\zeughaus`, readable by
@@ -281,7 +277,7 @@ boot task runs), `state\`, `src\` (the checkouts a deploy builds), `cargo\`
 and `rustup\`. Its WireGuard tunnel `sadala` (`C:\zeughaus\wg\sadala.conf`,
 the WireGuard for Windows service) gives it `10.8.0.12`; the firewall admits
 the runner from `10.8.0.0/24` only. It runs `.ps1` jobs on its host in
-`C:\zeughaus\state\ci\work\<repo>\<workspace>`, has no containers, machines,
+`C:\zeughaus\state\ci\work\<repo>\host`, has no containers, machines,
 shims or updater: a restart (every deploy) ends its terminals and the job
 it runs.
 
@@ -337,20 +333,21 @@ bundles the platform archives into a signed release directory
 (`manifest.json`, `manifest.sig`, `SHA256SUMS`; the seed comes from
 `ZEUGHAUS_UPDATE_KEY`, never from an argument) and checks one.
 
-This repository is one of its repos: every push to Forgejo runs
-`.zeughaus-ci/gate.sh` (the gate below, in the `.zeughaus-ci/trixie.Containerfile`
-image, against weida's `main` as the sibling checkout) and posts
-`zeughaus/gate` on the commit. A push to `main`, a `v*` tag and the nightly
-cron (`0 3 * * *`) also run one build job per platform, each packing
-`zeughaus-<version>-<platform>.tar.gz` (`.zip` on Windows) into its output:
-`linux-amd64` (tuco-pc, in the `trixie` image, after the gate in the same
-`linux` context, so it builds in the gate's warm workspace) and `linux-arm64` (atik, the
-same image in an Apple `container`), `windows-amd64` (the `wohnzimmer` runner's host),
-`darwin-arm64` (atik's host; the editor as
-`Zeughaus.app` through `deploy/macos-app.sh`). The `nightly` and `release`
-channels are `clean`: their pipelines start from empty workspaces.
-`.zeughaus-ci/build.sh` is
-their shared helper. `publish.sh` runs on sadala after the gate and all four,
+This repository is one of its repos: a push to `main`, a `v*` tag and the
+nightly cron (`0 3 * * *`) run a build job and a check job per platform,
+against weida's `main` as the sibling checkout, and post `zeughaus/<job>`
+on the commit; pushes to other branches start nothing. `build-<platform>`
+packs `zeughaus-<version>-<platform>.tar.gz` (`.zip` on Windows) into its
+output, and `check-<platform>` runs clippy and the tests after it in the
+same warm workspace (`check-linux-amd64` is the whole gate below: also
+`fmt` and the wasm check): `linux-amd64` (tuco-pc, in the
+`.zeughaus-ci/trixie.Containerfile` image), `linux-arm64` (atik, the same
+image in an Apple `container`), `windows-amd64` (the `wohnzimmer` runner's
+host), `darwin-arm64` (atik's host; the editor as `Zeughaus.app` through
+`deploy/macos-app.sh`). The `nightly` and `release` channels are `clean`:
+their pipelines start from empty workspaces. `.zeughaus-ci/build.sh` (and
+`windows.ps1` on Windows) is their shared helper. `publish.sh` runs on
+sadala after all eight,
 bundles and signs them (the `zeughaus-runner` of the `linux-arm64` archive is
 the tool) and publishes into `/var/www/zeughaus-updates/<channel>/<build>/`
 with `latest` naming the newest; the two newest builds of a channel stay.

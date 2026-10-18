@@ -19,40 +19,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the toolchain) and builds and installs a commit there. The
   `windows-amd64` release archive is built on such a host, `wohnzimmer`,
   instead of the `win11` VM.
-- CI: jobs of one pipeline that name the same `context` in their header
-  share one warm workspace and run one after another, each finding what the
-  one before built. A pipeline keeps its context until its last job ended;
-  other pipelines' jobs of it wait their turn, the oldest first. A channel
-  marked `clean = true` in `channels.toml` starts every workspace of its
-  pipelines from nothing, `cache` paths included. This changes the enlist
-  protocol (to major 4, together with the artifact transfers under
-  Changed): a runner built before is refused (`protocol 2 is not 4`) until it
-  is updated.
 - CI: a job with `needs` may name the `channels` it runs in, so a publish
   step that depends on a build job runs for `nightly` or `release` pipelines
   only. `zeughaus-ci check` refuses a channel that is neither in
-  `channels.toml` nor one of the fallback names (`tags`, `cron`, `try`),
+  `channels.toml` nor one of the fallback names (`tags`, `cron`),
   and `channels` on a job with `on` is refused.
 - CI tab: a cable between two jobs animates, as arrows in the colour of a
   running job, while the needed job's artifact set moves to the runner of
   the needing one, and that job's card reads `receiving <need>`.
-- CI: a try run executes a command on a runner from an agent's working
-  tree, uncommitted files and sibling path dependencies included. An
-  editor's key uploads the snapshot as git bundles on the new `/try` path;
-  the CI runs it as a pipeline of the `try` channel on the host of the runner
-  (or in a container on it) that its `target` names, in a workspace all tries
-  of the repository share on that runner, so builds stay warm. A try needs no
-  entry in `ci.toml`, posts no forge status and cannot be rerun; a target
-  that is a Windows VM is refused. `/ci` also answers the last lines of a
-  job's output (`Log`) and lists the `[platforms]`.
 - `zeughaus-runner mcp` is a Model Context Protocol server on stdio that
   gives an agent the CI as tools: its status, pipelines and job logs,
-  rerun and cancel, and `try_run`, which runs a command on another
-  host's runner from the agent's working tree (uncommitted and untracked
-  files and the sibling checkouts its Cargo path dependencies point to
-  included) and answers with the result and the end of the output. It
-  dials the first CI of `zeughaus.toml`, or `--ci`, with the state
-  directory's client key, the way an editor does.
+  rerun and cancel, and `run_jobs` (below). It dials the first CI of
+  `zeughaus.toml`, or `--ci`, with the state directory's client key, the way
+  an editor does. `/ci` also answers the last lines of a job's output
+  (`Log`) and lists the `[platforms]`.
+- CI: manual job runs. `run_jobs`, a tool of that server, runs named jobs
+  of the repository's pipeline (for example `build-windows-amd64` and
+  `check-windows-amd64`) from the agent's working tree, uncommitted and
+  untracked files and the sibling checkouts its Cargo path dependencies
+  point to included, in the warm workspace the pipeline uses at each job's
+  place, so builds and tests are incremental. An editor's key uploads the
+  snapshot as git bundles on the `/manual` path
+  (`zeughaus_link::manual::RunUpload`); the CI plans only the named jobs
+  from the working tree's `.zeughaus-ci/`, drops a `needs` on a job that is
+  not named, gives them no secrets and puts the pipeline, event kind
+  `manual`, in the channel a push to the default branch selects. The
+  siblings are checked out under `<workspace>/.zci-siblings/<dir>` and
+  exported as `CI_SIBLINGS`. A manual run needs a repository of `ci.toml`,
+  posts no forge status, cannot be rerun and is refused for a job on a
+  Windows VM. `run_jobs` answers as `ci_wait` does.
 - A runner runs the periodic tasks of `<state-dir>/maintain.toml` by
   itself (a toolchain update, a dotfiles pull), one at a time while it is
   idle and holding off CI and graph jobs meanwhile, each as a terminal in
@@ -95,7 +90,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gigabytes starts moving at once. A job with several inputs fetches them
   in parallel, and each transfer is reported to the CI, which keeps when it
   began and ended and how many bytes moved, or why it failed, in the job's
-  record. This changes the enlist protocol to major 4: a runner built
+  record. This changes the enlist protocol: a runner built
   before is refused until it is updated.
 - CI: the artifacts of a job that ended are fetched early. A job that needs
   them and is placed on another runner no longer waits until it starts to
@@ -105,11 +100,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the builds of several platforms finds most of its inputs on its runner
   when the slowest build ends. A job that is skipped or cancelled before it
   starts has what was fetched for it deleted.
+- CI: a job's workspace is chosen by its place, not by its name:
+  `ci/work/<repo>/host`, `image-<image>` or `machine-<vm>`. Every job of a
+  repository at one place on one runner, of any pipeline and manual runs
+  too, shares it and runs one after another, oldest first, so a build finds
+  the warm tree the one before left. A job waits with `waiting for <job> in
+  workspace <ws>` (a job of its own pipeline), `workspace <ws> in use by
+  #<n>` or `workspace <ws> queued for #<n>`. A checkout is `Clean`
+  (`git clean -ffd`, so `target/` and other ignored files stay) or `Wipe`
+  (`-ffdx`): a channel marked `clean = true` in `channels.toml` starts the
+  first use of every place in its pipelines from nothing. This
+  changes the enlist protocol to major 5: a runner built before is refused
+  (`protocol 2 is not 5`) until it is updated, and the CI and its runners
+  are installed together. Workspaces of the old names are not reused: copy
+  or rename one to its place name to keep its tree, the rest go with the
+  runner's disk budget.
+- CI: zeughaus's own pipeline is a build job and a check job per platform
+  (`build-<p>`, `check-<p>` for `linux-amd64`, `linux-arm64`, `darwin-arm64`
+  and `windows-amd64`; the check `needs` its build and finds its `target/`
+  warm). Every platform now runs clippy with `-D warnings` and the workspace
+  tests, and `linux-amd64` also `cargo fmt --check` and the wasm check;
+  `publish` needs all eight jobs. The old `gate`, `linux-amd64`,
+  `linux-arm64`, `darwin-arm64` and `windows-amd64` jobs and the
+  `windows-runner` channel are gone, and a push to a branch other than
+  `main` starts nothing. A build job exports `ZEUGHAUS_BUILD` itself, so the
+  pipeline number no longer invalidates the shared workspace's builds.
 
 ### Removed
 
 - The `Job` node's `keep_on_failure` setting. A saved graph that still has
   it loads, and the row is ignored.
+- CI: the job header key `cache` has no effect any more. It still parses,
+  and `zeughaus-ci check` warns that a repository's jobs at one place share
+  one workspace and a checkout keeps ignored files.
 
 ### Fixed
 

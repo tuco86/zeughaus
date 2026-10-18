@@ -30,7 +30,7 @@ use std::process::ExitCode;
 use zeughaus_link::credentials;
 
 use crate::CI_DIR;
-use crate::channels::{CHANNELS_FILE, Channels, TRY_CHANNEL};
+use crate::channels::{CHANNELS_FILE, Channels};
 use crate::config::CiConfig;
 use crate::event::{self, CiEvent, EventKind};
 use crate::excerpt;
@@ -117,16 +117,30 @@ fn load_dir(dir: &Path) -> Result<(Vec<JobDef>, Channels), String> {
     Ok((jobs, Channels::from_files(&files)?))
 }
 
+/// What `check` says about the header keys that parse and do nothing, one
+/// line per key.
+fn ignored_key_warnings(jobs: &[JobDef]) -> Vec<String> {
+    jobs.iter()
+        .flat_map(|job| {
+            job.ignored_keys.iter().map(move |key| {
+                format!(
+                    "{CI_DIR}/{}: `{key}` is ignored: a repository's jobs at one place share one workspace, and a checkout keeps ignored files",
+                    job.file
+                )
+            })
+        })
+        .collect()
+}
+
 /// Every channel a job names exists: in `channels.toml`, or one of the
 /// fallback names an event without a listed channel gets.
 fn check_job_channels(jobs: &[JobDef], channels: &Channels) -> Result<(), String> {
-    let known = |c: &str| {
-        matches!(c, "tags" | "cron" | TRY_CHANNEL) || channels.names().any(|(name, ..)| name == c)
-    };
+    let known =
+        |c: &str| matches!(c, "tags" | "cron") || channels.names().any(|(name, ..)| name == c);
     for job in jobs {
         if let Some(c) = job.channels.iter().find(|c| !known(c)) {
             return Err(format!(
-                "{CI_DIR}/{}: channel `{c}` is not in {CHANNELS_FILE} and is no fallback name (tags, cron, try)",
+                "{CI_DIR}/{}: channel `{c}` is not in {CHANNELS_FILE} and is no fallback name (tags, cron)",
                 job.file
             ));
         }
@@ -145,6 +159,9 @@ fn check(state_dir: &Path, args: &[String]) -> Result<(), String> {
     };
     let dir = Path::new(dir);
     let (jobs, channels) = load_dir(dir)?;
+    for warning in ignored_key_warnings(&jobs) {
+        eprintln!("[ci] warning: {warning}");
+    }
     check_job_channels(&jobs, &channels)?;
     let config = match CiConfig::load(state_dir) {
         Ok(Some(config)) => Some(config),
@@ -232,7 +249,7 @@ fn parse_event(
             };
             (EventKind::Cron, default_branch.to_owned(), None, Some(expr))
         }
-        ("try", _) => return Err("try events come from the /try service".to_owned()),
+        ("manual", _) => return Err("manual events come from the /manual service".to_owned()),
         _ => return Err(USAGE.to_owned()),
     };
     Ok(CiEvent {
@@ -457,12 +474,33 @@ mod tests {
             "[[channel]]\nname = \"nightly\"\non = [\"cron *\"]\n".to_owned(),
         )])
         .unwrap();
-        let ok = job_in("\"nightly\", \"tags\", \"cron\", \"try\"");
+        let ok = job_in("\"nightly\", \"tags\", \"cron\"");
         assert!(check_job_channels(&[ok], &channels).is_ok());
         let err = check_job_channels(&[job_in("\"nightlyy\"")], &channels).unwrap_err();
         assert!(
             err.contains("channel `nightlyy` is not in channels.toml"),
             "{err}"
         );
+        assert!(check_job_channels(&[job_in("\"manual\"")], &channels).is_err());
+    }
+
+    #[test]
+    fn the_keys_a_header_carries_for_nothing_are_warned_about() {
+        let text =
+            "# /// ci\n# on = [\"push main\"]\n# context = \"x\"\n# cache = [\".c\"]\n# ///\n";
+        let job = header::parse_job("a.sh", text).unwrap().unwrap();
+        let plain = header::parse_job("b.sh", "# /// ci\n# on = [\"push main\"]\n# ///\n")
+            .unwrap()
+            .unwrap();
+        let warnings = ignored_key_warnings(&[job, plain]);
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].starts_with(".zeughaus-ci/a.sh: `context` is ignored: "));
+        assert!(warnings[1].starts_with(".zeughaus-ci/a.sh: `cache` is ignored: "));
+    }
+
+    #[test]
+    fn manual_events_cannot_be_queued_by_hand() {
+        let err = parse_event("r", "manual", &[], "main").unwrap_err();
+        assert_eq!(err, "manual events come from the /manual service");
     }
 }

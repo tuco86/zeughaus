@@ -21,6 +21,8 @@ pub fn when_busy_name(when_busy: WhenBusy) -> &'static str {
 
 /// Serialized into the pipeline record, so a restarted runner starts the
 /// pending jobs from what was selected rather than re-reading the commit.
+/// Keys a stored record carries that this struct does not know are skipped:
+/// records outlive the code that wrote them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobDef {
     pub name: String,
@@ -38,26 +40,16 @@ pub struct JobDef {
     /// is built. Exclusive with `machine`.
     #[serde(default)]
     pub platform: Option<String>,
-    /// A name shared by jobs that run one after another in one workspace,
-    /// named after the context, instead of one workspace each. Such jobs
-    /// have equal `image`, `machine`, `platform` and `cache`.
-    #[serde(default)]
-    pub context: Option<String>,
-    pub cache: Vec<String>,
     pub secrets: Vec<String>,
     pub when_busy: WhenBusy,
     pub env: BTreeMap<String, String>,
     pub timeout_minutes: u32,
     /// `sh` or `bash` for `.sh` jobs, `powershell` for `.ps1` jobs.
     pub interpreter: String,
-}
-
-impl JobDef {
-    /// The directory name of the job's workspace on a runner: its context,
-    /// else its own name.
-    pub fn workspace(&self) -> &str {
-        self.context.as_deref().unwrap_or(&self.name)
-    }
+    /// Header keys that parse and do nothing, for `zeughaus-ci check` to
+    /// name. Never stored.
+    #[serde(skip)]
+    pub ignored_keys: Vec<&'static str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,9 +64,13 @@ struct JobHeader {
     image: Option<String>,
     machine: Option<String>,
     platform: Option<String>,
-    context: Option<String>,
+    /// `context` and `cache` parse and are ignored: a repository's jobs at
+    /// one place share one workspace, and a checkout keeps ignored files.
+    /// Other repositories' headers still carry them.
     #[serde(default)]
-    cache: Vec<String>,
+    context: Option<toml::Value>,
+    #[serde(default)]
+    cache: Option<toml::Value>,
     #[serde(default)]
     secrets: Vec<String>,
     #[serde(default)]
@@ -121,19 +117,6 @@ fn interpreter(ext: &str, text: &str) -> Result<String, String> {
     }
 }
 
-fn check_cache(path: &str) -> Result<(), String> {
-    if path.is_empty() {
-        return Err("cache path is empty".into());
-    }
-    if path.starts_with('/') || path.starts_with('\\') || path.as_bytes().get(1) == Some(&b':') {
-        return Err(format!("cache path `{path}` must be relative"));
-    }
-    if path.split(['/', '\\']).any(|c| c == "..") {
-        return Err(format!("cache path `{path}` must not contain `..`"));
-    }
-    Ok(())
-}
-
 /// Parses the header of one `.zeughaus-ci/` file. `Ok(None)` is a helper file.
 pub fn parse_job(file_name: &str, text: &str) -> Result<Option<JobDef>, String> {
     let fail = |msg: String| format!("{}/{file_name}: {msg}", crate::CI_DIR);
@@ -160,15 +143,13 @@ pub fn parse_job(file_name: &str, text: &str) -> Result<Option<JobDef>, String> 
             "platform name `{p}` must match [a-z0-9][a-z0-9-]*"
         )));
     }
-    if let Some(c) = &header.context
-        && !valid_name(c)
+    // The image names the job's workspace on a runner, a directory there.
+    if let Some(image) = &header.image
+        && !valid_name(image)
     {
         return Err(fail(format!(
-            "context name `{c}` must match [a-z0-9][a-z0-9-]*"
+            "image name `{image}` must match [a-z0-9][a-z0-9-]*"
         )));
-    }
-    for path in &header.cache {
-        check_cache(path).map_err(fail)?;
     }
     for secret in &header.secrets {
         if !valid_env_name(secret) {
@@ -196,6 +177,13 @@ pub fn parse_job(file_name: &str, text: &str) -> Result<Option<JobDef>, String> 
         )));
     }
     let interpreter = interpreter(ext, text).map_err(fail)?;
+    let ignored_keys = [
+        ("context", header.context.is_some()),
+        ("cache", header.cache.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(key, present)| present.then_some(key))
+    .collect();
 
     Ok(Some(JobDef {
         name: name.to_string(),
@@ -205,14 +193,13 @@ pub fn parse_job(file_name: &str, text: &str) -> Result<Option<JobDef>, String> 
         image: header.image,
         machine: header.machine,
         platform: header.platform,
-        context: header.context,
-        cache: header.cache,
         channels: header.channels,
         secrets: header.secrets,
         when_busy: header.when_busy,
         env: header.env,
         timeout_minutes,
         interpreter,
+        ignored_keys,
     }))
 }
 
@@ -220,7 +207,7 @@ pub fn parse_job(file_name: &str, text: &str) -> Result<Option<JobDef>, String> 
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "#!/bin/bash\n# build it\n# /// ci\n# on = [\"push main\"]\n# cache = [\".cache\"]\n# when_busy = \"freeze\"\n# image = \"ubuntu\"\n# [env]\n# FOO = \"1\"\n# ///\n# trailing comment\necho hi\n";
+    const SAMPLE: &str = "#!/bin/bash\n# build it\n# /// ci\n# on = [\"push main\"]\n# when_busy = \"freeze\"\n# image = \"ubuntu\"\n# [env]\n# FOO = \"1\"\n# ///\n# trailing comment\necho hi\n";
 
     #[test]
     fn extracts_block_between_other_comments() {
@@ -228,7 +215,7 @@ mod tests {
         assert_eq!(job.name, "check");
         assert_eq!(job.file, "check.sh");
         assert_eq!(job.on, ["push main"]);
-        assert_eq!(job.cache, [".cache"]);
+        assert!(job.ignored_keys.is_empty());
         assert_eq!(job.when_busy, WhenBusy::Freeze);
         assert_eq!(job.image.as_deref(), Some("ubuntu"));
         assert_eq!(job.env["FOO"], "1");
@@ -277,9 +264,6 @@ mod tests {
     #[test]
     fn field_rules() {
         let wrap = |body: &str| format!("# /// ci\n# on = [\"push main\"]\n# {body}\n# ///\n");
-        assert!(parse_job("x.sh", &wrap("cache = [\"../x\"]")).is_err());
-        assert!(parse_job("x.sh", &wrap("cache = [\"/x\"]")).is_err());
-        assert!(parse_job("x.sh", &wrap("cache = [\"\"]")).is_err());
         assert!(parse_job("x.sh", &wrap("secrets = [\"lower\"]")).is_err());
         assert!(parse_job("x.sh", &wrap("env = { CI_X = \"1\" }")).is_err());
         assert!(parse_job("x.sh", &wrap("env = { ZEUGHAUS_X = \"1\" }")).is_err());
@@ -304,18 +288,27 @@ mod tests {
     }
 
     #[test]
-    fn a_context_names_the_workspace_and_is_checked() {
+    fn the_name_of_an_image_is_checked() {
         let wrap = |body: &str| format!("# /// ci\n# on = [\"push main\"]\n# {body}\n# ///\n");
-        let alone = parse_job("gate.sh", &wrap("")).unwrap().unwrap();
-        assert_eq!(alone.context, None);
-        assert_eq!(alone.workspace(), "gate");
-        let shared = parse_job("gate.sh", &wrap("context = \"linux\""))
+        let job = parse_job("x.sh", &wrap("image = \"ubuntu24\""))
             .unwrap()
             .unwrap();
-        assert_eq!(shared.context.as_deref(), Some("linux"));
-        assert_eq!(shared.workspace(), "linux");
-        let err = parse_job("gate.sh", &wrap("context = \"Linux\"")).unwrap_err();
-        assert!(err.contains("context name `Linux`"), "{err}");
+        assert_eq!(job.image.as_deref(), Some("ubuntu24"));
+        for bad in ["Ubuntu", "ubuntu_24", "../x", "ubuntu.24", ""] {
+            let err = parse_job("x.sh", &wrap(&format!("image = \"{bad}\""))).unwrap_err();
+            assert!(err.contains(&format!("image name `{bad}`")), "{err}");
+        }
+    }
+
+    #[test]
+    fn context_and_cache_parse_and_are_ignored() {
+        let wrap = |body: &str| format!("# /// ci\n# on = [\"push main\"]\n# {body}\n# ///\n");
+        let job = parse_job("x.sh", &wrap("context = \"x\"\n# cache = [\".c\"]"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.ignored_keys, ["context", "cache"]);
+        let plain = parse_job("x.sh", &wrap("")).unwrap().unwrap();
+        assert!(plain.ignored_keys.is_empty());
     }
 
     #[test]

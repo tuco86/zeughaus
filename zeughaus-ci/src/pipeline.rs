@@ -5,8 +5,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
-use zeughaus_link::tryrun::TRY_WORKSPACE;
-
 use crate::CI_DIR;
 use crate::event::{CiEvent, EventKind};
 use crate::header::{JobDef, parse_job};
@@ -147,7 +145,6 @@ pub fn load_jobs(
     for job in by_name.values() {
         validate(job, &by_name, containerfiles)?;
     }
-    check_workspaces(&by_name)?;
     topological(by_name)
 }
 
@@ -206,49 +203,6 @@ fn validate(
     }
     for pattern in &job.on {
         Pattern::parse(pattern).map_err(|e| fail(format!("on: {e}")))?;
-    }
-    Ok(())
-}
-
-/// The rules over the workspaces a folder's jobs share: a context is never a
-/// job's name, nothing takes the name of the try runs' workspace, and the
-/// jobs of one context agree on where they run and what they keep.
-fn check_workspaces(by_name: &BTreeMap<String, JobDef>) -> Result<(), String> {
-    let mut first_of: BTreeMap<&str, &JobDef> = BTreeMap::new();
-    for job in by_name.values() {
-        let fail = |msg: String| format!("{CI_DIR}/{}: {msg}", job.file);
-        if job.workspace() == TRY_WORKSPACE || job.name == TRY_WORKSPACE {
-            return Err(fail(format!(
-                "\"{TRY_WORKSPACE}\" is reserved for try runs"
-            )));
-        }
-        let Some(context) = job.context.as_deref() else {
-            continue;
-        };
-        if by_name.contains_key(context) {
-            return Err(fail(format!(
-                "context \"{context}\" is also the name of a job"
-            )));
-        }
-        let Some(first) = first_of.get(context) else {
-            first_of.insert(context, job);
-            continue;
-        };
-        let same_cache = first.cache.iter().collect::<BTreeSet<_>>()
-            == job.cache.iter().collect::<BTreeSet<_>>();
-        for (key, same) in [
-            ("image", first.image == job.image),
-            ("machine", first.machine == job.machine),
-            ("platform", first.platform == job.platform),
-            ("cache", same_cache),
-        ] {
-            if !same {
-                return Err(fail(format!(
-                    "context \"{context}\": {} and {} differ in {key}",
-                    first.name, job.name
-                )));
-            }
-        }
     }
     Ok(())
 }
@@ -451,32 +405,6 @@ mod tests {
     }
 
     #[test]
-    fn jobs_of_one_context_agree_and_share_a_workspace() {
-        let on = "on = [\"push main\"]";
-        let jobs = load(&[
-            file(
-                "gate.sh",
-                &format!("{on}\ncontext = \"linux\"\nimage = \"ubuntu\"\ncache = [\".a\", \".b\"]"),
-            ),
-            // The same paths in another order are the same cache.
-            file(
-                "build.sh",
-                "needs = [\"gate\"]\ncontext = \"linux\"\nimage = \"ubuntu\"\ncache = [\".b\", \".a\"]",
-            ),
-            file("lint.sh", on),
-        ])
-        .unwrap();
-        let workspaces: Vec<(&str, &str)> = jobs
-            .iter()
-            .map(|j| (j.name.as_str(), j.workspace()))
-            .collect();
-        assert_eq!(
-            workspaces,
-            [("gate", "linux"), ("build", "linux"), ("lint", "lint")]
-        );
-    }
-
-    #[test]
     fn validation_rules() {
         let on = "on = [\"push main\"]";
         let cases: Vec<(Vec<(String, String)>, &str)> = vec![
@@ -531,52 +459,6 @@ mod tests {
                     file("a.ps1", &format!("{on}\nmachine = \"w\"")),
                 ],
                 "already defined",
-            ),
-            (
-                vec![
-                    file("a.sh", &format!("{on}\ncontext = \"b\"")),
-                    file("b.sh", on),
-                ],
-                "context \"b\" is also the name of a job",
-            ),
-            (
-                vec![
-                    file(
-                        "a.sh",
-                        &format!("{on}\ncontext = \"c\"\nimage = \"ubuntu\""),
-                    ),
-                    file("b.sh", &format!("{on}\ncontext = \"c\"")),
-                ],
-                "context \"c\": a and b differ in image",
-            ),
-            (
-                vec![
-                    file("a.sh", &format!("{on}\ncontext = \"c\"\nmachine = \"w\"")),
-                    file("b.sh", &format!("{on}\ncontext = \"c\"")),
-                ],
-                "context \"c\": a and b differ in machine",
-            ),
-            (
-                vec![
-                    file("a.sh", &format!("{on}\ncontext = \"c\"\nplatform = \"p\"")),
-                    file("b.sh", &format!("{on}\ncontext = \"c\"")),
-                ],
-                "context \"c\": a and b differ in platform",
-            ),
-            (
-                vec![
-                    file("a.sh", &format!("{on}\ncontext = \"c\"\ncache = [\".x\"]")),
-                    file("b.sh", &format!("{on}\ncontext = \"c\"")),
-                ],
-                "context \"c\": a and b differ in cache",
-            ),
-            (
-                vec![file("zeughaus-try.sh", on)],
-                "\"zeughaus-try\" is reserved for try runs",
-            ),
-            (
-                vec![file("a.sh", &format!("{on}\ncontext = \"zeughaus-try\""))],
-                "\"zeughaus-try\" is reserved for try runs",
             ),
         ];
         for (files, expect) in cases {
