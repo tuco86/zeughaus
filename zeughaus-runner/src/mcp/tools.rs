@@ -1,4 +1,4 @@
-//! The nine tools, the schemas an agent sees and the text they answer with.
+//! The ten tools, the schemas an agent sees and the text they answer with.
 //!
 //! The text is for a model, so it is short, one fact per line and in a shape
 //! that is the same every time. The functions that build it take the records
@@ -11,9 +11,11 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use zeughaus_link::ci::MAX_PIPELINES_PER_REQUEST;
+use zeughaus_link::ci::{MAX_PIPELINES_PER_REQUEST, MAX_TIMING_LINES, TIMING_READ_BYTES};
 use zeughaus_link::tryrun::TryReply;
-use zeughaus_link::{CiOverview, CiReply, CiRequest, JobView, PipelineView};
+use zeughaus_link::{
+    CiOverview, CiReply, CiRequest, JobTiming, JobView, PipelineView, TransferView,
+};
 
 use super::client::Client;
 use super::rpc::Tools;
@@ -25,7 +27,8 @@ try_run executes a command on another host's zeughaus runner (Windows, macOS or 
 from the current working tree, with its uncommitted files and the sibling checkouts its Cargo path \
 dependencies need, and answers with the result and the end of the output; ci_status lists the \
 targets it accepts, and with the other ci_* tools the CI's channels, pipelines and logs; ci_wait \
-waits for a pipeline, or one job of it, to settle, also for the pipeline a push is about to start.";
+waits for a pipeline, or one job of it, to settle, also for the pipeline a push is about to start; \
+ci_timing says where the time of a pipeline, or of one job's output, went.";
 
 /// Pipelines listed when the call gives no limit.
 const DEFAULT_PIPELINES: u32 = 10;
@@ -35,6 +38,8 @@ const DEFAULT_TAIL: u32 = 200;
 const MAX_TAIL: u32 = 5000;
 /// Lines of output the report of a try run ends with.
 const REPORT_LINES: u32 = 200;
+/// Lines `ci_timing` names when the call gives no count.
+const DEFAULT_TOP: u32 = 15;
 const DEFAULT_TIMEOUT_MINUTES: u32 = 60;
 const MAX_TIMEOUT_MINUTES: u32 = 1440;
 /// How long a call waits for a try run when it is not told.
@@ -121,9 +126,33 @@ impl Toolbox {
             number: args.number,
             job: args.job,
             tail: args.tail.unwrap_or(DEFAULT_TAIL).clamp(1, MAX_TAIL),
+            timestamps: args.timestamps.unwrap_or(false),
         };
         match self.client.ci(request).await? {
             CiReply::Log { text, finished } => Ok(log_text(&text, finished)),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Where a pipeline's time went; with a job, where its output's did.
+    async fn timing(&self, args: TimingArgs) -> Result<String, String> {
+        let TimingArgs {
+            repo,
+            number,
+            job,
+            top,
+        } = args;
+        let Some(job) = job else {
+            return Ok(timing_text(&self.view(&repo, number).await?));
+        };
+        let request = CiRequest::Timing {
+            repo: repo.clone(),
+            number,
+            job: job.clone(),
+            top: top.unwrap_or(DEFAULT_TOP).clamp(1, MAX_TIMING_LINES),
+        };
+        match self.client.ci(request).await? {
+            CiReply::Timing { timing } => Ok(job_timing_text(&repo, number, &job, &timing)),
             other => Err(unexpected(&other)),
         }
     }
@@ -415,6 +444,7 @@ impl Toolbox {
                     number: view.number,
                     job: job.name.clone(),
                     tail: REPORT_LINES,
+                    timestamps: false,
                 };
                 Some(self.client.ci(request).await)
             }
@@ -442,6 +472,7 @@ impl Tools for Toolbox {
             "ci_pipelines" => self.pipelines(arguments_of(arguments)?).await,
             "ci_pipeline" => self.pipeline(arguments_of(arguments)?).await,
             "ci_log" => self.log(arguments_of(arguments)?).await,
+            "ci_timing" => self.timing(arguments_of(arguments)?).await,
             "ci_rerun" => self.rerun(arguments_of(arguments)?).await,
             "ci_cancel" => self.cancel(arguments_of(arguments)?).await,
             "ci_wait" => self.ci_wait(arguments_of(arguments)?).await,
@@ -488,6 +519,16 @@ struct LogArgs {
     number: u64,
     job: String,
     tail: Option<u32>,
+    timestamps: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TimingArgs {
+    repo: String,
+    number: u64,
+    job: Option<String>,
+    top: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -677,14 +718,21 @@ fn pipeline_line(pipeline: &PipelineView) -> String {
     line
 }
 
-/// `ci_pipeline`: the header, then every job; a failed job adds why.
-fn pipeline_text(pipeline: &PipelineView) -> String {
-    let mut text = format!(
-        "{}/{} {}\n",
+/// `<repo>/<channel>` and the pipeline's line: how every text about one
+/// pipeline begins.
+fn pipeline_header(pipeline: &PipelineView) -> String {
+    format!(
+        "{}/{} {}",
         pipeline.repo,
         pipeline.channel,
         pipeline_line(pipeline)
-    );
+    )
+}
+
+/// `ci_pipeline`: the header, then every job; a failed job adds why.
+fn pipeline_text(pipeline: &PipelineView) -> String {
+    let mut text = pipeline_header(pipeline);
+    text.push('\n');
     if !pipeline.note.is_empty() {
         text.push_str(&format!("note: {}\n", one_line(&pipeline.note)));
     }
@@ -744,6 +792,118 @@ fn log_text(text: &str, finished: bool) -> String {
         out.push_str("(the job still runs; more output may follow)\n");
     }
     out
+}
+
+/// `ci_timing` without a job: when the pipeline was created and how long it
+/// took, then for every job when it was assigned, started and ended (seconds
+/// after the pipeline's creation), how long it staged (assigned to started)
+/// and ran, and under it the inputs that moved to its runner.
+fn timing_text(pipeline: &PipelineView) -> String {
+    let created = pipeline.created;
+    let day = created % 86_400;
+    let mut text = pipeline_header(pipeline);
+    text.push_str(&format!(
+        "\ncreated {:02}:{:02}:{:02} UTC, ",
+        day / 3600,
+        day % 3600 / 60,
+        day % 60
+    ));
+    match pipeline.finished {
+        Some(finished) => {
+            text.push_str(&format!("took {} s\n", finished.saturating_sub(created)));
+        }
+        None => text.push_str("running\n"),
+    }
+    let offset = |at: Option<u64>| {
+        at.map_or_else(
+            || "-".to_owned(),
+            |at| format!("+{} s", at.saturating_sub(created)),
+        )
+    };
+    let between = |from: Option<u64>, to: Option<u64>| match (from, to) {
+        (Some(from), Some(to)) => format!("{} s", to.saturating_sub(from)),
+        _ => "-".to_owned(),
+    };
+    for job in &pipeline.jobs {
+        text.push_str(&format!(
+            "  {:<20} {:<9} assigned {} started {} ended {} staging {} ran {}\n",
+            job.name,
+            job.status,
+            offset(job.assigned),
+            offset(job.started),
+            offset(job.finished),
+            between(job.assigned, job.started),
+            between(job.started, job.finished),
+        ));
+        for transfer in &job.transfers {
+            text.push_str(&transfer_line(transfer, job.assigned));
+            text.push('\n');
+        }
+    }
+    text
+}
+
+/// `    input <need>: <size> MB in <s> s`, with `(fetched early)` when the
+/// set was there before the job was assigned; `failed: <error>` or
+/// `receiving` in place of both when it did not arrive or has not yet.
+fn transfer_line(transfer: &TransferView, assigned: Option<u64>) -> String {
+    let what = match (&transfer.error, transfer.finished) {
+        (Some(error), _) => format!("failed: {}", one_line(error)),
+        (None, None) => "receiving".to_owned(),
+        (None, Some(finished)) => {
+            let size = transfer.bytes.map_or_else(
+                || "-".to_owned(),
+                |bytes| format!("{:.1} MB", bytes as f64 / 1e6),
+            );
+            let early = if assigned.is_some_and(|assigned| finished <= assigned) {
+                " (fetched early)"
+            } else {
+                ""
+            };
+            format!(
+                "{size} in {} s{early}",
+                finished.saturating_sub(transfer.started)
+            )
+        }
+    };
+    format!("    input {}: {what}", transfer.need)
+}
+
+/// `ci_timing` with a job: how much output it has and how long it spans,
+/// then the lines that the longest pauses follow, each with when it began
+/// (seconds after the job's first output) and how long it stood.
+fn job_timing_text(repo: &str, number: u64, job: &str, timing: &JobTiming) -> String {
+    let seconds = |ms: u64| ms as f64 / 1000.0;
+    let mut text = format!(
+        "{repo} #{number} {job}: {} lines over {:.1} s of output",
+        timing.lines,
+        seconds(timing.span_ms)
+    );
+    if !timing.finished {
+        text.push_str(", still running");
+    }
+    text.push('\n');
+    if timing.truncated {
+        text.push_str(&format!(
+            "(only the last {} MiB of output were read)\n",
+            TIMING_READ_BYTES >> 20
+        ));
+    }
+    if !timing.slowest.is_empty() {
+        text.push_str(&format!(
+            "the {} lines followed by the longest pauses, in output order:\n",
+            timing.slowest.len()
+        ));
+        for line in &timing.slowest {
+            text.push_str(&format!(
+                "  +{:.1} s  {:.1} s  {}\n",
+                seconds(line.at_ms),
+                seconds(line.took_ms),
+                line.text
+            ));
+        }
+    }
+    text
 }
 
 /// The job a try run is about: the one named `try`, else the first.
@@ -937,8 +1097,39 @@ fn definitions() -> Vec<Value> {
                     "default": DEFAULT_TAIL,
                     "description": "How many lines from the end.",
                 },
+                "timestamps": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Prefix every line with the seconds since the job's first \
+                                    output.",
+                },
             }),
             &["repo", "number", "job"],
+            true,
+        ),
+        tool(
+            "ci_timing",
+            "Where a pipeline's time went. Without job: each job's assignment, start and end \
+             relative to the pipeline's creation, its staging time and the inputs it received. \
+             With job: the lines of that job's output that the longest pauses follow, with \
+             when each began and how long it stood.",
+            json!({
+                "repo": repo,
+                "number": number,
+                "job": {
+                    "type": "string",
+                    "description": "Job name as ci_pipeline lists it: tell where the time of \
+                                    its output went instead of the pipeline's.",
+                },
+                "top": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_TIMING_LINES,
+                    "default": DEFAULT_TOP,
+                    "description": "With job: how many lines to name.",
+                },
+            }),
+            &["repo", "number"],
             true,
         ),
         tool(
@@ -1079,7 +1270,9 @@ mod tests {
     use zeughaus_link::enlist::UploadDir;
     use zeughaus_link::enlist::{read_frame, write_frame};
     use zeughaus_link::tryrun::TryUpload;
-    use zeughaus_link::{CI_PATH, ChannelView, MachineJob, MachineView, QueuedView, TRY_PATH};
+    use zeughaus_link::{
+        CI_PATH, ChannelView, MachineJob, MachineView, QueuedView, TRY_PATH, TimedLine,
+    };
 
     use super::*;
     use crate::transport::Transport;
@@ -1120,7 +1313,7 @@ mod tests {
     }
 
     #[test]
-    fn there_are_nine_tools_and_each_takes_an_object() {
+    fn there_are_ten_tools_and_each_takes_an_object() {
         let definitions = definitions();
         let names: Vec<&str> = definitions
             .iter()
@@ -1133,6 +1326,7 @@ mod tests {
                 "ci_pipelines",
                 "ci_pipeline",
                 "ci_log",
+                "ci_timing",
                 "ci_wait",
                 "ci_rerun",
                 "ci_cancel",
@@ -1153,11 +1347,25 @@ mod tests {
                 assert!(tool["inputSchema"]["properties"][key].is_object(), "{tool}");
             }
         }
-        let run = &definitions[7]["inputSchema"];
+        fn schema<'a>(definitions: &'a [Value], name: &str) -> &'a Value {
+            &definitions
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("no tool {name}"))["inputSchema"]
+        }
+        let run = schema(&definitions, "try_run");
         assert_eq!(run["required"], json!(["target", "command"]));
         assert_eq!(run["properties"]["wait_seconds"]["default"], 540);
         assert_eq!(run["properties"]["wait_seconds"]["maximum"], 600);
         assert_eq!(run["properties"]["timeout_minutes"]["default"], 60);
+        let log = schema(&definitions, "ci_log");
+        assert_eq!(log["required"], json!(["repo", "number", "job"]));
+        assert_eq!(log["properties"]["timestamps"]["type"], "boolean");
+        assert_eq!(log["properties"]["timestamps"]["default"], false);
+        let timing = schema(&definitions, "ci_timing");
+        assert_eq!(timing["required"], json!(["repo", "number"]));
+        assert_eq!(timing["properties"]["top"]["default"], 15);
+        assert_eq!(timing["properties"]["top"]["maximum"], 100);
     }
 
     #[test]
@@ -1365,6 +1573,138 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_pipelines_time_is_told_per_job_with_what_moved_into_it() {
+        let timed = |name: &str, status: &str, times: [Option<u64>; 3]| {
+            let mut job = job(name, status, "tuco-pc", "");
+            [job.assigned, job.started, job.finished] = times;
+            job
+        };
+        let transfer = |need: &str, started, finished, bytes, error: Option<&str>| TransferView {
+            need: need.to_owned(),
+            started,
+            finished,
+            bytes,
+            error: error.map(str::to_owned),
+        };
+        let a = timed("a", "succeeded", [Some(45_000), Some(45_002), Some(45_010)]);
+        let b = timed("b", "succeeded", [Some(45_000), Some(45_001), Some(45_030)]);
+        // `a` reached the runner of `c` while `b` still ran, before `c` was
+        // assigned.
+        let mut c = timed("c", "succeeded", [Some(45_030), Some(45_031), Some(45_040)]);
+        c.transfers = vec![transfer("a", 45_010, Some(45_016), Some(300_000_000), None)];
+        // `d` fetched what `c` made after it was assigned, or in the very
+        // second it was; one input broke and another is still on its way.
+        let mut d = timed("d", "failed", [Some(45_040), Some(45_046), Some(45_058)]);
+        d.transfers = vec![
+            transfer("c", 45_041, Some(45_045), Some(1_500_000), None),
+            transfer(
+                "x",
+                45_041,
+                Some(45_042),
+                None,
+                Some("the upload ended\nbefore the end of the set"),
+            ),
+            transfer("y", 45_042, None, None, None),
+            transfer("z", 45_039, Some(45_040), Some(0), None),
+        ];
+        let e = timed("e", "skipped", [None; 3]);
+        let mut view = pipeline("failed", Some(45_060), vec![a, b, c, d, e]);
+        view.created = 45_000;
+        view.channel = "dev".to_owned();
+        view.event = "push".to_owned();
+        view.git_ref = "main".to_owned();
+        assert_eq!(
+            timing_text(&view),
+            concat!(
+                "demo/dev #7 failed push main 0123456 cargo test (hannes@tuco-pc)\n",
+                "created 12:30:00 UTC, took 60 s\n",
+                "  a                    succeeded assigned +0 s started +2 s ended +10 s staging 2 s ran 8 s\n",
+                "  b                    succeeded assigned +0 s started +1 s ended +30 s staging 1 s ran 29 s\n",
+                "  c                    succeeded assigned +30 s started +31 s ended +40 s staging 1 s ran 9 s\n",
+                "    input a: 300.0 MB in 6 s (fetched early)\n",
+                "  d                    failed    assigned +40 s started +46 s ended +58 s staging 6 s ran 12 s\n",
+                "    input c: 1.5 MB in 4 s\n",
+                "    input x: failed: the upload ended before the end of the set\n",
+                "    input y: receiving\n",
+                "    input z: 0.0 MB in 1 s (fetched early)\n",
+                "  e                    skipped   assigned - started - ended - staging - ran -\n",
+            )
+        );
+
+        // A pipeline that has not finished has no duration yet.
+        let mut going = pipeline(
+            "running",
+            None,
+            vec![
+                timed("a", "running", [Some(45_000), Some(45_002), None]),
+                timed("b", "pending", [None; 3]),
+            ],
+        );
+        going.created = 45_000;
+        assert_eq!(
+            timing_text(&going),
+            concat!(
+                "demo/try #7 running try try 0123456 cargo test (hannes@tuco-pc)\n",
+                "created 12:30:00 UTC, running\n",
+                "  a                    running   assigned +0 s started +2 s ended - staging 2 s ran -\n",
+                "  b                    pending   assigned - started - ended - staging - ran -\n",
+            )
+        );
+    }
+
+    #[test]
+    fn the_lines_a_jobs_longest_pauses_follow_come_with_when_and_how_long() {
+        let line = |at_ms, took_ms, text: &str| TimedLine {
+            at_ms,
+            took_ms,
+            text: text.to_owned(),
+        };
+        let mut timing = JobTiming {
+            lines: 4,
+            span_ms: 40_000,
+            slowest: vec![
+                line(200, 30_000, "compiling a"),
+                line(31_000, 9_040, "link"),
+            ],
+            finished: false,
+            truncated: false,
+        };
+        assert_eq!(
+            job_timing_text("demo", 7, "build", &timing),
+            "demo #7 build: 4 lines over 40.0 s of output, still running\n\
+             the 2 lines followed by the longest pauses, in output order:\n\
+             \x20 +0.2 s  30.0 s  compiling a\n\
+             \x20 +31.0 s  9.0 s  link\n"
+        );
+
+        // A job that ended, of whose output only the end was read.
+        timing.finished = true;
+        timing.truncated = true;
+        let text = job_timing_text("demo", 7, "build", &timing);
+        assert!(
+            text.starts_with(
+                "demo #7 build: 4 lines over 40.0 s of output\n\
+                 (only the last 64 MiB of output were read)\n\
+                 the 2 lines followed"
+            ),
+            "{text}"
+        );
+
+        // Output that has not begun has no lines to name.
+        let nothing = JobTiming {
+            lines: 0,
+            span_ms: 0,
+            slowest: Vec::new(),
+            finished: true,
+            truncated: false,
+        };
+        assert_eq!(
+            job_timing_text("demo", 7, "build", &nothing),
+            "demo #7 build: 0 lines over 0.0 s of output\n"
+        );
+    }
+
     fn toolbox_without_a_ci() -> Toolbox {
         Toolbox::new(Arc::new(Client::new(Err(
             "no CI configured: add ci = [..] to /x/zeughaus.toml".to_owned(),
@@ -1379,6 +1719,15 @@ mod tests {
             ("ci_pipelines", json!({ "repo": "r", "channel": "c" })),
             ("ci_pipeline", json!({ "repo": "r", "number": 1 })),
             ("ci_log", json!({ "repo": "r", "number": 1, "job": "j" })),
+            (
+                "ci_log",
+                json!({ "repo": "r", "number": 1, "job": "j", "timestamps": true }),
+            ),
+            ("ci_timing", json!({ "repo": "r", "number": 1 })),
+            (
+                "ci_timing",
+                json!({ "repo": "r", "number": 1, "job": "j", "top": 3 }),
+            ),
             ("ci_rerun", json!({ "repo": "r", "number": 1 })),
             ("ci_cancel", json!({ "repo": "r", "number": 1 })),
             ("ci_wait", json!({ "repo": "r", "number": 1 })),
@@ -1560,9 +1909,33 @@ mod tests {
                     message: "the scheduler is restarting".to_owned(),
                 },
                 CiRequest::Pipeline { .. } => CiReply::Pipeline { pipeline: None },
-                CiRequest::Log { job, tail, .. } => CiReply::Log {
-                    text: format!("job {job}, {tail} lines\ntest result: ok. 1 passed\n"),
+                CiRequest::Log {
+                    job,
+                    tail,
+                    timestamps,
+                    ..
+                } => CiReply::Log {
+                    text: format!(
+                        "{}job {job}, {tail} lines\ntest result: ok. 1 passed\n",
+                        if timestamps { "[+     0.0s] " } else { "" }
+                    ),
                     finished: true,
+                },
+                CiRequest::Timing { job, .. } if job == "nothing" => CiReply::Error {
+                    message: "no output for nothing of #1".to_owned(),
+                },
+                CiRequest::Timing { job, top, .. } => CiReply::Timing {
+                    timing: JobTiming {
+                        lines: 3,
+                        span_ms: 31_200,
+                        slowest: vec![TimedLine {
+                            at_ms: 0,
+                            took_ms: 30_000,
+                            text: format!("{job}: asked for {top}"),
+                        }],
+                        finished: false,
+                        truncated: true,
+                    },
                 },
                 _ => CiReply::Error {
                     message: "not served by the fake".to_owned(),
@@ -1891,6 +2264,110 @@ mod tests {
                 .expect_err(sha);
             assert!(err.contains("is not 4 to 40 hex digits"), "{sha}: {err}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ci_timing_tells_the_pipeline_or_asks_the_ci_for_the_pauses_of_a_job() {
+        let ci = fake_ci("timing", 0, None).await;
+        let tools = toolbox_for(&ci);
+
+        // Without a job it is the pipeline's own record, one look at it.
+        let text = tools
+            .call("ci_timing", json!({ "repo": "demo", "number": 1 }))
+            .await
+            .expect("the pipeline");
+        assert!(
+            text.starts_with(
+                "demo/try #1 succeeded try try 0123456 cargo test (hannes@tuco-pc)\n\
+                 created 00:16:40 UTC, took 7 s\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("started +0 s ended +12 s staging - ran 12 s\n"),
+            "{text}"
+        );
+        assert_eq!(ci.seen.asked.lock().unwrap().len(), 1);
+
+        // With one the CI is asked, for 15 lines unless told otherwise and
+        // for no more than it gives.
+        let timing = |extra: Value| {
+            let mut arguments = json!({ "repo": "demo", "number": 1, "job": "try" });
+            arguments
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            tools.call("ci_timing", arguments)
+        };
+        let text = timing(json!({})).await.expect("the job's pauses");
+        assert_eq!(
+            text,
+            "demo #1 try: 3 lines over 31.2 s of output, still running\n\
+             (only the last 64 MiB of output were read)\n\
+             the 1 lines followed by the longest pauses, in output order:\n\
+             \x20 +0.0 s  30.0 s  try: asked for 15\n"
+        );
+        assert_eq!(
+            ci.seen.asked.lock().unwrap().last(),
+            Some(&CiRequest::Timing {
+                repo: "demo".to_owned(),
+                number: 1,
+                job: "try".to_owned(),
+                top: 15,
+            })
+        );
+        let text = timing(json!({ "top": 1000 })).await.expect("clamped");
+        assert!(text.contains("try: asked for 100\n"), "{text}");
+        let text = timing(json!({ "top": 0 })).await.expect("clamped");
+        assert!(text.contains("try: asked for 1\n"), "{text}");
+
+        // The CI's refusal is the tool's error.
+        let err = tools
+            .call(
+                "ci_timing",
+                json!({ "repo": "demo", "number": 1, "job": "nothing" }),
+            )
+            .await
+            .expect_err("no output");
+        assert_eq!(err, "no output for nothing of #1");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ci_log_asks_for_timestamps_only_when_told_to() {
+        let ci = fake_ci("stamps", 0, None).await;
+        let tools = toolbox_for(&ci);
+        let log = |extra: Value| {
+            let mut arguments = json!({ "repo": "demo", "number": 1, "job": "try" });
+            arguments
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            tools.call("ci_log", arguments)
+        };
+
+        let plain = log(json!({})).await.expect("log");
+        assert_eq!(plain, "job try, 200 lines\ntest result: ok. 1 passed\n");
+        assert!(matches!(
+            ci.seen.asked.lock().unwrap().last(),
+            Some(CiRequest::Log {
+                timestamps: false,
+                tail: 200,
+                ..
+            })
+        ));
+
+        let stamped = log(json!({ "timestamps": true })).await.expect("log");
+        assert_eq!(
+            stamped,
+            "[+     0.0s] job try, 200 lines\ntest result: ok. 1 passed\n"
+        );
+        assert!(matches!(
+            ci.seen.asked.lock().unwrap().last(),
+            Some(CiRequest::Log {
+                timestamps: true,
+                ..
+            })
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

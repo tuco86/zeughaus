@@ -2,7 +2,7 @@
 //!
 //! The timestamps sit on the byte stream, not on lines: a chunk is whatever
 //! one PTY read returned, so a line's time is derived later from the chunk
-//! it ends in.
+//! that holds its first byte.
 //!
 //! File format: the 8-byte [`MAGIC`], then records of `u64 LE at_micros`
 //! (microseconds since the UNIX epoch), `u32 LE len` and `len` bytes. A
@@ -176,47 +176,115 @@ pub fn read_bytes(path: &Path) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// The last `max` bytes of [`read_bytes`], reading only the records that
-/// hold them: the others are skipped by seeking.
-pub fn tail_bytes(path: &Path, max: usize) -> io::Result<Vec<u8>> {
+/// Opens the WAL at `path` for reading, positioned after the magic, with the
+/// file's size.
+fn open_for_reading(path: &Path) -> io::Result<(File, u64)> {
     let mut file = File::open(path)?;
     let size = file.metadata()?.len();
     let mut magic = [0u8; 8];
     if file.read_exact(&mut magic).is_err() || &magic != MAGIC {
         return Err(not_a_wal(path));
     }
-    // (offset of the payload, its length) of every complete record.
-    let mut bodies: Vec<(u64, u32)> = Vec::new();
+    Ok((file, size))
+}
+
+/// Where the payload of one complete record sits in its file.
+struct Slot {
+    at_micros: u64,
+    /// Offset of the payload.
+    body: u64,
+    len: u32,
+}
+
+/// The newest complete records of the WAL at `path` that hold at least `max`
+/// payload bytes, oldest first, found by walking the headers: every payload
+/// is seeked over. Also the file, positioned anywhere, and whether older
+/// records were left out.
+fn tail_slots(path: &Path, max: usize) -> io::Result<(File, Vec<Slot>, bool)> {
+    let (mut file, size) = open_for_reading(path)?;
+    let mut slots: Vec<Slot> = Vec::new();
     let mut at = MAGIC.len() as u64;
     let mut header = [0u8; HEADER];
     while at + HEADER as u64 <= size {
         file.read_exact(&mut header)?;
+        let at_micros = u64::from_le_bytes(header[..8].try_into().expect("8 bytes"));
         let len = u32::from_le_bytes(header[8..].try_into().expect("4 bytes"));
         let body = at + HEADER as u64;
         if body + u64::from(len) > size {
             break;
         }
-        bodies.push((body, len));
+        slots.push(Slot {
+            at_micros,
+            body,
+            len,
+        });
         at = body + u64::from(len);
         file.seek(SeekFrom::Start(at))?;
     }
-    let mut first = bodies.len();
+    let mut first = slots.len();
     let mut held = 0usize;
     while first > 0 && held < max {
         first -= 1;
-        held += bodies[first].1 as usize;
+        held += slots[first].len as usize;
     }
+    slots.drain(..first);
+    Ok((file, slots, first > 0))
+}
+
+/// The last `max` bytes of [`read_bytes`], reading only the records that
+/// hold them: the others are skipped by seeking.
+pub fn tail_bytes(path: &Path, max: usize) -> io::Result<Vec<u8>> {
+    let (mut file, slots, _) = tail_slots(path, max)?;
+    let held: usize = slots.iter().map(|slot| slot.len as usize).sum();
     let mut out = Vec::with_capacity(held);
-    for &(body, len) in &bodies[first..] {
-        file.seek(SeekFrom::Start(body))?;
+    for slot in &slots {
+        file.seek(SeekFrom::Start(slot.body))?;
         let mark = out.len();
-        out.resize(mark + len as usize, 0);
+        out.resize(mark + slot.len as usize, 0);
         file.read_exact(&mut out[mark..])?;
     }
     if out.len() > max {
         out.drain(..out.len() - max);
     }
     Ok(out)
+}
+
+/// The complete records that hold the last `max` payload bytes of the WAL at
+/// `path`, oldest first, whole even where that is more than `max` bytes, and
+/// whether earlier records were left out. Of those only the headers are
+/// read, to find where the tail begins.
+pub fn tail_records(path: &Path, max: usize) -> io::Result<(Vec<Record>, bool)> {
+    let (mut file, slots, skipped) = tail_slots(path, max)?;
+    let mut records = Vec::with_capacity(slots.len());
+    for slot in slots {
+        file.seek(SeekFrom::Start(slot.body))?;
+        let mut bytes = vec![0u8; slot.len as usize];
+        file.read_exact(&mut bytes)?;
+        records.push(Record {
+            at_micros: slot.at_micros,
+            bytes,
+        });
+    }
+    Ok((records, skipped))
+}
+
+/// The time of the first record of the WAL at `path`, read from the start of
+/// the file alone; `None` while there is no complete record.
+pub fn first_at(path: &Path) -> io::Result<Option<u64>> {
+    let (mut file, size) = open_for_reading(path)?;
+    let mut header = [0u8; HEADER];
+    match file.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let len = u32::from_le_bytes(header[8..].try_into().expect("4 bytes"));
+    if (MAGIC.len() + HEADER) as u64 + u64::from(len) > size {
+        return Ok(None);
+    }
+    Ok(Some(u64::from_le_bytes(
+        header[..8].try_into().expect("8 bytes"),
+    )))
 }
 
 /// Reads the records appended to a WAL since the last call.
@@ -333,6 +401,8 @@ mod tests {
         assert_eq!(message, format!("not a WAL: {}", path.display()));
         assert!(WalWriter::open(&path, None).is_err());
         assert!(tail_bytes(&path, 4).is_err());
+        assert!(tail_records(&path, 4).is_err());
+        assert!(first_at(&path).is_err());
     }
 
     #[test]
@@ -352,6 +422,10 @@ mod tests {
             assert_eq!(records[0].bytes, b"abc");
             assert_eq!(read_bytes(&path).expect("bytes"), b"abc");
             assert_eq!(tail_bytes(&path, 10).expect("tail"), b"abc");
+            assert_eq!(
+                tail_records(&path, 10).expect("tail records"),
+                (records, false)
+            );
         }
     }
 
@@ -367,6 +441,69 @@ mod tests {
         assert_eq!(tail_bytes(&path, 6).expect("tail"), b"cdefgh");
         assert_eq!(tail_bytes(&path, 100).expect("tail"), b"abcdefgh");
         assert_eq!(tail_bytes(&path, 0).expect("tail"), b"");
+    }
+
+    #[test]
+    fn the_tail_records_are_whole_and_say_whether_earlier_ones_were_left_out() {
+        let dir = Dir::new("tail-records");
+        let path = dir.path("wal");
+        let mut writer = WalWriter::open(&path, None).expect("open");
+        // Nothing was written, so nothing was left out.
+        assert_eq!(tail_records(&path, 10).expect("empty"), (Vec::new(), false));
+        writer.append(1, b"abc").expect("append");
+        writer.append(2, b"defgh").expect("append");
+        writer.append(3, b"ij").expect("append");
+        drop(writer);
+        let record = |at_micros, bytes: &[u8]| Record {
+            at_micros,
+            bytes: bytes.to_vec(),
+        };
+        let (abc, defgh, ij) = (record(1, b"abc"), record(2, b"defgh"), record(3, b"ij"));
+        let tail = |max| tail_records(&path, max).expect("tail records");
+
+        // The newest record that holds the bytes asked for; one byte more
+        // than it has takes the next one along whole, not cut.
+        assert_eq!(tail(2), (vec![ij.clone()], true));
+        assert_eq!(tail(3), (vec![defgh.clone(), ij.clone()], true));
+        assert_eq!(tail(7), (vec![defgh.clone(), ij.clone()], true));
+        assert_eq!(
+            tail(8),
+            (vec![abc.clone(), defgh.clone(), ij.clone()], false)
+        );
+        assert_eq!(tail(100), (vec![abc, defgh, ij], false));
+        assert_eq!(tail(0), (Vec::new(), true));
+
+        // The bytes of the tail are the last bytes of the stream, at every size.
+        let stream = read_bytes(&path).expect("bytes");
+        for max in 0..=stream.len() + 2 {
+            let from = stream.len().saturating_sub(max);
+            assert_eq!(
+                tail_bytes(&path, max).expect("tail"),
+                &stream[from..],
+                "max {max}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_time_is_read_from_the_first_record_alone() {
+        let dir = Dir::new("first");
+        let path = dir.path("wal");
+        assert!(first_at(&path).is_err(), "no file");
+        let mut writer = WalWriter::open(&path, None).expect("open");
+        assert_eq!(first_at(&path).expect("empty"), None);
+        writer.append(40, b"abc").expect("append");
+        writer.append(90, b"d").expect("append");
+        drop(writer);
+        assert_eq!(first_at(&path).expect("first"), Some(40));
+
+        // A first record that is not whole has no time to give yet: cut
+        // inside its header, then inside its payload.
+        let full = std::fs::read(&path).expect("read raw");
+        for cut in [8 + 4, 8 + 12 + 2] {
+            std::fs::write(&path, &full[..cut]).expect("truncate");
+            assert_eq!(first_at(&path).expect("torn"), None, "cut at {cut}");
+        }
     }
 
     #[test]

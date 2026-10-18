@@ -8,17 +8,19 @@
 //! transcript is a read-only screen in [`Transcripts`], served on `/mux`.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use weida::{Replier, TransferMeta};
-use zeughaus_link::ci::MAX_PIPELINES_PER_REQUEST;
+use zeughaus_link::ci::{MAX_PIPELINES_PER_REQUEST, MAX_TIMING_LINES, TIMING_READ_BYTES};
 use zeughaus_link::enlist::Place;
 use zeughaus_link::{
-    BusyMode, ChannelView, CiOverview, CiReply, CiRequest, JobView, MAX_CI_REPLY_BYTES,
-    MAX_CI_REQUEST_BYTES, MachineJob, MachineView, PipelineView, QueuedView, TransferView,
+    BusyMode, ChannelView, CiOverview, CiReply, CiRequest, JobTiming, JobView, MAX_CI_REPLY_BYTES,
+    MAX_CI_REQUEST_BYTES, MachineJob, MachineView, PipelineView, QueuedView, TimedLine,
+    TransferView,
 };
 use zeughaus_mux::TerminalId;
+use zeughaus_terminal::wal;
 
 use crate::config::{CiConfig, valid_name};
 use crate::event::{self, EventKind};
@@ -43,6 +45,9 @@ const FIND_RECORDS: usize = 500;
 
 /// How much of a transcript's end a `Log` reply is made from.
 const LOG_READ_BYTES: usize = 8 << 20;
+
+/// The longest line of output a `Timing` reply carries, in characters.
+const TIMING_TEXT_CHARS: usize = 200;
 
 pub struct CiServer {
     state_dir: PathBuf,
@@ -101,7 +106,14 @@ impl CiServer {
                 number,
                 job,
                 tail,
-            } => self.log(&repo, number, &job, tail),
+                timestamps,
+            } => self.log(&repo, number, &job, tail, timestamps),
+            CiRequest::Timing {
+                repo,
+                number,
+                job,
+                top,
+            } => self.timing(&repo, number, &job, top),
         }
     }
 
@@ -290,7 +302,8 @@ impl CiServer {
     /// The end of a job's stored output as plain text: at most `tail` lines,
     /// and never more than a reply may carry. The transcript is read from
     /// its end, so a job that wrote for hours costs what its last lines do.
-    fn log(&self, repo: &str, number: u64, job: &str, tail: u32) -> CiReply {
+    /// With `timestamps` every line starts with when it began.
+    fn log(&self, repo: &str, number: u64, job: &str, tail: u32, timestamps: bool) -> CiReply {
         if !valid_name(repo) || !valid_name(job) {
             return error("no such job");
         }
@@ -298,13 +311,47 @@ impl CiServer {
         if !dir.join("wal").exists() {
             return error(&format!("no output for {job} of #{number}"));
         }
-        match excerpt::read_log_tail(&dir, LOG_READ_BYTES) {
+        let lines = tail.min(MAX_LOG_LINES) as usize;
+        let text = if timestamps {
+            timestamped_tail(&dir, LOG_READ_BYTES, lines)
+        } else {
+            excerpt::read_log_tail(&dir, LOG_READ_BYTES)
+        };
+        match text {
             Ok(text) => CiReply::Log {
-                text: last_lines(&text, tail.min(MAX_LOG_LINES) as usize, MAX_LOG_TEXT_BYTES)
-                    .to_owned(),
+                text: last_lines(&text, lines, MAX_LOG_TEXT_BYTES).to_owned(),
                 finished: dir.join("exit").exists(),
             },
             Err(e) => error(&e),
+        }
+    }
+
+    /// Where a job's time went, from the times its output arrived on the
+    /// runner: the lines that the longest pauses follow.
+    fn timing(&self, repo: &str, number: u64, job: &str, top: u32) -> CiReply {
+        if !valid_name(repo) || !valid_name(job) {
+            return error("no such job");
+        }
+        let Some(record) = self
+            .record(repo, number)
+            .and_then(|pipeline| pipeline.jobs.into_iter().find(|j| j.def.name == job))
+        else {
+            return error("no such job");
+        };
+        let dir = transcript_dir(&self.state_dir, repo, number, job);
+        if !dir.join("wal").exists() {
+            return error(&format!("no output for {job} of #{number}"));
+        }
+        let tail = match timed_tail(&dir, TIMING_READ_BYTES) {
+            Ok(tail) => tail,
+            Err(e) => return error(&e),
+        };
+        // The record knows when the job ended; one that still runs ends now.
+        let end = record
+            .finished
+            .map_or_else(wal::now_micros, |secs| secs.saturating_mul(1_000_000));
+        CiReply::Timing {
+            timing: job_timing(&tail, end, dir.join("exit").exists(), top),
         }
     }
 }
@@ -340,6 +387,91 @@ fn last_lines(text: &str, lines: usize, max: usize) -> &str {
     match kept[cut..].find('\n') {
         Some(newline) => &kept[cut + newline + 1..],
         None => &kept[cut..],
+    }
+}
+
+/// The lines of a transcript's last bytes, with the times they began.
+struct TimedTail {
+    /// Microseconds since the UNIX epoch and the text of each line that has
+    /// text, oldest first.
+    lines: Vec<(u64, String)>,
+    /// When the transcript's first output arrived; `None` while it has none.
+    origin: Option<u64>,
+    /// The output before these lines was not read.
+    truncated: bool,
+}
+
+/// The lines of the transcript in `dir` that its last `max` bytes hold. A
+/// window that opens inside the output starts with the rest of a line whose
+/// beginning was left out, which is dropped.
+fn timed_tail(dir: &Path, max: usize) -> Result<TimedTail, String> {
+    let path = dir.join("wal");
+    let unreadable =
+        |e: std::io::Error| format!("cannot read the output of {}: {e}", dir.display());
+    let (records, truncated) = wal::tail_records(&path, max).map_err(unreadable)?;
+    let origin = wal::first_at(&path).map_err(unreadable)?;
+    let mut lines = excerpt::timed_lines(&records);
+    if truncated && !lines.is_empty() {
+        lines.remove(0);
+    }
+    Ok(TimedTail {
+        lines,
+        origin,
+        truncated,
+    })
+}
+
+/// The last `keep` lines of the transcript in `dir` that its last `max`
+/// bytes hold, each as `[+<seconds since the job's first output>s] <text>`.
+fn timestamped_tail(dir: &Path, max: usize, keep: usize) -> Result<String, String> {
+    let tail = timed_tail(dir, max)?;
+    let origin = tail.origin.unwrap_or(0);
+    let from = tail.lines.len().saturating_sub(keep);
+    let mut text = String::new();
+    for (at, line) in &tail.lines[from..] {
+        let seconds = at.saturating_sub(origin) as f64 / 1e6;
+        text.push_str(&format!("[+{seconds:>8.1}s] {line}\n"));
+    }
+    Ok(text)
+}
+
+/// A job's lines as how long each stood: the `top` lines (clamped to
+/// `1..=`[`MAX_TIMING_LINES`]) that the longest pauses follow, in output
+/// order. A line stands until the next one begins and the last one until
+/// `end`, in microseconds since the UNIX epoch; the end comes from the
+/// CI's clock and the lines from the runner's, so it is never taken as
+/// earlier than the last line.
+fn job_timing(tail: &TimedTail, end: u64, finished: bool, top: u32) -> JobTiming {
+    let lines = &tail.lines;
+    let end = lines.last().map_or(end, |&(at, _)| end.max(at));
+    let took: Vec<u64> = lines
+        .iter()
+        .zip(lines.iter().skip(1).map(|&(at, _)| at).chain([end]))
+        .map(|(&(at, _), next)| next.saturating_sub(at))
+        .collect();
+    let keep = (top.clamp(1, MAX_TIMING_LINES) as usize).min(lines.len());
+    let mut order: Vec<usize> = (0..lines.len()).collect();
+    if keep < order.len() {
+        // The earlier line wins a tie, so the pick does not depend on how
+        // the selection happens to arrange equals.
+        order.select_nth_unstable_by_key(keep, |&i| (std::cmp::Reverse(took[i]), i));
+        order.truncate(keep);
+    }
+    order.sort_unstable();
+    let origin = tail.origin;
+    JobTiming {
+        lines: lines.len() as u64,
+        span_ms: origin.map_or(0, |from| end.saturating_sub(from) / 1000),
+        slowest: order
+            .into_iter()
+            .map(|i| TimedLine {
+                at_ms: lines[i].0.saturating_sub(origin.unwrap_or(0)) / 1000,
+                took_ms: took[i] / 1000,
+                text: lines[i].1.chars().take(TIMING_TEXT_CHARS).collect(),
+            })
+            .collect(),
+        finished,
+        truncated: tail.truncated,
     }
 }
 
@@ -1212,6 +1344,7 @@ mod tests {
                 number: 3,
                 job: job.to_owned(),
                 tail,
+                timestamps: false,
             })
         };
         let log = |tail| match ask("view", "build", tail) {
@@ -1237,6 +1370,264 @@ mod tests {
         // Names that are no job read nothing.
         assert_eq!(ask("../view", "build", 10), error("no such job"));
         assert_eq!(ask("view", "../build", 10), error("no such job"));
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_jobs_log_can_start_every_line_with_the_time_it_began() {
+        let state = scratch("log-times");
+        let dir = transcript_dir(&state, "view", 3, "build");
+        std::fs::create_dir_all(&dir).expect("create the transcript directory");
+        let server = server(&state);
+        let log = |tail| match server.answer(CiRequest::Log {
+            repo: "view".to_owned(),
+            number: 3,
+            job: "build".to_owned(),
+            tail,
+            timestamps: true,
+        }) {
+            CiReply::Log { text, finished } => (text, finished),
+            other => panic!("unexpected reply {other:?}"),
+        };
+        let mut writer = wal::WalWriter::open(&dir.join("wal"), None).expect("open the WAL");
+        // The first output is the origin. "slow" begins in the first chunk
+        // and ends in the second, a blank line has no text to stamp, and
+        // the last line has no line feed yet.
+        writer
+            .append(10_000_000, b"\x1b[32mone\x1b[0m\r\nsl")
+            .expect("append");
+        writer
+            .append(11_500_000, b"ow\r\n\r\ntwo\r\n")
+            .expect("append");
+        writer.append(75_800_000, b"three").expect("append");
+
+        assert_eq!(
+            log(100),
+            (
+                "[+     0.0s] one\n[+     0.0s] slow\n[+     1.5s] two\n[+    65.8s] three\n"
+                    .to_owned(),
+                false
+            )
+        );
+        assert_eq!(
+            log(2),
+            ("[+     1.5s] two\n[+    65.8s] three\n".to_owned(), false)
+        );
+        assert_eq!(log(0), (String::new(), false));
+        std::fs::write(dir.join("exit"), "code=0\n").expect("write the exit record");
+        assert_eq!(log(1), ("[+    65.8s] three\n".to_owned(), true));
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_jobs_timing_names_the_lines_the_longest_pauses_follow() {
+        let state = scratch("timing");
+        let mut build = job("build", JobStatus::Succeeded, Some("alpha"), None);
+        // The CI's record of the end: 140 s past the epoch.
+        build.finished = Some(140);
+        let idle = job("idle", JobStatus::Pending, None, None);
+        store(
+            &state,
+            &pipeline(
+                "view",
+                3,
+                "dev",
+                PipelineStatus::Succeeded,
+                vec![build.clone(), idle],
+            ),
+        );
+        let dir = transcript_dir(&state, "view", 3, "build");
+        std::fs::create_dir_all(&dir).expect("create the transcript directory");
+        let server = server(&state);
+        let ask = |repo: &str, number, job: &str, top| {
+            server.answer(CiRequest::Timing {
+                repo: repo.to_owned(),
+                number,
+                job: job.to_owned(),
+                top,
+            })
+        };
+        let timing = |top| match ask("view", 3, "build", top) {
+            CiReply::Timing { timing } => timing,
+            other => panic!("unexpected reply {other:?}"),
+        };
+
+        assert_eq!(
+            ask("view", 3, "build", 5),
+            error("no output for build of #3")
+        );
+        let mut writer = wal::WalWriter::open(&dir.join("wal"), None).expect("open the WAL");
+        writer.append(100_000_000, b"start\r\n").expect("append");
+        writer
+            .append(100_200_000, b"compiling a\r\n")
+            .expect("append");
+        writer
+            .append(130_200_000, b"compiling b\r\n")
+            .expect("append");
+        writer.append(131_000_000, b"link\r\n").expect("append");
+
+        // The pause after "compiling a" is 30 s and the one after "link"
+        // runs to the end of the job, 9 s; times are from the first output.
+        let two = timing(2);
+        assert_eq!((two.lines, two.span_ms), (4, 40_000));
+        assert_eq!(
+            two.slowest,
+            vec![
+                TimedLine {
+                    at_ms: 200,
+                    took_ms: 30_000,
+                    text: "compiling a".to_owned()
+                },
+                TimedLine {
+                    at_ms: 31_000,
+                    took_ms: 9_000,
+                    text: "link".to_owned()
+                },
+            ]
+        );
+        assert!(!two.finished && !two.truncated);
+        // The number of lines asked for is kept within what a reply allows.
+        assert_eq!(timing(0).slowest.len(), 1);
+        assert_eq!(timing(1000).slowest.len(), 4);
+        std::fs::write(dir.join("exit"), "code=0\n").expect("write the exit record");
+        assert!(timing(1).finished);
+
+        // A job the record has no end for is still running: its last line
+        // has stood until now.
+        let mut running = build;
+        running.finished = None;
+        store(
+            &state,
+            &pipeline("view", 3, "dev", PipelineStatus::Running, vec![running]),
+        );
+        let now = timing(1);
+        assert!(now.span_ms > 1_000_000_000, "{now:?}");
+
+        // No such pipeline, job or name; a job without output.
+        assert_eq!(ask("view", 9, "build", 5), error("no such job"));
+        assert_eq!(ask("view", 3, "nope", 5), error("no such job"));
+        assert_eq!(ask("view", 3, "../build", 5), error("no such job"));
+        assert_eq!(ask("../view", 3, "build", 5), error("no such job"));
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_job_without_output_in_its_record_has_nothing_to_time() {
+        let state = scratch("timing-idle");
+        store(
+            &state,
+            &pipeline(
+                "view",
+                3,
+                "dev",
+                PipelineStatus::Running,
+                vec![job("idle", JobStatus::Pending, None, None)],
+            ),
+        );
+        let server = server(&state);
+        assert_eq!(
+            server.answer(CiRequest::Timing {
+                repo: "view".to_owned(),
+                number: 3,
+                job: "idle".to_owned(),
+                top: 5,
+            }),
+            error("no output for idle of #3")
+        );
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_line_stands_until_the_next_and_the_last_until_the_end_of_the_job() {
+        let tail = |lines: &[(u64, &str)]| TimedTail {
+            lines: lines
+                .iter()
+                .map(|&(at, text)| (at, text.to_owned()))
+                .collect(),
+            origin: Some(1_000_000),
+            truncated: false,
+        };
+        let texts = |timing: &JobTiming| {
+            timing
+                .slowest
+                .iter()
+                .map(|line| line.text.clone())
+                .collect::<Vec<_>>()
+        };
+        let even = tail(&[(1_000_000, "a"), (2_000_000, "b"), (3_000_000, "c")]);
+
+        // Equal pauses go to the earlier line, whatever the selection does.
+        let timing = job_timing(&even, 4_000_000, true, 2);
+        assert_eq!(texts(&timing), ["a", "b"]);
+        assert_eq!(
+            (timing.lines, timing.span_ms, timing.finished),
+            (3, 3_000, true)
+        );
+        assert_eq!(
+            texts(&job_timing(&even, 4_000_000, true, 15)),
+            ["a", "b", "c"]
+        );
+
+        // An end before the last line (the CI's clock is not the runner's)
+        // leaves that line no time, not a negative one.
+        let early = job_timing(&even, 2_500_000, true, 15);
+        assert_eq!(
+            early.slowest.last().map(|line| (line.at_ms, line.took_ms)),
+            Some((2_000, 0))
+        );
+        assert_eq!(early.span_ms, 2_000);
+
+        // A long line is cut at a character, not in the middle of one.
+        let long = tail(&[(1_000_000, &"\u{e9}".repeat(300))]);
+        let timing = job_timing(&long, 2_000_000, false, 1);
+        assert_eq!(timing.slowest[0].text, "\u{e9}".repeat(TIMING_TEXT_CHARS));
+        assert!(!timing.finished);
+
+        // Output that has not begun has no span.
+        let nothing = TimedTail {
+            lines: Vec::new(),
+            origin: None,
+            truncated: true,
+        };
+        let timing = job_timing(&nothing, 9_000_000, false, 15);
+        assert_eq!((timing.lines, timing.span_ms), (0, 0));
+        assert!(timing.slowest.is_empty() && timing.truncated);
+    }
+
+    #[test]
+    fn a_window_that_opens_inside_a_line_drops_the_rest_of_it() {
+        let state = scratch("window");
+        let dir = transcript_dir(&state, "view", 3, "build");
+        std::fs::create_dir_all(&dir).expect("create the transcript directory");
+        let mut writer = wal::WalWriter::open(&dir.join("wal"), None).expect("open the WAL");
+        writer.append(1_000_000, b"alpha\nbe").expect("append");
+        writer.append(2_000_000, b"ta\ngamma\n").expect("append");
+        writer.append(3_000_000, b"delta\n").expect("append");
+        let line = |at, text: &str| (at, text.to_owned());
+
+        let all = timed_tail(&dir, 1 << 20).expect("the whole log");
+        assert!(!all.truncated);
+        assert_eq!(all.origin, Some(1_000_000));
+        assert_eq!(
+            all.lines,
+            [
+                line(1_000_000, "alpha"),
+                line(1_000_000, "beta"),
+                line(2_000_000, "gamma"),
+                line(3_000_000, "delta"),
+            ]
+        );
+
+        // Seven bytes need the second record whole, and its first line is
+        // the end of "beta", which began in the record left out. The origin
+        // is still the log's first output.
+        let tail = timed_tail(&dir, 7).expect("the last records");
+        assert!(tail.truncated);
+        assert_eq!(tail.origin, Some(1_000_000));
+        assert_eq!(
+            tail.lines,
+            [line(2_000_000, "gamma"), line(3_000_000, "delta")]
+        );
         let _ = std::fs::remove_dir_all(&state);
     }
 

@@ -144,8 +144,13 @@ that directory's `client.pem`, so it is the same principal as an editor
 there; without either it still starts and every tool answers with what is
 missing. `ci_status`, `ci_pipelines`, `ci_pipeline`, `ci_log`, `ci_rerun`
 and `ci_cancel` read and control the CI's channels, pipelines and job
-output; `ci_wait` waits until a pipeline (by number, or by the sha of the
-commit just pushed) or one job of it has settled. `try_run` snapshots the
+output (`ci_log` can start every line with the seconds since the job's
+first output); `ci_wait` waits until a pipeline (by number, or by the sha of
+the commit just pushed) or one job of it has settled; `ci_timing` says where
+a pipeline's time went (for each job when it was assigned, started and ended
+after the pipeline was created, its staging time and the inputs that moved
+to it) or, for one job, which lines of its output the longest pauses follow,
+from the time the terminal WAL keeps for every chunk. `try_run` snapshots the
 checkout of the current directory (its
 commit, the changes to it and the untracked files that are not ignored) and
 the sibling checkouts its Cargo path dependencies point to, uploads them to

@@ -21,6 +21,14 @@ pub const MAX_CI_REPLY_BYTES: usize = 4 << 20;
 /// The most pipelines one [`CiRequest::Pipelines`] returns.
 pub const MAX_PIPELINES_PER_REQUEST: u32 = 50;
 
+/// The most lines one [`CiRequest::Timing`] returns.
+pub const MAX_TIMING_LINES: u32 = 100;
+
+/// How much of a job's output, counted from its end, the CI reads to answer
+/// a [`CiRequest::Timing`]; [`JobTiming::truncated`] says when there was
+/// more.
+pub const TIMING_READ_BYTES: usize = 64 << 20;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CiRequest {
@@ -56,13 +64,27 @@ pub enum CiRequest {
     /// Answers [`CiReply::Accepted`], or an error when it is not running.
     Cancel { repo: String, number: u64 },
     /// The tail of one job's stored output: at most `tail` lines, never more
-    /// than the CI's own cap. Answers [`CiReply::Log`], or an error when the
-    /// job has no output.
+    /// than the CI's own cap. With `timestamps` every line starts with the
+    /// seconds since the job's first output (`[+     1.5s] text`) and a line
+    /// with no text is left out. Answers [`CiReply::Log`], or an error when
+    /// the job has no output.
     Log {
         repo: String,
         number: u64,
         job: String,
         tail: u32,
+        #[serde(default)]
+        timestamps: bool,
+    },
+    /// Where a job's time went: the `top` lines of its output (clamped to
+    /// `1..=`[`MAX_TIMING_LINES`]) that the longest pauses follow, from the
+    /// times the output arrived. Answers [`CiReply::Timing`], or an error
+    /// when the job has no output.
+    Timing {
+        repo: String,
+        number: u64,
+        job: String,
+        top: u32,
     },
 }
 
@@ -92,6 +114,10 @@ pub enum CiReply {
     Log {
         text: String,
         finished: bool,
+    },
+    /// The lines of a job's output that its longest pauses follow.
+    Timing {
+        timing: JobTiming,
     },
     Error {
         message: String,
@@ -203,6 +229,36 @@ pub struct TransferView {
     pub finished: Option<u64>,
     pub bytes: Option<u64>,
     pub error: Option<String>,
+}
+
+/// How a job's output was spread over time, from the times its chunks
+/// arrived on the runner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobTiming {
+    /// The lines with text in the part of the output that was read.
+    pub lines: u64,
+    /// From the job's first output to its end, in milliseconds; a job that
+    /// still runs ends now.
+    pub span_ms: u64,
+    /// The lines that the longest pauses follow, in output order.
+    pub slowest: Vec<TimedLine>,
+    /// The job ended: its exit record exists.
+    pub finished: bool,
+    /// Only the last [`TIMING_READ_BYTES`] of the output were read; the
+    /// lines before them are missing.
+    pub truncated: bool,
+}
+
+/// One line of a job's output and how long it stood last.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimedLine {
+    /// Milliseconds from the job's first output to this line's.
+    pub at_ms: u64,
+    /// Milliseconds from this line to the next one; for the last line, to
+    /// the end of the job.
+    pub took_ms: u64,
+    /// As the transcript shows it, cut to a length a reply can carry.
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -354,6 +410,20 @@ mod tests {
                 number: 7,
                 job: "build".to_owned(),
                 tail: 200,
+                timestamps: false,
+            },
+            CiRequest::Log {
+                repo: "griasdi".to_owned(),
+                number: 7,
+                job: "build".to_owned(),
+                tail: 50,
+                timestamps: true,
+            },
+            CiRequest::Timing {
+                repo: "griasdi".to_owned(),
+                number: 7,
+                job: "build".to_owned(),
+                top: 15,
             },
         ];
         for request in requests {
@@ -417,12 +487,36 @@ mod tests {
                 text: "line\n".to_owned(),
                 finished: true,
             },
+            CiReply::Timing {
+                timing: JobTiming {
+                    lines: 3,
+                    span_ms: 31_200,
+                    slowest: vec![TimedLine {
+                        at_ms: 0,
+                        took_ms: 30_000,
+                        text: "sleeping".to_owned(),
+                    }],
+                    finished: false,
+                    truncated: true,
+                },
+            },
             CiReply::Error {
                 message: "no such job".to_owned(),
             },
         ];
         for reply in replies {
             assert_eq!(CiReply::decode(&reply.encode()), Some(reply));
+        }
+    }
+
+    #[test]
+    fn a_log_request_without_timestamps_still_decodes() {
+        let old = br#"{"kind":"log","repo":"griasdi","number":7,"job":"build","tail":200}"#;
+        match CiRequest::decode(old) {
+            Some(CiRequest::Log {
+                tail, timestamps, ..
+            }) => assert_eq!((tail, timestamps), (200, false)),
+            other => panic!("{other:?}"),
         }
     }
 

@@ -492,8 +492,12 @@ per chunk (`zeughaus-terminal/src/wal.rs`): the magic `ZGHWAL1\n`, then
 records of `u64 LE` microseconds since the epoch, `u32 LE` length and the
 bytes one PTY read returned, stamped by the shim before anything else
 touches them. A reader stops at the last complete record, so a torn tail is
-not an error. The times sit on the byte stream, not on lines; a line's time
-is derived from the chunk it ends in. A shell's WAL is `wal` in its shim
+not an error: `tail_records` returns the whole records that hold the last
+bytes by walking the headers, and `first_at` the time of the first one. The
+times sit on the byte stream, not on lines; a line's time is derived from
+the chunk that holds its first byte, so a step that prints its name and
+finishes later is one line at the moment it began (`timed_lines` in
+`zeughaus-ci/src/excerpt.rs`). A shell's WAL is `wal` in its shim
 directory, rotates at 64 MiB into `wal.1` and goes with the terminal; a
 job run's is `<run_dir>/wal` and stays with the run. The mux writes
 `<state-dir>/workspace.json` (tabs, groups, splits, id counters, per
@@ -1153,9 +1157,20 @@ machine the connected runners report as `kind = "windows-vm"`, each with the
 jobs active on it as `MachineJob { repo, channel, number, job }`, and the
 `[platforms]` of `ci.toml` as (platform, target) pairs), a channel's pipelines
 newest first by pages, one pipeline, opens or closes a transcript, answers
-`Log { repo, number, job, tail }` with the last lines of a job's stored output
-as plain text (at most 5000 lines and 3 MiB, read from the end of its `wal`,
-`finished` once its `exit` exists), answers `Find { repo, sha }` with the newest
+`Log { repo, number, job, tail, timestamps }` with the last lines of a job's
+stored output as plain text (at most 5000 lines and 3 MiB, read from the end
+of its `wal`, `finished` once its `exit` exists; with `timestamps` every line
+starts with `[+<seconds>s]` since the job's first output, by the time of the
+record that holds the line's first byte, and lines with no text are left out),
+answers `Timing { repo, number, job, top }` with the `top` (1 to 100) lines of
+a job's output that the longest pauses follow, in output order, each with the
+time it began after the first output and how long it stood (until the next
+line began; the last one until the end of the job, `finished` of its record,
+else now), and with the number of lines, the span, `finished` once the `exit`
+exists and `truncated` when the 64 MiB it reads from the end of the `wal`
+did not hold all of it (a window that opens inside the output drops its first
+line, which may be the end of one that began before), answers
+`Find { repo, sha }` with the newest
 of a repository's last 500 pipelines, of any channel and a try run too, whose
 commit id starts with the 4 to 40 hex digits `sha` (`Pipeline`, empty when
 none does) and takes two actions, both answered `Accepted`:
@@ -1242,7 +1257,15 @@ The tools (`tools.rs`) are `ci_status` (the overview and the `[platforms]`
 of `ci.toml`, which are what a `try_run` target resolves through),
 `ci_pipelines`, `ci_pipeline` (a failed job adds its `cause` and
 `excerpt`), `ci_log` (`CiRequest::Log`: the last lines of a job's stored
-output, 5000 at most, and whether the job has finished), `ci_wait` (one
+output, 5000 at most, and whether the job has finished; `timestamps` starts
+every line with the seconds since the job's first output), `ci_timing`
+(without `job`, from the pipeline's record alone: when it was created and how
+long it took, and for each job when it was assigned, started and ended as
+seconds after the creation, how long it staged (assigned to started) and ran,
+and the inputs that moved to its runner, marked `(fetched early)` when one
+was there before the job was assigned; with `job`, `CiRequest::Timing`: the
+`top` lines, 15 unless told, that the longest pauses of its output follow),
+`ci_wait` (one
 pipeline, named by number or by the sha of its commit, or one job of it,
 looked at every 2 s until it has settled; a sha that matches nothing yet is
 waited for, and then followed by its number; at the end of the wait it

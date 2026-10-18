@@ -63,6 +63,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   number or by the sha of its commit right after a push, which it waits
   for if the CI has no pipeline of it yet. `/ci` gets `Find { repo, sha }`
   for it.
+- The MCP server's `ci_timing` says where a pipeline's time went: for each
+  job when it was assigned, started and ended after the pipeline was
+  created, how long it staged and ran, and which inputs moved to its runner
+  and whether they arrived before it was assigned. With a `job` it names the
+  lines of that job's output that the longest pauses follow, from the time
+  the terminal WAL keeps for every chunk, and `ci_log` can start every line
+  with the seconds since the job's first output (`timestamps`). `/ci` gets
+  `Timing { repo, number, job, top }` and `Log` a `timestamps` field.
 
 ### Changed
 

@@ -16,7 +16,7 @@
 //! stderr.
 //!
 //! - [`rpc`]: the JSON-RPC framing and the calls running in parallel;
-//! - [`tools`]: the eight tools and the text they answer with;
+//! - [`tools`]: the ten tools and the text they answer with;
 //! - [`client`]: the CI's `/ci` and `/try` exchanges;
 //! - [`snapshot`]: a working tree and its path dependencies as git bundles.
 
@@ -122,7 +122,7 @@ mod tests {
         assert!(parse_args(&args(&["--feed-addr", "x"])).is_err());
     }
 
-    /// What the agent sees of a runner that has no CI: eight tools, and an
+    /// What the agent sees of a runner that has no CI: ten tools, and an
     /// error with the reason from every call.
     #[tokio::test]
     async fn a_session_without_a_ci_lists_the_tools_and_explains_every_call() {
@@ -159,7 +159,7 @@ mod tests {
         };
 
         assert_eq!(by_id(1)["result"]["serverInfo"]["name"], "zeughaus");
-        assert_eq!(by_id(2)["result"]["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(by_id(2)["result"]["tools"].as_array().unwrap().len(), 10);
         let status = &by_id(3)["result"];
         assert_eq!(status["isError"], true);
         let text = status["content"][0]["text"].as_str().unwrap();

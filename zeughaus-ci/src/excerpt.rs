@@ -7,6 +7,8 @@
 
 use std::path::Path;
 
+use zeughaus_terminal::wal::Record;
+
 /// Lines an excerpt keeps.
 pub const EXCERPT_LINES: usize = 40;
 /// Bytes read from the end of a log for an excerpt: 40 lines of a build
@@ -157,6 +159,43 @@ fn run_output_tail(dir: &Path, max: usize) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// The lines of a run's output with the time each began, from the WAL
+/// records that hold them: the text as [`plain_text`] shows it, and the time
+/// (microseconds since the UNIX epoch) of the record in which the line's
+/// first byte arrived. A step that prints its name and finishes later is
+/// thus one line at the moment it began, however late the rest of it comes.
+/// Lines with no text are left out.
+pub fn timed_lines(records: &[Record]) -> Vec<(u64, String)> {
+    let mut lines = Vec::new();
+    // The line in progress: a record may end inside a line, or inside a
+    // character, so its bytes wait for the next one.
+    let mut raw: Vec<u8> = Vec::new();
+    let mut at = 0;
+    for record in records {
+        let mut pieces = record.bytes.split(|&b| b == b'\n').peekable();
+        while let Some(piece) = pieces.next() {
+            if raw.is_empty() {
+                at = record.at_micros;
+            }
+            raw.extend_from_slice(piece);
+            // Every piece but the last ends at a line feed.
+            if pieces.peek().is_some() {
+                push_timed(&mut lines, at, &raw);
+                raw.clear();
+            }
+        }
+    }
+    push_timed(&mut lines, at, &raw);
+    lines
+}
+
+fn push_timed(lines: &mut Vec<(u64, String)>, at: u64, raw: &[u8]) {
+    let text = plain_text(raw);
+    if !text.is_empty() {
+        lines.push((at, text));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +255,49 @@ mod tests {
             Some("error[E0425]: cannot find value `x` in this scope")
         );
         assert_eq!(cause("all good\nexit 3"), None);
+    }
+
+    fn record(at_micros: u64, bytes: &[u8]) -> Record {
+        Record {
+            at_micros,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_line_has_the_time_of_the_record_its_first_byte_came_in() {
+        // "bc" begins in the first record and ends in the second.
+        let records = [record(1, b"a\nb"), record(5, b"c\n")];
+        assert_eq!(
+            timed_lines(&records),
+            [(1, "a".to_owned()), (1, "bc".to_owned())]
+        );
+    }
+
+    #[test]
+    fn timed_lines_show_what_a_reader_sees_and_leave_out_what_is_empty() {
+        let records = [
+            // Colours, a progress bar, a blank line, a line of spaces, and
+            // a character cut between two records.
+            record(
+                10,
+                b"\x1b[32mone\x1b[0m\r\n 10%\r100%\r\n\r\n   \r\ncaf\xc3",
+            ),
+            record(20, b"\xa9\r\n"),
+            // A record without bytes changes nothing; the last line needs
+            // no line feed.
+            record(30, b""),
+            record(40, b"tail"),
+        ];
+        assert_eq!(
+            timed_lines(&records),
+            [
+                (10, "one".to_owned()),
+                (10, "100%".to_owned()),
+                (10, "caf\u{e9}".to_owned()),
+                (40, "tail".to_owned()),
+            ]
+        );
+        assert!(timed_lines(&[]).is_empty());
     }
 }
