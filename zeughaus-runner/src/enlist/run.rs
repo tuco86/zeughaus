@@ -466,6 +466,13 @@ impl Executor {
             if vm.is_none() {
                 let exe = matches!(a.place, Place::Host).then_some(self.exe.as_path());
                 write(&run_dir.join("inner.sh"), &launch::inner_sh(a, exe))?;
+                // Apple's containers set their clock from the host's before
+                // the job starts.
+                if matches!(a.place, Place::Container { .. })
+                    && stage::Engine::host() == stage::Engine::Apple
+                {
+                    write(&run_dir.join("clock.sh"), launch::clock_sh())?;
+                }
             }
             (
                 "/bin/sh".to_owned(),

@@ -3,10 +3,11 @@
 //! `launch.sh` is the terminal's program on a unix runner for every kind of
 //! job: it checks the commit out (on the host, or over ssh in the guest) and
 //! starts the job where it runs. `inner.sh` / `inner.ps1` is the job itself
-//! in its environment. Every script ends with the job's exit code, and the
-//! terminal closes with it: nothing stays behind a failed job. A Windows
-//! runner runs host jobs only, and `launch.ps1` does all of that in one
-//! script.
+//! in its environment; an Apple container reaches `inner.sh` through
+//! `clock.sh`, which sets the VM's clock first. Every script ends with the
+//! job's exit code, and the terminal closes with it: nothing stays behind a
+//! failed job. A Windows runner runs host jobs only, and `launch.ps1` does
+//! all of that in one script.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -278,15 +279,17 @@ pub fn launch_sh(launch: &Launch<'_>) -> String {
                 }
                 // `container` has no `:ro` on `-v`, so the inputs are writable.
                 // The system is started on demand and left running; every
-                // container is a VM of its own that `--rm` removes.
+                // container is a VM of its own that `--rm` removes. That VM's
+                // clock can run behind the host's, so the job starts through
+                // `clock.sh` ([`clock_sh`]), which needs `CAP_SYS_TIME`.
                 Engine::Apple => {
                     let _ = write!(
                         out,
                         "container system status >/dev/null 2>&1 || container system start --enable-kernel-install || exit 71\n\
                          container image inspect {tag} >/dev/null 2>&1 || container build -t {tag} -f {file} --cpus {cpus} --memory {memory} {ctx} || exit 71\n\
                          container run --rm -it --init --name {name} --cpus {cpus} --memory {memory} \
-                         --env-file \"$secret_dir/env\" -v {mount} -v {run}:/ci/run \
-                         -v {inputs}:/ci/inputs -w {workdir} {tag} /bin/sh /ci/run/inner.sh\n\
+                         --cap-add CAP_SYS_TIME --env-file \"$secret_dir/env\" -v {mount} -v {run}:/ci/run \
+                         -v {inputs}:/ci/inputs -w {workdir} {tag} /bin/sh /ci/run/clock.sh\n\
                          exit $?\n",
                     );
                 }
@@ -319,6 +322,27 @@ pub fn inner_sh(a: &Assignment, runner_exe: Option<&Path>) -> String {
          mkdir -p \"$CI_OUTPUT\"\n\
          exec {run}\n",
     )
+}
+
+/// `clock.sh`, the command of an Apple container: sets the VM's clock from
+/// the host's, then becomes `inner.sh`.
+///
+/// The VM keeps a clock of its own that can run behind the host's, while the
+/// files a job writes through the mounts are stamped by the host: build tools
+/// then see files from the future. A file created in `/ci/run` carries the
+/// host's time, which goes to `date -s` with 5 ms added, so the guest runs a
+/// little ahead of the host and a file written now never looks newer than the
+/// clock. When any step fails the script says so and the job runs on with the
+/// clock the VM has. Podman shares the host kernel's clock and has no such
+/// script.
+pub fn clock_sh() -> &'static str {
+    r#": > /ci/run/.clock \
+  && t=$(stat -c %.Y /ci/run/.clock) \
+  && date -s "@$(awk -v t="$t" 'BEGIN { printf "%.6f", t + 0.005 }')" >/dev/null \
+  || printf '[zeughaus-ci] warning: cannot set the container clock from the host; files written now may look newer than the clock\n'
+rm -f /ci/run/.clock
+exec /bin/sh /ci/run/inner.sh
+"#
 }
 
 /// The guest directory of a run: `W:\ci\runs\<id>`.
@@ -627,6 +651,17 @@ mod tests {
         }
     }
 
+    /// A program the shell side of these tests can run in place of `ssh`,
+    /// `date` or the runner's `timeout`: `body` under `#!/bin/sh`.
+    fn stand_in(path: &Path, body: &str) {
+        std::fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
+        std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(path)
+            .status()
+            .unwrap();
+    }
+
     /// A host job is timed by the runner's own subcommand, a container job by
     /// coreutils inside the image.
     #[test]
@@ -652,12 +687,7 @@ mod tests {
         std::fs::write(ws.join(CI_DIR).join("build.sh"), "echo ran; exit 3\n").unwrap();
         // Stands in for `zeughaus-runner timeout <secs> -- <program> ..`.
         let stub = base.join("timeout-stub");
-        std::fs::write(&stub, "#!/bin/sh\nshift 3\nexec \"$@\"\n").unwrap();
-        std::process::Command::new("chmod")
-            .arg("+x")
-            .arg(&stub)
-            .status()
-            .unwrap();
+        stand_in(&stub, "shift 3\nexec \"$@\"\n");
         let a = assignment(Place::Host);
         let output = std::process::Command::new("/bin/sh")
             .arg("-c")
@@ -698,13 +728,7 @@ mod tests {
             ),
             ("scp", "printf '%s\\n' \"scp $*\" >> \"$STUB_LOG\"\n"),
         ] {
-            let path = bin.join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
-            std::process::Command::new("chmod")
-                .arg("+x")
-                .arg(&path)
-                .status()
-                .unwrap();
+            stand_in(&bin.join(name), body);
         }
         let a = assignment(Place::Machine {
             name: "win11".to_owned(),
@@ -825,6 +849,104 @@ mod tests {
         assert!(script.contains("-v '/s/runs/4/inputs':/ci/inputs -w /work"));
         assert!(!script.contains("podman"));
         assert!(!script.contains(":ro"));
+    }
+
+    /// Apple's container VM keeps a clock of its own, so its job starts
+    /// through `clock.sh` and the capability to set the clock; podman shares
+    /// the host kernel's clock and starts `inner.sh` directly.
+    #[test]
+    fn only_an_apple_container_sets_its_clock_from_the_host() {
+        let apple = container_script(Engine::Apple);
+        assert!(apple.contains("--cap-add CAP_SYS_TIME"), "{apple}");
+        assert!(
+            apple.contains(
+                "-w /work 'localhost/zci-demo-arch:0123456789abcdef' /bin/sh /ci/run/clock.sh\nexit $?\n"
+            ),
+            "{apple}"
+        );
+        assert!(!apple.contains("inner.sh"), "{apple}");
+
+        let podman = container_script(Engine::Podman);
+        assert!(
+            podman.contains(" /bin/sh /ci/run/inner.sh\nexit $?\n"),
+            "{podman}"
+        );
+        assert!(
+            !podman.contains("CAP_SYS_TIME") && !podman.contains("clock.sh"),
+            "{podman}"
+        );
+    }
+
+    /// The clock script run for real against stand-ins for `stat` and `date`:
+    /// the clock is set to the host's stamp plus 5 ms and the job starts; when
+    /// setting it fails the script says so and the job starts all the same.
+    #[test]
+    fn the_clock_script_sets_the_clock_a_little_ahead_and_always_starts_the_job() {
+        let base = std::env::temp_dir().join(format!("zci-launch-clock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (bin, run) = (base.join("bin"), base.join("run"));
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&run).unwrap();
+        // The host's stamp on the file, and the one call that sets the clock.
+        stand_in(&bin.join("stat"), "echo 1700000000.250000000\n");
+        stand_in(
+            &bin.join("date"),
+            "printf '%s\\n' \"$*\" > \"$STUB_DATE_LOG\"\nexit \"$STUB_DATE_EXIT\"\n",
+        );
+        let started = run.join("started");
+        std::fs::write(
+            run.join("inner.sh"),
+            format!("echo ran > {}\n", sh_path(&started)),
+        )
+        .unwrap();
+        // `/ci/run` is the run directory inside the container.
+        let script = run.join("clock.sh");
+        std::fs::write(
+            &script,
+            clock_sh().replace("/ci/run", &run.to_string_lossy()),
+        )
+        .unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let log = base.join("date.log");
+        let clock = |date_exit: &str| {
+            let _ = std::fs::remove_file(&started);
+            let _ = std::fs::remove_file(&log);
+            let output = std::process::Command::new("/bin/sh")
+                .arg(&script)
+                .env("PATH", &path)
+                .env("STUB_DATE_LOG", &log)
+                .env("STUB_DATE_EXIT", date_exit)
+                .output()
+                .expect("run sh");
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+            )
+        };
+
+        let (code, out) = clock("0");
+        assert_eq!(code, Some(0), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "-s @1700000000.255000\n"
+        );
+        assert!(!out.contains("warning"), "{out}");
+        assert!(started.exists(), "the job runs");
+        assert!(!run.join(".clock").exists());
+
+        let (code, out) = clock("1");
+        assert_eq!(code, Some(0), "{out}");
+        assert!(
+            out.contains("warning: cannot set the container clock from the host"),
+            "{out}"
+        );
+        assert!(started.exists(), "the job runs on with the clock it had");
+        assert!(!run.join(".clock").exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn host_launcher(a: &Assignment) -> String {

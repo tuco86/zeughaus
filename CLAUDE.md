@@ -280,7 +280,11 @@ it runs.
 On macOS the runner's container engine is Apple's `container` (Homebrew
 formula `container`), not podman. The runner starts its system on demand
 (`container system start --enable-kernel-install`) and never stops it; each
-job container is a VM of its own that goes away with the job. The job's
+job container is a VM of its own that goes away with the job. Its clock can
+run behind the host's while files written through the mounts carry the
+host's time, so the container gets `CAP_SYS_TIME` and starts the job through
+`clock.sh`: it sets the clock to the host's stamp on a file it creates in
+the run directory plus 5 ms, and only warns when that fails. The job's
 `inputs` are mounted writable, because `container` has no read-only mount,
 and a job in such a container cannot be frozen: the runner logs that it
 cannot and the job runs on. The runner offers containers only where

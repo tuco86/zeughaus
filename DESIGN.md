@@ -924,7 +924,12 @@ in between. Then it starts the job:
   its tag, and `container run --rm -it --init` with the same mounts. The
   system is never stopped by the runner; every container is a VM of its own
   that `--rm` removes. `container` has no read-only mount, so the inputs are
-  writable there.
+  writable there. The VM's clock can run behind the host's while files
+  written through the mounts carry the host's time, so the container has
+  `CAP_SYS_TIME` and starts `clock.sh` instead of `inner.sh`: it creates a
+  file in `/ci/run`, sets the clock to that file's stamp (the host's) plus
+  5 ms, so a file written now never looks newer than the clock, and `exec`s
+  `inner.sh`. A failure only warns and the job runs on.
 - **Machine:** over ssh, from a git bundle, in `W:\work\<repo>\<workspace>`.
 
 Host and container jobs time out inside `inner.sh`; a machine job on the

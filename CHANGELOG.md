@@ -77,6 +77,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the tag points at. It carried the tag object's sha from the forge's
   push, which GitHub refused as a release target, so the `v0.2.0` and
   `v0.2.1` releases reached the update channel but not GitHub.
+- CI: a job in an Apple container sees a clock that agrees with the files it
+  writes. The VM's clock could run behind the host's while files written
+  through the mounts carry the host's time, so build tools saw sources and
+  outputs from the future. The container now sets its clock from the host's
+  (5 ms ahead) before the job starts, and a job whose image cannot do that
+  gets a warning in its log.
 
 ## [0.2.1] - 2026-10-16
 
