@@ -1,8 +1,9 @@
 //! The runner binary's subcommands: `trigger` and `hold` as a client of a
 //! running runner, `maintain` as a reader of its maintenance records,
 //! `timeout` as the deadline a host CI job runs under, `release` as the tool
-//! that makes and checks signed release bundles and `mcp` as the server that
-//! gives an agent the CI's pipelines and try runs as tools.
+//! that makes and checks signed release bundles, `mcp` as the server that
+//! gives an agent the CI's pipelines and try runs as tools and `ci` as the
+//! answer to a script that asks that CI about a checkout or a commit.
 //!
 //! `trigger` and `hold` talk to the endpoint a runner printed at start
 //! (`[runner] weida endpoint weida://sha256:<fp>@host:port/`) with the client
@@ -14,6 +15,8 @@
 //! zeughaus-runner trigger <endpoint> <node-id> [payload]
 //! zeughaus-runner hold <endpoint> on|off
 //! zeughaus-runner mcp [--ci <url>]
+//! zeughaus-runner ci repo [--json] [<path>]
+//! zeughaus-runner ci find [--json] <repo> <sha>
 //! zeughaus-runner maintain
 //! zeughaus-runner timeout <seconds> -- <program> [args..]
 //! zeughaus-runner release keygen <file>
@@ -33,11 +36,13 @@ use zeughaus_link::{
 /// is given, so an argument it does not know must never fall through to
 /// serving: a second runner on the same state directory takes the first
 /// one's terminals.
-const USAGE: &str = "\
+pub(crate) const USAGE: &str = "\
 usage: zeughaus-runner [--state-dir <dir>] [--feed-addr <host:port>] [--keep-runs <n>]
        zeughaus-runner trigger <endpoint> <node-id> [payload]
        zeughaus-runner hold <endpoint> on|off
        zeughaus-runner mcp [--ci <url>]
+       zeughaus-runner ci repo [--json] [<path>]
+       zeughaus-runner ci find [--json] <repo> <sha>
        zeughaus-runner maintain
        zeughaus-runner timeout <seconds> -- <program> [args..]
        zeughaus-runner release keygen <file>
@@ -107,6 +112,9 @@ pub fn run(args: &[String], state_dir: &Path) -> Option<ExitCode> {
         // A server, not a command: it runs until its input ends and writes
         // nothing to stdout but protocol messages.
         Some("mcp") => return Some(crate::mcp::run(&positional[1..], state_dir)),
+        // A question to the CI that is answered on stdout: it starts no
+        // server and takes no lock, so a script can ask beside a runner.
+        Some("ci") => return Some(crate::mcp::cli(&positional[1..], state_dir)),
         Some("trigger") => parse_trigger(&positional[1..]),
         Some("hold") => parse_hold(&positional[1..]),
         Some("maintain") => return Some(maintain(&positional[1..], state_dir)),

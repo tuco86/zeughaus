@@ -156,8 +156,17 @@ the untracked files that are not ignored) and the sibling checkouts its
 Cargo path dependencies point to, uploads them to the CI as git bundles
 with the names of jobs of the repository's pipeline, and answers as
 `ci_wait` does once that manual pipeline has settled, or with how to
-continue with `ci_wait`. Nothing but protocol messages is written to its
-stdout.
+continue with `ci_wait`. `ci_repo` says which repository of the CI the
+checkout is (by its origin), whether its default branch and `HEAD` are
+green, and every job of its `.zeughaus-ci/` with the runner and place it
+runs at; in such a checkout `repo` can be omitted from every other tool,
+and `ci_wait` without a number or sha waits for `HEAD`. Nothing but
+protocol messages is written to its stdout.
+`zeughaus-runner [--state-dir <dir>] ci repo [--json] [<path>]` and `ci
+find [--json] <repo> <sha>` answer the same for a script (exit 3: the
+origin is no repository of `ci.toml`; 2: no CI or no answer); the
+`zeughaus-ci` omp plugin in `omp-plugin/` uses them for its session
+context and its push watch.
 
 A runner also runs the tasks of `<state-dir>/maintain.toml` (`[[task]]` with
 `name`, `command` as an argv, `every_minutes` and `timeout_minutes`,

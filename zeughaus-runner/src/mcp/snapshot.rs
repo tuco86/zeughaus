@@ -264,7 +264,7 @@ fn canonical(path: &Path) -> Result<PathBuf, String> {
     std::fs::canonicalize(path).map_err(|e| format!("cannot resolve {}: {e}", path.display()))
 }
 
-fn toplevel(dir: &Path) -> Result<PathBuf, String> {
+pub(super) fn toplevel(dir: &Path) -> Result<PathBuf, String> {
     git(dir, &[], &["rev-parse", "--show-toplevel"], None)
         .map(|top| PathBuf::from(top.trim_end_matches(['\n', '\r'])))
         .map_err(|e| format!("{} is not inside a git checkout ({e})", dir.display()))
@@ -272,7 +272,7 @@ fn toplevel(dir: &Path) -> Result<PathBuf, String> {
 
 /// `git -C <dir> <args>`; stdout on success. `env` is added to the
 /// environment of the process and `stdin` is what it reads.
-fn git(
+pub(super) fn git(
     dir: &Path,
     env: &[(&str, &OsStr)],
     args: &[&str],
@@ -318,7 +318,7 @@ fn git(
 
 /// `url` without the user and password of its authority. A remote may carry
 /// a token, and the URL is stored by the CI and shown in its logs.
-fn without_credentials(url: &str) -> String {
+pub(super) fn without_credentials(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_owned();
     };

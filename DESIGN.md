@@ -1334,10 +1334,28 @@ pipeline, named by number or by the sha of its commit, or one job of it,
 looked at every 2 s until it has settled; a sha that matches nothing yet is
 waited for, and then followed by its number; at the end of the wait it
 says `still running after <s> s; call ci_wait again with repo=.. number=..`),
-`ci_rerun`, `ci_cancel` and `run_jobs`; their answers are one
+`ci_rerun`, `ci_cancel`, `ci_repo` and `run_jobs`; their answers are one
 fact per line
 in a fixed shape, and a CI that answers with an error, or not at all within
 30 s, is the tool's error.
+
+`ci_repo` (`repo.rs`) reads the checkout at `path` (default: the working
+directory): its top level, its `origin` with credentials cut, and `HEAD`,
+and asks `CiRequest::Repo` with `jobs`. It answers the repository's name and
+forge with the default branch's streak, the pipeline of `HEAD`, the
+channels, one padded line per job (runner and place, `on` or `needs`,
+secrets marked as absent in a manual run, `run_jobs cannot run it (Windows
+VM)` for a job on a machine, `cannot be placed: <why>`), the runners and
+machines and the platforms. Every tool that takes `repo` may omit it: the
+working directory's checkout is then resolved the same way (without the
+jobs) and its name kept for the session; `ci_wait` with neither `number`
+nor `sha` waits for the sha of that checkout's `HEAD`. `zeughaus-runner
+[--state-dir D] ci repo [--json] [<path>]` and `ci find [--json] <repo>
+<sha>` are the same two exchanges for a script (the `zeughaus-ci` omp
+plugin): `--json` prints `{"repo": RepoView, "text": ..}` or the
+`PipelineView` (`null` when there is none); the exit code is 0 when
+answered, 3 when the origin is no repository of `ci.toml`, 2 when no CI is
+configured or the exchange failed, 1 for bad arguments or no checkout.
 
 `run_jobs` runs named jobs of the repository's pipeline from the working
 tree it is called in (`jobs`, one to 16 names: the files of
