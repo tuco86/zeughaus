@@ -226,6 +226,9 @@ struct JobGraph {
     /// One per need, from the right edge of the needed job's card to the
     /// left edge of the needing one's.
     cables: Vec<Shape>,
+    /// One per entry of `cables`: the set of the needed job is moving to
+    /// the runner of the needing one right now.
+    flowing: Vec<bool>,
     /// Where a cable meets a card, once per card edge.
     ports: Vec<[f32; 2]>,
 }
@@ -281,6 +284,15 @@ impl JobGraph {
             .iter()
             .map(|&(from, to)| cable(output(from), input(to)))
             .collect();
+        let flowing = edges
+            .iter()
+            .map(|&(from, to)| {
+                jobs[to]
+                    .transfers
+                    .iter()
+                    .any(|t| t.finished.is_none() && t.need == jobs[from].name)
+            })
+            .collect();
         let mut outputs = vec![false; jobs.len()];
         let mut inputs = vec![false; jobs.len()];
         for &(from, to) in &edges {
@@ -304,6 +316,7 @@ impl JobGraph {
             size,
             cards,
             cables,
+            flowing,
             ports,
         }
     }
@@ -2097,8 +2110,10 @@ impl App {
             Cables::new(
                 graph.size,
                 &graph.cables,
+                &graph.flowing,
                 &graph.ports,
                 self.theme.extended().background.strong.color,
+                Tone::Active.color(&self.theme),
             )
             .into(),
         );
@@ -2264,6 +2279,19 @@ fn job_detail(job: &JobView, now: u64) -> String {
     };
     // The runner a job runs on, without the image or machine after it.
     let place = job.place.split(',').next().unwrap_or_default().trim();
+    // A set on its way in is what a pending or starting job does; a job that
+    // ended says how it ended.
+    if !matches!(tone, Tone::Good | Tone::Bad) {
+        let receiving: Vec<&str> = job
+            .transfers
+            .iter()
+            .filter(|t| t.finished.is_none())
+            .map(|t| t.need.as_str())
+            .collect();
+        if !receiving.is_empty() {
+            return flatten(&format!("receiving {}", receiving.join(", ")), NOTE_CHARS);
+        }
+    }
     match tone {
         Tone::Bad => failure_note(job),
         Tone::Good | Tone::Active => match took {
@@ -2606,6 +2634,7 @@ fn tip<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeughaus_link::TransferView;
 
     #[test]
     fn ago_steps_at_each_unit_boundary() {
@@ -2682,6 +2711,86 @@ mod tests {
         );
         assert_eq!(note(&job("runner x (busy)")), "runner x (busy)");
         assert_eq!(note(&job("odd (#)")), "odd (#)");
+    }
+
+    fn job_with(name: &str, needs: &[&str], status: &str, transfers: Vec<TransferView>) -> JobView {
+        JobView {
+            name: name.to_owned(),
+            needs: needs.iter().map(|need| (*need).to_owned()).collect(),
+            place: "atik".to_owned(),
+            status: status.to_owned(),
+            note: String::new(),
+            started: None,
+            finished: None,
+            code: None,
+            cause: None,
+            excerpt: None,
+            assigned: None,
+            transfers,
+        }
+    }
+
+    fn moving(need: &str, finished: Option<u64>) -> TransferView {
+        TransferView {
+            need: need.to_owned(),
+            started: 10,
+            finished,
+            bytes: finished.map(|_| 5),
+            error: None,
+        }
+    }
+
+    fn pipeline_of(jobs: Vec<JobView>) -> PipelineView {
+        PipelineView {
+            repo: "r".to_owned(),
+            number: 1,
+            channel: "dev".to_owned(),
+            event: "push".to_owned(),
+            git_ref: "main".to_owned(),
+            sha: None,
+            actor: String::new(),
+            subject: String::new(),
+            status: "running".to_owned(),
+            note: String::new(),
+            created: 0,
+            finished: None,
+            jobs,
+        }
+    }
+
+    /// Only the cable whose consumer still receives that producer's set
+    /// flows; a finished transfer and a transfer of another need do not.
+    #[test]
+    fn only_a_cable_with_an_unfinished_transfer_of_its_producer_flows() {
+        let graph = JobGraph::of(&pipeline_of(vec![
+            job_with("a", &[], "succeeded", Vec::new()),
+            job_with("b", &[], "succeeded", Vec::new()),
+            job_with("c", &["a", "b"], "waiting", vec![moving("a", None)]),
+            job_with("d", &["a"], "waiting", vec![moving("a", Some(12))]),
+            job_with("e", &["b"], "waiting", vec![moving("a", None)]),
+        ]));
+        // Edges in the order the needs are listed: a->c, b->c, a->d, b->e.
+        assert_eq!(graph.cables.len(), 4);
+        assert_eq!(graph.flowing, vec![true, false, false, false]);
+    }
+
+    #[test]
+    fn a_card_names_the_sets_it_is_still_receiving() {
+        let receiving = job_with(
+            "c",
+            &["a", "b", "x"],
+            "waiting",
+            vec![moving("a", None), moving("x", Some(11)), moving("b", None)],
+        );
+        assert_eq!(job_detail(&receiving, 20), "receiving a, b");
+        // A starting job shows it too.
+        let starting = job_with("c", &["a"], "starting", vec![moving("a", None)]);
+        assert_eq!(job_detail(&starting, 20), "receiving a");
+        // A running or finished one does not: its place and time are the news.
+        let running = job_with("c", &["a"], "running", vec![moving("a", Some(11))]);
+        assert_eq!(job_detail(&running, 20), "atik");
+        let failed = job_with("c", &["a"], "failed", vec![moving("a", None)]);
+        assert!(!job_detail(&failed, 20).starts_with("receiving"));
     }
 
     #[test]

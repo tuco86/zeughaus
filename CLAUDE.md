@@ -104,7 +104,8 @@ executes, or a coloured group. A `CI <label>` section for each CI the editor
 dials (the `ci = [..]` URLs) holds a `Runners` tab with the enlisted runners
 and their machines and a locked group
 per repository with one tab per channel (pipelines one row each, newest on
-top and open with its jobs, failures with their cause and log excerpt,
+top and open with its jobs, a cable animating while its artifact set moves,
+failures with their cause and log excerpt,
 `Rerun` and `Cancel`; pressing a job shows its transcript read-only, live
 while it runs; Up/Down and Enter walk and open the list, Escape closes the
 transcript). The play/pause circle (filled when set by

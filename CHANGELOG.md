@@ -32,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only. `zeughaus-ci check` refuses a channel that is neither in
   `channels.toml` nor one of the fallback names (`tags`, `cron`, `try`),
   and `channels` on a job with `on` is refused.
+- CI tab: a cable between two jobs animates, as arrows in the colour of a
+  running job, while the needed job's artifact set moves to the runner of
+  the needing one, and that job's card reads `receiving <need>`.
 - CI: a try run executes a command on a runner from an agent's working
   tree, uncommitted files and sibling path dependencies included. An
   editor's key uploads the snapshot as git bundles on the new `/try` path;
