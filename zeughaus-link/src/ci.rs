@@ -180,6 +180,24 @@ pub struct JobView {
     /// escape-free.
     #[serde(default)]
     pub excerpt: Option<String>,
+    /// When the job was handed to its runner; its staging runs from here to
+    /// `started`. Seconds since the UNIX epoch.
+    #[serde(default)]
+    pub assigned: Option<u64>,
+    /// The inputs that moved to the job's runner.
+    #[serde(default)]
+    pub transfers: Vec<TransferView>,
+}
+
+/// One artifact set moving to the runner of a consuming job. Seconds since
+/// the UNIX epoch; `finished` is `None` while it moves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferView {
+    pub need: String,
+    pub started: u64,
+    pub finished: Option<u64>,
+    pub bytes: Option<u64>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -261,6 +279,8 @@ mod tests {
                     code: Some(0),
                     cause: None,
                     excerpt: None,
+                    assigned: Some(1_700_000_000),
+                    transfers: Vec::new(),
                 },
                 JobView {
                     name: "test".to_owned(),
@@ -273,6 +293,14 @@ mod tests {
                     code: None,
                     cause: Some("error: boom".to_owned()),
                     excerpt: Some("error: boom".to_owned()),
+                    assigned: Some(1_700_000_021),
+                    transfers: vec![TransferView {
+                        need: "build".to_owned(),
+                        started: 1_700_000_021,
+                        finished: Some(1_700_000_024),
+                        bytes: Some(300_000_000),
+                        error: None,
+                    }],
                 },
             ],
         }

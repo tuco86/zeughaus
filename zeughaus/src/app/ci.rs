@@ -2669,6 +2669,8 @@ mod tests {
             code: None,
             cause: None,
             excerpt: None,
+            assigned: None,
+            transfers: Vec::new(),
         };
         assert_eq!(
             note(&job("skipped: gate failed (#4)")),

@@ -132,6 +132,13 @@ pub struct JobRecord {
     pub started: Option<u64>,
     #[serde(default)]
     pub finished: Option<u64>,
+    /// When the job was handed to its runner: the start of its staging.
+    /// `started` is overwritten when the runner reports the program began.
+    #[serde(default)]
+    pub assigned: Option<u64>,
+    /// The inputs that moved to this job's runner, one entry per need.
+    #[serde(default)]
+    pub transfers: Vec<TransferRecord>,
     /// The runner the job is placed on, decided when the pipeline is set up.
     #[serde(default)]
     pub runner: Option<String>,
@@ -146,6 +153,17 @@ pub struct JobRecord {
     /// The end of a failed run's log (see [`excerpt`]).
     #[serde(default)]
     pub excerpt: Option<String>,
+}
+
+/// One artifact set moving to the runner of a consuming job. Times are
+/// seconds since the UNIX epoch, like [`JobRecord::started`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TransferRecord {
+    pub need: String,
+    pub started: u64,
+    pub finished: Option<u64>,
+    pub bytes: Option<u64>,
+    pub error: Option<String>,
 }
 
 impl JobRecord {
@@ -790,6 +808,8 @@ impl Scheduler {
                 note: String::new(),
                 code: None,
                 started: None,
+                assigned: None,
+                transfers: Vec::new(),
                 finished: None,
                 runner: Some(planned.runner),
                 place: Some(planned.place),
@@ -1490,6 +1510,7 @@ impl Scheduler {
         let record = &mut self.running[pi].jobs[ji];
         record.status = JobStatus::Starting;
         record.started = Some(now);
+        record.assigned = Some(now);
         record.note.clear();
         self.running[pi].save(&self.state_dir, &self.changes);
         let pipeline = self.running[pi].clone();
@@ -2011,6 +2032,8 @@ impl Scheduler {
         job.status = JobStatus::Pending;
         job.note.clear();
         job.started = None;
+        job.assigned = None;
+        job.transfers.clear();
         self.running[pi].save(&self.state_dir, &self.changes);
     }
 }
@@ -2801,6 +2824,8 @@ mod tests {
             note: String::new(),
             code: None,
             started: None,
+            assigned: None,
+            transfers: Vec::new(),
             finished: None,
             runner: Some(runner.to_owned()),
             place: Some(Place::Host),
@@ -3488,6 +3513,17 @@ mod tests {
     }
 
     #[test]
+    fn a_job_record_from_before_transfers_still_loads() {
+        let mut json = serde_json::to_value(record("a", &[], "x", JobStatus::Pending)).unwrap();
+        let job = json.as_object_mut().unwrap();
+        assert!(job.remove("assigned").is_some());
+        assert!(job.remove("transfers").is_some());
+        let old = serde_json::from_value::<JobRecord>(json).unwrap();
+        assert_eq!(old.assigned, None);
+        assert!(old.transfers.is_empty());
+    }
+
+    #[test]
     fn an_input_from_another_runner_waits_for_that_runner() {
         let state = scratch("remote-input");
         let mut s = scheduler(&state);
@@ -3505,6 +3541,11 @@ mod tests {
         let _x = connect(&s.runners, "x", 0);
         s.advance();
         assert_eq!(s.running[0].jobs[1].status, JobStatus::Starting);
+        assert_eq!(
+            s.running[0].jobs[1].assigned, s.running[0].jobs[1].started,
+            "assigned is stamped with the handover"
+        );
+        assert!(s.running[0].jobs[1].assigned.is_some());
         let assignment = assigned(&mut y);
         assert_eq!(assignment.run, "view.7.b");
         assert_eq!(
@@ -3565,6 +3606,14 @@ mod tests {
         let mut p = two_jobs("y");
         p.jobs[1].status = JobStatus::Starting;
         p.jobs[1].started = Some(50);
+        p.jobs[1].assigned = Some(50);
+        p.jobs[1].transfers.push(TransferRecord {
+            need: "a".to_owned(),
+            started: 51,
+            finished: None,
+            bytes: None,
+            error: None,
+        });
         s.running.push(p);
         s.runners.assign("view.7.b", "y");
         s.handle(Msg::RunnerHello {
@@ -3573,6 +3622,8 @@ mod tests {
             artifacts: Vec::new(),
         });
         assert_eq!(s.running[0].jobs[1].status, JobStatus::Pending);
+        assert_eq!(s.running[0].jobs[1].assigned, None);
+        assert!(s.running[0].jobs[1].transfers.is_empty());
         assert_eq!(s.runners.assigned_to("view.7.b"), None);
 
         // Handed over after the connection began: the runner has it queued.

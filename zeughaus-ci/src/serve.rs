@@ -16,7 +16,7 @@ use zeughaus_link::ci::MAX_PIPELINES_PER_REQUEST;
 use zeughaus_link::enlist::Place;
 use zeughaus_link::{
     BusyMode, ChannelView, CiOverview, CiReply, CiRequest, JobView, MAX_CI_REPLY_BYTES,
-    MAX_CI_REQUEST_BYTES, MachineJob, MachineView, PipelineView, QueuedView,
+    MAX_CI_REQUEST_BYTES, MachineJob, MachineView, PipelineView, QueuedView, TransferView,
 };
 use zeughaus_mux::TerminalId;
 
@@ -350,6 +350,18 @@ fn job_view(job: &JobRecord) -> JobView {
         code: job.code,
         cause: job.cause(),
         excerpt: job.excerpt.clone(),
+        assigned: job.assigned,
+        transfers: job
+            .transfers
+            .iter()
+            .map(|t| TransferView {
+                need: t.need.clone(),
+                started: t.started,
+                finished: t.finished,
+                bytes: t.bytes,
+                error: t.error.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -570,6 +582,8 @@ mod tests {
             note: String::new(),
             code: None,
             started: None,
+            assigned: None,
+            transfers: Vec::new(),
             finished: None,
             runner: runner.map(str::to_owned),
             place,

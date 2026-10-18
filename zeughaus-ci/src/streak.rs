@@ -173,6 +173,8 @@ mod tests {
             note: String::new(),
             code: None,
             started: None,
+            assigned: None,
+            transfers: Vec::new(),
             finished: None,
             runner: None,
             place: None,

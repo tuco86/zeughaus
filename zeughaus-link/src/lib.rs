@@ -43,7 +43,7 @@ pub mod tryrun;
 
 pub use ci::{
     ChannelView, CiOverview, CiReply, CiRequest, JobView, MAX_CI_REPLY_BYTES, MAX_CI_REQUEST_BYTES,
-    MachineJob, MachineView, PipelineView, QueuedView,
+    MachineJob, MachineView, PipelineView, QueuedView, TransferView,
 };
 pub use events::{
     ErrorRow, MAX_EVENT_BYTES, MAX_SNAPSHOT_BYTES, MAX_TRIGGER_BYTES, OutputRow, RejectionRow,

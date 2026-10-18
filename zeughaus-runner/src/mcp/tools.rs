@@ -909,6 +909,8 @@ mod tests {
             code: None,
             cause: None,
             excerpt: None,
+            assigned: None,
+            transfers: Vec::new(),
         }
     }
 
