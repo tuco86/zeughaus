@@ -1,6 +1,6 @@
 # Dot-sourced by the Windows build and check jobs; no header, so not a job.
-# Sets `Run`, `$cache` and CARGO_TARGET_DIR, and makes `..\weida` the weida
-# checkout the workspace builds against.
+# Sets `Run`, `Install-Nextest`, `$cache` and CARGO_TARGET_DIR, and makes
+# `..\weida` the weida checkout the workspace builds against.
 $ErrorActionPreference = 'Stop'
 
 # Runs a native command and ends the script with its exit code when it fails.
@@ -27,6 +27,21 @@ function Run([string]$Command, [string[]]$Arguments = @()) {
 
 $cache = Join-Path $env:CI_WORKSPACE '.ci-cache'
 $env:CARGO_TARGET_DIR = Join-Path $cache 'target'
+
+# cargo-nextest from its prebuilt release into `$cache\bin`, kept between runs
+# by the warm workspace; on PATH so `cargo nextest` finds it.
+function Install-Nextest {
+    $bin = Join-Path $cache 'bin'
+    if (-not (Test-Path (Join-Path $bin 'cargo-nextest.exe'))) {
+        New-Item -ItemType Directory -Force -Path $bin | Out-Null
+        $zip = Join-Path $env:TEMP "cargo-nextest-$PID.zip"
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -UseBasicParsing -Uri 'https://get.nexte.st/0.9/windows' -OutFile $zip
+        Expand-Archive -Path $zip -DestinationPath $bin -Force
+        Remove-Item -LiteralPath $zip
+    }
+    $env:PATH = "$bin;$env:PATH"
+}
 
 # `$cache\weida` is always the weida checkout, as weida.sh does for the Unix
 # jobs. A manual run fetches the weida it brings in CI_SIBLINGS into it;

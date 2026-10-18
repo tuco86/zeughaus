@@ -27,10 +27,27 @@ step() {
     fi
 }
 
-# clippy and the tests: what every platform checks.
+# cargo-nextest from its prebuilt release into the workspace's cargo home,
+# where cargo finds subcommands; kept between runs by the warm workspace.
+nextest_env() {
+    [ -x "$CARGO_HOME/bin/cargo-nextest" ] && return
+    case "$CI_PLATFORM" in
+        linux-amd64) asset=linux ;;
+        linux-arm64) asset=linux-arm ;;
+        darwin-arm64) asset=mac ;;
+        *) echo "no cargo-nextest for $CI_PLATFORM" >&2; return 1 ;;
+    esac
+    mkdir -p "$CARGO_HOME/bin"
+    curl -LsSf "https://get.nexte.st/0.9/$asset" | tar zxf - -C "$CARGO_HOME/bin"
+}
+
+# clippy and both test tiers (`.config/nextest.toml`), then the doctests,
+# which nextest does not run: what every platform checks.
 check_platform() {
     step cargo clippy --locked --workspace --all-targets -- -D warnings
-    step cargo test --locked --workspace
+    nextest_env
+    step cargo nextest run --locked --workspace --profile ci
+    step cargo test --locked --workspace --doc
 }
 
 # The workspace version, which names the archive and its top directory.
