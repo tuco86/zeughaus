@@ -32,7 +32,7 @@ os = "windows"
 [platforms]
 linux-amd64 = "tuco-pc"
 linux-arm64 = "atik"
-windows-amd64 = "win11"
+windows-amd64 = "wohnzimmer"       # a Windows runner's host; a VM such as win11 works too
 darwin-arm64 = "atik"
 
 [secrets]

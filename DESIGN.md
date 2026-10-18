@@ -1359,7 +1359,7 @@ has build 0.
 |---|---|---|
 | `linux-amd64` | `linux-amd64` | tuco-pc, container `trixie`, `freeze` |
 | `linux-arm64` | `linux-arm64` | atik, the same Containerfile in an Apple `container` |
-| `windows-amd64` | - | `machine = "wohnzimmer"`, the Windows runner's host (the `windows-amd64` platform stays on the `win11` VM, which griasdi's job needs) |
+| `windows-amd64` | - | `machine = "wohnzimmer"`, the Windows runner's host, which is also where `[platforms]` puts `windows-amd64`; the `win11` VM stays configured behind `tuco-pc` but no longer builds the platform |
 | `darwin-arm64` | `darwin-arm64` | atik's host; the editor as `Zeughaus.app` (`deploy/macos-app.sh`) and the runner |
 | `publish` | - | `machine = "sadala"`, needs the gate and all four |
 
