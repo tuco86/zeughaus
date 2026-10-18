@@ -7,8 +7,9 @@
 //! and the kill must not fail it), and every applied command is one
 //! revision, as is a terminal title the snapshot shows changing. The
 //! invariants live here and nowhere else: never an empty tab, groups one
-//! level deep, a locked group filled and emptied by the runner alone, split
-//! ratios kept away from the edges. A workspace may hold no tab at all.
+//! level deep, a locked group filled and emptied by the runner alone and
+//! present only while it holds a tab, split ratios kept away from the edges.
+//! A workspace may hold no tab at all.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -160,6 +161,7 @@ impl Workspace {
         }
         // A locked group's tab is one run's and is never split.
         self.take_tab(pos);
+        self.drop_empty_locked();
         self.detached.insert(terminal);
         self.revision += 1;
         true
@@ -232,7 +234,8 @@ impl Workspace {
     ///
     /// A pane of a terminal that did not is removed like a closed one, a tab
     /// left without panes goes, and so does a group left without tabs unless
-    /// it is the locked one, which the next triggered run fills again. Graph
+    /// the user left it empty on purpose; a locked group with no surviving
+    /// tab is not restored, the next triggered run creates it again. Graph
     /// panes stay: whether their graph still exists is the next
     /// [`Workspace::sync_graphs`]'s to say. Every owned terminal ends up
     /// shown or detached.
@@ -279,7 +282,8 @@ impl Workspace {
                     let tabs: Vec<Tab> = group.tabs.iter().filter_map(&restore_tab).collect();
                     // A group the user left empty is theirs to remove; one
                     // the restore emptied held nothing but dead terminals.
-                    if tabs.is_empty() && !group.tabs.is_empty() && !group.locked {
+                    // A locked group goes with its last tab either way.
+                    if tabs.is_empty() && (group.locked || !group.tabs.is_empty()) {
                         continue;
                     }
                     workspace.items.push(Item::Group(Group {
@@ -715,6 +719,7 @@ impl Workspace {
                 Applied::default()
             }
         };
+        self.drop_empty_locked();
         self.revision += 1;
         Ok(applied)
     }
@@ -787,7 +792,9 @@ impl Workspace {
     }
 
     /// Takes the tab at `pos` out of its container. A group it leaves
-    /// empty stays: removing a group is its own command.
+    /// empty stays until the caller ends with [`Workspace::drop_empty_locked`]
+    /// (a locked one) or the user dissolves it (an unlocked one): removing
+    /// an unlocked group is its own command.
     fn take_tab(&mut self, pos: TabPos) -> Tab {
         match pos.group {
             None => match self.items.remove(pos.index) {
@@ -796,6 +803,16 @@ impl Workspace {
             },
             Some(group) => self.group_at_mut(group).tabs.remove(pos.index),
         }
+    }
+
+    /// A locked group exists only while it holds a tab: the runner creates
+    /// it with the next run that needs it. Every operation that can remove
+    /// a tab ends here, before the revision moves, so no snapshot shows one
+    /// empty.
+    fn drop_empty_locked(&mut self) {
+        self.items.retain(
+            |item| !matches!(item, Item::Group(group) if group.locked && group.tabs.is_empty()),
+        );
     }
 
     /// Puts `tab` at `index` of the top level (`group: None`) or of the
@@ -1826,6 +1843,29 @@ mod tests {
     }
 
     #[test]
+    fn the_locked_group_goes_with_its_last_run_and_returns_with_the_next() {
+        let (mut ws, mut spawn) = with_tabs(1);
+        ws.add_owned(TerminalId(500), OwnedPlacement::Triggered);
+        assert_eq!(layout(&ws), ["T101", "G[T500]"]);
+
+        let before = ws.revision();
+        let run_tab = tab_showing(&ws, TerminalId(500));
+        let applied = apply(
+            &mut ws,
+            &mut spawn,
+            TopologyCommand::CloseTab { tab: run_tab },
+        );
+        assert_eq!(applied.killed, vec![TerminalId(500)]);
+        assert!(ws.revision() > before);
+        assert_eq!(layout(&ws), ["T101"]);
+        assert_eq!(snap(&ws).groups().count(), 0);
+
+        ws.add_owned(TerminalId(501), OwnedPlacement::Triggered);
+        assert_eq!(layout(&ws), ["T101", "G[T501]"]);
+        assert!(snap(&ws).groups().next().unwrap().locked);
+    }
+
+    #[test]
     fn a_hidden_run_leaves_the_locked_group_for_the_detached_list() {
         let (mut ws, mut spawn) = with_tabs(1);
         ws.add_owned(TerminalId(500), OwnedPlacement::Triggered);
@@ -2083,11 +2123,11 @@ mod tests {
     }
 
     #[test]
-    fn a_restore_without_survivors_keeps_graphs_the_locked_group_and_nothing_else() {
+    fn a_restore_without_survivors_keeps_graphs_and_nothing_else() {
         let (_, saved) = saved_fixture();
         let ws = Workspace::restore(RunnerIncarnation::from_bytes([1; 16]), &saved, |_| false);
-        assert_eq!(layout(&ws), ["T0", "G[]"]);
-        assert!(snap(&ws).groups().next().unwrap().locked);
+        assert_eq!(layout(&ws), ["T0"]);
+        assert_eq!(snap(&ws).groups().count(), 0, "the locked group is gone");
         assert!(detached_ids(&ws).is_empty());
         assert!(!ws.knows(TerminalId(200)));
     }

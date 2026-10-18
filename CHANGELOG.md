@@ -51,6 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every connected editor; `zeughaus-runner maintain` lists the last result
   of each. The wohnzimmer runner updates its Rust toolchain this way.
 
+### Changed
+
+- A runner's locked `Triggered` group, and a CI section's group of a
+  repository without channels, is shown only while it holds a tab: it no
+  longer sits empty in the tab bar between runs.
+
 ### Fixed
 
 - CI: a pipeline of an annotated tag runs, reports and releases the commit

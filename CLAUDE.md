@@ -132,7 +132,8 @@ its terminal for attaching, every run keeps a timestamped WAL in
 `zeughaus-runner trigger <endpoint> <node-id> [payload]` and
 `zeughaus-runner hold <endpoint> on|off` do the same from a script, against
 the endpoint URL a runner prints at start; a triggered run's terminal lands
-in that runner's locked `Triggered` group.
+in that runner's locked `Triggered` group, which exists only while it holds
+a tab.
 
 `zeughaus-runner [--state-dir <dir>] mcp [--ci <url>]` is an MCP server on
 stdio, for an agent that starts it as a tool server. It dials the CI that

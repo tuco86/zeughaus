@@ -520,7 +520,7 @@ impl CiClient {
             },
         })];
         for (repo, known) in &self.repos {
-            let tabs = known
+            let tabs: Vec<TabSnapshot> = known
                 .channels
                 .values()
                 .filter_map(|view| Some((*view, self.views.get(view)?)))
@@ -531,6 +531,10 @@ impl CiClient {
                     root: state.root(view),
                 })
                 .collect();
+            // A locked group exists only while it holds a tab, as on a runner.
+            if tabs.is_empty() {
+                continue;
+            }
             items.push(WorkspaceItem::Group(GroupSnapshot {
                 id: GroupId(known.group),
                 name: repo.clone(),

@@ -48,8 +48,8 @@ pub struct GroupSnapshot {
     /// RGBA, straight alpha.
     pub color_rgba: [u8; 4],
     /// A group only the runner fills (the terminals of externally triggered
-    /// runs). No client moves a tab in or out of it, and it is never
-    /// dissolved.
+    /// runs). No client moves a tab in or out of it. It goes when its last
+    /// tab goes and comes back with the next run.
     pub locked: bool,
     pub tabs: Vec<TabSnapshot>,
 }

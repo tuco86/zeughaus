@@ -699,7 +699,8 @@ through weida only: no HTTP listener and no polling in the runner.
 `zeughaus-runner trigger <endpoint> <node-id> [payload]` pushes on
 `/triggers` marked `external`: the run it starts gets a tab in the runner's
 locked `Triggered` group, which only the runner fills and from which no tab
-is dragged; a press from an editor leaves its run detached. The group shows
+is dragged and which exists only while it holds a tab (the next run creates
+it again); a press from an editor leaves its run detached. The group shows
 runs that are still going: a failed run's terminal moves to the detached
 list ("Terminal / Attach" in the palette), shell and all, unless a client
 attached it somewhere else.
