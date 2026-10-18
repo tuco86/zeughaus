@@ -6,11 +6,10 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use zeughaus_mux::{
-    Axis, Dimensions, GroupId, PaneId, PaneNode, SplitId, SurfaceRef, TabId, TerminalId,
-};
+use zeughaus_mux::{Dimensions, GroupId, PaneNode, TabId, TerminalId};
 
-use super::workspace::remove_leaf;
+#[cfg(unix)]
+pub use read::load;
 
 /// Bumped when a field changes meaning. The previous version is migrated,
 /// because its file names the user's live shells; any other version is
@@ -75,44 +74,6 @@ pub struct SavedRun {
     pub artifacts: Vec<String>,
 }
 
-/// Reads `path`. `None` when there is nothing usable, with the reason on
-/// stderr unless the file simply does not exist.
-pub fn load(path: &Path) -> Option<SavedWorkspace> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(e) => {
-            eprintln!("[mux] cannot read {}: {e}", path.display());
-            return None;
-        }
-    };
-    match parse(&bytes) {
-        Ok(saved) => Some(saved),
-        Err(e) => {
-            eprintln!("[mux] {}: {e}; starting fresh", path.display());
-            None
-        }
-    }
-}
-
-/// A saved workspace of this version, or of the one before it in today's
-/// shape.
-fn parse(bytes: &[u8]) -> Result<SavedWorkspace, String> {
-    #[derive(Deserialize)]
-    struct Header {
-        version: u32,
-    }
-    let unparsable = |e: serde_json::Error| format!("cannot parse: {e}");
-    let Header { version } = serde_json::from_slice(bytes).map_err(unparsable)?;
-    match version {
-        VERSION => serde_json::from_slice(bytes).map_err(unparsable),
-        1 => serde_json::from_slice::<SavedWorkspaceV1>(bytes)
-            .map(SavedWorkspaceV1::migrate)
-            .map_err(unparsable),
-        other => Err(format!("version {other} is not {VERSION}")),
-    }
-}
-
 /// Writes `saved` to `path` through a temporary file and a rename, so a
 /// runner killed mid-write leaves the previous state rather than half of
 /// the new one.
@@ -123,121 +84,177 @@ pub fn store(path: &Path, saved: &SavedWorkspace) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// A version-1 file: a flat list of tabs with a free-text group label, and a
-/// graph pane that named no graph. Fields it has and version 2 does not are
-/// left out and so ignored: the label is not a group.
-#[derive(Deserialize)]
-struct SavedWorkspaceV1 {
-    tabs: Vec<SavedTabV1>,
-    next_tab: u64,
-    next_split: u64,
-    next_pane: u64,
-    next_terminal: u64,
-    owned: Vec<TerminalId>,
-    detached: Vec<TerminalId>,
-    terminals: Vec<SavedTerminal>,
-}
+/// Reading a saved workspace back. Only terminals in shims outlive a
+/// runner, and shims are unix-only; the tests parse everywhere.
+#[cfg(any(unix, test))]
+mod read {
+    #[cfg(unix)]
+    use std::path::Path;
 
-#[derive(Deserialize)]
-struct SavedTabV1 {
-    id: TabId,
-    title: Option<String>,
-    accent: Option<[u8; 4]>,
-    root: PaneNodeV1,
-}
+    use serde::Deserialize;
+    use zeughaus_mux::{Axis, PaneId, PaneNode, SplitId, SurfaceRef, TabId, TerminalId};
 
-#[derive(Deserialize)]
-enum PaneNodeV1 {
-    Split {
-        id: SplitId,
-        axis: Axis,
-        ratio: f32,
-        first: Box<PaneNodeV1>,
-        second: Box<PaneNodeV1>,
-    },
-    Leaf {
-        pane_id: PaneId,
-        surface: SurfaceV1,
-    },
-}
+    use super::super::workspace::remove_leaf;
+    use super::{SavedItem, SavedTab, SavedTerminal, SavedWorkspace, VERSION};
 
-#[derive(Deserialize)]
-enum SurfaceV1 {
-    Graph,
-    Empty,
-    Terminal(TerminalId),
-}
-
-impl SavedWorkspaceV1 {
-    /// Every tab at the top level. A graph pane goes like a closed one: it
-    /// named no graph, and the graphs this runner executes get their panes
-    /// from the document. A tab that showed nothing else goes with it.
-    fn migrate(self) -> SavedWorkspace {
-        let items = self
-            .tabs
-            .into_iter()
-            .filter_map(|tab| {
-                let mut graphs = Vec::new();
-                let root = tab.root.migrate(&mut graphs);
-                let root = graphs.into_iter().try_fold(root, remove_leaf)?;
-                Some(SavedItem::Tab(SavedTab {
-                    id: tab.id,
-                    title: tab.title,
-                    accent: tab.accent,
-                    root,
-                }))
-            })
-            .collect();
-        SavedWorkspace {
-            version: VERSION,
-            items,
-            next_tab: self.next_tab,
-            next_group: 1,
-            next_split: self.next_split,
-            next_pane: self.next_pane,
-            next_terminal: self.next_terminal,
-            owned: self.owned,
-            detached: self.detached,
-            terminals: self.terminals,
+    /// Reads `path`. `None` when there is nothing usable, with the reason on
+    /// stderr unless the file simply does not exist.
+    #[cfg(unix)]
+    pub fn load(path: &Path) -> Option<SavedWorkspace> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                eprintln!("[mux] cannot read {}: {e}", path.display());
+                return None;
+            }
+        };
+        match parse(&bytes) {
+            Ok(saved) => Some(saved),
+            Err(e) => {
+                eprintln!("[mux] {}: {e}; starting fresh", path.display());
+                None
+            }
         }
     }
-}
 
-impl PaneNodeV1 {
-    /// The same tree with a graph leaf left empty and its pane listed in
-    /// `graphs`, for the caller to remove.
-    fn migrate(self, graphs: &mut Vec<PaneId>) -> PaneNode {
-        match self {
-            PaneNodeV1::Split {
-                id,
-                axis,
-                ratio,
-                first,
-                second,
-            } => PaneNode::Split {
-                id,
-                axis,
-                ratio,
-                first: Box::new(first.migrate(graphs)),
-                second: Box::new(second.migrate(graphs)),
-            },
-            PaneNodeV1::Leaf { pane_id, surface } => PaneNode::Leaf {
-                pane_id,
-                surface: match surface {
-                    SurfaceV1::Graph => {
-                        graphs.push(pane_id);
-                        SurfaceRef::Empty
-                    }
-                    SurfaceV1::Empty => SurfaceRef::Empty,
-                    SurfaceV1::Terminal(terminal) => SurfaceRef::Terminal(terminal),
+    /// A saved workspace of this version, or of the one before it in today's
+    /// shape.
+    pub(super) fn parse(bytes: &[u8]) -> Result<SavedWorkspace, String> {
+        #[derive(Deserialize)]
+        struct Header {
+            version: u32,
+        }
+        let unparsable = |e: serde_json::Error| format!("cannot parse: {e}");
+        let Header { version } = serde_json::from_slice(bytes).map_err(unparsable)?;
+        match version {
+            VERSION => serde_json::from_slice(bytes).map_err(unparsable),
+            1 => serde_json::from_slice::<SavedWorkspaceV1>(bytes)
+                .map(SavedWorkspaceV1::migrate)
+                .map_err(unparsable),
+            other => Err(format!("version {other} is not {VERSION}")),
+        }
+    }
+
+    /// A version-1 file: a flat list of tabs with a free-text group label, and a
+    /// graph pane that named no graph. Fields it has and version 2 does not are
+    /// left out and so ignored: the label is not a group.
+    #[derive(Deserialize)]
+    struct SavedWorkspaceV1 {
+        tabs: Vec<SavedTabV1>,
+        next_tab: u64,
+        next_split: u64,
+        next_pane: u64,
+        next_terminal: u64,
+        owned: Vec<TerminalId>,
+        detached: Vec<TerminalId>,
+        terminals: Vec<SavedTerminal>,
+    }
+
+    #[derive(Deserialize)]
+    struct SavedTabV1 {
+        id: TabId,
+        title: Option<String>,
+        accent: Option<[u8; 4]>,
+        root: PaneNodeV1,
+    }
+
+    #[derive(Deserialize)]
+    enum PaneNodeV1 {
+        Split {
+            id: SplitId,
+            axis: Axis,
+            ratio: f32,
+            first: Box<PaneNodeV1>,
+            second: Box<PaneNodeV1>,
+        },
+        Leaf {
+            pane_id: PaneId,
+            surface: SurfaceV1,
+        },
+    }
+
+    #[derive(Deserialize)]
+    enum SurfaceV1 {
+        Graph,
+        Empty,
+        Terminal(TerminalId),
+    }
+
+    impl SavedWorkspaceV1 {
+        /// Every tab at the top level. A graph pane goes like a closed one: it
+        /// named no graph, and the graphs this runner executes get their panes
+        /// from the document. A tab that showed nothing else goes with it.
+        fn migrate(self) -> SavedWorkspace {
+            let items = self
+                .tabs
+                .into_iter()
+                .filter_map(|tab| {
+                    let mut graphs = Vec::new();
+                    let root = tab.root.migrate(&mut graphs);
+                    let root = graphs.into_iter().try_fold(root, remove_leaf)?;
+                    Some(SavedItem::Tab(SavedTab {
+                        id: tab.id,
+                        title: tab.title,
+                        accent: tab.accent,
+                        root,
+                    }))
+                })
+                .collect();
+            SavedWorkspace {
+                version: VERSION,
+                items,
+                next_tab: self.next_tab,
+                next_group: 1,
+                next_split: self.next_split,
+                next_pane: self.next_pane,
+                next_terminal: self.next_terminal,
+                owned: self.owned,
+                detached: self.detached,
+                terminals: self.terminals,
+            }
+        }
+    }
+
+    impl PaneNodeV1 {
+        /// The same tree with a graph leaf left empty and its pane listed in
+        /// `graphs`, for the caller to remove.
+        fn migrate(self, graphs: &mut Vec<PaneId>) -> PaneNode {
+            match self {
+                PaneNodeV1::Split {
+                    id,
+                    axis,
+                    ratio,
+                    first,
+                    second,
+                } => PaneNode::Split {
+                    id,
+                    axis,
+                    ratio,
+                    first: Box::new(first.migrate(graphs)),
+                    second: Box::new(second.migrate(graphs)),
                 },
-            },
+                PaneNodeV1::Leaf { pane_id, surface } => PaneNode::Leaf {
+                    pane_id,
+                    surface: match surface {
+                        SurfaceV1::Graph => {
+                            graphs.push(pane_id);
+                            SurfaceRef::Empty
+                        }
+                        SurfaceV1::Empty => SurfaceRef::Empty,
+                        SurfaceV1::Terminal(terminal) => SurfaceRef::Terminal(terminal),
+                    },
+                },
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use zeughaus_mux::{Axis, PaneId, SplitId, SurfaceRef};
+
+    use super::read::parse;
     use super::*;
 
     /// A file as a version-1 runner wrote it: the graph tab, a tab split

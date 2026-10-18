@@ -310,12 +310,13 @@ pub fn inner_sh(a: &Assignment, runner_exe: Option<&Path>) -> String {
 /// host's time, which goes to `date -s` with 5 ms added, so the guest runs a
 /// little ahead of the host and a file written now never looks newer than the
 /// clock. When any step fails the script says so and the job runs on with the
-/// clock the VM has. Podman shares the host kernel's clock and has no such
+/// clock the VM has. `awk` formats in the C locale: a decimal comma is no
+/// time `date` reads. Podman shares the host kernel's clock and has no such
 /// script.
 pub fn clock_sh() -> &'static str {
     r#": > /ci/run/.clock \
   && t=$(stat -c %.Y /ci/run/.clock) \
-  && date -s "@$(awk -v t="$t" 'BEGIN { printf "%.6f", t + 0.005 }')" >/dev/null \
+  && date -s "@$(LC_ALL=C awk -v t="$t" 'BEGIN { printf "%.6f", t + 0.005 }')" >/dev/null \
   || printf '[zeughaus-ci] warning: cannot set the container clock from the host; files written now may look newer than the clock\n'
 rm -f /ci/run/.clock
 exec /bin/sh /ci/run/inner.sh
@@ -558,7 +559,11 @@ mod tests {
 
     use super::*;
 
+    // A test that runs `/bin/sh` or reads a `launch.sh` for POSIX paths is
+    // `cfg(unix)`: a Windows runner writes and runs `.ps1` launchers only.
+
     #[test]
+    #[cfg(unix)]
     fn shell_quoting_survives_quotes() {
         let quoted = sh_quote("it's $HOME");
         let output = std::process::Command::new("/bin/sh")
@@ -570,6 +575,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn env_sh_round_trips_through_a_shell() {
         let vars = vec![
             ("A".to_owned(), "x 'y' $z".to_owned()),
@@ -614,6 +620,7 @@ mod tests {
 
     /// A program the shell side of these tests can run in place of `ssh`,
     /// `date` or the runner's `timeout`: `body` under `#!/bin/sh`.
+    #[cfg(unix)]
     fn stand_in(path: &Path, body: &str) {
         std::fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
         std::process::Command::new("chmod")
@@ -638,6 +645,7 @@ mod tests {
     /// timeout program and ends with the job's exit code: no shell follows a
     /// failure, and nothing is written for the runner to look for.
     #[test]
+    #[cfg(unix)]
     fn a_failed_host_job_exits_with_its_code() {
         let base = std::env::temp_dir().join(format!("zci-launch-inner-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -671,6 +679,7 @@ mod tests {
     /// the output back only after a success, and opens no second session
     /// after a failure.
     #[test]
+    #[cfg(unix)]
     fn a_vm_job_ends_with_the_guests_exit_code_and_opens_no_shell() {
         let base = std::env::temp_dir().join(format!("zci-launch-vm-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -800,6 +809,7 @@ mod tests {
     /// Apple's `container` starts its system on demand and has no read-only
     /// volume.
     #[test]
+    #[cfg(unix)]
     fn an_apple_container_launcher_starts_the_system_and_mounts_inputs_writable() {
         let script = container_script(Engine::Apple);
         assert!(script.contains(
@@ -845,6 +855,7 @@ mod tests {
     /// the clock is set to the host's stamp plus 5 ms and the job starts; when
     /// setting it fails the script says so and the job starts all the same.
     #[test]
+    #[cfg(unix)]
     fn the_clock_script_sets_the_clock_a_little_ahead_and_always_starts_the_job() {
         let base = std::env::temp_dir().join(format!("zci-launch-clock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -980,6 +991,7 @@ mod tests {
 
     /// `git -C dir args`, which must succeed: its output without the final
     /// newline.
+    #[cfg(unix)]
     fn git(dir: &Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
             .arg("-C")
@@ -1000,6 +1012,7 @@ mod tests {
     }
 
     /// `script` under `/bin/sh`: its exit code and standard output.
+    #[cfg(unix)]
     fn sh(script: &str) -> (Option<i32>, String) {
         let output = std::process::Command::new("/bin/sh")
             .arg("-c")
@@ -1016,6 +1029,7 @@ mod tests {
     /// snapshot makes it: `files` written (None removes one), a commit
     /// without a parent of the whole tree, and a bundle of it under `refname`
     /// as bundle `index` of the run in `run_dir`. Returns the commit.
+    #[cfg(unix)]
     fn snapshot(
         base: &Path,
         run_dir: &Path,
@@ -1061,6 +1075,7 @@ mod tests {
     /// rest of what is untracked is not, and a wipe takes the ignored files
     /// too.
     #[test]
+    #[cfg(unix)]
     fn a_checkout_keeps_what_git_ignores_until_it_is_a_wipe() {
         let base = std::env::temp_dir().join(format!("zci-launch-checkout-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -1119,6 +1134,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn manual_launcher(a: &Assignment, target: Target<'_>) -> String {
         launch_sh(&Launch {
             assignment: a,
@@ -1134,6 +1150,7 @@ mod tests {
     /// and the others into `.zci-siblings` below it, and the job starts in the
     /// first.
     #[test]
+    #[cfg(unix)]
     fn a_manual_launcher_fetches_every_bundle_and_checks_out_every_commit() {
         let workspace = PathBuf::from("/s/ci/work/demo/host");
         let a = manual_assignment(Place::Host);
@@ -1304,6 +1321,7 @@ mod tests {
     /// what an earlier one built there, and a bundle that does not hold its
     /// commit ends the launcher with 70.
     #[test]
+    #[cfg(unix)]
     fn a_manual_run_enters_every_working_tree_from_its_bundle() {
         let base = std::env::temp_dir().join(format!("zci-launch-manual-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -1450,6 +1468,7 @@ mod tests {
     /// replaces the tree, and a pipeline's checkout leaves the siblings of a
     /// manual run alone until it is a wipe.
     #[test]
+    #[cfg(unix)]
     fn a_pipeline_job_and_a_manual_run_share_one_workspace() {
         let base = std::env::temp_dir().join(format!("zci-launch-shared-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);

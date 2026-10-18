@@ -118,12 +118,12 @@ pub fn engine(engine: Engine, args: &[&str]) -> Result<(), String> {
     }
 }
 
-#[cfg(test)]
+// Hard links and their inode numbers are compared through unix metadata.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
     #[test]
-    #[cfg(unix)]
     fn a_linked_tree_shares_its_files_and_keeps_its_shape() {
         use std::os::unix::fs::MetadataExt;
         let base = std::env::temp_dir().join(format!("zci-link-{}", std::process::id()));

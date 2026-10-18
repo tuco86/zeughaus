@@ -1048,7 +1048,14 @@ mod tests {
         );
     }
 
+    /// A job as the CI gives it to a runner of this host's kind: a Windows
+    /// runner runs `.ps1` jobs only.
     fn assignment() -> Assignment {
+        let (file, interpreter) = if cfg!(windows) {
+            ("build.ps1", "powershell")
+        } else {
+            ("build.sh", "/bin/sh")
+        };
         Assignment {
             run: "demo.7.build".to_owned(),
             repo: "demo".to_owned(),
@@ -1058,8 +1065,8 @@ mod tests {
             fetch_user: String::new(),
             fetch_token: None,
             sha: "ab12".to_owned(),
-            file: "build.sh".to_owned(),
-            interpreter: "/bin/sh".to_owned(),
+            file: file.to_owned(),
+            interpreter: interpreter.to_owned(),
             place: Place::Host,
             env: Vec::new(),
             secrets: Vec::new(),
@@ -1114,11 +1121,12 @@ mod tests {
         ] {
             assert!(validate(&bad).is_err(), "{bad:?}");
         }
+        // A Windows runner has no containers.
         let in_container = Assignment {
             place: container("trixie"),
             ..ok
         };
-        assert!(validate(&in_container).is_ok());
+        assert_eq!(validate(&in_container).is_ok(), cfg!(unix));
     }
 
     /// The names of a manual run's checkouts become directories below its
@@ -1135,8 +1143,6 @@ mod tests {
             number: 9,
             job: "check".to_owned(),
             sha: "a".repeat(40),
-            file: "check.sh".to_owned(),
-            interpreter: "sh".to_owned(),
             upload: Some(Upload {
                 dirs: vec![dir("demo", &"a".repeat(40)), dir("weida", &"b".repeat(40))],
             }),
@@ -1147,7 +1153,7 @@ mod tests {
             place: container("trixie"),
             ..ok.clone()
         };
-        assert!(validate(&in_container).is_ok());
+        assert_eq!(validate(&in_container).is_ok(), cfg!(unix));
 
         let with = |dirs: Vec<UploadDir>| Assignment {
             upload: Some(Upload { dirs }),

@@ -212,7 +212,9 @@ impl Workspace {
     /// tab is not restored, the next triggered run creates it again. Graph
     /// panes stay: whether their graph still exists is the next
     /// [`Workspace::sync_graphs`]'s to say. Every owned terminal ends up
-    /// shown or detached.
+    /// shown or detached. Only terminals in shims outlive a runner, and
+    /// shims are unix-only.
+    #[cfg(any(unix, test))]
     pub fn restore(
         incarnation: RunnerIncarnation,
         saved: &SavedWorkspace,
@@ -280,6 +282,7 @@ impl Workspace {
 
     /// Whether `terminal` belongs to this workspace: a pane shows it, or
     /// the runner owns it.
+    #[cfg(any(unix, test))]
     pub fn knows(&self, terminal: TerminalId) -> bool {
         self.owned.contains(&terminal)
             || self

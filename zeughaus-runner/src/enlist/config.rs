@@ -222,7 +222,9 @@ mod tests {
         );
     }
 
+    // Containers and machines are offered by unix runners only.
     #[test]
+    #[cfg(unix)]
     fn a_full_file_reads_every_section() {
         let text = format!(
             "ci = \"{}\"\nname = \"tuco-pc\"\ncpus = 16\n\
