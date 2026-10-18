@@ -4,13 +4,23 @@
 //! Frames on [`crate::ENLIST_PATH`] and [`crate::ARTIFACTS_PATH`] are a 4-byte
 //! little-endian length followed by a postcard body of at most
 //! [`MAX_ENLIST_FRAME_BYTES`].
+//!
+//! An artifact set (a tar) or a try bundle moves on an
+//! [`crate::ARTIFACTS_PATH`] exchange as chunks that follow the frame that
+//! announces it: an [`ArtifactRequest::Upload`] (producer to CI) or an
+//! [`ArtifactReply::Sending`] (CI to consumer). A chunk is a `u32`
+//! little-endian length in `1..=`[`ARTIFACT_CHUNK`] and that many bytes; a
+//! length of 0 ends the set. A body that ends without the 0 is a broken
+//! transfer, and every hop refuses a running total above
+//! [`MAX_ARTIFACT_BYTES`]. The size is not announced, so the sender packs
+//! while it sends and the receiver unpacks while it receives.
 
 use serde::{Deserialize, Serialize};
 
 use crate::machine::MachineState;
 
 /// The protocol major a runner and the CI must share.
-pub const ENLIST_MAJOR: u32 = 3;
+pub const ENLIST_MAJOR: u32 = 4;
 
 /// The most one frame body may carry.
 pub const MAX_ENLIST_FRAME_BYTES: usize = 1 << 20;
@@ -19,8 +29,11 @@ pub const MAX_ENLIST_FRAME_BYTES: usize = 1 << 20;
 /// [`MAX_ENLIST_FRAME_BYTES`] so the frame around it still fits.
 pub const MAX_OUTPUT_CHUNK: usize = 256 << 10;
 
-/// The largest artifact tar either side accepts.
+/// The largest artifact set, counted in bytes of tar, either side accepts.
 pub const MAX_ARTIFACT_BYTES: u64 = 4 << 30;
+
+/// The most bytes one chunk of an artifact transfer carries.
+pub const ARTIFACT_CHUNK: usize = 1 << 20;
 
 /// What a runner says to the CI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -54,6 +67,27 @@ pub enum FromRunner {
     Frozen { run: String, frozen: bool },
     /// The run ended; its log has been sent up to its end.
     Finished { run: String, end: RunEnd },
+    /// An input of the run `run`, the consuming job's, moves to this runner:
+    /// the artifact set of its need `need`.
+    Transfer {
+        run: String,
+        need: String,
+        event: TransferEvent,
+    },
+}
+
+/// How far the transfer of one input has come.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransferEvent {
+    /// The runner began to fetch the set.
+    Started,
+    /// The set arrived and is unpacked; `bytes` is the size of its tar.
+    Done {
+        bytes: u64,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 /// What a runner can run.
@@ -227,13 +261,10 @@ pub enum InputSource {
 /// First frame of an [`crate::ARTIFACTS_PATH`] exchange.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArtifactRequest {
-    /// The producing runner answers [`ToRunner::Upload`]; `size` raw bytes
-    /// follow, which the CI streams to the waiting download.
-    Upload {
-        run: String,
-        transfer: u64,
-        size: u64,
-    },
+    /// The producing runner answers [`ToRunner::Upload`]; the chunks of the
+    /// set follow, which the CI relays to the waiting download as they
+    /// arrive.
+    Upload { run: String, transfer: u64 },
     /// The producing runner cannot send what `transfer` asked for.
     Unavailable {
         run: String,
@@ -246,14 +277,12 @@ pub enum ArtifactRequest {
     TryBundle { run: String, index: u32 },
 }
 
-/// The CI's answer; after `Sending`, `size` raw bytes follow.
+/// The CI's answer; after `Sending`, the chunks of the set follow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArtifactReply {
     /// An upload reached its download, or an `Unavailable` was passed on.
     Done,
-    Sending {
-        size: u64,
-    },
+    Sending,
     Error {
         message: String,
     },
@@ -332,6 +361,80 @@ where
     postcard::from_bytes(&body)
         .map(Some)
         .map_err(|e| format!("decode frame: {e}"))
+}
+
+/// Writes one chunk of an artifact transfer: its length, then `bytes`, which
+/// must be `1..=`[`ARTIFACT_CHUNK`] long. A length of 0 ends the set, which
+/// [`write_end`] writes.
+#[cfg(feature = "tokio")]
+pub async fn write_chunk<W>(w: &mut W, bytes: &[u8]) -> Result<(), String>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    if bytes.is_empty() || bytes.len() > ARTIFACT_CHUNK {
+        return Err(format!(
+            "a chunk of {} bytes is not in 1..={ARTIFACT_CHUNK}",
+            bytes.len()
+        ));
+    }
+    // At most ARTIFACT_CHUNK, which a u32 holds.
+    w.write_all(&(bytes.len() as u32).to_le_bytes())
+        .await
+        .map_err(|e| format!("write chunk: {e}"))?;
+    w.write_all(bytes)
+        .await
+        .map_err(|e| format!("write chunk: {e}"))
+}
+
+/// Ends an artifact transfer: the set is complete.
+#[cfg(feature = "tokio")]
+pub async fn write_end<W>(w: &mut W) -> Result<(), String>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    w.write_all(&0u32.to_le_bytes())
+        .await
+        .map_err(|e| format!("write end: {e}"))
+}
+
+/// Reads the next chunk of an artifact transfer; `buf` holds exactly that
+/// chunk afterwards. `false` is the end of the set, and `buf` is empty then.
+/// A stream that ends before the end marker is an error, and so is a length
+/// above [`ARTIFACT_CHUNK`], raised before its body is read.
+#[cfg(feature = "tokio")]
+pub async fn read_chunk<R>(r: &mut R, buf: &mut Vec<u8>) -> Result<bool, String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::{AsyncReadExt, ErrorKind};
+
+    let cut_short = |e: std::io::Error| {
+        if e.kind() == ErrorKind::UnexpectedEof {
+            "the stream ended before the end of the set".to_owned()
+        } else {
+            format!("read chunk: {e}")
+        }
+    };
+    let mut len = [0u8; 4];
+    r.read_exact(&mut len).await.map_err(cut_short)?;
+    let len = u32::from_le_bytes(len) as usize;
+    if len == 0 {
+        buf.clear();
+        return Ok(false);
+    }
+    if len > ARTIFACT_CHUNK {
+        return Err(format!("chunk of {len} bytes exceeds {ARTIFACT_CHUNK}"));
+    }
+    // The read overwrites everything it keeps, so only what the buffer
+    // lacks of a longer chunk is zero-filled.
+    buf.truncate(len);
+    buf.resize(len, 0);
+    r.read_exact(buf).await.map_err(cut_short)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -420,6 +523,105 @@ mod tests {
             read_frame::<_, ArtifactRequest>(&mut r).await.unwrap(),
             Some(request)
         );
+    }
+
+    #[tokio::test]
+    async fn chunks_round_trip_and_the_set_ends_at_the_marker() {
+        let big = vec![7u8; ARTIFACT_CHUNK];
+        let mut wire = Vec::new();
+        write_chunk(&mut wire, b"abc").await.unwrap();
+        write_chunk(&mut wire, &big).await.unwrap();
+        write_chunk(&mut wire, b"z").await.unwrap();
+        write_end(&mut wire).await.unwrap();
+        // What follows the set belongs to whoever reads on.
+        wire.extend_from_slice(b"next");
+
+        let mut r: &[u8] = &wire;
+        let mut buf = Vec::new();
+        assert!(read_chunk(&mut r, &mut buf).await.unwrap());
+        assert_eq!(buf, b"abc");
+        assert!(read_chunk(&mut r, &mut buf).await.unwrap());
+        assert_eq!(buf, big);
+        assert!(read_chunk(&mut r, &mut buf).await.unwrap());
+        assert_eq!(buf, b"z", "a short chunk replaces a long one");
+        assert!(!read_chunk(&mut r, &mut buf).await.unwrap());
+        assert!(buf.is_empty());
+        assert_eq!(r, b"next");
+    }
+
+    #[tokio::test]
+    async fn a_set_cut_before_its_end_marker_is_an_error() {
+        let mut whole = Vec::new();
+        write_chunk(&mut whole, b"abcdef").await.unwrap();
+        write_end(&mut whole).await.unwrap();
+        // Cut inside the length, inside the body, between body and marker
+        // and inside the marker.
+        for cut in 0..whole.len() {
+            let mut r: &[u8] = &whole[..cut];
+            let mut buf = Vec::new();
+            let mut read = read_chunk(&mut r, &mut buf).await;
+            if read == Ok(true) {
+                read = read_chunk(&mut r, &mut buf).await;
+            }
+            let err = read.unwrap_err();
+            assert!(err.contains("before the end"), "cut at {cut}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversize_chunk_is_refused_before_its_body() {
+        // Only the length follows: a read of the body would meet the end of
+        // the stream and report that instead.
+        let len = (ARTIFACT_CHUNK as u32 + 1).to_le_bytes();
+        let mut r: &[u8] = &len;
+        let err = read_chunk(&mut r, &mut Vec::new()).await.unwrap_err();
+        assert!(err.contains("exceeds"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_chunk_holds_one_byte_up_to_the_limit() {
+        let mut out = Vec::new();
+        // A zero length is the end of the set, so an empty chunk must not be
+        // written.
+        assert!(write_chunk(&mut out, &[]).await.is_err());
+        assert!(
+            write_chunk(&mut out, &vec![0u8; ARTIFACT_CHUNK + 1])
+                .await
+                .is_err()
+        );
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_transfer_report_round_trips() {
+        let events = [
+            TransferEvent::Started,
+            TransferEvent::Done { bytes: 3 << 30 },
+            TransferEvent::Failed {
+                message: "the CI is gone".to_owned(),
+            },
+        ];
+        let mut buf = Vec::new();
+        for event in &events {
+            let msg = FromRunner::Transfer {
+                run: "r.2.c".to_owned(),
+                need: "a".to_owned(),
+                event: event.clone(),
+            };
+            write_frame(&mut buf, &msg).await.unwrap();
+        }
+        let mut r: &[u8] = &buf;
+        for event in events {
+            let Some(FromRunner::Transfer {
+                run,
+                need,
+                event: got,
+            }) = read_frame::<_, FromRunner>(&mut r).await.unwrap()
+            else {
+                panic!("not a transfer report");
+            };
+            assert_eq!((run.as_str(), need.as_str(), got), ("r.2.c", "a", event));
+        }
     }
 }
 

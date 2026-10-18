@@ -312,7 +312,12 @@ impl Executor {
     }
 
     /// Downloads the bundles of a try run into `<run>/bundles/`.
-    fn stage_bundles(&self, ctl: &RunCtl, upload: &Upload, run_dir: &Path) -> Result<(), Prep> {
+    fn stage_bundles(
+        self: &Arc<Self>,
+        ctl: &RunCtl,
+        upload: &Upload,
+        run_dir: &Path,
+    ) -> Result<(), Prep> {
         for (index, _) in (0u32..).zip(&upload.dirs) {
             let dest = launch::bundle_file(run_dir, index);
             self.fetch_try_bundle(&ctl.assignment.run, index, &dest)
@@ -334,10 +339,8 @@ impl Executor {
         let started = now_secs();
         let inputs = run_dir.join("inputs");
         std::fs::create_dir_all(&inputs).map_err(|e| format!("cannot create inputs: {e}"))?;
-        for input in &a.inputs {
-            self.stage_input(&inputs, input)?;
-            check_abort(ctl)?;
-        }
+        self.stage_inputs(&a.run, &inputs, &a.inputs)?;
+        check_abort(ctl)?;
 
         let workspace = work_dir(&self.state_dir, &a.repo, &a.workspace);
         // A try run starts in its main checkout, one of those below the
@@ -549,8 +552,50 @@ impl Executor {
             .ok_or_else(|| format!("runner {} offers no machine {name}", self.config.name))
     }
 
-    /// Puts one need's artifacts under `inputs/<need>`.
-    fn stage_input(&self, inputs: &Path, input: &Input) -> Result<(), Prep> {
+    /// Stages every input at once. Each is a transfer of its own, bound by a
+    /// link or a disk and not by this thread, so they overlap. The first
+    /// error, in the order of the inputs, is the run's.
+    fn stage_inputs(
+        self: &Arc<Self>,
+        consumer: &str,
+        inputs: &Path,
+        needs: &[Input],
+    ) -> Result<(), Prep> {
+        std::thread::scope(|scope| {
+            let staging: Vec<_> = needs
+                .iter()
+                .map(|input| {
+                    std::thread::Builder::new()
+                        .name("zeughaus-enlist-stage".into())
+                        .spawn_scoped(scope, move || self.stage_input(consumer, inputs, input))
+                })
+                .collect();
+            let mut first = Ok(());
+            for thread in staging {
+                let staged = match thread {
+                    Ok(handle) => handle.join().unwrap_or_else(|_| {
+                        Err(Prep::Failed("an input thread panicked".to_owned()))
+                    }),
+                    Err(e) => Err(Prep::Failed(format!(
+                        "cannot start a thread to stage inputs: {e}"
+                    ))),
+                };
+                if first.is_ok() {
+                    first = staged;
+                }
+            }
+            first
+        })
+    }
+
+    /// Puts one need's artifacts under `inputs/<need>`, for the run
+    /// `consumer`.
+    fn stage_input(
+        self: &Arc<Self>,
+        consumer: &str,
+        inputs: &Path,
+        input: &Input,
+    ) -> Result<(), Prep> {
         if !valid_name(&input.need) {
             return Err(Prep::Failed(format!("{:?} is not a job name", input.need)));
         }
@@ -570,7 +615,7 @@ impl Executor {
                 if !safe_run(run) {
                     return Err(Prep::Failed(format!("{run:?} is not a run")));
                 }
-                self.download(run, &dest)
+                self.fetch_input(consumer, &input.need, run, &dest)
                     .map_err(|e| format!("cannot fetch inputs of {}: {e}", input.need))?;
             }
         }

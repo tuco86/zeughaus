@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeughaus_link::enlist::{
     Assignment, Checkout, FromRunner, Input, InputSource, Place, RunEnd, RunReport, ToRunner,
-    Upload, WhenBusy, parse_run_id, run_id,
+    TransferEvent, Upload, WhenBusy, parse_run_id, run_id,
 };
 use zeughaus_link::tryrun::TRY_WORKSPACE;
 
@@ -1827,7 +1827,57 @@ impl Scheduler {
                     self.runners.send(name, ToRunner::Forget { run });
                 }
             }
+            FromRunner::Transfer { run, need, event } => {
+                self.on_transfer(name, &run, need, event);
+            }
         }
+    }
+
+    /// Records how far an input moves to the runner of the job `run`, and
+    /// announces the record. Ignored unless that runner is the job's, the job
+    /// has not ended and `need` is one of its needs: the record is what
+    /// editors show.
+    fn on_transfer(&mut self, name: &str, run: &str, need: String, event: TransferEvent) {
+        let Some((pi, ji)) = self.locate(run) else {
+            return;
+        };
+        let job = &mut self.running[pi].jobs[ji];
+        if job.runner.as_deref() != Some(name)
+            || job.status.is_terminal()
+            || !job.def.needs.contains(&need)
+        {
+            return;
+        }
+        let now = crate::now_secs();
+        match event {
+            TransferEvent::Started => {
+                // An attempt that never reported its end is superseded.
+                job.transfers
+                    .retain(|t| t.need != need || t.finished.is_some());
+                job.transfers.push(TransferRecord {
+                    need,
+                    started: now,
+                    finished: None,
+                    bytes: None,
+                    error: None,
+                });
+            }
+            TransferEvent::Done { bytes } => {
+                let Some(transfer) = open_transfer(job, &need) else {
+                    return;
+                };
+                transfer.finished = Some(now);
+                transfer.bytes = Some(bytes);
+            }
+            TransferEvent::Failed { message } => {
+                let Some(transfer) = open_transfer(job, &need) else {
+                    return;
+                };
+                transfer.finished = Some(now);
+                transfer.error = Some(message);
+            }
+        }
+        self.running[pi].save(&self.state_dir, &self.changes);
     }
 
     /// A run ended. Its transcript is complete here: the runner streams the
@@ -2037,6 +2087,14 @@ impl Scheduler {
         job.transfers.clear();
         self.running[pi].save(&self.state_dir, &self.changes);
     }
+}
+
+/// The newest transfer of `need` that has not ended.
+fn open_transfer<'a>(job: &'a mut JobRecord, need: &str) -> Option<&'a mut TransferRecord> {
+    job.transfers
+        .iter_mut()
+        .rev()
+        .find(|t| t.need == need && t.finished.is_none())
 }
 
 /// The cause line of a failed job's excerpt, unless the job holds secrets:
@@ -3523,6 +3581,68 @@ mod tests {
         let old = serde_json::from_value::<JobRecord>(json).unwrap();
         assert_eq!(old.assigned, None);
         assert!(old.transfers.is_empty());
+    }
+
+    #[test]
+    fn transfer_reports_land_in_the_consumers_record() {
+        let state = scratch("transfers");
+        let mut s = scheduler(&state);
+        // `b`, the consumer, runs on `y`.
+        s.running.push(two_jobs("x"));
+        let report = |runner: &str, need: &str, event| Msg::FromRunner {
+            name: runner.to_owned(),
+            message: FromRunner::Transfer {
+                run: "view.7.b".to_owned(),
+                need: need.to_owned(),
+                event,
+            },
+        };
+        let transfers = |s: &Scheduler| s.running[0].jobs[1].transfers.clone();
+
+        // Only the consumer's runner reports on it, and only about its needs.
+        s.handle(report("x", "a", TransferEvent::Started));
+        s.handle(report("y", "zzz", TransferEvent::Started));
+        assert!(transfers(&s).is_empty());
+
+        s.handle(report("y", "a", TransferEvent::Started));
+        let open = transfers(&s);
+        assert_eq!(open.len(), 1);
+        assert_eq!((open[0].need.as_str(), open[0].finished), ("a", None));
+        s.handle(report("x", "a", TransferEvent::Done { bytes: 99 }));
+        assert_eq!(transfers(&s), open, "x is not the runner of b");
+
+        s.handle(report("y", "a", TransferEvent::Done { bytes: 10 }));
+        let done = transfers(&s);
+        assert_eq!(done.len(), 1);
+        assert_eq!((done[0].bytes, done[0].error.as_deref()), (Some(10), None));
+        assert!(done[0].finished.is_some());
+
+        // A new attempt replaces one that never ended; a failure keeps its
+        // message.
+        s.handle(report("y", "a", TransferEvent::Started));
+        s.handle(report("y", "a", TransferEvent::Started));
+        let failure = TransferEvent::Failed {
+            message: "the CI is gone".to_owned(),
+        };
+        s.handle(report("y", "a", failure));
+        let all = transfers(&s);
+        assert_eq!(all.len(), 2, "the first stays, the two starts are one try");
+        assert_eq!(all[0], done[0]);
+        assert_eq!(
+            (all[1].bytes, all[1].error.as_deref()),
+            (None, Some("the CI is gone"))
+        );
+        assert!(all[1].finished.is_some());
+
+        // The record on disk is the one the editors are told about.
+        let saved = load_pipeline(&state, "view", 7).unwrap();
+        assert_eq!(saved.jobs[1].transfers, all);
+
+        // A job that ended takes no more reports.
+        s.running[0].jobs[1].status = JobStatus::Failed;
+        s.handle(report("y", "a", TransferEvent::Started));
+        assert_eq!(transfers(&s), all);
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]

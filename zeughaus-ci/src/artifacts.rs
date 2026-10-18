@@ -5,12 +5,14 @@
 //!
 //! A consuming runner opens a `Download`; the CI asks the producing runner
 //! for the set with [`ToRunner::Upload`] under a transfer number, and that
-//! runner answers on an exchange of its own with `Upload` (the tar follows)
-//! or `Unavailable`. The upload's bytes are streamed into the waiting
-//! download's reply as they arrive. One exchange moves one tar; the request
-//! is one frame ([`ArtifactRequest`]), an upload's bytes follow it, a
-//! download's follow the reply frame ([`ArtifactReply`]). A `TryBundle` is
-//! answered the same way, from the file the `/try` service stored.
+//! runner answers on an exchange of its own with `Upload` (the chunks of the
+//! set follow) or `Unavailable`. The upload's chunks are relayed into the
+//! waiting download's reply as they arrive, so the producer packs and the
+//! consumer unpacks while the set moves. One exchange moves one set; the
+//! request is one frame ([`ArtifactRequest`]), an upload's chunks follow it,
+//! a download's follow the reply frame ([`ArtifactReply`]), framed as
+//! `zeughaus_link::enlist` describes. A `TryBundle` is answered the same way,
+//! from the file the `/try` service stored.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -22,8 +24,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
 use weida::{IncomingRequest, IncomingTransfer, Replier, TransferMeta};
 use zeughaus_link::enlist::{
-    ArtifactReply, ArtifactRequest, MAX_ARTIFACT_BYTES, ToRunner, parse_run_id, read_frame, run_id,
-    write_frame,
+    ARTIFACT_CHUNK, ArtifactReply, ArtifactRequest, MAX_ARTIFACT_BYTES, ToRunner, parse_run_id,
+    read_chunk, read_frame, run_id, write_chunk, write_end, write_frame,
 };
 
 use crate::config::{CiConfig, valid_name};
@@ -32,11 +34,9 @@ use crate::scheduler::{JobStatus, Pipeline, load_pipeline};
 use crate::transport::principal_of;
 use crate::tryrun;
 
-/// Bytes moved per read or write.
-const CHUNK: usize = 256 << 10;
-
-/// How long a download waits for the producing runner to start its upload:
-/// it packs the set into a tar first, which for a gigabyte takes a while.
+/// How long a download waits for the producing runner to open its upload. The
+/// producer packs while it sends, so this is the time to be told, to connect
+/// and to pack the first chunk, not to pack the whole set.
 const UPLOAD_WAIT: Duration = Duration::from_secs(600);
 
 pub struct ArtifactService {
@@ -57,9 +57,8 @@ struct Waiting {
 
 /// What the producing runner answered.
 enum Offer {
-    /// `size` bytes of tar follow on `body`; `done` hears how the relay went.
+    /// The set's chunks follow on `body`; `done` hears how the relay went.
     Tar {
-        size: u64,
         body: IncomingTransfer,
         done: oneshot::Sender<Result<(), String>>,
     },
@@ -127,12 +126,8 @@ impl ArtifactService {
             }
         };
         let outcome = match first {
-            ArtifactRequest::Upload {
-                run,
-                transfer,
-                size,
-            } => {
-                let relayed = self.upload(&runner, &run, transfer, size, body).await;
+            ArtifactRequest::Upload { run, transfer } => {
+                let relayed = self.upload(&runner, &run, transfer, body).await;
                 answer(&mut reply, &runner, &run, relayed).await
             }
             ArtifactRequest::Unavailable {
@@ -171,21 +166,17 @@ impl ArtifactService {
     }
 
     /// Hands the upload's body to its download and waits until the download
-    /// has streamed it on.
+    /// has relayed it on.
     async fn upload(
         &self,
         runner: &str,
         run: &str,
         transfer: u64,
-        size: u64,
         body: IncomingTransfer,
     ) -> Result<(), String> {
-        if size > MAX_ARTIFACT_BYTES {
-            return Err(format!("{size} bytes is more than {MAX_ARTIFACT_BYTES}"));
-        }
         let waiting = self.take_waiting(runner, run, transfer)?;
         let (done, outcome) = oneshot::channel();
-        if waiting.offer.send(Offer::Tar { size, body, done }).is_err() {
+        if waiting.offer.send(Offer::Tar { body, done }).is_err() {
             return Err(format!("the download of {run} ended before the upload"));
         }
         outcome
@@ -229,8 +220,8 @@ impl ArtifactService {
         };
         lock(&self.waiting).remove(&transfer);
         let refused = |message: String| ArtifactReply::Error { message };
-        let (size, mut body, done) = match offered {
-            Some(Ok(Ok(Offer::Tar { size, body, done }))) => (size, body, done),
+        let (mut body, done) = match offered {
+            Some(Ok(Ok(Offer::Tar { body, done }))) => (body, done),
             Some(Ok(Ok(Offer::Unavailable(message)))) => {
                 return write_frame(reply, &refused(format!("runner {producer}: {message}"))).await;
             }
@@ -250,8 +241,8 @@ impl ArtifactService {
                 return write_frame(reply, &refused(message)).await;
             }
         };
-        let relayed = match write_frame(reply, &ArtifactReply::Sending { size }).await {
-            Ok(()) => relay(&mut body, size, reply).await,
+        let relayed = match write_frame(reply, &ArtifactReply::Sending).await {
+            Ok(()) => relay(&mut body, reply, MAX_ARTIFACT_BYTES).await,
             Err(e) => Err(e),
         };
         let _ = done.send(relayed.clone());
@@ -273,7 +264,7 @@ impl ArtifactService {
         })
     }
 
-    /// Streams bundle `index` of the try run `run` into `reply`.
+    /// Streams bundle `index` of the try run `run` into `reply` as chunks.
     async fn try_bundle(
         &self,
         requester: &str,
@@ -281,8 +272,8 @@ impl ArtifactService {
         index: u32,
         reply: &mut weida::OutgoingTransfer,
     ) -> Result<(), String> {
-        let (path, size) = match self.bundle_for(requester, run, index) {
-            Ok(found) => found,
+        let path = match self.bundle_for(requester, run, index) {
+            Ok(path) => path,
             Err(message) => return write_frame(reply, &ArtifactReply::Error { message }).await,
         };
         let mut file = match tokio::fs::File::open(&path).await {
@@ -292,15 +283,34 @@ impl ArtifactService {
                 return write_frame(reply, &ArtifactReply::Error { message }).await;
             }
         };
-        write_frame(reply, &ArtifactReply::Sending { size }).await?;
-        relay(&mut file, size, reply).await
+        write_frame(reply, &ArtifactReply::Sending).await?;
+        let mut chunk = vec![0u8; ARTIFACT_CHUNK];
+        let mut total = 0u64;
+        loop {
+            let n = file
+                .read(&mut chunk)
+                .await
+                .map_err(|e| format!("cannot read bundle {index} of {run}: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            if total > MAX_ARTIFACT_BYTES {
+                return Err(format!("more than {MAX_ARTIFACT_BYTES} bytes"));
+            }
+            write_chunk(reply, &chunk[..n]).await?;
+        }
+        write_end(reply).await?;
+        reply
+            .flush()
+            .await
+            .map_err(|e| format!("download failed: {e}"))
     }
 
-    /// The file and size of bundle `index` of the try run `run`, when
-    /// `requester` is the runner it is assigned to. The name came from a
-    /// peer and is joined into a path, so it is checked before and against
-    /// the records after.
-    fn bundle_for(&self, requester: &str, run: &str, index: u32) -> Result<(PathBuf, u64), String> {
+    /// The file of bundle `index` of the try run `run`, when `requester` is
+    /// the runner it is assigned to. The name came from a peer and is joined
+    /// into a path, so it is checked before and against the records after.
+    fn bundle_for(&self, requester: &str, run: &str, index: u32) -> Result<PathBuf, String> {
         let (repo, number, job) = parse_run_id(run).ok_or_else(|| format!("{run} is not a run"))?;
         if !valid_name(&repo) || !valid_name(&job) {
             return Err(format!("{run} is not a run"));
@@ -319,11 +329,7 @@ impl ArtifactService {
                 upload.dirs.len()
             ));
         }
-        let path = tryrun::bundle_path(&self.state_dir, id, index);
-        let size = std::fs::metadata(&path)
-            .map_err(|e| format!("cannot read bundle {index} of {run}: {e}"))?
-            .len();
-        Ok((path, size))
+        Ok(tryrun::bundle_path(&self.state_dir, id, index))
     }
 }
 
@@ -372,29 +378,32 @@ async fn answer(
     }
 }
 
-/// Copies exactly `size` bytes of `body` to `out`; a body that ends short is
-/// an error.
+/// Copies the chunks of `body` to `out` as they arrive, then the end marker.
+/// A body that ends before its end marker, or whose chunks add up to more
+/// than `limit` bytes, is an error, and `out` gets no end marker: whoever
+/// reads it sees a broken transfer.
 async fn relay(
     body: &mut (impl AsyncRead + Unpin),
-    size: u64,
     out: &mut (impl AsyncWrite + Unpin),
+    limit: u64,
 ) -> Result<(), String> {
-    let mut buf = vec![0u8; CHUNK];
-    let mut left = size;
-    while left > 0 {
-        let want = usize::try_from(left).map_or(CHUNK, |left| left.min(CHUNK));
-        let n = body
-            .read(&mut buf[..want])
-            .await
-            .map_err(|e| format!("upload failed: {e}"))?;
-        if n == 0 {
-            return Err(format!("upload ended {left} bytes short"));
+    let mut chunk = Vec::new();
+    let mut total = 0u64;
+    while read_chunk(body, &mut chunk)
+        .await
+        .map_err(|e| format!("upload failed: {e}"))?
+    {
+        total += chunk.len() as u64;
+        if total > limit {
+            return Err(format!("more than {limit} bytes"));
         }
-        out.write_all(&buf[..n])
+        write_chunk(out, &chunk)
             .await
             .map_err(|e| format!("download failed: {e}"))?;
-        left -= n as u64;
     }
+    write_end(out)
+        .await
+        .map_err(|e| format!("download failed: {e}"))?;
     out.flush()
         .await
         .map_err(|e| format!("download failed: {e}"))
@@ -410,16 +419,45 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn a_short_upload_is_an_error_and_a_full_one_is_exact() {
-        let mut out = Vec::new();
-        let mut body: &[u8] = b"0123456789";
-        assert!(relay(&mut body, 12, &mut out).await.is_err());
+    /// The bytes of a transfer of `parts` as chunks, with or without its end
+    /// marker.
+    async fn chunks(parts: &[&[u8]], end: bool) -> Vec<u8> {
+        let mut wire = Vec::new();
+        for part in parts {
+            write_chunk(&mut wire, part).await.unwrap();
+        }
+        if end {
+            write_end(&mut wire).await.unwrap();
+        }
+        wire
+    }
 
+    #[tokio::test]
+    async fn a_relayed_set_keeps_its_chunks_and_its_end_marker() {
+        let wire = chunks(&[b"0123", b"456789"], true).await;
+        let mut body: &[u8] = &wire;
         let mut out = Vec::new();
-        let mut body: &[u8] = b"0123456789";
-        relay(&mut body, 6, &mut out).await.expect("relay");
-        assert_eq!(out, b"012345");
+        relay(&mut body, &mut out, 100).await.expect("relay");
+        assert_eq!(out, wire);
+    }
+
+    #[tokio::test]
+    async fn a_set_cut_short_or_over_the_limit_is_passed_on_without_its_marker() {
+        // The upload stops before its end marker.
+        let wire = chunks(&[b"0123", b"456789"], false).await;
+        let mut body: &[u8] = &wire;
+        let mut out = Vec::new();
+        let err = relay(&mut body, &mut out, 100).await.unwrap_err();
+        assert!(err.contains("before the end"), "{err}");
+        assert_eq!(out, wire, "what arrived is passed on, nothing more");
+
+        // The chunk that takes the total over the limit is not passed on.
+        let wire = chunks(&[b"0123", b"456789"], true).await;
+        let mut body: &[u8] = &wire;
+        let mut out = Vec::new();
+        let err = relay(&mut body, &mut out, 9).await.unwrap_err();
+        assert!(err.contains("more than 9 bytes"), "{err}");
+        assert_eq!(out, chunks(&[b"0123"], false).await);
     }
 
     const FP: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
@@ -479,8 +517,8 @@ mod tests {
 
         assert!(service.bundle_for("x", run, 0).is_err(), "not assigned yet");
         service.runners.assign(run, "x");
-        assert_eq!(service.bundle_for("x", run, 0), Ok((path(0), 5)));
-        assert_eq!(service.bundle_for("x", run, 1), Ok((path(1), 3)));
+        assert_eq!(service.bundle_for("x", run, 0), Ok(path(0)));
+        assert_eq!(service.bundle_for("x", run, 1), Ok(path(1)));
         assert!(service.bundle_for("x", run, 2).is_err(), "no third bundle");
         assert!(service.bundle_for("y", run, 0).is_err(), "another runner");
         for bad in ["demo.4.try", "../demo.3.try", "demo.3.../try", "demo", ""] {

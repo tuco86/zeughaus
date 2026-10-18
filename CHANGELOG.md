@@ -25,8 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other pipelines' jobs of it wait their turn, the oldest first. A channel
   marked `clean = true` in `channels.toml` starts every workspace of its
   pipelines from nothing, `cache` paths included. This changes the enlist
-  protocol to major 3: a runner built before is refused (`protocol 2 is not
-  3`) until it is updated.
+  protocol (to major 4, together with the artifact transfers under
+  Changed): a runner built before is refused (`protocol 2 is not 4`) until it
+  is updated.
 - CI: a job with `needs` may name the `channels` it runs in, so a publish
   step that depends on a build job runs for `nightly` or `release` pipelines
   only. `zeughaus-ci check` refuses a channel that is neither in
@@ -86,6 +87,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stays up for a day after a failure and a CI job's excerpt is the last 40
   lines of its output. A restarted runner closes the terminals of the runs
   it finds recorded as ended.
+- CI: the artifacts of a job reach the runner of a job on another runner
+  while they are packed. The producing runner no longer writes a tar file
+  and measures it first: it sends the tar as 1 MiB chunks, the CI relays
+  them as they come and the consuming runner unpacks them as they arrive,
+  so neither runner needs the disk for a second copy and a set of
+  gigabytes starts moving at once. A job with several inputs fetches them
+  in parallel, and each transfer is reported to the CI, which keeps when it
+  began and ended and how many bytes moved, or why it failed, in the job's
+  record. This changes the enlist protocol to major 4: a runner built
+  before is refused until it is updated.
 
 ### Removed
 

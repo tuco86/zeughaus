@@ -833,7 +833,7 @@ lists the channels, `plan` starts with the one an event selects, and
 `clean = true` on a channel marks the pipelines it gets `clean` (kept in the
 record): their jobs start every workspace from nothing (**Contexts**).
 
-**The enlist protocol** (`zeughaus-link/src/enlist.rs`, `ENLIST_MAJOR` 3) is
+**The enlist protocol** (`zeughaus-link/src/enlist.rs`, `ENLIST_MAJOR` 4) is
 one long exchange on `/enlist` (req/rep) per runner. Frames are a 4-byte
 little-endian length and a postcard body, at most `MAX_ENLIST_FRAME_BYTES`
 (1 MiB), refused before the body is allocated.
@@ -848,9 +848,10 @@ little-endian length and a postcard body, at most `MAX_ENLIST_FRAME_BYTES`
   run's output the CI already holds.
 - The runner then reports `Busy`, `Machine` (a machine's status), `Started`,
   `StartFailed`, `Output { run, offset, bytes }` (at most
-  `MAX_OUTPUT_CHUNK`), `Frozen` and `Finished { run, end }`; the CI sends
-  `Assign`, `Kill`, `Upload` and `Forget`. A run is named
-  `<repo>.<number>.<job>` (`run_id`).
+  `MAX_OUTPUT_CHUNK`), `Frozen`, `Finished { run, end }` and `Transfer { run,
+  need, event }` (an input of the run `run` moving to this runner: `Started`,
+  `Done { bytes }` or `Failed { message }`); the CI sends `Assign`, `Kill`,
+  `Upload` and `Forget`. A run is named `<repo>.<number>.<job>` (`run_id`).
 - `Assign` carries everything the run needs and the runner has not: the
   repository URL and the fetch token, the commit, the script, the place, the
   environment (`CI`, `CI_REPO`, `CI_REF`, `CI_SHA`, `CI_JOB`, `CI_PLATFORM`, ...), the
@@ -878,9 +879,10 @@ own, after the runner is no longer held (`zeughaus-runner hold`):
    one), check the commit is there, pin it as `refs/ci/<n>`. A try run has
    no commit on the forge: it downloads its bundles into `<run>/bundles/`
    instead (**Try runs**).
-2. Stage the inputs into `<run>/inputs/<need>/`: hard-linked from this
-   runner's `ci/artifacts/<run>/` when the need ran here, else downloaded
-   through the CI's relay into a temporary tar of its own and unpacked.
+2. Stage the inputs into `<run>/inputs/<need>/`, one thread per input:
+   hard-linked from this runner's `ci/artifacts/<run>/` when the need ran
+   here, else downloaded through the CI's relay and unpacked as the chunks
+   arrive, reported to the CI as a `Transfer`.
 3. Write the secrets as files under `$XDG_RUNTIME_DIR/zeughaus-ci/<run>/`
    (`ci/tmp/<run>` where there is no `XDG_RUNTIME_DIR`, as on macOS), which
    the launcher removes.
@@ -949,19 +951,25 @@ runner that made it, and only as long as a job needs it; there is no
 retention count on either side. A runner keeps a successful run's set and
 hard-links it as `CI_INPUTS/<need>/` for a job of its own that needs it. For a
 job on another runner, the CI is a relay: the consumer's runner opens
-`Download { run }` on `/artifacts` (req/rep, `ArtifactRequest`/`ArtifactReply`,
-at most `MAX_ARTIFACT_BYTES`), the CI checks that it is assigned a job that
-needs the run and sends the producing runner `Upload { run, transfer }`;
-that runner packs the set into a temporary tar and answers on an exchange of
-its own with `Upload { run, transfer, size }` and the bytes, which the CI
-streams into the waiting download as they arrive and never stores (or
+`Download { run }` on `/artifacts` (req/rep, `ArtifactRequest`/`ArtifactReply`),
+the CI checks that it is assigned a job that needs the run and sends the
+producing runner `Upload { run, transfer }`; that runner answers on an
+exchange of its own with `Upload { run, transfer }` and the set, which the CI
+relays into the waiting download as it arrives and never stores (or
 `Unavailable`, which fails the download at once; nothing for ten minutes
-fails it too). A consumer is assigned only while the producing runner is
-connected. Once every job that needs a set has ended (succeeded, failed or
-skipped), and at once for a set nobody needs, the CI sends the producing
-runner `DropArtifacts { run }`; a runner's `Hello` lists the sets it holds,
-and the CI drops each one no pending job needs, which covers a drop lost
-with a connection or a restart of the CI. Nothing else reads a finished set.
+fails it too). The set is a tar sent as chunks: a `u32` little-endian length
+in `1..=ARTIFACT_CHUNK` (1 MiB) and that many bytes, ended by a length of 0.
+No size is announced and no file is made in transit: the producer packs while
+it sends and the consumer unpacks while it receives, a short queue between
+the thread that works on files and the task that moves the bytes. Every hop
+refuses a running total above `MAX_ARTIFACT_BYTES`, and a body that ends
+without the 0 is a broken transfer. A consumer is assigned only while the
+producing runner is connected. Once every job that needs a set has ended
+(succeeded, failed or skipped), and at once for a set nobody needs, the CI
+sends the producing runner `DropArtifacts { run }`; a runner's `Hello` lists
+the sets it holds, and the CI drops each one no pending job needs, which
+covers a drop lost with a connection or a restart of the CI. Nothing else
+reads a finished set.
 Only configured runners may use `/artifacts`. `TryBundle { run, index }` is
 the one request the CI answers from its own disk: bundle `index` of a try
 run, to the runner that run is assigned to (**Try runs**).

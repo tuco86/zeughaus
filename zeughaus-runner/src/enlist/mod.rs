@@ -25,7 +25,7 @@
 //!   the restart of runs a previous process left.
 //! * `control`: the clock of this runner: busy state, freezing, machine
 //!   status and the VM timeout.
-//! * `artifacts`: the tar files that cross to and from the CI.
+//! * `artifacts`: the artifact sets that cross to and from the CI, streamed.
 //! * `launch`, `machine`, `busy`, `git`, `cleanup`, `stage`: what a run is
 //!   rendered from and housekeeping.
 
@@ -95,8 +95,7 @@ fn work_dir(state_dir: &Path, repo: &str, workspace: &str) -> PathBuf {
     ci_dir(state_dir).join("work").join(repo).join(workspace)
 }
 
-/// Scratch space: secrets where there is no tmpfs, artifact tars in transit
-/// (`<run>.<n>.tar`).
+/// Scratch space: secrets where there is no tmpfs.
 fn tmp_dir(state_dir: &Path) -> PathBuf {
     ci_dir(state_dir).join("tmp")
 }
@@ -190,9 +189,6 @@ pub struct Executor {
     link: Mutex<Link>,
     /// One lock per repository's mirror.
     mirrors: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    /// Numbers the tar files in transit, so two transfers of one run never
-    /// share a file.
-    transfers: AtomicU64,
 }
 
 /// Starts enlisting: the executor's threads and the connection task. Called
@@ -256,12 +252,10 @@ pub fn start(
         runs: Mutex::new(HashMap::new()),
         link: Mutex::new(Link::default()),
         mirrors: Mutex::new(HashMap::new()),
-        transfers: AtomicU64::new(0),
     });
     if executor.containers || !executor.machines.is_empty() {
         control::thaw_everything(&executor);
     }
-    executor.clear_stale_tars();
     executor.recover();
     executor.sweep_inputs();
     control::spawn(&executor);
