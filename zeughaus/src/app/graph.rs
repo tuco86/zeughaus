@@ -1000,8 +1000,8 @@ impl App {
         self.document_of_nodes(&members)
     }
 
-    /// The graphs no runner holds: what the restore file carries.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// The graphs no runner holds: what the restore file of a restart carries.
+    #[cfg(unix)]
     pub(super) fn local_document(&self) -> GraphDocument {
         let members: Vec<NodeId> = self
             .node_order

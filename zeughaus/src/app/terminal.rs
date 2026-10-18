@@ -634,6 +634,7 @@ impl App {
 
     /// Terminals this window has scrolled back, with how many rows above the
     /// live screen their viewport starts: what a restart hands on.
+    #[cfg(unix)]
     pub(super) fn terminal_scrolls(&self) -> Vec<(RunnerKey, zeughaus_mux::TerminalId, i64)> {
         let mut scrolls: Vec<_> = self
             .mux

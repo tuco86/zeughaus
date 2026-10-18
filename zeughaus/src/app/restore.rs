@@ -15,7 +15,9 @@
 //! scrolls only once its first screen is here. Tabs and panes are named by
 //! their section's runner key, because their ids are unique per runner only.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use iced::{Point, Task};
@@ -102,11 +104,13 @@ pub fn from_env() -> Option<RestoreState> {
 
 /// Where a restart writes the restore file. The PID survives the `exec`, so
 /// two editors restarting at once cannot take each other's.
+#[cfg(unix)]
 pub fn path() -> PathBuf {
     zeughaus_link::credentials::state_dir().join(format!("restore-{}.json", std::process::id()))
 }
 
 /// Writes `state` to `file`, creating the state directory if needed.
+#[cfg(unix)]
 pub fn write(file: &Path, state: &RestoreState) -> std::io::Result<()> {
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir)?;
@@ -209,7 +213,9 @@ impl App {
         (app, Task::batch(tasks))
     }
 
-    /// What the next process needs to look like this one.
+    /// What the next process needs to look like this one. Only a restart
+    /// (`SIGUSR1`, unix) writes it.
+    #[cfg(unix)]
     pub(super) fn restore_state(&self) -> RestoreState {
         let mut cameras: Vec<(u64, f32, f32, f32)> = self
             .cameras
