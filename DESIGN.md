@@ -329,7 +329,7 @@ winit 0.30, which iced 0.14 pins, makes `set_window_icon` a no-op there, and
 `xdg_toplevel_icon_v1` -- the protocol that carries an icon per toplevel, and
 which KWin implements -- is supported from winit 0.31. Until iced moves, a
 Wayland compositor finds the icon through the desktop entry
-`deploy/install.sh` installs, named after the window's `app_id`. macOS has no
+`zeughaus-runner install desktop` writes, named after the window's `app_id`. macOS has no
 window icon at all: the icon of an app is the Dock's, and macOS reads it from
 the `Info.plist` of the bundle the app runs in. `deploy/macos-app.sh` is that
 bundle -- `deploy/macos/Info.plist` and an icns `render.py` draws at the ten
@@ -578,8 +578,8 @@ results keyed by (pin, tier, sequence).
 | runs | `<state-dir>/runs/<run-id>/` holds `wal` (a run from before the WAL: `log`), `exit` and `artifacts/` of every job run this runner executed; `--keep-runs <n>` (default 50) is how many successful runs stay, pruned when a run starts; failed runs and runs without an exit record are never pruned |
 | terminals | `<state-dir>/terminals/<id>/` (`spec.json`, `sock`, `shim.log`, a shell's `wal` and `wal.1`) per live terminal, `<state-dir>/workspace.json` for the tabs a restarted runner restores |
 | editor restart | `SIGUSR1` writes `<state-dir>/restore-<pid>.json` (window size and maximized state, active tab, focused pane and collapsed sections and groups by runner, cameras, node sizes, selection, an open palette with its input, a rename in progress, terminal scroll-back, nested views open in a section without a runner, the scratch document without a runner) and `exec`s the editor, which reads and deletes it through `ZEUGHAUS_RESTORE`. The window's position is not restored: a Wayland client can neither read nor set it |
-| deployment | `deploy/install.sh`: binaries in `~/.cargo/bin`, the systemd user unit `zeughaus-runner` (`KillMode=process`: the shims outlive the runner process; `reload` is `SIGUSR1`), and `~/.local/share/applications/net.doodleshnookie.Zeughaus.desktop` with its icon, which is how a Wayland compositor shows the editor's icon. Where `systemd-run --user --scope true` succeeds at start, the runner starts every shim in a transient scope of its own, so systemd-oomd, which kills whole cgroups, takes one terminal instead of the unit with every shell |
-| self-update | `<state-dir>/update.toml` (`channel`, optional `url`) turns the runner's updater on (section 14, **Releases and the updater**); it works in `<state-dir>/updates/<build>/`. Without the file nothing is checked or fetched |
+| deployment | A host is bootstrapped once by `deploy/bootstrap.sh <profile>` (or a `deploy/setup-*.sh` that ends in it) and then updates itself (section 14, **Releases and the updater**). The `desktop` profile (`zeughaus-runner install desktop`) puts the binaries in `~/.cargo/bin`, the systemd user unit `zeughaus-runner` (`KillMode=process`: the shims outlive the runner process; `reload` is `SIGUSR1`), and `~/.local/share/applications/net.doodleshnookie.Zeughaus.desktop` with its icon, which is how a Wayland compositor shows the editor's icon. Where `systemd-run --user --scope true` succeeds at start, the runner starts every shim in a transient scope of its own, so systemd-oomd, which kills whole cgroups, takes one terminal instead of the unit with every shell |
+| self-update | `<state-dir>/update.toml` (`channel`, optional `url`) turns the updater of the runner and of the CI on (section 14, **Releases and the updater**); every host has one, on `dev`. It works in `<state-dir>/updates/<build>/` and keeps its trial state in `<state-dir>/updates/state.json`; `<state-dir>/install.toml` (`profile`, `bin_dir`, optional `feed_addr`) says which files of the release's `share/` it rewrites for a new build. Without `update.toml` nothing is checked or fetched |
 | maintenance | `<state-dir>/maintain.toml` (`[[task]]`: `name`, `command` argv, `every_minutes`, `timeout_minutes`, default 30) lists tasks the runner runs itself (section 13, **Maintenance**); `<state-dir>/maintain/<name>.json` records each one's last start. Without the file nothing runs |
 
 ## 12. Testing strategy
@@ -1407,12 +1407,23 @@ those its repository's `grants` release to the event. They travel in
 there.
 
 **Releases and the updater.** zeughaus's own `.zeughaus-ci/` produces the
-releases its installed runners follow. Per platform one build job,
+releases its hosts follow. Per platform one build job,
 `build-<platform>`, builds the editor and the runner in a full build on its
 own platform, with no cross compilation of Rust code, and packs
 `zeughaus-<version>-<platform>.tar.gz` (`.zip` on
-Windows) into `CI_OUTPUT`, with the workspace version and `LICENSE-*` in a
-top directory `zeughaus-<version>-<platform>/`. The build number
+Windows) into `CI_OUTPUT`, with the workspace version, `LICENSE-*` and a
+`share/` directory in a top directory `zeughaus-<version>-<platform>/`.
+`share/` holds repository files under their repository paths, which `install`
+and the refresh after an update read instead of the checkout (`stage_share`
+in `build.sh`): on Linux `deploy/zeughaus-runner.service`,
+`deploy/net.doodleshnookie.Zeughaus.desktop`,
+`zeughaus/assets/icon/zeughaus.svg`, `deploy/runner/zeughaus-runner.service`,
+`deploy/runner/ssh_config`, `deploy/ci/zeughaus-ci.service` and
+`vm/win11/{vm.sh,autounattend.xml,setup.ps1,firstboot.ps1,toolchain.ps1,prepare.ps1}`;
+on `darwin-arm64` `deploy/macos/net.doodleshnookie.zeughaus-runner.plist`; on
+`windows-amd64` `deploy/windows/maintain.toml`. They are files of the archive
+and not `include_str!`, because every crate is published and a package
+cannot include files outside its directory. The build number
 `CI_PIPELINE` is compiled in as `ZEUGHAUS_BUILD` by the build jobs, not by
 `cargo_env`: it changes with every pipeline and would rebuild every unit
 that reads it in the shared workspace. A binary made anywhere else has
@@ -1445,7 +1456,7 @@ fingerprints.
 | `darwin-arm64` | `build-darwin-arm64`, `check-darwin-arm64` | `platform = "darwin-arm64"`: atik's host; the editor as `Zeughaus.app` (`deploy/macos-app.sh`) and the runner |
 | `publish` | - | `machine = "sadala"`, needs all eight |
 
-The Linux archives also hold `zeughaus-ci`; the updater never installs it.
+The Linux archives also hold `zeughaus-ci`, which the CI's updater installs.
 `build.sh` (no header, so a helper) is sourced by the Unix build and check
 jobs and by `publish.sh`; `windows.ps1` is the Windows jobs' helper (the
 `Run` function, `CARGO_TARGET_DIR` under `<workspace>\.ci-cache`, and weida:
@@ -1478,44 +1489,133 @@ characters, the Ed25519 seed from `zeughaus-runner release keygen`) and
 `ZEUGHAUS_GITHUB_TOKEN`. `publish.sh` reaches GitHub through a header file,
 never through argv.
 
-**What a runner trusts** is its own binary: the public key that signs
-releases is compiled in (`TRUSTED_KEYS` in `update/manifest.rs`), so a server
-that answers cannot make a runner install anything the CI's key did not
-sign. The signature is over the manifest, which binds the build number, the
-channel and the size and SHA-256 of every archive; an old release served as
-a new one, another channel's and a tampered archive are refused.
+**What a runner or CI trusts** is its own binary: the public key that signs
+releases is compiled in (`TRUSTED_KEYS` in `zeughaus-update/src/manifest.rs`),
+so a server that answers cannot make a host install anything the CI's key did
+not sign. The signature is over the manifest, which binds the build number,
+the channel and the size and SHA-256 of every archive; an old release served
+as a new one, another channel's and a tampered archive are refused. The one
+download that is not signature-checked is `deploy/bootstrap.sh`'s first
+one, which trusts HTTPS to the update host and the archive's `SHA256SUMS`
+line.
 
-**The updater** (`zeughaus-runner/src/update/`, unix only) starts with the
-runner when `<state-dir>/update.toml` exists. Its keys are `channel` and
+**The updater** (the `zeughaus-update` crate, which `zeughaus-runner` and
+`zeughaus-ci` both use; `Product::Runner` or `Product::Ci`) starts with the
+process when `<state-dir>/update.toml` exists. Its keys are `channel` and
 `url` (default `https://zeughaus.doodleshnookie.net/updates`); an unknown key
 or a malformed file is logged as `[update] <path>: <error>` and means no
 updater. One thread waits 10 s, then looks every 60 s at
-`<url>/<channel>/latest` with `curl`. A number above the binary's own build
-starts an attempt in `<state-dir>/updates/<build>/`: manifest and signature,
-then the archive of the host's platform (`linux-amd64`, `linux-arm64`,
-`darwin-arm64`; an Intel Mac has none and logs that it does not update),
-unpacked with `tar`. Nothing outside
-`updates/` changes before every check has passed. Then the runner file is
-replaced by a rename of a copy written next to it, together with the editor
-installed beside it: `zeughaus` in the runner's directory on Linux,
-`~/Applications/Zeughaus.app` on macOS (the bundle written as `.new`, the
-old one moved aside); where there is none, only the runner is replaced, and
-if one of the writes fails nothing is replaced. Editors are then sent
+`<url>/<channel>/latest` with `curl` (Windows 10 ships `curl.exe`). A number
+above the binary's own build, and not the refused one, starts an attempt in
+`<state-dir>/updates/<build>/`: manifest and signature, then the archive of
+the host's platform (`linux-amd64`, `linux-arm64`, `darwin-arm64`,
+`windows-amd64`; an Intel Mac has none and logs that it does not update),
+unpacked with `tar -xf` on every platform (GNU tar and bsdtar detect gzip, and
+Windows 10's `tar.exe` reads the `.zip`). Nothing outside `updates/` changes
+before every check has passed, and the last check is a **preflight**: the
+staged binary runs as `<binary> version` and its stdout must be exactly
+`<version> build <n>` of the manifest within 30 s (polled every 100 ms, then
+killed). A binary that cannot load or panics at once fails the attempt as
+`the new <binary> does not start: <status and the first 200 bytes of stderr,
+or timed out after 30 s>` and replaces nothing. The editor is not preflighted.
+
+Then the binary file is replaced, together with the editor installed beside
+it for the runner: `zeughaus` in the runner's directory on Linux,
+`zeughaus.exe` on Windows, `~/Applications/Zeughaus.app` on macOS (the bundle
+written as `.new`); where there is none, only the runner is replaced, and if
+one of the writes fails nothing is replaced. The CI replaces `zeughaus-ci`
+only. The replaced file stays as `<target>.previous` (`Zeughaus.app.previous`
+for the bundle): on Unix the old file is hard-linked (else copied) to
+`.previous` before the rename of the new copy over the target; on Windows,
+where a running executable cannot be overwritten but can be renamed, the
+target is renamed to `.previous` and the new file to the target, and a
+failure of the second rename puts the first back. Editors are then sent
 `SIGUSR1`, which reopens them as they were (Linux: every process whose
 `/proc/<pid>/exe` is that file, or `(deleted)`, and whose `SigCgt` shows the
-handler, as `deploy/install.sh` checks; macOS: the pids `pgrep -f
-<app>/Contents/MacOS/zeughaus` finds), and the runner restarts itself through
-the same path as its own `SIGUSR1` (section 9). Every other directory under
-`updates/` is then removed; a failed attempt is logged as `[update] build
+handler; macOS: the pids `pgrep -f <app>/Contents/MacOS/zeughaus` finds;
+Windows: none, a running editor keeps its build until it is reopened and
+`[update] running editors keep build <old> until they are reopened` is
+logged). The runner restarts itself through the same path as its own
+`SIGUSR1` (section 9) on Unix. On Windows the runner updates only while it is
+idle (not held, no live run: the predicate the maintenance tasks use) because
+a restart ends every terminal and run; it saves the graphs and the workspace, logs
+`[runner] restarting` and exits with 0, and the boot task's `runner.cmd` loop
+starts the new binary about 5 s later. The CI's restart is an `exec` of its
+own path with the same arguments (`[ci] restarting`); its listeners are
+close-on-exec and its state is on disk, so the new image binds the same
+ports, and an `exec` that fails is logged and the CI carries on. Every other
+directory under `updates/` is then removed, except the installed and the
+previous build's (their `staging/` is what the refresh reads); files in
+`updates/` are never removed. A failed attempt is logged as `[update] build
 <n>: <error>`, removed, and not retried by that process.
 
-The updater is off where `update.toml` is absent, and that is the setting for
-the CI's own hosts: sadala and the `tuco-pc` service runner have none, so a
-broken `dev` build cannot take down the CI or the runner that would build
-and publish its fix. They change by `deploy/install-sadala.sh` and
-`deploy/install.sh`. The runners of the user's own machines (`tuco-pc-hannes`,
-atik) follow `dev`. Windows has no updater; `release bundle` and `release
-verify` exist on every platform.
+**Trial and rollback.** `<state-dir>/updates/state.json` (written by tmp and
+rename) holds `installed`, `previous`, `starts`, `confirmed`, `refreshed` and
+`refused`; unknown fields are ignored so it can grow. After an install and
+before the restart it records `installed = <new>`, `previous = <own>`,
+`starts = 0`, `confirmed = false`. At every start (`boot`, before serving) a
+binary whose build is the installed, unconfirmed one counts a start; a
+build 0, a missing file, another build or a confirmed one counts nothing. A
+thread started with the updater confirms the installed build after 120 s of
+running (`[update] build <n> confirmed`), also where `update.toml` is absent.
+The 4th start of an unconfirmed build is the rollback: each target's
+`.previous` is put back (Unix by rename; Windows by renaming the target to
+`.failed`, the previous to the target and removing `.failed`; bundles the
+same with directories), the state becomes `refused = <n>`, `installed =
+<m>`, `previous = 0`, `confirmed = true`, `starts = 0`, `[update] build <n>
+did not come up 3 times; back to build <m>` is logged and the old binary is
+`exec`ed with the same arguments (Windows: the process exits and `runner.cmd`
+starts it; a missing `.previous` logs that there is no previous build and
+carries on). Starts are counted across the supervisors' restarts (systemd's
+`Restart=`, launchd's `KeepAlive`, the `runner.cmd` loop); at a spacing of
+about 3 to 5 s the 3 starts stay under systemd's default `StartLimitBurst`.
+A refused build is not installed again; a newer one is tried normally.
+
+`zeughaus-runner [--state-dir D] update status|rollback` and `zeughaus-ci
+[--state-dir D] update status|rollback` read and undo the state. `status`
+prints `following <channel> at <url>` (or `not following a channel (no
+update.toml)`), `running build <own> (<version>)`, `installed <n>, previous
+<m>, confirmed|unconfirmed, <k> starts` and `refused <n|->`. `rollback`
+restores the `.previous` files and records it as the automatic rollback does,
+but does not restart: it answers `rolled back to build <m>; restart the
+service to run it: <hint>`, the hint chosen by the `profile` in `install.toml`
+(`systemctl --user reload zeughaus-runner` for desktop, `sudo systemctl
+--user -M zeughaus@ reload zeughaus-runner` for service, `launchctl kill
+SIGUSR1 gui/$(id -u)/net.doodleshnookie.zeughaus-runner` for macos,
+`schtasks /End /TN zeughaus-runner && schtasks /Run /TN zeughaus-runner` for
+windows, `sudo systemctl --user -M zeughaus-ci@ restart zeughaus-ci` for ci);
+without a `.previous` it fails with `no previous build to go back to`. Both
+binaries also answer `version` with `<version> build <n>` without touching
+the state lock, which is what the preflight runs.
+
+**Install profiles and refresh.** `zeughaus-runner install
+<desktop|macos|service|windows>` and `zeughaus-ci install ci` (`--channel`,
+`--from`, `--bin-dir`, `--feed-addr`, `--no-service`; the details are in
+`CLAUDE.md`) write a host's binaries with the updater's own staged rename
+(`install_binary`, `install_bundle`), the files of the archive's `share/` with
+`@BINDIR@`, `@FEED_ADDR@` and `@LOGS@` replaced, and `update.toml` and
+`install.toml`; `write_if_changed` in `zeughaus_update::host` makes a
+repeated run write nothing. Service control (`systemctl --user` enable and
+reload or start, `launchctl`, SIGUSR1 to editors) belongs to `install`
+only. For every newly installed build whose first start finds `install.toml`,
+`state.installed` equal to its own build and `state.refreshed` different, the
+updater thread calls the product's refresh hook once with
+`<state-dir>/updates/<build>/staging/zeughaus-<version>-<platform>` and then
+records `refreshed = <build>`: it rewrites that profile's files (units,
+desktop entry, icon, VM scripts, `ssh_config`, `maintain.toml`) and, when a
+unit changed, runs `systemctl --user daemon-reload` and logs `[install] unit
+changed; it applies at the next start of the service`. The binaries and the
+service are left alone: the process is already the new build.
+
+**Every host follows `dev`**, the CI's own hosts included (sadala: runner and
+CI; the `tuco-pc` service runner; `tuco-pc-hannes`, atik and wohnzimmer
+too), and those hosts own their binaries (`/var/lib/zeughaus/bin`,
+`/var/lib/zeughaus-ci/bin`), so an update needs no root. A broken `dev` build
+could in principle take down the CI that would publish its fix; the safety
+net is the preflight (a build that does not run is never installed), the
+trial (a build that does not stay up is replaced by the previous one after 3
+starts and refused until a newer one is published) and `update rollback`
+by hand. `release bundle` and `release verify` exist on every platform.
 
 ## 15. Not built
 

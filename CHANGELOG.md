@@ -85,6 +85,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Every host updates itself from the release channels, the CI's own hosts
+  (sadala, the `tuco-pc` service runner) and the Windows runner included;
+  `zeughaus-ci` follows a channel too. The updater is the new
+  `zeughaus-update` crate, which both binaries use. A build is run once as
+  `<binary> version` (it must print `<version> build <n>`) before anything
+  is replaced, the replaced binary stays as `<binary>.previous`, and a new
+  build is on trial: confirmed after 120 s of running, put back
+  automatically on its 4th unconfirmed start and refused until a newer one
+  is published. `zeughaus-runner update status|rollback`, `zeughaus-ci
+  update status|rollback` and `version` report and undo it. A Windows
+  runner updates only while idle and restarts through its `runner.cmd`
+  loop. Release archives carry `share/` (units, desktop entry, icon, VM
+  scripts, plist, `maintain.toml`) at their repository paths, and
+  `zeughaus-runner install <desktop|macos|service|windows>` and
+  `zeughaus-ci install ci` write a host's binaries and files from an
+  unpacked archive and set it to follow `dev`; the first start of each
+  newly installed build rewrites those files. `deploy/bootstrap.sh`,
+  `setup-service-runner.sh`, `setup-sadala.sh`, `setup-windows.sh` and
+  `windows/bootstrap.ps1` replace `install.sh`, `install-sadala.sh`,
+  `install-runner-user.sh`, `install-macos.sh`, `install-windows.sh`,
+  `build-aarch64.sh` and `windows/install.ps1`, so no script builds from a
+  checkout or copies binaries. The service runner's and the CI's binaries
+  move from `/usr/local/lib/zeughaus` to `/var/lib/zeughaus/bin` and
+  `/var/lib/zeughaus-ci/bin`, and the VM scripts to
+  `/var/lib/zeughaus/lib/vm/win11`.
 - zeughaus's own pipeline times every step (`== <command>: <s> s`), pins
   the Rust toolchain in `rust-toolchain.toml` and the image's tag, and
   keeps weida in one cache checkout that a manual run fetches its sibling

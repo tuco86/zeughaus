@@ -13,7 +13,8 @@
 # iconutil wants, around a release build of the editor.
 #
 # Only the editor. The runner is a headless process with no Dock presence;
-# deploy/install-macos.sh installs it as a launchd agent next to this bundle.
+# `zeughaus-runner install macos` installs the runner as a launchd agent and
+# this bundle from the release.
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)

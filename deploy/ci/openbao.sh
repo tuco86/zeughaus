@@ -1,7 +1,7 @@
 #!/bin/sh
 # The CI's OpenBao identity: policy and AppRole `zeughaus-ci`, and a fresh
 # secret_id sealed with systemd-creds for the user zeughaus-ci. Runs on
-# sadala, next to OpenBao, as root (deploy/install-sadala.sh runs it with
+# sadala, next to OpenBao, as root (deploy/setup-sadala.sh runs it with
 # sudo). Rerunning rotates: every older secret_id of the role is destroyed
 # once the new one is sealed. Prints the role_id that [secrets] in ci.toml
 # needs. No secret is printed or written in the clear.

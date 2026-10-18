@@ -1,6 +1,6 @@
 # Installs the build toolchain: into the VM's golden image, run over ssh by
 # `vm.sh toolchain` with the base image booted (PERSIST=1), and onto a
-# Windows runner host by deploy/install-windows.sh. CARGO_HOME and
+# Windows runner host by deploy/setup-windows.sh. CARGO_HOME and
 # RUSTUP_HOME live under -CacheRoot: the cache disk (W:) in the VM, which
 # does not exist in the golden image, so prepare.ps1 runs rustup-init there
 # on first use; a host has its root already and gets Rust here.

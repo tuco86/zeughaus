@@ -1,11 +1,12 @@
 # One-time setup of a Windows host for a zeughaus runner, run elevated over
-# ssh as the account the runner will run as (deploy/install-windows.sh
+# ssh as the account the runner will run as (deploy/setup-windows.sh
 # --setup). Idempotent. The toolchain is vm/win11/toolchain.ps1, run next to
 # it with -CacheRoot set to the same root.
 #
 # Everything lives under $Root, readable by this account and SYSTEM only:
 # bin\ (the installed binaries), state\ (the runner's state directory), src\
-# (the checkouts a deploy builds), cargo\ and rustup\.
+# (deploy\windows\bootstrap.ps1, copied there by setup-windows.sh), cargo\
+# and rustup\.
 param(
     [string]$Root = 'C:\zeughaus',
     # The runner's weida endpoint, an address on the WireGuard interface.

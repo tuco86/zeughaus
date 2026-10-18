@@ -1,5 +1,6 @@
-# Maintenance tasks of the wohnzimmer runner; install-windows.sh copies this to
-# C:\zeughaus\state\maintain.toml. See zeughaus-runner/src/maintain.rs.
+# Maintenance tasks of the wohnzimmer runner; `zeughaus-runner install windows`
+# writes this from the release to C:\zeughaus\state\maintain.toml, and every
+# update rewrites it. See zeughaus-runner/src/maintain.rs.
 
 [[task]]
 name = "rust"

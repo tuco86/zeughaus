@@ -156,7 +156,7 @@ pub(crate) const APP_ID: &str = "net.doodleshnookie.Zeughaus";
 /// [`dock_icon`] sets. On Wayland the protocol that would carry one
 /// (`xdg_toplevel_icon_v1`, which KWin implements) arrived in winit 0.31;
 /// until iced pins that, a compositor finds the icon through the desktop
-/// entry named after [`APP_ID`], which `deploy/install.sh` installs.
+/// entry named after [`APP_ID`], which `zeughaus-runner install desktop` writes.
 #[cfg(not(target_arch = "wasm32"))]
 fn window_icon() -> Option<iced::window::Icon> {
     let mut reader = png::Decoder::new(std::io::Cursor::new(ICON_PNG))

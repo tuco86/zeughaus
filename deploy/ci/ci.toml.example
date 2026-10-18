@@ -21,7 +21,7 @@ fingerprint = "<fingerprint>"
 [runners.sadala]
 fingerprint = "<fingerprint>"
 
-# A Windows host (deploy/install-windows.sh): it runs `.ps1` jobs on its own
+# A Windows host (deploy/setup-windows.sh): it runs `.ps1` jobs on its own
 # host and offers no containers and no machines. Default: os = "unix".
 [runners.wohnzimmer]
 fingerprint = "<fingerprint>"

@@ -22,8 +22,9 @@ build of the editor compiles and edits locally (it reaches no runner yet).
 
 ```
 zeughaus/              # binary: the iced editor; edits the graph and views results, never executes
-zeughaus-runner/       # binary: headless process that executes the graph, owns the terminals, runs the CI jobs it is assigned and can follow a release channel; `release` makes and checks signed bundles; `mcp` gives an agent the CI and manual job runs as tools
-zeughaus-ci/           # binary: the CI service; schedules pipelines onto enlisted runners, webhook intake, manual-run uploads, stored transcripts
+zeughaus-runner/       # binary: headless process that executes the graph, owns the terminals, runs the CI jobs it is assigned and follows a release channel; `install` writes a host's profile, `update status|rollback` and `version` report and undo updates, `release` makes and checks signed bundles; `mcp` gives an agent the CI and manual job runs as tools
+zeughaus-ci/           # binary: the CI service; schedules pipelines onto enlisted runners, webhook intake, manual-run uploads, stored transcripts; follows a release channel itself (`install ci`, `update`, `version`)
+zeughaus-update/       # the self-updater both binaries share: signed manifest, fetch, preflight, install with `.previous`, trial and rollback, and the helpers of the `install` profiles (`host`)
 zeughaus-core/         # Ty/Typed/Value, pins, ExecutableNode/DomainPlugin, settings, scalar wire encoding, graph document types
 zeughaus-runtime/      # GraphExecutor: topology, node instances, edge cache, dirty set, async work, node errors
 zeughaus-link/         # the runner<->editor protocol over weida (graph, feed, events, snapshot, triggers, paths), the runner<->CI enlist protocol, the `/manual` upload of working-tree snapshots and the credentials both ends present
@@ -42,7 +43,7 @@ iced_terminal/         # the terminal widget: one wgpu primitive per pane, bundl
 iced_tabs/             # the tab tree the workspace shell uses: runner sections, groups, drop markers
 zeughaus-theme/        # the editor's theme: iced theme paired with a terminal colour scheme, catalogs for every widget, bundled pack, WezTerm scheme parser
 vm/win11/              # scripts: headless Windows 11 guest under QEMU/KVM, the service runner's `win11` machine (boot, toolchain, per-boot prepare.ps1); toolchain.ps1 also provisions a Windows runner host
-deploy/                # install.sh, systemd user unit for the runner, desktop entry template, macos-app.sh and the bundle's Info.plist; install-sadala.sh, install-runner-user.sh, install-macos.sh, install-windows.sh, build-aarch64.sh; runner/ (unit, ssh config, enlist.toml.example) and ci/ (CI unit, ci.toml.example, openbao.sh), macos/ (launchd agent), windows/ (host setup and install scripts)
+deploy/                # bootstrap.sh (downloads, checks and runs a build's `install <profile>`), setup-service-runner.sh, setup-sadala.sh, setup-windows.sh (the one-time part of a host); systemd user unit for the runner, desktop entry template, macos-app.sh and the bundle's Info.plist; runner/ (unit, ssh config, enlist.toml.example) and ci/ (CI unit, ci.toml.example, openbao.sh), macos/ (launchd agent), windows/ (host setup, bootstrap.ps1, maintain.toml)
 third_party/           # its own workspace: wezterm's terminal crates at the pinned revision, published as zeughaus-* packages
 omp-plugin/            # the zeughaus-ci omp plugin (skill + extension); catalog in .omp-plugin/marketplace.json; bump its three versions together
 ```
@@ -59,13 +60,20 @@ only changes made to it.
 
 ## Running it
 
-The user's stack is installed, not run from the checkout: `deploy/install.sh`
-`cargo install`s the editor and runner into `~/.cargo/bin`, installs the
-systemd user unit `zeughaus-runner` (`KillMode=process` so the shims and
-their shells outlive a stop, `reload` = SIGUSR1), a desktop entry and icon
-matching the editor's Wayland app id, then starts or reloads the runner and
-restarts running editors. The editor is started from the application menu
-(`Zeughaus`). Logs: `journalctl --user -u zeughaus-runner`.
+The user's stack is installed, not run from the checkout, and updates itself:
+`sh deploy/bootstrap.sh desktop` downloads the newest `dev` build, checks the
+archive against its `SHA256SUMS` line, unpacks it and runs its
+`zeughaus-runner install desktop`. That puts the editor and runner binaries
+into `~/.cargo/bin`, the systemd user unit `zeughaus-runner`
+(`KillMode=process` so the shims and their shells outlive a stop, `reload` =
+SIGUSR1), a desktop entry and icon matching the editor's Wayland app id
+(icon cache and `kbuildsycoca6` refreshed) in place, writes
+`<state-dir>/update.toml` (`channel = "dev"`) and `install.toml`, then
+enables and starts or reloads the runner and restarts running editors. After
+that the runner follows `dev` by itself (see Updates below); the checkout is
+needed to run the bootstrap and to develop, not to deploy. The editor is
+started from the application menu (`Zeughaus`). Logs: `journalctl --user -u
+zeughaus-runner`.
 
 By hand, two processes, in this order:
 
@@ -180,8 +188,8 @@ does not end with code 0 raises a desktop notification in every connected
 editor; its log is `<state-dir>/runs/<id>/wal`.
 `zeughaus-runner [--state-dir D] maintain` prints each task with its last
 result and age from `<state-dir>/maintain/<name>.json`. The wohnzimmer
-runner's file is `deploy/windows/maintain.toml`, which
-`deploy/install-windows.sh` copies on every run.
+runner's file is `deploy/windows/maintain.toml`, which the release's `share/`
+carries and `install windows` and every update write to its state directory.
 
 Every terminal lives in a shim process (`zeughaus-runner shim <dir>`, one
 per terminal under `<state-dir>/terminals/`), so shells and job runs
@@ -208,8 +216,11 @@ nothing itself. On sadala (aarch64 Ubuntu) it runs as the Unix user
 runners it accepts and the forge tokens are in
 `/var/lib/zeughaus-ci/state/ci.toml` (`deploy/ci/ci.toml.example`);
 secrets live in OpenBao (`secret/zeughaus/ci`, read with the AppRole that
-`deploy/ci/openbao.sh`, run on sadala, seals to the CI user). The wrapper
-`/usr/local/bin/zeughaus-ci` on sadala runs the binary as that user:
+`deploy/ci/openbao.sh`, run on sadala, seals to the CI user). Its binary is
+`/var/lib/zeughaus-ci/bin/zeughaus-ci`, owned by that user, and it updates
+itself (see Updates). The wrapper
+`/usr/local/bin/zeughaus-ci` on sadala runs the binary as that user
+(`sudo -u zeughaus-ci` with `--state-dir /var/lib/zeughaus-ci/state`):
 `zeughaus-ci run|status|log|forge-check|secrets-check` queues a pipeline,
 reads results, a failed job's excerpt and its log, and checks the forge
 token and every secret `ci.toml` names. `zeughaus-ci check [DIR]` and `plan
@@ -225,11 +236,11 @@ VM)). The CI pins each one by the fingerprint in its own `endpoint` file:
 
 | host | runner | enlisted as | installed by |
 |---|---|---|---|
-| sadala | Unix user `zeughaus`, `10.8.0.1:7443` | `sadala` | `deploy/install-sadala.sh` |
-| tuco-pc | user `hannes`, `10.8.0.10:7443` (a local drop-in of its unit sets `--feed-addr`) | `tuco-pc-hannes` | `deploy/install.sh` |
-| tuco-pc | user `zeughaus` (home `/var/lib/zeughaus`), `10.8.0.10:7444`; containers, the `win11` VM, GPU busy | `tuco-pc`, the default runner | `deploy/install-runner-user.sh --feed-addr 10.8.0.10:7444`; `deploy/install.sh` updates it |
-| atik (macOS) | launchd agent `net.doodleshnookie.zeughaus-runner`, `10.8.0.7:7443`, log `~/Library/Logs/zeughaus-runner.log` | `atik` | `deploy/install-macos.sh` |
-| wohnzimmer (Windows 10, LAN `10.0.0.13`) | user `zeughaus`, boot task `zeughaus-runner` (S4U), `10.8.0.12:7443`, state and log `C:\zeughaus\state` (`runner.log`) | `wohnzimmer`, `os = "windows"`, builds `windows-amd64` | `deploy/install-windows.sh [--setup] zeughaus@10.8.0.12` |
+| sadala | Unix user `zeughaus`, `10.8.0.1:7443`, binary in `/var/lib/zeughaus/bin` | `sadala` | `deploy/setup-sadala.sh` (also the CI) |
+| tuco-pc | user `hannes`, `10.8.0.10:7443` (a local drop-in of its unit sets `--feed-addr`) | `tuco-pc-hannes` | `sh deploy/bootstrap.sh desktop` |
+| tuco-pc | user `zeughaus` (home `/var/lib/zeughaus`, binary in `/var/lib/zeughaus/bin`), `10.8.0.10:7444`; containers, the `win11` VM, GPU busy | `tuco-pc`, the default runner | `deploy/setup-service-runner.sh --feed-addr 10.8.0.10:7444` |
+| atik (macOS) | launchd agent `net.doodleshnookie.zeughaus-runner`, `10.8.0.7:7443`, log `~/Library/Logs/zeughaus-runner.log` | `atik` | `sh deploy/bootstrap.sh macos` |
+| wohnzimmer (Windows 10, LAN `10.0.0.13`) | user `zeughaus`, boot task `zeughaus-runner` (S4U), `10.8.0.12:7443`, state and log `C:\zeughaus\state` (`runner.log`) | `wohnzimmer`, `os = "windows"`, builds `windows-amd64` | `deploy/setup-windows.sh [--setup] zeughaus@10.8.0.12` |
 
 In `ci.toml`, `default_runner` names the runner of every job without a
 `machine` or `platform`; `[runners.<name>]` has its `fingerprint`, its
@@ -249,8 +260,9 @@ a container, a machine, or a platform that resolves to one: a host job
 cannot be frozen. The job sees its platform as `CI_PLATFORM`. A runner that
 is not in `ci.toml`, or whose host is not the configured `os`, is refused.
 The Windows VM scripts (`vm/win11/`) are
-installed under `/usr/local/lib/zeughaus/vm/win11` and booted and stopped by
-the `tuco-pc` runner.
+installed under `/var/lib/zeughaus/lib/vm/win11` (written by `install
+service` and again by every update) and booted and stopped by the `tuco-pc`
+runner.
 
 A repository's jobs at one place share one warm workspace on their runner:
 `ci/work/<repo>/host` on the runner's host, `ci/work/<repo>/image-<image>`
@@ -284,13 +296,17 @@ lines as text (`Log`) and lists the `[platforms]`.
 The Windows runner `wohnzimmer` is the living-room PC, used by someone else
 at its console. Everything of zeughaus is under `C:\zeughaus`, readable by
 its account and SYSTEM only: `bin\` (binaries and the `runner.cmd` loop the
-boot task runs), `state\`, `src\` (the checkouts a deploy builds), `cargo\`
+boot task runs), `state\`, `src\` (the `bootstrap.ps1` that
+`setup-windows.sh` uploads), `cargo\`
 and `rustup\`. Its WireGuard tunnel `sadala` (`C:\zeughaus\wg\sadala.conf`,
 the WireGuard for Windows service) gives it `10.8.0.12`; the firewall admits
 the runner from `10.8.0.0/24` only. It runs `.ps1` jobs on its host in
-`C:\zeughaus\state\ci\work\<repo>\host`, has no containers, machines,
-shims or updater: a restart (every deploy) ends its terminals and the job
-it runs.
+`C:\zeughaus\state\ci\work\<repo>\host`, has no containers, machines or
+shims, and updates itself like the other hosts, but only while idle (not
+held, no live run): the restart ends every terminal and the job it runs, as
+the runner exits and the boot task's `runner.cmd` loop starts the new binary
+about 5 s later. A running editor there keeps its build until it is
+reopened.
 
 On macOS the runner's container engine is Apple's `container` (Homebrew
 formula `container`), not podman. The runner starts its system on demand
@@ -305,38 +321,99 @@ and a job in such a container cannot be frozen: the runner logs that it
 cannot and the job runs on. The runner offers containers only where
 `[containers]` is in its `enlist.toml` and `container --version` answers.
 
-Updates: `deploy/install-sadala.sh` (on atik: builds with
-`deploy/build-aarch64.sh` in a native arm64 container of colima's docker,
-installs both binaries, restarts the CI and reloads the sadala runner;
-`--setup --ci-toml <file>` the first time, `--skip-build` to install what is
-already built) and `deploy/install.sh` (tuco-pc, also the service runner);
-`deploy/install-macos.sh` on atik; `deploy/install-windows.sh` from a unix
-checkout for wohnzimmer (bundles HEAD and `../weida`'s HEAD, builds on the
-host).
+Updates: no script builds from a checkout or copies binaries. A host is
+bootstrapped once and then follows a release channel itself.
+`deploy/bootstrap.sh <profile> [--channel C] [--feed-addr A] [--url U]`
+(`desktop`, `macos`, `service` or `ci`; channel `dev` and url
+`https://zeughaus.doodleshnookie.net/updates` by default) downloads the
+channel's newest build, checks the archive against its `SHA256SUMS` line,
+unpacks it and runs its `install`. It is the only download that is not
+signature-checked (it trusts HTTPS to the update host); every later update
+is. `deploy/setup-service-runner.sh --feed-addr <a>` (tuco-pc),
+`deploy/setup-sadala.sh [--ci-toml <file>]` (from a workstation, last) and
+`deploy/setup-windows.sh [--setup] [--feed-addr A] <ssh-host>` do a host's
+root-only or remote one-time part (packages, users, trust, units, the old
+binary's migration) and then run the bootstrap on it;
+`deploy/windows/bootstrap.ps1 [-Channel dev] [-Url ...]` is the Windows
+bootstrap. Rollout order: tuco-pc user, atik, the tuco-pc service runner,
+wohnzimmer, and sadala last, so the CI keeps publishing throughout.
 
-A runner also follows a release channel by itself when
-`<state-dir>/update.toml` exists: `channel = "dev"` (`dev`, `nightly` or
-`release`) and optionally `url` (default
-`https://zeughaus.doodleshnookie.net/updates`). Once a minute it reads
-`<url>/<channel>/latest`, a CI build number. A build newer than its own
+`zeughaus-runner [--state-dir D] install <desktop|macos|service|windows>
+[--channel C] [--feed-addr A] [--bin-dir B] [--from DIR] [--no-service]`
+writes a profile from an unpacked release (`--from`, by default the
+directory of the running binary): `desktop` is the editor and runner into
+`--bin-dir` (`$CARGO_HOME/bin` or `~/.cargo/bin`), the user unit, desktop
+entry and icon, `systemctl --user` enable and reload or start, SIGUSR1 to
+editors of that binary; `macos` the runner into `--bin-dir` and
+`Zeughaus.app` into `~/Applications`, the launchd agent plist (`--feed-addr`
+defaults to `10.8.0.7:7443`), `launchctl kill SIGUSR1` or `bootstrap`;
+`service` (run as the service user; `--feed-addr` required) the runner into
+`~/bin`, the VM scripts into `~/lib/vm/win11/`, `deploy/runner/ssh_config`
+into `~/.ssh/config` and the unit with the feed address; `windows` both
+executables into `--bin-dir` (required, `C:\zeughaus\bin`) and
+`maintain.toml`, with no service control (the bootstrap script stops and
+starts the task). `desktop` and `windows` refuse `--feed-addr`. Every
+profile also writes `<state-dir>/update.toml` (`channel`) and
+`<state-dir>/install.toml` (`profile`, `bin_dir`, optional `feed_addr`) and
+prints `[install] <profile> from build <n>`. The non-binary files come from
+the archive's `share/`, which holds repository files at their repository
+paths; they are not compiled in. `zeughaus-ci [--state-dir D] install ci
+[--channel C] [--from DIR] [--no-service]` does the same for the CI:
+`zeughaus-ci` into `~/bin` (`/var/lib/zeughaus-ci/bin`), its unit, restart
+or start. `zeughaus-runner version` and `zeughaus-ci version` print
+`<version> build <n>`.
+
+A runner or CI follows a release channel by itself when
+`<state-dir>/update.toml` exists, and every host does: `channel = "dev"`
+(`dev`, `nightly` or `release`) and optionally `url`. The CI hosts too, so
+the safety net is the checks below, not a host left out. Once a minute it
+reads `<url>/<channel>/latest`, a CI build number. A build newer than its own
 (`ZEUGHAUS_BUILD` at compile time, the CI pipeline number; 0 for a build
 made anywhere else, so a `cargo install` is replaced by the first published
 one) is downloaded with `curl` into `<state-dir>/updates/<build>/`, its
 `manifest.json` checked against `manifest.sig` with the keys compiled in
-(`TRUSTED_KEYS`, `zeughaus-runner/src/update/manifest.rs`), then the
-archive for the host's platform against the size and SHA-256 the manifest
-gives. Only then it replaces itself by a rename, and the editor installed
-beside it: `zeughaus` in the runner's directory on Linux,
-`~/Applications/Zeughaus.app` on macOS, if there is one. `zeughaus-ci` is
-never replaced. Every running editor of that copy gets `SIGUSR1` (Linux: a
-process whose `exe` is that file or `(deleted)` and that catches it; macOS:
-`pgrep -f` on the app's binary), and the runner restarts the way its own
-`SIGUSR1` does. A failed attempt is logged as `[update] build <n>: <error>`
-and not tried again by that process. `tuco-pc-hannes` and atik have an
-`update.toml` with `channel = "dev"`; the `tuco-pc` service runner and
-sadala have none on purpose: the CI infrastructure stays on explicit
-deploys, so a broken `dev` build cannot take down the CI that would publish
-its fix. A runner built for Windows has no updater.
+(`TRUSTED_KEYS`, `zeughaus-update/src/manifest.rs`), then the archive for the
+host's platform against the size and SHA-256 the manifest gives, and
+unpacked with `tar` (Windows 10's `tar.exe` reads the `.zip`). The new
+binary must then answer `<binary> version` with exactly `<version> build
+<n>` within 30 s, else the attempt fails (`the new <binary> does not start:
+...`) and nothing is replaced. Only then it replaces itself by a rename,
+keeping the replaced file as `<binary>.previous` (`Zeughaus.app.previous` on
+macOS), and the editor installed beside it (runner only): `zeughaus` in the
+runner's directory on Linux and Windows, `~/Applications/Zeughaus.app` on
+macOS, if there is one. The CI replaces `zeughaus-ci` only and restarts by
+`exec` of its own path with the same arguments. Every running editor of that
+copy gets `SIGUSR1` (Linux: a process whose `exe` is that file or
+`(deleted)` and that catches it; macOS: `pgrep -f` on the app's binary;
+Windows: none, editors keep their build until reopened), and the runner
+restarts the way its own `SIGUSR1` does. On Windows the runner updates only
+while idle (not held, no live run) and restarts by exiting, which the boot
+task's `runner.cmd` loop answers by starting the new binary. A failed
+attempt is logged as `[update] build <n>: <error>` and not tried again by
+that process.
+
+A new build is on trial. `<state-dir>/updates/state.json` records
+`installed`, `previous`, `starts`, `confirmed`, `refreshed` and `refused`.
+Each start of an installed, unconfirmed build counts; after 120 s of running
+it is confirmed (`[update] build <n> confirmed`). The 4th start of an
+unconfirmed build puts the `.previous` files back, refuses that build until a
+newer one is published, logs `[update] build <n> did not come up 3 times; back
+to build <m>` and `exec`s the old binary (Windows: exits, and `runner.cmd`
+restarts it). `zeughaus-runner [--state-dir D] update status|rollback` and
+`zeughaus-ci [--state-dir D] update status|rollback` read and undo that:
+`status` prints `following <channel> at <url>` (or `not following a channel
+(no update.toml)`), `running build <own> (<version>)`, `installed <n>,
+previous <m>, confirmed|unconfirmed, <k> starts` and `refused <n|->`;
+`rollback` restores `.previous`, records it the same way and does not
+restart, answering `rolled back to build <m>; restart the service to run it:
+<hint>` with the hint of the host's profile from `install.toml`. The first
+start of each newly installed build on a host with `install.toml` also
+rewrites that profile's files (units, desktop entry, icon, VM scripts,
+`maintain.toml`) from `<state-dir>/updates/<build>/staging/`, which the
+updater keeps for the installed and the previous build; a changed unit gets
+`daemon-reload` and applies at the next start of the service, and binaries
+and service are not touched. `tuco-pc-hannes`, atik, the `tuco-pc` service
+runner, sadala (runner and CI) and wohnzimmer all have `channel = "dev"`.
 
 `zeughaus-runner release keygen <file>|bundle|verify <dir>` makes the
 signing key (seed in a 0600 file, public half printed for `TRUSTED_KEYS`),
@@ -403,7 +480,8 @@ logical pixels; `MS` paces a move or drag). `ctl` resolves a relative
 `screenshot`/`record` path against its own working directory. `record`
 writes an MP4 through `ffmpeg` with the pointer drawn in, for attaching to
 an issue or PR by hand; screenshots and videos are never committed.
-Signals to the agent's processes go by PID, never by name.
+Signals to the agent's processes go by PID, never by name; an agent signals
+only its own.
 
 To test CI, the agent runs its own `zeughaus-ci --state-dir /tmp/zh-ci serve
 --listen 127.0.0.1:7999` with a `ci.toml` that pins its agent runner's
@@ -413,21 +491,14 @@ fingerprint (from that runner's `endpoint` file), gives the runner an
 CI or its Forgejo webhook.
 
 When a change is finished, its gate passed and it is committed, the agent
-integrates it into the user's running stack; that is the point of the
-reload. `deploy/install.sh` does it in order: `cargo install` of both
-binaries (the running ones keep serving meanwhile), unit, desktop entry,
-`systemctl --user reload zeughaus-runner`,
-and SIGUSR1 to every editor whose `/proc/<pid>/exe` is the installed
-binary and whose `SigCgt` has the handler. Confirm the reload: `readlink
-/proc/<pid>/exe` no longer ends in `(deleted)`. The agent's own processes
-run from `target/agent` and are never signalled.
-
-Before signalling a process, check it has a restart handler: bit 9
-(`0x200`, SIGUSR1) in `SigCgt` of `/proc/<pid>/status`. A process built
-before the reload existed dies from SIGUSR1 instead, and a runner that old
-also keeps its shells in-process -- the agent's own session may be one of
-them (`ps --ppid <runner-pid>`). That one switch is the user's to make, by
-restarting the process by hand.
+integrates it into the user's running stack by pushing to `main`: the CI
+builds and publishes it to `dev`, and every host installs it within a minute
+of the publish. After `ci_wait` shows the dev pipeline succeeded, the agent
+confirms with `zeughaus-runner update status` on the host it can reach:
+`installed <pipeline number>` at once and `confirmed` after 2 minutes; an
+unconfirmed build that restarts three times is rolled back by the updater
+itself. The agent does not install binaries or signal the user's processes,
+and its own processes run from `target/agent`.
 
 ## Development Workflow
 
