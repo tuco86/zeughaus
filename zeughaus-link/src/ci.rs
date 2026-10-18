@@ -86,6 +86,16 @@ pub enum CiRequest {
         job: String,
         top: u32,
     },
+    /// The repository of `ci.toml` whose `url` names the same remote as
+    /// `origin` (a checkout's origin URL; at most [`MAX_ORIGIN_BYTES`]),
+    /// for an agent in that checkout. `sha` (4 to 40 hex digits) names the
+    /// checkout's HEAD; `jobs` asks for the jobs of its `.zeughaus-ci/`,
+    /// which costs git reads on the CI's mirror. Answers [`CiReply::Repo`].
+    Repo {
+        origin: String,
+        sha: Option<String>,
+        jobs: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -118,6 +128,10 @@ pub enum CiReply {
     /// The lines of a job's output that its longest pauses follow.
     Timing {
         timing: JobTiming,
+    },
+    /// `None` when no repository of `ci.toml` has the asked origin.
+    Repo {
+        repo: Option<Box<RepoView>>,
     },
     Error {
         message: String,
@@ -282,6 +296,59 @@ pub struct MachineJob {
     pub job: String,
 }
 
+/// The longest origin a [`CiRequest::Repo`] may name, in bytes.
+pub const MAX_ORIGIN_BYTES: usize = 1024;
+
+/// What the CI knows of one of its repositories, for an agent in a checkout
+/// of it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RepoView {
+    pub name: String,
+    /// `"<forge> <slug>"`, or `"none"`.
+    pub forge: String,
+    pub default_branch: String,
+    /// The default branch's state: `green`, or who is red since when.
+    pub branch: String,
+    /// This repository's channels, the newest pipeline of each.
+    pub channels: Vec<ChannelView>,
+    /// The newest pipeline of the asked sha, in any channel.
+    pub head: Option<Box<PipelineView>>,
+    /// The commit `jobs` were read from: the asked sha when the CI's mirror
+    /// has it, else the head of the default branch.
+    pub jobs_sha: Option<String>,
+    pub jobs: Vec<JobDefView>,
+    /// Why `jobs` is empty when it is; empty otherwise.
+    pub jobs_note: String,
+    pub machines: Vec<MachineView>,
+    pub platforms: Vec<(String, String)>,
+}
+
+/// One job of a repository's `.zeughaus-ci/` and where it would run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobDefView {
+    pub name: String,
+    /// The job's file name in `.zeughaus-ci/`.
+    pub file: String,
+    pub on: Vec<String>,
+    pub needs: Vec<String>,
+    pub channels: Vec<String>,
+    /// The header's placement: `host`, `image:<x>`, `platform:<p> image:<x>`, ...
+    pub place: String,
+    /// The runner the CI would place it on; empty when `placement` says why
+    /// not.
+    pub runner: String,
+    /// Where on that runner: `host`, `image:<x>` or `machine:<vm>`.
+    pub at: String,
+    /// Why the job cannot be placed; empty when it can.
+    pub placement: String,
+    pub secrets: Vec<String>,
+    /// `wait`, `freeze` or `run`.
+    pub when_busy: String,
+    /// Whether a manual run (`run_jobs`) can run it: placed, and not on a
+    /// machine.
+    pub manual: bool,
+}
+
 impl CiRequest {
     pub fn encode(&self) -> Vec<u8> {
         serde_json::to_vec(self).unwrap_or_else(|_| b"{}".to_vec())
@@ -425,6 +492,16 @@ mod tests {
                 job: "build".to_owned(),
                 top: 15,
             },
+            CiRequest::Repo {
+                origin: "ssh://git@git.doodleshnookie.net/tuco86/zeughaus.git".to_owned(),
+                sha: Some("3635dad".to_owned()),
+                jobs: true,
+            },
+            CiRequest::Repo {
+                origin: "/tmp/demo.git".to_owned(),
+                sha: None,
+                jobs: false,
+            },
         ];
         for request in requests {
             assert_eq!(CiRequest::decode(&request.encode()), Some(request));
@@ -499,6 +576,40 @@ mod tests {
                     finished: false,
                     truncated: true,
                 },
+            },
+            CiReply::Repo { repo: None },
+            CiReply::Repo {
+                repo: Some(Box::new(RepoView {
+                    name: "zeughaus".to_owned(),
+                    forge: "forgejo tuco86/zeughaus".to_owned(),
+                    default_branch: "main".to_owned(),
+                    branch: "green".to_owned(),
+                    channels: vec![ChannelView {
+                        repo: "zeughaus".to_owned(),
+                        channel: "dev".to_owned(),
+                        latest: 64,
+                        status: "succeeded".to_owned(),
+                    }],
+                    head: Some(Box::new(pipeline())),
+                    jobs_sha: Some("3635dad0".to_owned()),
+                    jobs: vec![JobDefView {
+                        name: "publish".to_owned(),
+                        file: "publish.sh".to_owned(),
+                        on: Vec::new(),
+                        needs: vec!["build-linux-amd64".to_owned()],
+                        channels: vec!["dev".to_owned()],
+                        place: "host".to_owned(),
+                        runner: "sadala".to_owned(),
+                        at: "host".to_owned(),
+                        placement: String::new(),
+                        secrets: vec!["ZEUGHAUS_UPDATE_KEY".to_owned()],
+                        when_busy: "wait".to_owned(),
+                        manual: true,
+                    }],
+                    jobs_note: String::new(),
+                    machines: Vec::new(),
+                    platforms: vec![("linux-amd64".to_owned(), "tuco-pc".to_owned())],
+                })),
             },
             CiReply::Error {
                 message: "no such job".to_owned(),

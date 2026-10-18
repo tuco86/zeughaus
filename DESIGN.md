@@ -1227,7 +1227,17 @@ line, which may be the end of one that began before), answers
 `Find { repo, sha }` with the newest
 of a repository's last 500 pipelines, of any channel and a manual run too, whose
 commit id starts with the 4 to 40 hex digits `sha` (`Pipeline`, empty when
-none does) and takes two actions, both answered `Accepted`:
+none does), answers `Repo { origin, sha, jobs }` (for an agent in a
+checkout: `origin` is its origin URL, at most 1024 bytes, matched against
+the `url`s of `ci.toml` as a manual upload's is; `None` when no repository
+has it) with the repository's name, forge, default branch and that branch's
+streak (`green`, or red since when), its channels, the newest pipeline of
+`sha`, the machines and the platforms, and with `jobs` also every job of its
+`.zeughaus-ci/` read from the CI's mirror at `sha` when the mirror has it,
+else at the default branch's head, each with the runner and place
+`place_job` picks (or why none), its secrets and whether a manual run can
+take it (not on a VM); `jobs_note` says why the list is empty (not fetched
+yet, unreadable) -- and takes two actions, both answered `Accepted`:
 `Rerun { repo, number }` writes the pipeline's event to the inbox again,
 pinned to the recorded sha, with the actor `rerun of #<n>` (a manual run is
 refused: its trees were the uploader's); `Cancel { repo,

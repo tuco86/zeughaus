@@ -223,7 +223,9 @@ pub fn transcript_dir(state_dir: &Path, repo: &str, number: u64, job: &str) -> P
         .join(job)
 }
 
-fn mirror_dir(state_dir: &Path, repo: &str) -> PathBuf {
+/// `ci/mirrors/<repo>.git`: the bare repository the scheduler fetches every
+/// branch and tag of `repo` into.
+pub(crate) fn mirror_dir(state_dir: &Path, repo: &str) -> PathBuf {
     crate::ci_dir(state_dir)
         .join("mirrors")
         .join(format!("{repo}.git"))
@@ -2292,7 +2294,7 @@ pub fn place_job(
 }
 
 /// The text of `<image>.Containerfile` at `sha`.
-fn containerfile_at(mirror: &Path, sha: &str, image: &str) -> Result<String, String> {
+pub(crate) fn containerfile_at(mirror: &Path, sha: &str, image: &str) -> Result<String, String> {
     git(
         mirror,
         &["show", &format!("{sha}:{CI_DIR}/{image}.Containerfile")],
@@ -2360,7 +2362,7 @@ fn consumers_pending(pipeline: &Pipeline, job: &str) -> bool {
 }
 
 /// `git -C <dir> <args>`; stdout on success.
-fn git(dir: &Path, args: &[&str], env: &[(String, String)]) -> Result<String, String> {
+pub(crate) fn git(dir: &Path, args: &[&str], env: &[(String, String)]) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -2381,7 +2383,7 @@ fn git(dir: &Path, args: &[&str], env: &[(String, String)]) -> Result<String, St
     }
 }
 
-fn rev_parse(mirror: &Path, rev: &str) -> Result<String, String> {
+pub(crate) fn rev_parse(mirror: &Path, rev: &str) -> Result<String, String> {
     git(mirror, &["rev-parse", "--verify", "-q", rev], &[])
         .map(|out| out.trim().to_owned())
         .map_err(|_| format!("{rev} does not exist"))
@@ -2411,7 +2413,7 @@ fn event_commit(mirror: &Path, event: &CiEvent) -> Result<String, String> {
 /// and the names of the Containerfiles.
 type CiFiles = (Vec<(String, String)>, Vec<String>);
 
-fn read_ci(mirror: &Path, sha: &str) -> Result<CiFiles, String> {
+pub(crate) fn read_ci(mirror: &Path, sha: &str) -> Result<CiFiles, String> {
     let listing = git(mirror, &["ls-tree", sha, &format!("{CI_DIR}/")], &[])?;
     let mut files = Vec::new();
     let mut containerfiles = Vec::new();

@@ -6,25 +6,32 @@
 //! the scheduler, and a restarted scheduler changes nothing here. The
 //! runners come from the registry the `/enlist` service keeps. A job's
 //! transcript is a read-only screen in [`Transcripts`], served on `/mux`.
+//!
+//! A `Repo` request also reads the jobs of a repository's `.zeughaus-ci/`
+//! from the mirror the scheduler fetches into, with git, as reads only.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use weida::{Replier, TransferMeta};
-use zeughaus_link::ci::{MAX_PIPELINES_PER_REQUEST, MAX_TIMING_LINES, TIMING_READ_BYTES};
+use zeughaus_link::ci::{
+    MAX_ORIGIN_BYTES, MAX_PIPELINES_PER_REQUEST, MAX_TIMING_LINES, TIMING_READ_BYTES,
+};
 use zeughaus_link::enlist::Place;
 use zeughaus_link::{
-    BusyMode, ChannelView, CiOverview, CiReply, CiRequest, JobTiming, JobView, MAX_CI_REPLY_BYTES,
-    MAX_CI_REQUEST_BYTES, MachineJob, MachineView, PipelineView, QueuedView, TimedLine,
-    TransferView,
+    BusyMode, ChannelView, CiOverview, CiReply, CiRequest, JobDefView, JobTiming, JobView,
+    MAX_CI_REPLY_BYTES, MAX_CI_REQUEST_BYTES, MachineJob, MachineView, PipelineView, QueuedView,
+    RepoView, TimedLine, TransferView,
 };
 use zeughaus_mux::TerminalId;
 use zeughaus_terminal::wal;
 
-use crate::config::{CiConfig, valid_name};
+use crate::CI_DIR;
+use crate::config::{CiConfig, Forge, RepoConfig, valid_name};
 use crate::event::{self, EventKind};
 use crate::excerpt;
+use crate::header::{JobDef, when_busy_name};
 use crate::runners::Runners;
 use crate::scheduler::{
     self, JobRecord, Pipeline, PipelineStatus, load_pipeline, load_pipelines, load_repo_pipelines,
@@ -42,6 +49,9 @@ const MAX_LOG_TEXT_BYTES: usize = 3 << 20;
 
 /// How many of a repository's newest records a `Find` looks at.
 const FIND_RECORDS: usize = 500;
+
+/// What a `Find` or `Repo` answers to a `sha` that is not 4 to 40 hex digits.
+const BAD_SHA: &str = "sha must be 4 to 40 hex digits";
 
 /// How much of a transcript's end a `Log` reply is made from.
 const LOG_READ_BYTES: usize = 8 << 20;
@@ -71,7 +81,8 @@ impl CiServer {
         }
     }
 
-    /// Blocking: reads records from disk.
+    /// Blocking: reads records from disk, and for a `Repo` runs git on the
+    /// scheduler's mirror.
     fn answer(&self, request: CiRequest) -> CiReply {
         match request {
             CiRequest::Overview => CiReply::Overview {
@@ -114,6 +125,7 @@ impl CiServer {
                 job,
                 top,
             } => self.timing(&repo, number, &job, top),
+            CiRequest::Repo { origin, sha, jobs } => self.repo(&origin, sha.as_deref(), jobs),
         }
     }
 
@@ -145,13 +157,18 @@ impl CiServer {
             channels: channel_views(&pipelines),
             machines: self.machine_views(&pipelines),
             queued: queued_views(&pipelines, &queued),
-            platforms: self
-                .config
-                .platforms
-                .iter()
-                .map(|(platform, target)| (platform.clone(), target.clone()))
-                .collect(),
+            platforms: self.platforms(),
         }
+    }
+
+    /// The `[platforms]` of the configuration: each platform and the runner
+    /// or machine that builds it.
+    fn platforms(&self) -> Vec<(String, String)> {
+        self.config
+            .platforms
+            .iter()
+            .map(|(platform, target)| (platform.clone(), target.clone()))
+            .collect()
     }
 
     /// Every configured runner by name (offline ones too), then the
@@ -269,10 +286,9 @@ impl CiServer {
         if !valid_name(repo) {
             return error("no such repository");
         }
-        if !(4..=40).contains(&sha.len()) || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return error("sha must be 4 to 40 hex digits");
-        }
-        let sha = sha.to_ascii_lowercase();
+        let Some(sha) = sha_prefix(sha) else {
+            return error(BAD_SHA);
+        };
         let dir = crate::ci_dir(&self.state_dir).join("pipelines").join(repo);
         let mut numbers: Vec<u64> = std::fs::read_dir(&dir)
             .into_iter()
@@ -288,14 +304,104 @@ impl CiServer {
         let found = numbers
             .into_iter()
             .filter_map(|number| load_pipeline(&self.state_dir, repo, number).ok())
-            .find(|pipeline| {
-                pipeline
-                    .sha
-                    .as_deref()
-                    .is_some_and(|full| full.to_ascii_lowercase().starts_with(&sha))
-            });
+            .find(|pipeline| has_sha(pipeline, &sha));
         CiReply::Pipeline {
             pipeline: found.as_ref().map(|record| Box::new(pipeline_view(record))),
+        }
+    }
+
+    /// The repository of `ci.toml` whose url `origin`, the origin remote of
+    /// an agent's checkout, names: where its default branch stands, the
+    /// newest pipeline of the checkout's commit `sha` and, with `jobs`, the
+    /// jobs of its `.zeughaus-ci/` and where each would run. Records and the
+    /// scheduler's mirror are only read, so the answer never waits for the
+    /// scheduler.
+    fn repo(&self, origin: &str, sha: Option<&str>, jobs: bool) -> CiReply {
+        if origin.is_empty() || origin.len() > MAX_ORIGIN_BYTES {
+            return error(&format!("origin must be 1 to {MAX_ORIGIN_BYTES} bytes"));
+        }
+        let sha = match sha {
+            Some(sha) => match sha_prefix(sha) {
+                Some(sha) => Some(sha),
+                None => return error(BAD_SHA),
+            },
+            None => None,
+        };
+        let Ok((name, repo)) = crate::manual::repo_of(&self.config, origin) else {
+            return CiReply::Repo { repo: None };
+        };
+        // Only this repository's records are read: the jobs a machine shows
+        // are the ones this repository runs on it.
+        let pipelines = load_repo_pipelines(&self.state_dir, name);
+        let read = if jobs {
+            self.read_jobs(name, &repo.default_branch, sha.as_deref())
+        } else {
+            RepoJobs::default()
+        };
+        CiReply::Repo {
+            repo: Some(Box::new(RepoView {
+                name: name.to_owned(),
+                forge: forge_label(repo),
+                default_branch: repo.default_branch.clone(),
+                branch: crate::streak::of_branch(&pipelines, &repo.default_branch)
+                    .describe(crate::now_secs()),
+                channels: channel_views(&pipelines),
+                head: sha
+                    .and_then(|sha| newest_of_sha(&pipelines, &sha))
+                    .map(|head| Box::new(pipeline_view(head))),
+                jobs_sha: read.sha,
+                jobs: read.jobs,
+                jobs_note: read.note,
+                machines: self.machine_views(&pipelines),
+                platforms: self.platforms(),
+            })),
+        }
+    }
+
+    /// The jobs of `name`'s `.zeughaus-ci/` from the scheduler's mirror: at
+    /// `sha` when the mirror has that commit, else at the head of
+    /// `default_branch`, each with the place the CI would run it at.
+    fn read_jobs(&self, name: &str, default_branch: &str, sha: Option<&str>) -> RepoJobs {
+        let nothing = |note: String| RepoJobs {
+            note,
+            ..RepoJobs::default()
+        };
+        let mirror = scheduler::mirror_dir(&self.state_dir, name);
+        if !mirror.join("HEAD").exists() {
+            return nothing(format!(
+                "the CI has not fetched {name} yet; it does with its first event"
+            ));
+        }
+        let resolve = |rev: String| scheduler::rev_parse(&mirror, &rev).ok();
+        let Some(commit) = sha
+            .and_then(|sha| resolve(format!("{sha}^{{commit}}")))
+            .or_else(|| resolve(format!("refs/heads/{default_branch}^{{commit}}")))
+        else {
+            return nothing(format!("no commit of {name} to read {CI_DIR}/ from"));
+        };
+        let short = &commit[..commit.len().min(7)];
+        let read = scheduler::read_ci(&mirror, &commit).and_then(|(files, containerfiles)| {
+            crate::pipeline::load_jobs(&files, &containerfiles)
+        });
+        let (jobs, note) = match read {
+            Err(e) => (Vec::new(), format!("{short} {CI_DIR}/: {e}")),
+            Ok(defs) if defs.is_empty() => (Vec::new(), format!("{short} has no job in {CI_DIR}/")),
+            Ok(defs) => {
+                let jobs: Vec<JobDefView> = defs
+                    .iter()
+                    .map(|def| {
+                        job_def_view(&self.config, name, def, |image| {
+                            scheduler::containerfile_at(&mirror, &commit, image)
+                        })
+                    })
+                    .collect();
+                (jobs, String::new())
+            }
+        };
+        RepoJobs {
+            sha: Some(commit),
+            jobs,
+            note,
         }
     }
 
@@ -359,6 +465,95 @@ impl CiServer {
 fn error(message: &str) -> CiReply {
     CiReply::Error {
         message: message.to_owned(),
+    }
+}
+
+/// `sha` in lower case, when it is 4 to 40 hex digits: a commit id or the
+/// start of one.
+fn sha_prefix(sha: &str) -> Option<String> {
+    ((4..=40).contains(&sha.len()) && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| sha.to_ascii_lowercase())
+}
+
+/// Whether the commit `pipeline` ran for starts with `sha`, which is in
+/// lower case.
+fn has_sha(pipeline: &Pipeline, sha: &str) -> bool {
+    pipeline
+        .sha
+        .as_deref()
+        .and_then(|full| full.get(..sha.len()))
+        .is_some_and(|start| start.eq_ignore_ascii_case(sha))
+}
+
+/// The newest of `pipelines`, one repository's records in any order, whose
+/// commit starts with `sha`, which is in lower case.
+fn newest_of_sha<'a>(pipelines: &'a [Pipeline], sha: &str) -> Option<&'a Pipeline> {
+    pipelines
+        .iter()
+        .filter(|pipeline| has_sha(pipeline, sha))
+        .max_by_key(|pipeline| pipeline.number)
+}
+
+/// `<forge> <slug>`, or `none` for a repository without a forge.
+fn forge_label(repo: &RepoConfig) -> String {
+    match repo.forge {
+        Forge::Github => format!("github {}", repo.slug),
+        Forge::Forgejo => format!("forgejo {}", repo.slug),
+        Forge::None => "none".to_owned(),
+    }
+}
+
+/// The jobs of a repository's `.zeughaus-ci/` as [`CiServer::read_jobs`]
+/// found them.
+#[derive(Default)]
+struct RepoJobs {
+    /// The commit they were read from.
+    sha: Option<String>,
+    jobs: Vec<JobDefView>,
+    /// Why there are none; empty when there are.
+    note: String,
+}
+
+/// A job of a `.zeughaus-ci/` and where the CI would run it. One that
+/// cannot be placed says why and runs nowhere. `containerfile` reads the
+/// text of `<image>.Containerfile` at the commit the job comes from.
+fn job_def_view(
+    config: &CiConfig,
+    repo: &str,
+    def: &JobDef,
+    containerfile: impl Fn(&str) -> Result<String, String>,
+) -> JobDefView {
+    let (runner, at, placement, manual) =
+        match scheduler::place_job(config, repo, def, containerfile) {
+            // A machine is a Windows VM; a manual run does not take one.
+            Ok((runner, place)) => {
+                let manual = !matches!(place, Place::Machine { .. });
+                (runner, place_at(&place), String::new(), manual)
+            }
+            Err(why) => (String::new(), String::new(), why, false),
+        };
+    JobDefView {
+        name: def.name.clone(),
+        file: def.file.clone(),
+        on: def.on.clone(),
+        needs: def.needs.clone(),
+        channels: def.channels.clone(),
+        place: scheduler::place_name(def),
+        runner,
+        at,
+        placement,
+        secrets: def.secrets.clone(),
+        when_busy: when_busy_name(def.when_busy).to_owned(),
+        manual,
+    }
+}
+
+/// Where on its runner a job runs: `host`, `image:<x>` or `machine:<vm>`.
+fn place_at(place: &Place) -> String {
+    match place {
+        Place::Host => "host".to_owned(),
+        Place::Container { image, .. } => format!("image:{image}"),
+        Place::Machine { name } => format!("machine:{name}"),
     }
 }
 
@@ -720,14 +915,15 @@ mod tests {
         dir
     }
 
-    fn config() -> Arc<CiConfig> {
+    /// The test configuration followed by `tables`: more of `ci.toml`.
+    fn config(tables: &str) -> Arc<CiConfig> {
         let other = FINGERPRINT.replace('1', "2");
         Arc::new(
             CiConfig::parse(&format!(
                 "default_runner = \"alpha\"\n\
                  [runners.alpha]\nfingerprint = \"{FINGERPRINT}\"\nmachines = [\"win11\"]\n\
                  [runners.beta]\nfingerprint = \"{other}\"\n\
-                 [platforms]\nlinux-amd64 = \"alpha\"\nwindows-amd64 = \"win11\"\n"
+                 [platforms]\nlinux-amd64 = \"alpha\"\nwindows-amd64 = \"win11\"\n{tables}"
             ))
             .expect("a valid ci.toml"),
         )
@@ -809,9 +1005,14 @@ mod tests {
     }
 
     fn server(state: &Path) -> CiServer {
+        server_with(state, "")
+    }
+
+    /// A server whose `ci.toml` also has `tables`.
+    fn server_with(state: &Path, tables: &str) -> CiServer {
         CiServer::new(
             state.to_path_buf(),
-            config(),
+            config(tables),
             Arc::new(Runners::new()),
             Arc::new(Transcripts::new(state.to_path_buf())),
         )
@@ -1185,6 +1386,585 @@ mod tests {
             }),
             error("no such repository")
         );
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// The origin remote of a checkout of the repository `view`, as
+    /// `ci.toml` spells it.
+    const VIEW_ORIGIN: &str = "ssh://git@git.example.org/me/view.git";
+
+    /// `ci.toml` tables for the repository `view`, which has a forge, and
+    /// `plain`, which has none and a default branch of its own.
+    fn repos() -> String {
+        format!(
+            "[repos.view]\nurl = '{VIEW_ORIGIN}'\nforge = \"forgejo\"\nslug = \"me/view\"\n\
+             api = \"https://git.example.org\"\n\
+             [repos.plain]\nurl = '/srv/git/plain.git'\ndefault_branch = \"trunk\"\n"
+        )
+    }
+
+    /// What a `Repo` request answers: the view, or `None` for an origin no
+    /// repository has.
+    fn ask_repo(
+        server: &CiServer,
+        origin: &str,
+        sha: Option<&str>,
+        jobs: bool,
+    ) -> Option<RepoView> {
+        match server.answer(CiRequest::Repo {
+            origin: origin.to_owned(),
+            sha: sha.map(str::to_owned),
+            jobs,
+        }) {
+            CiReply::Repo { repo } => repo.map(|view| *view),
+            other => panic!("unexpected reply {other:?}"),
+        }
+    }
+
+    /// The view of the repository `view`.
+    fn view_of(server: &CiServer, sha: Option<&str>, jobs: bool) -> RepoView {
+        ask_repo(server, VIEW_ORIGIN, sha, jobs).expect("the repository is configured")
+    }
+
+    #[test]
+    fn a_repository_is_found_by_its_origin_in_any_spelling_of_its_url() {
+        let state = scratch("repo-origin");
+        let server = server_with(&state, &repos());
+        let named = |origin: &str| ask_repo(&server, origin, None, false).map(|view| view.name);
+
+        // `ci.toml` has the ssh form; a checkout may have another.
+        for origin in [
+            VIEW_ORIGIN,
+            "git@git.example.org:me/view.git",
+            "https://git.example.org/me/view",
+            "https://git.example.org/me/view.git/",
+        ] {
+            assert_eq!(named(origin).as_deref(), Some("view"), "{origin}");
+        }
+        assert_eq!(named("/srv/git/plain.git").as_deref(), Some("plain"));
+        assert_eq!(named("https://git.example.org/me/other"), None);
+        assert_eq!(named("https://git.example.org/me"), None);
+        assert_eq!(named("/tmp/view"), None);
+
+        // What `ci.toml` says of the repository and of what builds where.
+        let view = view_of(&server, None, false);
+        assert_eq!(
+            (view.forge.as_str(), view.default_branch.as_str()),
+            ("forgejo me/view", "main")
+        );
+        let plain = ask_repo(&server, "/srv/git/plain.git", None, false).expect("plain");
+        assert_eq!(
+            (plain.forge.as_str(), plain.default_branch.as_str()),
+            ("none", "trunk")
+        );
+        assert_eq!(
+            view.platforms,
+            [
+                ("linux-amd64".to_owned(), "alpha".to_owned()),
+                ("windows-amd64".to_owned(), "win11".to_owned()),
+            ]
+        );
+
+        // The runners are those of `ci.toml`, with the state they report.
+        let runners = |server: &CiServer| {
+            let view = view_of(server, None, false);
+            view.machines
+                .into_iter()
+                .map(|machine| (machine.name, machine.status))
+                .collect::<Vec<_>>()
+        };
+        let pair = |name: &str, status: &str| (name.to_owned(), status.to_owned());
+        assert_eq!(
+            runners(&server),
+            [pair("alpha", "offline"), pair("beta", "offline")]
+        );
+        connect(&server, "alpha", None);
+        assert_eq!(
+            runners(&server),
+            [pair("alpha", "online"), pair("beta", "offline")]
+        );
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_repo_request_names_an_origin_and_a_sha_within_bounds() {
+        let state = scratch("repo-bounds");
+        let server = server_with(&state, &repos());
+        let reply = |origin: &str, sha: Option<&str>| {
+            server.answer(CiRequest::Repo {
+                origin: origin.to_owned(),
+                sha: sha.map(str::to_owned),
+                jobs: false,
+            })
+        };
+
+        for origin in [String::new(), "a".repeat(MAX_ORIGIN_BYTES + 1)] {
+            assert_eq!(
+                reply(&origin, None),
+                error(&format!("origin must be 1 to {MAX_ORIGIN_BYTES} bytes")),
+                "{} bytes",
+                origin.len()
+            );
+        }
+        // The longest origin is looked up, and no repository has it.
+        assert_eq!(
+            reply(&"a".repeat(MAX_ORIGIN_BYTES), None),
+            CiReply::Repo { repo: None }
+        );
+
+        for bad in ["abc", "xyz1", "", &"a".repeat(41)] {
+            assert_eq!(
+                reply(VIEW_ORIGIN, Some(bad)),
+                error("sha must be 4 to 40 hex digits"),
+                "{bad:?}"
+            );
+        }
+        for good in ["abcd", "ABCDEF0", &"0".repeat(40)] {
+            assert!(
+                matches!(
+                    reply(VIEW_ORIGIN, Some(good)),
+                    CiReply::Repo { repo: Some(_) }
+                ),
+                "{good:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_commit_id_is_matched_by_its_start_whatever_the_case_of_the_record() {
+        let mut record = pipeline("view", 1, "dev", PipelineStatus::Running, Vec::new());
+        record.sha = Some("ABCDEF0123456789ABCDEF0123456789ABCDEF01".to_owned());
+        assert!(has_sha(&record, "abcdef0"));
+        assert!(has_sha(&record, "abcdef0123456789abcdef0123456789abcdef01"));
+        assert!(!has_sha(&record, "abcdef1"));
+        // Longer than any commit id.
+        assert!(!has_sha(
+            &record,
+            "abcdef0123456789abcdef0123456789abcdef012"
+        ));
+        record.sha = None;
+        assert!(!has_sha(&record, "abcd"));
+    }
+
+    #[test]
+    fn the_view_has_the_newest_pipeline_of_the_sha_and_the_channels_of_its_repository_only() {
+        let state = scratch("repo-head");
+        let with_sha = |repo: &str, number, channel: &str, sha: &str| {
+            let mut record = pipeline(repo, number, channel, PipelineStatus::Succeeded, Vec::new());
+            record.sha = Some(sha.to_owned());
+            store(&state, &record);
+        };
+        with_sha("view", 2, "dev", "abcdef0123456789abcdef0123456789abcdef01");
+        // A rerun of the same commit, another commit, and the first one in
+        // another repository.
+        with_sha(
+            "view",
+            9,
+            "release",
+            "abcdef0123456789abcdef0123456789abcdef01",
+        );
+        with_sha(
+            "view",
+            10,
+            "nightly",
+            "1234567890abcdef1234567890abcdef12345678",
+        );
+        with_sha(
+            "plain",
+            11,
+            "dev",
+            "abcdef0123456789abcdef0123456789abcdef01",
+        );
+        let server = server_with(&state, &repos());
+        let head = |sha: Option<&str>| {
+            view_of(&server, sha, false)
+                .head
+                .map(|head| (head.repo, head.number, head.channel))
+        };
+
+        let rerun = Some(("view".to_owned(), 9, "release".to_owned()));
+        assert_eq!(head(Some("abcdef0")), rerun);
+        assert_eq!(
+            head(Some("ABCDEF0123456789ABCDEF0123456789ABCDEF01")),
+            rerun
+        );
+        assert_eq!(
+            head(Some("1234")),
+            Some(("view".to_owned(), 10, "nightly".to_owned()))
+        );
+        assert_eq!(head(Some("ffff")), None);
+        assert_eq!(head(None), None);
+
+        let channel = |channel: &str, latest| ChannelView {
+            repo: "view".to_owned(),
+            channel: channel.to_owned(),
+            latest,
+            status: "succeeded".to_owned(),
+        };
+        assert_eq!(
+            view_of(&server, None, false).channels,
+            [
+                channel("dev", 2),
+                channel("nightly", 10),
+                channel("release", 9)
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn the_default_branch_is_green_or_red_since_the_pipeline_that_broke_it() {
+        let state = scratch("repo-branch");
+        let server = server_with(&state, &repos());
+        // A run of `repo` on `branch` whose `check` job ended as `check`.
+        // Both jobs have a pattern of their own, so neither is a deploy
+        // job, which the streak would also name.
+        let run = |repo: &str, number: u64, branch: &str, check: JobStatus| {
+            let mut jobs = vec![
+                job("build", JobStatus::Succeeded, None, None),
+                job("check", check, None, None),
+            ];
+            for job in &mut jobs {
+                job.def.on = vec!["push main".to_owned()];
+            }
+            let mut record = pipeline(repo, number, "dev", PipelineStatus::Failed, jobs);
+            record.event.git_ref = branch.to_owned();
+            record.sha = Some(format!("{number}{}", "a".repeat(39)));
+            record.created = crate::now_secs();
+            store(&state, &record);
+        };
+        let branch = |server: &CiServer| view_of(server, None, false).branch;
+
+        // Nothing has run yet.
+        assert_eq!(branch(&server), "green");
+        run("view", 1, "main", JobStatus::Succeeded);
+        assert_eq!(branch(&server), "green");
+        run("view", 2, "main", JobStatus::Failed);
+        run("view", 3, "main", JobStatus::Failed);
+        assert_eq!(
+            branch(&server),
+            "check red since #2 (2aaaaaa, 0 min, 2 pipelines)"
+        );
+        // Another branch breaking says nothing about this one.
+        run("view", 4, "feature/x", JobStatus::Succeeded);
+        assert_eq!(
+            branch(&server),
+            "check red since #2 (2aaaaaa, 0 min, 2 pipelines)"
+        );
+        run("view", 5, "main", JobStatus::Succeeded);
+        assert_eq!(branch(&server), "green");
+
+        // The default branch is the one `ci.toml` names: `plain` has `trunk`.
+        run("plain", 1, "main", JobStatus::Failed);
+        let plain = |server: &CiServer| {
+            ask_repo(server, "/srv/git/plain.git", None, false)
+                .expect("plain")
+                .branch
+        };
+        assert_eq!(plain(&server), "green");
+        run("plain", 2, "trunk", JobStatus::Failed);
+        assert_eq!(
+            plain(&server),
+            "check red since #2 (2aaaaaa, 0 min, 1 pipeline)"
+        );
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    const BUILD: (&str, &str) = (
+        ".zeughaus-ci/build.sh",
+        "# /// ci\n# on = [\"push main\", \"tag v*\"]\n# ///\necho build\n",
+    );
+    const CHECK: (&str, &str) = (
+        ".zeughaus-ci/check.sh",
+        "# /// ci\n# needs = [\"build\"]\n# image = \"trixie\"\n# when_busy = \"freeze\"\n# ///\necho check\n",
+    );
+    const TRIXIE: (&str, &str) = (".zeughaus-ci/trixie.Containerfile", "FROM scratch\n");
+    const PUBLISH: (&str, &str) = (
+        ".zeughaus-ci/publish.sh",
+        "# /// ci\n# needs = [\"check\"]\n# channels = [\"dev\"]\n# secrets = [\"TOKEN\", \"OTHER_TOKEN\"]\n# ///\necho publish\n",
+    );
+    const LINUX: (&str, &str) = (
+        ".zeughaus-ci/linux.sh",
+        "# /// ci\n# on = [\"push main\"]\n# platform = \"linux-amd64\"\n# ///\necho linux\n",
+    );
+    const MAC: (&str, &str) = (
+        ".zeughaus-ci/mac.sh",
+        "# /// ci\n# on = [\"push main\"]\n# platform = \"darwin-arm64\"\n# ///\necho mac\n",
+    );
+    const WINDOWS: (&str, &str) = (
+        ".zeughaus-ci/windows.ps1",
+        "# /// ci\n# on = [\"push main\"]\n# machine = \"win11\"\n# ///\nWrite-Output windows\n",
+    );
+    const WINDOWS_AMD64: (&str, &str) = (
+        ".zeughaus-ci/windows-amd64.ps1",
+        "# /// ci\n# on = [\"push main\"]\n# platform = \"windows-amd64\"\n# ///\nWrite-Output windows\n",
+    );
+    const CHANNELS: (&str, &str) = (
+        ".zeughaus-ci/channels.toml",
+        "[[channel]]\nname = \"dev\"\non = [\"push main\"]\n",
+    );
+
+    /// The scheduler's mirror of the repository `view`, a bare repository
+    /// with the branch `main` of a work tree that committed `commits`,
+    /// oldest first: a commit's `.zeughaus-ci/` holds the files it lists.
+    /// Returns the commit ids. No commit leaves a mirror with nothing in it.
+    fn mirror_with(state: &Path, commits: &[&[(&str, &str)]]) -> Vec<String> {
+        let author: Vec<(String, String)> = [
+            ("GIT_AUTHOR_NAME", "t"),
+            ("GIT_AUTHOR_EMAIL", "t@t"),
+            ("GIT_COMMITTER_NAME", "t"),
+            ("GIT_COMMITTER_EMAIL", "t@t"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+        let git = |dir: &Path, args: &[&str]| {
+            scheduler::git(dir, args, &author).unwrap_or_else(|e| panic!("{e}"))
+        };
+        let work = state.join("work");
+        std::fs::create_dir_all(&work).expect("create the work tree");
+        git(&work, &["init", "-q", "-b", "main"]);
+        let mut ids = Vec::new();
+        for files in commits {
+            let _ = std::fs::remove_dir_all(work.join(CI_DIR));
+            for (path, text) in *files {
+                let path = work.join(path);
+                std::fs::create_dir_all(path.parent().expect("a file in a folder"))
+                    .expect("create the folder");
+                std::fs::write(&path, text).expect("write the file");
+            }
+            git(&work, &["add", "-A"]);
+            git(&work, &["commit", "-q", "--allow-empty", "-m", "snapshot"]);
+            ids.push(git(&work, &["rev-parse", "HEAD"]).trim().to_owned());
+        }
+        let mirror = scheduler::mirror_dir(state, "view");
+        std::fs::create_dir_all(&mirror).expect("create the mirror");
+        git(&mirror, &["init", "--bare", "-q", "-b", "main"]);
+        if !ids.is_empty() {
+            let from = work.to_string_lossy();
+            git(
+                &mirror,
+                &["fetch", "-q", &from, "+refs/heads/*:refs/heads/*"],
+            );
+        }
+        ids
+    }
+
+    #[test]
+    fn the_jobs_are_read_at_the_asked_commit_else_at_the_head_of_the_default_branch() {
+        let state = scratch("repo-jobs-at");
+        let ids = mirror_with(
+            &state,
+            &[
+                &[BUILD, CHECK, TRIXIE, CHANNELS],
+                &[BUILD, CHECK, TRIXIE, CHANNELS, PUBLISH, LINUX],
+            ],
+        );
+        let server = server_with(&state, &repos());
+        let read = |sha: Option<&str>| {
+            let view = view_of(&server, sha, true);
+            let mut names: Vec<&str> = view.jobs.iter().map(|job| job.name.as_str()).collect();
+            names.sort_unstable();
+            (
+                view.jobs_sha.clone(),
+                names.join(" "),
+                view.jobs_note.clone(),
+            )
+        };
+        let old = (
+            Some(ids[0].clone()),
+            "build check".to_owned(),
+            String::new(),
+        );
+        let head = (
+            Some(ids[1].clone()),
+            "build check linux publish".to_owned(),
+            String::new(),
+        );
+
+        // The commit asked for, whole or by its start.
+        assert_eq!(read(Some(&ids[0])), old);
+        assert_eq!(read(Some(&ids[0][..8])), old);
+        assert_eq!(read(Some(&ids[0][..8].to_uppercase())), old);
+        assert_eq!(read(Some(&ids[1])), head);
+        // One the mirror does not have, or none: the head of `main`.
+        assert_eq!(read(Some(&"f".repeat(40))), head);
+        assert_eq!(read(None), head);
+
+        // Without the jobs asked for, git is not run and nothing is said.
+        let bare = view_of(&server, Some(&ids[0]), false);
+        assert_eq!(
+            (bare.jobs_sha, bare.jobs.len(), bare.jobs_note),
+            (None, 0, String::new())
+        );
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn each_job_says_where_it_runs_what_it_needs_and_whether_run_jobs_takes_it() {
+        let state = scratch("repo-jobs-place");
+        mirror_with(
+            &state,
+            &[&[
+                BUILD,
+                CHECK,
+                TRIXIE,
+                PUBLISH,
+                LINUX,
+                MAC,
+                WINDOWS,
+                WINDOWS_AMD64,
+                CHANNELS,
+            ]],
+        );
+        let server = server_with(&state, &repos());
+        let view = view_of(&server, None, true);
+        assert_eq!(view.jobs_note, "");
+        let job = |name: &str| {
+            view.jobs
+                .iter()
+                .find(|job| job.name == name)
+                .unwrap_or_else(|| panic!("no job {name}"))
+        };
+        // The runner, where on it, and whether a manual run takes the job.
+        let placed = |name: &str| {
+            let job = job(name);
+            (job.runner.as_str(), job.at.as_str(), job.manual)
+        };
+        assert_eq!(placed("build"), ("alpha", "host", true));
+        assert_eq!(placed("check"), ("alpha", "image:trixie", true));
+        assert_eq!(placed("publish"), ("alpha", "host", true));
+        assert_eq!(placed("linux"), ("alpha", "host", true));
+        // A machine is a Windows VM, which a manual run does not take.
+        assert_eq!(placed("windows"), ("alpha", "machine:win11", false));
+        assert_eq!(placed("windows-amd64"), ("alpha", "machine:win11", false));
+        // A platform `ci.toml` has no entry for runs nowhere.
+        assert_eq!(placed("mac"), ("", "", false));
+        assert_eq!(
+            job("mac").placement,
+            ".zeughaus-ci/mac.sh: platform darwin-arm64 is not in ci.toml [platforms]"
+        );
+        let unplaced: Vec<&str> = view
+            .jobs
+            .iter()
+            .filter(|job| !job.placement.is_empty())
+            .map(|job| job.name.as_str())
+            .collect();
+        assert_eq!(unplaced, ["mac"]);
+
+        // The header as written.
+        let build = job("build");
+        assert_eq!(
+            (build.file.as_str(), build.place.as_str()),
+            ("build.sh", "host")
+        );
+        assert_eq!(build.on, ["push main", "tag v*"]);
+        assert_eq!(build.when_busy, "wait");
+        assert!(build.needs.is_empty() && build.secrets.is_empty());
+        let check = job("check");
+        assert_eq!(check.place, "image:trixie");
+        assert_eq!(
+            (check.needs.as_slice(), check.when_busy.as_str()),
+            (&["build".to_owned()][..], "freeze")
+        );
+        let publish = job("publish");
+        assert_eq!(publish.secrets, ["TOKEN", "OTHER_TOKEN"]);
+        assert_eq!(
+            (publish.needs.as_slice(), publish.channels.as_slice()),
+            (&["check".to_owned()][..], &["dev".to_owned()][..])
+        );
+        assert!(publish.on.is_empty());
+        assert_eq!(job("linux").place, "platform:linux-amd64");
+        assert_eq!(job("windows").place, "machine:win11");
+        assert_eq!(job("windows-amd64").place, "platform:windows-amd64");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn an_image_job_is_placed_by_the_text_of_its_containerfile() {
+        let mut def = job("check", JobStatus::Pending, None, None).def;
+        def.image = Some("trixie".to_owned());
+        let config = config("");
+
+        let placed = job_def_view(&config, "view", &def, |image| {
+            assert_eq!(image, "trixie");
+            Ok("FROM scratch\n".to_owned())
+        });
+        assert_eq!(
+            (placed.runner.as_str(), placed.at.as_str(), placed.manual),
+            ("alpha", "image:trixie", true)
+        );
+        assert_eq!(placed.placement, "");
+
+        let lost = job_def_view(&config, "view", &def, |_| {
+            Err("git show: no such path".to_owned())
+        });
+        assert_eq!(
+            (lost.runner.as_str(), lost.at.as_str(), lost.manual),
+            ("", "", false)
+        );
+        assert_eq!(lost.placement, "git show: no such path");
+    }
+
+    #[test]
+    fn a_repository_the_ci_has_not_fetched_has_no_jobs_to_show_and_says_why() {
+        let state = scratch("repo-jobs-unfetched");
+        let server = server_with(&state, &repos());
+        let view = view_of(&server, Some(&"a".repeat(40)), true);
+        assert_eq!(
+            (view.jobs_sha, view.jobs.len(), view.jobs_note.as_str()),
+            (
+                None,
+                0,
+                "the CI has not fetched view yet; it does with its first event"
+            )
+        );
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn jobs_that_cannot_be_read_are_replaced_by_the_reason() {
+        let state = scratch("repo-jobs-note");
+        let server = server_with(&state, &repos());
+        let note = |sha: Option<&str>| {
+            let view = view_of(&server, sha, true);
+            assert!(view.jobs.is_empty());
+            (view.jobs_sha, view.jobs_note)
+        };
+
+        // A mirror that is set up and has no commit yet.
+        assert!(mirror_with(&state, &[]).is_empty());
+        assert_eq!(
+            note(None),
+            (
+                None,
+                "no commit of view to read .zeughaus-ci/ from".to_owned()
+            )
+        );
+
+        let ids = mirror_with(
+            &state,
+            &[
+                &[("README", "view\n")],
+                &[(
+                    ".zeughaus-ci/bad.sh",
+                    "# /// ci\n# nonsense = 1\n# ///\necho\n",
+                )],
+            ],
+        );
+        // No folder, then a header the CI cannot read.
+        assert_eq!(
+            note(Some(&ids[0])),
+            (
+                Some(ids[0].clone()),
+                format!("{} has no job in .zeughaus-ci/", &ids[0][..7])
+            )
+        );
+        let (sha, text) = note(Some(&ids[1]));
+        assert_eq!(sha, Some(ids[1].clone()));
+        let reason = format!("{} .zeughaus-ci/: .zeughaus-ci/bad.sh: ", &ids[1][..7]);
+        assert!(text.starts_with(&reason), "{text}");
         let _ = std::fs::remove_dir_all(&state);
     }
 

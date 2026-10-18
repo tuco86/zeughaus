@@ -206,7 +206,10 @@ pub fn normalize_url(url: &str) -> String {
 
 /// The repository of `ci.toml` whose `url` is the same repository as
 /// `origin`, with its name.
-fn repo_of<'a>(config: &'a CiConfig, origin: &str) -> Result<(&'a str, &'a RepoConfig), String> {
+pub(crate) fn repo_of<'a>(
+    config: &'a CiConfig,
+    origin: &str,
+) -> Result<(&'a str, &'a RepoConfig), String> {
     let wanted = normalize_url(origin);
     config
         .repos
