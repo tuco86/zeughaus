@@ -1485,7 +1485,7 @@ mod tests {
     /// without one skips it rather than failing.
     #[test]
     fn a_frame_of_text_reaches_the_target_texture() {
-        let Some((device, queue)) = headless_device() else {
+        let Some((_turn, device, queue)) = headless_device() else {
             eprintln!("iced_terminal: no wgpu adapter, skipping the GPU smoke test");
             return;
         };
@@ -1693,7 +1693,7 @@ mod tests {
     /// background across the whole surface instead of walking them.
     #[test]
     fn a_pane_without_a_view_paints_only_its_background() {
-        let Some((device, queue)) = headless_device() else {
+        let Some((_turn, device, queue)) = headless_device() else {
             eprintln!("iced_terminal: no wgpu adapter, skipping the GPU smoke test");
             return;
         };
@@ -1811,11 +1811,27 @@ mod tests {
         }
     }
 
-    fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-                .ok()?;
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+    /// The one device every GPU test of this crate draws with, one test at a
+    /// time, and never dropped. The NVIDIA Vulkan driver on Windows hangs a
+    /// test process whose tests create and drop devices concurrently.
+    fn headless_device() -> Option<(
+        std::sync::MutexGuard<'static, ()>,
+        wgpu::Device,
+        wgpu::Queue,
+    )> {
+        static DEVICE: LazyLock<Option<(wgpu::Device, wgpu::Queue)>> = LazyLock::new(|| {
+            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+            let adapter = pollster::block_on(
+                instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+            )
+            .ok()?;
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+        });
+        static TURN: Mutex<()> = Mutex::new(());
+        let turn = TURN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (device, queue) = DEVICE.as_ref()?;
+        Some((turn, device.clone(), queue.clone()))
     }
 }
