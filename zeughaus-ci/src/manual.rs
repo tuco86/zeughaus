@@ -686,10 +686,7 @@ mod tests {
         }
         let long_ago = SystemTime::now() - 2 * STALE_AFTER;
         for path in [upload_dir(&state, old), number_path(&state, old)] {
-            std::fs::File::open(&path)
-                .unwrap()
-                .set_modified(long_ago)
-                .unwrap();
+            set_modified(&path, long_ago);
         }
         remove_stale(&state, STALE_AFTER);
         assert!(!upload_dir(&state, old).exists());
@@ -697,6 +694,22 @@ mod tests {
         assert!(upload_dir(&state, fresh).exists());
         assert!(number_path(&state, fresh).exists());
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// Sets the modification time of a file or a directory. Windows opens a
+    /// directory only with `FILE_FLAG_BACKUP_SEMANTICS`, and sets a time only
+    /// through a handle opened for writing.
+    fn set_modified(path: &Path, time: SystemTime) {
+        let mut options = std::fs::OpenOptions::new();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            options.write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        #[cfg(not(windows))]
+        options.read(true);
+        options.open(path).unwrap().set_modified(time).unwrap();
     }
 
     fn service(state: &Path, wait: Duration) -> ManualService {

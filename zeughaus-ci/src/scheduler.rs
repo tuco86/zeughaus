@@ -3196,7 +3196,7 @@ mod tests {
             CiConfig::parse(&format!(
                 "default_runner = \"x\"\n\
                  [runners.x]\nfingerprint = \"{FP_1}\"\n\
-                 [repos.view]\nurl = \"{}\"\n",
+                 [repos.view]\nurl = '{}'\n",
                 origin.display()
             ))
             .expect("a valid config"),
