@@ -1,4 +1,4 @@
-# Test tiers (see CLAUDE.md, Development Workflow). A test that touches the
+# Test tiers (see AGENTS.md, Development Workflow). A test that touches the
 # filesystem, network, processes, a PTY, a GPU, the environment or real time
 # lives in a module named `io`; everything else is a unit test.
 nextest-version = { required = "0.9.115" }

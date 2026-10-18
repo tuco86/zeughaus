@@ -1,4 +1,4 @@
-# Claude Code Instructions for Zeughaus
+# Agent instructions for Zeughaus
 
 ## Project Overview
 
@@ -516,9 +516,11 @@ integration -p <crate>` when I/O code changed. An I/O test lives in a `mod
 io` inside its `#[cfg(test)] mod tests`; `.config/nextest.toml` holds the
 tiers and their time limits.
 
-A change to a crate's manifest or to what it includes also passes
-`cargo publish --workspace --dry-run` (a repeated one only after clearing
-the stale unpacked crates, `RELEASING.md` step 4).
+`cargo publish --workspace --dry-run` belongs to the release (`RELEASING.md`
+step 4), not to a change: it builds every crate again from its package and
+took 7.6 min on 2026-10-18. A change that adds a crate or changes what a
+crate includes checks that crate's file list with `cargo package -p <crate>
+--no-verify --allow-dirty` (no compile).
 
 Iterate with `cargo check -q --message-format short -p <crate>`. One cargo
 invocation per workspace at a time; long runs get a generous timeout.

@@ -1,6 +1,5 @@
 # Cargo build output at any level.
 target/
-.claude/settings.local.json
 
 # What a runner writes into its working directory: the database plugin's
 # default SQLite file and the recorder's default dataset directory.

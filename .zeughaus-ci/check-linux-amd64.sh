@@ -7,7 +7,7 @@
 # when_busy = "freeze"
 # timeout_minutes = 120
 # ///
-# The gate from CLAUDE.md: formatting, clippy, the tests, and the editor's
+# The gate from AGENTS.md: formatting, clippy, the tests, and the editor's
 # wasm build.
 set -eu
 

@@ -1591,7 +1591,7 @@ the state lock, which is what the preflight runs.
 **Install profiles and refresh.** `zeughaus-runner install
 <desktop|macos|service|windows>` and `zeughaus-ci install ci` (`--channel`,
 `--from`, `--bin-dir`, `--feed-addr`, `--no-service`; the details are in
-`CLAUDE.md`) write a host's binaries with the updater's own staged rename
+`AGENTS.md`) write a host's binaries with the updater's own staged rename
 (`install_binary`, `install_bundle`), the files of the archive's `share/` with
 `@BINDIR@`, `@FEED_ADDR@` and `@LOGS@` replaced, and `update.toml` and
 `install.toml`; `write_if_changed` in `zeughaus_update::host` makes a
