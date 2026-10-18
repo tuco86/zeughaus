@@ -12,3 +12,8 @@ plan/
 
 # Headless review captures: screenshots are never committed.
 .impeccable/review/
+
+# What the CI jobs keep in their workspace between runs: cargo's home and
+# target directory, the weida checkout, the staged archives. A checkout
+# cleans untracked files but keeps ignored ones.
+.ci-cache/

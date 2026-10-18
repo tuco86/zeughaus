@@ -1,8 +1,7 @@
 #!/bin/bash
 # /// ci
-# needs = ["gate", "linux-amd64", "linux-arm64", "windows-amd64", "darwin-arm64"]
+# needs = ["build-linux-amd64", "build-linux-arm64", "build-windows-amd64", "build-darwin-arm64", "check-linux-amd64", "check-linux-arm64", "check-windows-amd64", "check-darwin-arm64"]
 # machine = "sadala"
-# cache = [".ci-cache"]
 # secrets = ["ZEUGHAUS_UPDATE_KEY", "ZEUGHAUS_GITHUB_TOKEN"]
 # when_busy = "run"
 # timeout_minutes = 60
@@ -40,9 +39,9 @@ trap 'rm -rf "$work"' EXIT
 platforms="linux-amd64 linux-arm64 windows-amd64 darwin-arm64"
 mkdir "$work/files"
 for p in $platforms; do
-    dir="$CI_INPUTS/$p"
+    dir="$CI_INPUTS/build-$p"
     if [ ! -d "$dir" ]; then
-        echo "no output of job $p in $CI_INPUTS"
+        echo "no output of job build-$p in $CI_INPUTS"
         exit 1
     fi
     cp -L "$dir"/* "$work/files/"

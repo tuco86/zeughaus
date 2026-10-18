@@ -2,7 +2,6 @@
 # /// ci
 # on = ["push main", "tag v*", "cron 0 3 * * *"]
 # platform = "darwin-arm64"
-# cache = [".ci-cache"]
 # secrets = ["FORGEJO_READ_TOKEN"]
 # timeout_minutes = 120
 # ///
@@ -13,6 +12,7 @@ set -eu
 
 . "$CI_WORKSPACE/.zeughaus-ci/build.sh"
 cargo_env
+export ZEUGHAUS_BUILD="$CI_PIPELINE"
 . "$CI_WORKSPACE/.zeughaus-ci/weida.sh"
 
 triple=aarch64-apple-darwin

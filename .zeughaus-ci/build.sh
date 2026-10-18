@@ -1,15 +1,23 @@
-# Sourced by the platform build jobs; no header, so not a job.
+# Sourced by the platform build and check jobs; no header, so not a job.
 # Run from the workspace root, with CI_PLATFORM set by the job's `platform`.
 
-# Cargo's home and target directory live in the job's cache, and the build
-# number is compiled into the binaries (`option_env!("ZEUGHAUS_BUILD")`), which
-# is how an installed runner knows whether a published build is newer.
+# Cargo's home and target directory live in the workspace, which the jobs of
+# one place share and keep warm. The build number is not set here: it
+# changes every pipeline and would rebuild every unit that reads it; the
+# build jobs export ZEUGHAUS_BUILD themselves.
 cargo_env() {
     cache="$CI_WORKSPACE/.ci-cache"
     export CARGO_HOME="$cache/cargo"
     export CARGO_TARGET_DIR="$cache/target"
     export CARGO_TERM_COLOR=always
-    export ZEUGHAUS_BUILD="$CI_PIPELINE"
+}
+
+step() { printf '\n== %s\n' "$*"; "$@"; }
+
+# clippy and the tests: what every platform checks.
+check_platform() {
+    step cargo clippy --locked --workspace --all-targets -- -D warnings
+    step cargo test --locked --workspace
 }
 
 # The workspace version, which names the archive and its top directory.
