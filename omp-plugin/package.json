@@ -1,0 +1,10 @@
+{
+  "name": "zeughaus-ci",
+  "version": "0.1.0",
+  "private": true,
+  "omp": {
+    "extensions": [
+      "./src/main.ts"
+    ]
+  }
+}

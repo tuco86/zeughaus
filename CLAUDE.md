@@ -44,6 +44,7 @@ zeughaus-theme/        # the editor's theme: iced theme paired with a terminal c
 vm/win11/              # scripts: headless Windows 11 guest under QEMU/KVM, the service runner's `win11` machine (boot, toolchain, per-boot prepare.ps1); toolchain.ps1 also provisions a Windows runner host
 deploy/                # install.sh, systemd user unit for the runner, desktop entry template, macos-app.sh and the bundle's Info.plist; install-sadala.sh, install-runner-user.sh, install-macos.sh, install-windows.sh, build-aarch64.sh; runner/ (unit, ssh config, enlist.toml.example) and ci/ (CI unit, ci.toml.example, openbao.sh), macos/ (launchd agent), windows/ (host setup and install scripts)
 third_party/           # its own workspace: wezterm's terminal crates at the pinned revision, published as zeughaus-* packages
+omp-plugin/            # the zeughaus-ci omp plugin (skill + extension); catalog in .omp-plugin/marketplace.json; bump its three versions together
 ```
 
 Sibling checkout this workspace depends on by path: `../weida` (the QUIC

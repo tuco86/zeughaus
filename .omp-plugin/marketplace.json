@@ -1,0 +1,17 @@
+{
+  "name": "zeughaus",
+  "owner": {
+    "name": "Hannes Uebelacker"
+  },
+  "metadata": {
+    "description": "omp plugins of zeughaus"
+  },
+  "plugins": [
+    {
+      "name": "zeughaus-ci",
+      "source": "./omp-plugin",
+      "version": "0.1.0",
+      "description": "zeughaus-ci in omp: the checkout's CI at session start, push watching, the CI skill"
+    }
+  ]
+}

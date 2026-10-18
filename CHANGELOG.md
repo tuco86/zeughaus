@@ -67,9 +67,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the terminal WAL keeps for every chunk, and `ci_log` can start every line
   with the seconds since the job's first output (`timestamps`). `/ci` gets
   `Timing { repo, number, job, top }` and `Log` a `timestamps` field.
+- The MCP server's `ci_repo` says which repository of the CI the checkout
+  is, by its origin: the default branch's state, the pipeline of `HEAD`,
+  the channels, every job of its `.zeughaus-ci/` with the runner and place
+  it runs at, its secrets and whether `run_jobs` can run it, the runners
+  and the platforms. In such a checkout every other tool's `repo` may be
+  omitted, and `ci_wait` without a number or sha waits for `HEAD`.
+  `zeughaus-runner ci repo [--json] [<path>]` and `ci find [--json] <repo>
+  <sha>` give the same to a script. `/ci` gets `Repo { origin, sha, jobs }`.
+- `omp-plugin/` is an omp plugin, `zeughaus-ci` (catalog
+  `.omp-plugin/marketplace.json`): in a checkout the CI builds it puts the
+  CI's view of it into the session's system prompt, watches the pipeline
+  after a `git push` and reports its first failure into the session, shows
+  the state in the status line and as `/zeughaus`, and ships the
+  `zeughaus-ci` skill: the debug loop with `run_jobs` and how to shape a
+  pipeline for the CI.
 
 ### Changed
 
+- zeughaus's own pipeline times every step (`== <command>: <s> s`), pins
+  the Rust toolchain in `rust-toolchain.toml` and the image's tag, and
+  keeps weida in one cache checkout that a manual run fetches its sibling
+  into, so cargo does not rebuild weida between pipelines and manual runs.
 - A runner's locked `Triggered` group, and a CI section's group of a
   repository without channels, is shown only while it holds a tab: it no
   longer sits empty in the tab bar between runs.
