@@ -159,7 +159,7 @@ mod tests {
         };
 
         assert_eq!(by_id(1)["result"]["serverInfo"]["name"], "zeughaus");
-        assert_eq!(by_id(2)["result"]["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(by_id(2)["result"]["tools"].as_array().unwrap().len(), 9);
         let status = &by_id(3)["result"];
         assert_eq!(status["isError"], true);
         let text = status["content"][0]["text"].as_str().unwrap();

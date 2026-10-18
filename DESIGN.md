@@ -1155,8 +1155,10 @@ jobs active on it as `MachineJob { repo, channel, number, job }`, and the
 newest first by pages, one pipeline, opens or closes a transcript, answers
 `Log { repo, number, job, tail }` with the last lines of a job's stored output
 as plain text (at most 5000 lines and 3 MiB, read from the end of its `wal`,
-`finished` once its `exit` exists) and takes two actions, both answered
-`Accepted`:
+`finished` once its `exit` exists), answers `Find { repo, sha }` with the newest
+of a repository's last 500 pipelines, of any channel and a try run too, whose
+commit id starts with the 4 to 40 hex digits `sha` (`Pipeline`, empty when
+none does) and takes two actions, both answered `Accepted`:
 `Rerun { repo, number }` writes the pipeline's event to the inbox again,
 pinned to the recorded sha, with the actor `rerun of #<n>` (a try run is
 refused: its trees were the uploader's); `Cancel { repo,
@@ -1240,8 +1242,13 @@ The tools (`tools.rs`) are `ci_status` (the overview and the `[platforms]`
 of `ci.toml`, which are what a `try_run` target resolves through),
 `ci_pipelines`, `ci_pipeline` (a failed job adds its `cause` and
 `excerpt`), `ci_log` (`CiRequest::Log`: the last lines of a job's stored
-output, 5000 at most, and whether the job has finished), `ci_rerun`,
-`ci_cancel`, `try_run` and `try_wait`; their answers are one fact per line
+output, 5000 at most, and whether the job has finished), `ci_wait` (one
+pipeline, named by number or by the sha of its commit, or one job of it,
+looked at every 2 s until it has settled; a sha that matches nothing yet is
+waited for, and then followed by its number; at the end of the wait it
+says `still running after <s> s; call ci_wait again with repo=.. number=..`),
+`ci_rerun`, `ci_cancel`, `try_run` and `try_wait`; their answers are one
+fact per line
 in a fixed shape, and a CI that answers with an error, or not at all within
 30 s, is the tool's error.
 

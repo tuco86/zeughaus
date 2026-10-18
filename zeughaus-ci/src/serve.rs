@@ -38,6 +38,9 @@ const MAX_LOG_LINES: u32 = 5000;
 /// take the rest of [`MAX_CI_REPLY_BYTES`].
 const MAX_LOG_TEXT_BYTES: usize = 3 << 20;
 
+/// How many of a repository's newest records a `Find` looks at.
+const FIND_RECORDS: usize = 500;
+
 /// How much of a transcript's end a `Log` reply is made from.
 const LOG_READ_BYTES: usize = 8 << 20;
 
@@ -90,6 +93,7 @@ impl CiServer {
                 self.transcripts.close(TerminalId(terminal));
                 CiReply::Closed
             }
+            CiRequest::Find { repo, sha } => self.find(&repo, &sha),
             CiRequest::Rerun { repo, number } => self.rerun(&repo, number),
             CiRequest::Cancel { repo, number } => self.cancel(&repo, number),
             CiRequest::Log {
@@ -243,6 +247,43 @@ impl CiServer {
         match event::write_cancel(&self.state_dir, repo, number) {
             Ok(()) => CiReply::Accepted,
             Err(e) => error(&e),
+        }
+    }
+
+    /// The newest pipeline of `repo`, of any channel, whose commit id starts
+    /// with `sha`. Only the file names are listed; a record is read when its
+    /// turn comes, newest first, so a recent push costs one read.
+    fn find(&self, repo: &str, sha: &str) -> CiReply {
+        if !valid_name(repo) {
+            return error("no such repository");
+        }
+        if !(4..=40).contains(&sha.len()) || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return error("sha must be 4 to 40 hex digits");
+        }
+        let sha = sha.to_ascii_lowercase();
+        let dir = crate::ci_dir(&self.state_dir).join("pipelines").join(repo);
+        let mut numbers: Vec<u64> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                name.to_str()?.strip_suffix(".json")?.parse().ok()
+            })
+            .collect();
+        numbers.sort_unstable_by_key(|&number| std::cmp::Reverse(number));
+        numbers.truncate(FIND_RECORDS);
+        let found = numbers
+            .into_iter()
+            .filter_map(|number| load_pipeline(&self.state_dir, repo, number).ok())
+            .find(|pipeline| {
+                pipeline
+                    .sha
+                    .as_deref()
+                    .is_some_and(|full| full.to_ascii_lowercase().starts_with(&sha))
+            });
+        CiReply::Pipeline {
+            pipeline: found.as_ref().map(|record| Box::new(pipeline_view(record))),
         }
     }
 
@@ -967,6 +1008,52 @@ mod tests {
         };
         assert_eq!(pipeline.map(|p| p.number), Some(1));
         assert_eq!(open(&server, sneaky, 1, "j0"), error("no such job"));
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_pipeline_is_found_by_the_prefix_of_its_sha_in_any_channel_newest_first() {
+        let state = scratch("find");
+        let with_sha = |number, channel: &str, sha: &str| {
+            let mut record = pipeline("view", number, channel, PipelineStatus::Running, Vec::new());
+            record.sha = Some(sha.to_owned());
+            store(&state, &record);
+        };
+        with_sha(2, "dev", "abcdef0123456789abcdef0123456789abcdef01");
+        // A rerun of the same commit, and a try run of another one.
+        with_sha(9, "release", "abcdef0123456789abcdef0123456789abcdef01");
+        with_sha(10, "try", "1234567890abcdef1234567890abcdef12345678");
+        let server = server(&state);
+        let find = |sha: &str| match server.answer(CiRequest::Find {
+            repo: "view".to_owned(),
+            sha: sha.to_owned(),
+        }) {
+            CiReply::Pipeline { pipeline } => pipeline.map(|p| (p.number, p.channel)),
+            other => panic!("unexpected reply {other:?}"),
+        };
+
+        assert_eq!(find("abcdef0"), Some((9, "release".to_owned())));
+        assert_eq!(find("ABCD"), Some((9, "release".to_owned())));
+        assert_eq!(find("1234"), Some((10, "try".to_owned())));
+        assert_eq!(find("ffff"), None);
+
+        for bad in ["abc", "xyz1", "", &"a".repeat(41)] {
+            assert_eq!(
+                server.answer(CiRequest::Find {
+                    repo: "view".to_owned(),
+                    sha: bad.to_owned(),
+                }),
+                error("sha must be 4 to 40 hex digits"),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            server.answer(CiRequest::Find {
+                repo: "../view".to_owned(),
+                sha: "abcd".to_owned(),
+            }),
+            error("no such repository")
+        );
         let _ = std::fs::remove_dir_all(&state);
     }
 

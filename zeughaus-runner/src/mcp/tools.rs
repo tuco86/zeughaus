@@ -1,4 +1,4 @@
-//! The eight tools, the schemas an agent sees and the text they answer with.
+//! The nine tools, the schemas an agent sees and the text they answer with.
 //!
 //! The text is for a model, so it is short, one fact per line and in a shape
 //! that is the same every time. The functions that build it take the records
@@ -24,7 +24,8 @@ const INSTRUCTIONS: &str = "zeughaus is this person's CI: its runners are the ma
 try_run executes a command on another host's zeughaus runner (Windows, macOS or a Linux container) \
 from the current working tree, with its uncommitted files and the sibling checkouts its Cargo path \
 dependencies need, and answers with the result and the end of the output; ci_status lists the \
-targets it accepts, and with the other ci_* tools the CI's channels, pipelines and logs.";
+targets it accepts, and with the other ci_* tools the CI's channels, pipelines and logs; ci_wait \
+waits for a pipeline, or one job of it, to settle, also for the pipeline a push is about to start.";
 
 /// Pipelines listed when the call gives no limit.
 const DEFAULT_PIPELINES: u32 = 10;
@@ -210,6 +211,100 @@ impl Toolbox {
         .await
     }
 
+    /// Looks at a pipeline, named by its number or by the sha of its commit,
+    /// until it has settled (or, with `job`, until that job has) or the wait
+    /// has passed, and answers as `ci_pipeline` does. A sha that matches no
+    /// pipeline yet is waited for: the push may not have reached the CI. Once
+    /// it matches, the pipeline is followed by its number, so a newer one of
+    /// the same commit does not take its place.
+    async fn ci_wait(&self, args: CiWaitArgs) -> Result<String, String> {
+        let CiWaitArgs {
+            repo,
+            number,
+            sha,
+            job,
+            wait_seconds,
+        } = args;
+        let mut wanted = match (number, sha) {
+            (Some(number), None) => Wanted::Number(number),
+            (None, Some(sha)) if is_sha_prefix(&sha) => Wanted::Sha(sha),
+            (None, Some(sha)) => return Err(format!("sha {sha:?} is not 4 to 40 hex digits")),
+            _ => return Err("give either number or sha".to_owned()),
+        };
+        self.client.configured()?;
+        let started = Instant::now();
+        let deadline = started + wait_for(wait_seconds);
+        let mut latest: Option<PipelineView> = None;
+        // Every look sets it before the loop can end.
+        let mut last_error: Option<String>;
+        let mut failing_since: Option<Instant> = None;
+        loop {
+            let looked = match &wanted {
+                Wanted::Number(number) => self.look(&repo, *number).await,
+                Wanted::Sha(sha) => self.find(&repo, sha).await,
+            };
+            match looked {
+                Ok(Some(view)) => {
+                    wanted = Wanted::Number(view.number);
+                    last_error = None;
+                    failing_since = None;
+                    let mut settled = view.finished.is_some();
+                    if let Some(name) = &job {
+                        let found =
+                            view.jobs.iter().find(|j| j.name == *name).ok_or_else(|| {
+                                let jobs: Vec<&str> =
+                                    view.jobs.iter().map(|j| j.name.as_str()).collect();
+                                format!(
+                                    "no job {name} in {repo} #{}; its jobs are {}",
+                                    view.number,
+                                    jobs.join(", ")
+                                )
+                            })?;
+                        settled |=
+                            matches!(found.status.as_str(), "succeeded" | "failed" | "skipped");
+                    }
+                    if settled {
+                        return Ok(pipeline_text(&view));
+                    }
+                    latest = Some(view);
+                }
+                Ok(None) => match &wanted {
+                    Wanted::Number(number) => return Err(format!("no pipeline {repo} #{number}")),
+                    Wanted::Sha(_) => {
+                        last_error = None;
+                        failing_since = None;
+                    }
+                },
+                // A CI that restarts or a link that drops is not the end of
+                // the wait: look again for a while.
+                Err(e) => {
+                    let since = *failing_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= self.error_grace {
+                        return Err(unreachable_text(&e, &wanted.describe(&repo), "ci_wait"));
+                    }
+                    last_error = Some(e);
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            tokio::time::sleep(self.poll.min(deadline - now)).await;
+        }
+        let seconds = started.elapsed().as_secs();
+        match (latest, &wanted, last_error) {
+            (Some(view), _, _) => Ok(waiting_text(&view, job.as_deref(), seconds)),
+            (None, wanted, Some(e)) => {
+                Err(unreachable_text(&e, &wanted.describe(&repo), "ci_wait"))
+            }
+            (None, Wanted::Sha(sha), None) => Ok(format!(
+                "no pipeline of {sha} in {repo} after {seconds} s; the push may not have \
+                 reached the CI yet; call ci_wait again\n"
+            )),
+            (None, Wanted::Number(number), None) => Err(format!("no pipeline {repo} #{number}")),
+        }
+    }
+
     /// Looks at the pipeline until it has finished or `wait` has passed since
     /// `started`, and says where it stands. A pipeline missing from the CI's
     /// records is an error once `grace` has passed, and so is a CI that has
@@ -248,7 +343,11 @@ impl Toolbox {
                 Err(e) => {
                     let since = *failing_since.get_or_insert_with(Instant::now);
                     if since.elapsed() >= self.error_grace {
-                        return Err(unreachable_text(&e, repo, number));
+                        return Err(unreachable_text(
+                            &e,
+                            &format!("{repo} #{number}"),
+                            "try_wait",
+                        ));
                     }
                     last_error = Some(e);
                 }
@@ -266,8 +365,25 @@ impl Toolbox {
                 now(),
                 started.elapsed().as_secs(),
             )),
-            (None, Some(e)) => Err(unreachable_text(&e, repo, number)),
+            (None, Some(e)) => Err(unreachable_text(
+                &e,
+                &format!("{repo} #{number}"),
+                "try_wait",
+            )),
             (None, None) => Err(format!("no pipeline {repo} #{number}")),
+        }
+    }
+
+    /// The newest pipeline of any channel whose commit id starts with `sha`;
+    /// `None` while there is none.
+    async fn find(&self, repo: &str, sha: &str) -> Result<Option<PipelineView>, String> {
+        let request = CiRequest::Find {
+            repo: repo.to_owned(),
+            sha: sha.to_owned(),
+        };
+        match self.client.ci(request).await? {
+            CiReply::Pipeline { pipeline } => Ok(pipeline.map(|view| *view)),
+            other => Err(unexpected(&other)),
         }
     }
 
@@ -328,6 +444,7 @@ impl Tools for Toolbox {
             "ci_log" => self.log(arguments_of(arguments)?).await,
             "ci_rerun" => self.rerun(arguments_of(arguments)?).await,
             "ci_cancel" => self.cancel(arguments_of(arguments)?).await,
+            "ci_wait" => self.ci_wait(arguments_of(arguments)?).await,
             "try_run" => self.try_run(arguments_of(arguments)?).await,
             "try_wait" => self.try_wait(arguments_of(arguments)?).await,
             other => Err(format!(
@@ -392,6 +509,37 @@ struct TryWaitArgs {
     wait_seconds: Option<u64>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CiWaitArgs {
+    repo: String,
+    number: Option<u64>,
+    sha: Option<String>,
+    job: Option<String>,
+    wait_seconds: Option<u64>,
+}
+
+/// What a `ci_wait` is waiting for: a pipeline by number, or the newest one
+/// of a commit until it shows up.
+enum Wanted {
+    Number(u64),
+    Sha(String),
+}
+
+impl Wanted {
+    fn describe(&self, repo: &str) -> String {
+        match self {
+            Wanted::Number(number) => format!("{repo} #{number}"),
+            Wanted::Sha(sha) => format!("the one of {sha} in {repo}"),
+        }
+    }
+}
+
+/// 4 to 40 hex digits: what the CI accepts as the start of a commit id.
+fn is_sha_prefix(sha: &str) -> bool {
+    (4..=40).contains(&sha.len()) && sha.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn arguments_of<T: DeserializeOwned>(arguments: Value) -> Result<T, String> {
     serde_json::from_value(arguments).map_err(|e| format!("invalid arguments: {e}"))
 }
@@ -424,10 +572,10 @@ fn unexpected(reply: &CiReply) -> String {
     format!("the CI answered something else than asked: {reply:?}")
 }
 
-/// Why a wait stopped: the CI could not be asked, and the run it was
-/// waiting for goes on without it.
-fn unreachable_text(error: &str, repo: &str, number: u64) -> String {
-    format!("{error} (the pipeline is {repo} #{number}; try_wait asks again)")
+/// Why a wait stopped: the CI could not be asked, and the pipeline it was
+/// waiting for goes on without it. `again` is the tool that asks again.
+fn unreachable_text(error: &str, pipeline: &str, again: &str) -> String {
+    format!("{error} (the pipeline is {pipeline}; {again} asks again)")
 }
 
 fn accepted(reply: CiReply) -> Result<String, String> {
@@ -555,6 +703,21 @@ fn pipeline_text(pipeline: &PipelineView) -> String {
             }
         }
     }
+    text
+}
+
+/// A `ci_wait` that stopped before what it waited for happened: the
+/// pipeline as it stands, and how to wait on.
+fn waiting_text(pipeline: &PipelineView, job: Option<&str>, waited_seconds: u64) -> String {
+    let mut text = pipeline_text(pipeline);
+    text.push_str(&format!(
+        "still running after {waited_seconds} s; call ci_wait again with repo={} number={}",
+        pipeline.repo, pipeline.number
+    ));
+    if let Some(job) = job {
+        text.push_str(&format!(" job={job}"));
+    }
+    text.push('\n');
     text
 }
 
@@ -779,6 +942,30 @@ fn definitions() -> Vec<Value> {
             true,
         ),
         tool(
+            "ci_wait",
+            "Wait until a pipeline, or one job of it, has settled, and answer with the pipeline \
+             as ci_pipeline does. Name the pipeline by number, or by the sha of its commit right \
+             after a push: a pipeline that does not exist yet is waited for.",
+            json!({
+                "repo": repo,
+                "number": number,
+                "sha": {
+                    "type": "string",
+                    "pattern": "^[0-9a-fA-F]{4,40}$",
+                    "description": "The start of the commit id, instead of number: the newest \
+                                    pipeline of that commit in any channel.",
+                },
+                "job": {
+                    "type": "string",
+                    "description": "Wait for this job only; it has settled when it ended or \
+                                    was skipped because a job it needs failed.",
+                },
+                "wait_seconds": wait("How long to wait for it to settle."),
+            }),
+            &["repo"],
+            true,
+        ),
+        tool(
             "ci_rerun",
             "Queue the pipeline's event again, pinned to the commit it ran for. Answers \
              `accepted`. A try run cannot be rerun: start a new one with try_run.",
@@ -933,7 +1120,7 @@ mod tests {
     }
 
     #[test]
-    fn there_are_eight_tools_and_each_takes_an_object() {
+    fn there_are_nine_tools_and_each_takes_an_object() {
         let definitions = definitions();
         let names: Vec<&str> = definitions
             .iter()
@@ -946,6 +1133,7 @@ mod tests {
                 "ci_pipelines",
                 "ci_pipeline",
                 "ci_log",
+                "ci_wait",
                 "ci_rerun",
                 "ci_cancel",
                 "try_run",
@@ -965,7 +1153,7 @@ mod tests {
                 assert!(tool["inputSchema"]["properties"][key].is_object(), "{tool}");
             }
         }
-        let run = &definitions[6]["inputSchema"];
+        let run = &definitions[7]["inputSchema"];
         assert_eq!(run["required"], json!(["target", "command"]));
         assert_eq!(run["properties"]["wait_seconds"]["default"], 540);
         assert_eq!(run["properties"]["wait_seconds"]["maximum"], 600);
@@ -1193,6 +1381,7 @@ mod tests {
             ("ci_log", json!({ "repo": "r", "number": 1, "job": "j" })),
             ("ci_rerun", json!({ "repo": "r", "number": 1 })),
             ("ci_cancel", json!({ "repo": "r", "number": 1 })),
+            ("ci_wait", json!({ "repo": "r", "number": 1 })),
             ("try_run", json!({ "target": "t", "command": "true" })),
             ("try_wait", json!({ "repo": "r", "number": 1 })),
         ] {
@@ -1269,6 +1458,8 @@ mod tests {
         asked: Mutex<Vec<CiRequest>>,
         /// Looks at the pipeline before it is finished.
         running_looks: AtomicU32,
+        /// Asks to find a pipeline by sha.
+        finds: AtomicU32,
     }
 
     /// A weida listener that answers `/ci` and `/try` the way the CI does,
@@ -1311,6 +1502,20 @@ mod tests {
         }
     }
 
+    /// Pipeline 1 of the fake: running for `running_looks` looks, then done.
+    fn pipeline_one(seen: &Seen, running_looks: u32) -> PipelineView {
+        let looks = seen.running_looks.fetch_add(1, Ordering::Relaxed);
+        let mut view = if looks < running_looks {
+            pipeline("running", None, vec![job("try", "running", "agent", "")])
+        } else {
+            let mut done = job("try", "succeeded", "agent", "");
+            done.code = Some(0);
+            pipeline("succeeded", Some(1_007), vec![done])
+        };
+        view.number = 1;
+        view
+    }
+
     async fn serve_ci(replier: weida::Replier, seen: Arc<Seen>, running_looks: u32) {
         while let Ok(mut request) = replier.accept().await {
             let body = request
@@ -1321,20 +1526,35 @@ mod tests {
             let asked = CiRequest::decode(&body).expect("a CiRequest");
             seen.asked.lock().unwrap().push(asked.clone());
             let reply = match asked {
-                CiRequest::Pipeline { number: 1, .. } => {
-                    let looks = seen.running_looks.fetch_add(1, Ordering::Relaxed);
-                    let mut view = if looks < running_looks {
-                        pipeline("running", None, vec![job("try", "running", "agent", "")])
-                    } else {
-                        let mut done = job("try", "succeeded", "agent", "");
-                        done.code = Some(0);
-                        pipeline("succeeded", Some(1_007), vec![done])
-                    };
-                    view.number = 1;
+                CiRequest::Pipeline { number: 1, .. } => CiReply::Pipeline {
+                    pipeline: Some(Box::new(pipeline_one(&seen, running_looks))),
+                },
+                // Still running, one of its jobs already settled.
+                CiRequest::Pipeline { number: 4, .. } => {
+                    let mut view = pipeline(
+                        "running",
+                        None,
+                        vec![
+                            job("build", "running", "agent", ""),
+                            job("publish", "skipped", "agent", ""),
+                        ],
+                    );
+                    view.number = 4;
                     CiReply::Pipeline {
                         pipeline: Some(Box::new(view)),
                     }
                 }
+                // The push of `dead..` reaches the CI after two asks.
+                CiRequest::Find { sha, .. } if sha.starts_with("dead") => {
+                    if seen.finds.fetch_add(1, Ordering::Relaxed) < 2 {
+                        CiReply::Pipeline { pipeline: None }
+                    } else {
+                        CiReply::Pipeline {
+                            pipeline: Some(Box::new(pipeline_one(&seen, running_looks))),
+                        }
+                    }
+                }
+                CiRequest::Find { .. } => CiReply::Pipeline { pipeline: None },
                 // What a CI says while it cannot read its records.
                 CiRequest::Pipeline { number: 3, .. } => CiReply::Error {
                     message: "the scheduler is restarting".to_owned(),
@@ -1536,6 +1756,141 @@ mod tests {
             started.elapsed() < Duration::from_secs(10),
             "it was told it could wait 30 s, not that it had to"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ci_wait_returns_once_the_pipeline_has_finished() {
+        let ci = fake_ci("wait", 2, None).await;
+        let tools = toolbox_for(&ci);
+        let text = tools
+            .call(
+                "ci_wait",
+                json!({ "repo": "demo", "number": 1, "wait_seconds": 30 }),
+            )
+            .await
+            .expect("the pipeline finishes");
+        assert!(
+            text.starts_with("demo/try #1 succeeded try try 0123456"),
+            "{text}"
+        );
+        assert!(!text.contains("still running"), "{text}");
+        assert_eq!(ci.seen.running_looks.load(Ordering::Relaxed), 3);
+
+        // A number the CI does not know is an error at once, not a wait.
+        let err = tools
+            .call(
+                "ci_wait",
+                json!({ "repo": "demo", "number": 2, "wait_seconds": 30 }),
+            )
+            .await
+            .expect_err("unknown pipeline");
+        assert_eq!(err, "no pipeline demo #2");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ci_wait_for_a_job_returns_when_that_job_has_settled() {
+        let ci = fake_ci("job", 0, None).await;
+        let tools = toolbox_for(&ci);
+        // The pipeline runs on, the skipped job is settled.
+        let text = tools
+            .call(
+                "ci_wait",
+                json!({ "repo": "demo", "number": 4, "job": "publish", "wait_seconds": 30 }),
+            )
+            .await
+            .expect("publish is skipped");
+        assert!(text.contains("\n  publish skipped agent\n"), "{text}");
+        assert!(text.contains("\n  build running agent\n"), "{text}");
+        assert!(!text.contains("still running"), "{text}");
+
+        // A job that has not settled by the end of the wait says how to go on.
+        let text = tools
+            .call(
+                "ci_wait",
+                json!({ "repo": "demo", "number": 4, "job": "build", "wait_seconds": 0 }),
+            )
+            .await
+            .expect("still running is not an error");
+        assert!(
+            text.ends_with(
+                "still running after 0 s; call ci_wait again with repo=demo number=4 job=build\n"
+            ),
+            "{text}"
+        );
+
+        let err = tools
+            .call(
+                "ci_wait",
+                json!({ "repo": "demo", "number": 4, "job": "deploy" }),
+            )
+            .await
+            .expect_err("no such job");
+        assert_eq!(err, "no job deploy in demo #4; its jobs are build, publish");
+    }
+
+    /// A pipeline named by the sha of its commit may not exist yet: it is
+    /// asked for until it does, and then followed by its number.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ci_wait_for_a_sha_waits_for_the_pipeline_to_appear() {
+        let ci = fake_ci("sha", 1, None).await;
+        let tools = toolbox_for(&ci);
+        let text = tools
+            .call(
+                "ci_wait",
+                json!({ "repo": "demo", "sha": "deadbeef", "wait_seconds": 30 }),
+            )
+            .await
+            .expect("the pipeline appears and finishes");
+        assert!(text.starts_with("demo/try #1 succeeded"), "{text}");
+        let find = CiRequest::Find {
+            repo: "demo".to_owned(),
+            sha: "deadbeef".to_owned(),
+        };
+        assert_eq!(
+            *ci.seen.asked.lock().unwrap(),
+            [
+                find.clone(),
+                find.clone(),
+                find,
+                CiRequest::Pipeline {
+                    repo: "demo".to_owned(),
+                    number: 1
+                }
+            ]
+        );
+
+        // Nothing matches: the end of the wait says so.
+        let text = tools
+            .call(
+                "ci_wait",
+                json!({ "repo": "demo", "sha": "beef", "wait_seconds": 0 }),
+            )
+            .await
+            .expect("a missing pipeline is waited for");
+        assert_eq!(
+            text,
+            "no pipeline of beef in demo after 0 s; the push may not have reached the CI \
+             yet; call ci_wait again\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn ci_wait_wants_a_number_or_a_sha_and_nothing_else() {
+        let tools = toolbox_without_a_ci();
+        for arguments in [
+            json!({ "repo": "r" }),
+            json!({ "repo": "r", "number": 1, "sha": "abcd" }),
+        ] {
+            let err = tools.call("ci_wait", arguments).await.expect_err("both");
+            assert_eq!(err, "give either number or sha");
+        }
+        for sha in ["abc", "xyz1", ""] {
+            let err = tools
+                .call("ci_wait", json!({ "repo": "r", "sha": sha }))
+                .await
+                .expect_err(sha);
+            assert!(err.contains("is not 4 to 40 hex digits"), "{sha}: {err}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

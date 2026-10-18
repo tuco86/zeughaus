@@ -36,6 +36,11 @@ pub enum CiRequest {
     },
     /// One pipeline; `None` in the reply when it does not exist.
     Pipeline { repo: String, number: u64 },
+    /// The newest pipeline of any channel (a try run included) whose commit
+    /// id starts with `sha`, 4 to 40 hex digits; answers
+    /// [`CiReply::Pipeline`], `None` when no pipeline matches. Only the
+    /// newest 500 records of the repository are looked at.
+    Find { repo: String, sha: String },
     /// A read-only terminal replaying one job's output, live while it runs.
     OpenTranscript {
         repo: String,
@@ -339,6 +344,10 @@ mod tests {
             CiRequest::Cancel {
                 repo: "griasdi".to_owned(),
                 number: 7,
+            },
+            CiRequest::Find {
+                repo: "griasdi".to_owned(),
+                sha: "0123abc".to_owned(),
             },
             CiRequest::Log {
                 repo: "griasdi".to_owned(),

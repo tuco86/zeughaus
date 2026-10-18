@@ -55,6 +55,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its `Triggered` group. A failed task raises a desktop notification in
   every connected editor; `zeughaus-runner maintain` lists the last result
   of each. The wohnzimmer runner updates its Rust toolchain this way.
+- The MCP server's `ci_wait` waits until a pipeline, or one job of it, has
+  settled, and answers as `ci_pipeline` does. The pipeline is named by its
+  number or by the sha of its commit right after a push, which it waits
+  for if the CI has no pipeline of it yet. `/ci` gets `Find { repo, sha }`
+  for it.
 
 ### Changed
 
