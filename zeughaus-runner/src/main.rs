@@ -173,6 +173,12 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // A build on trial counts this start; the one that has failed to come up
+    // too often is replaced by the previous build here, before anything is
+    // bound. On Windows there is no lock, but the same place.
+    if let Ok(exe) = exe.as_ref() {
+        zeughaus_update::boot(&state_dir, exe, zeughaus_update::Product::Runner);
+    }
     // A malformed `enlist.toml` is refused before anything is bound: a runner
     // that silently stays out of the CI would leave its jobs waiting.
     let enlist_config = match enlist::config::load(&state_dir) {
@@ -351,10 +357,26 @@ fn main() -> ExitCode {
         }
         // The updater has no use for the mux or for enlisting: it replaces
         // files and asks the loop below for the restart. Only an
-        // `update.toml` turns it on.
-        #[cfg(unix)]
+        // `update.toml` makes it follow a channel. On Windows a restart ends
+        // every terminal and run, so an update waits for an idle runner.
         if let Ok(exe) = exe.as_ref() {
-            zeughaus_update::start(&state_dir, exe.clone(), Box::new(restart_signal::request));
+            let may_restart: Box<dyn Fn() -> bool + Send> = match &job_host {
+                Some(host) if cfg!(windows) => {
+                    let host = Arc::clone(host);
+                    Box::new(move || {
+                        use zeughaus_job::ProcessHost;
+                        !host.held() && host.live_runs() == 0
+                    })
+                }
+                _ => Box::new(|| true),
+            };
+            zeughaus_update::start(
+                &state_dir,
+                exe.clone(),
+                zeughaus_update::Product::Runner,
+                may_restart,
+                Box::new(restart_signal::request),
+            );
         }
         // Maintenance runs as the host's runs, so it needs the mux like a job
         // does, and this binary's path for its `timeout` wrapper.
@@ -441,7 +463,6 @@ fn main() -> ExitCode {
     // a second and the reason for waiting is worth saying once.
     let mut draining = false;
     loop {
-        #[cfg(unix)]
         if restart_signal::take() {
             restart(exe.as_ref().ok(), mux_service.as_ref(), &graphs);
         }
@@ -687,6 +708,20 @@ fn restart(exe: Option<&PathBuf>, mux: Option<&MuxService>, graphs: &GraphServic
     eprintln!("[runner] restart failed: {e}");
 }
 
+/// Saves the graphs and the workspace and ends this process: the boot task's
+/// `runner.cmd` loop starts the binary at its path again, which an update
+/// has just replaced. Terminals and runs end with the process; the updater
+/// asks for this only while none runs.
+#[cfg(windows)]
+fn restart(_exe: Option<&PathBuf>, mux: Option<&MuxService>, graphs: &GraphService) -> ! {
+    graphs.persist(true);
+    if let Some(mux) = mux {
+        mux.persist();
+    }
+    eprintln!("[runner] restarting");
+    std::process::exit(0)
+}
+
 /// Takes `<state-dir>/runner.lock`, or says which process holds it.
 ///
 /// Two runners on one state directory reattach the same shims, and a shim
@@ -735,18 +770,19 @@ fn lock_state_dir(state_dir: &std::path::Path) -> Result<std::fs::File, String> 
 /// the signal and the `exec`.
 ///
 /// The self-updater asks for the same restart by setting the flag itself,
-/// once it has replaced the binary.
-#[cfg(unix)]
+/// once it has replaced the binary; on Windows that is the only way in.
 mod restart_signal {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     static REQUESTED: AtomicBool = AtomicBool::new(false);
 
+    #[cfg(unix)]
     extern "C" fn on_usr1(_: libc::c_int) {
         // An atomic store is async-signal-safe; nothing else happens here.
         REQUESTED.store(true, Ordering::SeqCst);
     }
 
+    #[cfg(unix)]
     pub fn install() {
         // SAFETY: `on_usr1` only stores to an atomic, and `SA_RESTART` keeps
         // the signal from failing blocking calls elsewhere in the process.

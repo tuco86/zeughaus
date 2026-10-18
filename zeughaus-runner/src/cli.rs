@@ -2,8 +2,9 @@
 //! running runner, `maintain` as a reader of its maintenance records,
 //! `timeout` as the deadline a host CI job runs under, `release` as the tool
 //! that makes and checks signed release bundles, `mcp` as the server that
-//! gives an agent the CI's pipelines and try runs as tools and `ci` as the
-//! answer to a script that asks that CI about a checkout or a commit.
+//! gives an agent the CI's pipelines and try runs as tools, `ci` as the
+//! answer to a script that asks that CI about a checkout or a commit, and
+//! `version` and `update` for the self-updater.
 //!
 //! `trigger` and `hold` talk to the endpoint a runner printed at start
 //! (`[runner] weida endpoint weida://sha256:<fp>@host:port/`) with the client
@@ -22,6 +23,8 @@
 //! zeughaus-runner release keygen <file>
 //! zeughaus-runner release bundle --channel <c> --build <n> --sha <sha> --version <v> --out <dir> <file>...
 //! zeughaus-runner release verify <dir>
+//! zeughaus-runner version
+//! zeughaus-runner update status|rollback
 //! ```
 
 use std::path::Path;
@@ -47,7 +50,9 @@ usage: zeughaus-runner [--state-dir <dir>] [--feed-addr <host:port>] [--keep-run
        zeughaus-runner timeout <seconds> -- <program> [args..]
        zeughaus-runner release keygen <file>
        zeughaus-runner release bundle --channel <c> --build <n> --sha <sha> --version <v> --out <dir> <file>...
-       zeughaus-runner release verify <dir>";
+       zeughaus-runner release verify <dir>
+       zeughaus-runner version
+       zeughaus-runner update status|rollback";
 
 /// Runs `timeout` if the first argument names it. Checked before the serving
 /// flags are read and before `--state-dir` is stripped: everything after the
@@ -118,6 +123,17 @@ pub fn run(args: &[String], state_dir: &Path) -> Option<ExitCode> {
         Some("trigger") => parse_trigger(&positional[1..]),
         Some("hold") => parse_hold(&positional[1..]),
         Some("maintain") => return Some(maintain(&positional[1..], state_dir)),
+        // What the updater runs a new binary with before it trusts it: the
+        // answer must not depend on anything but the binary.
+        Some("version") if positional.len() == 1 => {
+            println!(
+                "{} build {}",
+                env!("CARGO_PKG_VERSION"),
+                zeughaus_update::manifest::own_build()
+            );
+            return Some(ExitCode::SUCCESS);
+        }
+        Some("update") => return Some(update(&positional[1..], state_dir)),
         _ => {
             return match check_serve_args(&positional) {
                 Ok(ServeArgs::Serve) => None,
@@ -176,6 +192,27 @@ fn maintain(args: &[String], state_dir: &Path) -> ExitCode {
         }
         Err(e) => {
             eprintln!("[maintain] {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `update status|rollback`: what the self-updater installed, and the way
+/// back to the build before. It only touches files, so it runs beside a
+/// serving runner, which a rollback asks to be restarted.
+fn update(args: &[String], state_dir: &Path) -> ExitCode {
+    let answer = std::env::current_exe()
+        .map_err(|e| format!("this executable cannot be located: {e}"))
+        .and_then(|exe| {
+            zeughaus_update::command(args, state_dir, &exe, zeughaus_update::Product::Runner)
+        });
+    match answer {
+        Ok(text) => {
+            println!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("[update] {e}");
             ExitCode::FAILURE
         }
     }
