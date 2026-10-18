@@ -302,9 +302,6 @@ async fn ci_answer(client: &Client, command: CiCommand) -> Result<String, Failur
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{Value, json};
-    use tokio::io::{AsyncReadExt, BufReader};
-
     use super::*;
 
     fn args(list: &[&str]) -> Vec<String> {
@@ -389,52 +386,61 @@ mod tests {
         }
     }
 
-    /// What the agent sees of a runner that has no CI: ten tools, and an
-    /// error with the reason from every call.
-    #[tokio::test]
-    async fn a_session_without_a_ci_lists_the_tools_and_explains_every_call() {
-        let link = Link::resolve(None, Path::new("/nonexistent/zeughaus-state"));
-        let client = Arc::new(Client::new(link));
-        let toolbox = Arc::new(Toolbox::new(client));
-        let script = concat!(
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
-            "\n",
-            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
-            "\n",
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
-            "\n",
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ci_status","arguments":{}}}"#,
-            "\n",
-            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"nothing"}}"#,
-            "\n",
-        );
-        let (mut read, write) = tokio::io::duplex(1 << 20);
-        rpc::serve(toolbox, BufReader::new(script.as_bytes()), write)
-            .await
-            .expect("served");
-        let mut written = String::new();
-        read.read_to_string(&mut written).await.expect("answers");
-        let answers: Vec<Value> = written
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("JSON"))
-            .collect();
-        let by_id = |id: u64| {
-            answers
-                .iter()
-                .find(|answer| answer["id"] == json!(id))
-                .unwrap_or_else(|| panic!("no answer for {id}: {written}"))
-        };
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        assert_eq!(by_id(1)["result"]["serverInfo"]["name"], "zeughaus");
-        assert_eq!(by_id(2)["result"]["tools"].as_array().unwrap().len(), 10);
-        let status = &by_id(3)["result"];
-        assert_eq!(status["isError"], true);
-        let text = status["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.starts_with("no CI configured: add ci = [..] to /nonexistent/zeughaus-state"),
-            "{text}"
-        );
-        assert_eq!(by_id(4)["result"]["isError"], true);
-        assert_eq!(answers.len(), 4, "the notification is not answered");
+        use serde_json::{Value, json};
+        use tokio::io::{AsyncReadExt, BufReader};
+
+        /// What the agent sees of a runner that has no CI: ten tools, and an
+        /// error with the reason from every call.
+        #[tokio::test]
+        async fn a_session_without_a_ci_lists_the_tools_and_explains_every_call() {
+            let link = Link::resolve(None, Path::new("/nonexistent/zeughaus-state"));
+            let client = Arc::new(Client::new(link));
+            let toolbox = Arc::new(Toolbox::new(client));
+            let script = concat!(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ci_status","arguments":{}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"nothing"}}"#,
+                "\n",
+            );
+            let (mut read, write) = tokio::io::duplex(1 << 20);
+            rpc::serve(toolbox, BufReader::new(script.as_bytes()), write)
+                .await
+                .expect("served");
+            let mut written = String::new();
+            read.read_to_string(&mut written).await.expect("answers");
+            let answers: Vec<Value> = written
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("JSON"))
+                .collect();
+            let by_id = |id: u64| {
+                answers
+                    .iter()
+                    .find(|answer| answer["id"] == json!(id))
+                    .unwrap_or_else(|| panic!("no answer for {id}: {written}"))
+            };
+
+            assert_eq!(by_id(1)["result"]["serverInfo"]["name"], "zeughaus");
+            assert_eq!(by_id(2)["result"]["tools"].as_array().unwrap().len(), 10);
+            let status = &by_id(3)["result"];
+            assert_eq!(status["isError"], true);
+            let text = status["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.starts_with("no CI configured: add ci = [..] to /nonexistent/zeughaus-state"),
+                "{text}"
+            );
+            assert_eq!(by_id(4)["result"]["isError"], true);
+            assert_eq!(answers.len(), 4, "the notification is not answered");
+        }
     }
 }

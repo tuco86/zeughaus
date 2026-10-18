@@ -484,13 +484,6 @@ mod tests {
 
     const FP: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zci-manual-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create the scratch directory");
-        dir
-    }
-
     fn config() -> Arc<CiConfig> {
         Arc::new(
             CiConfig::parse(&format!(
@@ -679,173 +672,187 @@ mod tests {
         assert_eq!(subject(&"é".repeat(500)).chars().count(), SUBJECT_CHARS);
     }
 
-    #[test]
-    fn stale_uploads_and_numbers_go_and_fresh_ones_stay() {
-        let state = scratch("stale");
-        let (old, fresh) = ("0000000000000001", "0000000000000002");
-        for id in [old, fresh] {
-            std::fs::create_dir_all(upload_dir(&state, id)).unwrap();
-            write_number(&state, id, 3).unwrap();
-        }
-        let long_ago = SystemTime::now() - 2 * STALE_AFTER;
-        for path in [upload_dir(&state, old), number_path(&state, old)] {
-            set_modified(&path, long_ago);
-        }
-        remove_stale(&state, STALE_AFTER);
-        assert!(!upload_dir(&state, old).exists());
-        assert!(!number_path(&state, old).exists());
-        assert!(upload_dir(&state, fresh).exists());
-        assert!(number_path(&state, fresh).exists());
-        let _ = std::fs::remove_dir_all(&state);
-    }
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-    /// Sets the modification time of a file or a directory. Windows opens a
-    /// directory only with `FILE_FLAG_BACKUP_SEMANTICS`, and sets a time only
-    /// through a handle opened for writing.
-    fn set_modified(path: &Path, time: SystemTime) {
-        let mut options = std::fs::OpenOptions::new();
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-            options.write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        fn scratch(name: &str) -> PathBuf {
+            let dir =
+                std::env::temp_dir().join(format!("zci-manual-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create the scratch directory");
+            dir
         }
-        #[cfg(not(windows))]
-        options.read(true);
-        options.open(path).unwrap().set_modified(time).unwrap();
-    }
 
-    fn service(state: &Path, wait: Duration) -> ManualService {
-        ManualService {
-            state_dir: state.to_path_buf(),
-            config: config(),
-            wait,
-        }
-    }
-
-    /// The scheduler's half of the exchange: takes the event the service
-    /// queued and says which pipeline it became.
-    async fn scheduler_answers(state: &Path, number: u64) -> CiEvent {
-        loop {
-            event::drain_inbox(state);
-            if let Some((_, event)) = event::queued(state).pop() {
-                let id = event.upload.clone().expect("an upload");
-                write_number(state, &id, number).unwrap();
-                return event;
+        #[test]
+        fn stale_uploads_and_numbers_go_and_fresh_ones_stay() {
+            let state = scratch("stale");
+            let (old, fresh) = ("0000000000000001", "0000000000000002");
+            for id in [old, fresh] {
+                std::fs::create_dir_all(upload_dir(&state, id)).unwrap();
+                write_number(&state, id, 3).unwrap();
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            let long_ago = SystemTime::now() - 2 * STALE_AFTER;
+            for path in [upload_dir(&state, old), number_path(&state, old)] {
+                set_modified(&path, long_ago);
+            }
+            remove_stale(&state, STALE_AFTER);
+            assert!(!upload_dir(&state, old).exists());
+            assert!(!number_path(&state, old).exists());
+            assert!(upload_dir(&state, fresh).exists());
+            assert!(number_path(&state, fresh).exists());
+            let _ = std::fs::remove_dir_all(&state);
         }
-    }
 
-    #[tokio::test]
-    async fn an_accepted_upload_is_stored_queued_and_answered_with_its_number() {
-        let state = scratch("accept");
-        let service = service(&state, Duration::from_secs(20));
-        let sent = upload("git@github.com:griasdi/griasdi.git", &[5, 6]);
-        let mut body: &[u8] = b"firstsecond-rest";
+        /// Sets the modification time of a file or a directory. Windows opens a
+        /// directory only with `FILE_FLAG_BACKUP_SEMANTICS`, and sets a time only
+        /// through a handle opened for writing.
+        fn set_modified(path: &Path, time: SystemTime) {
+            let mut options = std::fs::OpenOptions::new();
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+                options.write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+            }
+            #[cfg(not(windows))]
+            options.read(true);
+            options.open(path).unwrap().set_modified(time).unwrap();
+        }
 
-        let (answer, queued) = tokio::join!(
-            service.accept("sha256:me", sent.clone(), &mut body),
-            scheduler_answers(&state, 12)
-        );
-        assert_eq!(answer, Ok(("griasdi".to_owned(), 12)));
-        assert_eq!(body, b"-rest", "exactly the declared bytes were read");
+        fn service(state: &Path, wait: Duration) -> ManualService {
+            ManualService {
+                state_dir: state.to_path_buf(),
+                config: config(),
+                wait,
+            }
+        }
 
-        let id = queued.upload.clone().expect("an upload");
-        assert_eq!(
-            (queued.repo.as_str(), queued.kind, queued.git_ref.as_str()),
-            ("griasdi", EventKind::Manual, "trunk")
-        );
-        assert_eq!(queued.sha, Some("a".repeat(40)));
-        assert_eq!(queued.actor, "hannes@tuco-pc");
-        assert_eq!(event::queue_key(&queued), format!("griasdi.manual.{id}"));
-        assert_eq!(read_upload(&state, &id), Ok(sent));
-        assert_eq!(
-            std::fs::read(bundle_path(&state, &id, 0)).unwrap(),
-            b"first"
-        );
-        assert_eq!(
-            std::fs::read(bundle_path(&state, &id, 1)).unwrap(),
-            b"second"
-        );
-        // The number was consumed.
-        assert!(!number_path(&state, &id).exists());
-        let _ = std::fs::remove_dir_all(&state);
-    }
+        /// The scheduler's half of the exchange: takes the event the service
+        /// queued and says which pipeline it became.
+        async fn scheduler_answers(state: &Path, number: u64) -> CiEvent {
+            loop {
+                event::drain_inbox(state);
+                if let Some((_, event)) = event::queued(state).pop() {
+                    let id = event.upload.clone().expect("an upload");
+                    write_number(state, &id, number).unwrap();
+                    return event;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
 
-    /// What a refused upload leaves: nothing, and no event.
-    #[tokio::test]
-    async fn an_upload_that_cannot_be_stored_leaves_nothing() {
-        let state = scratch("refuse");
-        let service = service(&state, Duration::from_secs(1));
-        let left = || {
-            std::fs::read_dir(crate::ci_dir(&state).join("manual"))
-                .map(|entries| entries.count())
-                .unwrap_or(0)
-        };
+        #[tokio::test]
+        async fn an_accepted_upload_is_stored_queued_and_answered_with_its_number() {
+            let state = scratch("accept");
+            let service = service(&state, Duration::from_secs(20));
+            let sent = upload("git@github.com:griasdi/griasdi.git", &[5, 6]);
+            let mut body: &[u8] = b"firstsecond-rest";
 
-        // The body ends inside the second bundle.
-        let mut short: &[u8] = b"firstsec";
-        let sent = upload("git@github.com:griasdi/griasdi.git", &[5, 6]);
-        let err = service
-            .accept("sha256:me", sent, &mut short)
-            .await
-            .expect_err("a short upload");
-        assert!(
-            err.contains("bundle of weida") && err.contains("3 bytes short"),
-            "{err}"
-        );
-        assert_eq!(left(), 0);
+            let (answer, queued) = tokio::join!(
+                service.accept("sha256:me", sent.clone(), &mut body),
+                scheduler_answers(&state, 12)
+            );
+            assert_eq!(answer, Ok(("griasdi".to_owned(), 12)));
+            assert_eq!(body, b"-rest", "exactly the declared bytes were read");
 
-        // A repository that ci.toml does not list, and a run of no job.
-        let mut body: &[u8] = b"first";
-        let unlisted = upload("git@example.org:someone/iced_nodegraph.git", &[5]);
-        let err = service
-            .accept("sha256:me", unlisted, &mut body)
-            .await
-            .expect_err("an unlisted repository");
-        assert_eq!(
-            err,
-            "git@example.org:someone/iced_nodegraph.git is no repository of ci.toml"
-        );
-        let no_jobs = RunUpload {
-            jobs: Vec::new(),
-            ..upload("git@github.com:griasdi/griasdi.git", &[5])
-        };
-        assert!(
-            service
-                .accept("sha256:me", no_jobs, &mut body)
+            let id = queued.upload.clone().expect("an upload");
+            assert_eq!(
+                (queued.repo.as_str(), queued.kind, queued.git_ref.as_str()),
+                ("griasdi", EventKind::Manual, "trunk")
+            );
+            assert_eq!(queued.sha, Some("a".repeat(40)));
+            assert_eq!(queued.actor, "hannes@tuco-pc");
+            assert_eq!(event::queue_key(&queued), format!("griasdi.manual.{id}"));
+            assert_eq!(read_upload(&state, &id), Ok(sent));
+            assert_eq!(
+                std::fs::read(bundle_path(&state, &id, 0)).unwrap(),
+                b"first"
+            );
+            assert_eq!(
+                std::fs::read(bundle_path(&state, &id, 1)).unwrap(),
+                b"second"
+            );
+            // The number was consumed.
+            assert!(!number_path(&state, &id).exists());
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        /// What a refused upload leaves: nothing, and no event.
+        #[tokio::test]
+        async fn an_upload_that_cannot_be_stored_leaves_nothing() {
+            let state = scratch("refuse");
+            let service = service(&state, Duration::from_secs(1));
+            let left = || {
+                std::fs::read_dir(crate::ci_dir(&state).join("manual"))
+                    .map(|entries| entries.count())
+                    .unwrap_or(0)
+            };
+
+            // The body ends inside the second bundle.
+            let mut short: &[u8] = b"firstsec";
+            let sent = upload("git@github.com:griasdi/griasdi.git", &[5, 6]);
+            let err = service
+                .accept("sha256:me", sent, &mut short)
                 .await
-                .is_err()
-        );
-        assert_eq!(body, b"first", "nothing of a refused upload is read");
-        assert_eq!(left(), 0);
-        event::drain_inbox(&state);
-        assert!(event::queued(&state).is_empty());
-        let _ = std::fs::remove_dir_all(&state);
-    }
+                .expect_err("a short upload");
+            assert!(
+                err.contains("bundle of weida") && err.contains("3 bytes short"),
+                "{err}"
+            );
+            assert_eq!(left(), 0);
 
-    /// A scheduler that does not answer leaves the upload to itself: the
-    /// event is queued, and it may still run.
-    #[tokio::test]
-    async fn an_upload_the_scheduler_does_not_answer_is_refused_but_kept() {
-        let state = scratch("silent");
-        let service = service(&state, Duration::from_millis(400));
-        let sent = upload("git@github.com:griasdi/griasdi.git", &[5]);
-        let mut body: &[u8] = b"first";
-        let err = service
-            .accept("sha256:me", sent, &mut body)
-            .await
-            .expect_err("no answer");
-        assert!(
-            err.starts_with("the CI did not start the manual run within "),
-            "{err}"
-        );
-        event::drain_inbox(&state);
-        let queued = event::queued(&state);
-        assert_eq!(queued.len(), 1);
-        let id = queued[0].1.upload.clone().expect("an upload");
-        assert!(read_upload(&state, &id).is_ok());
-        let _ = std::fs::remove_dir_all(&state);
+            // A repository that ci.toml does not list, and a run of no job.
+            let mut body: &[u8] = b"first";
+            let unlisted = upload("git@example.org:someone/iced_nodegraph.git", &[5]);
+            let err = service
+                .accept("sha256:me", unlisted, &mut body)
+                .await
+                .expect_err("an unlisted repository");
+            assert_eq!(
+                err,
+                "git@example.org:someone/iced_nodegraph.git is no repository of ci.toml"
+            );
+            let no_jobs = RunUpload {
+                jobs: Vec::new(),
+                ..upload("git@github.com:griasdi/griasdi.git", &[5])
+            };
+            assert!(
+                service
+                    .accept("sha256:me", no_jobs, &mut body)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(body, b"first", "nothing of a refused upload is read");
+            assert_eq!(left(), 0);
+            event::drain_inbox(&state);
+            assert!(event::queued(&state).is_empty());
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        /// A scheduler that does not answer leaves the upload to itself: the
+        /// event is queued, and it may still run.
+        #[tokio::test]
+        async fn an_upload_the_scheduler_does_not_answer_is_refused_but_kept() {
+            let state = scratch("silent");
+            let service = service(&state, Duration::from_millis(400));
+            let sent = upload("git@github.com:griasdi/griasdi.git", &[5]);
+            let mut body: &[u8] = b"first";
+            let err = service
+                .accept("sha256:me", sent, &mut body)
+                .await
+                .expect_err("no answer");
+            assert!(
+                err.starts_with("the CI did not start the manual run within "),
+                "{err}"
+            );
+            event::drain_inbox(&state);
+            let queued = event::queued(&state);
+            assert_eq!(queued.len(), 1);
+            let id = queued[0].1.upload.clone().expect("an upload");
+            assert!(read_upload(&state, &id).is_ok());
+            let _ = std::fs::remove_dir_all(&state);
+        }
     }
 }

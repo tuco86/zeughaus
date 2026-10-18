@@ -223,28 +223,6 @@ mod tests {
         }
     }
 
-    fn temp(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zci-event-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[test]
-    fn three_events_same_key_leave_the_last() {
-        let dir = temp("coalesce");
-        for (i, sha) in ["a", "b", "c"].iter().enumerate() {
-            write_inbox(&dir, &event(sha, i as u64)).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        drain_inbox(&dir);
-        let queued = queued(&dir);
-        assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].1.sha.as_deref(), Some("c"));
-        assert!(json_files(&inbox_dir(&dir)).is_empty());
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
     #[test]
     fn key_distinguishes_ref_kind_and_cron() {
         let a = event("x", 0);
@@ -283,18 +261,6 @@ mod tests {
     }
 
     #[test]
-    fn malformed_inbox_file_is_set_aside() {
-        let dir = temp("bad");
-        let inbox = inbox_dir(&dir);
-        std::fs::create_dir_all(&inbox).unwrap();
-        std::fs::write(inbox.join("1-1.json"), "{nope").unwrap();
-        drain_inbox(&dir);
-        assert!(inbox.join("1-1.json.bad").exists());
-        assert!(queued(&dir).is_empty());
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
     fn kind_round_trips() {
         for kind in [
             EventKind::Push,
@@ -307,17 +273,57 @@ mod tests {
         assert!("pull".parse::<EventKind>().is_err());
     }
 
-    #[test]
-    fn cancel_requests_are_drained_once() {
-        let dir = temp("cancel");
-        write_cancel(&dir, "smoke", 7).unwrap();
-        write_cancel(&dir, "other-repo", 12).unwrap();
-        std::fs::write(cancel_dir(&dir).join("junk"), "").unwrap();
-        assert_eq!(
-            drain_cancels(&dir),
-            vec![("other-repo".to_owned(), 12), ("smoke".to_owned(), 7)]
-        );
-        assert!(drain_cancels(&dir).is_empty());
-        std::fs::remove_dir_all(&dir).unwrap();
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        fn temp(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("zci-event-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[test]
+        fn three_events_same_key_leave_the_last() {
+            let dir = temp("coalesce");
+            for (i, sha) in ["a", "b", "c"].iter().enumerate() {
+                write_inbox(&dir, &event(sha, i as u64)).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            drain_inbox(&dir);
+            let queued = queued(&dir);
+            assert_eq!(queued.len(), 1);
+            assert_eq!(queued[0].1.sha.as_deref(), Some("c"));
+            assert!(json_files(&inbox_dir(&dir)).is_empty());
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn malformed_inbox_file_is_set_aside() {
+            let dir = temp("bad");
+            let inbox = inbox_dir(&dir);
+            std::fs::create_dir_all(&inbox).unwrap();
+            std::fs::write(inbox.join("1-1.json"), "{nope").unwrap();
+            drain_inbox(&dir);
+            assert!(inbox.join("1-1.json.bad").exists());
+            assert!(queued(&dir).is_empty());
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn cancel_requests_are_drained_once() {
+            let dir = temp("cancel");
+            write_cancel(&dir, "smoke", 7).unwrap();
+            write_cancel(&dir, "other-repo", 12).unwrap();
+            std::fs::write(cancel_dir(&dir).join("junk"), "").unwrap();
+            assert_eq!(
+                drain_cancels(&dir),
+                vec![("other-repo".to_owned(), 12), ("smoke".to_owned(), 7)]
+            );
+            assert!(drain_cancels(&dir).is_empty());
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 }

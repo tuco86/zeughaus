@@ -337,214 +337,221 @@ impl Follower {
 mod tests {
     use super::*;
 
-    struct Dir(PathBuf);
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-    impl Dir {
-        fn new(name: &str) -> Dir {
-            let dir = std::env::temp_dir().join(format!("zh-wal-{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("create the test directory");
-            Dir(dir)
+        struct Dir(PathBuf);
+
+        impl Dir {
+            fn new(name: &str) -> Dir {
+                let dir =
+                    std::env::temp_dir().join(format!("zh-wal-{name}-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).expect("create the test directory");
+                Dir(dir)
+            }
+
+            fn path(&self, name: &str) -> PathBuf {
+                self.0.join(name)
+            }
         }
 
-        fn path(&self, name: &str) -> PathBuf {
-            self.0.join(name)
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
         }
-    }
 
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    #[test]
-    fn records_round_trip_with_their_times() {
-        let dir = Dir::new("roundtrip");
-        let path = dir.path("wal");
-        let mut writer = WalWriter::open(&path, None).expect("open");
-        writer.append(10, b"abc").expect("append");
-        writer.append(25, b"").expect("append");
-        writer.append(40, b"defgh").expect("append");
-        drop(writer);
-        let records = read(&path).expect("read");
-        assert_eq!(
-            records,
-            vec![
-                Record {
-                    at_micros: 10,
-                    bytes: b"abc".to_vec()
-                },
-                Record {
-                    at_micros: 25,
-                    bytes: Vec::new()
-                },
-                Record {
-                    at_micros: 40,
-                    bytes: b"defgh".to_vec()
-                },
-            ]
-        );
-        assert_eq!(read_bytes(&path).expect("bytes"), b"abcdefgh");
-        // Reopening appends after the magic instead of writing it again.
-        let mut writer = WalWriter::open(&path, None).expect("reopen");
-        writer.append(50, b"i").expect("append");
-        assert_eq!(read_bytes(&path).expect("bytes"), b"abcdefghi");
-    }
-
-    #[test]
-    fn a_file_without_the_magic_is_not_a_wal() {
-        let dir = Dir::new("magic");
-        let path = dir.path("log");
-        std::fs::write(&path, "plain text, no magic").expect("write");
-        let message = read(&path).expect_err("not a WAL").to_string();
-        assert_eq!(message, format!("not a WAL: {}", path.display()));
-        assert!(WalWriter::open(&path, None).is_err());
-        assert!(tail_bytes(&path, 4).is_err());
-        assert!(tail_records(&path, 4).is_err());
-        assert!(first_at(&path).is_err());
-    }
-
-    #[test]
-    fn a_torn_tail_reads_the_complete_records_only() {
-        let dir = Dir::new("torn");
-        let path = dir.path("wal");
-        let mut writer = WalWriter::open(&path, None).expect("open");
-        writer.append(1, b"abc").expect("append");
-        writer.append(2, b"defgh").expect("append");
-        drop(writer);
-        let full = std::fs::read(&path).expect("read raw");
-        // Cut inside the second record's payload, then inside its header.
-        for cut in [full.len() - 2, 8 + 12 + 3 + 5] {
-            std::fs::write(&path, &full[..cut]).expect("truncate");
+        #[test]
+        fn records_round_trip_with_their_times() {
+            let dir = Dir::new("roundtrip");
+            let path = dir.path("wal");
+            let mut writer = WalWriter::open(&path, None).expect("open");
+            writer.append(10, b"abc").expect("append");
+            writer.append(25, b"").expect("append");
+            writer.append(40, b"defgh").expect("append");
+            drop(writer);
             let records = read(&path).expect("read");
-            assert_eq!(records.len(), 1, "cut at {cut}");
-            assert_eq!(records[0].bytes, b"abc");
-            assert_eq!(read_bytes(&path).expect("bytes"), b"abc");
-            assert_eq!(tail_bytes(&path, 10).expect("tail"), b"abc");
             assert_eq!(
-                tail_records(&path, 10).expect("tail records"),
-                (records, false)
+                records,
+                vec![
+                    Record {
+                        at_micros: 10,
+                        bytes: b"abc".to_vec()
+                    },
+                    Record {
+                        at_micros: 25,
+                        bytes: Vec::new()
+                    },
+                    Record {
+                        at_micros: 40,
+                        bytes: b"defgh".to_vec()
+                    },
+                ]
             );
+            assert_eq!(read_bytes(&path).expect("bytes"), b"abcdefgh");
+            // Reopening appends after the magic instead of writing it again.
+            let mut writer = WalWriter::open(&path, None).expect("reopen");
+            writer.append(50, b"i").expect("append");
+            assert_eq!(read_bytes(&path).expect("bytes"), b"abcdefghi");
         }
-    }
 
-    #[test]
-    fn the_tail_is_the_last_bytes_of_the_stream() {
-        let dir = Dir::new("tail");
-        let path = dir.path("wal");
-        let mut writer = WalWriter::open(&path, None).expect("open");
-        writer.append(1, b"abc").expect("append");
-        writer.append(2, b"defgh").expect("append");
-        drop(writer);
-        assert_eq!(tail_bytes(&path, 5).expect("tail"), b"defgh");
-        assert_eq!(tail_bytes(&path, 6).expect("tail"), b"cdefgh");
-        assert_eq!(tail_bytes(&path, 100).expect("tail"), b"abcdefgh");
-        assert_eq!(tail_bytes(&path, 0).expect("tail"), b"");
-    }
+        #[test]
+        fn a_file_without_the_magic_is_not_a_wal() {
+            let dir = Dir::new("magic");
+            let path = dir.path("log");
+            std::fs::write(&path, "plain text, no magic").expect("write");
+            let message = read(&path).expect_err("not a WAL").to_string();
+            assert_eq!(message, format!("not a WAL: {}", path.display()));
+            assert!(WalWriter::open(&path, None).is_err());
+            assert!(tail_bytes(&path, 4).is_err());
+            assert!(tail_records(&path, 4).is_err());
+            assert!(first_at(&path).is_err());
+        }
 
-    #[test]
-    fn the_tail_records_are_whole_and_say_whether_earlier_ones_were_left_out() {
-        let dir = Dir::new("tail-records");
-        let path = dir.path("wal");
-        let mut writer = WalWriter::open(&path, None).expect("open");
-        // Nothing was written, so nothing was left out.
-        assert_eq!(tail_records(&path, 10).expect("empty"), (Vec::new(), false));
-        writer.append(1, b"abc").expect("append");
-        writer.append(2, b"defgh").expect("append");
-        writer.append(3, b"ij").expect("append");
-        drop(writer);
-        let record = |at_micros, bytes: &[u8]| Record {
-            at_micros,
-            bytes: bytes.to_vec(),
-        };
-        let (abc, defgh, ij) = (record(1, b"abc"), record(2, b"defgh"), record(3, b"ij"));
-        let tail = |max| tail_records(&path, max).expect("tail records");
+        #[test]
+        fn a_torn_tail_reads_the_complete_records_only() {
+            let dir = Dir::new("torn");
+            let path = dir.path("wal");
+            let mut writer = WalWriter::open(&path, None).expect("open");
+            writer.append(1, b"abc").expect("append");
+            writer.append(2, b"defgh").expect("append");
+            drop(writer);
+            let full = std::fs::read(&path).expect("read raw");
+            // Cut inside the second record's payload, then inside its header.
+            for cut in [full.len() - 2, 8 + 12 + 3 + 5] {
+                std::fs::write(&path, &full[..cut]).expect("truncate");
+                let records = read(&path).expect("read");
+                assert_eq!(records.len(), 1, "cut at {cut}");
+                assert_eq!(records[0].bytes, b"abc");
+                assert_eq!(read_bytes(&path).expect("bytes"), b"abc");
+                assert_eq!(tail_bytes(&path, 10).expect("tail"), b"abc");
+                assert_eq!(
+                    tail_records(&path, 10).expect("tail records"),
+                    (records, false)
+                );
+            }
+        }
 
-        // The newest record that holds the bytes asked for; one byte more
-        // than it has takes the next one along whole, not cut.
-        assert_eq!(tail(2), (vec![ij.clone()], true));
-        assert_eq!(tail(3), (vec![defgh.clone(), ij.clone()], true));
-        assert_eq!(tail(7), (vec![defgh.clone(), ij.clone()], true));
-        assert_eq!(
-            tail(8),
-            (vec![abc.clone(), defgh.clone(), ij.clone()], false)
-        );
-        assert_eq!(tail(100), (vec![abc, defgh, ij], false));
-        assert_eq!(tail(0), (Vec::new(), true));
+        #[test]
+        fn the_tail_is_the_last_bytes_of_the_stream() {
+            let dir = Dir::new("tail");
+            let path = dir.path("wal");
+            let mut writer = WalWriter::open(&path, None).expect("open");
+            writer.append(1, b"abc").expect("append");
+            writer.append(2, b"defgh").expect("append");
+            drop(writer);
+            assert_eq!(tail_bytes(&path, 5).expect("tail"), b"defgh");
+            assert_eq!(tail_bytes(&path, 6).expect("tail"), b"cdefgh");
+            assert_eq!(tail_bytes(&path, 100).expect("tail"), b"abcdefgh");
+            assert_eq!(tail_bytes(&path, 0).expect("tail"), b"");
+        }
 
-        // The bytes of the tail are the last bytes of the stream, at every size.
-        let stream = read_bytes(&path).expect("bytes");
-        for max in 0..=stream.len() + 2 {
-            let from = stream.len().saturating_sub(max);
+        #[test]
+        fn the_tail_records_are_whole_and_say_whether_earlier_ones_were_left_out() {
+            let dir = Dir::new("tail-records");
+            let path = dir.path("wal");
+            let mut writer = WalWriter::open(&path, None).expect("open");
+            // Nothing was written, so nothing was left out.
+            assert_eq!(tail_records(&path, 10).expect("empty"), (Vec::new(), false));
+            writer.append(1, b"abc").expect("append");
+            writer.append(2, b"defgh").expect("append");
+            writer.append(3, b"ij").expect("append");
+            drop(writer);
+            let record = |at_micros, bytes: &[u8]| Record {
+                at_micros,
+                bytes: bytes.to_vec(),
+            };
+            let (abc, defgh, ij) = (record(1, b"abc"), record(2, b"defgh"), record(3, b"ij"));
+            let tail = |max| tail_records(&path, max).expect("tail records");
+
+            // The newest record that holds the bytes asked for; one byte more
+            // than it has takes the next one along whole, not cut.
+            assert_eq!(tail(2), (vec![ij.clone()], true));
+            assert_eq!(tail(3), (vec![defgh.clone(), ij.clone()], true));
+            assert_eq!(tail(7), (vec![defgh.clone(), ij.clone()], true));
             assert_eq!(
-                tail_bytes(&path, max).expect("tail"),
-                &stream[from..],
-                "max {max}"
+                tail(8),
+                (vec![abc.clone(), defgh.clone(), ij.clone()], false)
             );
+            assert_eq!(tail(100), (vec![abc, defgh, ij], false));
+            assert_eq!(tail(0), (Vec::new(), true));
+
+            // The bytes of the tail are the last bytes of the stream, at every size.
+            let stream = read_bytes(&path).expect("bytes");
+            for max in 0..=stream.len() + 2 {
+                let from = stream.len().saturating_sub(max);
+                assert_eq!(
+                    tail_bytes(&path, max).expect("tail"),
+                    &stream[from..],
+                    "max {max}"
+                );
+            }
         }
-    }
 
-    #[test]
-    fn the_first_time_is_read_from_the_first_record_alone() {
-        let dir = Dir::new("first");
-        let path = dir.path("wal");
-        assert!(first_at(&path).is_err(), "no file");
-        let mut writer = WalWriter::open(&path, None).expect("open");
-        assert_eq!(first_at(&path).expect("empty"), None);
-        writer.append(40, b"abc").expect("append");
-        writer.append(90, b"d").expect("append");
-        drop(writer);
-        assert_eq!(first_at(&path).expect("first"), Some(40));
+        #[test]
+        fn the_first_time_is_read_from_the_first_record_alone() {
+            let dir = Dir::new("first");
+            let path = dir.path("wal");
+            assert!(first_at(&path).is_err(), "no file");
+            let mut writer = WalWriter::open(&path, None).expect("open");
+            assert_eq!(first_at(&path).expect("empty"), None);
+            writer.append(40, b"abc").expect("append");
+            writer.append(90, b"d").expect("append");
+            drop(writer);
+            assert_eq!(first_at(&path).expect("first"), Some(40));
 
-        // A first record that is not whole has no time to give yet: cut
-        // inside its header, then inside its payload.
-        let full = std::fs::read(&path).expect("read raw");
-        for cut in [8 + 4, 8 + 12 + 2] {
-            std::fs::write(&path, &full[..cut]).expect("truncate");
-            assert_eq!(first_at(&path).expect("torn"), None, "cut at {cut}");
+            // A first record that is not whole has no time to give yet: cut
+            // inside its header, then inside its payload.
+            let full = std::fs::read(&path).expect("read raw");
+            for cut in [8 + 4, 8 + 12 + 2] {
+                std::fs::write(&path, &full[..cut]).expect("truncate");
+                assert_eq!(first_at(&path).expect("torn"), None, "cut at {cut}");
+            }
         }
-    }
 
-    #[test]
-    fn a_capped_writer_rotates_into_a_second_file() {
-        let dir = Dir::new("rotate");
-        let path = dir.path("wal");
-        let mut writer = WalWriter::open(&path, Some(64)).expect("open");
-        // 8 + 32 = 40, and a second 32-byte record would make 72 > 64.
-        writer.append(1, &[b'a'; 20]).expect("append");
-        writer.append(2, &[b'b'; 20]).expect("append");
-        drop(writer);
-        let older = dir.path("wal.1");
-        assert_eq!(read_bytes(&older).expect("older"), vec![b'a'; 20]);
-        assert_eq!(read_bytes(&path).expect("newer"), vec![b'b'; 20]);
-        assert!(std::fs::read(&path).expect("raw").starts_with(MAGIC));
-    }
+        #[test]
+        fn a_capped_writer_rotates_into_a_second_file() {
+            let dir = Dir::new("rotate");
+            let path = dir.path("wal");
+            let mut writer = WalWriter::open(&path, Some(64)).expect("open");
+            // 8 + 32 = 40, and a second 32-byte record would make 72 > 64.
+            writer.append(1, &[b'a'; 20]).expect("append");
+            writer.append(2, &[b'b'; 20]).expect("append");
+            drop(writer);
+            let older = dir.path("wal.1");
+            assert_eq!(read_bytes(&older).expect("older"), vec![b'a'; 20]);
+            assert_eq!(read_bytes(&path).expect("newer"), vec![b'b'; 20]);
+            assert!(std::fs::read(&path).expect("raw").starts_with(MAGIC));
+        }
 
-    #[test]
-    fn a_follower_returns_only_new_complete_records() {
-        let dir = Dir::new("follow");
-        let path = dir.path("wal");
-        let mut writer = WalWriter::open(&path, None).expect("open");
-        let mut follower = Follower::open(&path).expect("follow");
-        assert!(follower.next_records().expect("empty").is_empty());
-        writer.append(1, b"one").expect("append");
-        let first = follower.next_records().expect("first");
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].bytes, b"one");
-        assert!(follower.next_records().expect("quiet").is_empty());
-        // A record cut in the middle waits until it is whole.
-        let mut raw = OpenOptions::new().append(true).open(&path).expect("raw");
-        let mut record = Vec::new();
-        record.extend_from_slice(&2u64.to_le_bytes());
-        record.extend_from_slice(&4u32.to_le_bytes());
-        record.extend_from_slice(b"twoo");
-        raw.write_all(&record[..14]).expect("part");
-        assert!(follower.next_records().expect("torn").is_empty());
-        raw.write_all(&record[14..]).expect("rest");
-        let second = follower.next_records().expect("second");
-        assert_eq!(second.len(), 1);
-        assert_eq!(second[0].bytes, b"twoo");
-        assert_eq!(second[0].at_micros, 2);
+        #[test]
+        fn a_follower_returns_only_new_complete_records() {
+            let dir = Dir::new("follow");
+            let path = dir.path("wal");
+            let mut writer = WalWriter::open(&path, None).expect("open");
+            let mut follower = Follower::open(&path).expect("follow");
+            assert!(follower.next_records().expect("empty").is_empty());
+            writer.append(1, b"one").expect("append");
+            let first = follower.next_records().expect("first");
+            assert_eq!(first.len(), 1);
+            assert_eq!(first[0].bytes, b"one");
+            assert!(follower.next_records().expect("quiet").is_empty());
+            // A record cut in the middle waits until it is whole.
+            let mut raw = OpenOptions::new().append(true).open(&path).expect("raw");
+            let mut record = Vec::new();
+            record.extend_from_slice(&2u64.to_le_bytes());
+            record.extend_from_slice(&4u32.to_le_bytes());
+            record.extend_from_slice(b"twoo");
+            raw.write_all(&record[..14]).expect("part");
+            assert!(follower.next_records().expect("torn").is_empty());
+            raw.write_all(&record[14..]).expect("rest");
+            let second = follower.next_records().expect("second");
+            assert_eq!(second.len(), 1);
+            assert_eq!(second[0].bytes, b"twoo");
+            assert_eq!(second[0].at_micros, 2);
+        }
     }
 }

@@ -1145,23 +1145,9 @@ fn tool(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    use tokio::io::AsyncReadExt;
-    use weida::TransferMeta;
-    use zeughaus_link::enlist::UploadDir;
-    use zeughaus_link::enlist::{read_frame, write_frame};
-    use zeughaus_link::manual::{RunReply, RunUpload};
-    use zeughaus_link::{
-        CI_PATH, ChannelView, JobDefView, MANUAL_PATH, MachineJob, MachineView, QueuedView,
-        RepoView, TimedLine,
-    };
+    use zeughaus_link::{ChannelView, MachineJob, MachineView, QueuedView, TimedLine};
 
     use super::*;
-    use crate::mcp::{CiCommand, Failure, ci_answer};
-    use crate::transport::Transport;
 
     fn job(name: &str, status: &str, place: &str, note: &str) -> JobView {
         JobView {
@@ -1631,506 +1617,6 @@ mod tests {
         assert_eq!(wait_for(Some(86_400)), Duration::from_secs(600));
     }
 
-    /// What the fake CI below was asked.
-    #[derive(Default)]
-    struct Seen {
-        uploads: Mutex<Vec<(RunUpload, Vec<Vec<u8>>)>>,
-        asked: Mutex<Vec<CiRequest>>,
-        /// Looks at the pipeline before it is finished.
-        running_looks: AtomicU32,
-        /// Asks to find a pipeline by sha.
-        finds: AtomicU32,
-    }
-
-    /// A weida listener that answers `/ci` and `/manual` the way the CI does,
-    /// with a pipeline that runs for `running_looks` looks, then ends as
-    /// `outcome`.
-    struct FakeCi {
-        _transport: Transport,
-        state: PathBuf,
-        url: String,
-        seen: Arc<Seen>,
-    }
-
-    impl Drop for FakeCi {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.state);
-        }
-    }
-
-    async fn fake_ci(tag: &str, running_looks: u32, refuse: Option<&str>) -> FakeCi {
-        let state =
-            std::env::temp_dir().join(format!("zeughaus-mcp-fake-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&state);
-        let transport = Transport::start(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), &state)
-            .await
-            .expect("fake CI");
-        let seen = Arc::new(Seen::default());
-        let ci = transport.listener().replier(CI_PATH).expect("/ci");
-        tokio::spawn(serve_ci(ci, Arc::clone(&seen), running_looks));
-        let manual = transport.listener().replier(MANUAL_PATH).expect("/manual");
-        tokio::spawn(serve_manual(
-            manual,
-            Arc::clone(&seen),
-            refuse.map(str::to_owned),
-        ));
-        FakeCi {
-            url: transport.url().to_owned(),
-            _transport: transport,
-            state,
-            seen,
-        }
-    }
-
-    /// Pipeline 1 of the fake: running for `running_looks` looks, then done.
-    fn pipeline_one(seen: &Seen, running_looks: u32) -> PipelineView {
-        let looks = seen.running_looks.fetch_add(1, Ordering::Relaxed);
-        let mut view = if looks < running_looks {
-            pipeline("running", None, vec![job("build", "running", "agent", "")])
-        } else {
-            let mut done = job("build", "succeeded", "agent", "");
-            done.code = Some(0);
-            pipeline("succeeded", Some(1_007), vec![done])
-        };
-        view.number = 1;
-        view
-    }
-
-    /// The origin of the checkouts these tests make: the one repository the
-    /// fake CI knows.
-    const DEMO_ORIGIN: &str = "git@example.invalid:o/demo.git";
-
-    /// What the fake says of `demo`: its newest pipeline for the asked commit,
-    /// and with `jobs` the one job of its `.zeughaus-ci/`.
-    fn demo_repo(sha: Option<&str>, jobs: bool) -> RepoView {
-        let mut head = pipeline(
-            "succeeded",
-            Some(1_007),
-            vec![job("build", "succeeded", "agent", "")],
-        );
-        head.number = 5;
-        let defined = JobDefView {
-            name: "build".to_owned(),
-            file: "build.sh".to_owned(),
-            on: vec!["push main".to_owned()],
-            needs: Vec::new(),
-            channels: Vec::new(),
-            place: "host".to_owned(),
-            runner: "agent".to_owned(),
-            at: "host".to_owned(),
-            placement: String::new(),
-            secrets: Vec::new(),
-            when_busy: "wait".to_owned(),
-            manual: true,
-        };
-        RepoView {
-            name: "demo".to_owned(),
-            forge: "none".to_owned(),
-            default_branch: "main".to_owned(),
-            branch: "green".to_owned(),
-            channels: vec![ChannelView {
-                repo: "demo".to_owned(),
-                channel: "dev".to_owned(),
-                latest: 5,
-                status: "succeeded".to_owned(),
-            }],
-            head: sha.map(|_| Box::new(head)),
-            jobs_sha: sha.filter(|_| jobs).map(str::to_owned),
-            jobs: if jobs { vec![defined] } else { Vec::new() },
-            jobs_note: String::new(),
-            machines: vec![MachineView {
-                name: "agent".to_owned(),
-                kind: "runner".to_owned(),
-                status: "online".to_owned(),
-                jobs: Vec::new(),
-            }],
-            platforms: vec![("linux-amd64".to_owned(), "agent".to_owned())],
-        }
-    }
-
-    async fn serve_ci(replier: weida::Replier, seen: Arc<Seen>, running_looks: u32) {
-        while let Ok(mut request) = replier.accept().await {
-            let body = request
-                .take_body()
-                .collect(zeughaus_link::MAX_CI_REQUEST_BYTES)
-                .await
-                .expect("request");
-            let asked = CiRequest::decode(&body).expect("a CiRequest");
-            seen.asked.lock().unwrap().push(asked.clone());
-            let reply = match asked {
-                CiRequest::Pipeline { number: 1, .. } => CiReply::Pipeline {
-                    pipeline: Some(Box::new(pipeline_one(&seen, running_looks))),
-                },
-                // Still running, one of its jobs already settled.
-                CiRequest::Pipeline { number: 4, .. } => {
-                    let mut view = pipeline(
-                        "running",
-                        None,
-                        vec![
-                            job("build", "running", "agent", ""),
-                            job("publish", "skipped", "agent", ""),
-                        ],
-                    );
-                    view.number = 4;
-                    CiReply::Pipeline {
-                        pipeline: Some(Box::new(view)),
-                    }
-                }
-                // The push of `dead..` reaches the CI after two asks.
-                CiRequest::Find { sha, .. } if sha.starts_with("dead") => {
-                    if seen.finds.fetch_add(1, Ordering::Relaxed) < 2 {
-                        CiReply::Pipeline { pipeline: None }
-                    } else {
-                        CiReply::Pipeline {
-                            pipeline: Some(Box::new(pipeline_one(&seen, running_looks))),
-                        }
-                    }
-                }
-                CiRequest::Find { .. } => CiReply::Pipeline { pipeline: None },
-                // What a CI says while it cannot read its records.
-                CiRequest::Pipeline { number: 3, .. } => CiReply::Error {
-                    message: "the scheduler is restarting".to_owned(),
-                },
-                CiRequest::Pipeline { .. } => CiReply::Pipeline { pipeline: None },
-                CiRequest::Log {
-                    job,
-                    tail,
-                    timestamps,
-                    ..
-                } => CiReply::Log {
-                    text: format!(
-                        "{}job {job}, {tail} lines\ntest result: ok. 1 passed\n",
-                        if timestamps { "[+     0.0s] " } else { "" }
-                    ),
-                    finished: true,
-                },
-                CiRequest::Timing { job, .. } if job == "nothing" => CiReply::Error {
-                    message: "no output for nothing of #1".to_owned(),
-                },
-                CiRequest::Timing { job, top, .. } => CiReply::Timing {
-                    timing: JobTiming {
-                        lines: 3,
-                        span_ms: 31_200,
-                        slowest: vec![TimedLine {
-                            at_ms: 0,
-                            took_ms: 30_000,
-                            text: format!("{job}: asked for {top}"),
-                        }],
-                        finished: false,
-                        truncated: true,
-                    },
-                },
-                CiRequest::Repo { origin, sha, jobs } if origin == DEMO_ORIGIN => CiReply::Repo {
-                    repo: Some(Box::new(demo_repo(sha.as_deref(), jobs))),
-                },
-                // A remote that is none of the repositories of its ci.toml.
-                CiRequest::Repo { .. } => CiReply::Repo { repo: None },
-                CiRequest::Pipelines { repo, channel, .. } => {
-                    let mut view = pipeline("succeeded", Some(1_007), Vec::new());
-                    view.repo = repo;
-                    view.channel = channel;
-                    view.number = 1;
-                    CiReply::Pipelines {
-                        pipelines: vec![view],
-                    }
-                }
-                _ => CiReply::Error {
-                    message: "not served by the fake".to_owned(),
-                },
-            };
-            let mut out = request.reply(TransferMeta::default()).await.expect("reply");
-            out.write_all(&reply.encode()).await.expect("write");
-            out.finish().expect("finish");
-        }
-    }
-
-    async fn serve_manual(replier: weida::Replier, seen: Arc<Seen>, refuse: Option<String>) {
-        while let Ok(mut request) = replier.accept().await {
-            let mut body = request.take_body();
-            let upload: RunUpload = read_frame(&mut body)
-                .await
-                .expect("frame")
-                .expect("an upload");
-            let reply = match &refuse {
-                Some(message) => RunReply::Refused {
-                    message: message.clone(),
-                },
-                None => {
-                    let mut bundles = Vec::new();
-                    for size in &upload.sizes {
-                        let mut bundle = vec![0u8; *size as usize];
-                        body.read_exact(&mut bundle).await.expect("a whole bundle");
-                        bundles.push(bundle);
-                    }
-                    // Nothing follows the bundles.
-                    let mut rest = Vec::new();
-                    body.read_to_end(&mut rest).await.expect("the end");
-                    assert!(rest.is_empty());
-                    seen.uploads.lock().unwrap().push((upload, bundles));
-                    RunReply::Accepted {
-                        repo: "demo".to_owned(),
-                        number: 1,
-                    }
-                }
-            };
-            let mut out = request.reply(TransferMeta::default()).await.expect("reply");
-            write_frame(&mut out, &reply).await.expect("frame");
-            out.finish().expect("finish");
-        }
-    }
-
-    /// A tools box that talks to `ci` with the client key its transport made.
-    fn toolbox_for(ci: &FakeCi) -> Toolbox {
-        let link = super::super::client::Link::resolve(Some(ci.url.clone()), &ci.state);
-        Toolbox::new(Arc::new(Client::new(link))).polling_every(Duration::from_millis(20))
-    }
-
-    fn checkout(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "zeughaus-mcp-demo-{tag}-{}/demo",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
-        std::fs::create_dir_all(dir.join("sub")).unwrap();
-        std::fs::write(dir.join("sub/file.txt"), "in a subdirectory\n").unwrap();
-        std::fs::write(dir.join("note.txt"), "untracked\n").unwrap();
-        for args in [
-            &["init", "-q"][..],
-            &["remote", "add", "origin", "git@example.invalid:o/demo.git"][..],
-        ] {
-            let status = std::process::Command::new("git")
-                .current_dir(&dir)
-                .args(args)
-                .status()
-                .unwrap();
-            assert!(status.success());
-        }
-        dir
-    }
-
-    /// The whole of a manual run against a CI that is not the real one: the
-    /// snapshot is taken from a directory, uploaded, and the pipeline the CI
-    /// numbered is waited for.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_manual_run_uploads_the_snapshot_and_waits_for_the_pipeline() {
-        let ci = fake_ci("run", 2, None).await;
-        let tools = toolbox_for(&ci);
-        let dir = checkout("run");
-
-        let text = tools
-            .call(
-                "run_jobs",
-                json!({
-                    "jobs": ["build-x", "check-x"],
-                    "path": dir.join("sub"),
-                    "wait_seconds": 30,
-                }),
-            )
-            .await
-            .expect("the run");
-
-        assert!(
-            text.starts_with("demo/dev #1 succeeded manual main 0123456"),
-            "{text}"
-        );
-        assert!(text.contains("\n  build succeeded agent\n"), "{text}");
-        assert!(!text.contains("still running"), "{text}");
-
-        let uploads = ci.seen.uploads.lock().unwrap();
-        assert_eq!(uploads.len(), 1);
-        let (upload, bundles) = &uploads[0];
-        assert_eq!(upload.origin, "git@example.invalid:o/demo.git");
-        assert_eq!(upload.jobs, ["build-x", "check-x"]);
-        assert_eq!(upload.summary, "working tree");
-        assert_eq!(upload.dirs.len(), 1);
-        assert_eq!(upload.dirs[0].dir, "demo");
-        assert_eq!(bundles.len(), 1);
-        assert_eq!(bundles[0].len() as u64, upload.sizes[0]);
-        assert!(
-            bundles[0].starts_with(b"# v2 git bundle\n")
-                || bundles[0].starts_with(b"# v3 git bundle\n"),
-            "{:?}",
-            String::from_utf8_lossy(&bundles[0][..20])
-        );
-        // The pipeline was looked at while it ran and once when it was done,
-        // and nothing else was asked.
-        assert_eq!(ci.seen.running_looks.load(Ordering::Relaxed), 3);
-        assert!(
-            ci.seen
-                .asked
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|asked| matches!(asked, CiRequest::Pipeline { number: 1, .. }))
-        );
-        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_manual_run_that_outlasts_the_wait_says_how_to_continue() {
-        let ci = fake_ci("again", 1_000, None).await;
-        let tools = toolbox_for(&ci);
-        let dir = checkout("again");
-
-        let text = tools
-            .call(
-                "run_jobs",
-                json!({ "jobs": ["build-x"], "path": dir, "wait_seconds": 1 }),
-            )
-            .await
-            .expect("still running is not an error");
-        assert!(
-            text.starts_with("demo/dev #1 running manual main"),
-            "{text}"
-        );
-        assert!(
-            text.ends_with("still running after 1 s; call ci_wait again with repo=demo number=1\n"),
-            "{text}"
-        );
-        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
-    }
-
-    /// A CI that answers with an error is looked at again for a while, in
-    /// case it is a restart, and is then given up on, with the way back to
-    /// the run.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_ci_that_keeps_failing_ends_the_wait_with_its_error() {
-        let ci = fake_ci("failing", 0, None).await;
-        let tools = toolbox_for(&ci).tolerating_errors_for(Duration::from_millis(100));
-        let started = Instant::now();
-        let err = tools
-            .call(
-                "ci_wait",
-                json!({ "repo": "demo", "number": 3, "wait_seconds": 30 }),
-            )
-            .await
-            .expect_err("the CI fails");
-        assert_eq!(
-            err,
-            "the scheduler is restarting (the pipeline is demo #3; ci_wait asks again)"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "it was told it could wait 30 s, not that it had to"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ci_wait_returns_once_the_pipeline_has_finished() {
-        let ci = fake_ci("wait", 2, None).await;
-        let tools = toolbox_for(&ci);
-        let text = tools
-            .call(
-                "ci_wait",
-                json!({ "repo": "demo", "number": 1, "wait_seconds": 30 }),
-            )
-            .await
-            .expect("the pipeline finishes");
-        assert!(
-            text.starts_with("demo/dev #1 succeeded manual main 0123456"),
-            "{text}"
-        );
-        assert!(!text.contains("still running"), "{text}");
-        assert_eq!(ci.seen.running_looks.load(Ordering::Relaxed), 3);
-
-        // A number the CI does not know is an error at once, not a wait.
-        let err = tools
-            .call(
-                "ci_wait",
-                json!({ "repo": "demo", "number": 2, "wait_seconds": 30 }),
-            )
-            .await
-            .expect_err("unknown pipeline");
-        assert_eq!(err, "no pipeline demo #2");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ci_wait_for_a_job_returns_when_that_job_has_settled() {
-        let ci = fake_ci("job", 0, None).await;
-        let tools = toolbox_for(&ci);
-        // The pipeline runs on, the skipped job is settled.
-        let text = tools
-            .call(
-                "ci_wait",
-                json!({ "repo": "demo", "number": 4, "job": "publish", "wait_seconds": 30 }),
-            )
-            .await
-            .expect("publish is skipped");
-        assert!(text.contains("\n  publish skipped agent\n"), "{text}");
-        assert!(text.contains("\n  build running agent\n"), "{text}");
-        assert!(!text.contains("still running"), "{text}");
-
-        // A job that has not settled by the end of the wait says how to go on.
-        let text = tools
-            .call(
-                "ci_wait",
-                json!({ "repo": "demo", "number": 4, "job": "build", "wait_seconds": 0 }),
-            )
-            .await
-            .expect("still running is not an error");
-        assert!(
-            text.ends_with(
-                "still running after 0 s; call ci_wait again with repo=demo number=4 job=build\n"
-            ),
-            "{text}"
-        );
-
-        let err = tools
-            .call(
-                "ci_wait",
-                json!({ "repo": "demo", "number": 4, "job": "deploy" }),
-            )
-            .await
-            .expect_err("no such job");
-        assert_eq!(err, "no job deploy in demo #4; its jobs are build, publish");
-    }
-
-    /// A pipeline named by the sha of its commit may not exist yet: it is
-    /// asked for until it does, and then followed by its number.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ci_wait_for_a_sha_waits_for_the_pipeline_to_appear() {
-        let ci = fake_ci("sha", 1, None).await;
-        let tools = toolbox_for(&ci);
-        let text = tools
-            .call(
-                "ci_wait",
-                json!({ "repo": "demo", "sha": "deadbeef", "wait_seconds": 30 }),
-            )
-            .await
-            .expect("the pipeline appears and finishes");
-        assert!(text.starts_with("demo/dev #1 succeeded"), "{text}");
-        let find = CiRequest::Find {
-            repo: "demo".to_owned(),
-            sha: "deadbeef".to_owned(),
-        };
-        assert_eq!(
-            *ci.seen.asked.lock().unwrap(),
-            [
-                find.clone(),
-                find.clone(),
-                find,
-                CiRequest::Pipeline {
-                    repo: "demo".to_owned(),
-                    number: 1
-                }
-            ]
-        );
-
-        // Nothing matches: the end of the wait says so.
-        let text = tools
-            .call(
-                "ci_wait",
-                json!({ "repo": "demo", "sha": "beef", "wait_seconds": 0 }),
-            )
-            .await
-            .expect("a missing pipeline is waited for");
-        assert_eq!(
-            text,
-            "no pipeline of beef in demo after 0 s; the push may not have reached the CI \
-             yet; call ci_wait again\n"
-        );
-    }
-
     #[tokio::test]
     async fn ci_wait_takes_a_number_or_a_sha_or_neither_but_not_both() {
         let tools = toolbox_without_a_ci();
@@ -2157,596 +1643,1122 @@ mod tests {
         assert!(err.starts_with("no CI configured"), "{err}");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ci_timing_tells_the_pipeline_or_asks_the_ci_for_the_pauses_of_a_job() {
-        let ci = fake_ci("timing", 0, None).await;
-        let tools = toolbox_for(&ci);
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        // Without a job it is the pipeline's own record, one look at it.
-        let text = tools
-            .call("ci_timing", json!({ "repo": "demo", "number": 1 }))
-            .await
-            .expect("the pipeline");
-        assert!(
-            text.starts_with(
-                "demo/dev #1 succeeded manual main 0123456 cargo test (hannes@tuco-pc)\n\
-                 created 00:16:40 UTC, took 7 s\n"
+        use std::path::Path;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        use tokio::io::AsyncReadExt;
+        use weida::TransferMeta;
+        use zeughaus_link::enlist::UploadDir;
+        use zeughaus_link::enlist::{read_frame, write_frame};
+        use zeughaus_link::manual::{RunReply, RunUpload};
+        use zeughaus_link::{CI_PATH, JobDefView, MANUAL_PATH, RepoView};
+
+        use crate::mcp::{CiCommand, Failure, ci_answer};
+        use crate::transport::Transport;
+
+        /// What the fake CI below was asked.
+        #[derive(Default)]
+        struct Seen {
+            uploads: Mutex<Vec<(RunUpload, Vec<Vec<u8>>)>>,
+            asked: Mutex<Vec<CiRequest>>,
+            /// Looks at the pipeline before it is finished.
+            running_looks: AtomicU32,
+            /// Asks to find a pipeline by sha.
+            finds: AtomicU32,
+        }
+
+        /// A weida listener that answers `/ci` and `/manual` the way the CI does,
+        /// with a pipeline that runs for `running_looks` looks, then ends as
+        /// `outcome`.
+        struct FakeCi {
+            _transport: Transport,
+            state: PathBuf,
+            url: String,
+            seen: Arc<Seen>,
+        }
+
+        impl Drop for FakeCi {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.state);
+            }
+        }
+
+        async fn fake_ci(tag: &str, running_looks: u32, refuse: Option<&str>) -> FakeCi {
+            let state = std::env::temp_dir()
+                .join(format!("zeughaus-mcp-fake-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&state);
+            let transport =
+                Transport::start(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), &state)
+                    .await
+                    .expect("fake CI");
+            let seen = Arc::new(Seen::default());
+            let ci = transport.listener().replier(CI_PATH).expect("/ci");
+            tokio::spawn(serve_ci(ci, Arc::clone(&seen), running_looks));
+            let manual = transport.listener().replier(MANUAL_PATH).expect("/manual");
+            tokio::spawn(serve_manual(
+                manual,
+                Arc::clone(&seen),
+                refuse.map(str::to_owned),
+            ));
+            FakeCi {
+                url: transport.url().to_owned(),
+                _transport: transport,
+                state,
+                seen,
+            }
+        }
+
+        /// Pipeline 1 of the fake: running for `running_looks` looks, then done.
+        fn pipeline_one(seen: &Seen, running_looks: u32) -> PipelineView {
+            let looks = seen.running_looks.fetch_add(1, Ordering::Relaxed);
+            let mut view = if looks < running_looks {
+                pipeline("running", None, vec![job("build", "running", "agent", "")])
+            } else {
+                let mut done = job("build", "succeeded", "agent", "");
+                done.code = Some(0);
+                pipeline("succeeded", Some(1_007), vec![done])
+            };
+            view.number = 1;
+            view
+        }
+
+        /// The origin of the checkouts these tests make: the one repository the
+        /// fake CI knows.
+        const DEMO_ORIGIN: &str = "git@example.invalid:o/demo.git";
+
+        /// What the fake says of `demo`: its newest pipeline for the asked commit,
+        /// and with `jobs` the one job of its `.zeughaus-ci/`.
+        fn demo_repo(sha: Option<&str>, jobs: bool) -> RepoView {
+            let mut head = pipeline(
+                "succeeded",
+                Some(1_007),
+                vec![job("build", "succeeded", "agent", "")],
+            );
+            head.number = 5;
+            let defined = JobDefView {
+                name: "build".to_owned(),
+                file: "build.sh".to_owned(),
+                on: vec!["push main".to_owned()],
+                needs: Vec::new(),
+                channels: Vec::new(),
+                place: "host".to_owned(),
+                runner: "agent".to_owned(),
+                at: "host".to_owned(),
+                placement: String::new(),
+                secrets: Vec::new(),
+                when_busy: "wait".to_owned(),
+                manual: true,
+            };
+            RepoView {
+                name: "demo".to_owned(),
+                forge: "none".to_owned(),
+                default_branch: "main".to_owned(),
+                branch: "green".to_owned(),
+                channels: vec![ChannelView {
+                    repo: "demo".to_owned(),
+                    channel: "dev".to_owned(),
+                    latest: 5,
+                    status: "succeeded".to_owned(),
+                }],
+                head: sha.map(|_| Box::new(head)),
+                jobs_sha: sha.filter(|_| jobs).map(str::to_owned),
+                jobs: if jobs { vec![defined] } else { Vec::new() },
+                jobs_note: String::new(),
+                machines: vec![MachineView {
+                    name: "agent".to_owned(),
+                    kind: "runner".to_owned(),
+                    status: "online".to_owned(),
+                    jobs: Vec::new(),
+                }],
+                platforms: vec![("linux-amd64".to_owned(), "agent".to_owned())],
+            }
+        }
+
+        async fn serve_ci(replier: weida::Replier, seen: Arc<Seen>, running_looks: u32) {
+            while let Ok(mut request) = replier.accept().await {
+                let body = request
+                    .take_body()
+                    .collect(zeughaus_link::MAX_CI_REQUEST_BYTES)
+                    .await
+                    .expect("request");
+                let asked = CiRequest::decode(&body).expect("a CiRequest");
+                seen.asked.lock().unwrap().push(asked.clone());
+                let reply = match asked {
+                    CiRequest::Pipeline { number: 1, .. } => CiReply::Pipeline {
+                        pipeline: Some(Box::new(pipeline_one(&seen, running_looks))),
+                    },
+                    // Still running, one of its jobs already settled.
+                    CiRequest::Pipeline { number: 4, .. } => {
+                        let mut view = pipeline(
+                            "running",
+                            None,
+                            vec![
+                                job("build", "running", "agent", ""),
+                                job("publish", "skipped", "agent", ""),
+                            ],
+                        );
+                        view.number = 4;
+                        CiReply::Pipeline {
+                            pipeline: Some(Box::new(view)),
+                        }
+                    }
+                    // The push of `dead..` reaches the CI after two asks.
+                    CiRequest::Find { sha, .. } if sha.starts_with("dead") => {
+                        if seen.finds.fetch_add(1, Ordering::Relaxed) < 2 {
+                            CiReply::Pipeline { pipeline: None }
+                        } else {
+                            CiReply::Pipeline {
+                                pipeline: Some(Box::new(pipeline_one(&seen, running_looks))),
+                            }
+                        }
+                    }
+                    CiRequest::Find { .. } => CiReply::Pipeline { pipeline: None },
+                    // What a CI says while it cannot read its records.
+                    CiRequest::Pipeline { number: 3, .. } => CiReply::Error {
+                        message: "the scheduler is restarting".to_owned(),
+                    },
+                    CiRequest::Pipeline { .. } => CiReply::Pipeline { pipeline: None },
+                    CiRequest::Log {
+                        job,
+                        tail,
+                        timestamps,
+                        ..
+                    } => CiReply::Log {
+                        text: format!(
+                            "{}job {job}, {tail} lines\ntest result: ok. 1 passed\n",
+                            if timestamps { "[+     0.0s] " } else { "" }
+                        ),
+                        finished: true,
+                    },
+                    CiRequest::Timing { job, .. } if job == "nothing" => CiReply::Error {
+                        message: "no output for nothing of #1".to_owned(),
+                    },
+                    CiRequest::Timing { job, top, .. } => CiReply::Timing {
+                        timing: JobTiming {
+                            lines: 3,
+                            span_ms: 31_200,
+                            slowest: vec![TimedLine {
+                                at_ms: 0,
+                                took_ms: 30_000,
+                                text: format!("{job}: asked for {top}"),
+                            }],
+                            finished: false,
+                            truncated: true,
+                        },
+                    },
+                    CiRequest::Repo { origin, sha, jobs } if origin == DEMO_ORIGIN => {
+                        CiReply::Repo {
+                            repo: Some(Box::new(demo_repo(sha.as_deref(), jobs))),
+                        }
+                    }
+                    // A remote that is none of the repositories of its ci.toml.
+                    CiRequest::Repo { .. } => CiReply::Repo { repo: None },
+                    CiRequest::Pipelines { repo, channel, .. } => {
+                        let mut view = pipeline("succeeded", Some(1_007), Vec::new());
+                        view.repo = repo;
+                        view.channel = channel;
+                        view.number = 1;
+                        CiReply::Pipelines {
+                            pipelines: vec![view],
+                        }
+                    }
+                    _ => CiReply::Error {
+                        message: "not served by the fake".to_owned(),
+                    },
+                };
+                let mut out = request.reply(TransferMeta::default()).await.expect("reply");
+                out.write_all(&reply.encode()).await.expect("write");
+                out.finish().expect("finish");
+            }
+        }
+
+        async fn serve_manual(replier: weida::Replier, seen: Arc<Seen>, refuse: Option<String>) {
+            while let Ok(mut request) = replier.accept().await {
+                let mut body = request.take_body();
+                let upload: RunUpload = read_frame(&mut body)
+                    .await
+                    .expect("frame")
+                    .expect("an upload");
+                let reply = match &refuse {
+                    Some(message) => RunReply::Refused {
+                        message: message.clone(),
+                    },
+                    None => {
+                        let mut bundles = Vec::new();
+                        for size in &upload.sizes {
+                            let mut bundle = vec![0u8; *size as usize];
+                            body.read_exact(&mut bundle).await.expect("a whole bundle");
+                            bundles.push(bundle);
+                        }
+                        // Nothing follows the bundles.
+                        let mut rest = Vec::new();
+                        body.read_to_end(&mut rest).await.expect("the end");
+                        assert!(rest.is_empty());
+                        seen.uploads.lock().unwrap().push((upload, bundles));
+                        RunReply::Accepted {
+                            repo: "demo".to_owned(),
+                            number: 1,
+                        }
+                    }
+                };
+                let mut out = request.reply(TransferMeta::default()).await.expect("reply");
+                write_frame(&mut out, &reply).await.expect("frame");
+                out.finish().expect("finish");
+            }
+        }
+
+        /// A tools box that talks to `ci` with the client key its transport made.
+        fn toolbox_for(ci: &FakeCi) -> Toolbox {
+            let link = crate::mcp::client::Link::resolve(Some(ci.url.clone()), &ci.state);
+            Toolbox::new(Arc::new(Client::new(link))).polling_every(Duration::from_millis(20))
+        }
+
+        fn checkout(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "zeughaus-mcp-demo-{tag}-{}/demo",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+            std::fs::create_dir_all(dir.join("sub")).unwrap();
+            std::fs::write(dir.join("sub/file.txt"), "in a subdirectory\n").unwrap();
+            std::fs::write(dir.join("note.txt"), "untracked\n").unwrap();
+            for args in [
+                &["init", "-q"][..],
+                &["remote", "add", "origin", "git@example.invalid:o/demo.git"][..],
+            ] {
+                let status = std::process::Command::new("git")
+                    .current_dir(&dir)
+                    .args(args)
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+            }
+            dir
+        }
+
+        /// The whole of a manual run against a CI that is not the real one: the
+        /// snapshot is taken from a directory, uploaded, and the pipeline the CI
+        /// numbered is waited for.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_manual_run_uploads_the_snapshot_and_waits_for_the_pipeline() {
+            let ci = fake_ci("run", 2, None).await;
+            let tools = toolbox_for(&ci);
+            let dir = checkout("run");
+
+            let text = tools
+                .call(
+                    "run_jobs",
+                    json!({
+                        "jobs": ["build-x", "check-x"],
+                        "path": dir.join("sub"),
+                        "wait_seconds": 30,
+                    }),
+                )
+                .await
+                .expect("the run");
+
+            assert!(
+                text.starts_with("demo/dev #1 succeeded manual main 0123456"),
+                "{text}"
+            );
+            assert!(text.contains("\n  build succeeded agent\n"), "{text}");
+            assert!(!text.contains("still running"), "{text}");
+
+            let uploads = ci.seen.uploads.lock().unwrap();
+            assert_eq!(uploads.len(), 1);
+            let (upload, bundles) = &uploads[0];
+            assert_eq!(upload.origin, "git@example.invalid:o/demo.git");
+            assert_eq!(upload.jobs, ["build-x", "check-x"]);
+            assert_eq!(upload.summary, "working tree");
+            assert_eq!(upload.dirs.len(), 1);
+            assert_eq!(upload.dirs[0].dir, "demo");
+            assert_eq!(bundles.len(), 1);
+            assert_eq!(bundles[0].len() as u64, upload.sizes[0]);
+            assert!(
+                bundles[0].starts_with(b"# v2 git bundle\n")
+                    || bundles[0].starts_with(b"# v3 git bundle\n"),
+                "{:?}",
+                String::from_utf8_lossy(&bundles[0][..20])
+            );
+            // The pipeline was looked at while it ran and once when it was done,
+            // and nothing else was asked.
+            assert_eq!(ci.seen.running_looks.load(Ordering::Relaxed), 3);
+            assert!(
+                ci.seen
+                    .asked
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|asked| matches!(asked, CiRequest::Pipeline { number: 1, .. }))
+            );
+            let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_manual_run_that_outlasts_the_wait_says_how_to_continue() {
+            let ci = fake_ci("again", 1_000, None).await;
+            let tools = toolbox_for(&ci);
+            let dir = checkout("again");
+
+            let text = tools
+                .call(
+                    "run_jobs",
+                    json!({ "jobs": ["build-x"], "path": dir, "wait_seconds": 1 }),
+                )
+                .await
+                .expect("still running is not an error");
+            assert!(
+                text.starts_with("demo/dev #1 running manual main"),
+                "{text}"
+            );
+            assert!(
+                text.ends_with(
+                    "still running after 1 s; call ci_wait again with repo=demo number=1\n"
+                ),
+                "{text}"
+            );
+            let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        }
+
+        /// A CI that answers with an error is looked at again for a while, in
+        /// case it is a restart, and is then given up on, with the way back to
+        /// the run.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_ci_that_keeps_failing_ends_the_wait_with_its_error() {
+            let ci = fake_ci("failing", 0, None).await;
+            let tools = toolbox_for(&ci).tolerating_errors_for(Duration::from_millis(100));
+            let started = Instant::now();
+            let err = tools
+                .call(
+                    "ci_wait",
+                    json!({ "repo": "demo", "number": 3, "wait_seconds": 30 }),
+                )
+                .await
+                .expect_err("the CI fails");
+            assert_eq!(
+                err,
+                "the scheduler is restarting (the pipeline is demo #3; ci_wait asks again)"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "it was told it could wait 30 s, not that it had to"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn ci_wait_returns_once_the_pipeline_has_finished() {
+            let ci = fake_ci("wait", 2, None).await;
+            let tools = toolbox_for(&ci);
+            let text = tools
+                .call(
+                    "ci_wait",
+                    json!({ "repo": "demo", "number": 1, "wait_seconds": 30 }),
+                )
+                .await
+                .expect("the pipeline finishes");
+            assert!(
+                text.starts_with("demo/dev #1 succeeded manual main 0123456"),
+                "{text}"
+            );
+            assert!(!text.contains("still running"), "{text}");
+            assert_eq!(ci.seen.running_looks.load(Ordering::Relaxed), 3);
+
+            // A number the CI does not know is an error at once, not a wait.
+            let err = tools
+                .call(
+                    "ci_wait",
+                    json!({ "repo": "demo", "number": 2, "wait_seconds": 30 }),
+                )
+                .await
+                .expect_err("unknown pipeline");
+            assert_eq!(err, "no pipeline demo #2");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn ci_wait_for_a_job_returns_when_that_job_has_settled() {
+            let ci = fake_ci("job", 0, None).await;
+            let tools = toolbox_for(&ci);
+            // The pipeline runs on, the skipped job is settled.
+            let text = tools
+                .call(
+                    "ci_wait",
+                    json!({ "repo": "demo", "number": 4, "job": "publish", "wait_seconds": 30 }),
+                )
+                .await
+                .expect("publish is skipped");
+            assert!(text.contains("\n  publish skipped agent\n"), "{text}");
+            assert!(text.contains("\n  build running agent\n"), "{text}");
+            assert!(!text.contains("still running"), "{text}");
+
+            // A job that has not settled by the end of the wait says how to go on.
+            let text = tools
+                .call(
+                    "ci_wait",
+                    json!({ "repo": "demo", "number": 4, "job": "build", "wait_seconds": 0 }),
+                )
+                .await
+                .expect("still running is not an error");
+            assert!(
+            text.ends_with(
+                "still running after 0 s; call ci_wait again with repo=demo number=4 job=build\n"
             ),
             "{text}"
         );
-        assert!(
-            text.contains("started +0 s ended +12 s staging - ran 12 s\n"),
-            "{text}"
-        );
-        assert_eq!(ci.seen.asked.lock().unwrap().len(), 1);
 
-        // With one the CI is asked, for 15 lines unless told otherwise and
-        // for no more than it gives.
-        let timing = |extra: Value| {
-            let mut arguments = json!({ "repo": "demo", "number": 1, "job": "build" });
-            arguments
-                .as_object_mut()
-                .unwrap()
-                .extend(extra.as_object().unwrap().clone());
-            tools.call("ci_timing", arguments)
-        };
-        let text = timing(json!({})).await.expect("the job's pauses");
-        assert_eq!(
-            text,
-            "demo #1 build: 3 lines over 31.2 s of output, still running\n\
+            let err = tools
+                .call(
+                    "ci_wait",
+                    json!({ "repo": "demo", "number": 4, "job": "deploy" }),
+                )
+                .await
+                .expect_err("no such job");
+            assert_eq!(err, "no job deploy in demo #4; its jobs are build, publish");
+        }
+
+        /// A pipeline named by the sha of its commit may not exist yet: it is
+        /// asked for until it does, and then followed by its number.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn ci_wait_for_a_sha_waits_for_the_pipeline_to_appear() {
+            let ci = fake_ci("sha", 1, None).await;
+            let tools = toolbox_for(&ci);
+            let text = tools
+                .call(
+                    "ci_wait",
+                    json!({ "repo": "demo", "sha": "deadbeef", "wait_seconds": 30 }),
+                )
+                .await
+                .expect("the pipeline appears and finishes");
+            assert!(text.starts_with("demo/dev #1 succeeded"), "{text}");
+            let find = CiRequest::Find {
+                repo: "demo".to_owned(),
+                sha: "deadbeef".to_owned(),
+            };
+            assert_eq!(
+                *ci.seen.asked.lock().unwrap(),
+                [
+                    find.clone(),
+                    find.clone(),
+                    find,
+                    CiRequest::Pipeline {
+                        repo: "demo".to_owned(),
+                        number: 1
+                    }
+                ]
+            );
+
+            // Nothing matches: the end of the wait says so.
+            let text = tools
+                .call(
+                    "ci_wait",
+                    json!({ "repo": "demo", "sha": "beef", "wait_seconds": 0 }),
+                )
+                .await
+                .expect("a missing pipeline is waited for");
+            assert_eq!(
+                text,
+                "no pipeline of beef in demo after 0 s; the push may not have reached the CI \
+             yet; call ci_wait again\n"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn ci_timing_tells_the_pipeline_or_asks_the_ci_for_the_pauses_of_a_job() {
+            let ci = fake_ci("timing", 0, None).await;
+            let tools = toolbox_for(&ci);
+
+            // Without a job it is the pipeline's own record, one look at it.
+            let text = tools
+                .call("ci_timing", json!({ "repo": "demo", "number": 1 }))
+                .await
+                .expect("the pipeline");
+            assert!(
+                text.starts_with(
+                    "demo/dev #1 succeeded manual main 0123456 cargo test (hannes@tuco-pc)\n\
+                 created 00:16:40 UTC, took 7 s\n"
+                ),
+                "{text}"
+            );
+            assert!(
+                text.contains("started +0 s ended +12 s staging - ran 12 s\n"),
+                "{text}"
+            );
+            assert_eq!(ci.seen.asked.lock().unwrap().len(), 1);
+
+            // With one the CI is asked, for 15 lines unless told otherwise and
+            // for no more than it gives.
+            let timing = |extra: Value| {
+                let mut arguments = json!({ "repo": "demo", "number": 1, "job": "build" });
+                arguments
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                tools.call("ci_timing", arguments)
+            };
+            let text = timing(json!({})).await.expect("the job's pauses");
+            assert_eq!(
+                text,
+                "demo #1 build: 3 lines over 31.2 s of output, still running\n\
              (only the last 64 MiB of output were read)\n\
              the 1 lines followed by the longest pauses, in output order:\n\
              \x20 +0.0 s  30.0 s  build: asked for 15\n"
-        );
-        assert_eq!(
-            ci.seen.asked.lock().unwrap().last(),
-            Some(&CiRequest::Timing {
-                repo: "demo".to_owned(),
-                number: 1,
-                job: "build".to_owned(),
-                top: 15,
-            })
-        );
-        let text = timing(json!({ "top": 1000 })).await.expect("clamped");
-        assert!(text.contains("build: asked for 100\n"), "{text}");
-        let text = timing(json!({ "top": 0 })).await.expect("clamped");
-        assert!(text.contains("build: asked for 1\n"), "{text}");
-
-        // The CI's refusal is the tool's error.
-        let err = tools
-            .call(
-                "ci_timing",
-                json!({ "repo": "demo", "number": 1, "job": "nothing" }),
-            )
-            .await
-            .expect_err("no output");
-        assert_eq!(err, "no output for nothing of #1");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ci_log_asks_for_timestamps_only_when_told_to() {
-        let ci = fake_ci("stamps", 0, None).await;
-        let tools = toolbox_for(&ci);
-        let log = |extra: Value| {
-            let mut arguments = json!({ "repo": "demo", "number": 1, "job": "build" });
-            arguments
-                .as_object_mut()
-                .unwrap()
-                .extend(extra.as_object().unwrap().clone());
-            tools.call("ci_log", arguments)
-        };
-
-        let plain = log(json!({})).await.expect("log");
-        assert_eq!(plain, "job build, 200 lines\ntest result: ok. 1 passed\n");
-        assert!(matches!(
-            ci.seen.asked.lock().unwrap().last(),
-            Some(CiRequest::Log {
-                timestamps: false,
-                tail: 200,
-                ..
-            })
-        ));
-
-        let stamped = log(json!({ "timestamps": true })).await.expect("log");
-        assert_eq!(
-            stamped,
-            "[+     0.0s] job build, 200 lines\ntest result: ok. 1 passed\n"
-        );
-        assert!(matches!(
-            ci.seen.asked.lock().unwrap().last(),
-            Some(CiRequest::Log {
-                timestamps: true,
-                ..
-            })
-        ));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_cis_refusal_of_a_run_is_the_tools_error() {
-        let ci = fake_ci(
-            "refuse",
-            0,
-            Some("git@example.invalid:o/demo.git is no repository of ci.toml"),
-        )
-        .await;
-        let tools = toolbox_for(&ci);
-        let dir = checkout("refuse");
-        let err = tools
-            .call("run_jobs", json!({ "jobs": ["build-x"], "path": dir }))
-            .await
-            .expect_err("refused");
-        assert_eq!(
-            err,
-            "git@example.invalid:o/demo.git is no repository of ci.toml"
-        );
-        assert!(ci.seen.uploads.lock().unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
-    }
-
-    /// A CI that refuses an upload does not read its bundles, which breaks
-    /// the stream under a writer that still has megabytes to send. What the
-    /// caller is told is the refusal, not the broken stream.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_refusal_that_comes_before_the_bundles_are_read_is_still_heard() {
-        const SIZE: usize = 48 << 20;
-        let ci = fake_ci("early", 0, Some("no repository matches x")).await;
-        let link = super::super::client::Link::resolve(Some(ci.url.clone()), &ci.state);
-        let client = Client::new(link);
-        let bundle = std::env::temp_dir().join(format!("zeughaus-mcp-big-{}", std::process::id()));
-        std::fs::write(&bundle, vec![7u8; SIZE]).unwrap();
-        let upload = RunUpload {
-            origin: "x".to_owned(),
-            actor: "a@b".to_owned(),
-            summary: "s".to_owned(),
-            jobs: vec!["build-x".to_owned()],
-            dirs: vec![UploadDir {
-                dir: "x".to_owned(),
-                sha: "0".repeat(40),
-            }],
-            sizes: vec![SIZE as u64],
-        };
-
-        let reply = client
-            .manual_upload(&upload, std::slice::from_ref(&bundle))
-            .await
-            .expect("a refusal is an answer");
-
-        assert_eq!(
-            reply,
-            RunReply::Refused {
-                message: "no repository matches x".to_owned()
-            }
-        );
-        let _ = std::fs::remove_file(&bundle);
-        client.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_read_tools_answer_from_the_cis_records() {
-        let ci = fake_ci("read", 0, None).await;
-        let tools = toolbox_for(&ci);
-
-        let text = tools
-            .call("ci_pipeline", json!({ "repo": "demo", "number": 1 }))
-            .await
-            .expect("pipeline");
-        assert!(
-            text.starts_with("demo/dev #1 succeeded manual main 0123456"),
-            "{text}"
-        );
-        assert!(text.contains("\n  build succeeded agent\n"), "{text}");
-
-        let log = tools
-            .call(
-                "ci_log",
-                json!({ "repo": "demo", "number": 1, "job": "build", "tail": 9_999 }),
-            )
-            .await
-            .expect("log");
-        // Asked for more than the CI gives: asked for what it gives.
-        assert_eq!(log, "job build, 5000 lines\ntest result: ok. 1 passed\n");
-
-        let err = tools
-            .call("ci_rerun", json!({ "repo": "demo", "number": 1 }))
-            .await
-            .expect_err("the fake refuses");
-        assert_eq!(err, "not served by the fake");
-    }
-
-    /// Git as a test fixture runs it: its own identity, whatever the
-    /// developer has configured.
-    fn fx(dir: &Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(["-c", "user.name=fx", "-c", "user.email=fx@example.invalid"])
-            .args(["-c", "commit.gpgsign=false"])
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
-    }
-
-    /// A checkout with one commit: its directory and the commit's id.
-    fn committed_checkout(tag: &str) -> (PathBuf, String) {
-        let dir = checkout(tag);
-        fx(&dir, &["commit", "-q", "--allow-empty", "-m", "first"]);
-        let head = fx(&dir, &["rev-parse", "HEAD"]);
-        (dir, head)
-    }
-
-    /// A `zeughaus-runner ci` client of the fake CI.
-    fn ci_client(ci: &FakeCi) -> Client {
-        Client::new(super::super::client::Link::resolve(
-            Some(ci.url.clone()),
-            &ci.state,
-        ))
-    }
-
-    /// An omitted `repo` is the repository the working directory's checkout
-    /// is by its origin, asked of the CI once.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_omitted_repo_is_the_repository_the_working_directorys_checkout_is() {
-        let ci = fake_ci("implicit", 0, None).await;
-        let dir = checkout("implicit");
-        let tools = toolbox_for(&ci).working_in(dir.clone());
-
-        let text = tools
-            .call("ci_pipelines", json!({ "channel": "dev" }))
-            .await
-            .expect("the pipelines of demo");
-        assert_eq!(
-            text,
-            "#1 succeeded manual main 0123456 cargo test (hannes@tuco-pc)\n"
-        );
-        // A checkout without a commit names its origin alone.
-        assert_eq!(
-            *ci.seen.asked.lock().unwrap(),
-            [
-                CiRequest::Repo {
-                    origin: DEMO_ORIGIN.to_owned(),
-                    sha: None,
-                    jobs: false
-                },
-                CiRequest::Pipelines {
+            );
+            assert_eq!(
+                ci.seen.asked.lock().unwrap().last(),
+                Some(&CiRequest::Timing {
                     repo: "demo".to_owned(),
-                    channel: "dev".to_owned(),
-                    before: None,
-                    limit: 10
-                },
-            ]
-        );
+                    number: 1,
+                    job: "build".to_owned(),
+                    top: 15,
+                })
+            );
+            let text = timing(json!({ "top": 1000 })).await.expect("clamped");
+            assert!(text.contains("build: asked for 100\n"), "{text}");
+            let text = timing(json!({ "top": 0 })).await.expect("clamped");
+            assert!(text.contains("build: asked for 1\n"), "{text}");
 
-        // The answer is kept: the next call goes to the pipeline itself.
-        let text = tools
-            .call("ci_pipeline", json!({ "number": 1 }))
-            .await
-            .expect("the pipeline");
-        assert!(
-            text.starts_with("demo/dev #1 succeeded manual main 0123456"),
-            "{text}"
-        );
-        let asked = ci.seen.asked.lock().unwrap().clone();
-        assert_eq!(asked.len(), 3, "{asked:?}");
-        assert_eq!(
-            asked[2],
-            CiRequest::Pipeline {
-                repo: "demo".to_owned(),
-                number: 1
-            }
-        );
-
-        // A repo that is named is used as it is, whatever the checkout is.
-        tools
-            .call("ci_pipeline", json!({ "repo": "named", "number": 1 }))
-            .await
-            .expect("the pipeline");
-        let asked = ci.seen.asked.lock().unwrap().clone();
-        assert_eq!(asked.len(), 4, "{asked:?}");
-        assert_eq!(
-            asked[3],
-            CiRequest::Pipeline {
-                repo: "named".to_owned(),
-                number: 1
-            }
-        );
-        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_checkout_the_ci_does_not_know_is_refused_with_its_origin_and_asked_again() {
-        let ci = fake_ci("unknown", 0, None).await;
-        let dir = checkout("unknown");
-        // The credentials of a remote are not told, nor sent.
-        fx(
-            &dir,
-            &[
-                "remote",
-                "set-url",
-                "origin",
-                "https://token@git.example.invalid/o/other.git",
-            ],
-        );
-        let tools = toolbox_for(&ci).working_in(dir.clone());
-
-        for _ in 0..2 {
+            // The CI's refusal is the tool's error.
             let err = tools
+                .call(
+                    "ci_timing",
+                    json!({ "repo": "demo", "number": 1, "job": "nothing" }),
+                )
+                .await
+                .expect_err("no output");
+            assert_eq!(err, "no output for nothing of #1");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn ci_log_asks_for_timestamps_only_when_told_to() {
+            let ci = fake_ci("stamps", 0, None).await;
+            let tools = toolbox_for(&ci);
+            let log = |extra: Value| {
+                let mut arguments = json!({ "repo": "demo", "number": 1, "job": "build" });
+                arguments
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                tools.call("ci_log", arguments)
+            };
+
+            let plain = log(json!({})).await.expect("log");
+            assert_eq!(plain, "job build, 200 lines\ntest result: ok. 1 passed\n");
+            assert!(matches!(
+                ci.seen.asked.lock().unwrap().last(),
+                Some(CiRequest::Log {
+                    timestamps: false,
+                    tail: 200,
+                    ..
+                })
+            ));
+
+            let stamped = log(json!({ "timestamps": true })).await.expect("log");
+            assert_eq!(
+                stamped,
+                "[+     0.0s] job build, 200 lines\ntest result: ok. 1 passed\n"
+            );
+            assert!(matches!(
+                ci.seen.asked.lock().unwrap().last(),
+                Some(CiRequest::Log {
+                    timestamps: true,
+                    ..
+                })
+            ));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_cis_refusal_of_a_run_is_the_tools_error() {
+            let ci = fake_ci(
+                "refuse",
+                0,
+                Some("git@example.invalid:o/demo.git is no repository of ci.toml"),
+            )
+            .await;
+            let tools = toolbox_for(&ci);
+            let dir = checkout("refuse");
+            let err = tools
+                .call("run_jobs", json!({ "jobs": ["build-x"], "path": dir }))
+                .await
+                .expect_err("refused");
+            assert_eq!(
+                err,
+                "git@example.invalid:o/demo.git is no repository of ci.toml"
+            );
+            assert!(ci.seen.uploads.lock().unwrap().is_empty());
+            let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        }
+
+        /// A CI that refuses an upload does not read its bundles, which breaks
+        /// the stream under a writer that still has megabytes to send. What the
+        /// caller is told is the refusal, not the broken stream.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refusal_that_comes_before_the_bundles_are_read_is_still_heard() {
+            const SIZE: usize = 48 << 20;
+            let ci = fake_ci("early", 0, Some("no repository matches x")).await;
+            let link = crate::mcp::client::Link::resolve(Some(ci.url.clone()), &ci.state);
+            let client = Client::new(link);
+            let bundle =
+                std::env::temp_dir().join(format!("zeughaus-mcp-big-{}", std::process::id()));
+            std::fs::write(&bundle, vec![7u8; SIZE]).unwrap();
+            let upload = RunUpload {
+                origin: "x".to_owned(),
+                actor: "a@b".to_owned(),
+                summary: "s".to_owned(),
+                jobs: vec!["build-x".to_owned()],
+                dirs: vec![UploadDir {
+                    dir: "x".to_owned(),
+                    sha: "0".repeat(40),
+                }],
+                sizes: vec![SIZE as u64],
+            };
+
+            let reply = client
+                .manual_upload(&upload, std::slice::from_ref(&bundle))
+                .await
+                .expect("a refusal is an answer");
+
+            assert_eq!(
+                reply,
+                RunReply::Refused {
+                    message: "no repository matches x".to_owned()
+                }
+            );
+            let _ = std::fs::remove_file(&bundle);
+            client.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_read_tools_answer_from_the_cis_records() {
+            let ci = fake_ci("read", 0, None).await;
+            let tools = toolbox_for(&ci);
+
+            let text = tools
+                .call("ci_pipeline", json!({ "repo": "demo", "number": 1 }))
+                .await
+                .expect("pipeline");
+            assert!(
+                text.starts_with("demo/dev #1 succeeded manual main 0123456"),
+                "{text}"
+            );
+            assert!(text.contains("\n  build succeeded agent\n"), "{text}");
+
+            let log = tools
+                .call(
+                    "ci_log",
+                    json!({ "repo": "demo", "number": 1, "job": "build", "tail": 9_999 }),
+                )
+                .await
+                .expect("log");
+            // Asked for more than the CI gives: asked for what it gives.
+            assert_eq!(log, "job build, 5000 lines\ntest result: ok. 1 passed\n");
+
+            let err = tools
+                .call("ci_rerun", json!({ "repo": "demo", "number": 1 }))
+                .await
+                .expect_err("the fake refuses");
+            assert_eq!(err, "not served by the fake");
+        }
+
+        /// Git as a test fixture runs it: its own identity, whatever the
+        /// developer has configured.
+        fn fx(dir: &Path, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(["-c", "user.name=fx", "-c", "user.email=fx@example.invalid"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+
+        /// A checkout with one commit: its directory and the commit's id.
+        fn committed_checkout(tag: &str) -> (PathBuf, String) {
+            let dir = checkout(tag);
+            fx(&dir, &["commit", "-q", "--allow-empty", "-m", "first"]);
+            let head = fx(&dir, &["rev-parse", "HEAD"]);
+            (dir, head)
+        }
+
+        /// A `zeughaus-runner ci` client of the fake CI.
+        fn ci_client(ci: &FakeCi) -> Client {
+            Client::new(crate::mcp::client::Link::resolve(
+                Some(ci.url.clone()),
+                &ci.state,
+            ))
+        }
+
+        /// An omitted `repo` is the repository the working directory's checkout
+        /// is by its origin, asked of the CI once.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_omitted_repo_is_the_repository_the_working_directorys_checkout_is() {
+            let ci = fake_ci("implicit", 0, None).await;
+            let dir = checkout("implicit");
+            let tools = toolbox_for(&ci).working_in(dir.clone());
+
+            let text = tools
+                .call("ci_pipelines", json!({ "channel": "dev" }))
+                .await
+                .expect("the pipelines of demo");
+            assert_eq!(
+                text,
+                "#1 succeeded manual main 0123456 cargo test (hannes@tuco-pc)\n"
+            );
+            // A checkout without a commit names its origin alone.
+            assert_eq!(
+                *ci.seen.asked.lock().unwrap(),
+                [
+                    CiRequest::Repo {
+                        origin: DEMO_ORIGIN.to_owned(),
+                        sha: None,
+                        jobs: false
+                    },
+                    CiRequest::Pipelines {
+                        repo: "demo".to_owned(),
+                        channel: "dev".to_owned(),
+                        before: None,
+                        limit: 10
+                    },
+                ]
+            );
+
+            // The answer is kept: the next call goes to the pipeline itself.
+            let text = tools
                 .call("ci_pipeline", json!({ "number": 1 }))
+                .await
+                .expect("the pipeline");
+            assert!(
+                text.starts_with("demo/dev #1 succeeded manual main 0123456"),
+                "{text}"
+            );
+            let asked = ci.seen.asked.lock().unwrap().clone();
+            assert_eq!(asked.len(), 3, "{asked:?}");
+            assert_eq!(
+                asked[2],
+                CiRequest::Pipeline {
+                    repo: "demo".to_owned(),
+                    number: 1
+                }
+            );
+
+            // A repo that is named is used as it is, whatever the checkout is.
+            tools
+                .call("ci_pipeline", json!({ "repo": "named", "number": 1 }))
+                .await
+                .expect("the pipeline");
+            let asked = ci.seen.asked.lock().unwrap().clone();
+            assert_eq!(asked.len(), 4, "{asked:?}");
+            assert_eq!(
+                asked[3],
+                CiRequest::Pipeline {
+                    repo: "named".to_owned(),
+                    number: 1
+                }
+            );
+            let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_checkout_the_ci_does_not_know_is_refused_with_its_origin_and_asked_again() {
+            let ci = fake_ci("unknown", 0, None).await;
+            let dir = checkout("unknown");
+            // The credentials of a remote are not told, nor sent.
+            fx(
+                &dir,
+                &[
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://token@git.example.invalid/o/other.git",
+                ],
+            );
+            let tools = toolbox_for(&ci).working_in(dir.clone());
+
+            for _ in 0..2 {
+                let err = tools
+                    .call("ci_pipeline", json!({ "number": 1 }))
+                    .await
+                    .expect_err("no such repository");
+                assert_eq!(
+                    err,
+                    "repo omitted, and https://git.example.invalid/o/other.git is no repository \
+                 of the CI's ci.toml"
+                );
+            }
+            // An unknown origin is not remembered: ci.toml may be fixed meanwhile.
+            assert_eq!(ci.seen.asked.lock().unwrap().len(), 2);
+
+            let err = tools
+                .call("ci_repo", json!({}))
                 .await
                 .expect_err("no such repository");
             assert_eq!(
                 err,
-                "repo omitted, and https://git.example.invalid/o/other.git is no repository \
-                 of the CI's ci.toml"
-            );
-        }
-        // An unknown origin is not remembered: ci.toml may be fixed meanwhile.
-        assert_eq!(ci.seen.asked.lock().unwrap().len(), 2);
-
-        let err = tools
-            .call("ci_repo", json!({}))
-            .await
-            .expect_err("no such repository");
-        assert_eq!(
-            err,
-            "https://git.example.invalid/o/other.git is no repository of the CI's ci.toml: \
+                "https://git.example.invalid/o/other.git is no repository of the CI's ci.toml: \
              its jobs do not run there"
-        );
-        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
-    }
+            );
+            let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ci_repo_tells_what_the_ci_knows_of_the_checkouts_repository() {
-        let ci = fake_ci("repo", 0, None).await;
-        let (dir, head) = committed_checkout("repo");
-        let tools = toolbox_for(&ci).working_in(dir.clone());
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn ci_repo_tells_what_the_ci_knows_of_the_checkouts_repository() {
+            let ci = fake_ci("repo", 0, None).await;
+            let (dir, head) = committed_checkout("repo");
+            let tools = toolbox_for(&ci).working_in(dir.clone());
 
-        let text = tools.call("ci_repo", json!({})).await.expect("the view");
-        let sha = &head[..7];
-        assert_eq!(
-            text,
-            repo::describe(&demo_repo(Some(&head), true), Some(&head))
-        );
-        assert!(
+            let text = tools.call("ci_repo", json!({})).await.expect("the view");
+            let sha = &head[..7];
+            assert_eq!(
+                text,
+                repo::describe(&demo_repo(Some(&head), true), Some(&head))
+            );
+            assert!(
             text.starts_with(&format!(
                 "demo (none): main green\nHEAD {sha}: dev #5 succeeded\nchannels: dev #5 succeeded\n"
             )),
             "{text}"
         );
-        assert!(
+            assert!(
             text.contains(&format!(
                 "jobs at {sha} (run_jobs takes these names):\n  build  agent host  on push main\n"
             )),
             "{text}"
         );
-        assert_eq!(
-            *ci.seen.asked.lock().unwrap(),
-            [CiRequest::Repo {
-                origin: DEMO_ORIGIN.to_owned(),
-                sha: Some(head.clone()),
-                jobs: true
-            }]
-        );
-
-        // A `path` inside the checkout names it, whatever the working
-        // directory is.
-        let by_path = toolbox_for(&ci)
-            .call("ci_repo", json!({ "path": dir.join("sub") }))
-            .await
-            .expect("by path");
-        assert_eq!(by_path, text);
-        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ci_wait_without_number_or_sha_waits_for_the_commit_the_checkout_is_at() {
-        let ci = fake_ci("head", 0, None).await;
-        let (dir, head) = committed_checkout("head");
-        let tools = toolbox_for(&ci).working_in(dir.clone());
-
-        let text = tools
-            .call("ci_wait", json!({ "wait_seconds": 0 }))
-            .await
-            .expect("no pipeline yet is not an error");
-        assert_eq!(
-            text,
-            format!(
-                "no pipeline of {head} in demo after 0 s; the push may not have reached the CI \
-                 yet; call ci_wait again\n"
-            )
-        );
-        assert_eq!(
-            *ci.seen.asked.lock().unwrap(),
-            [
-                CiRequest::Repo {
+            assert_eq!(
+                *ci.seen.asked.lock().unwrap(),
+                [CiRequest::Repo {
                     origin: DEMO_ORIGIN.to_owned(),
                     sha: Some(head.clone()),
-                    jobs: false
-                },
-                CiRequest::Find {
-                    repo: "demo".to_owned(),
-                    sha: head.clone()
-                },
-            ]
-        );
+                    jobs: true
+                }]
+            );
 
-        // A repo that is named is taken as it is; the commit is still the
-        // checkout's.
-        let text = tools
-            .call("ci_wait", json!({ "repo": "named", "wait_seconds": 0 }))
-            .await
-            .expect("no pipeline yet is not an error");
-        assert!(
-            text.starts_with(&format!("no pipeline of {head} in named after 0 s")),
-            "{text}"
-        );
+            // A `path` inside the checkout names it, whatever the working
+            // directory is.
+            let by_path = toolbox_for(&ci)
+                .call("ci_repo", json!({ "path": dir.join("sub") }))
+                .await
+                .expect("by path");
+            assert_eq!(by_path, text);
+            let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        }
 
-        // A checkout without a commit has nothing to wait for.
-        let unborn = checkout("head-unborn");
-        let err = toolbox_for(&ci)
-            .working_in(unborn.clone())
-            .call("ci_wait", json!({}))
-            .await
-            .expect_err("no commit");
-        assert!(
-            err.ends_with("has no commit to wait for; give number or sha"),
-            "{err}"
-        );
-        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
-        let _ = std::fs::remove_dir_all(unborn.parent().unwrap());
-    }
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn ci_wait_without_number_or_sha_waits_for_the_commit_the_checkout_is_at() {
+            let ci = fake_ci("head", 0, None).await;
+            let (dir, head) = committed_checkout("head");
+            let tools = toolbox_for(&ci).working_in(dir.clone());
 
-    // `zeughaus-runner ci` is tested here because the fake CI is: what a
-    // script gets, and the exit code that goes with it.
+            let text = tools
+                .call("ci_wait", json!({ "wait_seconds": 0 }))
+                .await
+                .expect("no pipeline yet is not an error");
+            assert_eq!(
+                text,
+                format!(
+                    "no pipeline of {head} in demo after 0 s; the push may not have reached the CI \
+                 yet; call ci_wait again\n"
+                )
+            );
+            assert_eq!(
+                *ci.seen.asked.lock().unwrap(),
+                [
+                    CiRequest::Repo {
+                        origin: DEMO_ORIGIN.to_owned(),
+                        sha: Some(head.clone()),
+                        jobs: false
+                    },
+                    CiRequest::Find {
+                        repo: "demo".to_owned(),
+                        sha: head.clone()
+                    },
+                ]
+            );
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ci_repo_prints_the_text_or_one_line_of_json() {
-        let ci = fake_ci("cli-repo", 0, None).await;
-        let (dir, head) = committed_checkout("cli-repo");
-        let client = ci_client(&ci);
-        let command = |json| CiCommand::Repo {
-            json,
-            path: Some(dir.to_string_lossy().into_owned()),
-        };
-        let expected = repo::describe(&demo_repo(Some(&head), true), Some(&head));
+            // A repo that is named is taken as it is; the commit is still the
+            // checkout's.
+            let text = tools
+                .call("ci_wait", json!({ "repo": "named", "wait_seconds": 0 }))
+                .await
+                .expect("no pipeline yet is not an error");
+            assert!(
+                text.starts_with(&format!("no pipeline of {head} in named after 0 s")),
+                "{text}"
+            );
 
-        let text = ci_answer(&client, command(false)).await.expect("the text");
-        assert_eq!(text, format!("{expected}\n"));
+            // A checkout without a commit has nothing to wait for.
+            let unborn = checkout("head-unborn");
+            let err = toolbox_for(&ci)
+                .working_in(unborn.clone())
+                .call("ci_wait", json!({}))
+                .await
+                .expect_err("no commit");
+            assert!(
+                err.ends_with("has no commit to wait for; give number or sha"),
+                "{err}"
+            );
+            let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+            let _ = std::fs::remove_dir_all(unborn.parent().unwrap());
+        }
 
-        let line = ci_answer(&client, command(true)).await.expect("the JSON");
-        assert_eq!(line.matches('\n').count(), 1, "one line: {line}");
-        assert!(line.ends_with('\n'), "{line}");
-        let json: Value = serde_json::from_str(&line).expect("JSON");
-        assert_eq!(json["text"], expected);
-        assert_eq!(json["repo"]["name"], "demo");
-        assert_eq!(json["repo"]["head"]["number"], 5);
-        assert_eq!(json["repo"]["jobs"][0]["name"], "build");
-        assert_eq!(json["repo"]["jobs"][0]["manual"], true);
-        client.shutdown().await;
-        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
-    }
+        // `zeughaus-runner ci` is tested here because the fake CI is: what a
+        // script gets, and the exit code that goes with it.
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ci_repo_exits_3_for_an_origin_the_ci_lacks_and_1_for_what_is_no_checkout() {
-        let ci = fake_ci("cli-unknown", 0, None).await;
-        let (dir, _) = committed_checkout("cli-unknown");
-        fx(
-            &dir,
-            &[
-                "remote",
-                "set-url",
-                "origin",
-                "git@example.invalid:o/other.git",
-            ],
-        );
-        let plain = dir.parent().unwrap().join("plain");
-        std::fs::create_dir_all(&plain).unwrap();
-        let client = ci_client(&ci);
-        let ask = |path: &Path| {
-            ci_answer(
-                &client,
-                CiCommand::Repo {
-                    json: true,
-                    path: Some(path.to_string_lossy().into_owned()),
-                },
-            )
-        };
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn ci_repo_prints_the_text_or_one_line_of_json() {
+            let ci = fake_ci("cli-repo", 0, None).await;
+            let (dir, head) = committed_checkout("cli-repo");
+            let client = ci_client(&ci);
+            let command = |json| CiCommand::Repo {
+                json,
+                path: Some(dir.to_string_lossy().into_owned()),
+            };
+            let expected = repo::describe(&demo_repo(Some(&head), true), Some(&head));
 
-        assert_eq!(
-            ask(&dir).await,
-            Err(Failure {
-                code: 3,
-                message: "git@example.invalid:o/other.git is no repository of the CI's ci.toml"
-                    .to_owned()
-            })
-        );
-        let failure = ask(&plain).await.expect_err("no checkout");
-        assert_eq!(failure.code, 1);
-        assert!(
-            failure.message.contains("is not inside a git checkout"),
-            "{}",
-            failure.message
-        );
-        let failure = ask(&dir.join("missing")).await.expect_err("no directory");
-        assert_eq!(failure.code, 1);
-        // Only the first question reached the CI.
-        assert_eq!(ci.seen.asked.lock().unwrap().len(), 1);
-        client.shutdown().await;
-        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
-    }
+            let text = ci_answer(&client, command(false)).await.expect("the text");
+            assert_eq!(text, format!("{expected}\n"));
 
-    #[tokio::test]
-    async fn without_a_ci_a_command_exits_2_but_a_checkout_is_checked_first() {
-        let reason = "no CI configured: add ci = [..] to /x/zeughaus.toml";
-        let client = Client::new(Err(reason.to_owned()));
-        let (dir, _) = committed_checkout("cli-noci");
-        let in_dir = |path: &Path| CiCommand::Repo {
-            json: false,
-            path: Some(path.to_string_lossy().into_owned()),
-        };
+            let line = ci_answer(&client, command(true)).await.expect("the JSON");
+            assert_eq!(line.matches('\n').count(), 1, "one line: {line}");
+            assert!(line.ends_with('\n'), "{line}");
+            let json: Value = serde_json::from_str(&line).expect("JSON");
+            assert_eq!(json["text"], expected);
+            assert_eq!(json["repo"]["name"], "demo");
+            assert_eq!(json["repo"]["head"]["number"], 5);
+            assert_eq!(json["repo"]["jobs"][0]["name"], "build");
+            assert_eq!(json["repo"]["jobs"][0]["manual"], true);
+            client.shutdown().await;
+            let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        }
 
-        assert_eq!(
-            ci_answer(&client, in_dir(&dir)).await,
-            Err(Failure {
-                code: 2,
-                message: reason.to_owned()
-            })
-        );
-        let find = CiCommand::Find {
-            json: true,
-            repo: "demo".to_owned(),
-            sha: "deadbeef".to_owned(),
-        };
-        assert_eq!(
-            ci_answer(&client, find).await,
-            Err(Failure {
-                code: 2,
-                message: reason.to_owned()
-            })
-        );
-        let failure = ci_answer(&client, in_dir(&dir.join("missing")))
-            .await
-            .expect_err("no directory");
-        assert_eq!(failure.code, 1);
-        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
-    }
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn ci_repo_exits_3_for_an_origin_the_ci_lacks_and_1_for_what_is_no_checkout() {
+            let ci = fake_ci("cli-unknown", 0, None).await;
+            let (dir, _) = committed_checkout("cli-unknown");
+            fx(
+                &dir,
+                &[
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "git@example.invalid:o/other.git",
+                ],
+            );
+            let plain = dir.parent().unwrap().join("plain");
+            std::fs::create_dir_all(&plain).unwrap();
+            let client = ci_client(&ci);
+            let ask = |path: &Path| {
+                ci_answer(
+                    &client,
+                    CiCommand::Repo {
+                        json: true,
+                        path: Some(path.to_string_lossy().into_owned()),
+                    },
+                )
+            };
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ci_find_prints_the_newest_pipeline_of_a_commit_or_null_while_there_is_none() {
-        let ci = fake_ci("cli-find", 0, None).await;
-        let client = ci_client(&ci);
-        let find = |json: bool| {
-            ci_answer(
-                &client,
-                CiCommand::Find {
-                    json,
-                    repo: "demo".to_owned(),
-                    sha: "deadbeef".to_owned(),
-                },
-            )
-        };
+            assert_eq!(
+                ask(&dir).await,
+                Err(Failure {
+                    code: 3,
+                    message: "git@example.invalid:o/other.git is no repository of the CI's ci.toml"
+                        .to_owned()
+                })
+            );
+            let failure = ask(&plain).await.expect_err("no checkout");
+            assert_eq!(failure.code, 1);
+            assert!(
+                failure.message.contains("is not inside a git checkout"),
+                "{}",
+                failure.message
+            );
+            let failure = ask(&dir.join("missing")).await.expect_err("no directory");
+            assert_eq!(failure.code, 1);
+            // Only the first question reached the CI.
+            assert_eq!(ci.seen.asked.lock().unwrap().len(), 1);
+            client.shutdown().await;
+            let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        }
 
-        // The push of `dead..` reaches the fake CI after two questions.
-        assert_eq!(
-            find(false).await.expect("none"),
-            "no pipeline of deadbeef in demo\n"
-        );
-        assert_eq!(find(true).await.expect("none"), "null\n");
-        let line = find(true).await.expect("one");
-        assert_eq!(line.matches('\n').count(), 1, "one line: {line}");
-        let json: Value = serde_json::from_str(&line).expect("JSON");
-        assert_eq!(json["number"], 1);
-        assert_eq!(json["status"], "succeeded");
-        let text = find(false).await.expect("one");
-        assert!(
-            text.starts_with("demo/dev #1 succeeded manual main 0123456"),
-            "{text}"
-        );
-        assert!(text.ends_with("\n  build succeeded agent\n"), "{text}");
-        client.shutdown().await;
+        #[tokio::test]
+        async fn without_a_ci_a_command_exits_2_but_a_checkout_is_checked_first() {
+            let reason = "no CI configured: add ci = [..] to /x/zeughaus.toml";
+            let client = Client::new(Err(reason.to_owned()));
+            let (dir, _) = committed_checkout("cli-noci");
+            let in_dir = |path: &Path| CiCommand::Repo {
+                json: false,
+                path: Some(path.to_string_lossy().into_owned()),
+            };
+
+            assert_eq!(
+                ci_answer(&client, in_dir(&dir)).await,
+                Err(Failure {
+                    code: 2,
+                    message: reason.to_owned()
+                })
+            );
+            let find = CiCommand::Find {
+                json: true,
+                repo: "demo".to_owned(),
+                sha: "deadbeef".to_owned(),
+            };
+            assert_eq!(
+                ci_answer(&client, find).await,
+                Err(Failure {
+                    code: 2,
+                    message: reason.to_owned()
+                })
+            );
+            let failure = ci_answer(&client, in_dir(&dir.join("missing")))
+                .await
+                .expect_err("no directory");
+            assert_eq!(failure.code, 1);
+            let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn ci_find_prints_the_newest_pipeline_of_a_commit_or_null_while_there_is_none() {
+            let ci = fake_ci("cli-find", 0, None).await;
+            let client = ci_client(&ci);
+            let find = |json: bool| {
+                ci_answer(
+                    &client,
+                    CiCommand::Find {
+                        json,
+                        repo: "demo".to_owned(),
+                        sha: "deadbeef".to_owned(),
+                    },
+                )
+            };
+
+            // The push of `dead..` reaches the fake CI after two questions.
+            assert_eq!(
+                find(false).await.expect("none"),
+                "no pipeline of deadbeef in demo\n"
+            );
+            assert_eq!(find(true).await.expect("none"), "null\n");
+            let line = find(true).await.expect("one");
+            assert_eq!(line.matches('\n').count(), 1, "one line: {line}");
+            let json: Value = serde_json::from_str(&line).expect("JSON");
+            assert_eq!(json["number"], 1);
+            assert_eq!(json["status"], "succeeded");
+            let text = find(false).await.expect("one");
+            assert!(
+                text.starts_with("demo/dev #1 succeeded manual main 0123456"),
+                "{text}"
+            );
+            assert!(text.ends_with("\n  build succeeded agent\n"), "{text}");
+            client.shutdown().await;
+        }
     }
 }

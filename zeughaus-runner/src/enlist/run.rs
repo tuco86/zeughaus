@@ -978,76 +978,6 @@ mod tests {
 
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zci-run-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[test]
-    fn the_exit_record_is_read_back() {
-        let dir = scratch("exit");
-        assert_eq!(read_exit_record(&dir), None);
-        std::fs::write(dir.join("exit"), "code=3\nkilled=false\nstarted=1\n").unwrap();
-        assert_eq!(
-            read_exit_record(&dir),
-            Some(RunExit {
-                code: Some(3),
-                killed: false
-            })
-        );
-        std::fs::write(dir.join("exit"), "code=none\nkilled=true\n").unwrap();
-        assert_eq!(
-            read_exit_record(&dir),
-            Some(RunExit {
-                code: None,
-                killed: true
-            })
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The log goes out from the offset it is asked to start at, in pieces
-    /// that join back to the file, and a second pass sends only what grew.
-    #[test]
-    fn the_log_is_sent_from_an_offset_and_only_what_grew() {
-        let dir = scratch("pump");
-        let wal = dir.join("wal");
-        std::fs::write(&wal, b"hello world").unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let mut sent = 6;
-        assert_eq!(pump(&wal, "r", &tx, &mut sent).ok(), Some(5));
-        assert_eq!(pump(&wal, "r", &tx, &mut sent).ok(), Some(0));
-        {
-            use std::io::Write as _;
-            std::fs::OpenOptions::new()
-                .append(true)
-                .open(&wal)
-                .unwrap()
-                .write_all(b"!!")
-                .unwrap();
-        }
-        assert_eq!(pump(&wal, "r", &tx, &mut sent).ok(), Some(2));
-        let mut got = Vec::new();
-        while let Ok(FromRunner::Output { offset, bytes, .. }) = rx.try_recv() {
-            assert_eq!(offset, 6 + got.len() as u64);
-            got.extend(bytes);
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(got, b"world!!");
-    }
-
-    #[test]
-    fn a_log_that_does_not_exist_yet_has_nothing_to_send() {
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let mut sent = 0;
-        assert_eq!(
-            pump(Path::new("/nonexistent/wal"), "r", &tx, &mut sent).ok(),
-            Some(0)
-        );
-    }
-
     /// A job as the CI gives it to a runner of this host's kind: a Windows
     /// runner runs `.ps1` jobs only.
     fn assignment() -> Assignment {
@@ -1195,5 +1125,81 @@ mod tests {
             siblings_var(&container("trixie"), &workspace),
             "/work/.zci-siblings"
         );
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        fn scratch(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("zci-run-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[test]
+        fn the_exit_record_is_read_back() {
+            let dir = scratch("exit");
+            assert_eq!(read_exit_record(&dir), None);
+            std::fs::write(dir.join("exit"), "code=3\nkilled=false\nstarted=1\n").unwrap();
+            assert_eq!(
+                read_exit_record(&dir),
+                Some(RunExit {
+                    code: Some(3),
+                    killed: false
+                })
+            );
+            std::fs::write(dir.join("exit"), "code=none\nkilled=true\n").unwrap();
+            assert_eq!(
+                read_exit_record(&dir),
+                Some(RunExit {
+                    code: None,
+                    killed: true
+                })
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The log goes out from the offset it is asked to start at, in pieces
+        /// that join back to the file, and a second pass sends only what grew.
+        #[test]
+        fn the_log_is_sent_from_an_offset_and_only_what_grew() {
+            let dir = scratch("pump");
+            let wal = dir.join("wal");
+            std::fs::write(&wal, b"hello world").unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let mut sent = 6;
+            assert_eq!(pump(&wal, "r", &tx, &mut sent).ok(), Some(5));
+            assert_eq!(pump(&wal, "r", &tx, &mut sent).ok(), Some(0));
+            {
+                use std::io::Write as _;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&wal)
+                    .unwrap()
+                    .write_all(b"!!")
+                    .unwrap();
+            }
+            assert_eq!(pump(&wal, "r", &tx, &mut sent).ok(), Some(2));
+            let mut got = Vec::new();
+            while let Ok(FromRunner::Output { offset, bytes, .. }) = rx.try_recv() {
+                assert_eq!(offset, 6 + got.len() as u64);
+                got.extend(bytes);
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(got, b"world!!");
+        }
+
+        #[test]
+        fn a_log_that_does_not_exist_yet_has_nothing_to_send() {
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            let mut sent = 0;
+            assert_eq!(
+                pump(Path::new("/nonexistent/wal"), "r", &tx, &mut sent).ok(),
+                Some(0)
+            );
+        }
     }
 }

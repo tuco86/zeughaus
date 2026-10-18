@@ -361,25 +361,6 @@ mod tests {
         parse(&manifest.to_json()).expect_err("the manifest must be refused")
     }
 
-    /// A directory that removes itself.
-    struct Scratch(std::path::PathBuf);
-
-    impl Scratch {
-        fn new(tag: &str) -> Scratch {
-            let path = std::env::temp_dir()
-                .join(format!("zeughaus-manifest-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).expect("scratch directory");
-            Scratch(path)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     #[test]
     fn a_signed_manifest_verifies_against_its_key() {
         let json = sample().to_json();
@@ -620,29 +601,54 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_artifact_checks_the_file_it_describes() {
-        let scratch = Scratch::new("artifact");
-        let path = scratch.0.join("zeughaus-0.1.0-linux-amd64.tar.gz");
-        std::fs::write(&path, b"abc").unwrap();
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        let artifact = Artifact::of_file("linux-amd64", &path).unwrap();
-        assert_eq!(artifact.platform, "linux-amd64");
-        assert_eq!(artifact.file, "zeughaus-0.1.0-linux-amd64.tar.gz");
-        assert_eq!(artifact.size, 3);
-        // FIPS 180-2's SHA-256 of "abc".
-        assert_eq!(
-            artifact.sha256,
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        assert_eq!(artifact.check(&path), Ok(()));
+        /// A directory that removes itself.
+        struct Scratch(std::path::PathBuf);
 
-        std::fs::write(&path, b"abd").unwrap();
-        let err = artifact.check(&path).unwrap_err();
-        assert!(err.contains("sha256"), "{err}");
-        std::fs::write(&path, b"ab").unwrap();
-        let err = artifact.check(&path).unwrap_err();
-        assert!(err.contains("2 bytes"), "{err}");
-        assert!(artifact.check(&scratch.0.join("missing")).is_err());
+        impl Scratch {
+            fn new(tag: &str) -> Scratch {
+                let path = std::env::temp_dir()
+                    .join(format!("zeughaus-manifest-{tag}-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&path);
+                std::fs::create_dir_all(&path).expect("scratch directory");
+                Scratch(path)
+            }
+        }
+
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        #[test]
+        fn an_artifact_checks_the_file_it_describes() {
+            let scratch = Scratch::new("artifact");
+            let path = scratch.0.join("zeughaus-0.1.0-linux-amd64.tar.gz");
+            std::fs::write(&path, b"abc").unwrap();
+
+            let artifact = Artifact::of_file("linux-amd64", &path).unwrap();
+            assert_eq!(artifact.platform, "linux-amd64");
+            assert_eq!(artifact.file, "zeughaus-0.1.0-linux-amd64.tar.gz");
+            assert_eq!(artifact.size, 3);
+            // FIPS 180-2's SHA-256 of "abc".
+            assert_eq!(
+                artifact.sha256,
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            );
+            assert_eq!(artifact.check(&path), Ok(()));
+
+            std::fs::write(&path, b"abd").unwrap();
+            let err = artifact.check(&path).unwrap_err();
+            assert!(err.contains("sha256"), "{err}");
+            std::fs::write(&path, b"ab").unwrap();
+            let err = artifact.check(&path).unwrap_err();
+            assert!(err.contains("2 bytes"), "{err}");
+            assert!(artifact.check(&scratch.0.join("missing")).is_err());
+        }
     }
 }

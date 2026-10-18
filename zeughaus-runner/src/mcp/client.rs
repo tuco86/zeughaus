@@ -331,87 +331,6 @@ mod tests {
 
     const CI: &str = "weida://sha256:0000000000000000000000000000000000000000000000000000000000000001@10.8.0.1:7444/";
 
-    fn state(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("zeughaus-mcp-client-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("state directory");
-        dir
-    }
-
-    #[test]
-    fn no_ci_is_named_with_the_file_to_add_it_to() {
-        let dir = state("none");
-        let err = Link::resolve(None, &dir).err().expect("no CI");
-        assert_eq!(
-            err,
-            format!(
-                "no CI configured: add ci = [..] to {}",
-                dir.join("zeughaus.toml").display()
-            )
-        );
-        // An empty list is the same as no file.
-        std::fs::write(dir.join("zeughaus.toml"), "remotes = []\nci = []\n").unwrap();
-        assert!(
-            Link::resolve(None, &dir)
-                .err()
-                .expect("empty")
-                .starts_with("no CI configured")
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_missing_client_key_is_named_with_its_path() {
-        let dir = state("nokey");
-        let err = Link::resolve(Some(CI.to_owned()), &dir)
-            .err()
-            .expect("no identity");
-        assert_eq!(
-            err,
-            format!("no client identity in {}", dir.join("client.pem").display())
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn the_first_ci_of_the_editors_file_is_dialled_unless_one_is_given() {
-        let dir = state("first");
-        credentials::client_identity(&dir).expect("client key");
-        std::fs::write(
-            dir.join("zeughaus.toml"),
-            format!("remotes = [\"weida://elsewhere/\"]\ntheme = \"x\"\nci = [\"{CI}\", \"weida://other/\"]\n"),
-        )
-        .unwrap();
-        assert_eq!(Link::resolve(None, &dir).expect("from file").url(), CI);
-        let other = CI.replace("10.8.0.1", "10.8.0.2");
-        assert_eq!(
-            Link::resolve(Some(other.clone()), &dir)
-                .expect("flag")
-                .url(),
-            other
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_ci_that_is_not_pinned_or_not_a_url_is_refused() {
-        let dir = state("pin");
-        credentials::client_identity(&dir).expect("client key");
-        let err = Link::resolve(Some("weida://10.8.0.1:7444/".to_owned()), &dir)
-            .err()
-            .expect("unpinned");
-        assert!(err.contains("names no fingerprint"), "{err}");
-        let err = Link::resolve(Some("not a url".to_owned()), &dir)
-            .err()
-            .expect("garbage");
-        assert!(err.contains("is not valid"), "{err}");
-        std::fs::write(dir.join("zeughaus.toml"), "ci = 3\n").unwrap();
-        let err = Link::resolve(None, &dir).err().expect("bad toml");
-        assert!(err.contains("zeughaus.toml"), "{err}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[tokio::test]
     async fn an_unconfigured_client_says_why_on_every_call() {
         let client = Client::new(Err("no CI configured: add ci = [..] to x".to_owned()));
@@ -428,5 +347,92 @@ mod tests {
         let sent = client.manual_upload(&upload, &[]).await.expect_err("no CI");
         assert!(sent.starts_with("no CI configured"), "{sent}");
         client.shutdown().await;
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        fn state(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir()
+                .join(format!("zeughaus-mcp-client-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("state directory");
+            dir
+        }
+
+        #[test]
+        fn no_ci_is_named_with_the_file_to_add_it_to() {
+            let dir = state("none");
+            let err = Link::resolve(None, &dir).err().expect("no CI");
+            assert_eq!(
+                err,
+                format!(
+                    "no CI configured: add ci = [..] to {}",
+                    dir.join("zeughaus.toml").display()
+                )
+            );
+            // An empty list is the same as no file.
+            std::fs::write(dir.join("zeughaus.toml"), "remotes = []\nci = []\n").unwrap();
+            assert!(
+                Link::resolve(None, &dir)
+                    .err()
+                    .expect("empty")
+                    .starts_with("no CI configured")
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_missing_client_key_is_named_with_its_path() {
+            let dir = state("nokey");
+            let err = Link::resolve(Some(CI.to_owned()), &dir)
+                .err()
+                .expect("no identity");
+            assert_eq!(
+                err,
+                format!("no client identity in {}", dir.join("client.pem").display())
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn the_first_ci_of_the_editors_file_is_dialled_unless_one_is_given() {
+            let dir = state("first");
+            credentials::client_identity(&dir).expect("client key");
+            std::fs::write(
+            dir.join("zeughaus.toml"),
+            format!("remotes = [\"weida://elsewhere/\"]\ntheme = \"x\"\nci = [\"{CI}\", \"weida://other/\"]\n"),
+        )
+        .unwrap();
+            assert_eq!(Link::resolve(None, &dir).expect("from file").url(), CI);
+            let other = CI.replace("10.8.0.1", "10.8.0.2");
+            assert_eq!(
+                Link::resolve(Some(other.clone()), &dir)
+                    .expect("flag")
+                    .url(),
+                other
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_ci_that_is_not_pinned_or_not_a_url_is_refused() {
+            let dir = state("pin");
+            credentials::client_identity(&dir).expect("client key");
+            let err = Link::resolve(Some("weida://10.8.0.1:7444/".to_owned()), &dir)
+                .err()
+                .expect("unpinned");
+            assert!(err.contains("names no fingerprint"), "{err}");
+            let err = Link::resolve(Some("not a url".to_owned()), &dir)
+                .err()
+                .expect("garbage");
+            assert!(err.contains("is not valid"), "{err}");
+            std::fs::write(dir.join("zeughaus.toml"), "ci = 3\n").unwrap();
+            let err = Link::resolve(None, &dir).err().expect("bad toml");
+            assert!(err.contains("zeughaus.toml"), "{err}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

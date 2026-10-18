@@ -315,38 +315,6 @@ pub fn append_output(path: &Path, offset: u64, bytes: &[u8]) -> Result<u64, Stri
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("zeughaus-enlist-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    }
-
-    #[test]
-    fn overlapping_output_appends_only_what_is_new() {
-        let dir = scratch("append");
-        let wal = dir.join("1.runs/job/wal");
-        assert_eq!(append_output(&wal, 0, b"abcdefgh"), Ok(8));
-        // Resent from byte 5: "fgh" is held, "ij" is new.
-        assert_eq!(append_output(&wal, 5, b"fghij"), Ok(10));
-        assert_eq!(append_output(&wal, 10, b"klm"), Ok(13));
-        // A chunk wholly behind the end changes nothing.
-        assert_eq!(append_output(&wal, 2, b"cde"), Ok(13));
-        assert_eq!(std::fs::read(&wal).expect("read"), b"abcdefghijklm");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn output_past_the_end_is_an_error_and_writes_nothing() {
-        let dir = scratch("gap");
-        let wal = dir.join("wal");
-        assert_eq!(append_output(&wal, 0, b"abc"), Ok(3));
-        assert!(append_output(&wal, 4, b"x").is_err());
-        assert!(append_output(&dir.join("other"), 1, b"x").is_err());
-        assert_eq!(std::fs::read(&wal).expect("read"), b"abc");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[test]
     fn a_run_id_is_checked_before_it_is_a_path() {
         let state = Path::new("/state");
@@ -354,5 +322,43 @@ mod tests {
         assert!(wal_path(state, "../x.3.job").is_none());
         assert!(wal_path(state, "repo.3.Job/..").is_none());
         assert!(wal_path(state, "repo.x.job").is_none());
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        fn scratch(name: &str) -> std::path::PathBuf {
+            let dir =
+                std::env::temp_dir().join(format!("zeughaus-enlist-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            dir
+        }
+
+        #[test]
+        fn overlapping_output_appends_only_what_is_new() {
+            let dir = scratch("append");
+            let wal = dir.join("1.runs/job/wal");
+            assert_eq!(append_output(&wal, 0, b"abcdefgh"), Ok(8));
+            // Resent from byte 5: "fgh" is held, "ij" is new.
+            assert_eq!(append_output(&wal, 5, b"fghij"), Ok(10));
+            assert_eq!(append_output(&wal, 10, b"klm"), Ok(13));
+            // A chunk wholly behind the end changes nothing.
+            assert_eq!(append_output(&wal, 2, b"cde"), Ok(13));
+            assert_eq!(std::fs::read(&wal).expect("read"), b"abcdefghijklm");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn output_past_the_end_is_an_error_and_writes_nothing() {
+            let dir = scratch("gap");
+            let wal = dir.join("wal");
+            assert_eq!(append_output(&wal, 0, b"abc"), Ok(3));
+            assert!(append_output(&wal, 4, b"x").is_err());
+            assert!(append_output(&dir.join("other"), 1, b"x").is_err());
+            assert_eq!(std::fs::read(&wal).expect("read"), b"abc");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

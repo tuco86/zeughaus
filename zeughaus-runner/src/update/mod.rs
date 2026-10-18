@@ -600,288 +600,7 @@ mod unix {
 
     #[cfg(test)]
     mod tests {
-        use super::manifest::{Artifact, Manifest};
         use super::*;
-
-        const SEED: [u8; 32] = [7; 32];
-        const OTHER: [u8; 32] = [9; 32];
-        const CHANNEL: &str = "dev";
-        const PLATFORM: &str = "linux-amd64";
-        const VERSION: &str = "1.2.3";
-
-        /// A site, a runner, an editor and a state directory in one temporary
-        /// directory that removes itself.
-        struct Fixture {
-            root: PathBuf,
-        }
-
-        impl Fixture {
-            fn new(tag: &str) -> Fixture {
-                let root = std::env::temp_dir()
-                    .join(format!("zeughaus-update-{tag}-{}", std::process::id()));
-                let _ = std::fs::remove_dir_all(&root);
-                std::fs::create_dir_all(root.join("bin")).unwrap();
-                std::fs::write(root.join("bin/zeughaus-runner"), "old runner").unwrap();
-                std::fs::write(root.join("bin/zeughaus"), "old editor").unwrap();
-                // `/proc/<pid>/exe` names the resolved path.
-                let root = std::fs::canonicalize(&root).unwrap();
-                Fixture { root }
-            }
-
-            fn path(&self, relative: &str) -> PathBuf {
-                self.root.join(relative)
-            }
-
-            fn text(&self, relative: &str) -> String {
-                std::fs::read_to_string(self.path(relative)).unwrap()
-            }
-
-            /// What a platform job outputs: `zeughaus-<v>-<platform>/` with a
-            /// runner, an editor and a licence, packed.
-            fn archive(&self) -> PathBuf {
-                let stem = manifest::stem(VERSION, PLATFORM);
-                let pack = self.path("pack");
-                let top = pack.join(&stem);
-                std::fs::create_dir_all(&top).unwrap();
-                std::fs::write(top.join("zeughaus-runner"), "new runner").unwrap();
-                std::fs::write(top.join("zeughaus"), "new editor").unwrap();
-                std::fs::write(top.join("LICENSE-MIT"), "licence").unwrap();
-                let archive = self.path(&manifest::archive_name(VERSION, PLATFORM));
-                let packed = Command::new("tar")
-                    .arg("-czf")
-                    .arg(&archive)
-                    .arg("-C")
-                    .arg(&pack)
-                    .arg(&stem)
-                    .status()
-                    .unwrap();
-                assert!(packed.success());
-                archive
-            }
-
-            /// The manifest of `archive` as build `build` of the channel.
-            fn manifest(&self, build: u64, archive: &Path) -> Manifest {
-                Manifest {
-                    format: manifest::FORMAT,
-                    channel: CHANNEL.into(),
-                    build,
-                    version: VERSION.into(),
-                    sha: "0123456789abcdef0123456789abcdef01234567".into(),
-                    artifacts: vec![Artifact::of_file(PLATFORM, archive).unwrap()],
-                }
-            }
-
-            /// Lays `manifest`, signed by `signer`, and `archive` out under
-            /// the channel the way the publish job does: `<channel>/<build>/`
-            /// and the `latest` file.
-            fn publish(&self, build: u64, manifest: &Manifest, signer: &[u8; 32], archive: &Path) {
-                let channel = self.path("site").join(CHANNEL);
-                let dir = channel.join(build.to_string());
-                std::fs::create_dir_all(&dir).unwrap();
-                let json = manifest.to_json();
-                std::fs::write(dir.join("manifest.json"), &json).unwrap();
-                std::fs::write(dir.join("manifest.sig"), manifest::sign(signer, &json)).unwrap();
-                std::fs::copy(archive, dir.join(archive.file_name().unwrap())).unwrap();
-                std::fs::write(channel.join("latest"), format!("{build}\n")).unwrap();
-            }
-
-            /// Build 7 of the channel, correct and signed by the trusted key.
-            fn publish_seven(&self) -> PathBuf {
-                let archive = self.archive();
-                self.publish(7, &self.manifest(7, &archive), &SEED, &archive);
-                archive
-            }
-
-            fn updater(&self) -> Updater {
-                Updater {
-                    config: UpdateConfig {
-                        channel: CHANNEL.into(),
-                        url: format!("file://{}", self.path("site").display()),
-                    },
-                    platform: PLATFORM,
-                    work: self.path("state/updates"),
-                    exe: self.path("bin/zeughaus-runner"),
-                    home: None,
-                    keys: vec![manifest::public_key(&SEED)],
-                    own: 3,
-                }
-            }
-
-            /// Nothing the update was to replace has changed.
-            fn assert_untouched(&self) {
-                assert_eq!(self.text("bin/zeughaus-runner"), "old runner");
-                assert_eq!(self.text("bin/zeughaus"), "old editor");
-                assert!(!self.path("bin/zeughaus-runner.new").exists());
-                assert!(!self.path("bin/zeughaus.new").exists());
-            }
-        }
-
-        impl Drop for Fixture {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.root);
-            }
-        }
-
-        #[test]
-        fn a_published_build_replaces_the_runner() {
-            let fx = Fixture::new("runner");
-            fx.publish_seven();
-            let updater = fx.updater();
-            assert_eq!(updater.latest(), Ok(7));
-
-            let installed = updater.install(7).unwrap();
-            assert_eq!(installed.version, VERSION);
-            assert_eq!(fx.text("bin/zeughaus-runner"), "new runner");
-            let mode = std::fs::metadata(fx.path("bin/zeughaus-runner"))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o755);
-            assert!(!fx.path("bin/zeughaus-runner.new").exists());
-            // What was downloaded stays until the next update prunes it.
-            assert!(fx.path("state/updates/7/manifest.json").is_file());
-            assert!(
-                fx.path("state/updates/7/staging")
-                    .join(manifest::stem(VERSION, PLATFORM))
-                    .is_dir()
-            );
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        #[test]
-        fn the_editor_beside_the_runner_is_replaced_with_it() {
-            let fx = Fixture::new("editor");
-            fx.publish_seven();
-            let installed = fx.updater().install(7).unwrap();
-            assert_eq!(fx.text("bin/zeughaus"), "new editor");
-            assert_eq!(fx.text("bin/zeughaus-runner"), "new runner");
-            assert_eq!(
-                installed.editor,
-                Some(Editor::Binary(fx.path("bin/zeughaus")))
-            );
-            assert!(!fx.path("bin/zeughaus.new").exists());
-
-            // Without an editor beside it only the runner is installed.
-            let fx = Fixture::new("no-editor");
-            std::fs::remove_file(fx.path("bin/zeughaus")).unwrap();
-            fx.publish_seven();
-            let installed = fx.updater().install(7).unwrap();
-            assert_eq!(installed.editor, None);
-            assert_eq!(fx.text("bin/zeughaus-runner"), "new runner");
-            assert!(!fx.path("bin/zeughaus").exists());
-        }
-
-        #[test]
-        fn a_release_signed_by_another_key_installs_nothing() {
-            let fx = Fixture::new("foreign");
-            let archive = fx.archive();
-            fx.publish(7, &fx.manifest(7, &archive), &OTHER, &archive);
-            let err = fx.updater().install(7).err().unwrap();
-            assert!(err.contains("no trusted key"), "{err}");
-            fx.assert_untouched();
-        }
-
-        #[test]
-        fn a_tampered_archive_installs_nothing() {
-            let fx = Fixture::new("tampered");
-            let archive = fx.publish_seven();
-            let name = archive.file_name().unwrap();
-            let published = fx.path("site/dev/7").join(name);
-
-            // Same size, other bytes.
-            let mut bytes = std::fs::read(&published).unwrap();
-            let last = bytes.len() - 1;
-            bytes[last] ^= 1;
-            std::fs::write(&published, &bytes).unwrap();
-            let err = fx.updater().install(7).err().unwrap();
-            assert!(err.contains("sha256"), "{err}");
-            fx.assert_untouched();
-
-            // Another size.
-            bytes.push(0);
-            std::fs::write(&published, &bytes).unwrap();
-            let err = fx.updater().install(7).err().unwrap();
-            assert!(err.contains("bytes"), "{err}");
-            fx.assert_untouched();
-        }
-
-        #[test]
-        fn a_manifest_that_is_not_for_this_build_and_channel_installs_nothing() {
-            let fx = Fixture::new("mismatch");
-            let archive = fx.archive();
-            // An old release served as a new one.
-            fx.publish(7, &fx.manifest(5, &archive), &SEED, &archive);
-            let err = fx.updater().install(7).err().unwrap();
-            assert!(err.contains("build 5"), "{err}");
-            fx.assert_untouched();
-
-            let mut other = fx.manifest(7, &archive);
-            other.channel = "nightly".into();
-            fx.publish(7, &other, &SEED, &archive);
-            let err = fx.updater().install(7).err().unwrap();
-            assert!(err.contains("channel nightly"), "{err}");
-            fx.assert_untouched();
-        }
-
-        #[test]
-        fn a_release_without_this_platform_installs_nothing() {
-            let fx = Fixture::new("platform");
-            fx.publish_seven();
-            let mut updater = fx.updater();
-            updater.platform = "darwin-arm64";
-            let err = updater.install(7).err().unwrap();
-            assert!(err.contains("no archive for darwin-arm64"), "{err}");
-            fx.assert_untouched();
-        }
-
-        #[test]
-        fn a_release_that_is_not_there_installs_nothing() {
-            let fx = Fixture::new("missing");
-            let updater = fx.updater();
-            assert!(updater.latest().is_err());
-            assert!(updater.install(7).is_err());
-            fx.assert_untouched();
-        }
-
-        #[test]
-        fn a_failed_attempt_leaves_nothing_under_updates() {
-            let fx = Fixture::new("failed");
-            let archive = fx.archive();
-            fx.publish(7, &fx.manifest(7, &archive), &OTHER, &archive);
-            fx.updater().update(7);
-            assert!(!fx.path("state/updates/7").exists());
-            fx.assert_untouched();
-        }
-
-        #[test]
-        fn only_the_installed_build_stays_under_updates() {
-            let fx = Fixture::new("prune");
-            let updates = fx.path("state/updates");
-            for build in ["5", "6", "7"] {
-                std::fs::create_dir_all(updates.join(build).join("staging")).unwrap();
-            }
-            std::fs::write(updates.join("stray"), "not a directory").unwrap();
-
-            fx.updater().prune(7);
-            assert!(updates.join("7/staging").is_dir());
-            assert!(!updates.join("5").exists());
-            assert!(!updates.join("6").exists());
-            assert!(updates.join("stray").is_file());
-        }
-
-        #[test]
-        fn a_replacement_is_all_or_nothing() {
-            let fx = Fixture::new("all-or-nothing");
-            std::fs::write(fx.path("first-new"), "first").unwrap();
-            let replacements = [
-                Replacement::new(fx.path("first-new"), fx.path("bin/zeughaus-runner"), false),
-                // Nothing to write the second one from.
-                Replacement::new(fx.path("no-such-file"), fx.path("bin/zeughaus"), false),
-            ];
-            let err = replace_all(&replacements).unwrap_err();
-            assert!(err.contains("no-such-file"), "{err}");
-            fx.assert_untouched();
-        }
 
         #[test]
         fn the_channel_file_holds_a_build_number() {
@@ -922,20 +641,6 @@ mod unix {
         }
 
         #[test]
-        fn a_missing_config_means_no_updater_and_a_bad_one_names_its_file() {
-            let fx = Fixture::new("config");
-            assert!(load(&fx.root).unwrap().is_none());
-            std::fs::write(fx.path(CONFIG_FILE), "channel = [").unwrap();
-            let err = load(&fx.root).unwrap_err();
-            assert!(
-                err.starts_with(&fx.path(CONFIG_FILE).display().to_string()),
-                "{err}"
-            );
-            std::fs::write(fx.path(CONFIG_FILE), "channel = \"dev\"\n").unwrap();
-            assert_eq!(load(&fx.root).unwrap().unwrap().channel, "dev");
-        }
-
-        #[test]
         fn a_replaced_editor_is_still_found() {
             let editor = Path::new("/home/u/.cargo/bin/zeughaus");
             assert!(runs_file(editor, editor));
@@ -971,81 +676,394 @@ mod unix {
             assert!(!catches_usr1("SigCgt:\tnot hex\n"));
         }
 
-        /// A copy of the shell at `<root>/editor/zeughaus` running `script`,
-        /// then replaced on disk, the way an update replaces an editor: a
-        /// process whose executable is a file that is gone. `script` is given
-        /// the path of a file to create once it has set itself up.
-        #[cfg(target_os = "linux")]
-        fn running_editor(fx: &Fixture, script: &str) -> (PathBuf, std::process::Child) {
-            let editor = fx.path("editor/zeughaus");
-            std::fs::create_dir_all(editor.parent().unwrap()).unwrap();
-            std::fs::copy("/bin/sh", &editor).unwrap();
-            let ready = fx.path("ready");
-            let mut attempts = 0;
-            let child = loop {
-                match Command::new(&editor)
-                    .args(["-c", script, "sh"])
-                    .arg(&ready)
-                    .spawn()
-                {
-                    // The copy is still open for writing in another test's fork.
-                    Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempts < 100 => {
-                        attempts += 1;
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                    spawned => break spawned.unwrap(),
-                }
-            };
-            for _ in 0..500 {
-                if ready.exists() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
+        /// Tests that touch the filesystem, network, processes or real time: the
+        /// integration tier (`.config/nextest.toml`).
+        mod io {
+            use super::*;
+
+            use super::manifest::{Artifact, Manifest};
+
+            const SEED: [u8; 32] = [7; 32];
+
+            const OTHER: [u8; 32] = [9; 32];
+
+            const CHANNEL: &str = "dev";
+
+            const PLATFORM: &str = "linux-amd64";
+
+            const VERSION: &str = "1.2.3";
+
+            /// A site, a runner, an editor and a state directory in one temporary
+            /// directory that removes itself.
+            struct Fixture {
+                root: PathBuf,
             }
-            assert!(ready.exists(), "the script did not start");
-            std::fs::write(fx.path("editor/zeughaus.new"), "new").unwrap();
-            std::fs::rename(fx.path("editor/zeughaus.new"), &editor).unwrap();
-            (editor, child)
-        }
 
-        #[cfg(target_os = "linux")]
-        #[test]
-        fn a_running_editor_that_catches_usr1_is_restarted() {
-            let fx = Fixture::new("usr1");
-            let (editor, mut child) = running_editor(
-                &fx,
-                "trap 'exit 0' USR1; touch \"$1\"; while :; do sleep 0.05; done",
-            );
-            restart_binary_editors(&editor);
-            let ended = (0..500).find_map(|_| {
-                std::thread::sleep(Duration::from_millis(10));
-                child.try_wait().unwrap()
-            });
-            let _ = child.kill();
-            let _ = child.wait();
-            assert_eq!(
-                ended.and_then(|status| status.code()),
-                Some(0),
-                "the editor was not signalled"
-            );
-        }
+            impl Fixture {
+                fn new(tag: &str) -> Fixture {
+                    let root = std::env::temp_dir()
+                        .join(format!("zeughaus-update-{tag}-{}", std::process::id()));
+                    let _ = std::fs::remove_dir_all(&root);
+                    std::fs::create_dir_all(root.join("bin")).unwrap();
+                    std::fs::write(root.join("bin/zeughaus-runner"), "old runner").unwrap();
+                    std::fs::write(root.join("bin/zeughaus"), "old editor").unwrap();
+                    // `/proc/<pid>/exe` names the resolved path.
+                    let root = std::fs::canonicalize(&root).unwrap();
+                    Fixture { root }
+                }
 
-        #[cfg(target_os = "linux")]
-        #[test]
-        fn a_running_editor_that_does_not_catch_usr1_is_left_alone() {
-            let fx = Fixture::new("no-usr1");
-            let (editor, mut child) =
-                running_editor(&fx, "touch \"$1\"; while :; do sleep 0.05; done");
-            restart_binary_editors(&editor);
-            // The signal's default action would end the shell within moments.
-            std::thread::sleep(Duration::from_millis(300));
-            let alive = child.try_wait().unwrap().is_none();
-            let _ = child.kill();
-            let _ = child.wait();
-            assert!(
-                alive,
-                "a process that cannot restart itself must not be signalled"
-            );
+                fn path(&self, relative: &str) -> PathBuf {
+                    self.root.join(relative)
+                }
+
+                fn text(&self, relative: &str) -> String {
+                    std::fs::read_to_string(self.path(relative)).unwrap()
+                }
+
+                /// What a platform job outputs: `zeughaus-<v>-<platform>/` with a
+                /// runner, an editor and a licence, packed.
+                fn archive(&self) -> PathBuf {
+                    let stem = manifest::stem(VERSION, PLATFORM);
+                    let pack = self.path("pack");
+                    let top = pack.join(&stem);
+                    std::fs::create_dir_all(&top).unwrap();
+                    std::fs::write(top.join("zeughaus-runner"), "new runner").unwrap();
+                    std::fs::write(top.join("zeughaus"), "new editor").unwrap();
+                    std::fs::write(top.join("LICENSE-MIT"), "licence").unwrap();
+                    let archive = self.path(&manifest::archive_name(VERSION, PLATFORM));
+                    let packed = Command::new("tar")
+                        .arg("-czf")
+                        .arg(&archive)
+                        .arg("-C")
+                        .arg(&pack)
+                        .arg(&stem)
+                        .status()
+                        .unwrap();
+                    assert!(packed.success());
+                    archive
+                }
+
+                /// The manifest of `archive` as build `build` of the channel.
+                fn manifest(&self, build: u64, archive: &Path) -> Manifest {
+                    Manifest {
+                        format: manifest::FORMAT,
+                        channel: CHANNEL.into(),
+                        build,
+                        version: VERSION.into(),
+                        sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                        artifacts: vec![Artifact::of_file(PLATFORM, archive).unwrap()],
+                    }
+                }
+
+                /// Lays `manifest`, signed by `signer`, and `archive` out under
+                /// the channel the way the publish job does: `<channel>/<build>/`
+                /// and the `latest` file.
+                fn publish(
+                    &self,
+                    build: u64,
+                    manifest: &Manifest,
+                    signer: &[u8; 32],
+                    archive: &Path,
+                ) {
+                    let channel = self.path("site").join(CHANNEL);
+                    let dir = channel.join(build.to_string());
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let json = manifest.to_json();
+                    std::fs::write(dir.join("manifest.json"), &json).unwrap();
+                    std::fs::write(dir.join("manifest.sig"), manifest::sign(signer, &json))
+                        .unwrap();
+                    std::fs::copy(archive, dir.join(archive.file_name().unwrap())).unwrap();
+                    std::fs::write(channel.join("latest"), format!("{build}\n")).unwrap();
+                }
+
+                /// Build 7 of the channel, correct and signed by the trusted key.
+                fn publish_seven(&self) -> PathBuf {
+                    let archive = self.archive();
+                    self.publish(7, &self.manifest(7, &archive), &SEED, &archive);
+                    archive
+                }
+
+                fn updater(&self) -> Updater {
+                    Updater {
+                        config: UpdateConfig {
+                            channel: CHANNEL.into(),
+                            url: format!("file://{}", self.path("site").display()),
+                        },
+                        platform: PLATFORM,
+                        work: self.path("state/updates"),
+                        exe: self.path("bin/zeughaus-runner"),
+                        home: None,
+                        keys: vec![manifest::public_key(&SEED)],
+                        own: 3,
+                    }
+                }
+
+                /// Nothing the update was to replace has changed.
+                fn assert_untouched(&self) {
+                    assert_eq!(self.text("bin/zeughaus-runner"), "old runner");
+                    assert_eq!(self.text("bin/zeughaus"), "old editor");
+                    assert!(!self.path("bin/zeughaus-runner.new").exists());
+                    assert!(!self.path("bin/zeughaus.new").exists());
+                }
+            }
+
+            impl Drop for Fixture {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.root);
+                }
+            }
+
+            #[test]
+            fn a_published_build_replaces_the_runner() {
+                let fx = Fixture::new("runner");
+                fx.publish_seven();
+                let updater = fx.updater();
+                assert_eq!(updater.latest(), Ok(7));
+
+                let installed = updater.install(7).unwrap();
+                assert_eq!(installed.version, VERSION);
+                assert_eq!(fx.text("bin/zeughaus-runner"), "new runner");
+                let mode = std::fs::metadata(fx.path("bin/zeughaus-runner"))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o755);
+                assert!(!fx.path("bin/zeughaus-runner.new").exists());
+                // What was downloaded stays until the next update prunes it.
+                assert!(fx.path("state/updates/7/manifest.json").is_file());
+                assert!(
+                    fx.path("state/updates/7/staging")
+                        .join(manifest::stem(VERSION, PLATFORM))
+                        .is_dir()
+                );
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            #[test]
+            fn the_editor_beside_the_runner_is_replaced_with_it() {
+                let fx = Fixture::new("editor");
+                fx.publish_seven();
+                let installed = fx.updater().install(7).unwrap();
+                assert_eq!(fx.text("bin/zeughaus"), "new editor");
+                assert_eq!(fx.text("bin/zeughaus-runner"), "new runner");
+                assert_eq!(
+                    installed.editor,
+                    Some(Editor::Binary(fx.path("bin/zeughaus")))
+                );
+                assert!(!fx.path("bin/zeughaus.new").exists());
+
+                // Without an editor beside it only the runner is installed.
+                let fx = Fixture::new("no-editor");
+                std::fs::remove_file(fx.path("bin/zeughaus")).unwrap();
+                fx.publish_seven();
+                let installed = fx.updater().install(7).unwrap();
+                assert_eq!(installed.editor, None);
+                assert_eq!(fx.text("bin/zeughaus-runner"), "new runner");
+                assert!(!fx.path("bin/zeughaus").exists());
+            }
+
+            #[test]
+            fn a_release_signed_by_another_key_installs_nothing() {
+                let fx = Fixture::new("foreign");
+                let archive = fx.archive();
+                fx.publish(7, &fx.manifest(7, &archive), &OTHER, &archive);
+                let err = fx.updater().install(7).err().unwrap();
+                assert!(err.contains("no trusted key"), "{err}");
+                fx.assert_untouched();
+            }
+
+            #[test]
+            fn a_tampered_archive_installs_nothing() {
+                let fx = Fixture::new("tampered");
+                let archive = fx.publish_seven();
+                let name = archive.file_name().unwrap();
+                let published = fx.path("site/dev/7").join(name);
+
+                // Same size, other bytes.
+                let mut bytes = std::fs::read(&published).unwrap();
+                let last = bytes.len() - 1;
+                bytes[last] ^= 1;
+                std::fs::write(&published, &bytes).unwrap();
+                let err = fx.updater().install(7).err().unwrap();
+                assert!(err.contains("sha256"), "{err}");
+                fx.assert_untouched();
+
+                // Another size.
+                bytes.push(0);
+                std::fs::write(&published, &bytes).unwrap();
+                let err = fx.updater().install(7).err().unwrap();
+                assert!(err.contains("bytes"), "{err}");
+                fx.assert_untouched();
+            }
+
+            #[test]
+            fn a_manifest_that_is_not_for_this_build_and_channel_installs_nothing() {
+                let fx = Fixture::new("mismatch");
+                let archive = fx.archive();
+                // An old release served as a new one.
+                fx.publish(7, &fx.manifest(5, &archive), &SEED, &archive);
+                let err = fx.updater().install(7).err().unwrap();
+                assert!(err.contains("build 5"), "{err}");
+                fx.assert_untouched();
+
+                let mut other = fx.manifest(7, &archive);
+                other.channel = "nightly".into();
+                fx.publish(7, &other, &SEED, &archive);
+                let err = fx.updater().install(7).err().unwrap();
+                assert!(err.contains("channel nightly"), "{err}");
+                fx.assert_untouched();
+            }
+
+            #[test]
+            fn a_release_without_this_platform_installs_nothing() {
+                let fx = Fixture::new("platform");
+                fx.publish_seven();
+                let mut updater = fx.updater();
+                updater.platform = "darwin-arm64";
+                let err = updater.install(7).err().unwrap();
+                assert!(err.contains("no archive for darwin-arm64"), "{err}");
+                fx.assert_untouched();
+            }
+
+            #[test]
+            fn a_release_that_is_not_there_installs_nothing() {
+                let fx = Fixture::new("missing");
+                let updater = fx.updater();
+                assert!(updater.latest().is_err());
+                assert!(updater.install(7).is_err());
+                fx.assert_untouched();
+            }
+
+            #[test]
+            fn a_failed_attempt_leaves_nothing_under_updates() {
+                let fx = Fixture::new("failed");
+                let archive = fx.archive();
+                fx.publish(7, &fx.manifest(7, &archive), &OTHER, &archive);
+                fx.updater().update(7);
+                assert!(!fx.path("state/updates/7").exists());
+                fx.assert_untouched();
+            }
+
+            #[test]
+            fn only_the_installed_build_stays_under_updates() {
+                let fx = Fixture::new("prune");
+                let updates = fx.path("state/updates");
+                for build in ["5", "6", "7"] {
+                    std::fs::create_dir_all(updates.join(build).join("staging")).unwrap();
+                }
+                std::fs::write(updates.join("stray"), "not a directory").unwrap();
+
+                fx.updater().prune(7);
+                assert!(updates.join("7/staging").is_dir());
+                assert!(!updates.join("5").exists());
+                assert!(!updates.join("6").exists());
+                assert!(updates.join("stray").is_file());
+            }
+
+            #[test]
+            fn a_replacement_is_all_or_nothing() {
+                let fx = Fixture::new("all-or-nothing");
+                std::fs::write(fx.path("first-new"), "first").unwrap();
+                let replacements = [
+                    Replacement::new(fx.path("first-new"), fx.path("bin/zeughaus-runner"), false),
+                    // Nothing to write the second one from.
+                    Replacement::new(fx.path("no-such-file"), fx.path("bin/zeughaus"), false),
+                ];
+                let err = replace_all(&replacements).unwrap_err();
+                assert!(err.contains("no-such-file"), "{err}");
+                fx.assert_untouched();
+            }
+
+            #[test]
+            fn a_missing_config_means_no_updater_and_a_bad_one_names_its_file() {
+                let fx = Fixture::new("config");
+                assert!(load(&fx.root).unwrap().is_none());
+                std::fs::write(fx.path(CONFIG_FILE), "channel = [").unwrap();
+                let err = load(&fx.root).unwrap_err();
+                assert!(
+                    err.starts_with(&fx.path(CONFIG_FILE).display().to_string()),
+                    "{err}"
+                );
+                std::fs::write(fx.path(CONFIG_FILE), "channel = \"dev\"\n").unwrap();
+                assert_eq!(load(&fx.root).unwrap().unwrap().channel, "dev");
+            }
+
+            /// A copy of the shell at `<root>/editor/zeughaus` running `script`,
+            /// then replaced on disk, the way an update replaces an editor: a
+            /// process whose executable is a file that is gone. `script` is given
+            /// the path of a file to create once it has set itself up.
+            #[cfg(target_os = "linux")]
+            fn running_editor(fx: &Fixture, script: &str) -> (PathBuf, std::process::Child) {
+                let editor = fx.path("editor/zeughaus");
+                std::fs::create_dir_all(editor.parent().unwrap()).unwrap();
+                std::fs::copy("/bin/sh", &editor).unwrap();
+                let ready = fx.path("ready");
+                let mut attempts = 0;
+                let child = loop {
+                    match Command::new(&editor)
+                        .args(["-c", script, "sh"])
+                        .arg(&ready)
+                        .spawn()
+                    {
+                        // The copy is still open for writing in another test's fork.
+                        Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempts < 100 => {
+                            attempts += 1;
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        spawned => break spawned.unwrap(),
+                    }
+                };
+                for _ in 0..500 {
+                    if ready.exists() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(ready.exists(), "the script did not start");
+                std::fs::write(fx.path("editor/zeughaus.new"), "new").unwrap();
+                std::fs::rename(fx.path("editor/zeughaus.new"), &editor).unwrap();
+                (editor, child)
+            }
+
+            #[cfg(target_os = "linux")]
+            #[test]
+            fn a_running_editor_that_catches_usr1_is_restarted() {
+                let fx = Fixture::new("usr1");
+                let (editor, mut child) = running_editor(
+                    &fx,
+                    "trap 'exit 0' USR1; touch \"$1\"; while :; do sleep 0.05; done",
+                );
+                restart_binary_editors(&editor);
+                let ended = (0..500).find_map(|_| {
+                    std::thread::sleep(Duration::from_millis(10));
+                    child.try_wait().unwrap()
+                });
+                let _ = child.kill();
+                let _ = child.wait();
+                assert_eq!(
+                    ended.and_then(|status| status.code()),
+                    Some(0),
+                    "the editor was not signalled"
+                );
+            }
+
+            #[cfg(target_os = "linux")]
+            #[test]
+            fn a_running_editor_that_does_not_catch_usr1_is_left_alone() {
+                let fx = Fixture::new("no-usr1");
+                let (editor, mut child) =
+                    running_editor(&fx, "touch \"$1\"; while :; do sleep 0.05; done");
+                restart_binary_editors(&editor);
+                // The signal's default action would end the shell within moments.
+                std::thread::sleep(Duration::from_millis(300));
+                let alive = child.try_wait().unwrap().is_none();
+                let _ = child.kill();
+                let _ = child.wait();
+                assert!(
+                    alive,
+                    "a process that cannot restart itself must not be signalled"
+                );
+            }
         }
     }
 }

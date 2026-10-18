@@ -347,126 +347,6 @@ fn non_empty(value: Option<OsString>) -> Option<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-
-    /// A directory that removes itself. No `tempfile` dependency for four
-    /// tests, and the name carries the process id so a parallel test binary
-    /// cannot collide.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(tag: &str) -> TempDir {
-            let mut path = std::env::temp_dir();
-            path.push(format!(
-                "zeughaus-credentials-{tag}-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            let _ = fs::remove_dir_all(&path);
-            TempDir(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// The point of the file: the fingerprint an editor pinned must still be
-    /// the runner's after a restart.
-    #[test]
-    fn the_runner_identity_is_created_once_and_then_reused() {
-        let dir = TempDir::new("runner");
-        let first = runner_identity(dir.path()).expect("create");
-        let second = runner_identity(dir.path()).expect("reuse");
-
-        assert!(dir.path().join(RUNNER_PEM).is_file());
-        assert_eq!(
-            first.fingerprint().expect("fingerprint"),
-            second.fingerprint().expect("fingerprint")
-        );
-    }
-
-    /// A private key readable by the rest of the machine is the same as no
-    /// authentication at all.
-    #[cfg(unix)]
-    #[test]
-    fn the_key_file_and_its_directory_are_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = TempDir::new("modes");
-        runner_identity(dir.path()).expect("create");
-
-        let dir_mode = fs::metadata(dir.path())
-            .expect("stat dir")
-            .permissions()
-            .mode();
-        let file_mode = fs::metadata(dir.path().join(RUNNER_PEM))
-            .expect("stat file")
-            .permissions()
-            .mode();
-        assert_eq!(dir_mode & 0o777, 0o700, "state dir mode {dir_mode:o}");
-        assert_eq!(file_mode & 0o777, 0o600, "key file mode {file_mode:o}");
-    }
-
-    /// Regenerating over an unreadable key would silently re-key a runner that
-    /// peers still pin, and destroy the only copy of the old one.
-    #[test]
-    fn a_corrupt_identity_is_reported_and_left_alone() {
-        let dir = TempDir::new("corrupt");
-        fs::create_dir_all(dir.path()).expect("mkdir");
-        let path = dir.path().join(CLIENT_PEM);
-        fs::write(&path, b"not a pem at all\n").expect("write");
-
-        let error = client_identity(dir.path()).expect_err("must not regenerate");
-        assert!(error.contains("client.pem"), "{error}");
-        assert_eq!(fs::read(&path).expect("read"), b"not a pem at all\n");
-
-        // The runner's trust is built from the same file, so it must refuse
-        // to start rather than come up trusting one client fewer.
-        assert!(client_trust(dir.path()).is_err());
-    }
-
-    /// The runner pins the local bootstrap and every hand-provisioned remote
-    /// certificate, and nothing else.
-    #[test]
-    fn trust_pins_the_local_client_and_provisioned_ones() {
-        let dir = TempDir::new("trust");
-        let remote = TempDir::new("remote");
-
-        assert!(
-            client_trust(dir.path()).expect("empty trust").is_empty(),
-            "an unprovisioned directory must trust nobody"
-        );
-
-        let local = client_identity(dir.path()).expect("bootstrap");
-        let provisioned = client_identity(remote.path()).expect("remote bootstrap");
-        fs::create_dir_all(dir.path().join(CLIENTS_DIR)).expect("mkdir clients");
-        fs::write(
-            dir.path().join(CLIENTS_DIR).join("laptop.pem"),
-            provisioned.certificate_pem().expect("certificate"),
-        )
-        .expect("provision");
-        // Not a PEM file: must be ignored rather than fail the runner.
-        fs::write(dir.path().join(CLIENTS_DIR).join("README.txt"), b"notes").expect("write");
-
-        let trust = client_trust(dir.path()).expect("trust");
-        assert_eq!(
-            trust.pins,
-            vec![
-                local.fingerprint().expect("fingerprint"),
-                provisioned.fingerprint().expect("fingerprint"),
-            ]
-        );
-        assert!(trust.anchors.is_empty());
-    }
 
     /// The knob a deployment sets, and the order it is resolved in.
     #[cfg(not(windows))]
@@ -500,5 +380,131 @@ mod tests {
             ])),
             PathBuf::from("/home/u/state/zeughaus")
         );
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        /// A directory that removes itself. No `tempfile` dependency for four
+        /// tests, and the name carries the process id so a parallel test binary
+        /// cannot collide.
+        struct TempDir(PathBuf);
+
+        impl TempDir {
+            fn new(tag: &str) -> TempDir {
+                let mut path = std::env::temp_dir();
+                path.push(format!(
+                    "zeughaus-credentials-{tag}-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                let _ = fs::remove_dir_all(&path);
+                TempDir(path)
+            }
+
+            fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        /// The point of the file: the fingerprint an editor pinned must still be
+        /// the runner's after a restart.
+        #[test]
+        fn the_runner_identity_is_created_once_and_then_reused() {
+            let dir = TempDir::new("runner");
+            let first = runner_identity(dir.path()).expect("create");
+            let second = runner_identity(dir.path()).expect("reuse");
+
+            assert!(dir.path().join(RUNNER_PEM).is_file());
+            assert_eq!(
+                first.fingerprint().expect("fingerprint"),
+                second.fingerprint().expect("fingerprint")
+            );
+        }
+
+        /// A private key readable by the rest of the machine is the same as no
+        /// authentication at all.
+        #[cfg(unix)]
+        #[test]
+        fn the_key_file_and_its_directory_are_owner_only() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = TempDir::new("modes");
+            runner_identity(dir.path()).expect("create");
+
+            let dir_mode = fs::metadata(dir.path())
+                .expect("stat dir")
+                .permissions()
+                .mode();
+            let file_mode = fs::metadata(dir.path().join(RUNNER_PEM))
+                .expect("stat file")
+                .permissions()
+                .mode();
+            assert_eq!(dir_mode & 0o777, 0o700, "state dir mode {dir_mode:o}");
+            assert_eq!(file_mode & 0o777, 0o600, "key file mode {file_mode:o}");
+        }
+
+        /// Regenerating over an unreadable key would silently re-key a runner that
+        /// peers still pin, and destroy the only copy of the old one.
+        #[test]
+        fn a_corrupt_identity_is_reported_and_left_alone() {
+            let dir = TempDir::new("corrupt");
+            fs::create_dir_all(dir.path()).expect("mkdir");
+            let path = dir.path().join(CLIENT_PEM);
+            fs::write(&path, b"not a pem at all\n").expect("write");
+
+            let error = client_identity(dir.path()).expect_err("must not regenerate");
+            assert!(error.contains("client.pem"), "{error}");
+            assert_eq!(fs::read(&path).expect("read"), b"not a pem at all\n");
+
+            // The runner's trust is built from the same file, so it must refuse
+            // to start rather than come up trusting one client fewer.
+            assert!(client_trust(dir.path()).is_err());
+        }
+
+        /// The runner pins the local bootstrap and every hand-provisioned remote
+        /// certificate, and nothing else.
+        #[test]
+        fn trust_pins_the_local_client_and_provisioned_ones() {
+            let dir = TempDir::new("trust");
+            let remote = TempDir::new("remote");
+
+            assert!(
+                client_trust(dir.path()).expect("empty trust").is_empty(),
+                "an unprovisioned directory must trust nobody"
+            );
+
+            let local = client_identity(dir.path()).expect("bootstrap");
+            let provisioned = client_identity(remote.path()).expect("remote bootstrap");
+            fs::create_dir_all(dir.path().join(CLIENTS_DIR)).expect("mkdir clients");
+            fs::write(
+                dir.path().join(CLIENTS_DIR).join("laptop.pem"),
+                provisioned.certificate_pem().expect("certificate"),
+            )
+            .expect("provision");
+            // Not a PEM file: must be ignored rather than fail the runner.
+            fs::write(dir.path().join(CLIENTS_DIR).join("README.txt"), b"notes").expect("write");
+
+            let trust = client_trust(dir.path()).expect("trust");
+            assert_eq!(
+                trust.pins,
+                vec![
+                    local.fingerprint().expect("fingerprint"),
+                    provisioned.fingerprint().expect("fingerprint"),
+                ]
+            );
+            assert!(trust.anchors.is_empty());
+        }
     }
 }

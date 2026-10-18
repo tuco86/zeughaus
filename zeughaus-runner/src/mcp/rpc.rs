@@ -418,24 +418,6 @@ mod tests {
         assert_eq!(failed["content"][0]["text"], "it failed");
     }
 
-    /// The input ends while a call still runs: its answer must still be
-    /// written, and a call that started later but finished sooner answers
-    /// first -- they do not wait for each other.
-    #[tokio::test]
-    async fn calls_run_in_parallel_and_answer_after_the_input_ended() {
-        let answers = run(concat!(
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow"}}"#,
-            "\n",
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo"}}"#,
-            "\n",
-        ))
-        .await;
-        assert_eq!(answers.len(), 2);
-        assert_eq!(answers[0]["id"], 2);
-        assert_eq!(answers[1]["id"], 1);
-        assert_eq!(answers[1]["result"]["content"][0]["text"], "slow done");
-    }
-
     #[tokio::test]
     async fn a_call_that_panics_is_answered_with_an_error() {
         let answers = run(concat!(
@@ -444,5 +426,29 @@ mod tests {
         ))
         .await;
         assert_eq!(by_id(&answers, 7)["error"]["code"], -32603);
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        /// The input ends while a call still runs: its answer must still be
+        /// written, and a call that started later but finished sooner answers
+        /// first -- they do not wait for each other.
+        #[tokio::test]
+        async fn calls_run_in_parallel_and_answer_after_the_input_ended() {
+            let answers = run(concat!(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow"}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo"}}"#,
+                "\n",
+            ))
+            .await;
+            assert_eq!(answers.len(), 2);
+            assert_eq!(answers[0]["id"], 2);
+            assert_eq!(answers[1]["id"], 1);
+            assert_eq!(answers[1]["result"]["content"][0]["text"], "slow done");
+        }
     }
 }

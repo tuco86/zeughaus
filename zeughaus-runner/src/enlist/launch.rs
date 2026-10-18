@@ -563,34 +563,6 @@ mod tests {
     // `cfg(unix)`: a Windows runner writes and runs `.ps1` launchers only.
 
     #[test]
-    #[cfg(unix)]
-    fn shell_quoting_survives_quotes() {
-        let quoted = sh_quote("it's $HOME");
-        let output = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!("printf %s {quoted}"))
-            .output()
-            .expect("run sh");
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "it's $HOME");
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn env_sh_round_trips_through_a_shell() {
-        let vars = vec![
-            ("A".to_owned(), "x 'y' $z".to_owned()),
-            ("B".to_owned(), "plain".to_owned()),
-        ];
-        let script = format!("{}printf '%s|%s' \"$A\" \"$B\"", env_sh(&vars));
-        let output = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(script)
-            .output()
-            .expect("run sh");
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "x 'y' $z|plain");
-    }
-
-    #[test]
     fn powershell_quotes_double_single_quotes() {
         assert_eq!(ps_quote("it's"), "'it''s'");
     }
@@ -618,18 +590,6 @@ mod tests {
         }
     }
 
-    /// A program the shell side of these tests can run in place of `ssh`,
-    /// `date` or the runner's `timeout`: `body` under `#!/bin/sh`.
-    #[cfg(unix)]
-    fn stand_in(path: &Path, body: &str) {
-        std::fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
-        std::process::Command::new("chmod")
-            .arg("+x")
-            .arg(path)
-            .status()
-            .unwrap();
-    }
-
     /// A host job is timed by the runner's own subcommand, a container job by
     /// coreutils inside the image.
     #[test]
@@ -639,118 +599,6 @@ mod tests {
         assert!(host.contains("'/opt/zh runner' timeout 120 -- /bin/sh '.zeughaus-ci/build.sh'"));
         let container = inner_sh(&a, None);
         assert!(container.contains("timeout -k 60 120 /bin/sh '.zeughaus-ci/build.sh'"));
-    }
-
-    /// The rendered `inner.sh` of a host job runs the job under the given
-    /// timeout program and ends with the job's exit code: no shell follows a
-    /// failure, and nothing is written for the runner to look for.
-    #[test]
-    #[cfg(unix)]
-    fn a_failed_host_job_exits_with_its_code() {
-        let base = std::env::temp_dir().join(format!("zci-launch-inner-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let ws = base.join("ws");
-        let run = base.join("run");
-        std::fs::create_dir_all(ws.join(CI_DIR)).unwrap();
-        std::fs::create_dir_all(&run).unwrap();
-        std::fs::write(ws.join(CI_DIR).join("build.sh"), "echo ran; exit 3\n").unwrap();
-        // Stands in for `zeughaus-runner timeout <secs> -- <program> ..`.
-        let stub = base.join("timeout-stub");
-        stand_in(&stub, "shift 3\nexec \"$@\"\n");
-        let a = assignment(Place::Host);
-        let output = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(inner_sh(&a, Some(&stub)))
-            .env("CI_WORKSPACE", &ws)
-            .env("CI_OUTPUT", base.join("out"))
-            .env("CI_JOB", "build")
-            .env("ZEUGHAUS_RUN_DIR", &run)
-            .output()
-            .expect("run sh");
-        let wrote_code = run.join("code").exists();
-        let _ = std::fs::remove_dir_all(&base);
-        assert!(String::from_utf8_lossy(&output.stdout).contains("ran"));
-        assert_eq!(output.status.code(), Some(3));
-        assert!(!wrote_code);
-    }
-
-    /// The shell side of a Windows VM job, run for real against stand-ins for
-    /// `ssh` and `scp`: the launcher ends with the guest's exit code, copies
-    /// the output back only after a success, and opens no second session
-    /// after a failure.
-    #[test]
-    #[cfg(unix)]
-    fn a_vm_job_ends_with_the_guests_exit_code_and_opens_no_shell() {
-        let base = std::env::temp_dir().join(format!("zci-launch-vm-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let (bin, run, secret) = (base.join("bin"), base.join("run"), base.join("secret"));
-        for dir in [&bin, &run, &secret] {
-            std::fs::create_dir_all(dir).unwrap();
-        }
-        // `ssh` logs its arguments and answers the read of the guest's exit
-        // code with `$STUB_GUEST_RC`; `scp` only logs.
-        let log = base.join("log");
-        for (name, body) in [
-            (
-                "ssh",
-                "printf '%s\\n' \"ssh $*\" >> \"$STUB_LOG\"\n\
-                 case \"$*\" in *Get-Content*) printf '%s\\n' \"$STUB_GUEST_RC\" ;; esac\n",
-            ),
-            ("scp", "printf '%s\\n' \"scp $*\" >> \"$STUB_LOG\"\n"),
-        ] {
-            stand_in(&bin.join(name), body);
-        }
-        let a = assignment(Place::Machine {
-            name: "win11".to_owned(),
-        });
-        let script = launch_sh(&Launch {
-            assignment: &a,
-            run_dir: &run,
-            secret_dir: &secret,
-            mirror: Path::new("/s/ci/mirrors/demo.git"),
-            target: Target::WindowsVm { ssh_host: "win11" },
-        });
-        let path = format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-        let launch = |guest_rc: &str| {
-            let _ = std::fs::remove_file(&log);
-            let output = std::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(&script)
-                .env("PATH", &path)
-                .env("STUB_LOG", &log)
-                .env("STUB_GUEST_RC", guest_rc)
-                .output()
-                .expect("run sh");
-            (
-                output.status.code(),
-                std::fs::read_to_string(&log).unwrap_or_default(),
-            )
-        };
-
-        let (code, calls) = launch("3");
-        assert_eq!(code, Some(3), "{calls}");
-        assert_eq!(calls.matches("ssh -tt").count(), 1, "{calls}");
-        assert!(
-            !calls.contains("debug.ps1") && !calls.contains("-NoExit"),
-            "{calls}"
-        );
-        assert!(
-            !calls.contains("demo.7.build/out"),
-            "a failed run copies nothing back: {calls}"
-        );
-        assert!(!run.join("code").exists());
-
-        let (code, calls) = launch("0");
-        assert_eq!(code, Some(0), "{calls}");
-        assert!(
-            calls.contains("scp -q -r win11:/W:/ci/runs/demo.7.build/out"),
-            "{calls}"
-        );
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A Windows host job ends with its exit code, and nothing follows it.
@@ -851,79 +699,6 @@ mod tests {
         );
     }
 
-    /// The clock script run for real against stand-ins for `stat` and `date`:
-    /// the clock is set to the host's stamp plus 5 ms and the job starts; when
-    /// setting it fails the script says so and the job starts all the same.
-    #[test]
-    #[cfg(unix)]
-    fn the_clock_script_sets_the_clock_a_little_ahead_and_always_starts_the_job() {
-        let base = std::env::temp_dir().join(format!("zci-launch-clock-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let (bin, run) = (base.join("bin"), base.join("run"));
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::create_dir_all(&run).unwrap();
-        // The host's stamp on the file, and the one call that sets the clock.
-        stand_in(&bin.join("stat"), "echo 1700000000.250000000\n");
-        stand_in(
-            &bin.join("date"),
-            "printf '%s\\n' \"$*\" > \"$STUB_DATE_LOG\"\nexit \"$STUB_DATE_EXIT\"\n",
-        );
-        let started = run.join("started");
-        std::fs::write(
-            run.join("inner.sh"),
-            format!("echo ran > {}\n", sh_path(&started)),
-        )
-        .unwrap();
-        // `/ci/run` is the run directory inside the container.
-        let script = run.join("clock.sh");
-        std::fs::write(
-            &script,
-            clock_sh().replace("/ci/run", &run.to_string_lossy()),
-        )
-        .unwrap();
-        let path = format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-        let log = base.join("date.log");
-        let clock = |date_exit: &str| {
-            let _ = std::fs::remove_file(&started);
-            let _ = std::fs::remove_file(&log);
-            let output = std::process::Command::new("/bin/sh")
-                .arg(&script)
-                .env("PATH", &path)
-                .env("STUB_DATE_LOG", &log)
-                .env("STUB_DATE_EXIT", date_exit)
-                .output()
-                .expect("run sh");
-            (
-                output.status.code(),
-                String::from_utf8_lossy(&output.stdout).into_owned(),
-            )
-        };
-
-        let (code, out) = clock("0");
-        assert_eq!(code, Some(0), "{out}");
-        assert_eq!(
-            std::fs::read_to_string(&log).unwrap(),
-            "-s @1700000000.255000\n"
-        );
-        assert!(!out.contains("warning"), "{out}");
-        assert!(started.exists(), "the job runs");
-        assert!(!run.join(".clock").exists());
-
-        let (code, out) = clock("1");
-        assert_eq!(code, Some(0), "{out}");
-        assert!(
-            out.contains("warning: cannot set the container clock from the host"),
-            "{out}"
-        );
-        assert!(started.exists(), "the job runs on with the clock it had");
-        assert!(!run.join(".clock").exists());
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
     fn host_launcher(a: &Assignment) -> String {
         let workspace = PathBuf::from("/s/ci/work/demo/host");
         launch_sh(&Launch {
@@ -989,129 +764,11 @@ mod tests {
         }
     }
 
-    /// `git -C dir args`, which must succeed: its output without the final
-    /// newline.
-    #[cfg(unix)]
-    fn git(dir: &Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .expect("run git");
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
-    }
-
-    /// `script` under `/bin/sh`: its exit code and standard output.
-    #[cfg(unix)]
-    fn sh(script: &str) -> (Option<i32>, String) {
-        let output = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(script)
-            .output()
-            .expect("run sh");
-        (
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-        )
-    }
-
-    /// One snapshot of the repository `base/src/<name>`, as the agent's
-    /// snapshot makes it: `files` written (None removes one), a commit
-    /// without a parent of the whole tree, and a bundle of it under `refname`
-    /// as bundle `index` of the run in `run_dir`. Returns the commit.
-    #[cfg(unix)]
-    fn snapshot(
-        base: &Path,
-        run_dir: &Path,
-        name: &str,
-        files: &[(&str, Option<&str>)],
-        refname: &str,
-        index: u32,
-    ) -> String {
-        let src = base.join("src").join(name);
-        std::fs::create_dir_all(&src).unwrap();
-        if !src.join(".git").exists() {
-            git(&src, &["init", "-q"]);
-        }
-        for (file, text) in files {
-            match text {
-                Some(text) => std::fs::write(src.join(file), text).unwrap(),
-                None => std::fs::remove_file(src.join(file)).unwrap(),
-            }
-        }
-        git(&src, &["add", "-A"]);
-        let tree = git(&src, &["write-tree"]);
-        let commit = git(&src, &["commit-tree", &tree, "-m", "manual run"]);
-        git(&src, &["update-ref", refname, &commit]);
-        std::fs::create_dir_all(run_dir.join("bundles")).unwrap();
-        let bundle = bundle_file(run_dir, index);
-        git(
-            &src,
-            &["bundle", "create", bundle.to_str().unwrap(), refname],
-        );
-        git(&src, &["update-ref", "-d", refname]);
-        commit
-    }
-
     fn upload_dir(dir: &str, sha: &str) -> UploadDir {
         UploadDir {
             dir: dir.to_owned(),
             sha: sha.to_owned(),
         }
-    }
-
-    /// The shell side of a pipeline's checkout, run for real: what a job
-    /// leaves that git ignores (`target/`) is there for the next checkout, the
-    /// rest of what is untracked is not, and a wipe takes the ignored files
-    /// too.
-    #[test]
-    #[cfg(unix)]
-    fn a_checkout_keeps_what_git_ignores_until_it_is_a_wipe() {
-        let base = std::env::temp_dir().join(format!("zci-launch-checkout-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let (mirror, ws) = (base.join("mirror"), base.join("ws"));
-        std::fs::create_dir_all(&mirror).unwrap();
-        git(&mirror, &["init", "-q"]);
-        std::fs::write(mirror.join("tracked"), "x").unwrap();
-        std::fs::write(mirror.join(".gitignore"), "target/\n").unwrap();
-        git(&mirror, &["add", "-A"]);
-        git(&mirror, &["commit", "-q", "-m", "c"]);
-        git(&mirror, &["update-ref", "refs/ci/7", "HEAD"]);
-        let enter = |checkout: Checkout| {
-            let a = Assignment {
-                checkout,
-                ..assignment(Place::Host)
-            };
-            sh(&enter_sh(&a, &ws, &mirror)).0
-        };
-
-        assert_eq!(enter(Checkout::Clean), Some(0));
-        assert!(ws.join("tracked").exists());
-        assert!(ws.join(".git/zci-last-used").exists());
-
-        // A job builds into an ignored directory and leaves a stray file.
-        std::fs::create_dir_all(ws.join("target")).unwrap();
-        std::fs::write(ws.join("target/marker"), "").unwrap();
-        std::fs::write(ws.join("stray"), "").unwrap();
-        assert_eq!(enter(Checkout::Clean), Some(0));
-        assert!(ws.join("target/marker").exists());
-        assert!(!ws.join("stray").exists());
-        assert!(ws.join("tracked").exists());
-
-        assert_eq!(enter(Checkout::Wipe), Some(0));
-        assert!(!ws.join("target").exists());
-        assert!(ws.join("tracked").exists());
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn manual_upload() -> Upload {
@@ -1315,227 +972,582 @@ mod tests {
         }
     }
 
-    /// The shell side of a manual run, run for real against bundles as the
-    /// agent's snapshot makes them: the first checkout lands in the workspace
-    /// itself and the others in `.zci-siblings` below it, a later run finds
-    /// what an earlier one built there, and a bundle that does not hold its
-    /// commit ends the launcher with 70.
-    #[test]
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`). Every one runs `/bin/sh`.
     #[cfg(unix)]
-    fn a_manual_run_enters_every_working_tree_from_its_bundle() {
-        let base = std::env::temp_dir().join(format!("zci-launch-manual-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let (ws, run_dir) = (base.join("ws"), base.join("run"));
+    mod io {
+        use super::*;
 
-        let upload = |app: &str, lib: &str| Upload {
-            dirs: vec![upload_dir("app", app), upload_dir("lib", lib)],
-        };
-        let enter = |upload: &Upload| {
-            sh(&format!(
-                "{}pwd -P\n",
-                enter_manual_sh(upload, &ws, &run_dir)
-            ))
-        };
-        let read = |path: &str| std::fs::read_to_string(ws.join(path)).ok();
-        let excludes = || {
-            read(".git/info/exclude")
-                .unwrap_or_default()
-                .lines()
-                .filter(|line| *line == "/.zci-siblings/")
-                .count()
-        };
+        #[test]
+        #[cfg(unix)]
+        fn shell_quoting_survives_quotes() {
+            let quoted = sh_quote("it's $HOME");
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("printf %s {quoted}"))
+                .output()
+                .expect("run sh");
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "it's $HOME");
+        }
 
-        // The first run: both trees come out of their bundles.
-        let app1 = snapshot(
-            &base,
-            &run_dir,
-            "app",
-            &[
-                ("main.rs", Some("v1")),
-                ("old", Some("")),
-                (".gitignore", Some("target/\n")),
-            ],
-            "refs/zci-manual/1-1",
-            0,
-        );
-        let lib1 = snapshot(
-            &base,
-            &run_dir,
-            "lib",
-            &[("answer", Some("41"))],
-            "refs/zci-manual/1-1",
-            1,
-        );
-        let (code, out) = enter(&upload(&app1, &lib1));
-        assert_eq!(code, Some(0), "{out}");
-        assert_eq!(read("main.rs").as_deref(), Some("v1"));
-        assert_eq!(read(".zci-siblings/lib/answer").as_deref(), Some("41"));
-        assert_eq!(
-            out.trim_end(),
-            std::fs::canonicalize(&ws).unwrap().to_string_lossy(),
-            "the script ends in the main checkout"
-        );
-        assert!(!run_dir.join("bundles").exists(), "the bundles are gone");
-        assert!(ws.join(".git/zci-last-used").exists());
-        // The siblings are no change of the main checkout.
-        assert_eq!(excludes(), 1);
-        assert_eq!(
-            git(&ws, &["status", "--porcelain", "--untracked-files=all"]),
-            ""
-        );
+        #[test]
+        #[cfg(unix)]
+        fn env_sh_round_trips_through_a_shell() {
+            let vars = vec![
+                ("A".to_owned(), "x 'y' $z".to_owned()),
+                ("B".to_owned(), "plain".to_owned()),
+            ];
+            let script = format!("{}printf '%s|%s' \"$A\" \"$B\"", env_sh(&vars));
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .output()
+                .expect("run sh");
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "x 'y' $z|plain");
+        }
 
-        // A build leaves its output in an ignored directory, and a stray file.
-        std::fs::create_dir_all(ws.join("target")).unwrap();
-        std::fs::write(ws.join("target/marker"), "built").unwrap();
-        std::fs::write(ws.join("stray"), "").unwrap();
+        /// A program the shell side of these tests can run in place of `ssh`,
+        /// `date` or the runner's `timeout`: `body` under `#!/bin/sh`.
+        #[cfg(unix)]
+        fn stand_in(path: &Path, body: &str) {
+            std::fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
+            std::process::Command::new("chmod")
+                .arg("+x")
+                .arg(path)
+                .status()
+                .unwrap();
+        }
 
-        // The next run, from other bundles: the snapshot replaces the trees
-        // (a deleted file goes, a stray one goes), the build output stays, the
-        // ref of the first bundle is pruned and the exclude line is not
-        // written twice.
-        let app2 = snapshot(
-            &base,
-            &run_dir,
-            "app",
-            &[("main.rs", Some("v2")), ("old", None)],
-            "refs/zci-manual/2-1",
-            0,
-        );
-        let lib2 = snapshot(
-            &base,
-            &run_dir,
-            "lib",
-            &[("answer", Some("42"))],
-            "refs/zci-manual/2-1",
-            1,
-        );
-        let (code, out) = enter(&upload(&app2, &lib2));
-        assert_eq!(code, Some(0), "{out}");
-        assert_eq!(read("main.rs").as_deref(), Some("v2"));
-        assert_eq!(read(".zci-siblings/lib/answer").as_deref(), Some("42"));
-        assert_eq!(read("old"), None);
-        assert_eq!(read("stray"), None);
-        assert_eq!(read("target/marker").as_deref(), Some("built"));
-        let refs = git(&ws, &["for-each-ref", "--format=%(refname)"]);
-        assert_eq!(refs, "refs/zci-manual/2-1");
-        assert_eq!(excludes(), 1);
+        /// The rendered `inner.sh` of a host job runs the job under the given
+        /// timeout program and ends with the job's exit code: no shell follows a
+        /// failure, and nothing is written for the runner to look for.
+        #[test]
+        #[cfg(unix)]
+        fn a_failed_host_job_exits_with_its_code() {
+            let base =
+                std::env::temp_dir().join(format!("zci-launch-inner-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let ws = base.join("ws");
+            let run = base.join("run");
+            std::fs::create_dir_all(ws.join(CI_DIR)).unwrap();
+            std::fs::create_dir_all(&run).unwrap();
+            std::fs::write(ws.join(CI_DIR).join("build.sh"), "echo ran; exit 3\n").unwrap();
+            // Stands in for `zeughaus-runner timeout <secs> -- <program> ..`.
+            let stub = base.join("timeout-stub");
+            stand_in(&stub, "shift 3\nexec \"$@\"\n");
+            let a = assignment(Place::Host);
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(inner_sh(&a, Some(&stub)))
+                .env("CI_WORKSPACE", &ws)
+                .env("CI_OUTPUT", base.join("out"))
+                .env("CI_JOB", "build")
+                .env("ZEUGHAUS_RUN_DIR", &run)
+                .output()
+                .expect("run sh");
+            let wrote_code = run.join("code").exists();
+            let _ = std::fs::remove_dir_all(&base);
+            assert!(String::from_utf8_lossy(&output.stdout).contains("ran"));
+            assert_eq!(output.status.code(), Some(3));
+            assert!(!wrote_code);
+        }
 
-        // A bundle that does not hold the commit ends it with 70, and says
-        // which checkout.
-        let lib3 = snapshot(
-            &base,
-            &run_dir,
-            "lib",
-            &[("answer", Some("43"))],
-            "refs/zci-manual/3-1",
-            1,
-        );
-        std::fs::write(bundle_file(&run_dir, 0), "not a bundle").unwrap();
-        let (code, out) = enter(&upload(&app2, &lib3));
-        assert_eq!(code, Some(70), "{out}");
-        assert!(
-            out.contains("[zeughaus-ci] checkout of app failed"),
-            "{out}"
-        );
-        assert_eq!(
-            read(".zci-siblings/lib/answer").as_deref(),
-            Some("42"),
-            "nothing past it ran"
-        );
-
-        // So does one of a sibling, after the main checkout is in.
-        let app4 = snapshot(
-            &base,
-            &run_dir,
-            "app",
-            &[("main.rs", Some("v3"))],
-            "refs/zci-manual/4-1",
-            0,
-        );
-        std::fs::write(bundle_file(&run_dir, 1), "not a bundle").unwrap();
-        let (code, out) = enter(&upload(&app4, &lib3));
-        assert_eq!(code, Some(70), "{out}");
-        assert!(
-            out.contains("[zeughaus-ci] checkout of lib failed"),
-            "{out}"
-        );
-        assert_eq!(read("main.rs").as_deref(), Some("v3"));
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// A pipeline job and a manual run take turns in the workspace of their
-    /// place, run for real: each finds the build output the other left, each
-    /// replaces the tree, and a pipeline's checkout leaves the siblings of a
-    /// manual run alone until it is a wipe.
-    #[test]
-    #[cfg(unix)]
-    fn a_pipeline_job_and_a_manual_run_share_one_workspace() {
-        let base = std::env::temp_dir().join(format!("zci-launch-shared-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let (mirror, ws, run_dir) = (base.join("mirror"), base.join("ws"), base.join("run"));
-        std::fs::create_dir_all(&mirror).unwrap();
-        git(&mirror, &["init", "-q"]);
-        std::fs::write(mirror.join("main.rs"), "pipeline").unwrap();
-        std::fs::write(mirror.join(".gitignore"), "target/\n").unwrap();
-        git(&mirror, &["add", "-A"]);
-        git(&mirror, &["commit", "-q", "-m", "c"]);
-        git(&mirror, &["update-ref", "refs/ci/7", "HEAD"]);
-        let read = |path: &str| std::fs::read_to_string(ws.join(path)).ok();
-        let pipeline = |checkout: Checkout| {
-            let a = Assignment {
-                checkout,
-                ..assignment(Place::Host)
+        /// The shell side of a Windows VM job, run for real against stand-ins for
+        /// `ssh` and `scp`: the launcher ends with the guest's exit code, copies
+        /// the output back only after a success, and opens no second session
+        /// after a failure.
+        #[test]
+        #[cfg(unix)]
+        fn a_vm_job_ends_with_the_guests_exit_code_and_opens_no_shell() {
+            let base = std::env::temp_dir().join(format!("zci-launch-vm-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let (bin, run, secret) = (base.join("bin"), base.join("run"), base.join("secret"));
+            for dir in [&bin, &run, &secret] {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            // `ssh` logs its arguments and answers the read of the guest's exit
+            // code with `$STUB_GUEST_RC`; `scp` only logs.
+            let log = base.join("log");
+            for (name, body) in [
+                (
+                    "ssh",
+                    "printf '%s\\n' \"ssh $*\" >> \"$STUB_LOG\"\n\
+                 case \"$*\" in *Get-Content*) printf '%s\\n' \"$STUB_GUEST_RC\" ;; esac\n",
+                ),
+                ("scp", "printf '%s\\n' \"scp $*\" >> \"$STUB_LOG\"\n"),
+            ] {
+                stand_in(&bin.join(name), body);
+            }
+            let a = assignment(Place::Machine {
+                name: "win11".to_owned(),
+            });
+            let script = launch_sh(&Launch {
+                assignment: &a,
+                run_dir: &run,
+                secret_dir: &secret,
+                mirror: Path::new("/s/ci/mirrors/demo.git"),
+                target: Target::WindowsVm { ssh_host: "win11" },
+            });
+            let path = format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let launch = |guest_rc: &str| {
+                let _ = std::fs::remove_file(&log);
+                let output = std::process::Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(&script)
+                    .env("PATH", &path)
+                    .env("STUB_LOG", &log)
+                    .env("STUB_GUEST_RC", guest_rc)
+                    .output()
+                    .expect("run sh");
+                (
+                    output.status.code(),
+                    std::fs::read_to_string(&log).unwrap_or_default(),
+                )
             };
-            sh(&enter_sh(&a, &ws, &mirror)).0
-        };
 
-        // The pipeline's job builds.
-        assert_eq!(pipeline(Checkout::Clean), Some(0));
-        assert_eq!(read("main.rs").as_deref(), Some("pipeline"));
-        std::fs::create_dir_all(ws.join("target")).unwrap();
-        std::fs::write(ws.join("target/marker"), "built").unwrap();
+            let (code, calls) = launch("3");
+            assert_eq!(code, Some(3), "{calls}");
+            assert_eq!(calls.matches("ssh -tt").count(), 1, "{calls}");
+            assert!(
+                !calls.contains("debug.ps1") && !calls.contains("-NoExit"),
+                "{calls}"
+            );
+            assert!(
+                !calls.contains("demo.7.build/out"),
+                "a failed run copies nothing back: {calls}"
+            );
+            assert!(!run.join("code").exists());
 
-        // A manual run of the working tree finds that build and brings a
-        // sibling.
-        let app = snapshot(
-            &base,
-            &run_dir,
-            "app",
-            &[
-                ("main.rs", Some("manual")),
-                (".gitignore", Some("target/\n")),
-            ],
-            "refs/zci-manual/1-1",
-            0,
-        );
-        let lib = snapshot(
-            &base,
-            &run_dir,
-            "lib",
-            &[("answer", Some("42"))],
-            "refs/zci-manual/1-1",
-            1,
-        );
-        let upload = Upload {
-            dirs: vec![upload_dir("app", &app), upload_dir("lib", &lib)],
-        };
-        let (code, out) = sh(&enter_manual_sh(&upload, &ws, &run_dir));
-        assert_eq!(code, Some(0), "{out}");
-        assert_eq!(read("main.rs").as_deref(), Some("manual"));
-        assert_eq!(read("target/marker").as_deref(), Some("built"));
-        assert_eq!(read(".zci-siblings/lib/answer").as_deref(), Some("42"));
+            let (code, calls) = launch("0");
+            assert_eq!(code, Some(0), "{calls}");
+            assert!(
+                calls.contains("scp -q -r win11:/W:/ci/runs/demo.7.build/out"),
+                "{calls}"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
 
-        // The next pipeline job finds the build and the sibling.
-        assert_eq!(pipeline(Checkout::Clean), Some(0));
-        assert_eq!(read("main.rs").as_deref(), Some("pipeline"));
-        assert_eq!(read("target/marker").as_deref(), Some("built"));
-        assert_eq!(read(".zci-siblings/lib/answer").as_deref(), Some("42"));
+        /// The clock script run for real against stand-ins for `stat` and `date`:
+        /// the clock is set to the host's stamp plus 5 ms and the job starts; when
+        /// setting it fails the script says so and the job starts all the same.
+        #[test]
+        #[cfg(unix)]
+        fn the_clock_script_sets_the_clock_a_little_ahead_and_always_starts_the_job() {
+            let base =
+                std::env::temp_dir().join(format!("zci-launch-clock-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let (bin, run) = (base.join("bin"), base.join("run"));
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::create_dir_all(&run).unwrap();
+            // The host's stamp on the file, and the one call that sets the clock.
+            stand_in(&bin.join("stat"), "echo 1700000000.250000000\n");
+            stand_in(
+                &bin.join("date"),
+                "printf '%s\\n' \"$*\" > \"$STUB_DATE_LOG\"\nexit \"$STUB_DATE_EXIT\"\n",
+            );
+            let started = run.join("started");
+            std::fs::write(
+                run.join("inner.sh"),
+                format!("echo ran > {}\n", sh_path(&started)),
+            )
+            .unwrap();
+            // `/ci/run` is the run directory inside the container.
+            let script = run.join("clock.sh");
+            std::fs::write(
+                &script,
+                clock_sh().replace("/ci/run", &run.to_string_lossy()),
+            )
+            .unwrap();
+            let path = format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let log = base.join("date.log");
+            let clock = |date_exit: &str| {
+                let _ = std::fs::remove_file(&started);
+                let _ = std::fs::remove_file(&log);
+                let output = std::process::Command::new("/bin/sh")
+                    .arg(&script)
+                    .env("PATH", &path)
+                    .env("STUB_DATE_LOG", &log)
+                    .env("STUB_DATE_EXIT", date_exit)
+                    .output()
+                    .expect("run sh");
+                (
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stdout).into_owned(),
+                )
+            };
 
-        // A wipe starts from nothing.
-        assert_eq!(pipeline(Checkout::Wipe), Some(0));
-        assert_eq!(read("main.rs").as_deref(), Some("pipeline"));
-        assert_eq!(read("target/marker"), None);
-        assert_eq!(read(".zci-siblings/lib/answer"), None);
-        let _ = std::fs::remove_dir_all(&base);
+            let (code, out) = clock("0");
+            assert_eq!(code, Some(0), "{out}");
+            assert_eq!(
+                std::fs::read_to_string(&log).unwrap(),
+                "-s @1700000000.255000\n"
+            );
+            assert!(!out.contains("warning"), "{out}");
+            assert!(started.exists(), "the job runs");
+            assert!(!run.join(".clock").exists());
+
+            let (code, out) = clock("1");
+            assert_eq!(code, Some(0), "{out}");
+            assert!(
+                out.contains("warning: cannot set the container clock from the host"),
+                "{out}"
+            );
+            assert!(started.exists(), "the job runs on with the clock it had");
+            assert!(!run.join(".clock").exists());
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// `git -C dir args`, which must succeed: its output without the final
+        /// newline.
+        #[cfg(unix)]
+        fn git(dir: &Path, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+
+        /// `script` under `/bin/sh`: its exit code and standard output.
+        #[cfg(unix)]
+        fn sh(script: &str) -> (Option<i32>, String) {
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .output()
+                .expect("run sh");
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+            )
+        }
+
+        /// One snapshot of the repository `base/src/<name>`, as the agent's
+        /// snapshot makes it: `files` written (None removes one), a commit
+        /// without a parent of the whole tree, and a bundle of it under `refname`
+        /// as bundle `index` of the run in `run_dir`. Returns the commit.
+        #[cfg(unix)]
+        fn snapshot(
+            base: &Path,
+            run_dir: &Path,
+            name: &str,
+            files: &[(&str, Option<&str>)],
+            refname: &str,
+            index: u32,
+        ) -> String {
+            let src = base.join("src").join(name);
+            std::fs::create_dir_all(&src).unwrap();
+            if !src.join(".git").exists() {
+                git(&src, &["init", "-q"]);
+            }
+            for (file, text) in files {
+                match text {
+                    Some(text) => std::fs::write(src.join(file), text).unwrap(),
+                    None => std::fs::remove_file(src.join(file)).unwrap(),
+                }
+            }
+            git(&src, &["add", "-A"]);
+            let tree = git(&src, &["write-tree"]);
+            let commit = git(&src, &["commit-tree", &tree, "-m", "manual run"]);
+            git(&src, &["update-ref", refname, &commit]);
+            std::fs::create_dir_all(run_dir.join("bundles")).unwrap();
+            let bundle = bundle_file(run_dir, index);
+            git(
+                &src,
+                &["bundle", "create", bundle.to_str().unwrap(), refname],
+            );
+            git(&src, &["update-ref", "-d", refname]);
+            commit
+        }
+
+        /// The shell side of a pipeline's checkout, run for real: what a job
+        /// leaves that git ignores (`target/`) is there for the next checkout, the
+        /// rest of what is untracked is not, and a wipe takes the ignored files
+        /// too.
+        #[test]
+        #[cfg(unix)]
+        fn a_checkout_keeps_what_git_ignores_until_it_is_a_wipe() {
+            let base =
+                std::env::temp_dir().join(format!("zci-launch-checkout-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let (mirror, ws) = (base.join("mirror"), base.join("ws"));
+            std::fs::create_dir_all(&mirror).unwrap();
+            git(&mirror, &["init", "-q"]);
+            std::fs::write(mirror.join("tracked"), "x").unwrap();
+            std::fs::write(mirror.join(".gitignore"), "target/\n").unwrap();
+            git(&mirror, &["add", "-A"]);
+            git(&mirror, &["commit", "-q", "-m", "c"]);
+            git(&mirror, &["update-ref", "refs/ci/7", "HEAD"]);
+            let enter = |checkout: Checkout| {
+                let a = Assignment {
+                    checkout,
+                    ..assignment(Place::Host)
+                };
+                sh(&enter_sh(&a, &ws, &mirror)).0
+            };
+
+            assert_eq!(enter(Checkout::Clean), Some(0));
+            assert!(ws.join("tracked").exists());
+            assert!(ws.join(".git/zci-last-used").exists());
+
+            // A job builds into an ignored directory and leaves a stray file.
+            std::fs::create_dir_all(ws.join("target")).unwrap();
+            std::fs::write(ws.join("target/marker"), "").unwrap();
+            std::fs::write(ws.join("stray"), "").unwrap();
+            assert_eq!(enter(Checkout::Clean), Some(0));
+            assert!(ws.join("target/marker").exists());
+            assert!(!ws.join("stray").exists());
+            assert!(ws.join("tracked").exists());
+
+            assert_eq!(enter(Checkout::Wipe), Some(0));
+            assert!(!ws.join("target").exists());
+            assert!(ws.join("tracked").exists());
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// The shell side of a manual run, run for real against bundles as the
+        /// agent's snapshot makes them: the first checkout lands in the workspace
+        /// itself and the others in `.zci-siblings` below it, a later run finds
+        /// what an earlier one built there, and a bundle that does not hold its
+        /// commit ends the launcher with 70.
+        #[test]
+        #[cfg(unix)]
+        fn a_manual_run_enters_every_working_tree_from_its_bundle() {
+            let base =
+                std::env::temp_dir().join(format!("zci-launch-manual-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let (ws, run_dir) = (base.join("ws"), base.join("run"));
+
+            let upload = |app: &str, lib: &str| Upload {
+                dirs: vec![upload_dir("app", app), upload_dir("lib", lib)],
+            };
+            let enter = |upload: &Upload| {
+                sh(&format!(
+                    "{}pwd -P\n",
+                    enter_manual_sh(upload, &ws, &run_dir)
+                ))
+            };
+            let read = |path: &str| std::fs::read_to_string(ws.join(path)).ok();
+            let excludes = || {
+                read(".git/info/exclude")
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|line| *line == "/.zci-siblings/")
+                    .count()
+            };
+
+            // The first run: both trees come out of their bundles.
+            let app1 = snapshot(
+                &base,
+                &run_dir,
+                "app",
+                &[
+                    ("main.rs", Some("v1")),
+                    ("old", Some("")),
+                    (".gitignore", Some("target/\n")),
+                ],
+                "refs/zci-manual/1-1",
+                0,
+            );
+            let lib1 = snapshot(
+                &base,
+                &run_dir,
+                "lib",
+                &[("answer", Some("41"))],
+                "refs/zci-manual/1-1",
+                1,
+            );
+            let (code, out) = enter(&upload(&app1, &lib1));
+            assert_eq!(code, Some(0), "{out}");
+            assert_eq!(read("main.rs").as_deref(), Some("v1"));
+            assert_eq!(read(".zci-siblings/lib/answer").as_deref(), Some("41"));
+            assert_eq!(
+                out.trim_end(),
+                std::fs::canonicalize(&ws).unwrap().to_string_lossy(),
+                "the script ends in the main checkout"
+            );
+            assert!(!run_dir.join("bundles").exists(), "the bundles are gone");
+            assert!(ws.join(".git/zci-last-used").exists());
+            // The siblings are no change of the main checkout.
+            assert_eq!(excludes(), 1);
+            assert_eq!(
+                git(&ws, &["status", "--porcelain", "--untracked-files=all"]),
+                ""
+            );
+
+            // A build leaves its output in an ignored directory, and a stray file.
+            std::fs::create_dir_all(ws.join("target")).unwrap();
+            std::fs::write(ws.join("target/marker"), "built").unwrap();
+            std::fs::write(ws.join("stray"), "").unwrap();
+
+            // The next run, from other bundles: the snapshot replaces the trees
+            // (a deleted file goes, a stray one goes), the build output stays, the
+            // ref of the first bundle is pruned and the exclude line is not
+            // written twice.
+            let app2 = snapshot(
+                &base,
+                &run_dir,
+                "app",
+                &[("main.rs", Some("v2")), ("old", None)],
+                "refs/zci-manual/2-1",
+                0,
+            );
+            let lib2 = snapshot(
+                &base,
+                &run_dir,
+                "lib",
+                &[("answer", Some("42"))],
+                "refs/zci-manual/2-1",
+                1,
+            );
+            let (code, out) = enter(&upload(&app2, &lib2));
+            assert_eq!(code, Some(0), "{out}");
+            assert_eq!(read("main.rs").as_deref(), Some("v2"));
+            assert_eq!(read(".zci-siblings/lib/answer").as_deref(), Some("42"));
+            assert_eq!(read("old"), None);
+            assert_eq!(read("stray"), None);
+            assert_eq!(read("target/marker").as_deref(), Some("built"));
+            let refs = git(&ws, &["for-each-ref", "--format=%(refname)"]);
+            assert_eq!(refs, "refs/zci-manual/2-1");
+            assert_eq!(excludes(), 1);
+
+            // A bundle that does not hold the commit ends it with 70, and says
+            // which checkout.
+            let lib3 = snapshot(
+                &base,
+                &run_dir,
+                "lib",
+                &[("answer", Some("43"))],
+                "refs/zci-manual/3-1",
+                1,
+            );
+            std::fs::write(bundle_file(&run_dir, 0), "not a bundle").unwrap();
+            let (code, out) = enter(&upload(&app2, &lib3));
+            assert_eq!(code, Some(70), "{out}");
+            assert!(
+                out.contains("[zeughaus-ci] checkout of app failed"),
+                "{out}"
+            );
+            assert_eq!(
+                read(".zci-siblings/lib/answer").as_deref(),
+                Some("42"),
+                "nothing past it ran"
+            );
+
+            // So does one of a sibling, after the main checkout is in.
+            let app4 = snapshot(
+                &base,
+                &run_dir,
+                "app",
+                &[("main.rs", Some("v3"))],
+                "refs/zci-manual/4-1",
+                0,
+            );
+            std::fs::write(bundle_file(&run_dir, 1), "not a bundle").unwrap();
+            let (code, out) = enter(&upload(&app4, &lib3));
+            assert_eq!(code, Some(70), "{out}");
+            assert!(
+                out.contains("[zeughaus-ci] checkout of lib failed"),
+                "{out}"
+            );
+            assert_eq!(read("main.rs").as_deref(), Some("v3"));
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// A pipeline job and a manual run take turns in the workspace of their
+        /// place, run for real: each finds the build output the other left, each
+        /// replaces the tree, and a pipeline's checkout leaves the siblings of a
+        /// manual run alone until it is a wipe.
+        #[test]
+        #[cfg(unix)]
+        fn a_pipeline_job_and_a_manual_run_share_one_workspace() {
+            let base =
+                std::env::temp_dir().join(format!("zci-launch-shared-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let (mirror, ws, run_dir) = (base.join("mirror"), base.join("ws"), base.join("run"));
+            std::fs::create_dir_all(&mirror).unwrap();
+            git(&mirror, &["init", "-q"]);
+            std::fs::write(mirror.join("main.rs"), "pipeline").unwrap();
+            std::fs::write(mirror.join(".gitignore"), "target/\n").unwrap();
+            git(&mirror, &["add", "-A"]);
+            git(&mirror, &["commit", "-q", "-m", "c"]);
+            git(&mirror, &["update-ref", "refs/ci/7", "HEAD"]);
+            let read = |path: &str| std::fs::read_to_string(ws.join(path)).ok();
+            let pipeline = |checkout: Checkout| {
+                let a = Assignment {
+                    checkout,
+                    ..assignment(Place::Host)
+                };
+                sh(&enter_sh(&a, &ws, &mirror)).0
+            };
+
+            // The pipeline's job builds.
+            assert_eq!(pipeline(Checkout::Clean), Some(0));
+            assert_eq!(read("main.rs").as_deref(), Some("pipeline"));
+            std::fs::create_dir_all(ws.join("target")).unwrap();
+            std::fs::write(ws.join("target/marker"), "built").unwrap();
+
+            // A manual run of the working tree finds that build and brings a
+            // sibling.
+            let app = snapshot(
+                &base,
+                &run_dir,
+                "app",
+                &[
+                    ("main.rs", Some("manual")),
+                    (".gitignore", Some("target/\n")),
+                ],
+                "refs/zci-manual/1-1",
+                0,
+            );
+            let lib = snapshot(
+                &base,
+                &run_dir,
+                "lib",
+                &[("answer", Some("42"))],
+                "refs/zci-manual/1-1",
+                1,
+            );
+            let upload = Upload {
+                dirs: vec![upload_dir("app", &app), upload_dir("lib", &lib)],
+            };
+            let (code, out) = sh(&enter_manual_sh(&upload, &ws, &run_dir));
+            assert_eq!(code, Some(0), "{out}");
+            assert_eq!(read("main.rs").as_deref(), Some("manual"));
+            assert_eq!(read("target/marker").as_deref(), Some("built"));
+            assert_eq!(read(".zci-siblings/lib/answer").as_deref(), Some("42"));
+
+            // The next pipeline job finds the build and the sibling.
+            assert_eq!(pipeline(Checkout::Clean), Some(0));
+            assert_eq!(read("main.rs").as_deref(), Some("pipeline"));
+            assert_eq!(read("target/marker").as_deref(), Some("built"));
+            assert_eq!(read(".zci-siblings/lib/answer").as_deref(), Some("42"));
+
+            // A wipe starts from nothing.
+            assert_eq!(pipeline(Checkout::Wipe), Some(0));
+            assert_eq!(read("main.rs").as_deref(), Some("pipeline"));
+            assert_eq!(read("target/marker"), None);
+            assert_eq!(read(".zci-siblings/lib/answer"), None);
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 }

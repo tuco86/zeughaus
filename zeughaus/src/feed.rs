@@ -640,175 +640,184 @@ mod tests {
         assert_eq!(next_attempt(u32::MAX, brief), u32::MAX);
     }
 
-    /// One incarnation of a runtime's transport side: a bound listener with
-    /// the event topic, the snapshot service and a feed that answers every
-    /// request with one 2x2 frame stamped `seq` and then ends the exchange.
-    struct FakeRuntime {
-        runtime: weida::Runtime,
-        binding: weida::Binding,
-        publisher: weida::Publisher,
-    }
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-    impl FakeRuntime {
-        async fn bind(port: u16, identity: weida::Identity, seq: u64) -> FakeRuntime {
-            let runtime = weida::Runtime::new(weida::RuntimeConfig::default()).expect("runtime");
-            let listener = runtime.listener();
-            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-            let binding = listener.bind_quic(addr, identity).await.expect("bind");
-            let publisher = listener.publisher(EVENTS_PATH).expect("publisher");
-            let replier = listener.replier(SNAPSHOT_PATH).expect("replier");
-            tokio::spawn(async move {
-                while let Ok(mut request) = replier.accept().await {
-                    drop(request.take_body());
-                    let snapshot = Snapshot {
-                        seq,
-                        ..Snapshot::default()
-                    };
-                    let mut reply = request.reply(TransferMeta::default()).await.expect("reply");
-                    reply.write_all(&snapshot.encode()).await.expect("write");
-                    reply.finish().expect("finish");
+        /// One incarnation of a runtime's transport side: a bound listener with
+        /// the event topic, the snapshot service and a feed that answers every
+        /// request with one 2x2 frame stamped `seq` and then ends the exchange.
+        struct FakeRuntime {
+            runtime: weida::Runtime,
+            binding: weida::Binding,
+            publisher: weida::Publisher,
+        }
+
+        impl FakeRuntime {
+            async fn bind(port: u16, identity: weida::Identity, seq: u64) -> FakeRuntime {
+                let runtime =
+                    weida::Runtime::new(weida::RuntimeConfig::default()).expect("runtime");
+                let listener = runtime.listener();
+                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+                let binding = listener.bind_quic(addr, identity).await.expect("bind");
+                let publisher = listener.publisher(EVENTS_PATH).expect("publisher");
+                let replier = listener.replier(SNAPSHOT_PATH).expect("replier");
+                tokio::spawn(async move {
+                    while let Ok(mut request) = replier.accept().await {
+                        drop(request.take_body());
+                        let snapshot = Snapshot {
+                            seq,
+                            ..Snapshot::default()
+                        };
+                        let mut reply =
+                            request.reply(TransferMeta::default()).await.expect("reply");
+                        reply.write_all(&snapshot.encode()).await.expect("write");
+                        reply.finish().expect("finish");
+                    }
+                });
+                let feed = listener.replier(FEED_PATH).expect("feed replier");
+                tokio::spawn(async move {
+                    while let Ok(mut request) = feed.accept().await {
+                        let ask = request
+                            .take_body()
+                            .read_capped(4096)
+                            .await
+                            .expect("request");
+                        assert!(FeedRequest::decode(&ask).is_some(), "a well-formed request");
+                        let mut reply =
+                            request.reply(TransferMeta::default()).await.expect("reply");
+                        let header = FrameHeader::new(seq, 2, 2);
+                        reply.write_all(&header.encode()).await.expect("header");
+                        reply.write_all(&[7u8; 16]).await.expect("pixels");
+                        reply.finish().expect("finish");
+                    }
+                });
+                FakeRuntime {
+                    runtime,
+                    binding,
+                    publisher,
                 }
-            });
-            let feed = listener.replier(FEED_PATH).expect("feed replier");
-            tokio::spawn(async move {
-                while let Ok(mut request) = feed.accept().await {
-                    let ask = request
-                        .take_body()
-                        .read_capped(4096)
-                        .await
-                        .expect("request");
-                    assert!(FeedRequest::decode(&ask).is_some(), "a well-formed request");
-                    let mut reply = request.reply(TransferMeta::default()).await.expect("reply");
-                    let header = FrameHeader::new(seq, 2, 2);
-                    reply.write_all(&header.encode()).await.expect("header");
-                    reply.write_all(&[7u8; 16]).await.expect("pixels");
-                    reply.finish().expect("finish");
+            }
+
+            fn port(&self) -> u16 {
+                self.binding.local_addr().port()
+            }
+
+            /// Publishes until the subscriber is there to receive: a subscription
+            /// registered on a redialled connection lands a moment after the
+            /// address reports `Connected`.
+            async fn publish(&self, seq: u64) {
+                let event = RuntimeEvent::Edge { seq, edge_id: 1 };
+                for _ in 0..100 {
+                    if self.publisher.subscriber_count() > 0 {
+                        self.publisher
+                            .publish(zeughaus_link::TOPIC_EDGE, event.encode())
+                            .expect("publish");
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-            });
-            FakeRuntime {
-                runtime,
-                binding,
-                publisher,
+                panic!("no subscriber arrived");
+            }
+
+            /// Ends this incarnation the way a stopping runner does: every
+            /// connection closed with a shutdown, then the socket released.
+            async fn stop(self) {
+                self.binding.close().await;
+                self.runtime.shutdown().await;
             }
         }
 
-        fn port(&self) -> u16 {
-            self.binding.local_addr().port()
-        }
+        /// The whole point of the cutover: a runtime that goes away and comes
+        /// back under the same identity on the same port is redialled by weida,
+        /// and this side's only work is to say `Lost`, fetch the snapshot the
+        /// gap needs, and reopen the feed exchange. No second dial happens here
+        /// -- there is no loop left that could make one. Loopback QUIC, so it
+        /// needs a reactor; the process-wide client runtime binds to this test's
+        /// reactor, which is why it is the one network test in this module.
+        #[tokio::test]
+        async fn a_restarted_runtime_is_redialled_by_weida_not_by_us() {
+            use iced::futures::StreamExt;
+            use weida::EndpointAddr;
 
-        /// Publishes until the subscriber is there to receive: a subscription
-        /// registered on a redialled connection lands a moment after the
-        /// address reports `Connected`.
-        async fn publish(&self, seq: u64) {
-            let event = RuntimeEvent::Edge { seq, edge_id: 1 };
-            for _ in 0..100 {
-                if self.publisher.subscriber_count() > 0 {
-                    self.publisher
-                        .publish(zeughaus_link::TOPIC_EDGE, event.encode())
-                        .expect("publish");
-                    return;
+            let identity = weida::Identity::generate_for(["127.0.0.1"]).expect("identity");
+            let fingerprint = identity.fingerprint().expect("fingerprint");
+            let first = FakeRuntime::bind(0, identity.clone(), 1).await;
+            let port = first.port();
+            let endpoint = Endpoint(
+                EndpointAddr {
+                    host: "127.0.0.1".to_owned(),
+                    port: Some(port),
+                    path: "/".to_owned(),
+                    peer: Some(fingerprint),
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                .to_string(),
+            );
+
+            let mut traffic = std::pin::pin!(events(endpoint.clone()));
+            let mut video = std::pin::pin!(frames(FeedSpec {
+                endpoint,
+                key: FeedKey {
+                    node_id: 9,
+                    pin: Arc::from("frame"),
+                },
+                epoch: 0,
+                tier: 240,
+            }));
+            async fn next<T>(stream: &mut (impl Stream<Item = T> + Unpin)) -> T {
+                tokio::time::timeout(Duration::from_secs(10), stream.next())
+                    .await
+                    .expect("an item within 10 s")
+                    .expect("stream still open")
             }
-            panic!("no subscriber arrived");
-        }
 
-        /// Ends this incarnation the way a stopping runner does: every
-        /// connection closed with a shutdown, then the socket released.
-        async fn stop(self) {
-            self.binding.close().await;
-            self.runtime.shutdown().await;
-        }
-    }
+            assert!(matches!(next(&mut traffic).await, Traffic::Snapshot(s) if s.seq == 1));
+            first.publish(2).await;
+            assert!(matches!(
+                next(&mut traffic).await,
+                Traffic::Event(RuntimeEvent::Edge { seq: 2, .. })
+            ));
+            let frame = next(&mut video).await;
+            assert_eq!((frame.order.stream, frame.order.seq), (0, 1));
+            assert_eq!(frame.image.width(), 2);
 
-    /// The whole point of the cutover: a runtime that goes away and comes
-    /// back under the same identity on the same port is redialled by weida,
-    /// and this side's only work is to say `Lost`, fetch the snapshot the
-    /// gap needs, and reopen the feed exchange. No second dial happens here
-    /// -- there is no loop left that could make one. Loopback QUIC, so it
-    /// needs a reactor; the process-wide client runtime binds to this test's
-    /// reactor, which is why it is the one network test in this module.
-    #[tokio::test]
-    async fn a_restarted_runtime_is_redialled_by_weida_not_by_us() {
-        use iced::futures::StreamExt;
-        use weida::EndpointAddr;
+            first.stop().await;
+            assert!(matches!(next(&mut traffic).await, Traffic::Lost));
 
-        let identity = weida::Identity::generate_for(["127.0.0.1"]).expect("identity");
-        let fingerprint = identity.fingerprint().expect("fingerprint");
-        let first = FakeRuntime::bind(0, identity.clone(), 1).await;
-        let port = first.port();
-        let endpoint = Endpoint(
-            EndpointAddr {
-                host: "127.0.0.1".to_owned(),
-                port: Some(port),
-                path: "/".to_owned(),
-                peer: Some(fingerprint),
-            }
-            .to_string(),
-        );
+            let second = FakeRuntime::bind(port, identity, 3).await;
+            assert!(matches!(next(&mut traffic).await, Traffic::Snapshot(s) if s.seq == 3));
+            second.publish(4).await;
+            assert!(matches!(
+                next(&mut traffic).await,
+                Traffic::Event(RuntimeEvent::Edge { seq: 4, .. })
+            ));
+            // The feed's exchange was reopened on the redialled connection: a
+            // later stream number, and the second incarnation's frame on it.
+            let frame = next(&mut video).await;
+            assert!(frame.order.stream > 0, "a fresh stream after the restart");
+            assert_eq!(frame.order.seq, 3);
+            second.stop().await;
+            assert!(matches!(next(&mut traffic).await, Traffic::Lost));
 
-        let mut traffic = std::pin::pin!(events(endpoint.clone()));
-        let mut video = std::pin::pin!(frames(FeedSpec {
-            endpoint,
-            key: FeedKey {
-                node_id: 9,
-                pin: Arc::from("frame"),
-            },
-            epoch: 0,
-            tier: 240,
-        }));
-        async fn next<T>(stream: &mut (impl Stream<Item = T> + Unpin)) -> T {
-            tokio::time::timeout(Duration::from_secs(10), stream.next())
+            // A runner restarted with a fresh identity is a stranger to the
+            // address: weida refuses it in the handshake and gives the address
+            // up, and both streams end rather than looping on the loss. The
+            // runner's new address is what replaces them.
+            // Bounded by the redial schedule: two addresses back off
+            // independently up to 4 s per attempt, and the feed's own re-open
+            // pace sits on top, so the sum can pass ten seconds on a busy host.
+            let stranger = weida::Identity::generate_for(["127.0.0.1"]).expect("identity");
+            let third = FakeRuntime::bind(port, stranger, 5).await;
+            let ended = tokio::time::timeout(Duration::from_secs(30), traffic.next())
                 .await
-                .expect("an item within 10 s")
-                .expect("stream still open")
+                .expect("the event stream ends within 30 s");
+            assert!(ended.is_none(), "got {ended:?} from a stranger");
+            let ended = tokio::time::timeout(Duration::from_secs(30), video.next())
+                .await
+                .expect("the feed ends within 30 s");
+            assert!(ended.is_none(), "got {ended:?} from a stranger");
+            third.stop().await;
         }
-
-        assert!(matches!(next(&mut traffic).await, Traffic::Snapshot(s) if s.seq == 1));
-        first.publish(2).await;
-        assert!(matches!(
-            next(&mut traffic).await,
-            Traffic::Event(RuntimeEvent::Edge { seq: 2, .. })
-        ));
-        let frame = next(&mut video).await;
-        assert_eq!((frame.order.stream, frame.order.seq), (0, 1));
-        assert_eq!(frame.image.width(), 2);
-
-        first.stop().await;
-        assert!(matches!(next(&mut traffic).await, Traffic::Lost));
-
-        let second = FakeRuntime::bind(port, identity, 3).await;
-        assert!(matches!(next(&mut traffic).await, Traffic::Snapshot(s) if s.seq == 3));
-        second.publish(4).await;
-        assert!(matches!(
-            next(&mut traffic).await,
-            Traffic::Event(RuntimeEvent::Edge { seq: 4, .. })
-        ));
-        // The feed's exchange was reopened on the redialled connection: a
-        // later stream number, and the second incarnation's frame on it.
-        let frame = next(&mut video).await;
-        assert!(frame.order.stream > 0, "a fresh stream after the restart");
-        assert_eq!(frame.order.seq, 3);
-        second.stop().await;
-        assert!(matches!(next(&mut traffic).await, Traffic::Lost));
-
-        // A runner restarted with a fresh identity is a stranger to the
-        // address: weida refuses it in the handshake and gives the address
-        // up, and both streams end rather than looping on the loss. The
-        // runner's new address is what replaces them.
-        // Bounded by the redial schedule: two addresses back off
-        // independently up to 4 s per attempt, and the feed's own re-open
-        // pace sits on top, so the sum can pass ten seconds on a busy host.
-        let stranger = weida::Identity::generate_for(["127.0.0.1"]).expect("identity");
-        let third = FakeRuntime::bind(port, stranger, 5).await;
-        let ended = tokio::time::timeout(Duration::from_secs(30), traffic.next())
-            .await
-            .expect("the event stream ends within 30 s");
-        assert!(ended.is_none(), "got {ended:?} from a stranger");
-        let ended = tokio::time::timeout(Duration::from_secs(30), video.next())
-            .await
-            .expect("the feed ends within 30 s");
-        assert!(ended.is_none(), "got {ended:?} from a stranger");
-        third.stop().await;
     }
 }

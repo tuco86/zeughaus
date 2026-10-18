@@ -2442,11 +2442,6 @@ pub(crate) fn read_ci(mirror: &Path, sha: &str) -> Result<CiFiles, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    use zeughaus_link::enlist::UploadDir;
-    use zeughaus_link::manual::RunUpload;
-
     use super::*;
 
     const FP_1: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
@@ -2459,14 +2454,6 @@ mod tests {
         assert_eq!(map["aaa"], "fix: a  b");
         assert_eq!(map["bbb"], "");
         assert_eq!(map["ccc"], "x");
-    }
-
-    fn scratch(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("zeughaus-sched-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create the scratch directory");
-        dir
     }
 
     fn pipeline(channel: &str) -> Pipeline {
@@ -2496,90 +2483,6 @@ mod tests {
             cancelled: false,
             clean: false,
         }
-    }
-
-    #[test]
-    fn an_annotated_tag_event_runs_the_commit_it_points_at() {
-        let repo = scratch("peel");
-        let run = |args: &[&str]| {
-            git(
-                &repo,
-                args,
-                &[
-                    ("GIT_AUTHOR_NAME".to_owned(), "t".to_owned()),
-                    ("GIT_AUTHOR_EMAIL".to_owned(), "t@t".to_owned()),
-                    ("GIT_COMMITTER_NAME".to_owned(), "t".to_owned()),
-                    ("GIT_COMMITTER_EMAIL".to_owned(), "t@t".to_owned()),
-                ],
-            )
-            .expect("git")
-        };
-        run(&["init", "-q", "-b", "main"]);
-        run(&["commit", "-q", "--allow-empty", "-m", "release"]);
-        run(&["tag", "-a", "v1.0.0", "-m", "Release 1.0.0"]);
-        let commit = run(&["rev-parse", "HEAD"]).trim().to_owned();
-        let tag_object = run(&["rev-parse", "v1.0.0"]).trim().to_owned();
-        assert_ne!(
-            commit, tag_object,
-            "an annotated tag is an object of its own"
-        );
-
-        let mut event = pipeline("release").event;
-        event.kind = EventKind::Tag;
-        event.git_ref = "v1.0.0".to_owned();
-        // As the forge reports the push, and as `zeughaus-ci run` names it.
-        event.sha = Some(tag_object);
-        assert_eq!(event_commit(&repo, &event), Ok(commit.clone()));
-        event.sha = None;
-        assert_eq!(event_commit(&repo, &event), Ok(commit));
-
-        event.sha = Some("0".repeat(40));
-        assert!(event_commit(&repo, &event).is_err());
-        let _ = std::fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn a_saved_record_is_announced_under_its_channel() {
-        let state = scratch("announce");
-        let (changes, announced) = std::sync::mpsc::channel();
-        pipeline("release").save(&state, &changes);
-        // A record from before channels existed is announced under the
-        // channel its event sorts into.
-        let mut old = pipeline("");
-        old.number = 8;
-        old.save(&state, &changes);
-
-        assert!(pipelines_dir(&state, "view").join("7.json").exists());
-        assert_eq!(
-            announced.try_recv(),
-            Ok(CiChange {
-                repo: "view".to_owned(),
-                channel: "release".to_owned(),
-                number: 7,
-            })
-        );
-        assert_eq!(
-            announced.try_recv(),
-            Ok(CiChange {
-                repo: "view".to_owned(),
-                channel: "main".to_owned(),
-                number: 8,
-            })
-        );
-        assert!(announced.try_recv().is_err());
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_record_that_cannot_be_written_is_not_announced() {
-        let state = scratch("unwritable");
-        // A state directory below a file cannot be created.
-        let file = state.join("file");
-        std::fs::write(&file, "").expect("write the blocking file");
-        let (changes, announced) = std::sync::mpsc::channel();
-        pipeline("dev").save(&file.join("state"), &changes);
-        assert!(announced.try_recv().is_err());
-        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]
@@ -2879,34 +2782,6 @@ mod tests {
 
     // ---- assignment and runner messages, against a fake registry
 
-    fn scheduler(state: &Path) -> Scheduler {
-        let config = Arc::new(
-            CiConfig::parse(&format!(
-                "default_runner = \"x\"\n\
-                 [runners.x]\nfingerprint = \"{FP_1}\"\n\
-                 [runners.y]\nfingerprint = \"{FP_2}\"\nwait_minutes = 1\n\
-                 [repos.view]\nurl = \"file:///nowhere\"\n"
-            ))
-            .expect("a valid config"),
-        );
-        scheduler_over(state, config)
-    }
-
-    fn scheduler_over(state: &Path, config: Arc<CiConfig>) -> Scheduler {
-        let (_tx, rx) = std::sync::mpsc::channel();
-        let (alerts, _) = std::sync::mpsc::channel();
-        let (changes, _) = std::sync::mpsc::channel();
-        Scheduler::new(
-            state.to_path_buf(),
-            config,
-            Secrets::new(None, state),
-            Arc::new(Runners::new()),
-            rx,
-            alerts,
-            changes,
-        )
-    }
-
     fn connect(
         runners: &Runners,
         name: &str,
@@ -2965,31 +2840,11 @@ mod tests {
         }
     }
 
-    /// `a` (on `a_runner`) succeeded with artifacts; `b` needs it, runs on `y`.
-    fn two_jobs(a_runner: &str) -> Pipeline {
-        let mut p = pipeline("dev");
-        p.repo = "view".to_owned();
-        p.sha = Some("abc".to_owned());
-        let mut a = record("a", &[], a_runner, JobStatus::Succeeded);
-        a.artifacts = true;
-        p.jobs = vec![a, record("b", &["a"], "y", JobStatus::Pending)];
-        p
-    }
-
     fn assigned(rx: &mut tokio::sync::mpsc::UnboundedReceiver<ToRunner>) -> Box<Assignment> {
         match rx.try_recv() {
             Ok(ToRunner::Assign { assignment }) => assignment,
             other => panic!("expected an assignment, got {other:?}"),
         }
-    }
-
-    /// `job` in a container of `image`, tagged `tag`, on its runner.
-    fn in_image(mut job: JobRecord, image: &str, tag: &str) -> JobRecord {
-        job.place = Some(Place::Container {
-            image: image.to_owned(),
-            tag: tag.to_owned(),
-        });
-        job
     }
 
     /// Pipeline `number` of `view` with these jobs.
@@ -3000,107 +2855,6 @@ mod tests {
         p.sha = Some("abc".to_owned());
         p.jobs = jobs;
         p
-    }
-
-    #[test]
-    fn jobs_of_one_pipeline_at_one_place_take_the_workspace_in_turn() {
-        use JobStatus::{Pending, Succeeded};
-        let state = scratch("place-turns");
-        let mut s = scheduler(&state);
-        let mut x = connect_offering(&s.runners, "x", 0, true);
-        // Two tags of one image, as a changed Containerfile makes: the tag is
-        // no part of the place, so the jobs share a workspace.
-        s.running.push(numbered(
-            1,
-            vec![
-                in_image(
-                    record("a", &[], "x", Pending),
-                    "x",
-                    "localhost/zci-view-x:1",
-                ),
-                in_image(
-                    record("b", &[], "x", Pending),
-                    "x",
-                    "localhost/zci-view-x:2",
-                ),
-            ],
-        ));
-
-        s.assign(0, 1);
-        let b = &s.running[0].jobs[1];
-        assert_eq!(
-            (b.status, b.note.as_str()),
-            (JobStatus::Waiting, "waiting for a in workspace image-x")
-        );
-        assert!(x.try_recv().is_err());
-
-        s.assign(0, 0);
-        assert_eq!(assigned(&mut x).run, "view.1.a");
-        s.assign(0, 1);
-        assert_eq!(
-            s.running[0].jobs[1].note,
-            "waiting for a in workspace image-x"
-        );
-        assert!(x.try_recv().is_err());
-
-        s.running[0].jobs[0].status = Succeeded;
-        s.assign(0, 1);
-        assert_eq!(assigned(&mut x).run, "view.1.b");
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_newer_pipeline_waits_for_the_older_ones_job_at_its_place() {
-        use JobStatus::{Pending, Succeeded};
-        let state = scratch("place-queue");
-        let mut s = scheduler(&state);
-        let mut x = connect_offering(&s.runners, "x", 0, true);
-        let a = |status| in_image(record("a", &[], "x", status), "x", "localhost/zci-view-x:1");
-        s.running.push(numbered(1, vec![a(Pending)]));
-        s.running.push(numbered(2, vec![a(Pending)]));
-
-        // #1's job has not started, and it is older: #2's queues behind it.
-        s.assign(1, 0);
-        assert_eq!(
-            (
-                s.running[1].jobs[0].status,
-                s.running[1].jobs[0].note.as_str()
-            ),
-            (JobStatus::Waiting, "workspace image-x queued for #1")
-        );
-        assert!(x.try_recv().is_err());
-
-        // The older job is never held back by the younger one.
-        s.assign(0, 0);
-        assert_eq!(assigned(&mut x).run, "view.1.a");
-        s.assign(1, 0);
-        assert_eq!(s.running[1].jobs[0].note, "workspace image-x in use by #1");
-        assert!(x.try_recv().is_err());
-
-        s.running[0].jobs[0].status = Succeeded;
-        s.assign(1, 0);
-        assert_eq!(assigned(&mut x).run, "view.2.a");
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn the_same_image_on_two_runners_or_in_two_repositories_is_no_shared_workspace() {
-        use JobStatus::{Pending, Running};
-        let state = scratch("place-apart");
-        let mut s = scheduler(&state);
-        let _x = connect_offering(&s.runners, "x", 0, true);
-        let mut y = connect_offering(&s.runners, "y", 0, true);
-        let at = |runner: &str, status| in_image(record("a", &[], runner, status), "x", "t");
-        // The same image at runner x, and in another repository at runner y.
-        s.running.push(numbered(1, vec![at("x", Running)]));
-        let mut elsewhere = numbered(1, vec![at("y", Running)]);
-        elsewhere.repo = "other".to_owned();
-        s.running.push(elsewhere);
-        s.running.push(numbered(2, vec![at("y", Pending)]));
-
-        s.assign(2, 0);
-        assert_eq!(assigned(&mut y).run, "view.2.a");
-        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]
@@ -3137,506 +2891,6 @@ mod tests {
     }
 
     #[test]
-    fn a_clean_pipeline_wipes_each_place_once() {
-        use JobStatus::{Pending, Succeeded};
-        let state = scratch("place-clean");
-        let mut s = scheduler(&state);
-        let mut x = connect_offering(&s.runners, "x", 0, true);
-        let mut p = numbered(
-            5,
-            vec![
-                record("a", &[], "x", Pending),
-                record("b", &[], "x", Pending),
-                in_image(record("c", &[], "x", Pending), "x", "t"),
-            ],
-        );
-        p.clean = true;
-        s.running.push(p);
-
-        s.assign(0, 0);
-        assert_eq!(assigned(&mut x).checkout, Checkout::Wipe);
-        s.running[0].jobs[0].status = Succeeded;
-        s.assign(0, 1);
-        assert_eq!(assigned(&mut x).checkout, Checkout::Clean);
-        // Another place is another workspace, which the pipeline has not used.
-        s.assign(0, 2);
-        assert_eq!(assigned(&mut x).checkout, Checkout::Wipe);
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    /// A repository with a clean `nightly` channel and two jobs whose headers
-    /// still carry a `context`, read the way a pipeline is set up.
-    #[test]
-    fn setting_up_marks_a_clean_pipeline_and_runs_jobs_that_carry_a_context() {
-        let origin = scratch("setup-origin");
-        let state = scratch("setup-state");
-        let author = [
-            ("GIT_AUTHOR_NAME".to_owned(), "t".to_owned()),
-            ("GIT_AUTHOR_EMAIL".to_owned(), "t@t".to_owned()),
-            ("GIT_COMMITTER_NAME".to_owned(), "t".to_owned()),
-            ("GIT_COMMITTER_EMAIL".to_owned(), "t@t".to_owned()),
-        ];
-        let ci = origin.join(CI_DIR);
-        std::fs::create_dir_all(&ci).unwrap();
-        for name in ["a", "b"] {
-            std::fs::write(
-                ci.join(format!("{name}.sh")),
-                "# /// ci\n# on = [\"push *\", \"cron 0 3 * * *\"]\n# context = \"box\"\n# ///\necho\n",
-            )
-            .unwrap();
-        }
-        std::fs::write(
-            ci.join("channels.toml"),
-            "[[channel]]\nname = \"nightly\"\non = [\"cron *\"]\nclean = true\n",
-        )
-        .unwrap();
-        git(&origin, &["init", "-q", "-b", "main"], &author).unwrap();
-        git(&origin, &["add", "."], &author).unwrap();
-        git(&origin, &["commit", "-q", "-m", "ci"], &author).unwrap();
-
-        let config = Arc::new(
-            CiConfig::parse(&format!(
-                "default_runner = \"x\"\n\
-                 [runners.x]\nfingerprint = \"{FP_1}\"\n\
-                 [repos.view]\nurl = '{}'\n",
-                origin.display()
-            ))
-            .expect("a valid config"),
-        );
-        let mut s = scheduler_over(&state, Arc::clone(&config));
-        let repo = config.repos["view"].clone();
-        for (kind, cron, channel, clean) in [
-            (EventKind::Push, None, "main", false),
-            (EventKind::Cron, Some("0 3 * * *"), "nightly", true),
-        ] {
-            let mut p = pipeline("");
-            p.event.kind = kind;
-            p.event.cron = cron.map(str::to_owned);
-            let event = p.event.clone();
-            let planned = s
-                .set_up("view", &repo, &event, &mut p)
-                .expect("set up")
-                .expect("a CI folder");
-            assert_eq!((p.channel.as_str(), p.clean), (channel, clean));
-            let jobs: Vec<(&str, &[&str])> = planned
-                .iter()
-                .map(|j| (j.def.name.as_str(), j.def.ignored_keys.as_slice()))
-                .collect();
-            assert_eq!(jobs, [("a", &["context"][..]), ("b", &["context"][..])]);
-        }
-        let _ = std::fs::remove_dir_all(&origin);
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    // ---- manual runs
-
-    /// The `.zeughaus-ci/` of a snapshot: `build` and `check` after it, a job
-    /// nobody asks for, and one on a VM.
-    const SNAPSHOT: &[(&str, &str)] = &[
-        (
-            ".zeughaus-ci/build.sh",
-            "# /// ci\n# on = [\"push main\"]\n# machine = \"atik\"\n# secrets = [\"TOKEN\"]\n# ///\necho build\n",
-        ),
-        (
-            ".zeughaus-ci/check.sh",
-            "# /// ci\n# needs = [\"build\"]\n# machine = \"atik\"\n# ///\necho check\n",
-        ),
-        (
-            ".zeughaus-ci/other.sh",
-            "# /// ci\n# on = [\"push main\"]\n# machine = \"atik\"\n# ///\necho other\n",
-        ),
-        (
-            ".zeughaus-ci/windows.ps1",
-            "# /// ci\n# on = [\"push main\"]\n# platform = \"windows-amd64\"\n# ///\nWrite-Output windows\n",
-        ),
-        (
-            ".zeughaus-ci/channels.toml",
-            "[[channel]]\nname = \"dev\"\non = [\"push main\"]\n",
-        ),
-    ];
-
-    /// An upload the way the `/manual` service leaves it, and the event that
-    /// names it. Every call is an upload of its own.
-    fn stored_manual(state: &Path, repo: &str, jobs: &[&str], sha: &str) -> CiEvent {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        let id = format!("{:016x}", NEXT.fetch_add(1, Ordering::Relaxed));
-        let upload = RunUpload {
-            origin: format!("git@example.org:me/{repo}.git"),
-            actor: "hannes@tuco-pc".to_owned(),
-            summary: "fix(core): thing\nsecond line".to_owned(),
-            jobs: jobs.iter().map(|job| (*job).to_owned()).collect(),
-            dirs: vec![
-                UploadDir {
-                    dir: repo.to_owned(),
-                    sha: sha.to_owned(),
-                },
-                UploadDir {
-                    dir: "lib".to_owned(),
-                    sha: "b".repeat(40),
-                },
-            ],
-            sizes: vec![1, 1],
-        };
-        std::fs::create_dir_all(manual::upload_dir(state, &id)).unwrap();
-        manual::write_upload(state, &id, &upload).unwrap();
-        CiEvent {
-            repo: repo.to_owned(),
-            kind: EventKind::Manual,
-            git_ref: "main".to_owned(),
-            sha: Some(sha.to_owned()),
-            cron: None,
-            actor: upload.actor,
-            delivery: None,
-            upload: Some(id),
-            received: 0,
-        }
-    }
-
-    /// One commit that holds `files`, in a repository of its own, bundled
-    /// the way a snapshot is: one ref under `refs/zci-manual/`. Returns the
-    /// bundle and the commit.
-    fn bundle_of(dir: &Path, files: &[(&str, &str)]) -> (PathBuf, String) {
-        let author = [
-            ("GIT_AUTHOR_NAME".to_owned(), "t".to_owned()),
-            ("GIT_AUTHOR_EMAIL".to_owned(), "t@t".to_owned()),
-            ("GIT_COMMITTER_NAME".to_owned(), "t".to_owned()),
-            ("GIT_COMMITTER_EMAIL".to_owned(), "t@t".to_owned()),
-        ];
-        let src = dir.join("src");
-        for (name, text) in files {
-            let path = src.join(name);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, text).unwrap();
-        }
-        git(&src, &["init", "-q", "-b", "main"], &author).unwrap();
-        git(&src, &["add", "-A"], &author).unwrap();
-        git(&src, &["commit", "-q", "-m", "zeughaus manual"], &author).unwrap();
-        git(
-            &src,
-            &["update-ref", "refs/zci-manual/1-1", "HEAD"],
-            &author,
-        )
-        .unwrap();
-        let bundle = dir.join("0.bundle");
-        let to = bundle.to_string_lossy();
-        git(
-            &src,
-            &["bundle", "create", &to, "refs/zci-manual/1-1"],
-            &author,
-        )
-        .unwrap();
-        let sha = git(&src, &["rev-parse", "HEAD"], &[]).unwrap();
-        (bundle, sha.trim().to_owned())
-    }
-
-    /// Puts `bundle` where the service left the first bundle of the upload
-    /// `event` names.
-    fn with_bundle(state: &Path, event: &CiEvent, bundle: &Path) {
-        let id = event.upload.as_deref().unwrap();
-        std::fs::copy(bundle, manual::bundle_path(state, id, 0)).unwrap();
-    }
-
-    #[test]
-    fn a_manual_run_is_the_named_jobs_of_the_snapshots_pipeline() {
-        let state = scratch("manual-jobs");
-        let (bundle, sha) = bundle_of(&scratch("manual-jobs-src"), SNAPSHOT);
-        let s = scheduler_over(&state, Arc::new(config()));
-        let set_up = |jobs: &[&str]| {
-            let event = stored_manual(&state, "demo", jobs, &sha);
-            with_bundle(&state, &event, &bundle);
-            let mut p = pipeline("");
-            let planned = s.set_up_manual(&event, &mut p);
-            (p, planned)
-        };
-
-        // In the order of the folder's jobs, whatever the order asked for,
-        // each where its header places it.
-        let (p, planned) = set_up(&["check", "build"]);
-        let planned = planned.expect("set up").expect("jobs");
-        let names: Vec<&str> = planned.iter().map(|j| j.def.name.as_str()).collect();
-        assert_eq!(names, ["build", "check"]);
-        assert!(
-            planned
-                .iter()
-                .all(|j| j.runner == "atik" && j.place == Place::Host)
-        );
-        assert_eq!(planned[1].def.needs, ["build"]);
-        // The code of a working tree gets no secrets.
-        assert!(planned[0].def.secrets.is_empty());
-        assert_eq!(p.sha.as_deref(), Some(sha.as_str()));
-        assert_eq!(
-            (p.subject.as_str(), p.channel.as_str(), p.clean),
-            ("fix(core): thing (check, build)", "dev", false)
-        );
-
-        // A need on a job the run does not name is dropped, and a job it
-        // does not name is not run.
-        let (_, planned) = set_up(&["check"]);
-        let planned = planned.expect("set up").expect("jobs");
-        assert_eq!(planned.len(), 1);
-        assert!(planned[0].def.needs.is_empty());
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_manual_run_that_cannot_be_set_up_says_why() {
-        let state = scratch("manual-refused");
-        let (bundle, sha) = bundle_of(&scratch("manual-refused-src"), SNAPSHOT);
-        let (bare, bare_sha) = bundle_of(&scratch("manual-refused-bare"), &[("README", "no ci\n")]);
-        let s = scheduler_over(&state, Arc::new(config()));
-        let refused = |event: &CiEvent| {
-            s.set_up_manual(event, &mut pipeline(""))
-                .err()
-                .expect("a pipeline that does not start")
-        };
-        let uploaded = |repo: &str, jobs: &[&str], bundle: &Path, sha: &str| {
-            let event = stored_manual(&state, repo, jobs, sha);
-            with_bundle(&state, &event, bundle);
-            event
-        };
-
-        assert_eq!(
-            refused(&uploaded("demo", &["zzz"], &bundle, &sha)),
-            "no job zzz in .zeughaus-ci/ of the working tree; its jobs are build, check, other, windows"
-        );
-        assert_eq!(
-            refused(&uploaded("demo", &["windows"], &bundle, &sha)),
-            "manual runs run on a runner's host or in a container; windows runs on the machine win11"
-        );
-        assert_eq!(
-            refused(&uploaded("demo", &["build"], &bare, &bare_sha)),
-            "no .zeughaus-ci/ in the working tree"
-        );
-        assert_eq!(
-            refused(&uploaded("nowhere", &["build"], &bundle, &sha)),
-            "nowhere is no repository of ci.toml"
-        );
-
-        // An event with no upload, one whose upload is gone, and one whose
-        // id is no id.
-        let mut event = stored_manual(&state, "demo", &["build"], &sha);
-        let id = event.upload.take();
-        assert_eq!(refused(&event), "a manual event carries no upload");
-        event.upload = Some("fedcba9876543210".to_owned());
-        assert_eq!(refused(&event), "manual upload fedcba9876543210 is gone");
-        event.upload = id.map(|id| format!("../{id}"));
-        assert_eq!(refused(&event), "a manual event carries no upload");
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    /// The image of a manual job is read from the snapshot's own
-    /// Containerfile, which only its bundle has; the mirror it is read from
-    /// goes with the last manual run of the repository.
-    #[test]
-    fn a_manual_job_with_an_image_reads_its_containerfile_from_the_snapshot() {
-        let state = scratch("manual-image");
-        let (bundle, sha) = bundle_of(
-            &scratch("manual-image-src"),
-            &[
-                (".zeughaus-ci/trixie.Containerfile", "FROM debian:trixie\n"),
-                (
-                    ".zeughaus-ci/arm.sh",
-                    "# /// ci\n# on = [\"push main\"]\n# platform = \"linux-arm64\"\n# image = \"trixie\"\n# ///\necho arm\n",
-                ),
-                (
-                    ".zeughaus-ci/vm.sh",
-                    "# /// ci\n# on = [\"push main\"]\n# platform = \"windows-amd64\"\n# image = \"trixie\"\n# ///\necho vm\n",
-                ),
-            ],
-        );
-        let mut s = scheduler_over(&state, Arc::new(config()));
-        let event = stored_manual(&state, "demo", &["arm"], &sha);
-        let id = event.upload.clone().unwrap();
-        with_bundle(&state, &event, &bundle);
-
-        let mut p = pipeline("");
-        p.repo = "demo".to_owned();
-        p.event = event.clone();
-        let planned = s.set_up_manual(&event, &mut p).unwrap().unwrap();
-        let digest = hex::encode(Sha256::digest(b"FROM debian:trixie\n"));
-        assert_eq!(planned[0].runner, "atik");
-        assert_eq!(
-            planned[0].place,
-            Place::Container {
-                image: "trixie".to_owned(),
-                tag: format!("localhost/zci-demo-trixie:{}", &digest[..16]),
-            }
-        );
-        let mirror = manual::mirror_dir(&state, "demo");
-        assert!(mirror.join("HEAD").exists());
-
-        // A VM runs no container.
-        let on_vm = stored_manual(&state, "demo", &["vm"], &sha);
-        with_bundle(&state, &on_vm, &bundle);
-        let err = s.set_up_manual(&on_vm, &mut pipeline("")).err().unwrap();
-        assert!(err.contains("an image needs a runner"), "{err}");
-
-        // Another manual run of the repository is still running: the mirror
-        // stays.
-        let mut other = pipeline("dev");
-        other.repo = "demo".to_owned();
-        other.event.kind = EventKind::Manual;
-        s.running.push(other);
-        s.drop_manual(&p);
-        assert!(!manual::upload_dir(&state, &id).exists());
-        assert!(mirror.exists());
-        s.running.clear();
-        s.drop_manual(&p);
-        assert!(!mirror.exists());
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_manual_run_that_cannot_start_ends_as_an_error_pipeline_its_uploader_hears_of() {
-        let state = scratch("manual-error");
-        let (bundle, sha) = bundle_of(&scratch("manual-error-src"), SNAPSHOT);
-        let mut s = scheduler_over(&state, Arc::new(config()));
-        let event = stored_manual(&state, "demo", &["windows"], &sha);
-        let id = event.upload.clone().unwrap();
-        with_bundle(&state, &event, &bundle);
-        let key = event::queue_key(&event);
-        s.start_pipeline(Path::new("/nonexistent/queue.json"), event, key);
-
-        assert!(s.running.is_empty());
-        let record = load_pipeline(&state, "demo", 1).expect("the record");
-        assert_eq!(record.status, PipelineStatus::Error);
-        assert_eq!(
-            record.note,
-            "manual runs run on a runner's host or in a container; windows runs on the machine win11"
-        );
-        assert_eq!(
-            (record.channel(), record.event.kind),
-            ("dev".to_owned(), EventKind::Manual)
-        );
-        assert!(record.jobs.is_empty() && record.finished.is_some());
-        // The service learns the number from a file beside the upload, which
-        // is gone: nothing runs.
-        let number = std::fs::read_to_string(manual::number_path(&state, &id));
-        assert_eq!(number.as_deref().ok(), Some("1"));
-        assert!(!manual::upload_dir(&state, &id).exists());
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    /// From the upload to the assignment to the cleaning up, with a second
-    /// manual run that waits for the workspace the first one holds.
-    #[test]
-    fn a_manual_run_is_assigned_with_its_working_trees_and_cleans_up_after_itself() {
-        let state = scratch("manual-run");
-        let (bundle, sha) = bundle_of(
-            &scratch("manual-run-src"),
-            &[(
-                ".zeughaus-ci/a.sh",
-                "# /// ci\n# on = [\"push main\"]\n# ///\necho a\n",
-            )],
-        );
-        let mut s = scheduler(&state);
-        let mut x = connect(&s.runners, "x", 0);
-        let start = |s: &mut Scheduler| {
-            let event = stored_manual(&state, "view", &["a"], &sha);
-            let id = event.upload.clone().unwrap();
-            with_bundle(&state, &event, &bundle);
-            let key = event::queue_key(&event);
-            s.start_pipeline(Path::new("/nonexistent/queue.json"), event, key);
-            id
-        };
-        let first = start(&mut s);
-        let second = start(&mut s);
-        assert_eq!(s.running.len(), 2);
-        let said = |id: &str| std::fs::read_to_string(manual::number_path(&state, id)).ok();
-        assert_eq!(said(&first).as_deref(), Some("1"));
-        assert_eq!(said(&second).as_deref(), Some("2"));
-
-        s.advance();
-        let a = assigned(&mut x);
-        assert_eq!(
-            (a.run.as_str(), a.job.as_str(), a.number),
-            ("view.1.a", "a", 1)
-        );
-        assert_eq!(a.checkout, Checkout::Clean);
-        // No forge, no secrets: the working trees come in bundles.
-        assert_eq!(
-            (
-                a.url.as_str(),
-                a.fetch_user.as_str(),
-                a.fetch_token.as_deref()
-            ),
-            ("", "", None)
-        );
-        assert!(a.secrets.is_empty() && a.inputs.is_empty());
-        assert_eq!(
-            (a.file.as_str(), a.interpreter.as_str(), &a.place),
-            ("a.sh", "sh", &Place::Host)
-        );
-        assert_eq!(a.sha, sha);
-        let dirs: Vec<(&str, &str)> = a
-            .upload
-            .iter()
-            .flat_map(|upload| &upload.dirs)
-            .map(|d| (d.dir.as_str(), d.sha.as_str()))
-            .collect();
-        assert_eq!(
-            dirs,
-            [("view", sha.as_str()), ("lib", "b".repeat(40).as_str())]
-        );
-        let env = |name: &str| {
-            a.env
-                .iter()
-                .find(|(key, _)| key == name)
-                .map(|(_, value)| value.as_str())
-        };
-        assert_eq!(
-            (env("CI_EVENT"), env("CI_REF"), env("CI_REPO")),
-            (Some("manual"), Some("main"), Some("view"))
-        );
-        assert_eq!(env("CI_ACTOR"), Some("hannes@tuco-pc"));
-
-        // The second run waits for the workspace the first holds at its
-        // place, which every pipeline and manual run of the repository
-        // shares on this runner.
-        let waiting = &s.running[1].jobs[0];
-        assert_eq!(
-            (waiting.status, waiting.note.as_str()),
-            (JobStatus::Waiting, "workspace host in use by #1")
-        );
-        assert!(x.try_recv().is_err());
-
-        let message = |message| Msg::FromRunner {
-            name: "x".to_owned(),
-            message,
-        };
-        s.handle(message(FromRunner::Started {
-            run: "view.1.a".to_owned(),
-        }));
-        s.handle(message(FromRunner::Finished {
-            run: "view.1.a".to_owned(),
-            end: RunEnd {
-                code: Some(0),
-                killed: false,
-                timed_out: false,
-                artifacts: false,
-            },
-        }));
-        s.finish_pipelines();
-        assert_eq!(s.running.len(), 1);
-        assert_eq!(
-            load_pipeline(&state, "view", 1).unwrap().status,
-            PipelineStatus::Succeeded
-        );
-        assert!(!manual::upload_dir(&state, &first).exists());
-        assert!(manual::upload_dir(&state, &second).exists());
-
-        assert_eq!(
-            x.try_recv().ok(),
-            Some(ToRunner::Forget {
-                run: "view.1.a".to_owned()
-            })
-        );
-        s.advance();
-        assert_eq!(assigned(&mut x).run, "view.2.a");
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
     fn a_pipeline_record_from_before_clean_channels_still_loads() {
         let mut p = pipeline("nightly");
         p.clean = true;
@@ -3662,97 +2916,6 @@ mod tests {
         assert!(old.transfers.is_empty());
     }
 
-    #[test]
-    fn transfer_reports_land_in_the_consumers_record() {
-        let state = scratch("transfers");
-        let mut s = scheduler(&state);
-        // `b`, the consumer, runs on `y`.
-        s.running.push(two_jobs("x"));
-        let report = |runner: &str, need: &str, event| Msg::FromRunner {
-            name: runner.to_owned(),
-            message: FromRunner::Transfer {
-                run: "view.7.b".to_owned(),
-                need: need.to_owned(),
-                event,
-            },
-        };
-        let transfers = |s: &Scheduler| s.running[0].jobs[1].transfers.clone();
-
-        // Only the consumer's runner reports on it, and only about its needs.
-        s.handle(report("x", "a", TransferEvent::Started));
-        s.handle(report("y", "zzz", TransferEvent::Started));
-        assert!(transfers(&s).is_empty());
-
-        s.handle(report("y", "a", TransferEvent::Started));
-        let open = transfers(&s);
-        assert_eq!(open.len(), 1);
-        assert_eq!((open[0].need.as_str(), open[0].finished), ("a", None));
-        s.handle(report("x", "a", TransferEvent::Done { bytes: 99 }));
-        assert_eq!(transfers(&s), open, "x is not the runner of b");
-
-        s.handle(report("y", "a", TransferEvent::Done { bytes: 10 }));
-        let done = transfers(&s);
-        assert_eq!(done.len(), 1);
-        assert_eq!((done[0].bytes, done[0].error.as_deref()), (Some(10), None));
-        assert!(done[0].finished.is_some());
-
-        // A new attempt replaces one that never ended; a failure keeps its
-        // message.
-        s.handle(report("y", "a", TransferEvent::Started));
-        s.handle(report("y", "a", TransferEvent::Started));
-        let failure = TransferEvent::Failed {
-            message: "the CI is gone".to_owned(),
-        };
-        s.handle(report("y", "a", failure));
-        let all = transfers(&s);
-        assert_eq!(all.len(), 2, "the first stays, the two starts are one try");
-        assert_eq!(all[0], done[0]);
-        assert_eq!(
-            (all[1].bytes, all[1].error.as_deref()),
-            (None, Some("the CI is gone"))
-        );
-        assert!(all[1].finished.is_some());
-
-        // The record on disk is the one the editors are told about.
-        let saved = load_pipeline(&state, "view", 7).unwrap();
-        assert_eq!(saved.jobs[1].transfers, all);
-
-        // A job that ended takes no more reports.
-        s.running[0].jobs[1].status = JobStatus::Failed;
-        s.handle(report("y", "a", TransferEvent::Started));
-        assert_eq!(transfers(&s), all);
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_started_job_has_no_transfer_left_open() {
-        let state = scratch("started-transfers");
-        let mut s = scheduler(&state);
-        let mut p = two_jobs("x");
-        p.jobs[1].status = JobStatus::Starting;
-        p.jobs[1].assigned = Some(5);
-        // The report of this transfer's end never arrived.
-        p.jobs[1].transfers.push(TransferRecord {
-            need: "a".to_owned(),
-            started: 6,
-            finished: None,
-            bytes: None,
-            error: None,
-        });
-        s.running.push(p);
-        s.runners.assign("view.7.b", "y");
-        s.handle(Msg::FromRunner {
-            name: "y".to_owned(),
-            message: FromRunner::Started {
-                run: "view.7.b".to_owned(),
-            },
-        });
-        let b = &s.running[0].jobs[1];
-        assert_eq!(b.status, JobStatus::Running);
-        assert!(b.transfers[0].finished.is_some());
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
     fn finished(runner: &str, run: &str, artifacts: bool) -> Msg {
         Msg::FromRunner {
             name: runner.to_owned(),
@@ -3768,526 +2931,1368 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_succeeded_need_is_fetched_early_by_the_runner_of_a_pending_consumer() {
-        let state = scratch("prefetch");
-        let mut s = scheduler(&state);
-        let mut x = connect(&s.runners, "x", 0);
-        let mut y = connect(&s.runners, "y", 0);
-        // `a` runs on x. `b` and `g` wait for it on y; the rest must not be
-        // told to fetch: `c` runs on x, where the set is linked, `d` was
-        // handed its inputs already, `e` needs nothing and `f`'s runner is
-        // not connected.
-        let mut p = two_jobs("x");
-        p.jobs[0].status = JobStatus::Running;
-        p.jobs[0].artifacts = false;
-        p.jobs.extend([
-            record("c", &["a"], "x", JobStatus::Pending),
-            record("d", &["a"], "y", JobStatus::Starting),
-            record("e", &[], "y", JobStatus::Pending),
-            record("f", &["a"], "z", JobStatus::Pending),
-            record("g", &["a"], "y", JobStatus::Waiting),
-        ]);
-        s.running.push(p);
-        s.runners.assign("view.7.a", "x");
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use zeughaus_link::enlist::UploadDir;
+        use zeughaus_link::manual::RunUpload;
 
-        s.handle(finished("x", "view.7.a", true));
-        let early = |consumer: &str| ToRunner::Prefetch {
-            run: "view.7.a".to_owned(),
-            consumer: consumer.to_owned(),
-            need: "a".to_owned(),
-        };
-        assert_eq!(y.try_recv().ok(), Some(early("view.7.b")));
-        assert_eq!(y.try_recv().ok(), Some(early("view.7.g")));
-        assert!(y.try_recv().is_err());
-        // The producer's runner is only told the CI is done with the run.
-        assert_eq!(
-            x.try_recv().ok(),
-            Some(ToRunner::Forget {
-                run: "view.7.a".to_owned()
-            })
-        );
-        assert!(x.try_recv().is_err());
-
-        // A run that left no set has nothing to fetch.
-        let mut none = two_jobs("x");
-        none.number = 8;
-        none.jobs[0].status = JobStatus::Running;
-        none.jobs[0].artifacts = false;
-        s.running.push(none);
-        s.runners.assign("view.8.a", "x");
-        s.handle(finished("x", "view.8.a", false));
-        assert!(y.try_recv().is_err());
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn what_was_fetched_early_for_a_job_that_never_ran_is_dropped() {
-        let state = scratch("drop-prefetch");
-        let mut s = scheduler(&state);
-        let mut y = connect(&s.runners, "y", 0);
-        let fetched = TransferRecord {
-            need: "a".to_owned(),
-            started: 1,
-            finished: Some(2),
-            bytes: Some(3),
-            error: None,
-        };
-        // `a` left a set and `b` took it early; `c` failed, so `b` is skipped.
-        // `d` waits for `c` alone and fetched nothing.
-        let mut p = two_jobs("x");
-        p.jobs[0].artifacts = true;
-        p.jobs.push(record("c", &[], "x", JobStatus::Failed));
-        p.jobs[1].def.needs.push("c".to_owned());
-        p.jobs[1].transfers.push(fetched.clone());
-        p.jobs.push(record("d", &["c"], "y", JobStatus::Pending));
-        s.running.push(p);
-        s.advance();
-        assert_eq!(s.running[0].jobs[1].status, JobStatus::Skipped);
-        assert_eq!(s.running[0].jobs[3].status, JobStatus::Skipped);
-        assert_eq!(
-            y.try_recv().ok(),
-            Some(ToRunner::DropPrefetch {
-                consumer: "view.7.b".to_owned()
-            })
-        );
-        assert!(y.try_recv().is_err(), "`d` fetched nothing");
-
-        // A cancelled pipeline skips its pending jobs the same way.
-        let mut p = two_jobs("x");
-        p.number = 8;
-        p.jobs[1].transfers.push(fetched.clone());
-        s.running.push(p);
-        s.running[1].cancelled = true;
-        s.apply_cancel(1);
-        assert_eq!(
-            y.try_recv().ok(),
-            Some(ToRunner::DropPrefetch {
-                consumer: "view.8.b".to_owned()
-            })
-        );
-
-        // So does a job that fails before it is handed over, and one whose
-        // runner stayed away; a job that was handed over keeps what it has.
-        let mut p = two_jobs("x");
-        p.number = 9;
-        p.jobs[1].transfers.push(fetched.clone());
-        s.running.push(p);
-        s.fail_job(2, 1, "secret g is not granted".to_owned(), State::Error);
-        assert_eq!(
-            y.try_recv().ok(),
-            Some(ToRunner::DropPrefetch {
-                consumer: "view.9.b".to_owned()
-            })
-        );
-        let mut p = two_jobs("x");
-        p.number = 10;
-        p.jobs[1].transfers.push(fetched.clone());
-        s.running.push(p);
-        s.skip_offline(3, 1, "y");
-        assert_eq!(
-            y.try_recv().ok(),
-            Some(ToRunner::DropPrefetch {
-                consumer: "view.10.b".to_owned()
-            })
-        );
-        let mut p = two_jobs("x");
-        p.number = 11;
-        p.jobs[1].status = JobStatus::Starting;
-        p.jobs[1].assigned = Some(5);
-        p.jobs[1].transfers.push(fetched);
-        s.running.push(p);
-        s.fail_job(4, 1, "cannot fetch inputs of a".to_owned(), State::Error);
-        assert!(y.try_recv().is_err());
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn an_input_from_another_runner_waits_for_that_runner() {
-        let state = scratch("remote-input");
-        let mut s = scheduler(&state);
-        let mut y = connect(&s.runners, "y", 0);
-        s.running.push(two_jobs("x"));
-
-        s.advance();
-        assert_eq!(s.running[0].jobs[1].status, JobStatus::Waiting);
-        assert_eq!(
-            s.running[0].jobs[1].note,
-            "waiting for runner x (artifacts of a)"
-        );
-        assert!(y.try_recv().is_err());
-
-        let _x = connect(&s.runners, "x", 0);
-        s.advance();
-        assert_eq!(s.running[0].jobs[1].status, JobStatus::Starting);
-        assert_eq!(
-            s.running[0].jobs[1].assigned, s.running[0].jobs[1].started,
-            "assigned is stamped with the handover"
-        );
-        assert!(s.running[0].jobs[1].assigned.is_some());
-        let assignment = assigned(&mut y);
-        assert_eq!(assignment.run, "view.7.b");
-        assert_eq!(
-            assignment.inputs,
-            [Input {
-                need: "a".to_owned(),
-                source: InputSource::Ci {
-                    run: "view.7.a".to_owned()
-                }
-            }]
-        );
-        assert_eq!(s.runners.assigned_to("view.7.b").as_deref(), Some("y"));
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn an_input_from_the_same_runner_is_local() {
-        let state = scratch("local-input");
-        let mut s = scheduler(&state);
-        let mut y = connect(&s.runners, "y", 0);
-        s.running.push(two_jobs("y"));
-        s.advance();
-        let assignment = assigned(&mut y);
-        assert_eq!(
-            assignment.inputs,
-            [Input {
-                need: "a".to_owned(),
-                source: InputSource::Local {
-                    run: "view.7.a".to_owned()
-                }
-            }]
-        );
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_job_skips_when_its_runner_stays_offline() {
-        let state = scratch("offline");
-        let mut s = scheduler(&state);
-        s.running.push(two_jobs("y"));
-        s.advance();
-        assert_eq!(s.running[0].jobs[1].status, JobStatus::Waiting);
-        assert_eq!(s.running[0].jobs[1].note, "waiting for runner y");
-        // `wait_minutes` of `y` is one.
-        s.ready_since
-            .insert(("view".to_owned(), 7, "b".to_owned()), 0);
-        s.advance();
-        assert_eq!(s.running[0].jobs[1].status, JobStatus::Skipped);
-        assert_eq!(s.running[0].jobs[1].note, "runner y offline");
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_hello_requeues_a_handed_over_job_the_runner_does_not_know() {
-        let state = scratch("hello");
-        let mut s = scheduler(&state);
-        let _y = connect(&s.runners, "y", 100);
-        let mut p = two_jobs("y");
-        p.jobs[1].status = JobStatus::Starting;
-        p.jobs[1].started = Some(50);
-        p.jobs[1].assigned = Some(50);
-        p.jobs[1].transfers.push(TransferRecord {
-            need: "a".to_owned(),
-            started: 51,
-            finished: None,
-            bytes: None,
-            error: None,
-        });
-        s.running.push(p);
-        s.runners.assign("view.7.b", "y");
-        s.handle(Msg::RunnerHello {
-            name: "y".to_owned(),
-            runs: Vec::new(),
-            artifacts: Vec::new(),
-        });
-        assert_eq!(s.running[0].jobs[1].status, JobStatus::Pending);
-        assert_eq!(s.running[0].jobs[1].assigned, None);
-        assert!(s.running[0].jobs[1].transfers.is_empty());
-        assert_eq!(s.runners.assigned_to("view.7.b"), None);
-
-        // Handed over after the connection began: the runner has it queued.
-        s.running[0].jobs[1].status = JobStatus::Starting;
-        s.running[0].jobs[1].started = Some(150);
-        s.handle(Msg::RunnerHello {
-            name: "y".to_owned(),
-            runs: Vec::new(),
-            artifacts: Vec::new(),
-        });
-        assert_eq!(s.running[0].jobs[1].status, JobStatus::Starting);
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_hello_stops_runs_nobody_waits_for() {
-        let state = scratch("stray");
-        let mut s = scheduler(&state);
-        let mut y = connect(&s.runners, "y", 0);
-        s.handle(Msg::RunnerHello {
-            name: "y".to_owned(),
-            runs: vec![RunReport {
-                run: "view.9.zzz".to_owned(),
-                end: None,
-            }],
-            artifacts: Vec::new(),
-        });
-        assert_eq!(
-            y.try_recv().ok(),
-            Some(ToRunner::Kill {
-                run: "view.9.zzz".to_owned()
-            })
-        );
-        assert_eq!(
-            y.try_recv().ok(),
-            Some(ToRunner::Forget {
-                run: "view.9.zzz".to_owned()
-            })
-        );
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_hello_drops_the_sets_no_pending_job_needs() {
-        let state = scratch("held");
-        let mut s = scheduler(&state);
-        let mut x = connect(&s.runners, "x", 0);
-        let mut p = two_jobs("x");
-        p.jobs.push(record("c", &[], "x", JobStatus::Running));
-        s.running.push(p);
-        let mut done = two_jobs("x");
-        done.number = 8;
-        done.jobs[1].status = JobStatus::Succeeded;
-        s.running.push(done);
-        s.handle(Msg::RunnerHello {
-            name: "x".to_owned(),
-            runs: vec![RunReport {
-                run: "view.7.c".to_owned(),
-                end: None,
-            }],
-            artifacts: vec![
-                // `b` still needs it.
-                "view.7.a".to_owned(),
-                // Not settled yet: the end may still be on its way.
-                "view.7.c".to_owned(),
-                // Its consumer ended.
-                "view.8.a".to_owned(),
-                // A pipeline this process no longer runs.
-                "view.3.a".to_owned(),
-            ],
-        });
-        let mut sent = Vec::new();
-        while let Ok(message) = x.try_recv() {
-            sent.push(message);
+        fn scratch(name: &str) -> PathBuf {
+            let dir =
+                std::env::temp_dir().join(format!("zeughaus-sched-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create the scratch directory");
+            dir
         }
-        assert_eq!(
-            sent,
-            [
-                ToRunner::DropArtifacts {
-                    run: "view.8.a".to_owned()
-                },
-                ToRunner::DropArtifacts {
-                    run: "view.3.a".to_owned()
-                },
-            ]
-        );
-        let _ = std::fs::remove_dir_all(&state);
-    }
 
-    #[test]
-    fn a_finished_set_stays_until_its_last_consumer_ended() {
-        let state = scratch("finished");
-        let mut s = scheduler(&state);
-        let mut x = connect(&s.runners, "x", 0);
-        let mut p = two_jobs("x");
-        p.jobs[0].status = JobStatus::Running;
-        p.jobs[0].artifacts = false;
-        s.running.push(p);
-        s.runners.assign("view.7.a", "x");
-        s.handle(Msg::FromRunner {
-            name: "x".to_owned(),
-            message: FromRunner::Finished {
-                run: "view.7.a".to_owned(),
+        #[test]
+        fn an_annotated_tag_event_runs_the_commit_it_points_at() {
+            let repo = scratch("peel");
+            let run = |args: &[&str]| {
+                git(
+                    &repo,
+                    args,
+                    &[
+                        ("GIT_AUTHOR_NAME".to_owned(), "t".to_owned()),
+                        ("GIT_AUTHOR_EMAIL".to_owned(), "t@t".to_owned()),
+                        ("GIT_COMMITTER_NAME".to_owned(), "t".to_owned()),
+                        ("GIT_COMMITTER_EMAIL".to_owned(), "t@t".to_owned()),
+                    ],
+                )
+                .expect("git")
+            };
+            run(&["init", "-q", "-b", "main"]);
+            run(&["commit", "-q", "--allow-empty", "-m", "release"]);
+            run(&["tag", "-a", "v1.0.0", "-m", "Release 1.0.0"]);
+            let commit = run(&["rev-parse", "HEAD"]).trim().to_owned();
+            let tag_object = run(&["rev-parse", "v1.0.0"]).trim().to_owned();
+            assert_ne!(
+                commit, tag_object,
+                "an annotated tag is an object of its own"
+            );
+
+            let mut event = pipeline("release").event;
+            event.kind = EventKind::Tag;
+            event.git_ref = "v1.0.0".to_owned();
+            // As the forge reports the push, and as `zeughaus-ci run` names it.
+            event.sha = Some(tag_object);
+            assert_eq!(event_commit(&repo, &event), Ok(commit.clone()));
+            event.sha = None;
+            assert_eq!(event_commit(&repo, &event), Ok(commit));
+
+            event.sha = Some("0".repeat(40));
+            assert!(event_commit(&repo, &event).is_err());
+            let _ = std::fs::remove_dir_all(&repo);
+        }
+
+        #[test]
+        fn a_saved_record_is_announced_under_its_channel() {
+            let state = scratch("announce");
+            let (changes, announced) = std::sync::mpsc::channel();
+            pipeline("release").save(&state, &changes);
+            // A record from before channels existed is announced under the
+            // channel its event sorts into.
+            let mut old = pipeline("");
+            old.number = 8;
+            old.save(&state, &changes);
+
+            assert!(pipelines_dir(&state, "view").join("7.json").exists());
+            assert_eq!(
+                announced.try_recv(),
+                Ok(CiChange {
+                    repo: "view".to_owned(),
+                    channel: "release".to_owned(),
+                    number: 7,
+                })
+            );
+            assert_eq!(
+                announced.try_recv(),
+                Ok(CiChange {
+                    repo: "view".to_owned(),
+                    channel: "main".to_owned(),
+                    number: 8,
+                })
+            );
+            assert!(announced.try_recv().is_err());
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_record_that_cannot_be_written_is_not_announced() {
+            let state = scratch("unwritable");
+            // A state directory below a file cannot be created.
+            let file = state.join("file");
+            std::fs::write(&file, "").expect("write the blocking file");
+            let (changes, announced) = std::sync::mpsc::channel();
+            pipeline("dev").save(&file.join("state"), &changes);
+            assert!(announced.try_recv().is_err());
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        fn scheduler(state: &Path) -> Scheduler {
+            let config = Arc::new(
+                CiConfig::parse(&format!(
+                    "default_runner = \"x\"\n\
+                     [runners.x]\nfingerprint = \"{FP_1}\"\n\
+                     [runners.y]\nfingerprint = \"{FP_2}\"\nwait_minutes = 1\n\
+                     [repos.view]\nurl = \"file:///nowhere\"\n"
+                ))
+                .expect("a valid config"),
+            );
+            scheduler_over(state, config)
+        }
+
+        fn scheduler_over(state: &Path, config: Arc<CiConfig>) -> Scheduler {
+            let (_tx, rx) = std::sync::mpsc::channel();
+            let (alerts, _) = std::sync::mpsc::channel();
+            let (changes, _) = std::sync::mpsc::channel();
+            Scheduler::new(
+                state.to_path_buf(),
+                config,
+                Secrets::new(None, state),
+                Arc::new(Runners::new()),
+                rx,
+                alerts,
+                changes,
+            )
+        }
+
+        /// `a` (on `a_runner`) succeeded with artifacts; `b` needs it, runs on `y`.
+        fn two_jobs(a_runner: &str) -> Pipeline {
+            let mut p = pipeline("dev");
+            p.repo = "view".to_owned();
+            p.sha = Some("abc".to_owned());
+            let mut a = record("a", &[], a_runner, JobStatus::Succeeded);
+            a.artifacts = true;
+            p.jobs = vec![a, record("b", &["a"], "y", JobStatus::Pending)];
+            p
+        }
+
+        /// `job` in a container of `image`, tagged `tag`, on its runner.
+        fn in_image(mut job: JobRecord, image: &str, tag: &str) -> JobRecord {
+            job.place = Some(Place::Container {
+                image: image.to_owned(),
+                tag: tag.to_owned(),
+            });
+            job
+        }
+
+        #[test]
+        fn jobs_of_one_pipeline_at_one_place_take_the_workspace_in_turn() {
+            use JobStatus::{Pending, Succeeded};
+            let state = scratch("place-turns");
+            let mut s = scheduler(&state);
+            let mut x = connect_offering(&s.runners, "x", 0, true);
+            // Two tags of one image, as a changed Containerfile makes: the tag is
+            // no part of the place, so the jobs share a workspace.
+            s.running.push(numbered(
+                1,
+                vec![
+                    in_image(
+                        record("a", &[], "x", Pending),
+                        "x",
+                        "localhost/zci-view-x:1",
+                    ),
+                    in_image(
+                        record("b", &[], "x", Pending),
+                        "x",
+                        "localhost/zci-view-x:2",
+                    ),
+                ],
+            ));
+
+            s.assign(0, 1);
+            let b = &s.running[0].jobs[1];
+            assert_eq!(
+                (b.status, b.note.as_str()),
+                (JobStatus::Waiting, "waiting for a in workspace image-x")
+            );
+            assert!(x.try_recv().is_err());
+
+            s.assign(0, 0);
+            assert_eq!(assigned(&mut x).run, "view.1.a");
+            s.assign(0, 1);
+            assert_eq!(
+                s.running[0].jobs[1].note,
+                "waiting for a in workspace image-x"
+            );
+            assert!(x.try_recv().is_err());
+
+            s.running[0].jobs[0].status = Succeeded;
+            s.assign(0, 1);
+            assert_eq!(assigned(&mut x).run, "view.1.b");
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_newer_pipeline_waits_for_the_older_ones_job_at_its_place() {
+            use JobStatus::{Pending, Succeeded};
+            let state = scratch("place-queue");
+            let mut s = scheduler(&state);
+            let mut x = connect_offering(&s.runners, "x", 0, true);
+            let a = |status| in_image(record("a", &[], "x", status), "x", "localhost/zci-view-x:1");
+            s.running.push(numbered(1, vec![a(Pending)]));
+            s.running.push(numbered(2, vec![a(Pending)]));
+
+            // #1's job has not started, and it is older: #2's queues behind it.
+            s.assign(1, 0);
+            assert_eq!(
+                (
+                    s.running[1].jobs[0].status,
+                    s.running[1].jobs[0].note.as_str()
+                ),
+                (JobStatus::Waiting, "workspace image-x queued for #1")
+            );
+            assert!(x.try_recv().is_err());
+
+            // The older job is never held back by the younger one.
+            s.assign(0, 0);
+            assert_eq!(assigned(&mut x).run, "view.1.a");
+            s.assign(1, 0);
+            assert_eq!(s.running[1].jobs[0].note, "workspace image-x in use by #1");
+            assert!(x.try_recv().is_err());
+
+            s.running[0].jobs[0].status = Succeeded;
+            s.assign(1, 0);
+            assert_eq!(assigned(&mut x).run, "view.2.a");
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn the_same_image_on_two_runners_or_in_two_repositories_is_no_shared_workspace() {
+            use JobStatus::{Pending, Running};
+            let state = scratch("place-apart");
+            let mut s = scheduler(&state);
+            let _x = connect_offering(&s.runners, "x", 0, true);
+            let mut y = connect_offering(&s.runners, "y", 0, true);
+            let at = |runner: &str, status| in_image(record("a", &[], runner, status), "x", "t");
+            // The same image at runner x, and in another repository at runner y.
+            s.running.push(numbered(1, vec![at("x", Running)]));
+            let mut elsewhere = numbered(1, vec![at("y", Running)]);
+            elsewhere.repo = "other".to_owned();
+            s.running.push(elsewhere);
+            s.running.push(numbered(2, vec![at("y", Pending)]));
+
+            s.assign(2, 0);
+            assert_eq!(assigned(&mut y).run, "view.2.a");
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_clean_pipeline_wipes_each_place_once() {
+            use JobStatus::{Pending, Succeeded};
+            let state = scratch("place-clean");
+            let mut s = scheduler(&state);
+            let mut x = connect_offering(&s.runners, "x", 0, true);
+            let mut p = numbered(
+                5,
+                vec![
+                    record("a", &[], "x", Pending),
+                    record("b", &[], "x", Pending),
+                    in_image(record("c", &[], "x", Pending), "x", "t"),
+                ],
+            );
+            p.clean = true;
+            s.running.push(p);
+
+            s.assign(0, 0);
+            assert_eq!(assigned(&mut x).checkout, Checkout::Wipe);
+            s.running[0].jobs[0].status = Succeeded;
+            s.assign(0, 1);
+            assert_eq!(assigned(&mut x).checkout, Checkout::Clean);
+            // Another place is another workspace, which the pipeline has not used.
+            s.assign(0, 2);
+            assert_eq!(assigned(&mut x).checkout, Checkout::Wipe);
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        /// A repository with a clean `nightly` channel and two jobs whose headers
+        /// still carry a `context`, read the way a pipeline is set up.
+        #[test]
+        fn setting_up_marks_a_clean_pipeline_and_runs_jobs_that_carry_a_context() {
+            let origin = scratch("setup-origin");
+            let state = scratch("setup-state");
+            let author = [
+                ("GIT_AUTHOR_NAME".to_owned(), "t".to_owned()),
+                ("GIT_AUTHOR_EMAIL".to_owned(), "t@t".to_owned()),
+                ("GIT_COMMITTER_NAME".to_owned(), "t".to_owned()),
+                ("GIT_COMMITTER_EMAIL".to_owned(), "t@t".to_owned()),
+            ];
+            let ci = origin.join(CI_DIR);
+            std::fs::create_dir_all(&ci).unwrap();
+            for name in ["a", "b"] {
+                std::fs::write(
+                    ci.join(format!("{name}.sh")),
+                    "# /// ci\n# on = [\"push *\", \"cron 0 3 * * *\"]\n# context = \"box\"\n# ///\necho\n",
+                )
+                .unwrap();
+            }
+            std::fs::write(
+                ci.join("channels.toml"),
+                "[[channel]]\nname = \"nightly\"\non = [\"cron *\"]\nclean = true\n",
+            )
+            .unwrap();
+            git(&origin, &["init", "-q", "-b", "main"], &author).unwrap();
+            git(&origin, &["add", "."], &author).unwrap();
+            git(&origin, &["commit", "-q", "-m", "ci"], &author).unwrap();
+
+            let config = Arc::new(
+                CiConfig::parse(&format!(
+                    "default_runner = \"x\"\n\
+                     [runners.x]\nfingerprint = \"{FP_1}\"\n\
+                     [repos.view]\nurl = '{}'\n",
+                    origin.display()
+                ))
+                .expect("a valid config"),
+            );
+            let mut s = scheduler_over(&state, Arc::clone(&config));
+            let repo = config.repos["view"].clone();
+            for (kind, cron, channel, clean) in [
+                (EventKind::Push, None, "main", false),
+                (EventKind::Cron, Some("0 3 * * *"), "nightly", true),
+            ] {
+                let mut p = pipeline("");
+                p.event.kind = kind;
+                p.event.cron = cron.map(str::to_owned);
+                let event = p.event.clone();
+                let planned = s
+                    .set_up("view", &repo, &event, &mut p)
+                    .expect("set up")
+                    .expect("a CI folder");
+                assert_eq!((p.channel.as_str(), p.clean), (channel, clean));
+                let jobs: Vec<(&str, &[&str])> = planned
+                    .iter()
+                    .map(|j| (j.def.name.as_str(), j.def.ignored_keys.as_slice()))
+                    .collect();
+                assert_eq!(jobs, [("a", &["context"][..]), ("b", &["context"][..])]);
+            }
+            let _ = std::fs::remove_dir_all(&origin);
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        // ---- manual runs
+
+        /// The `.zeughaus-ci/` of a snapshot: `build` and `check` after it, a job
+        /// nobody asks for, and one on a VM.
+        const SNAPSHOT: &[(&str, &str)] = &[
+            (
+                ".zeughaus-ci/build.sh",
+                "# /// ci\n# on = [\"push main\"]\n# machine = \"atik\"\n# secrets = [\"TOKEN\"]\n# ///\necho build\n",
+            ),
+            (
+                ".zeughaus-ci/check.sh",
+                "# /// ci\n# needs = [\"build\"]\n# machine = \"atik\"\n# ///\necho check\n",
+            ),
+            (
+                ".zeughaus-ci/other.sh",
+                "# /// ci\n# on = [\"push main\"]\n# machine = \"atik\"\n# ///\necho other\n",
+            ),
+            (
+                ".zeughaus-ci/windows.ps1",
+                "# /// ci\n# on = [\"push main\"]\n# platform = \"windows-amd64\"\n# ///\nWrite-Output windows\n",
+            ),
+            (
+                ".zeughaus-ci/channels.toml",
+                "[[channel]]\nname = \"dev\"\non = [\"push main\"]\n",
+            ),
+        ];
+
+        /// An upload the way the `/manual` service leaves it, and the event that
+        /// names it. Every call is an upload of its own.
+        fn stored_manual(state: &Path, repo: &str, jobs: &[&str], sha: &str) -> CiEvent {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            let id = format!("{:016x}", NEXT.fetch_add(1, Ordering::Relaxed));
+            let upload = RunUpload {
+                origin: format!("git@example.org:me/{repo}.git"),
+                actor: "hannes@tuco-pc".to_owned(),
+                summary: "fix(core): thing\nsecond line".to_owned(),
+                jobs: jobs.iter().map(|job| (*job).to_owned()).collect(),
+                dirs: vec![
+                    UploadDir {
+                        dir: repo.to_owned(),
+                        sha: sha.to_owned(),
+                    },
+                    UploadDir {
+                        dir: "lib".to_owned(),
+                        sha: "b".repeat(40),
+                    },
+                ],
+                sizes: vec![1, 1],
+            };
+            std::fs::create_dir_all(manual::upload_dir(state, &id)).unwrap();
+            manual::write_upload(state, &id, &upload).unwrap();
+            CiEvent {
+                repo: repo.to_owned(),
+                kind: EventKind::Manual,
+                git_ref: "main".to_owned(),
+                sha: Some(sha.to_owned()),
+                cron: None,
+                actor: upload.actor,
+                delivery: None,
+                upload: Some(id),
+                received: 0,
+            }
+        }
+
+        /// One commit that holds `files`, in a repository of its own, bundled
+        /// the way a snapshot is: one ref under `refs/zci-manual/`. Returns the
+        /// bundle and the commit.
+        fn bundle_of(dir: &Path, files: &[(&str, &str)]) -> (PathBuf, String) {
+            let author = [
+                ("GIT_AUTHOR_NAME".to_owned(), "t".to_owned()),
+                ("GIT_AUTHOR_EMAIL".to_owned(), "t@t".to_owned()),
+                ("GIT_COMMITTER_NAME".to_owned(), "t".to_owned()),
+                ("GIT_COMMITTER_EMAIL".to_owned(), "t@t".to_owned()),
+            ];
+            let src = dir.join("src");
+            for (name, text) in files {
+                let path = src.join(name);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, text).unwrap();
+            }
+            git(&src, &["init", "-q", "-b", "main"], &author).unwrap();
+            git(&src, &["add", "-A"], &author).unwrap();
+            git(&src, &["commit", "-q", "-m", "zeughaus manual"], &author).unwrap();
+            git(
+                &src,
+                &["update-ref", "refs/zci-manual/1-1", "HEAD"],
+                &author,
+            )
+            .unwrap();
+            let bundle = dir.join("0.bundle");
+            let to = bundle.to_string_lossy();
+            git(
+                &src,
+                &["bundle", "create", &to, "refs/zci-manual/1-1"],
+                &author,
+            )
+            .unwrap();
+            let sha = git(&src, &["rev-parse", "HEAD"], &[]).unwrap();
+            (bundle, sha.trim().to_owned())
+        }
+
+        /// Puts `bundle` where the service left the first bundle of the upload
+        /// `event` names.
+        fn with_bundle(state: &Path, event: &CiEvent, bundle: &Path) {
+            let id = event.upload.as_deref().unwrap();
+            std::fs::copy(bundle, manual::bundle_path(state, id, 0)).unwrap();
+        }
+
+        #[test]
+        fn a_manual_run_is_the_named_jobs_of_the_snapshots_pipeline() {
+            let state = scratch("manual-jobs");
+            let (bundle, sha) = bundle_of(&scratch("manual-jobs-src"), SNAPSHOT);
+            let s = scheduler_over(&state, Arc::new(config()));
+            let set_up = |jobs: &[&str]| {
+                let event = stored_manual(&state, "demo", jobs, &sha);
+                with_bundle(&state, &event, &bundle);
+                let mut p = pipeline("");
+                let planned = s.set_up_manual(&event, &mut p);
+                (p, planned)
+            };
+
+            // In the order of the folder's jobs, whatever the order asked for,
+            // each where its header places it.
+            let (p, planned) = set_up(&["check", "build"]);
+            let planned = planned.expect("set up").expect("jobs");
+            let names: Vec<&str> = planned.iter().map(|j| j.def.name.as_str()).collect();
+            assert_eq!(names, ["build", "check"]);
+            assert!(
+                planned
+                    .iter()
+                    .all(|j| j.runner == "atik" && j.place == Place::Host)
+            );
+            assert_eq!(planned[1].def.needs, ["build"]);
+            // The code of a working tree gets no secrets.
+            assert!(planned[0].def.secrets.is_empty());
+            assert_eq!(p.sha.as_deref(), Some(sha.as_str()));
+            assert_eq!(
+                (p.subject.as_str(), p.channel.as_str(), p.clean),
+                ("fix(core): thing (check, build)", "dev", false)
+            );
+
+            // A need on a job the run does not name is dropped, and a job it
+            // does not name is not run.
+            let (_, planned) = set_up(&["check"]);
+            let planned = planned.expect("set up").expect("jobs");
+            assert_eq!(planned.len(), 1);
+            assert!(planned[0].def.needs.is_empty());
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_manual_run_that_cannot_be_set_up_says_why() {
+            let state = scratch("manual-refused");
+            let (bundle, sha) = bundle_of(&scratch("manual-refused-src"), SNAPSHOT);
+            let (bare, bare_sha) =
+                bundle_of(&scratch("manual-refused-bare"), &[("README", "no ci\n")]);
+            let s = scheduler_over(&state, Arc::new(config()));
+            let refused = |event: &CiEvent| {
+                s.set_up_manual(event, &mut pipeline(""))
+                    .err()
+                    .expect("a pipeline that does not start")
+            };
+            let uploaded = |repo: &str, jobs: &[&str], bundle: &Path, sha: &str| {
+                let event = stored_manual(&state, repo, jobs, sha);
+                with_bundle(&state, &event, bundle);
+                event
+            };
+
+            assert_eq!(
+                refused(&uploaded("demo", &["zzz"], &bundle, &sha)),
+                "no job zzz in .zeughaus-ci/ of the working tree; its jobs are build, check, other, windows"
+            );
+            assert_eq!(
+                refused(&uploaded("demo", &["windows"], &bundle, &sha)),
+                "manual runs run on a runner's host or in a container; windows runs on the machine win11"
+            );
+            assert_eq!(
+                refused(&uploaded("demo", &["build"], &bare, &bare_sha)),
+                "no .zeughaus-ci/ in the working tree"
+            );
+            assert_eq!(
+                refused(&uploaded("nowhere", &["build"], &bundle, &sha)),
+                "nowhere is no repository of ci.toml"
+            );
+
+            // An event with no upload, one whose upload is gone, and one whose
+            // id is no id.
+            let mut event = stored_manual(&state, "demo", &["build"], &sha);
+            let id = event.upload.take();
+            assert_eq!(refused(&event), "a manual event carries no upload");
+            event.upload = Some("fedcba9876543210".to_owned());
+            assert_eq!(refused(&event), "manual upload fedcba9876543210 is gone");
+            event.upload = id.map(|id| format!("../{id}"));
+            assert_eq!(refused(&event), "a manual event carries no upload");
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        /// The image of a manual job is read from the snapshot's own
+        /// Containerfile, which only its bundle has; the mirror it is read from
+        /// goes with the last manual run of the repository.
+        #[test]
+        fn a_manual_job_with_an_image_reads_its_containerfile_from_the_snapshot() {
+            let state = scratch("manual-image");
+            let (bundle, sha) = bundle_of(
+                &scratch("manual-image-src"),
+                &[
+                    (".zeughaus-ci/trixie.Containerfile", "FROM debian:trixie\n"),
+                    (
+                        ".zeughaus-ci/arm.sh",
+                        "# /// ci\n# on = [\"push main\"]\n# platform = \"linux-arm64\"\n# image = \"trixie\"\n# ///\necho arm\n",
+                    ),
+                    (
+                        ".zeughaus-ci/vm.sh",
+                        "# /// ci\n# on = [\"push main\"]\n# platform = \"windows-amd64\"\n# image = \"trixie\"\n# ///\necho vm\n",
+                    ),
+                ],
+            );
+            let mut s = scheduler_over(&state, Arc::new(config()));
+            let event = stored_manual(&state, "demo", &["arm"], &sha);
+            let id = event.upload.clone().unwrap();
+            with_bundle(&state, &event, &bundle);
+
+            let mut p = pipeline("");
+            p.repo = "demo".to_owned();
+            p.event = event.clone();
+            let planned = s.set_up_manual(&event, &mut p).unwrap().unwrap();
+            let digest = hex::encode(Sha256::digest(b"FROM debian:trixie\n"));
+            assert_eq!(planned[0].runner, "atik");
+            assert_eq!(
+                planned[0].place,
+                Place::Container {
+                    image: "trixie".to_owned(),
+                    tag: format!("localhost/zci-demo-trixie:{}", &digest[..16]),
+                }
+            );
+            let mirror = manual::mirror_dir(&state, "demo");
+            assert!(mirror.join("HEAD").exists());
+
+            // A VM runs no container.
+            let on_vm = stored_manual(&state, "demo", &["vm"], &sha);
+            with_bundle(&state, &on_vm, &bundle);
+            let err = s.set_up_manual(&on_vm, &mut pipeline("")).err().unwrap();
+            assert!(err.contains("an image needs a runner"), "{err}");
+
+            // Another manual run of the repository is still running: the mirror
+            // stays.
+            let mut other = pipeline("dev");
+            other.repo = "demo".to_owned();
+            other.event.kind = EventKind::Manual;
+            s.running.push(other);
+            s.drop_manual(&p);
+            assert!(!manual::upload_dir(&state, &id).exists());
+            assert!(mirror.exists());
+            s.running.clear();
+            s.drop_manual(&p);
+            assert!(!mirror.exists());
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_manual_run_that_cannot_start_ends_as_an_error_pipeline_its_uploader_hears_of() {
+            let state = scratch("manual-error");
+            let (bundle, sha) = bundle_of(&scratch("manual-error-src"), SNAPSHOT);
+            let mut s = scheduler_over(&state, Arc::new(config()));
+            let event = stored_manual(&state, "demo", &["windows"], &sha);
+            let id = event.upload.clone().unwrap();
+            with_bundle(&state, &event, &bundle);
+            let key = event::queue_key(&event);
+            s.start_pipeline(Path::new("/nonexistent/queue.json"), event, key);
+
+            assert!(s.running.is_empty());
+            let record = load_pipeline(&state, "demo", 1).expect("the record");
+            assert_eq!(record.status, PipelineStatus::Error);
+            assert_eq!(
+                record.note,
+                "manual runs run on a runner's host or in a container; windows runs on the machine win11"
+            );
+            assert_eq!(
+                (record.channel(), record.event.kind),
+                ("dev".to_owned(), EventKind::Manual)
+            );
+            assert!(record.jobs.is_empty() && record.finished.is_some());
+            // The service learns the number from a file beside the upload, which
+            // is gone: nothing runs.
+            let number = std::fs::read_to_string(manual::number_path(&state, &id));
+            assert_eq!(number.as_deref().ok(), Some("1"));
+            assert!(!manual::upload_dir(&state, &id).exists());
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        /// From the upload to the assignment to the cleaning up, with a second
+        /// manual run that waits for the workspace the first one holds.
+        #[test]
+        fn a_manual_run_is_assigned_with_its_working_trees_and_cleans_up_after_itself() {
+            let state = scratch("manual-run");
+            let (bundle, sha) = bundle_of(
+                &scratch("manual-run-src"),
+                &[(
+                    ".zeughaus-ci/a.sh",
+                    "# /// ci\n# on = [\"push main\"]\n# ///\necho a\n",
+                )],
+            );
+            let mut s = scheduler(&state);
+            let mut x = connect(&s.runners, "x", 0);
+            let start = |s: &mut Scheduler| {
+                let event = stored_manual(&state, "view", &["a"], &sha);
+                let id = event.upload.clone().unwrap();
+                with_bundle(&state, &event, &bundle);
+                let key = event::queue_key(&event);
+                s.start_pipeline(Path::new("/nonexistent/queue.json"), event, key);
+                id
+            };
+            let first = start(&mut s);
+            let second = start(&mut s);
+            assert_eq!(s.running.len(), 2);
+            let said = |id: &str| std::fs::read_to_string(manual::number_path(&state, id)).ok();
+            assert_eq!(said(&first).as_deref(), Some("1"));
+            assert_eq!(said(&second).as_deref(), Some("2"));
+
+            s.advance();
+            let a = assigned(&mut x);
+            assert_eq!(
+                (a.run.as_str(), a.job.as_str(), a.number),
+                ("view.1.a", "a", 1)
+            );
+            assert_eq!(a.checkout, Checkout::Clean);
+            // No forge, no secrets: the working trees come in bundles.
+            assert_eq!(
+                (
+                    a.url.as_str(),
+                    a.fetch_user.as_str(),
+                    a.fetch_token.as_deref()
+                ),
+                ("", "", None)
+            );
+            assert!(a.secrets.is_empty() && a.inputs.is_empty());
+            assert_eq!(
+                (a.file.as_str(), a.interpreter.as_str(), &a.place),
+                ("a.sh", "sh", &Place::Host)
+            );
+            assert_eq!(a.sha, sha);
+            let dirs: Vec<(&str, &str)> = a
+                .upload
+                .iter()
+                .flat_map(|upload| &upload.dirs)
+                .map(|d| (d.dir.as_str(), d.sha.as_str()))
+                .collect();
+            assert_eq!(
+                dirs,
+                [("view", sha.as_str()), ("lib", "b".repeat(40).as_str())]
+            );
+            let env = |name: &str| {
+                a.env
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.as_str())
+            };
+            assert_eq!(
+                (env("CI_EVENT"), env("CI_REF"), env("CI_REPO")),
+                (Some("manual"), Some("main"), Some("view"))
+            );
+            assert_eq!(env("CI_ACTOR"), Some("hannes@tuco-pc"));
+
+            // The second run waits for the workspace the first holds at its
+            // place, which every pipeline and manual run of the repository
+            // shares on this runner.
+            let waiting = &s.running[1].jobs[0];
+            assert_eq!(
+                (waiting.status, waiting.note.as_str()),
+                (JobStatus::Waiting, "workspace host in use by #1")
+            );
+            assert!(x.try_recv().is_err());
+
+            let message = |message| Msg::FromRunner {
+                name: "x".to_owned(),
+                message,
+            };
+            s.handle(message(FromRunner::Started {
+                run: "view.1.a".to_owned(),
+            }));
+            s.handle(message(FromRunner::Finished {
+                run: "view.1.a".to_owned(),
                 end: RunEnd {
                     code: Some(0),
                     killed: false,
                     timed_out: false,
-                    artifacts: true,
-                },
-            },
-        });
-        let a = &s.running[0].jobs[0];
-        assert_eq!(
-            (a.status, a.code, a.artifacts),
-            (JobStatus::Succeeded, Some(0), true)
-        );
-        let exit = transcript_dir(&state, "view", 7, "a").join("exit");
-        assert_eq!(std::fs::read_to_string(exit).unwrap(), "code=0\n");
-        assert_eq!(
-            x.try_recv().ok(),
-            Some(ToRunner::Forget {
-                run: "view.7.a".to_owned()
-            })
-        );
-        assert_eq!(s.runners.assigned_to("view.7.a"), None);
-
-        // `b` has not run yet: the set stays.
-        s.drop_artifacts();
-        assert!(x.try_recv().is_err());
-
-        // Failed counts as ended as much as succeeded does.
-        s.running[0].jobs[1].status = JobStatus::Failed;
-        s.drop_artifacts();
-        assert_eq!(
-            x.try_recv().ok(),
-            Some(ToRunner::DropArtifacts {
-                run: "view.7.a".to_owned()
-            })
-        );
-        assert!(!s.running[0].jobs[0].artifacts);
-        s.drop_artifacts();
-        assert!(x.try_recv().is_err());
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_set_whose_runner_is_offline_is_dropped_once_it_is_back() {
-        let state = scratch("drop-offline");
-        let mut s = scheduler(&state);
-        let mut p = two_jobs("x");
-        p.jobs[1].status = JobStatus::Skipped;
-        s.running.push(p);
-        s.drop_artifacts();
-        assert!(s.running[0].jobs[0].artifacts);
-        let mut x = connect(&s.runners, "x", 0);
-        s.drop_artifacts();
-        assert_eq!(
-            x.try_recv().ok(),
-            Some(ToRunner::DropArtifacts {
-                run: "view.7.a".to_owned()
-            })
-        );
-        assert!(!s.running[0].jobs[0].artifacts);
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_cancel_kills_the_active_job_and_skips_the_rest() {
-        let state = scratch("cancel");
-        let mut s = scheduler(&state);
-        let mut x = connect(&s.runners, "x", 0);
-        let mut p = pipeline("dev");
-        p.sha = Some("abc".to_owned());
-        p.jobs = vec![
-            record("a", &[], "x", JobStatus::Running),
-            record("b", &["a"], "x", JobStatus::Pending),
-            record("c", &[], "x", JobStatus::Waiting),
-            record("d", &[], "x", JobStatus::Succeeded),
-        ];
-        s.running.push(p);
-        s.runners.assign("view.7.a", "x");
-
-        // A request for a pipeline that is not running is dropped.
-        event::write_cancel(&state, "view", 99).unwrap();
-        event::write_cancel(&state, "view", 7).unwrap();
-        s.cancel_requests();
-        assert!(event::drain_cancels(&state).is_empty());
-
-        assert_eq!(
-            x.try_recv().ok(),
-            Some(ToRunner::Kill {
-                run: "view.7.a".to_owned()
-            })
-        );
-        assert!(x.try_recv().is_err());
-        let status = |s: &Scheduler| {
-            s.running[0]
-                .jobs
-                .iter()
-                .map(|j| j.status)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            status(&s),
-            [
-                JobStatus::Running,
-                JobStatus::Skipped,
-                JobStatus::Skipped,
-                JobStatus::Succeeded
-            ]
-        );
-        assert_eq!(s.running[0].jobs[1].note, "cancelled");
-        assert_eq!(s.running[0].jobs[2].note, "cancelled");
-        // The flag is on disk before the runner answers.
-        assert!(load_pipeline(&state, "view", 7).unwrap().cancelled);
-
-        // A job put back to pending meanwhile does not start again.
-        s.running[0].jobs[2].status = JobStatus::Pending;
-        s.advance();
-        assert_eq!(s.running[0].jobs[2].status, JobStatus::Skipped);
-        assert!(x.try_recv().is_err());
-
-        s.finish_pipelines();
-        assert_eq!(s.running.len(), 1);
-
-        s.handle(Msg::FromRunner {
-            name: "x".to_owned(),
-            message: FromRunner::Finished {
-                run: "view.7.a".to_owned(),
-                end: RunEnd {
-                    code: None,
-                    killed: true,
-                    timed_out: false,
                     artifacts: false,
                 },
-            },
-        });
-        let a = &s.running[0].jobs[0];
-        assert_eq!(
-            (a.status, a.note.as_str()),
-            (JobStatus::Skipped, "cancelled")
-        );
-        assert_eq!(a.excerpt, None);
+            }));
+            s.finish_pipelines();
+            assert_eq!(s.running.len(), 1);
+            assert_eq!(
+                load_pipeline(&state, "view", 1).unwrap().status,
+                PipelineStatus::Succeeded
+            );
+            assert!(!manual::upload_dir(&state, &first).exists());
+            assert!(manual::upload_dir(&state, &second).exists());
 
-        s.finish_pipelines();
-        assert!(s.running.is_empty());
-        let record = load_pipeline(&state, "view", 7).unwrap();
-        assert_eq!(record.status, PipelineStatus::Cancelled);
-        assert!(record.finished.is_some());
-        let _ = std::fs::remove_dir_all(&state);
-    }
+            assert_eq!(
+                x.try_recv().ok(),
+                Some(ToRunner::Forget {
+                    run: "view.1.a".to_owned()
+                })
+            );
+            s.advance();
+            assert_eq!(assigned(&mut x).run, "view.2.a");
+            let _ = std::fs::remove_dir_all(&state);
+        }
 
-    #[test]
-    fn a_cancelled_pipeline_is_finished_again_after_a_restart() {
-        let state = scratch("cancel-recover");
-        let mut s = scheduler(&state);
-        let mut p = pipeline("dev");
-        p.jobs = vec![
-            record("a", &[], "x", JobStatus::Running),
-            record("b", &["a"], "x", JobStatus::Pending),
-        ];
-        p.cancelled = true;
-        p.save(&state, &s.changes);
+        #[test]
+        fn transfer_reports_land_in_the_consumers_record() {
+            let state = scratch("transfers");
+            let mut s = scheduler(&state);
+            // `b`, the consumer, runs on `y`.
+            s.running.push(two_jobs("x"));
+            let report = |runner: &str, need: &str, event| Msg::FromRunner {
+                name: runner.to_owned(),
+                message: FromRunner::Transfer {
+                    run: "view.7.b".to_owned(),
+                    need: need.to_owned(),
+                    event,
+                },
+            };
+            let transfers = |s: &Scheduler| s.running[0].jobs[1].transfers.clone();
 
-        s.recover();
-        assert_eq!(s.running.len(), 1);
-        assert_eq!(s.running[0].jobs[1].status, JobStatus::Skipped);
-        assert_eq!(s.running[0].jobs[1].note, "cancelled");
+            // Only the consumer's runner reports on it, and only about its needs.
+            s.handle(report("x", "a", TransferEvent::Started));
+            s.handle(report("y", "zzz", TransferEvent::Started));
+            assert!(transfers(&s).is_empty());
 
-        // The runner still has the run when it connects again: it is killed.
-        let mut x = connect(&s.runners, "x", 0);
-        s.handle(Msg::RunnerHello {
-            name: "x".to_owned(),
-            runs: vec![RunReport {
+            s.handle(report("y", "a", TransferEvent::Started));
+            let open = transfers(&s);
+            assert_eq!(open.len(), 1);
+            assert_eq!((open[0].need.as_str(), open[0].finished), ("a", None));
+            s.handle(report("x", "a", TransferEvent::Done { bytes: 99 }));
+            assert_eq!(transfers(&s), open, "x is not the runner of b");
+
+            s.handle(report("y", "a", TransferEvent::Done { bytes: 10 }));
+            let done = transfers(&s);
+            assert_eq!(done.len(), 1);
+            assert_eq!((done[0].bytes, done[0].error.as_deref()), (Some(10), None));
+            assert!(done[0].finished.is_some());
+
+            // A new attempt replaces one that never ended; a failure keeps its
+            // message.
+            s.handle(report("y", "a", TransferEvent::Started));
+            s.handle(report("y", "a", TransferEvent::Started));
+            let failure = TransferEvent::Failed {
+                message: "the CI is gone".to_owned(),
+            };
+            s.handle(report("y", "a", failure));
+            let all = transfers(&s);
+            assert_eq!(all.len(), 2, "the first stays, the two starts are one try");
+            assert_eq!(all[0], done[0]);
+            assert_eq!(
+                (all[1].bytes, all[1].error.as_deref()),
+                (None, Some("the CI is gone"))
+            );
+            assert!(all[1].finished.is_some());
+
+            // The record on disk is the one the editors are told about.
+            let saved = load_pipeline(&state, "view", 7).unwrap();
+            assert_eq!(saved.jobs[1].transfers, all);
+
+            // A job that ended takes no more reports.
+            s.running[0].jobs[1].status = JobStatus::Failed;
+            s.handle(report("y", "a", TransferEvent::Started));
+            assert_eq!(transfers(&s), all);
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_started_job_has_no_transfer_left_open() {
+            let state = scratch("started-transfers");
+            let mut s = scheduler(&state);
+            let mut p = two_jobs("x");
+            p.jobs[1].status = JobStatus::Starting;
+            p.jobs[1].assigned = Some(5);
+            // The report of this transfer's end never arrived.
+            p.jobs[1].transfers.push(TransferRecord {
+                need: "a".to_owned(),
+                started: 6,
+                finished: None,
+                bytes: None,
+                error: None,
+            });
+            s.running.push(p);
+            s.runners.assign("view.7.b", "y");
+            s.handle(Msg::FromRunner {
+                name: "y".to_owned(),
+                message: FromRunner::Started {
+                    run: "view.7.b".to_owned(),
+                },
+            });
+            let b = &s.running[0].jobs[1];
+            assert_eq!(b.status, JobStatus::Running);
+            assert!(b.transfers[0].finished.is_some());
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_succeeded_need_is_fetched_early_by_the_runner_of_a_pending_consumer() {
+            let state = scratch("prefetch");
+            let mut s = scheduler(&state);
+            let mut x = connect(&s.runners, "x", 0);
+            let mut y = connect(&s.runners, "y", 0);
+            // `a` runs on x. `b` and `g` wait for it on y; the rest must not be
+            // told to fetch: `c` runs on x, where the set is linked, `d` was
+            // handed its inputs already, `e` needs nothing and `f`'s runner is
+            // not connected.
+            let mut p = two_jobs("x");
+            p.jobs[0].status = JobStatus::Running;
+            p.jobs[0].artifacts = false;
+            p.jobs.extend([
+                record("c", &["a"], "x", JobStatus::Pending),
+                record("d", &["a"], "y", JobStatus::Starting),
+                record("e", &[], "y", JobStatus::Pending),
+                record("f", &["a"], "z", JobStatus::Pending),
+                record("g", &["a"], "y", JobStatus::Waiting),
+            ]);
+            s.running.push(p);
+            s.runners.assign("view.7.a", "x");
+
+            s.handle(finished("x", "view.7.a", true));
+            let early = |consumer: &str| ToRunner::Prefetch {
                 run: "view.7.a".to_owned(),
-                end: None,
-            }],
-            artifacts: Vec::new(),
-        });
-        assert_eq!(
-            x.try_recv().ok(),
-            Some(ToRunner::Kill {
-                run: "view.7.a".to_owned()
-            })
-        );
-        let _ = std::fs::remove_dir_all(&state);
+                consumer: consumer.to_owned(),
+                need: "a".to_owned(),
+            };
+            assert_eq!(y.try_recv().ok(), Some(early("view.7.b")));
+            assert_eq!(y.try_recv().ok(), Some(early("view.7.g")));
+            assert!(y.try_recv().is_err());
+            // The producer's runner is only told the CI is done with the run.
+            assert_eq!(
+                x.try_recv().ok(),
+                Some(ToRunner::Forget {
+                    run: "view.7.a".to_owned()
+                })
+            );
+            assert!(x.try_recv().is_err());
+
+            // A run that left no set has nothing to fetch.
+            let mut none = two_jobs("x");
+            none.number = 8;
+            none.jobs[0].status = JobStatus::Running;
+            none.jobs[0].artifacts = false;
+            s.running.push(none);
+            s.runners.assign("view.8.a", "x");
+            s.handle(finished("x", "view.8.a", false));
+            assert!(y.try_recv().is_err());
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn what_was_fetched_early_for_a_job_that_never_ran_is_dropped() {
+            let state = scratch("drop-prefetch");
+            let mut s = scheduler(&state);
+            let mut y = connect(&s.runners, "y", 0);
+            let fetched = TransferRecord {
+                need: "a".to_owned(),
+                started: 1,
+                finished: Some(2),
+                bytes: Some(3),
+                error: None,
+            };
+            // `a` left a set and `b` took it early; `c` failed, so `b` is skipped.
+            // `d` waits for `c` alone and fetched nothing.
+            let mut p = two_jobs("x");
+            p.jobs[0].artifacts = true;
+            p.jobs.push(record("c", &[], "x", JobStatus::Failed));
+            p.jobs[1].def.needs.push("c".to_owned());
+            p.jobs[1].transfers.push(fetched.clone());
+            p.jobs.push(record("d", &["c"], "y", JobStatus::Pending));
+            s.running.push(p);
+            s.advance();
+            assert_eq!(s.running[0].jobs[1].status, JobStatus::Skipped);
+            assert_eq!(s.running[0].jobs[3].status, JobStatus::Skipped);
+            assert_eq!(
+                y.try_recv().ok(),
+                Some(ToRunner::DropPrefetch {
+                    consumer: "view.7.b".to_owned()
+                })
+            );
+            assert!(y.try_recv().is_err(), "`d` fetched nothing");
+
+            // A cancelled pipeline skips its pending jobs the same way.
+            let mut p = two_jobs("x");
+            p.number = 8;
+            p.jobs[1].transfers.push(fetched.clone());
+            s.running.push(p);
+            s.running[1].cancelled = true;
+            s.apply_cancel(1);
+            assert_eq!(
+                y.try_recv().ok(),
+                Some(ToRunner::DropPrefetch {
+                    consumer: "view.8.b".to_owned()
+                })
+            );
+
+            // So does a job that fails before it is handed over, and one whose
+            // runner stayed away; a job that was handed over keeps what it has.
+            let mut p = two_jobs("x");
+            p.number = 9;
+            p.jobs[1].transfers.push(fetched.clone());
+            s.running.push(p);
+            s.fail_job(2, 1, "secret g is not granted".to_owned(), State::Error);
+            assert_eq!(
+                y.try_recv().ok(),
+                Some(ToRunner::DropPrefetch {
+                    consumer: "view.9.b".to_owned()
+                })
+            );
+            let mut p = two_jobs("x");
+            p.number = 10;
+            p.jobs[1].transfers.push(fetched.clone());
+            s.running.push(p);
+            s.skip_offline(3, 1, "y");
+            assert_eq!(
+                y.try_recv().ok(),
+                Some(ToRunner::DropPrefetch {
+                    consumer: "view.10.b".to_owned()
+                })
+            );
+            let mut p = two_jobs("x");
+            p.number = 11;
+            p.jobs[1].status = JobStatus::Starting;
+            p.jobs[1].assigned = Some(5);
+            p.jobs[1].transfers.push(fetched);
+            s.running.push(p);
+            s.fail_job(4, 1, "cannot fetch inputs of a".to_owned(), State::Error);
+            assert!(y.try_recv().is_err());
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn an_input_from_another_runner_waits_for_that_runner() {
+            let state = scratch("remote-input");
+            let mut s = scheduler(&state);
+            let mut y = connect(&s.runners, "y", 0);
+            s.running.push(two_jobs("x"));
+
+            s.advance();
+            assert_eq!(s.running[0].jobs[1].status, JobStatus::Waiting);
+            assert_eq!(
+                s.running[0].jobs[1].note,
+                "waiting for runner x (artifacts of a)"
+            );
+            assert!(y.try_recv().is_err());
+
+            let _x = connect(&s.runners, "x", 0);
+            s.advance();
+            assert_eq!(s.running[0].jobs[1].status, JobStatus::Starting);
+            assert_eq!(
+                s.running[0].jobs[1].assigned, s.running[0].jobs[1].started,
+                "assigned is stamped with the handover"
+            );
+            assert!(s.running[0].jobs[1].assigned.is_some());
+            let assignment = assigned(&mut y);
+            assert_eq!(assignment.run, "view.7.b");
+            assert_eq!(
+                assignment.inputs,
+                [Input {
+                    need: "a".to_owned(),
+                    source: InputSource::Ci {
+                        run: "view.7.a".to_owned()
+                    }
+                }]
+            );
+            assert_eq!(s.runners.assigned_to("view.7.b").as_deref(), Some("y"));
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn an_input_from_the_same_runner_is_local() {
+            let state = scratch("local-input");
+            let mut s = scheduler(&state);
+            let mut y = connect(&s.runners, "y", 0);
+            s.running.push(two_jobs("y"));
+            s.advance();
+            let assignment = assigned(&mut y);
+            assert_eq!(
+                assignment.inputs,
+                [Input {
+                    need: "a".to_owned(),
+                    source: InputSource::Local {
+                        run: "view.7.a".to_owned()
+                    }
+                }]
+            );
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_job_skips_when_its_runner_stays_offline() {
+            let state = scratch("offline");
+            let mut s = scheduler(&state);
+            s.running.push(two_jobs("y"));
+            s.advance();
+            assert_eq!(s.running[0].jobs[1].status, JobStatus::Waiting);
+            assert_eq!(s.running[0].jobs[1].note, "waiting for runner y");
+            // `wait_minutes` of `y` is one.
+            s.ready_since
+                .insert(("view".to_owned(), 7, "b".to_owned()), 0);
+            s.advance();
+            assert_eq!(s.running[0].jobs[1].status, JobStatus::Skipped);
+            assert_eq!(s.running[0].jobs[1].note, "runner y offline");
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_hello_requeues_a_handed_over_job_the_runner_does_not_know() {
+            let state = scratch("hello");
+            let mut s = scheduler(&state);
+            let _y = connect(&s.runners, "y", 100);
+            let mut p = two_jobs("y");
+            p.jobs[1].status = JobStatus::Starting;
+            p.jobs[1].started = Some(50);
+            p.jobs[1].assigned = Some(50);
+            p.jobs[1].transfers.push(TransferRecord {
+                need: "a".to_owned(),
+                started: 51,
+                finished: None,
+                bytes: None,
+                error: None,
+            });
+            s.running.push(p);
+            s.runners.assign("view.7.b", "y");
+            s.handle(Msg::RunnerHello {
+                name: "y".to_owned(),
+                runs: Vec::new(),
+                artifacts: Vec::new(),
+            });
+            assert_eq!(s.running[0].jobs[1].status, JobStatus::Pending);
+            assert_eq!(s.running[0].jobs[1].assigned, None);
+            assert!(s.running[0].jobs[1].transfers.is_empty());
+            assert_eq!(s.runners.assigned_to("view.7.b"), None);
+
+            // Handed over after the connection began: the runner has it queued.
+            s.running[0].jobs[1].status = JobStatus::Starting;
+            s.running[0].jobs[1].started = Some(150);
+            s.handle(Msg::RunnerHello {
+                name: "y".to_owned(),
+                runs: Vec::new(),
+                artifacts: Vec::new(),
+            });
+            assert_eq!(s.running[0].jobs[1].status, JobStatus::Starting);
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_hello_stops_runs_nobody_waits_for() {
+            let state = scratch("stray");
+            let mut s = scheduler(&state);
+            let mut y = connect(&s.runners, "y", 0);
+            s.handle(Msg::RunnerHello {
+                name: "y".to_owned(),
+                runs: vec![RunReport {
+                    run: "view.9.zzz".to_owned(),
+                    end: None,
+                }],
+                artifacts: Vec::new(),
+            });
+            assert_eq!(
+                y.try_recv().ok(),
+                Some(ToRunner::Kill {
+                    run: "view.9.zzz".to_owned()
+                })
+            );
+            assert_eq!(
+                y.try_recv().ok(),
+                Some(ToRunner::Forget {
+                    run: "view.9.zzz".to_owned()
+                })
+            );
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_hello_drops_the_sets_no_pending_job_needs() {
+            let state = scratch("held");
+            let mut s = scheduler(&state);
+            let mut x = connect(&s.runners, "x", 0);
+            let mut p = two_jobs("x");
+            p.jobs.push(record("c", &[], "x", JobStatus::Running));
+            s.running.push(p);
+            let mut done = two_jobs("x");
+            done.number = 8;
+            done.jobs[1].status = JobStatus::Succeeded;
+            s.running.push(done);
+            s.handle(Msg::RunnerHello {
+                name: "x".to_owned(),
+                runs: vec![RunReport {
+                    run: "view.7.c".to_owned(),
+                    end: None,
+                }],
+                artifacts: vec![
+                    // `b` still needs it.
+                    "view.7.a".to_owned(),
+                    // Not settled yet: the end may still be on its way.
+                    "view.7.c".to_owned(),
+                    // Its consumer ended.
+                    "view.8.a".to_owned(),
+                    // A pipeline this process no longer runs.
+                    "view.3.a".to_owned(),
+                ],
+            });
+            let mut sent = Vec::new();
+            while let Ok(message) = x.try_recv() {
+                sent.push(message);
+            }
+            assert_eq!(
+                sent,
+                [
+                    ToRunner::DropArtifacts {
+                        run: "view.8.a".to_owned()
+                    },
+                    ToRunner::DropArtifacts {
+                        run: "view.3.a".to_owned()
+                    },
+                ]
+            );
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_finished_set_stays_until_its_last_consumer_ended() {
+            let state = scratch("finished");
+            let mut s = scheduler(&state);
+            let mut x = connect(&s.runners, "x", 0);
+            let mut p = two_jobs("x");
+            p.jobs[0].status = JobStatus::Running;
+            p.jobs[0].artifacts = false;
+            s.running.push(p);
+            s.runners.assign("view.7.a", "x");
+            s.handle(Msg::FromRunner {
+                name: "x".to_owned(),
+                message: FromRunner::Finished {
+                    run: "view.7.a".to_owned(),
+                    end: RunEnd {
+                        code: Some(0),
+                        killed: false,
+                        timed_out: false,
+                        artifacts: true,
+                    },
+                },
+            });
+            let a = &s.running[0].jobs[0];
+            assert_eq!(
+                (a.status, a.code, a.artifacts),
+                (JobStatus::Succeeded, Some(0), true)
+            );
+            let exit = transcript_dir(&state, "view", 7, "a").join("exit");
+            assert_eq!(std::fs::read_to_string(exit).unwrap(), "code=0\n");
+            assert_eq!(
+                x.try_recv().ok(),
+                Some(ToRunner::Forget {
+                    run: "view.7.a".to_owned()
+                })
+            );
+            assert_eq!(s.runners.assigned_to("view.7.a"), None);
+
+            // `b` has not run yet: the set stays.
+            s.drop_artifacts();
+            assert!(x.try_recv().is_err());
+
+            // Failed counts as ended as much as succeeded does.
+            s.running[0].jobs[1].status = JobStatus::Failed;
+            s.drop_artifacts();
+            assert_eq!(
+                x.try_recv().ok(),
+                Some(ToRunner::DropArtifacts {
+                    run: "view.7.a".to_owned()
+                })
+            );
+            assert!(!s.running[0].jobs[0].artifacts);
+            s.drop_artifacts();
+            assert!(x.try_recv().is_err());
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_set_whose_runner_is_offline_is_dropped_once_it_is_back() {
+            let state = scratch("drop-offline");
+            let mut s = scheduler(&state);
+            let mut p = two_jobs("x");
+            p.jobs[1].status = JobStatus::Skipped;
+            s.running.push(p);
+            s.drop_artifacts();
+            assert!(s.running[0].jobs[0].artifacts);
+            let mut x = connect(&s.runners, "x", 0);
+            s.drop_artifacts();
+            assert_eq!(
+                x.try_recv().ok(),
+                Some(ToRunner::DropArtifacts {
+                    run: "view.7.a".to_owned()
+                })
+            );
+            assert!(!s.running[0].jobs[0].artifacts);
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_cancel_kills_the_active_job_and_skips_the_rest() {
+            let state = scratch("cancel");
+            let mut s = scheduler(&state);
+            let mut x = connect(&s.runners, "x", 0);
+            let mut p = pipeline("dev");
+            p.sha = Some("abc".to_owned());
+            p.jobs = vec![
+                record("a", &[], "x", JobStatus::Running),
+                record("b", &["a"], "x", JobStatus::Pending),
+                record("c", &[], "x", JobStatus::Waiting),
+                record("d", &[], "x", JobStatus::Succeeded),
+            ];
+            s.running.push(p);
+            s.runners.assign("view.7.a", "x");
+
+            // A request for a pipeline that is not running is dropped.
+            event::write_cancel(&state, "view", 99).unwrap();
+            event::write_cancel(&state, "view", 7).unwrap();
+            s.cancel_requests();
+            assert!(event::drain_cancels(&state).is_empty());
+
+            assert_eq!(
+                x.try_recv().ok(),
+                Some(ToRunner::Kill {
+                    run: "view.7.a".to_owned()
+                })
+            );
+            assert!(x.try_recv().is_err());
+            let status = |s: &Scheduler| {
+                s.running[0]
+                    .jobs
+                    .iter()
+                    .map(|j| j.status)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                status(&s),
+                [
+                    JobStatus::Running,
+                    JobStatus::Skipped,
+                    JobStatus::Skipped,
+                    JobStatus::Succeeded
+                ]
+            );
+            assert_eq!(s.running[0].jobs[1].note, "cancelled");
+            assert_eq!(s.running[0].jobs[2].note, "cancelled");
+            // The flag is on disk before the runner answers.
+            assert!(load_pipeline(&state, "view", 7).unwrap().cancelled);
+
+            // A job put back to pending meanwhile does not start again.
+            s.running[0].jobs[2].status = JobStatus::Pending;
+            s.advance();
+            assert_eq!(s.running[0].jobs[2].status, JobStatus::Skipped);
+            assert!(x.try_recv().is_err());
+
+            s.finish_pipelines();
+            assert_eq!(s.running.len(), 1);
+
+            s.handle(Msg::FromRunner {
+                name: "x".to_owned(),
+                message: FromRunner::Finished {
+                    run: "view.7.a".to_owned(),
+                    end: RunEnd {
+                        code: None,
+                        killed: true,
+                        timed_out: false,
+                        artifacts: false,
+                    },
+                },
+            });
+            let a = &s.running[0].jobs[0];
+            assert_eq!(
+                (a.status, a.note.as_str()),
+                (JobStatus::Skipped, "cancelled")
+            );
+            assert_eq!(a.excerpt, None);
+
+            s.finish_pipelines();
+            assert!(s.running.is_empty());
+            let record = load_pipeline(&state, "view", 7).unwrap();
+            assert_eq!(record.status, PipelineStatus::Cancelled);
+            assert!(record.finished.is_some());
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_cancelled_pipeline_is_finished_again_after_a_restart() {
+            let state = scratch("cancel-recover");
+            let mut s = scheduler(&state);
+            let mut p = pipeline("dev");
+            p.jobs = vec![
+                record("a", &[], "x", JobStatus::Running),
+                record("b", &["a"], "x", JobStatus::Pending),
+            ];
+            p.cancelled = true;
+            p.save(&state, &s.changes);
+
+            s.recover();
+            assert_eq!(s.running.len(), 1);
+            assert_eq!(s.running[0].jobs[1].status, JobStatus::Skipped);
+            assert_eq!(s.running[0].jobs[1].note, "cancelled");
+
+            // The runner still has the run when it connects again: it is killed.
+            let mut x = connect(&s.runners, "x", 0);
+            s.handle(Msg::RunnerHello {
+                name: "x".to_owned(),
+                runs: vec![RunReport {
+                    run: "view.7.a".to_owned(),
+                    end: None,
+                }],
+                artifacts: Vec::new(),
+            });
+            assert_eq!(
+                x.try_recv().ok(),
+                Some(ToRunner::Kill {
+                    run: "view.7.a".to_owned()
+                })
+            );
+            let _ = std::fs::remove_dir_all(&state);
+        }
     }
 }

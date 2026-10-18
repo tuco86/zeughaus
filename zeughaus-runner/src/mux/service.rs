@@ -1068,838 +1068,6 @@ fn gone(e: &str) -> WireError {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::time::Duration;
-    use tokio::io::AsyncReadExt;
-    use weida::{ClientTls, EndpointAddr, Identity, Runtime, RuntimeConfig, ServerTls, Trust};
-    use zeughaus_mux::input::Key;
-    use zeughaus_mux::{
-        AttachTarget, Axis, KeyInput, KeyKind, Modifiers, NamedKey, SurfaceRef, TerminalAttached,
-        TerminalEvent,
-    };
-    use zeughaus_terminal::serve::HEAD_ROWS_ABOVE;
-
-    struct Client {
-        requester: weida::Requester,
-        id: ClientInstanceId,
-    }
-
-    struct Exchange {
-        request: weida::OutgoingTransfer,
-        reply: weida::IncomingTransfer,
-    }
-
-    impl Exchange {
-        async fn send(&mut self, message: Message, request_id: u64) {
-            write_frame(&mut self.request, &message, request_id)
-                .await
-                .expect("write");
-        }
-
-        async fn next(&mut self) -> Message {
-            tokio::time::timeout(Duration::from_secs(20), read_frame(&mut self.reply))
-                .await
-                .expect("a frame within 20 s")
-                .expect("a readable frame")
-                .1
-        }
-    }
-
-    async fn open(client: &Client, first: Message) -> Exchange {
-        let (mut request, reply) = client
-            .requester
-            .open(TransferMeta::default())
-            .await
-            .expect("open");
-        write_frame(&mut request, &first, 0)
-            .await
-            .expect("first frame");
-        let reply = reply.recv().await.expect("reply half");
-        Exchange { request, reply }
-    }
-
-    async fn setup() -> (MuxService, weida::Runtime, weida::Binding, String, Identity) {
-        let server_identity = Identity::generate_for(["127.0.0.1"]).expect("identity");
-        let client_identity = Identity::generate_for(["client"]).expect("identity");
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
-        let listener = runtime.listener();
-        let tls = ServerTls::new(server_identity.clone())
-            .require_client(Trust::by_address().and_pin(client_identity.fingerprint().unwrap()));
-        let binding = listener
-            .bind_quic(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), tls)
-            .await
-            .expect("bind");
-        let replier = listener.replier("/mux").expect("replier");
-        let shell = Profile {
-            label: "sh".into(),
-            program: Some("/bin/sh".into()),
-            args: vec![],
-            cwd: None,
-            env: vec![("PS1".into(), "$ ".into())],
-            scrollback_rows: 100,
-        };
-        let service = MuxService::new(
-            RunnerIncarnation::from_bytes([7; 16]),
-            vec![shell],
-            TerminalHost::Local,
-        );
-        tokio::spawn(service.clone().accept(replier));
-        let url = EndpointAddr {
-            host: "127.0.0.1".into(),
-            port: Some(binding.local_addr().port()),
-            path: "/mux".into(),
-            peer: Some(server_identity.fingerprint().unwrap()),
-        }
-        .to_string();
-        (service, runtime, binding, url, client_identity)
-    }
-
-    async fn client(runtime: &Runtime, url: &str, identity: &Identity, seed: u8) -> Client {
-        let requester =
-            runtime.requester(ClientTls::new(Trust::by_address()).with_identity(identity.clone()));
-        requester.connect(url).await.expect("connect");
-        Client {
-            requester,
-            id: ClientInstanceId::from_bytes([seed; 16]),
-        }
-    }
-
-    fn hello(client: &Client) -> Message {
-        Message::ControlAttach(ControlAttach {
-            hello: ClientHello {
-                major: MAJOR,
-                minor: MINOR,
-                client: client.id,
-                capabilities: vec![],
-                known_incarnation: None,
-                known_revision: None,
-            },
-        })
-    }
-
-    fn row_text(rows: &[zeughaus_mux::RowData]) -> String {
-        rows.iter()
-            .flat_map(|r| r.spans.iter().map(|s| s.text.as_str()))
-            .collect::<Vec<_>>()
-            .join("|")
-    }
-
-    /// Waits for deltas until `pred` holds on one, collecting events.
-    async fn until(
-        exchange: &mut Exchange,
-        mut pred: impl FnMut(&zeughaus_mux::TerminalDelta) -> bool,
-    ) -> Vec<TerminalEvent> {
-        let mut events = Vec::new();
-        for _ in 0..200 {
-            match exchange.next().await {
-                Message::TerminalDelta(delta) => {
-                    events.extend(delta.ordered_events.iter().cloned());
-                    if pred(&delta) {
-                        return events;
-                    }
-                }
-                other => panic!("unexpected {:?}", other.kind()),
-            }
-        }
-        panic!("no delta satisfied the predicate");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_shell_is_created_driven_shared_and_survives_its_viewers() {
-        let (service, runtime, _binding, url, identity) = setup().await;
-        let alice = client(&runtime, &url, &identity, 1).await;
-
-        // Attach: the default workspace, no terminals.
-        let mut control = open(&alice, hello(&alice)).await;
-        let Message::ControlAttached(attached) = control.next().await else {
-            panic!("expected ControlAttached");
-        };
-        assert_eq!(attached.workspace.tabs().count(), 0);
-        assert!(attached.heads.is_empty());
-        assert_eq!(
-            attached.hello.principal,
-            identity.fingerprint().unwrap().to_string()
-        );
-
-        // A new terminal tab: reply, then the snapshot that shows it.
-        control
-            .send(
-                Message::Command(Command {
-                    request: RequestId(1),
-                    command: TopologyCommand::NewTerminalTab {
-                        profile: ProfileId::DEFAULT,
-                    },
-                }),
-                1,
-            )
-            .await;
-        let mut terminal = None;
-        for _ in 0..2 {
-            match control.next().await {
-                Message::CommandReply(reply) => {
-                    assert_eq!(reply.request, RequestId(1));
-                    assert!(matches!(
-                        reply.outcome,
-                        CommandOutcome::Applied { revision: 2 }
-                    ));
-                }
-                Message::WorkspaceSnapshot(snapshot) => {
-                    assert_eq!(snapshot.revision, 2);
-                    terminal = snapshot.terminals().next();
-                }
-                other => panic!("unexpected {:?}", other.kind()),
-            }
-        }
-        let terminal = terminal.expect("the snapshot names the terminal");
-
-        // The same request id again is answered, not applied again.
-        control
-            .send(
-                Message::Command(Command {
-                    request: RequestId(1),
-                    command: TopologyCommand::NewTerminalTab {
-                        profile: ProfileId::DEFAULT,
-                    },
-                }),
-                1,
-            )
-            .await;
-        assert!(matches!(
-            control.next().await,
-            Message::CommandReply(CommandReply {
-                outcome: CommandOutcome::Applied { revision: 2 },
-                ..
-            })
-        ));
-
-        // Attach to the terminal, type, see the echo.
-        let mut term = open(
-            &alice,
-            Message::TerminalAttach(TerminalAttach {
-                client: alice.id,
-                terminal,
-                known: None,
-                size: Dimensions { cols: 40, rows: 10 },
-            }),
-        )
-        .await;
-        let Message::TerminalAttached(TerminalAttached { head: Some(head) }) = term.next().await
-        else {
-            panic!("expected a head");
-        };
-        assert_eq!(head.terminal, terminal);
-        term.send(
-            Message::TerminalCommand(TerminalCommand::Text {
-                serial: 1,
-                text: "echo mux-ok\n".into(),
-            }),
-            0,
-        )
-        .await;
-        let mut seen = String::new();
-        until(&mut term, |delta| {
-            seen.push_str(&row_text(&delta.row_replacements));
-            seen.contains("mux-ok") && delta.input_serial_ack >= 1
-        })
-        .await;
-        assert!(
-            service.controls(terminal, alice.id),
-            "the first typist holds the lease"
-        );
-
-        // Resize as the controller.
-        term.send(
-            Message::TerminalCommand(TerminalCommand::Resize(Dimensions { cols: 60, rows: 12 })),
-            0,
-        )
-        .await;
-        until(&mut term, |delta| {
-            delta.dimensions == Some(Dimensions { cols: 60, rows: 12 })
-        })
-        .await;
-
-        // A viewer: sees the screen, cannot type, can take control.
-        let bob = client(&runtime, &url, &identity, 2).await;
-        let mut bob_control = open(&bob, hello(&bob)).await;
-        let Message::ControlAttached(attached) = bob_control.next().await else {
-            panic!("expected ControlAttached");
-        };
-        assert_eq!(attached.heads.len(), 1);
-        assert!(row_text(&attached.heads[0].rows).contains("mux-ok"));
-        assert_eq!(
-            attached.heads[0].controller.as_ref().map(|c| c.client),
-            Some(alice.id)
-        );
-        let mut bob_term = open(
-            &bob,
-            Message::TerminalAttach(TerminalAttach {
-                client: bob.id,
-                terminal,
-                known: None,
-                size: Dimensions { cols: 60, rows: 12 },
-            }),
-        )
-        .await;
-        let Message::TerminalAttached(TerminalAttached { head: Some(_) }) = bob_term.next().await
-        else {
-            panic!("expected a head");
-        };
-        bob_term
-            .send(
-                Message::TerminalCommand(TerminalCommand::Text {
-                    serial: 1,
-                    text: "echo viewer-typed\n".into(),
-                }),
-                0,
-            )
-            .await;
-        // Nothing of Bob's reaches the shell: prove it by typing as Alice
-        // afterwards and checking what arrived first.
-        term.send(
-            Message::TerminalCommand(TerminalCommand::Text {
-                serial: 2,
-                text: "echo alice-again\n".into(),
-            }),
-            0,
-        )
-        .await;
-        let mut seen = String::new();
-        until(&mut term, |delta| {
-            seen.push_str(&row_text(&delta.row_replacements));
-            seen.contains("alice-again")
-        })
-        .await;
-        assert!(
-            !seen.contains("viewer-typed"),
-            "a viewer's input is dropped: {seen}"
-        );
-
-        // Semantic keys, not text: what a widget sends per keystroke.
-        let mut serial = 3;
-        for ch in "echo key-ok".chars() {
-            term.send(
-                Message::TerminalCommand(TerminalCommand::Key {
-                    serial,
-                    input: KeyInput {
-                        key: Key::Char(ch),
-                        modifiers: Modifiers::default(),
-                        kind: KeyKind::Press,
-                    },
-                }),
-                0,
-            )
-            .await;
-            serial += 1;
-        }
-        term.send(
-            Message::TerminalCommand(TerminalCommand::Key {
-                serial,
-                input: KeyInput {
-                    key: Key::Named(NamedKey::Enter),
-                    modifiers: Modifiers::default(),
-                    kind: KeyKind::Press,
-                },
-            }),
-            0,
-        )
-        .await;
-        let mut seen = String::new();
-        until(&mut term, |delta| {
-            seen.push_str(&row_text(&delta.row_replacements));
-            seen.contains("key-ok") && delta.input_serial_ack >= serial
-        })
-        .await;
-
-        // A burst that scrolls: rows that left the screen between two deltas
-        // were never sent, and a fetch is how a viewer gets them.
-        term.send(
-            Message::TerminalCommand(TerminalCommand::Text {
-                serial: serial + 1,
-                text: "seq 1 100\n".into(),
-            }),
-            0,
-        )
-        .await;
-        // The echo of the command line holds "100" too, before anything
-        // scrolled; wait until the screen has moved past the fetched range.
-        let mut visible = None;
-        until(&mut term, |delta| {
-            if let Some(v) = delta.visible {
-                visible = Some(v);
-            }
-            visible.is_some_and(|v| v.start >= 40)
-        })
-        .await;
-        let visible = visible.expect("a delta names the visible rows");
-        let mut fetch = open(
-            &alice,
-            Message::RowFetch(RowFetch {
-                terminal,
-                epoch: 1,
-                range: zeughaus_mux::StableRange {
-                    start: (visible.start - 40).max(0),
-                    end: visible.start,
-                },
-                generation: 7,
-            }),
-        )
-        .await;
-        let Message::RowPage(page) = fetch.next().await else {
-            panic!("expected a page");
-        };
-        assert_eq!(page.generation, 7);
-        assert!(!page.rows.is_empty(), "the rows above the screen exist");
-        let text = row_text(&page.rows);
-        assert!(
-            text.contains("|5|") || text.contains("50"),
-            "the page holds the burst's earlier lines: {text}"
-        );
-
-        bob_control
-            .send(
-                Message::Command(Command {
-                    request: RequestId(1),
-                    command: TopologyCommand::TakeControl { terminal },
-                }),
-                1,
-            )
-            .await;
-        assert!(matches!(bob_control.next().await, Message::CommandReply(_)));
-        let events = until(&mut term, |delta| {
-            delta.ordered_events.iter().any(
-                |e| matches!(e, TerminalEvent::ControllerChanged(Some(c)) if c.client == bob.id),
-            )
-        })
-        .await;
-        assert!(!events.is_empty());
-        assert!(service.controls(terminal, bob.id));
-
-        // Everyone leaves; the child keeps running; the next attach finds
-        // the screen as it was.
-        drop(term);
-        drop(bob_term);
-        drop(control);
-        drop(bob_control);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let session = service
-            .session(terminal)
-            .expect("the session outlives its viewers");
-        assert!(
-            session.exit().is_none(),
-            "the child was not killed by a detach"
-        );
-
-        let carol = client(&runtime, &url, &identity, 3).await;
-        let mut control = open(&carol, hello(&carol)).await;
-        let Message::ControlAttached(attached) = control.next().await else {
-            panic!("expected ControlAttached");
-        };
-        assert!(row_text(&attached.heads[0].rows).contains("100"));
-        // Bob's lease is within its grace, and Carol proves the same identity
-        // Bob did -- the same user's restarted editor. Her first keystroke
-        // takes the shell over rather than waiting the grace out.
-        assert!(service.controls(terminal, bob.id));
-        let mut carol_term = open(
-            &carol,
-            Message::TerminalAttach(TerminalAttach {
-                client: carol.id,
-                terminal,
-                known: None,
-                size: Dimensions { cols: 60, rows: 12 },
-            }),
-        )
-        .await;
-        let _ = carol_term.next().await;
-        carol_term
-            .send(
-                Message::TerminalCommand(TerminalCommand::Text {
-                    serial: 1,
-                    text: "echo carol-back\n".into(),
-                }),
-                0,
-            )
-            .await;
-        let mut seen = String::new();
-        until(&mut carol_term, |delta| {
-            seen.push_str(&row_text(&delta.row_replacements));
-            seen.contains("carol-back")
-        })
-        .await;
-        assert!(service.controls(terminal, carol.id));
-        drop(carol_term);
-
-        // Closing the pane kills the child and leaves no tab behind.
-        let pane = attached.workspace.tabs().next().unwrap().root.leaves()[0].0;
-        control
-            .send(
-                Message::Command(Command {
-                    request: RequestId(1),
-                    command: TopologyCommand::ClosePane { pane },
-                }),
-                1,
-            )
-            .await;
-        for _ in 0..2 {
-            match control.next().await {
-                Message::CommandReply(reply) => {
-                    assert!(matches!(reply.outcome, CommandOutcome::Applied { .. }));
-                }
-                Message::WorkspaceSnapshot(snapshot) => {
-                    assert_eq!(snapshot.tabs().count(), 0);
-                }
-                other => panic!("unexpected {:?}", other.kind()),
-            }
-        }
-        for _ in 0..50 {
-            if session.exit().is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert!(matches!(
-            session.exit(),
-            Some(zeughaus_mux::ExitState::Killed)
-        ));
-        assert!(service.session(terminal).is_none());
-
-        // A stranger's exchange kind, and a key that means nothing to the
-        // graph: both refused in words, never a panic.
-        let mut bad = open(
-            &carol,
-            Message::TerminalCommand(TerminalCommand::Key {
-                serial: 1,
-                input: KeyInput {
-                    key: Key::Named(NamedKey::Enter),
-                    modifiers: Modifiers::default(),
-                    kind: KeyKind::Press,
-                },
-            }),
-        )
-        .await;
-        assert!(matches!(
-            bad.next().await,
-            Message::Error(WireError {
-                code: ErrorCode::Protocol,
-                ..
-            })
-        ));
-        let mut buf = [0u8; 1];
-        assert_eq!(
-            bad.reply.read(&mut buf).await.ok(),
-            Some(0),
-            "the exchange is finished"
-        );
-
-        // A graph opened on the reconnected control is a pane like any other.
-        control
-            .send(
-                Message::Command(Command {
-                    request: RequestId(2),
-                    command: TopologyCommand::OpenGraph { graph: 7 },
-                }),
-                2,
-            )
-            .await;
-        let mut graph_pane = None;
-        for _ in 0..2 {
-            if let Message::WorkspaceSnapshot(s) = control.next().await {
-                graph_pane = s
-                    .tabs()
-                    .flat_map(|tab| tab.root.leaves())
-                    .find(|(_, surface)| *surface == SurfaceRef::Graph(7))
-                    .map(|(pane, _)| pane);
-            }
-        }
-        let graph_pane = graph_pane.expect("the snapshot shows the graph");
-        control
-            .send(
-                Message::Command(Command {
-                    request: RequestId(3),
-                    command: TopologyCommand::SplitWithTerminal {
-                        pane: graph_pane,
-                        axis: Axis::Horizontal,
-                        profile: ProfileId::DEFAULT,
-                    },
-                }),
-                3,
-            )
-            .await;
-        let mut split_seen = false;
-        for _ in 0..2 {
-            if let Message::WorkspaceSnapshot(s) = control.next().await {
-                split_seen = s.tabs().next().unwrap().root.leaf_count() == 2;
-            }
-        }
-        assert!(split_seen);
-    }
-
-    /// The plan's acceptance numbers, measured on loopback: a fresh dial plus
-    /// attach (QUIC, TLS, HELLO, one control exchange), a warm attach on the
-    /// pooled connection, and a keystroke's round trip to the delta that
-    /// echoes it. Ignored in the gate: it is a measurement, not a contract,
-    /// and it is meant for `cargo test --release -- --ignored perf`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore]
-    async fn perf_attach_and_keystroke_latency() {
-        fn percentiles(samples: &mut [Duration]) -> (Duration, Duration) {
-            samples.sort();
-            let p50 = samples[samples.len() / 2];
-            let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
-            (p50, p95)
-        }
-
-        let (_service, runtime, _binding, url, identity) = setup().await;
-
-        // Fresh dial: a new requester each time, so the pool cannot reuse.
-        let mut fresh = Vec::new();
-        for i in 0..20u8 {
-            // A runtime of its own per dial: the pool keys on the trust
-            // configuration, and an equal one would hand back the warm
-            // connection.
-            let fresh_runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
-            let started = Instant::now();
-            let client = client(&fresh_runtime, &url, &identity, 10 + i).await;
-            let mut control = open(&client, hello(&client)).await;
-            let Message::ControlAttached(_) = control.next().await else {
-                panic!("expected ControlAttached");
-            };
-            fresh.push(started.elapsed());
-        }
-        let (p50, p95) = percentiles(&mut fresh);
-        eprintln!("fresh dial + attach: p50 {p50:?} p95 {p95:?}");
-
-        // Warm attach: one requester, one pooled connection, many exchanges.
-        let alice = client(&runtime, &url, &identity, 1).await;
-        let mut warm = Vec::new();
-        for _ in 0..50 {
-            let started = Instant::now();
-            let mut control = open(&alice, hello(&alice)).await;
-            let Message::ControlAttached(_) = control.next().await else {
-                panic!("expected ControlAttached");
-            };
-            warm.push(started.elapsed());
-        }
-        let (p50, p95) = percentiles(&mut warm);
-        eprintln!("warm attach: p50 {p50:?} p95 {p95:?}");
-
-        // A terminal, then keystrokes: the time from sending a key to the
-        // delta that shows its echo.
-        let mut control = open(&alice, hello(&alice)).await;
-        let _ = control.next().await;
-        control
-            .send(
-                Message::Command(Command {
-                    request: RequestId(1),
-                    command: TopologyCommand::NewTerminalTab {
-                        profile: ProfileId::DEFAULT,
-                    },
-                }),
-                1,
-            )
-            .await;
-        let mut terminal = None;
-        for _ in 0..2 {
-            if let Message::WorkspaceSnapshot(s) = control.next().await {
-                terminal = s.terminals().next();
-            }
-        }
-        let terminal = terminal.expect("terminal");
-        let mut term = open(
-            &alice,
-            Message::TerminalAttach(TerminalAttach {
-                client: alice.id,
-                terminal,
-                known: None,
-                size: Dimensions { cols: 80, rows: 24 },
-            }),
-        )
-        .await;
-        let _ = term.next().await;
-        // Let the shell print its prompt before timing anything.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        while tokio::time::timeout(Duration::from_millis(200), term.next())
-            .await
-            .is_ok()
-        {}
-
-        let mut keys = Vec::new();
-        for i in 0..50u64 {
-            let ch = char::from(b'a' + (i % 26) as u8);
-            // A person types with gaps well past the coalescing window;
-            // back-to-back keys would measure the burst pacing instead.
-            tokio::time::sleep(Duration::from_millis(40)).await;
-            let started = Instant::now();
-            term.send(
-                Message::TerminalCommand(TerminalCommand::Key {
-                    serial: i + 1,
-                    input: KeyInput {
-                        key: Key::Char(ch),
-                        modifiers: Modifiers::default(),
-                        kind: KeyKind::Press,
-                    },
-                }),
-                0,
-            )
-            .await;
-            until(&mut term, |delta| delta.input_serial_ack > i).await;
-            keys.push(started.elapsed());
-        }
-        let (p50, p95) = percentiles(&mut keys);
-        eprintln!("keystroke to echoed delta: p50 {p50:?} p95 {p95:?}");
-
-        // Codec cost of what an attach carries.
-        let head = _service
-            .session(terminal)
-            .expect("session")
-            .head(HEAD_ROWS_ABOVE);
-        let started = Instant::now();
-        let bytes = Message::TerminalHead(head.clone())
-            .encode(0)
-            .expect("encode");
-        let encode = started.elapsed();
-        let started = Instant::now();
-        let header = zeughaus_mux::FrameHeader::decode(
-            bytes[..zeughaus_mux::FrameHeader::LEN].try_into().unwrap(),
-        )
-        .unwrap();
-        let _ = Message::decode(header.kind, &bytes[zeughaus_mux::FrameHeader::LEN..]).unwrap();
-        let decode = started.elapsed();
-        eprintln!(
-            "head of {} rows: {} bytes, encode {encode:?}, decode {decode:?}",
-            head.rows.len(),
-            bytes.len()
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_terminal_the_runner_owns_is_listed_attached_and_only_closed_on_demand() {
-        let (service, runtime, _binding, url, identity) = setup().await;
-        let job = service
-            .spawn_owned(
-                Profile {
-                    label: "job".into(),
-                    program: Some("/bin/sh".into()),
-                    args: vec!["-c".into(), "sleep 30".into()],
-                    cwd: None,
-                    env: vec![],
-                    scrollback_rows: 100,
-                },
-                Wal::Off,
-                None,
-                OwnedPlacement::Detached,
-            )
-            .expect("start the job's process");
-
-        let alice = client(&runtime, &url, &identity, 1).await;
-        let mut control = open(&alice, hello(&alice)).await;
-        let Message::ControlAttached(attached) = control.next().await else {
-            panic!("expected ControlAttached");
-        };
-        assert_eq!(
-            attached
-                .workspace
-                .detached
-                .iter()
-                .map(|d| d.terminal)
-                .collect::<Vec<_>>(),
-            vec![job],
-            "an owned terminal is listed before any pane shows it"
-        );
-        assert_eq!(attached.workspace.terminals().count(), 0);
-
-        control
-            .send(
-                Message::Command(Command {
-                    request: RequestId(1),
-                    command: TopologyCommand::AttachTerminal {
-                        terminal: job,
-                        target: AttachTarget::NewTab,
-                    },
-                }),
-                1,
-            )
-            .await;
-        let mut shown = false;
-        for _ in 0..2 {
-            match control.next().await {
-                Message::CommandReply(reply) => {
-                    assert!(matches!(reply.outcome, CommandOutcome::Applied { .. }));
-                }
-                Message::WorkspaceSnapshot(snapshot) => {
-                    assert!(snapshot.detached.is_empty());
-                    assert_eq!(snapshot.terminals().collect::<Vec<_>>(), vec![job]);
-                    shown = true;
-                }
-                other => panic!("unexpected {:?}", other.kind()),
-            }
-        }
-        assert!(shown, "the snapshot after an attach shows the terminal");
-
-        service.close_terminal(job).expect("close the job terminal");
-        assert!(
-            service.session(job).is_none(),
-            "a closed terminal is forgotten"
-        );
-        assert!(service.close_terminal(job).is_err());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_title_the_child_sets_renames_its_tab_without_a_terminal_stream() {
-        let (service, runtime, _binding, url, identity) = setup().await;
-        let alice = client(&runtime, &url, &identity, 1).await;
-        let mut control = open(&alice, hello(&alice)).await;
-        let Message::ControlAttached(_) = control.next().await else {
-            panic!("expected ControlAttached");
-        };
-        control
-            .send(
-                Message::Command(Command {
-                    request: RequestId(1),
-                    command: TopologyCommand::NewTerminalTab {
-                        profile: ProfileId::DEFAULT,
-                    },
-                }),
-                1,
-            )
-            .await;
-        let mut terminal = None;
-        for _ in 0..2 {
-            if let Message::WorkspaceSnapshot(snapshot) = control.next().await {
-                terminal = snapshot.terminals().next();
-            }
-        }
-        let terminal = terminal.expect("the snapshot names the terminal");
-
-        // Nobody attaches to the terminal: the title has to arrive on the
-        // control exchange alone.
-        service
-            .session(terminal)
-            .expect("session")
-            .apply(&TerminalCommand::Text {
-                serial: 1,
-                text: "printf '\\033]0;renamed\\007'\n".into(),
-            })
-            .expect("type");
-        for _ in 0..20 {
-            match control.next().await {
-                Message::WorkspaceSnapshot(snapshot)
-                    if snapshot
-                        .tabs()
-                        .next()
-                        .is_some_and(|tab| tab.title == "renamed") =>
-                {
-                    let tab = snapshot.tabs().next().unwrap().id;
-                    assert!(matches!(
-                        service.structural(&TopologyCommand::CloseTab { tab }),
-                        CommandOutcome::Applied { .. }
-                    ));
-                    return;
-                }
-                Message::WorkspaceSnapshot(_) => {}
-                other => panic!("unexpected {:?}", other.kind()),
-            }
-        }
-        panic!("no snapshot carried the new title");
-    }
 
     #[test]
     fn a_graph_tab_is_named_after_its_node_and_only_a_known_graph_opens() {
@@ -1932,5 +1100,852 @@ mod tests {
             service.structural(&TopologyCommand::OpenGraph { graph: 5 }),
             CommandOutcome::Refused { .. }
         ));
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        use std::time::Duration;
+
+        use tokio::io::AsyncReadExt;
+        use weida::{ClientTls, EndpointAddr, Identity, Runtime, RuntimeConfig, ServerTls, Trust};
+        use zeughaus_mux::input::Key;
+        use zeughaus_mux::{
+            AttachTarget, Axis, KeyInput, KeyKind, Modifiers, NamedKey, SurfaceRef,
+            TerminalAttached, TerminalEvent,
+        };
+
+        use zeughaus_terminal::serve::HEAD_ROWS_ABOVE;
+
+        struct Client {
+            requester: weida::Requester,
+            id: ClientInstanceId,
+        }
+
+        struct Exchange {
+            request: weida::OutgoingTransfer,
+            reply: weida::IncomingTransfer,
+        }
+
+        impl Exchange {
+            async fn send(&mut self, message: Message, request_id: u64) {
+                write_frame(&mut self.request, &message, request_id)
+                    .await
+                    .expect("write");
+            }
+
+            async fn next(&mut self) -> Message {
+                tokio::time::timeout(Duration::from_secs(20), read_frame(&mut self.reply))
+                    .await
+                    .expect("a frame within 20 s")
+                    .expect("a readable frame")
+                    .1
+            }
+        }
+
+        async fn open(client: &Client, first: Message) -> Exchange {
+            let (mut request, reply) = client
+                .requester
+                .open(TransferMeta::default())
+                .await
+                .expect("open");
+            write_frame(&mut request, &first, 0)
+                .await
+                .expect("first frame");
+            let reply = reply.recv().await.expect("reply half");
+            Exchange { request, reply }
+        }
+
+        async fn setup() -> (MuxService, weida::Runtime, weida::Binding, String, Identity) {
+            let server_identity = Identity::generate_for(["127.0.0.1"]).expect("identity");
+            let client_identity = Identity::generate_for(["client"]).expect("identity");
+            let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+            let listener = runtime.listener();
+            let tls = ServerTls::new(server_identity.clone()).require_client(
+                Trust::by_address().and_pin(client_identity.fingerprint().unwrap()),
+            );
+            let binding = listener
+                .bind_quic(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), tls)
+                .await
+                .expect("bind");
+            let replier = listener.replier("/mux").expect("replier");
+            let shell = Profile {
+                label: "sh".into(),
+                program: Some("/bin/sh".into()),
+                args: vec![],
+                cwd: None,
+                env: vec![("PS1".into(), "$ ".into())],
+                scrollback_rows: 100,
+            };
+            let service = MuxService::new(
+                RunnerIncarnation::from_bytes([7; 16]),
+                vec![shell],
+                TerminalHost::Local,
+            );
+            tokio::spawn(service.clone().accept(replier));
+            let url = EndpointAddr {
+                host: "127.0.0.1".into(),
+                port: Some(binding.local_addr().port()),
+                path: "/mux".into(),
+                peer: Some(server_identity.fingerprint().unwrap()),
+            }
+            .to_string();
+            (service, runtime, binding, url, client_identity)
+        }
+
+        async fn client(runtime: &Runtime, url: &str, identity: &Identity, seed: u8) -> Client {
+            let requester = runtime
+                .requester(ClientTls::new(Trust::by_address()).with_identity(identity.clone()));
+            requester.connect(url).await.expect("connect");
+            Client {
+                requester,
+                id: ClientInstanceId::from_bytes([seed; 16]),
+            }
+        }
+
+        fn hello(client: &Client) -> Message {
+            Message::ControlAttach(ControlAttach {
+                hello: ClientHello {
+                    major: MAJOR,
+                    minor: MINOR,
+                    client: client.id,
+                    capabilities: vec![],
+                    known_incarnation: None,
+                    known_revision: None,
+                },
+            })
+        }
+
+        fn row_text(rows: &[zeughaus_mux::RowData]) -> String {
+            rows.iter()
+                .flat_map(|r| r.spans.iter().map(|s| s.text.as_str()))
+                .collect::<Vec<_>>()
+                .join("|")
+        }
+
+        /// Waits for deltas until `pred` holds on one, collecting events.
+        async fn until(
+            exchange: &mut Exchange,
+            mut pred: impl FnMut(&zeughaus_mux::TerminalDelta) -> bool,
+        ) -> Vec<TerminalEvent> {
+            let mut events = Vec::new();
+            for _ in 0..200 {
+                match exchange.next().await {
+                    Message::TerminalDelta(delta) => {
+                        events.extend(delta.ordered_events.iter().cloned());
+                        if pred(&delta) {
+                            return events;
+                        }
+                    }
+                    other => panic!("unexpected {:?}", other.kind()),
+                }
+            }
+            panic!("no delta satisfied the predicate");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_shell_is_created_driven_shared_and_survives_its_viewers() {
+            let (service, runtime, _binding, url, identity) = setup().await;
+            let alice = client(&runtime, &url, &identity, 1).await;
+
+            // Attach: the default workspace, no terminals.
+            let mut control = open(&alice, hello(&alice)).await;
+            let Message::ControlAttached(attached) = control.next().await else {
+                panic!("expected ControlAttached");
+            };
+            assert_eq!(attached.workspace.tabs().count(), 0);
+            assert!(attached.heads.is_empty());
+            assert_eq!(
+                attached.hello.principal,
+                identity.fingerprint().unwrap().to_string()
+            );
+
+            // A new terminal tab: reply, then the snapshot that shows it.
+            control
+                .send(
+                    Message::Command(Command {
+                        request: RequestId(1),
+                        command: TopologyCommand::NewTerminalTab {
+                            profile: ProfileId::DEFAULT,
+                        },
+                    }),
+                    1,
+                )
+                .await;
+            let mut terminal = None;
+            for _ in 0..2 {
+                match control.next().await {
+                    Message::CommandReply(reply) => {
+                        assert_eq!(reply.request, RequestId(1));
+                        assert!(matches!(
+                            reply.outcome,
+                            CommandOutcome::Applied { revision: 2 }
+                        ));
+                    }
+                    Message::WorkspaceSnapshot(snapshot) => {
+                        assert_eq!(snapshot.revision, 2);
+                        terminal = snapshot.terminals().next();
+                    }
+                    other => panic!("unexpected {:?}", other.kind()),
+                }
+            }
+            let terminal = terminal.expect("the snapshot names the terminal");
+
+            // The same request id again is answered, not applied again.
+            control
+                .send(
+                    Message::Command(Command {
+                        request: RequestId(1),
+                        command: TopologyCommand::NewTerminalTab {
+                            profile: ProfileId::DEFAULT,
+                        },
+                    }),
+                    1,
+                )
+                .await;
+            assert!(matches!(
+                control.next().await,
+                Message::CommandReply(CommandReply {
+                    outcome: CommandOutcome::Applied { revision: 2 },
+                    ..
+                })
+            ));
+
+            // Attach to the terminal, type, see the echo.
+            let mut term = open(
+                &alice,
+                Message::TerminalAttach(TerminalAttach {
+                    client: alice.id,
+                    terminal,
+                    known: None,
+                    size: Dimensions { cols: 40, rows: 10 },
+                }),
+            )
+            .await;
+            let Message::TerminalAttached(TerminalAttached { head: Some(head) }) =
+                term.next().await
+            else {
+                panic!("expected a head");
+            };
+            assert_eq!(head.terminal, terminal);
+            term.send(
+                Message::TerminalCommand(TerminalCommand::Text {
+                    serial: 1,
+                    text: "echo mux-ok\n".into(),
+                }),
+                0,
+            )
+            .await;
+            let mut seen = String::new();
+            until(&mut term, |delta| {
+                seen.push_str(&row_text(&delta.row_replacements));
+                seen.contains("mux-ok") && delta.input_serial_ack >= 1
+            })
+            .await;
+            assert!(
+                service.controls(terminal, alice.id),
+                "the first typist holds the lease"
+            );
+
+            // Resize as the controller.
+            term.send(
+                Message::TerminalCommand(TerminalCommand::Resize(Dimensions {
+                    cols: 60,
+                    rows: 12,
+                })),
+                0,
+            )
+            .await;
+            until(&mut term, |delta| {
+                delta.dimensions == Some(Dimensions { cols: 60, rows: 12 })
+            })
+            .await;
+
+            // A viewer: sees the screen, cannot type, can take control.
+            let bob = client(&runtime, &url, &identity, 2).await;
+            let mut bob_control = open(&bob, hello(&bob)).await;
+            let Message::ControlAttached(attached) = bob_control.next().await else {
+                panic!("expected ControlAttached");
+            };
+            assert_eq!(attached.heads.len(), 1);
+            assert!(row_text(&attached.heads[0].rows).contains("mux-ok"));
+            assert_eq!(
+                attached.heads[0].controller.as_ref().map(|c| c.client),
+                Some(alice.id)
+            );
+            let mut bob_term = open(
+                &bob,
+                Message::TerminalAttach(TerminalAttach {
+                    client: bob.id,
+                    terminal,
+                    known: None,
+                    size: Dimensions { cols: 60, rows: 12 },
+                }),
+            )
+            .await;
+            let Message::TerminalAttached(TerminalAttached { head: Some(_) }) =
+                bob_term.next().await
+            else {
+                panic!("expected a head");
+            };
+            bob_term
+                .send(
+                    Message::TerminalCommand(TerminalCommand::Text {
+                        serial: 1,
+                        text: "echo viewer-typed\n".into(),
+                    }),
+                    0,
+                )
+                .await;
+            // Nothing of Bob's reaches the shell: prove it by typing as Alice
+            // afterwards and checking what arrived first.
+            term.send(
+                Message::TerminalCommand(TerminalCommand::Text {
+                    serial: 2,
+                    text: "echo alice-again\n".into(),
+                }),
+                0,
+            )
+            .await;
+            let mut seen = String::new();
+            until(&mut term, |delta| {
+                seen.push_str(&row_text(&delta.row_replacements));
+                seen.contains("alice-again")
+            })
+            .await;
+            assert!(
+                !seen.contains("viewer-typed"),
+                "a viewer's input is dropped: {seen}"
+            );
+
+            // Semantic keys, not text: what a widget sends per keystroke.
+            let mut serial = 3;
+            for ch in "echo key-ok".chars() {
+                term.send(
+                    Message::TerminalCommand(TerminalCommand::Key {
+                        serial,
+                        input: KeyInput {
+                            key: Key::Char(ch),
+                            modifiers: Modifiers::default(),
+                            kind: KeyKind::Press,
+                        },
+                    }),
+                    0,
+                )
+                .await;
+                serial += 1;
+            }
+            term.send(
+                Message::TerminalCommand(TerminalCommand::Key {
+                    serial,
+                    input: KeyInput {
+                        key: Key::Named(NamedKey::Enter),
+                        modifiers: Modifiers::default(),
+                        kind: KeyKind::Press,
+                    },
+                }),
+                0,
+            )
+            .await;
+            let mut seen = String::new();
+            until(&mut term, |delta| {
+                seen.push_str(&row_text(&delta.row_replacements));
+                seen.contains("key-ok") && delta.input_serial_ack >= serial
+            })
+            .await;
+
+            // A burst that scrolls: rows that left the screen between two deltas
+            // were never sent, and a fetch is how a viewer gets them.
+            term.send(
+                Message::TerminalCommand(TerminalCommand::Text {
+                    serial: serial + 1,
+                    text: "seq 1 100\n".into(),
+                }),
+                0,
+            )
+            .await;
+            // The echo of the command line holds "100" too, before anything
+            // scrolled; wait until the screen has moved past the fetched range.
+            let mut visible = None;
+            until(&mut term, |delta| {
+                if let Some(v) = delta.visible {
+                    visible = Some(v);
+                }
+                visible.is_some_and(|v| v.start >= 40)
+            })
+            .await;
+            let visible = visible.expect("a delta names the visible rows");
+            let mut fetch = open(
+                &alice,
+                Message::RowFetch(RowFetch {
+                    terminal,
+                    epoch: 1,
+                    range: zeughaus_mux::StableRange {
+                        start: (visible.start - 40).max(0),
+                        end: visible.start,
+                    },
+                    generation: 7,
+                }),
+            )
+            .await;
+            let Message::RowPage(page) = fetch.next().await else {
+                panic!("expected a page");
+            };
+            assert_eq!(page.generation, 7);
+            assert!(!page.rows.is_empty(), "the rows above the screen exist");
+            let text = row_text(&page.rows);
+            assert!(
+                text.contains("|5|") || text.contains("50"),
+                "the page holds the burst's earlier lines: {text}"
+            );
+
+            bob_control
+                .send(
+                    Message::Command(Command {
+                        request: RequestId(1),
+                        command: TopologyCommand::TakeControl { terminal },
+                    }),
+                    1,
+                )
+                .await;
+            assert!(matches!(bob_control.next().await, Message::CommandReply(_)));
+            let events = until(&mut term, |delta| {
+                delta.ordered_events.iter().any(
+                |e| matches!(e, TerminalEvent::ControllerChanged(Some(c)) if c.client == bob.id),
+            )
+            })
+            .await;
+            assert!(!events.is_empty());
+            assert!(service.controls(terminal, bob.id));
+
+            // Everyone leaves; the child keeps running; the next attach finds
+            // the screen as it was.
+            drop(term);
+            drop(bob_term);
+            drop(control);
+            drop(bob_control);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let session = service
+                .session(terminal)
+                .expect("the session outlives its viewers");
+            assert!(
+                session.exit().is_none(),
+                "the child was not killed by a detach"
+            );
+
+            let carol = client(&runtime, &url, &identity, 3).await;
+            let mut control = open(&carol, hello(&carol)).await;
+            let Message::ControlAttached(attached) = control.next().await else {
+                panic!("expected ControlAttached");
+            };
+            assert!(row_text(&attached.heads[0].rows).contains("100"));
+            // Bob's lease is within its grace, and Carol proves the same identity
+            // Bob did -- the same user's restarted editor. Her first keystroke
+            // takes the shell over rather than waiting the grace out.
+            assert!(service.controls(terminal, bob.id));
+            let mut carol_term = open(
+                &carol,
+                Message::TerminalAttach(TerminalAttach {
+                    client: carol.id,
+                    terminal,
+                    known: None,
+                    size: Dimensions { cols: 60, rows: 12 },
+                }),
+            )
+            .await;
+            let _ = carol_term.next().await;
+            carol_term
+                .send(
+                    Message::TerminalCommand(TerminalCommand::Text {
+                        serial: 1,
+                        text: "echo carol-back\n".into(),
+                    }),
+                    0,
+                )
+                .await;
+            let mut seen = String::new();
+            until(&mut carol_term, |delta| {
+                seen.push_str(&row_text(&delta.row_replacements));
+                seen.contains("carol-back")
+            })
+            .await;
+            assert!(service.controls(terminal, carol.id));
+            drop(carol_term);
+
+            // Closing the pane kills the child and leaves no tab behind.
+            let pane = attached.workspace.tabs().next().unwrap().root.leaves()[0].0;
+            control
+                .send(
+                    Message::Command(Command {
+                        request: RequestId(1),
+                        command: TopologyCommand::ClosePane { pane },
+                    }),
+                    1,
+                )
+                .await;
+            for _ in 0..2 {
+                match control.next().await {
+                    Message::CommandReply(reply) => {
+                        assert!(matches!(reply.outcome, CommandOutcome::Applied { .. }));
+                    }
+                    Message::WorkspaceSnapshot(snapshot) => {
+                        assert_eq!(snapshot.tabs().count(), 0);
+                    }
+                    other => panic!("unexpected {:?}", other.kind()),
+                }
+            }
+            for _ in 0..50 {
+                if session.exit().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(matches!(
+                session.exit(),
+                Some(zeughaus_mux::ExitState::Killed)
+            ));
+            assert!(service.session(terminal).is_none());
+
+            // A stranger's exchange kind, and a key that means nothing to the
+            // graph: both refused in words, never a panic.
+            let mut bad = open(
+                &carol,
+                Message::TerminalCommand(TerminalCommand::Key {
+                    serial: 1,
+                    input: KeyInput {
+                        key: Key::Named(NamedKey::Enter),
+                        modifiers: Modifiers::default(),
+                        kind: KeyKind::Press,
+                    },
+                }),
+            )
+            .await;
+            assert!(matches!(
+                bad.next().await,
+                Message::Error(WireError {
+                    code: ErrorCode::Protocol,
+                    ..
+                })
+            ));
+            let mut buf = [0u8; 1];
+            assert_eq!(
+                bad.reply.read(&mut buf).await.ok(),
+                Some(0),
+                "the exchange is finished"
+            );
+
+            // A graph opened on the reconnected control is a pane like any other.
+            control
+                .send(
+                    Message::Command(Command {
+                        request: RequestId(2),
+                        command: TopologyCommand::OpenGraph { graph: 7 },
+                    }),
+                    2,
+                )
+                .await;
+            let mut graph_pane = None;
+            for _ in 0..2 {
+                if let Message::WorkspaceSnapshot(s) = control.next().await {
+                    graph_pane = s
+                        .tabs()
+                        .flat_map(|tab| tab.root.leaves())
+                        .find(|(_, surface)| *surface == SurfaceRef::Graph(7))
+                        .map(|(pane, _)| pane);
+                }
+            }
+            let graph_pane = graph_pane.expect("the snapshot shows the graph");
+            control
+                .send(
+                    Message::Command(Command {
+                        request: RequestId(3),
+                        command: TopologyCommand::SplitWithTerminal {
+                            pane: graph_pane,
+                            axis: Axis::Horizontal,
+                            profile: ProfileId::DEFAULT,
+                        },
+                    }),
+                    3,
+                )
+                .await;
+            let mut split_seen = false;
+            for _ in 0..2 {
+                if let Message::WorkspaceSnapshot(s) = control.next().await {
+                    split_seen = s.tabs().next().unwrap().root.leaf_count() == 2;
+                }
+            }
+            assert!(split_seen);
+        }
+
+        /// The plan's acceptance numbers, measured on loopback: a fresh dial plus
+        /// attach (QUIC, TLS, HELLO, one control exchange), a warm attach on the
+        /// pooled connection, and a keystroke's round trip to the delta that
+        /// echoes it. Ignored in the gate: it is a measurement, not a contract,
+        /// and it is meant for `cargo test --release -- --ignored perf`.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore]
+        async fn perf_attach_and_keystroke_latency() {
+            fn percentiles(samples: &mut [Duration]) -> (Duration, Duration) {
+                samples.sort();
+                let p50 = samples[samples.len() / 2];
+                let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
+                (p50, p95)
+            }
+
+            let (_service, runtime, _binding, url, identity) = setup().await;
+
+            // Fresh dial: a new requester each time, so the pool cannot reuse.
+            let mut fresh = Vec::new();
+            for i in 0..20u8 {
+                // A runtime of its own per dial: the pool keys on the trust
+                // configuration, and an equal one would hand back the warm
+                // connection.
+                let fresh_runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+                let started = Instant::now();
+                let client = client(&fresh_runtime, &url, &identity, 10 + i).await;
+                let mut control = open(&client, hello(&client)).await;
+                let Message::ControlAttached(_) = control.next().await else {
+                    panic!("expected ControlAttached");
+                };
+                fresh.push(started.elapsed());
+            }
+            let (p50, p95) = percentiles(&mut fresh);
+            eprintln!("fresh dial + attach: p50 {p50:?} p95 {p95:?}");
+
+            // Warm attach: one requester, one pooled connection, many exchanges.
+            let alice = client(&runtime, &url, &identity, 1).await;
+            let mut warm = Vec::new();
+            for _ in 0..50 {
+                let started = Instant::now();
+                let mut control = open(&alice, hello(&alice)).await;
+                let Message::ControlAttached(_) = control.next().await else {
+                    panic!("expected ControlAttached");
+                };
+                warm.push(started.elapsed());
+            }
+            let (p50, p95) = percentiles(&mut warm);
+            eprintln!("warm attach: p50 {p50:?} p95 {p95:?}");
+
+            // A terminal, then keystrokes: the time from sending a key to the
+            // delta that shows its echo.
+            let mut control = open(&alice, hello(&alice)).await;
+            let _ = control.next().await;
+            control
+                .send(
+                    Message::Command(Command {
+                        request: RequestId(1),
+                        command: TopologyCommand::NewTerminalTab {
+                            profile: ProfileId::DEFAULT,
+                        },
+                    }),
+                    1,
+                )
+                .await;
+            let mut terminal = None;
+            for _ in 0..2 {
+                if let Message::WorkspaceSnapshot(s) = control.next().await {
+                    terminal = s.terminals().next();
+                }
+            }
+            let terminal = terminal.expect("terminal");
+            let mut term = open(
+                &alice,
+                Message::TerminalAttach(TerminalAttach {
+                    client: alice.id,
+                    terminal,
+                    known: None,
+                    size: Dimensions { cols: 80, rows: 24 },
+                }),
+            )
+            .await;
+            let _ = term.next().await;
+            // Let the shell print its prompt before timing anything.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            while tokio::time::timeout(Duration::from_millis(200), term.next())
+                .await
+                .is_ok()
+            {}
+
+            let mut keys = Vec::new();
+            for i in 0..50u64 {
+                let ch = char::from(b'a' + (i % 26) as u8);
+                // A person types with gaps well past the coalescing window;
+                // back-to-back keys would measure the burst pacing instead.
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                let started = Instant::now();
+                term.send(
+                    Message::TerminalCommand(TerminalCommand::Key {
+                        serial: i + 1,
+                        input: KeyInput {
+                            key: Key::Char(ch),
+                            modifiers: Modifiers::default(),
+                            kind: KeyKind::Press,
+                        },
+                    }),
+                    0,
+                )
+                .await;
+                until(&mut term, |delta| delta.input_serial_ack > i).await;
+                keys.push(started.elapsed());
+            }
+            let (p50, p95) = percentiles(&mut keys);
+            eprintln!("keystroke to echoed delta: p50 {p50:?} p95 {p95:?}");
+
+            // Codec cost of what an attach carries.
+            let head = _service
+                .session(terminal)
+                .expect("session")
+                .head(HEAD_ROWS_ABOVE);
+            let started = Instant::now();
+            let bytes = Message::TerminalHead(head.clone())
+                .encode(0)
+                .expect("encode");
+            let encode = started.elapsed();
+            let started = Instant::now();
+            let header = zeughaus_mux::FrameHeader::decode(
+                bytes[..zeughaus_mux::FrameHeader::LEN].try_into().unwrap(),
+            )
+            .unwrap();
+            let _ = Message::decode(header.kind, &bytes[zeughaus_mux::FrameHeader::LEN..]).unwrap();
+            let decode = started.elapsed();
+            eprintln!(
+                "head of {} rows: {} bytes, encode {encode:?}, decode {decode:?}",
+                head.rows.len(),
+                bytes.len()
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_terminal_the_runner_owns_is_listed_attached_and_only_closed_on_demand() {
+            let (service, runtime, _binding, url, identity) = setup().await;
+            let job = service
+                .spawn_owned(
+                    Profile {
+                        label: "job".into(),
+                        program: Some("/bin/sh".into()),
+                        args: vec!["-c".into(), "sleep 30".into()],
+                        cwd: None,
+                        env: vec![],
+                        scrollback_rows: 100,
+                    },
+                    Wal::Off,
+                    None,
+                    OwnedPlacement::Detached,
+                )
+                .expect("start the job's process");
+
+            let alice = client(&runtime, &url, &identity, 1).await;
+            let mut control = open(&alice, hello(&alice)).await;
+            let Message::ControlAttached(attached) = control.next().await else {
+                panic!("expected ControlAttached");
+            };
+            assert_eq!(
+                attached
+                    .workspace
+                    .detached
+                    .iter()
+                    .map(|d| d.terminal)
+                    .collect::<Vec<_>>(),
+                vec![job],
+                "an owned terminal is listed before any pane shows it"
+            );
+            assert_eq!(attached.workspace.terminals().count(), 0);
+
+            control
+                .send(
+                    Message::Command(Command {
+                        request: RequestId(1),
+                        command: TopologyCommand::AttachTerminal {
+                            terminal: job,
+                            target: AttachTarget::NewTab,
+                        },
+                    }),
+                    1,
+                )
+                .await;
+            let mut shown = false;
+            for _ in 0..2 {
+                match control.next().await {
+                    Message::CommandReply(reply) => {
+                        assert!(matches!(reply.outcome, CommandOutcome::Applied { .. }));
+                    }
+                    Message::WorkspaceSnapshot(snapshot) => {
+                        assert!(snapshot.detached.is_empty());
+                        assert_eq!(snapshot.terminals().collect::<Vec<_>>(), vec![job]);
+                        shown = true;
+                    }
+                    other => panic!("unexpected {:?}", other.kind()),
+                }
+            }
+            assert!(shown, "the snapshot after an attach shows the terminal");
+
+            service.close_terminal(job).expect("close the job terminal");
+            assert!(
+                service.session(job).is_none(),
+                "a closed terminal is forgotten"
+            );
+            assert!(service.close_terminal(job).is_err());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_title_the_child_sets_renames_its_tab_without_a_terminal_stream() {
+            let (service, runtime, _binding, url, identity) = setup().await;
+            let alice = client(&runtime, &url, &identity, 1).await;
+            let mut control = open(&alice, hello(&alice)).await;
+            let Message::ControlAttached(_) = control.next().await else {
+                panic!("expected ControlAttached");
+            };
+            control
+                .send(
+                    Message::Command(Command {
+                        request: RequestId(1),
+                        command: TopologyCommand::NewTerminalTab {
+                            profile: ProfileId::DEFAULT,
+                        },
+                    }),
+                    1,
+                )
+                .await;
+            let mut terminal = None;
+            for _ in 0..2 {
+                if let Message::WorkspaceSnapshot(snapshot) = control.next().await {
+                    terminal = snapshot.terminals().next();
+                }
+            }
+            let terminal = terminal.expect("the snapshot names the terminal");
+
+            // Nobody attaches to the terminal: the title has to arrive on the
+            // control exchange alone.
+            service
+                .session(terminal)
+                .expect("session")
+                .apply(&TerminalCommand::Text {
+                    serial: 1,
+                    text: "printf '\\033]0;renamed\\007'\n".into(),
+                })
+                .expect("type");
+            for _ in 0..20 {
+                match control.next().await {
+                    Message::WorkspaceSnapshot(snapshot)
+                        if snapshot
+                            .tabs()
+                            .next()
+                            .is_some_and(|tab| tab.title == "renamed") =>
+                    {
+                        let tab = snapshot.tabs().next().unwrap().id;
+                        assert!(matches!(
+                            service.structural(&TopologyCommand::CloseTab { tab }),
+                            CommandOutcome::Applied { .. }
+                        ));
+                        return;
+                    }
+                    Message::WorkspaceSnapshot(_) => {}
+                    other => panic!("unexpected {:?}", other.kind()),
+                }
+            }
+            panic!("no snapshot carried the new title");
+        }
     }
 }

@@ -201,27 +201,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_waiter_gets_the_outcome_once_the_fetch_ended() {
-        let early = Arc::new(Prefetch::new());
-        let waiters: Vec<_> = (0..2)
-            .map(|_| {
-                let early = Arc::clone(&early);
-                std::thread::spawn(move || early.wait())
-            })
-            .collect();
-        // Nothing has ended: both are blocked.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(waiters.iter().all(|waiter| !waiter.is_finished()));
-
-        early.finish(Err("the CI is gone".to_owned()));
-        for waiter in waiters {
-            assert_eq!(waiter.join().unwrap(), Err("the CI is gone".to_owned()));
-        }
-        // A late waiter does not block either.
-        assert_eq!(early.wait(), Err("the CI is gone".to_owned()));
-    }
-
-    #[test]
     fn a_fetch_is_known_once_and_claimed_once() {
         let table = Prefetches::default();
         assert!(table.begin("r.2.c", "a").is_some());
@@ -253,5 +232,32 @@ mod tests {
             table.claim("r.3.c", "a").is_some(),
             "another job keeps its fetch"
         );
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        #[test]
+        fn every_waiter_gets_the_outcome_once_the_fetch_ended() {
+            let early = Arc::new(Prefetch::new());
+            let waiters: Vec<_> = (0..2)
+                .map(|_| {
+                    let early = Arc::clone(&early);
+                    std::thread::spawn(move || early.wait())
+                })
+                .collect();
+            // Nothing has ended: both are blocked.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(waiters.iter().all(|waiter| !waiter.is_finished()));
+
+            early.finish(Err("the CI is gone".to_owned()));
+            for waiter in waiters {
+                assert_eq!(waiter.join().unwrap(), Err("the CI is gone".to_owned()));
+            }
+            // A late waiter does not block either.
+            assert_eq!(early.wait(), Err("the CI is gone".to_owned()));
+        }
     }
 }

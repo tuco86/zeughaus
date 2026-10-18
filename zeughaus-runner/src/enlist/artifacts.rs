@@ -566,176 +566,10 @@ impl Read for ChunkReader {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zci-art-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     /// Bytes that differ along their length, so a chunk boundary that loses
     /// or repeats one shows.
     fn pattern(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251) as u8).collect()
-    }
-
-    /// The tar of a small set, closing blocks included.
-    fn tar_of(dir: &Path) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        let mut builder = tar::Builder::new(&mut bytes);
-        builder.append_dir_all(".", dir).unwrap();
-        builder.finish().unwrap();
-        drop(builder);
-        bytes
-    }
-
-    /// A set whose big file crosses two chunk boundaries.
-    fn make_set(dir: &Path) {
-        std::fs::create_dir_all(dir.join("sub/deeper")).unwrap();
-        std::fs::write(dir.join("a"), "one").unwrap();
-        std::fs::write(dir.join("sub/b"), "two").unwrap();
-        let big = pattern(2 * ARTIFACT_CHUNK + 12_345);
-        std::fs::write(dir.join("sub/deeper/big"), big).unwrap();
-    }
-
-    /// Carries the pieces of a [`ChunkWriter`] through the chunk framing, as
-    /// the CI's relay and a receiving task do, to the queue of a
-    /// [`ChunkReader`]. The stream between them is small, so the sender has
-    /// to wait for the reader.
-    fn through_the_wire(
-        rt: &tokio::runtime::Runtime,
-        mut pieces: mpsc::Receiver<Piece>,
-    ) -> mpsc::Receiver<Result<Received, String>> {
-        let (tx, rx) = mpsc::channel(QUEUE);
-        rt.spawn(async move {
-            let (mut near, mut far) = tokio::io::duplex(64 << 10);
-            let sending = async move {
-                while let Some(piece) = pieces.recv().await {
-                    match piece {
-                        Piece::Bytes(bytes) => write_chunk(&mut near, &bytes).await.unwrap(),
-                        Piece::End => {
-                            write_end(&mut near).await.unwrap();
-                            break;
-                        }
-                    }
-                }
-            };
-            let receiving = async move {
-                let mut chunk = Vec::new();
-                loop {
-                    let next = match read_chunk(&mut far, &mut chunk).await {
-                        Ok(true) => Ok(Received::Bytes(std::mem::take(&mut chunk))),
-                        Ok(false) => Ok(Received::End),
-                        Err(e) => Err(e),
-                    };
-                    let last = !matches!(next, Ok(Received::Bytes(_)));
-                    tx.send(next).await.unwrap();
-                    if last {
-                        break;
-                    }
-                }
-            };
-            tokio::join!(sending, receiving);
-        });
-        rx
-    }
-
-    #[test]
-    fn an_artifact_set_survives_a_round_trip_through_the_chunks() {
-        let base = scratch("round-trip");
-        let from = base.join("from");
-        make_set(&from);
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-
-        let (tx, pieces) = mpsc::channel(QUEUE);
-        let packer = std::thread::spawn({
-            let from = from.clone();
-            move || pack(&from, tx)
-        });
-        let mut reader = ChunkReader::new(through_the_wire(&rt, pieces));
-        let to = base.join("to");
-        unpack(&mut reader, &to).unwrap();
-        packer.join().unwrap().unwrap();
-
-        assert_eq!(std::fs::read(to.join("a")).unwrap(), b"one");
-        assert_eq!(std::fs::read(to.join("sub/b")).unwrap(), b"two");
-        assert_eq!(
-            std::fs::read(to.join("sub/deeper/big")).unwrap(),
-            pattern(2 * ARTIFACT_CHUNK + 12_345)
-        );
-        assert!(reader.ended, "the end marker was read");
-        assert!(reader.bytes > 2 * ARTIFACT_CHUNK as u64);
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn a_set_that_stops_before_its_end_marker_is_not_a_set() {
-        let base = scratch("short");
-        let from = base.join("from");
-        make_set(&from);
-        // Every file is there; the tar's closing blocks and the end marker
-        // are not. A reader that took the end of the stream for the end of
-        // the set would accept this.
-        let mut tar = tar_of(&from);
-        tar.truncate(tar.len() - 1024);
-
-        let (tx, rx) = mpsc::channel(QUEUE);
-        tx.blocking_send(Ok(Received::Bytes(tar))).unwrap();
-        drop(tx);
-        let to = base.join("to");
-        let err = unpack(&mut ChunkReader::new(rx), &to).unwrap_err();
-        assert!(err.contains("the transfer ended early"), "{err}");
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn what_the_ci_says_is_the_reason_the_set_did_not_arrive() {
-        let base = scratch("refused");
-        let (tx, rx) = mpsc::channel(QUEUE);
-        tx.blocking_send(Err("runner x: view.7.a left no artifacts".to_owned()))
-            .unwrap();
-        let err = unpack(&mut ChunkReader::new(rx), &base.join("to")).unwrap_err();
-        assert!(err.contains("view.7.a left no artifacts"), "{err}");
-
-        // Also when the failure comes in the middle of a file, where the tar
-        // reader wraps it.
-        let from = base.join("from");
-        make_set(&from);
-        let tar = tar_of(&from);
-        let (tx, rx) = mpsc::channel(QUEUE);
-        tx.blocking_send(Ok(Received::Bytes(tar[..ARTIFACT_CHUNK].to_vec())))
-            .unwrap();
-        tx.blocking_send(Err("the CI went away".to_owned()))
-            .unwrap();
-        let err = unpack(&mut ChunkReader::new(rx), &base.join("to2")).unwrap_err();
-        assert!(err.contains("the CI went away"), "{err}");
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn a_bundle_is_written_chunk_by_chunk() {
-        let base = scratch("bundle");
-        let bundle = pattern(ARTIFACT_CHUNK + 7);
-        let (tx, rx) = mpsc::channel(QUEUE);
-        tx.blocking_send(Ok(Received::Bytes(bundle[..ARTIFACT_CHUNK].to_vec())))
-            .unwrap();
-        tx.blocking_send(Ok(Received::Bytes(bundle[ARTIFACT_CHUNK..].to_vec())))
-            .unwrap();
-        tx.blocking_send(Ok(Received::End)).unwrap();
-        let dest = base.join("bundle");
-        save(&mut ChunkReader::new(rx), &dest).unwrap();
-        assert_eq!(std::fs::read(&dest).unwrap(), bundle);
-
-        // Without its end marker the file is no bundle.
-        let (tx, rx) = mpsc::channel(QUEUE);
-        tx.blocking_send(Ok(Received::Bytes(bundle))).unwrap();
-        drop(tx);
-        assert!(save(&mut ChunkReader::new(rx), &dest).is_err());
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -779,6 +613,178 @@ mod tests {
         drop(rx);
         let mut writer = ChunkWriter::new(tx);
         let err = writer.write_all(&vec![0u8; ARTIFACT_CHUNK]).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        fn scratch(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("zci-art-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        /// The tar of a small set, closing blocks included.
+        fn tar_of(dir: &Path) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            let mut builder = tar::Builder::new(&mut bytes);
+            builder.append_dir_all(".", dir).unwrap();
+            builder.finish().unwrap();
+            drop(builder);
+            bytes
+        }
+
+        /// A set whose big file crosses two chunk boundaries.
+        fn make_set(dir: &Path) {
+            std::fs::create_dir_all(dir.join("sub/deeper")).unwrap();
+            std::fs::write(dir.join("a"), "one").unwrap();
+            std::fs::write(dir.join("sub/b"), "two").unwrap();
+            let big = pattern(2 * ARTIFACT_CHUNK + 12_345);
+            std::fs::write(dir.join("sub/deeper/big"), big).unwrap();
+        }
+
+        /// Carries the pieces of a [`ChunkWriter`] through the chunk framing, as
+        /// the CI's relay and a receiving task do, to the queue of a
+        /// [`ChunkReader`]. The stream between them is small, so the sender has
+        /// to wait for the reader.
+        fn through_the_wire(
+            rt: &tokio::runtime::Runtime,
+            mut pieces: mpsc::Receiver<Piece>,
+        ) -> mpsc::Receiver<Result<Received, String>> {
+            let (tx, rx) = mpsc::channel(QUEUE);
+            rt.spawn(async move {
+                let (mut near, mut far) = tokio::io::duplex(64 << 10);
+                let sending = async move {
+                    while let Some(piece) = pieces.recv().await {
+                        match piece {
+                            Piece::Bytes(bytes) => write_chunk(&mut near, &bytes).await.unwrap(),
+                            Piece::End => {
+                                write_end(&mut near).await.unwrap();
+                                break;
+                            }
+                        }
+                    }
+                };
+                let receiving = async move {
+                    let mut chunk = Vec::new();
+                    loop {
+                        let next = match read_chunk(&mut far, &mut chunk).await {
+                            Ok(true) => Ok(Received::Bytes(std::mem::take(&mut chunk))),
+                            Ok(false) => Ok(Received::End),
+                            Err(e) => Err(e),
+                        };
+                        let last = !matches!(next, Ok(Received::Bytes(_)));
+                        tx.send(next).await.unwrap();
+                        if last {
+                            break;
+                        }
+                    }
+                };
+                tokio::join!(sending, receiving);
+            });
+            rx
+        }
+
+        #[test]
+        fn an_artifact_set_survives_a_round_trip_through_the_chunks() {
+            let base = scratch("round-trip");
+            let from = base.join("from");
+            make_set(&from);
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+
+            let (tx, pieces) = mpsc::channel(QUEUE);
+            let packer = std::thread::spawn({
+                let from = from.clone();
+                move || pack(&from, tx)
+            });
+            let mut reader = ChunkReader::new(through_the_wire(&rt, pieces));
+            let to = base.join("to");
+            unpack(&mut reader, &to).unwrap();
+            packer.join().unwrap().unwrap();
+
+            assert_eq!(std::fs::read(to.join("a")).unwrap(), b"one");
+            assert_eq!(std::fs::read(to.join("sub/b")).unwrap(), b"two");
+            assert_eq!(
+                std::fs::read(to.join("sub/deeper/big")).unwrap(),
+                pattern(2 * ARTIFACT_CHUNK + 12_345)
+            );
+            assert!(reader.ended, "the end marker was read");
+            assert!(reader.bytes > 2 * ARTIFACT_CHUNK as u64);
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_set_that_stops_before_its_end_marker_is_not_a_set() {
+            let base = scratch("short");
+            let from = base.join("from");
+            make_set(&from);
+            // Every file is there; the tar's closing blocks and the end marker
+            // are not. A reader that took the end of the stream for the end of
+            // the set would accept this.
+            let mut tar = tar_of(&from);
+            tar.truncate(tar.len() - 1024);
+
+            let (tx, rx) = mpsc::channel(QUEUE);
+            tx.blocking_send(Ok(Received::Bytes(tar))).unwrap();
+            drop(tx);
+            let to = base.join("to");
+            let err = unpack(&mut ChunkReader::new(rx), &to).unwrap_err();
+            assert!(err.contains("the transfer ended early"), "{err}");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn what_the_ci_says_is_the_reason_the_set_did_not_arrive() {
+            let base = scratch("refused");
+            let (tx, rx) = mpsc::channel(QUEUE);
+            tx.blocking_send(Err("runner x: view.7.a left no artifacts".to_owned()))
+                .unwrap();
+            let err = unpack(&mut ChunkReader::new(rx), &base.join("to")).unwrap_err();
+            assert!(err.contains("view.7.a left no artifacts"), "{err}");
+
+            // Also when the failure comes in the middle of a file, where the tar
+            // reader wraps it.
+            let from = base.join("from");
+            make_set(&from);
+            let tar = tar_of(&from);
+            let (tx, rx) = mpsc::channel(QUEUE);
+            tx.blocking_send(Ok(Received::Bytes(tar[..ARTIFACT_CHUNK].to_vec())))
+                .unwrap();
+            tx.blocking_send(Err("the CI went away".to_owned()))
+                .unwrap();
+            let err = unpack(&mut ChunkReader::new(rx), &base.join("to2")).unwrap_err();
+            assert!(err.contains("the CI went away"), "{err}");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_bundle_is_written_chunk_by_chunk() {
+            let base = scratch("bundle");
+            let bundle = pattern(ARTIFACT_CHUNK + 7);
+            let (tx, rx) = mpsc::channel(QUEUE);
+            tx.blocking_send(Ok(Received::Bytes(bundle[..ARTIFACT_CHUNK].to_vec())))
+                .unwrap();
+            tx.blocking_send(Ok(Received::Bytes(bundle[ARTIFACT_CHUNK..].to_vec())))
+                .unwrap();
+            tx.blocking_send(Ok(Received::End)).unwrap();
+            let dest = base.join("bundle");
+            save(&mut ChunkReader::new(rx), &dest).unwrap();
+            assert_eq!(std::fs::read(&dest).unwrap(), bundle);
+
+            // Without its end marker the file is no bundle.
+            let (tx, rx) = mpsc::channel(QUEUE);
+            tx.blocking_send(Ok(Received::Bytes(bundle))).unwrap();
+            drop(tx);
+            assert!(save(&mut ChunkReader::new(rx), &dest).is_err());
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 }

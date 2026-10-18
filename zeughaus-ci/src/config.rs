@@ -333,8 +333,6 @@ pub fn valid_env_name(s: &str) -> bool {
 mod tests {
     use super::*;
     use crate::event::EventKind;
-    use std::path::PathBuf;
-
     const FP_A: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
     const FP_B: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000002";
 
@@ -383,13 +381,6 @@ forge = "none"
             upload: None,
             received: 0,
         }
-    }
-
-    fn temp(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zci-config-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
     }
 
     #[test]
@@ -539,12 +530,26 @@ forge = "none"
         assert!(!valid_env_name(""));
     }
 
-    #[test]
-    fn load_missing_is_none() {
-        let dir = temp("load");
-        assert!(CiConfig::load(&dir).unwrap().is_none());
-        std::fs::write(dir.join(CONFIG_FILE), with_runners("")).unwrap();
-        assert_eq!(CiConfig::load(&dir).unwrap().unwrap().default_runner, "a");
-        std::fs::remove_dir_all(&dir).unwrap();
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+        use std::path::PathBuf;
+
+        fn temp(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("zci-config-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[test]
+        fn load_missing_is_none() {
+            let dir = temp("load");
+            assert!(CiConfig::load(&dir).unwrap().is_none());
+            std::fs::write(dir.join(CONFIG_FILE), with_runners("")).unwrap();
+            assert_eq!(CiConfig::load(&dir).unwrap().unwrap().default_runner, "a");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 }

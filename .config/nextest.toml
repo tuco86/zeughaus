@@ -1,0 +1,40 @@
+# Test tiers (see CLAUDE.md, Development Workflow). A test that touches the
+# filesystem, network, processes, a PTY, a GPU, the environment or real time
+# lives in a module named `io`; everything else is a unit test.
+nextest-version = { required = "0.9.115" }
+
+# Unit tier: `cargo nextest run`. No I/O, so a second per test is already slow.
+[profile.default]
+default-filter = 'not test(/(^|::)io::/)'
+slow-timeout = { period = "1s", terminate-after = 5 }
+global-timeout = "60s"
+
+# I/O tier: `cargo nextest run --profile integration`.
+[profile.integration]
+default-filter = 'test(/(^|::)io::/)'
+slow-timeout = { period = "10s", terminate-after = 1 }
+global-timeout = "5m"
+
+# Both tiers, as every CI check runs them.
+[profile.ci]
+default-filter = 'all()'
+slow-timeout = { period = "10s", terminate-after = 1 }
+global-timeout = "6m"
+
+# The NVIDIA Vulkan driver on Windows hangs when devices are created
+# concurrently; nextest runs each test in its own process, so the in-process
+# lock in iced_terminal no longer serializes them.
+[test-groups]
+gpu = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(iced_terminal) and test(/^pipeline::tests::io::/)'
+test-group = 'gpu'
+
+[[profile.integration.overrides]]
+filter = 'package(iced_terminal) and test(/^pipeline::tests::io::/)'
+test-group = 'gpu'
+
+[[profile.ci.overrides]]
+filter = 'package(iced_terminal) and test(/^pipeline::tests::io::/)'
+test-group = 'gpu'

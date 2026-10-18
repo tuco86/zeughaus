@@ -514,28 +514,9 @@ impl ExecutableNode for PlayerNode {
 mod tests {
     use super::*;
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zeughaus-record-test-{name}"));
-        let _ = fs::remove_dir_all(&dir);
-        dir
-    }
-
     fn set(node: &mut dyn ExecutableNode, name: &str, text: &str) {
         node.set_parameter(name, Value::new(text.to_string()))
             .expect("set");
-    }
-
-    fn ctx() -> NodeContext {
-        NodeContext::new(NodeId(1))
-    }
-
-    /// A 2x2 frame whose pixels are derived from `tint`, so two frames are
-    /// distinguishable byte for byte.
-    fn frame(tint: u8) -> Image {
-        let pixels: Vec<u8> = (0..4u8)
-            .flat_map(|i| [tint, tint.wrapping_add(i), 0x40, 0xff])
-            .collect();
-        Image::from_rgba(2, 2, pixels)
     }
 
     /// Only explicit spellings loop. Reading everything else as "false" made
@@ -557,196 +538,6 @@ mod tests {
             // The refusal left the accepted value in place.
             assert!(node.looping);
         }
-    }
-
-    /// The two nodes are counterparts: the pixels and the values a recording
-    /// was written with are what playing it back produces.
-    #[test]
-    fn two_frames_written_come_back_out_of_the_player() {
-        let dir = temp_dir("roundtrip");
-        let dir_text = dir.to_string_lossy().into_owned();
-
-        let mut writer = RecorderNode::new();
-        set(&mut writer, "dir", &dir_text);
-        set(&mut writer, "session", "run1");
-
-        let mut written: Vec<Image> = Vec::new();
-        for (index, tint) in [0x10u8, 0x90].into_iter().enumerate() {
-            let image = frame(tint);
-            let mut inputs = InputSet::new();
-            inputs.insert("frame", Value::new(image.clone()));
-            inputs.insert("v0", Value::new(7.0_f64));
-            inputs.insert("v1", Value::new(format!("step{index}")));
-            inputs.mark_changed("frame");
-            // Both value slots have to exist for them to be recorded.
-            writer.sync_pins(&[
-                PinBinding {
-                    name: "v0",
-                    ty: &Ty::Float,
-                },
-                PinBinding {
-                    name: "v1",
-                    ty: &Ty::Str,
-                },
-            ]);
-            let mut writing = ctx();
-            writer.execute(&inputs, &mut writing).expect("write");
-            let outputs = writing.take_outputs();
-            assert_eq!(
-                outputs.get("count").and_then(Value::downcast_ref::<i64>),
-                Some(&(index as i64 + 1))
-            );
-            written.push(image);
-        }
-        assert_eq!(
-            writer.session_dir().expect("session"),
-            dir.join("run1"),
-            "the session directory is where the frames went"
-        );
-        assert_eq!(fs::read_dir(dir.join("run1")).expect("dir").count(), 3);
-
-        let mut player = PlayerNode::new();
-        set(&mut player, "dir", &dir_text);
-        set(&mut player, "session", "run1");
-        set(&mut player, "loop", "false");
-
-        for (index, source) in written.iter().enumerate() {
-            let mut playing = ctx();
-            player
-                .execute(&InputSet::new(), &mut playing)
-                .expect("play");
-            let outputs = playing.take_outputs();
-            let replayed = outputs
-                .get("frame")
-                .and_then(Value::downcast_ref::<Image>)
-                .expect("frame");
-            assert_eq!(replayed.width(), 2);
-            assert_eq!(replayed.height(), 2);
-            assert_eq!(
-                replayed.rgba().as_ref(),
-                source.rgba().as_ref(),
-                "frame {index} came back with different pixels"
-            );
-            assert_eq!(
-                outputs.get("seq").and_then(Value::downcast_ref::<i64>),
-                Some(&(index as i64 + 1))
-            );
-            let values = outputs
-                .get("values")
-                .and_then(Value::downcast_ref::<String>)
-                .expect("values");
-            let parsed: serde_json::Value = serde_json::from_str(values).expect("json");
-            assert_eq!(parsed["v0"], serde_json::json!(7.0));
-            assert_eq!(parsed["v1"], serde_json::json!(format!("step{index}")));
-            assert!(
-                outputs
-                    .get("ts")
-                    .and_then(Value::downcast_ref::<f64>)
-                    .is_some_and(|ts| *ts > 1_600_000_000.0),
-                "the line records when the frame was taken"
-            );
-        }
-
-        // Past the end with looping off: nothing is emitted rather than the
-        // last frame over and over.
-        let mut past_end = ctx();
-        player
-            .execute(&InputSet::new(), &mut past_end)
-            .expect("end");
-        assert!(past_end.take_outputs().is_empty());
-    }
-
-    /// Looping is what makes a recording a source: it restarts instead of
-    /// running dry.
-    #[test]
-    fn a_looping_player_restarts_at_the_first_frame() {
-        let dir = temp_dir("loop");
-        let dir_text = dir.to_string_lossy().into_owned();
-        let mut writer = RecorderNode::new();
-        set(&mut writer, "dir", &dir_text);
-        set(&mut writer, "session", "run1");
-        let mut inputs = InputSet::new();
-        inputs.insert("frame", Value::new(frame(0x20)));
-        inputs.mark_changed("frame");
-        writer.execute(&inputs, &mut ctx()).expect("write");
-
-        let mut player = PlayerNode::new();
-        set(&mut player, "dir", &dir_text);
-        set(&mut player, "session", "run1");
-        for _ in 0..3 {
-            let mut playing = ctx();
-            player
-                .execute(&InputSet::new(), &mut playing)
-                .expect("play");
-            assert_eq!(
-                playing
-                    .take_outputs()
-                    .get("seq")
-                    .and_then(Value::downcast_ref::<i64>),
-                Some(&1)
-            );
-        }
-    }
-
-    /// Both settings decide where the frames go, so both start a new
-    /// recording. Numbering that continued into the new directory would leave
-    /// one nominal session split across two roots, with an index in each that
-    /// names only part of it.
-    #[test]
-    fn changing_the_directory_starts_a_new_recording() {
-        let first = temp_dir("dir-a");
-        let second = temp_dir("dir-b");
-        let mut writer = RecorderNode::new();
-        set(&mut writer, "session", "run1");
-
-        let mut inputs = InputSet::new();
-        inputs.insert("frame", Value::new(frame(0x40)));
-        inputs.mark_changed("frame");
-
-        for dir in [&first, &second] {
-            set(&mut writer, "dir", &dir.to_string_lossy());
-            let mut writing = ctx();
-            writer.execute(&inputs, &mut writing).expect("write");
-            assert_eq!(
-                writing
-                    .take_outputs()
-                    .get("count")
-                    .and_then(Value::downcast_ref::<i64>),
-                Some(&1),
-                "each directory is its own recording"
-            );
-            assert!(dir.join("run1").join(frame_file(1)).exists());
-            assert_eq!(
-                fs::read_to_string(dir.join("run1").join(INDEX_FILE))
-                    .expect("index")
-                    .lines()
-                    .count(),
-                1
-            );
-        }
-    }
-
-    /// A pass the recorder runs in for another node's sake is not a frame.
-    #[test]
-    fn a_recorder_without_a_delivered_frame_writes_nothing() {
-        let dir = temp_dir("untriggered");
-        let dir_text = dir.to_string_lossy().into_owned();
-        let mut writer = RecorderNode::new();
-        set(&mut writer, "dir", &dir_text);
-        set(&mut writer, "session", "run1");
-
-        let mut inputs = InputSet::new();
-        inputs.insert("frame", Value::new(frame(0x30)));
-        let mut quiet = ctx();
-        writer.execute(&inputs, &mut quiet).expect("no-op");
-        assert_eq!(
-            quiet
-                .take_outputs()
-                .get("count")
-                .and_then(Value::downcast_ref::<i64>),
-            Some(&0)
-        );
-        assert!(!dir.join("run1").exists(), "nothing was created");
     }
 
     /// The spare slot is what a new wire lands on, and there is exactly one:
@@ -809,21 +600,236 @@ mod tests {
         );
     }
 
-    /// A player with nothing to play says which of the two things is missing.
-    #[test]
-    fn a_player_without_a_recording_reports_it() {
-        let mut player = PlayerNode::new();
-        let unnamed = player
-            .execute(&InputSet::new(), &mut ctx())
-            .expect_err("no session");
-        assert!(unnamed.to_string().contains("no session"));
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        let dir = temp_dir("missing");
-        set(&mut player, "dir", &dir.to_string_lossy());
-        set(&mut player, "session", "nope");
-        let missing = player
-            .execute(&InputSet::new(), &mut ctx())
-            .expect_err("no such recording");
-        assert!(missing.to_string().contains(INDEX_FILE));
+        fn temp_dir(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("zeughaus-record-test-{name}"));
+            let _ = fs::remove_dir_all(&dir);
+            dir
+        }
+
+        fn ctx() -> NodeContext {
+            NodeContext::new(NodeId(1))
+        }
+
+        /// A 2x2 frame whose pixels are derived from `tint`, so two frames are
+        /// distinguishable byte for byte.
+        fn frame(tint: u8) -> Image {
+            let pixels: Vec<u8> = (0..4u8)
+                .flat_map(|i| [tint, tint.wrapping_add(i), 0x40, 0xff])
+                .collect();
+            Image::from_rgba(2, 2, pixels)
+        }
+
+        /// The two nodes are counterparts: the pixels and the values a recording
+        /// was written with are what playing it back produces.
+        #[test]
+        fn two_frames_written_come_back_out_of_the_player() {
+            let dir = temp_dir("roundtrip");
+            let dir_text = dir.to_string_lossy().into_owned();
+
+            let mut writer = RecorderNode::new();
+            set(&mut writer, "dir", &dir_text);
+            set(&mut writer, "session", "run1");
+
+            let mut written: Vec<Image> = Vec::new();
+            for (index, tint) in [0x10u8, 0x90].into_iter().enumerate() {
+                let image = frame(tint);
+                let mut inputs = InputSet::new();
+                inputs.insert("frame", Value::new(image.clone()));
+                inputs.insert("v0", Value::new(7.0_f64));
+                inputs.insert("v1", Value::new(format!("step{index}")));
+                inputs.mark_changed("frame");
+                // Both value slots have to exist for them to be recorded.
+                writer.sync_pins(&[
+                    PinBinding {
+                        name: "v0",
+                        ty: &Ty::Float,
+                    },
+                    PinBinding {
+                        name: "v1",
+                        ty: &Ty::Str,
+                    },
+                ]);
+                let mut writing = ctx();
+                writer.execute(&inputs, &mut writing).expect("write");
+                let outputs = writing.take_outputs();
+                assert_eq!(
+                    outputs.get("count").and_then(Value::downcast_ref::<i64>),
+                    Some(&(index as i64 + 1))
+                );
+                written.push(image);
+            }
+            assert_eq!(
+                writer.session_dir().expect("session"),
+                dir.join("run1"),
+                "the session directory is where the frames went"
+            );
+            assert_eq!(fs::read_dir(dir.join("run1")).expect("dir").count(), 3);
+
+            let mut player = PlayerNode::new();
+            set(&mut player, "dir", &dir_text);
+            set(&mut player, "session", "run1");
+            set(&mut player, "loop", "false");
+
+            for (index, source) in written.iter().enumerate() {
+                let mut playing = ctx();
+                player
+                    .execute(&InputSet::new(), &mut playing)
+                    .expect("play");
+                let outputs = playing.take_outputs();
+                let replayed = outputs
+                    .get("frame")
+                    .and_then(Value::downcast_ref::<Image>)
+                    .expect("frame");
+                assert_eq!(replayed.width(), 2);
+                assert_eq!(replayed.height(), 2);
+                assert_eq!(
+                    replayed.rgba().as_ref(),
+                    source.rgba().as_ref(),
+                    "frame {index} came back with different pixels"
+                );
+                assert_eq!(
+                    outputs.get("seq").and_then(Value::downcast_ref::<i64>),
+                    Some(&(index as i64 + 1))
+                );
+                let values = outputs
+                    .get("values")
+                    .and_then(Value::downcast_ref::<String>)
+                    .expect("values");
+                let parsed: serde_json::Value = serde_json::from_str(values).expect("json");
+                assert_eq!(parsed["v0"], serde_json::json!(7.0));
+                assert_eq!(parsed["v1"], serde_json::json!(format!("step{index}")));
+                assert!(
+                    outputs
+                        .get("ts")
+                        .and_then(Value::downcast_ref::<f64>)
+                        .is_some_and(|ts| *ts > 1_600_000_000.0),
+                    "the line records when the frame was taken"
+                );
+            }
+
+            // Past the end with looping off: nothing is emitted rather than the
+            // last frame over and over.
+            let mut past_end = ctx();
+            player
+                .execute(&InputSet::new(), &mut past_end)
+                .expect("end");
+            assert!(past_end.take_outputs().is_empty());
+        }
+
+        /// Looping is what makes a recording a source: it restarts instead of
+        /// running dry.
+        #[test]
+        fn a_looping_player_restarts_at_the_first_frame() {
+            let dir = temp_dir("loop");
+            let dir_text = dir.to_string_lossy().into_owned();
+            let mut writer = RecorderNode::new();
+            set(&mut writer, "dir", &dir_text);
+            set(&mut writer, "session", "run1");
+            let mut inputs = InputSet::new();
+            inputs.insert("frame", Value::new(frame(0x20)));
+            inputs.mark_changed("frame");
+            writer.execute(&inputs, &mut ctx()).expect("write");
+
+            let mut player = PlayerNode::new();
+            set(&mut player, "dir", &dir_text);
+            set(&mut player, "session", "run1");
+            for _ in 0..3 {
+                let mut playing = ctx();
+                player
+                    .execute(&InputSet::new(), &mut playing)
+                    .expect("play");
+                assert_eq!(
+                    playing
+                        .take_outputs()
+                        .get("seq")
+                        .and_then(Value::downcast_ref::<i64>),
+                    Some(&1)
+                );
+            }
+        }
+
+        /// Both settings decide where the frames go, so both start a new
+        /// recording. Numbering that continued into the new directory would leave
+        /// one nominal session split across two roots, with an index in each that
+        /// names only part of it.
+        #[test]
+        fn changing_the_directory_starts_a_new_recording() {
+            let first = temp_dir("dir-a");
+            let second = temp_dir("dir-b");
+            let mut writer = RecorderNode::new();
+            set(&mut writer, "session", "run1");
+
+            let mut inputs = InputSet::new();
+            inputs.insert("frame", Value::new(frame(0x40)));
+            inputs.mark_changed("frame");
+
+            for dir in [&first, &second] {
+                set(&mut writer, "dir", &dir.to_string_lossy());
+                let mut writing = ctx();
+                writer.execute(&inputs, &mut writing).expect("write");
+                assert_eq!(
+                    writing
+                        .take_outputs()
+                        .get("count")
+                        .and_then(Value::downcast_ref::<i64>),
+                    Some(&1),
+                    "each directory is its own recording"
+                );
+                assert!(dir.join("run1").join(frame_file(1)).exists());
+                assert_eq!(
+                    fs::read_to_string(dir.join("run1").join(INDEX_FILE))
+                        .expect("index")
+                        .lines()
+                        .count(),
+                    1
+                );
+            }
+        }
+
+        /// A pass the recorder runs in for another node's sake is not a frame.
+        #[test]
+        fn a_recorder_without_a_delivered_frame_writes_nothing() {
+            let dir = temp_dir("untriggered");
+            let dir_text = dir.to_string_lossy().into_owned();
+            let mut writer = RecorderNode::new();
+            set(&mut writer, "dir", &dir_text);
+            set(&mut writer, "session", "run1");
+
+            let mut inputs = InputSet::new();
+            inputs.insert("frame", Value::new(frame(0x30)));
+            let mut quiet = ctx();
+            writer.execute(&inputs, &mut quiet).expect("no-op");
+            assert_eq!(
+                quiet
+                    .take_outputs()
+                    .get("count")
+                    .and_then(Value::downcast_ref::<i64>),
+                Some(&0)
+            );
+            assert!(!dir.join("run1").exists(), "nothing was created");
+        }
+
+        /// A player with nothing to play says which of the two things is missing.
+        #[test]
+        fn a_player_without_a_recording_reports_it() {
+            let mut player = PlayerNode::new();
+            let unnamed = player
+                .execute(&InputSet::new(), &mut ctx())
+                .expect_err("no session");
+            assert!(unnamed.to_string().contains("no session"));
+
+            let dir = temp_dir("missing");
+            set(&mut player, "dir", &dir.to_string_lossy());
+            set(&mut player, "session", "nope");
+            let missing = player
+                .execute(&InputSet::new(), &mut ctx())
+                .expect_err("no such recording");
+            assert!(missing.to_string().contains(INDEX_FILE));
+        }
     }
 }

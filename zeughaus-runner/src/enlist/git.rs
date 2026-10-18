@@ -131,45 +131,51 @@ pub fn bundle(mirror: &Path, number: u64, to: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    fn run(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(["-c", "user.name=ci", "-c", "user.email=ci@example.invalid"])
-            .args(args)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .output()
-            .expect("run git");
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
-    }
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-    #[test]
-    fn a_mirror_fetches_a_commit_and_pins_it_for_a_pipeline() {
-        let base = std::env::temp_dir().join(format!("zci-git-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let repo = base.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        run(&repo, &["init", "-q"]);
-        std::fs::write(repo.join("a"), "a").unwrap();
-        run(&repo, &["add", "."]);
-        run(&repo, &["commit", "-q", "-m", "a"]);
-        let sha = run(&repo, &["rev-parse", "HEAD"]);
+        fn run(dir: &Path, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .current_dir(dir)
+                .args(["-c", "user.name=ci", "-c", "user.email=ci@example.invalid"])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
 
-        let mirror = base.join("mirror.git");
-        let url = format!("file://{}", repo.display());
-        fetch_mirror(&mirror, &url, "x-access-token", None).expect("first fetch");
-        // The second one takes the already created mirror.
-        fetch_mirror(&mirror, &url, "x-access-token", None).expect("second fetch");
-        assert!(has_commit(&mirror, &sha));
-        assert!(!has_commit(&mirror, &"0".repeat(40)));
-        pin_commit(&mirror, 5, &sha).expect("pin");
-        let pinned = git(&mirror, &["rev-parse", "refs/ci/5"], &[]).expect("rev-parse");
-        let _ = std::fs::remove_dir_all(&base);
-        assert_eq!(pinned.trim(), sha);
+        #[test]
+        fn a_mirror_fetches_a_commit_and_pins_it_for_a_pipeline() {
+            let base = std::env::temp_dir().join(format!("zci-git-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let repo = base.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            run(&repo, &["init", "-q"]);
+            std::fs::write(repo.join("a"), "a").unwrap();
+            run(&repo, &["add", "."]);
+            run(&repo, &["commit", "-q", "-m", "a"]);
+            let sha = run(&repo, &["rev-parse", "HEAD"]);
+
+            let mirror = base.join("mirror.git");
+            let url = format!("file://{}", repo.display());
+            fetch_mirror(&mirror, &url, "x-access-token", None).expect("first fetch");
+            // The second one takes the already created mirror.
+            fetch_mirror(&mirror, &url, "x-access-token", None).expect("second fetch");
+            assert!(has_commit(&mirror, &sha));
+            assert!(!has_commit(&mirror, &"0".repeat(40)));
+            pin_commit(&mirror, 5, &sha).expect("pin");
+            let pinned = git(&mirror, &["rev-parse", "refs/ci/5"], &[]).expect("rev-parse");
+            let _ = std::fs::remove_dir_all(&base);
+            assert_eq!(pinned.trim(), sha);
+        }
     }
 }

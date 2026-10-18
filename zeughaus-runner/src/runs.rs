@@ -126,47 +126,53 @@ fn read_range(path: &Path, offset: u64, limit: usize) -> Option<(u64, Vec<u8>)> 
 mod tests {
     use super::*;
 
-    use std::sync::atomic::{AtomicU64, Ordering};
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-    static NEXT: AtomicU64 = AtomicU64::new(0);
+        use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "zeughaus-runs-{tag}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("temp dir");
-        path
-    }
+        static NEXT: AtomicU64 = AtomicU64::new(0);
 
-    /// Paging a log is the whole contract: every request is answered with the
-    /// length the file has now, so a tail knows both what it got and what is
-    /// still ahead of it.
-    #[test]
-    fn a_range_read_answers_the_current_length() {
-        let dir = temp_dir("range");
-        let file = dir.join("log");
-        std::fs::write(&file, b"0123456789").expect("write");
+        fn temp_dir(tag: &str) -> PathBuf {
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "zeughaus-runs-{tag}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("temp dir");
+            path
+        }
 
-        assert_eq!(
-            read_range(&file, 0, 4),
-            Some((10, b"0123".to_vec())),
-            "the first page"
-        );
-        assert_eq!(
-            read_range(&file, 8, 1024),
-            Some((10, b"89".to_vec())),
-            "a limit past the end reads what is there"
-        );
-        assert_eq!(
-            read_range(&file, 10, 1024),
-            Some((10, Vec::new())),
-            "a tail that caught up"
-        );
-        assert_eq!(read_range(&dir.join("exit"), 0, 16), None, "no such file");
-        let _ = std::fs::remove_dir_all(&dir);
+        /// Paging a log is the whole contract: every request is answered with the
+        /// length the file has now, so a tail knows both what it got and what is
+        /// still ahead of it.
+        #[test]
+        fn a_range_read_answers_the_current_length() {
+            let dir = temp_dir("range");
+            let file = dir.join("log");
+            std::fs::write(&file, b"0123456789").expect("write");
+
+            assert_eq!(
+                read_range(&file, 0, 4),
+                Some((10, b"0123".to_vec())),
+                "the first page"
+            );
+            assert_eq!(
+                read_range(&file, 8, 1024),
+                Some((10, b"89".to_vec())),
+                "a limit past the end reads what is there"
+            );
+            assert_eq!(
+                read_range(&file, 10, 1024),
+                Some((10, Vec::new())),
+                "a tail that caught up"
+            );
+            assert_eq!(read_range(&dir.join("exit"), 0, 16), None, "no such file");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

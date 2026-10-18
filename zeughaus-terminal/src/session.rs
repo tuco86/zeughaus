@@ -1070,27 +1070,7 @@ impl AlertHandler for Alerts {
 /// crate.
 #[cfg(all(test, unix))]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
-
-    fn shell(script: &str) -> Profile {
-        Profile {
-            label: "test".to_string(),
-            program: Some(PathBuf::from("/bin/sh")),
-            args: vec!["-c".to_string(), script.to_string()],
-            cwd: None,
-            env: Vec::new(),
-            scrollback_rows: 64,
-        }
-    }
-
-    fn text_of(head: &TerminalHead) -> String {
-        head.rows
-            .iter()
-            .flat_map(|row| row.spans.iter().map(|span| span.text.as_str()))
-            .collect()
-    }
 
     #[test]
     fn a_fed_session_shows_what_it_was_fed_and_ends_when_finished() {
@@ -1122,110 +1102,139 @@ mod tests {
         assert_eq!(session.exit(), Some(ExitState::Exited { code: 0 }));
     }
 
-    /// Wait for `done` to hold, driven by the session's own notifications.
-    async fn settle(session: &Session, within: Duration, done: impl Fn(&Session) -> bool) -> bool {
-        let mut changes = session.changes();
-        let deadline = tokio::time::Instant::now() + within;
-        loop {
-            if done(session) {
-                return true;
-            }
-            if tokio::time::timeout_at(deadline, changes.changed())
-                .await
-                .is_err()
-            {
-                return done(session);
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+        use std::time::Duration;
+
+        fn shell(script: &str) -> Profile {
+            Profile {
+                label: "test".to_string(),
+                program: Some(PathBuf::from("/bin/sh")),
+                args: vec!["-c".to_string(), script.to_string()],
+                cwd: None,
+                env: Vec::new(),
+                scrollback_rows: 64,
             }
         }
-    }
 
-    #[tokio::test]
-    async fn a_child_runs_and_its_exit_status_outlives_it() {
-        let session = Session::spawn(
-            TerminalId(7),
-            &shell("printf hello; exit 3"),
-            Dimensions { cols: 40, rows: 6 },
-            Wal::Off,
-            &TerminalHost::Local,
-        )
-        .expect("spawn /bin/sh");
-
-        let finished = settle(&session, Duration::from_secs(10), |session| {
-            session.exit().is_some() && text_of(&session.head(0)).contains("hello")
-        })
-        .await;
-
-        assert!(finished, "child never finished: exit={:?}", session.exit());
-        assert_eq!(session.exit(), Some(ExitState::Exited { code: 3 }));
-        // The final screen survives the child: a closed pane still shows what
-        // the program left behind.
-        assert!(text_of(&session.head(0)).contains("hello"));
-    }
-
-    #[tokio::test]
-    async fn killing_a_child_is_recorded_as_a_kill() {
-        let session = Session::spawn(
-            TerminalId(8),
-            &shell("sleep 30"),
-            Dimensions { cols: 40, rows: 6 },
-            Wal::Off,
-            &TerminalHost::Local,
-        )
-        .expect("spawn /bin/sh");
-
-        session.kill();
-        let finished = settle(&session, Duration::from_secs(5), |session| {
-            session.exit().is_some()
-        })
-        .await;
-
-        assert!(finished, "the child outlived its kill");
-        assert_eq!(session.exit(), Some(ExitState::Killed));
-    }
-
-    #[tokio::test]
-    async fn a_walled_child_is_appended_with_a_time_per_chunk() {
-        let path = std::env::temp_dir().join(format!("zh-session-wal-{}", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let mut seed = WalWriter::open(&path, None).expect("seed the WAL");
-        seed.append(1, b"earlier\n").expect("seed a record");
-        drop(seed);
-        let session = Session::spawn(
-            TerminalId(9),
-            &shell("printf a; sleep 1; printf b"),
-            Dimensions { cols: 40, rows: 6 },
-            Wal::At(path.clone()),
-            &TerminalHost::Local,
-        )
-        .expect("spawn /bin/sh");
-
-        // The exit is recorded without waiting for the reader (see
-        // `wait_loop`), so the last chunk may land in the WAL after it.
-        let stream = |records: &[wal::Record]| -> Vec<u8> {
-            records
+        fn text_of(head: &TerminalHead) -> String {
+            head.rows
                 .iter()
-                .skip(1)
-                .flat_map(|r| r.bytes.iter().copied())
+                .flat_map(|row| row.spans.iter().map(|span| span.text.as_str()))
                 .collect()
-        };
-        let finished = settle(&session, Duration::from_secs(10), |session| {
-            session.exit().is_some() && stream(&wal::read(&path).unwrap_or_default()) == b"ab"
-        })
-        .await;
+        }
 
-        let records = wal::read(&path).unwrap_or_default();
-        let _ = std::fs::remove_file(&path);
-        assert!(
-            finished,
-            "the child never finished or its output never arrived"
-        );
-        assert_eq!(records[0].bytes, b"earlier\n", "the WAL was truncated");
-        assert_eq!(stream(&records), b"ab");
-        let first = records[1].at_micros;
-        let last = records.last().expect("records").at_micros;
-        assert!(
-            last - first >= 900_000,
-            "chunks {first} and {last} are not a second apart"
-        );
+        /// Wait for `done` to hold, driven by the session's own notifications.
+        async fn settle(
+            session: &Session,
+            within: Duration,
+            done: impl Fn(&Session) -> bool,
+        ) -> bool {
+            let mut changes = session.changes();
+            let deadline = tokio::time::Instant::now() + within;
+            loop {
+                if done(session) {
+                    return true;
+                }
+                if tokio::time::timeout_at(deadline, changes.changed())
+                    .await
+                    .is_err()
+                {
+                    return done(session);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn a_child_runs_and_its_exit_status_outlives_it() {
+            let session = Session::spawn(
+                TerminalId(7),
+                &shell("printf hello; exit 3"),
+                Dimensions { cols: 40, rows: 6 },
+                Wal::Off,
+                &TerminalHost::Local,
+            )
+            .expect("spawn /bin/sh");
+
+            let finished = settle(&session, Duration::from_secs(10), |session| {
+                session.exit().is_some() && text_of(&session.head(0)).contains("hello")
+            })
+            .await;
+
+            assert!(finished, "child never finished: exit={:?}", session.exit());
+            assert_eq!(session.exit(), Some(ExitState::Exited { code: 3 }));
+            // The final screen survives the child: a closed pane still shows what
+            // the program left behind.
+            assert!(text_of(&session.head(0)).contains("hello"));
+        }
+
+        #[tokio::test]
+        async fn killing_a_child_is_recorded_as_a_kill() {
+            let session = Session::spawn(
+                TerminalId(8),
+                &shell("sleep 30"),
+                Dimensions { cols: 40, rows: 6 },
+                Wal::Off,
+                &TerminalHost::Local,
+            )
+            .expect("spawn /bin/sh");
+
+            session.kill();
+            let finished = settle(&session, Duration::from_secs(5), |session| {
+                session.exit().is_some()
+            })
+            .await;
+
+            assert!(finished, "the child outlived its kill");
+            assert_eq!(session.exit(), Some(ExitState::Killed));
+        }
+
+        #[tokio::test]
+        async fn a_walled_child_is_appended_with_a_time_per_chunk() {
+            let path = std::env::temp_dir().join(format!("zh-session-wal-{}", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let mut seed = WalWriter::open(&path, None).expect("seed the WAL");
+            seed.append(1, b"earlier\n").expect("seed a record");
+            drop(seed);
+            let session = Session::spawn(
+                TerminalId(9),
+                &shell("printf a; sleep 1; printf b"),
+                Dimensions { cols: 40, rows: 6 },
+                Wal::At(path.clone()),
+                &TerminalHost::Local,
+            )
+            .expect("spawn /bin/sh");
+
+            // The exit is recorded without waiting for the reader (see
+            // `wait_loop`), so the last chunk may land in the WAL after it.
+            let stream = |records: &[wal::Record]| -> Vec<u8> {
+                records
+                    .iter()
+                    .skip(1)
+                    .flat_map(|r| r.bytes.iter().copied())
+                    .collect()
+            };
+            let finished = settle(&session, Duration::from_secs(10), |session| {
+                session.exit().is_some() && stream(&wal::read(&path).unwrap_or_default()) == b"ab"
+            })
+            .await;
+
+            let records = wal::read(&path).unwrap_or_default();
+            let _ = std::fs::remove_file(&path);
+            assert!(
+                finished,
+                "the child never finished or its output never arrived"
+            );
+            assert_eq!(records[0].bytes, b"earlier\n", "the WAL was truncated");
+            assert_eq!(stream(&records), b"ab");
+            let first = records[1].at_micros;
+            let last = records.last().expect("records").at_micros;
+            assert!(
+                last - first >= 900_000,
+                "chunks {first} and {last} are not a second apart"
+            );
+        }
     }
 }

@@ -168,37 +168,43 @@ pub fn prune_images(repo: &str, used: &HashSet<String>) {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
-    use std::time::Duration;
-
     use super::*;
 
-    fn marked(path: &Path, secs: u64) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        File::create(path)
-            .unwrap()
-            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
-            .unwrap();
-    }
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-    /// A workspace is as old as the marker in its `.git`; one without it,
-    /// whatever lies beside its `.git`, counts as the oldest.
-    #[test]
-    fn a_workspace_is_as_old_as_its_marker() {
-        let base = std::env::temp_dir().join(format!("zci-last-used-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        marked(&base.join("repo/.git/zci-last-used"), 100);
-        marked(&base.join("beside/.zci-last-used"), 200);
-        std::fs::create_dir_all(base.join("never")).unwrap();
-        let secs = |ws: &str| {
-            last_used(&base.join(ws))
-                .duration_since(SystemTime::UNIX_EPOCH)
+        use std::fs::File;
+        use std::time::Duration;
+
+        fn marked(path: &Path, secs: u64) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            File::create(path)
                 .unwrap()
-                .as_secs()
-        };
-        assert_eq!(secs("repo"), 100);
-        assert_eq!(secs("beside"), 0);
-        assert_eq!(secs("never"), 0);
-        let _ = std::fs::remove_dir_all(&base);
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
+        }
+
+        /// A workspace is as old as the marker in its `.git`; one without it,
+        /// whatever lies beside its `.git`, counts as the oldest.
+        #[test]
+        fn a_workspace_is_as_old_as_its_marker() {
+            let base = std::env::temp_dir().join(format!("zci-last-used-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            marked(&base.join("repo/.git/zci-last-used"), 100);
+            marked(&base.join("beside/.zci-last-used"), 200);
+            std::fs::create_dir_all(base.join("never")).unwrap();
+            let secs = |ws: &str| {
+                last_used(&base.join(ws))
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+            };
+            assert_eq!(secs("repo"), 100);
+            assert_eq!(secs("beside"), 0);
+            assert_eq!(secs("never"), 0);
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 }

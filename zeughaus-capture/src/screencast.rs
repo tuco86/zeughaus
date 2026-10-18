@@ -872,47 +872,6 @@ mod tests {
     }
 
     #[test]
-    fn token_round_trips_through_the_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "zeughaus-screencast-token-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let path = dir.join("screencast_token");
-
-        assert_eq!(read_token(&path), None, "no file means no token");
-
-        write_token(&path, "restore-token-abc123");
-        assert_eq!(read_token(&path), Some("restore-token-abc123".to_string()));
-
-        // The portal mints a fresh token on every start, so overwriting must
-        // replace rather than append.
-        write_token(&path, "restore-token-def456");
-        assert_eq!(read_token(&path), Some("restore-token-def456".to_string()));
-
-        // A rejected token is removed, and that must read back as a first run
-        // rather than as an error.
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(read_token(&path), None);
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn empty_token_file_reads_as_no_token() {
-        let dir = std::env::temp_dir().join(format!(
-            "zeughaus-screencast-token-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let path = dir.join("screencast_token");
-        write_token(&path, "");
-        assert!(path.exists());
-        assert_eq!(read_token(&path), None);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
     fn token_path_prefers_xdg_state_home() {
         assert_eq!(
             token_path_in(Some("/run/state".into()), Some("/home/u".into())),
@@ -939,5 +898,52 @@ mod tests {
         let path = token_path_in(None, None);
         assert!(path.is_absolute());
         assert!(path.ends_with("zeughaus/screencast_token"));
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        #[test]
+        fn token_round_trips_through_the_file() {
+            let dir = std::env::temp_dir().join(format!(
+                "zeughaus-screencast-token-{}-{}",
+                std::process::id(),
+                line!()
+            ));
+            let path = dir.join("screencast_token");
+
+            assert_eq!(read_token(&path), None, "no file means no token");
+
+            write_token(&path, "restore-token-abc123");
+            assert_eq!(read_token(&path), Some("restore-token-abc123".to_string()));
+
+            // The portal mints a fresh token on every start, so overwriting must
+            // replace rather than append.
+            write_token(&path, "restore-token-def456");
+            assert_eq!(read_token(&path), Some("restore-token-def456".to_string()));
+
+            // A rejected token is removed, and that must read back as a first run
+            // rather than as an error.
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(read_token(&path), None);
+
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn empty_token_file_reads_as_no_token() {
+            let dir = std::env::temp_dir().join(format!(
+                "zeughaus-screencast-token-{}-{}",
+                std::process::id(),
+                line!()
+            ));
+            let path = dir.join("screencast_token");
+            write_token(&path, "");
+            assert!(path.exists());
+            assert_eq!(read_token(&path), None);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 }

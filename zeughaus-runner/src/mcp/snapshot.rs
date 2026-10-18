@@ -429,243 +429,6 @@ impl Drop for TempDir {
 mod tests {
     use super::*;
 
-    /// A directory tree under the system's temporary one, removed on drop.
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        fn new(tag: &str) -> Scratch {
-            let path = std::env::temp_dir().join(format!(
-                "zeughaus-mcp-{tag}-{}-{}",
-                std::process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            ));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).expect("scratch directory");
-            Scratch(path)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// Git as a test fixture runs it: its own identity, whatever the
-    /// developer has configured.
-    fn fx(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(["-c", "user.name=fx", "-c", "user.email=fx@example.invalid"])
-            .args(args)
-            .output()
-            .expect("run git");
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
-    }
-
-    fn write(path: impl AsRef<Path>, text: &str) {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("parent directory");
-        }
-        std::fs::write(path, text).expect("write fixture file");
-    }
-
-    /// A repository with one commit holding `files`.
-    fn repo(dir: &Path, origin: Option<&str>, files: &[(&str, &str)]) {
-        std::fs::create_dir_all(dir).expect("repository directory");
-        fx(dir, &["init", "-q"]);
-        for (name, text) in files {
-            write(dir.join(name), text);
-        }
-        fx(dir, &["add", "."]);
-        fx(dir, &["commit", "-q", "-m", "first"]);
-        if let Some(origin) = origin {
-            fx(dir, &["remote", "add", "origin", origin]);
-        }
-    }
-
-    fn crate_files<'a>(name: &'a str, dependency: Option<&'a str>) -> [(&'a str, String); 2] {
-        // A dependency is named like the package in the directory it points to.
-        let dependency = dependency
-            .map(|path| {
-                let name = Path::new(path).file_name().and_then(OsStr::to_str).unwrap();
-                format!("{name} = {{ path = \"{path}\" }}\n")
-            })
-            .unwrap_or_default();
-        [
-            (
-                "Cargo.toml",
-                format!(
-                    "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-                     [dependencies]\n{dependency}"
-                ),
-            ),
-            ("src/lib.rs", String::new()),
-        ]
-    }
-
-    fn crate_repo(dir: &Path, origin: Option<&str>, dependency: Option<&str>) {
-        let files = crate_files(dir.file_name().and_then(OsStr::to_str).unwrap(), dependency);
-        let files: Vec<(&str, &str)> = files.iter().map(|(n, t)| (*n, t.as_str())).collect();
-        repo(dir, origin, &files);
-    }
-
-    #[test]
-    fn a_snapshot_holds_the_changes_and_the_untracked_files_but_not_the_ignored_ones() {
-        let base = Scratch::new("tree");
-        let dir = base.0.join("griasdi");
-        repo(
-            &dir,
-            Some("git@github.com:Griasdi/griasdi.git"),
-            &[("tracked.txt", "one\n"), (".gitignore", "ignored/\n")],
-        );
-        write(dir.join("tracked.txt"), "two\n");
-        write(dir.join("untracked.txt"), "new\n");
-        write(dir.join("ignored/junk"), "junk\n");
-        // A commit made here would be signed with this program, which fails:
-        // a snapshot must not depend on the developer's signing setup.
-        fx(&dir, &["config", "commit.gpgsign", "true"]);
-        fx(&dir, &["config", "gpg.program", "false"]);
-        let status_before = fx(&dir, &["status", "--porcelain"]);
-
-        let snapshot = take(&dir).expect("snapshot");
-
-        assert_eq!(snapshot.origin, "git@github.com:Griasdi/griasdi.git");
-        assert_eq!(snapshot.dirs.len(), 1);
-        assert_eq!(snapshot.dirs[0].dir, "griasdi");
-        let sha = &snapshot.dirs[0].sha;
-        assert_eq!(sha.len(), 40, "{sha}");
-        let files: Vec<String> = fx(&dir, &["ls-tree", "-r", "--name-only", sha])
-            .lines()
-            .map(str::to_owned)
-            .collect();
-        assert_eq!(files, [".gitignore", "tracked.txt", "untracked.txt",]);
-        assert_eq!(fx(&dir, &["show", &format!("{sha}:tracked.txt")]), "two");
-        // No parent and no signature.
-        let object = fx(&dir, &["cat-file", "-p", sha]);
-        assert!(!object.contains("parent "), "{object}");
-        assert!(!object.contains("gpgsig"), "{object}");
-
-        // The checkout itself is as it was, and no ref is left behind.
-        assert_eq!(fx(&dir, &["status", "--porcelain"]), status_before);
-        assert_eq!(fx(&dir, &["for-each-ref", BUNDLE_REF]), "");
-
-        // What the runner does with the bundle: fetch it into a repository
-        // of its own and check the commit out.
-        let runner = base.0.join("runner");
-        std::fs::create_dir_all(&runner).expect("runner directory");
-        fx(&runner, &["init", "-q"]);
-        let bundle = snapshot.bundles[0].to_string_lossy().into_owned();
-        fx(
-            &runner,
-            &[
-                "fetch",
-                "-q",
-                "--no-tags",
-                &bundle,
-                "+refs/zci-manual/*:refs/zci-manual/*",
-            ],
-        );
-        fx(&runner, &["checkout", "-q", "--force", "--detach", sha]);
-        assert_eq!(
-            std::fs::read_to_string(runner.join("tracked.txt")).unwrap(),
-            "two\n"
-        );
-        assert!(runner.join("untracked.txt").is_file());
-        assert!(!runner.join("ignored").exists());
-
-        let upload = snapshot.upload(&["build-x".to_owned(), "check-x".to_owned()]);
-        assert_eq!(upload.jobs, ["build-x", "check-x"]);
-        assert_eq!(upload.summary, "first");
-        assert_eq!(
-            upload.sizes,
-            [std::fs::metadata(&snapshot.bundles[0]).unwrap().len()]
-        );
-        assert!(upload.actor.contains('@'), "{}", upload.actor);
-
-        let temp = snapshot._temp.0.clone();
-        drop(snapshot);
-        assert!(!temp.exists(), "the bundles go with the snapshot");
-    }
-
-    #[test]
-    fn a_repository_without_commits_and_without_an_origin_is_refused_by_name() {
-        let base = Scratch::new("origin");
-        let dir = base.0.join("fresh");
-        std::fs::create_dir_all(&dir).unwrap();
-        fx(&dir, &["init", "-q"]);
-        write(dir.join("a.txt"), "a\n");
-        let refused = take(&dir).err().expect("no origin");
-        assert_eq!(
-            refused,
-            "a manual run needs an origin remote to name the repository"
-        );
-
-        // With one, a repository that has no commit yet still snapshots.
-        fx(
-            &dir,
-            &["remote", "add", "origin", "https://u:secret@host/o/r.git"],
-        );
-        let snapshot = take(&dir).expect("unborn HEAD");
-        assert_eq!(snapshot.upload(&[]).summary, "working tree");
-        assert_eq!(snapshot.origin, "https://host/o/r.git");
-        let files = fx(
-            &dir,
-            &["ls-tree", "-r", "--name-only", &snapshot.dirs[0].sha],
-        );
-        assert!(files.contains("a.txt"), "{files}");
-    }
-
-    #[test]
-    fn a_path_outside_a_checkout_is_refused() {
-        let base = Scratch::new("outside");
-        let err = take(&base.0).err().expect("not a repository");
-        assert!(err.contains("is not inside a git checkout"), "{err}");
-        let err = take(&base.0.join("missing")).err().expect("missing");
-        assert!(err.contains("is not a directory"), "{err}");
-    }
-
-    #[test]
-    fn a_sub_directory_call_snapshots_the_whole_checkout() {
-        let base = Scratch::new("sub");
-        let dir = base.0.join("proj");
-        repo(
-            &dir,
-            Some("https://example.invalid/o/proj.git"),
-            &[("crates/foo/a.txt", "a\n"), ("top.txt", "t\n")],
-        );
-        let snapshot = take(&dir.join("crates/foo")).expect("snapshot");
-        assert_eq!(snapshot.dirs[0].dir, "proj");
-        let sha = &snapshot.dirs[0].sha;
-        assert_eq!(fx(&dir, &["show", &format!("{sha}:top.txt")]), "t");
-    }
-
-    #[test]
-    fn the_subject_is_the_head_commits_or_working_tree() {
-        let base = Scratch::new("summary");
-        let dir = base.0.join("proj");
-        repo(&dir, None, &[("a.txt", "a\n")]);
-        assert_eq!(summary(&dir), "first");
-        fx(
-            &dir,
-            &["commit", "-q", "--allow-empty", "-m", &"x".repeat(500)],
-        );
-        let long = summary(&dir);
-        assert_eq!(long.chars().count(), SUMMARY_CHARS + 3);
-        assert!(long.ends_with("..."));
-
-        let fresh = base.0.join("fresh");
-        std::fs::create_dir_all(&fresh).unwrap();
-        fx(&fresh, &["init", "-q"]);
-        assert_eq!(summary(&fresh), "working tree");
-    }
-
     #[test]
     fn a_remotes_credentials_do_not_travel() {
         for (url, expected) in [
@@ -684,56 +447,299 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_path_dependency_two_levels_up_is_refused() {
-        let base = Scratch::new("far");
-        crate_repo(&base.0.join("util"), None, None);
-        let app = base.0.join("a/b/app");
-        crate_repo(
-            &app,
-            Some("https://example.invalid/o/app.git"),
-            Some("../../../util"),
-        );
-        let err = take(&app).err().expect("not a sibling");
-        assert!(
-            err.starts_with("path dependency ") && err.contains("is not a sibling checkout of"),
-            "{err}"
-        );
-        assert!(err.contains("util") && err.contains("app"), "{err}");
-    }
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-    #[test]
-    fn sibling_path_dependencies_ride_along_with_their_uncommitted_changes() {
-        let base = Scratch::new("siblings");
-        let util = base.0.join("util");
-        crate_repo(&util, None, None);
-        write(util.join("src/lib.rs"), "pub fn answer() -> u32 { 42 }\n");
-        let app = base.0.join("app");
-        crate_repo(
-            &app,
-            Some("https://example.invalid/o/app.git"),
-            Some("../util"),
-        );
+        /// A directory tree under the system's temporary one, removed on drop.
+        struct Scratch(PathBuf);
 
-        let snapshot = take(&app).expect("snapshot");
+        impl Scratch {
+            fn new(tag: &str) -> Scratch {
+                let path = std::env::temp_dir().join(format!(
+                    "zeughaus-mcp-{tag}-{}-{}",
+                    std::process::id(),
+                    COUNTER.fetch_add(1, Ordering::Relaxed)
+                ));
+                let _ = std::fs::remove_dir_all(&path);
+                std::fs::create_dir_all(&path).expect("scratch directory");
+                Scratch(path)
+            }
+        }
 
-        let names: Vec<&str> = snapshot.dirs.iter().map(|d| d.dir.as_str()).collect();
-        assert_eq!(names, ["app", "util"]);
-        assert_eq!(snapshot.bundles.len(), 2);
-        assert_eq!(snapshot.upload(&["x".to_owned()]).sizes.len(), 2);
-        let sha = &snapshot.dirs[1].sha;
-        assert_eq!(
-            fx(&util, &["show", &format!("{sha}:src/lib.rs")]),
-            "pub fn answer() -> u32 { 42 }"
-        );
-    }
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
 
-    #[test]
-    fn a_directory_name_a_manual_run_cannot_carry_is_refused() {
-        let base = Scratch::new("names");
-        let dir = base.0.join("with space");
-        repo(&dir, Some("https://example.invalid/o/r.git"), &[("a", "a")]);
-        let err = take(&dir).err().expect("invalid name");
-        assert!(err.contains("not one a manual run can carry"), "{err}");
+        /// Git as a test fixture runs it: its own identity, whatever the
+        /// developer has configured.
+        fn fx(dir: &Path, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .current_dir(dir)
+                .args(["-c", "user.name=fx", "-c", "user.email=fx@example.invalid"])
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+
+        fn write(path: impl AsRef<Path>, text: &str) {
+            let path = path.as_ref();
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("parent directory");
+            }
+            std::fs::write(path, text).expect("write fixture file");
+        }
+
+        /// A repository with one commit holding `files`.
+        fn repo(dir: &Path, origin: Option<&str>, files: &[(&str, &str)]) {
+            std::fs::create_dir_all(dir).expect("repository directory");
+            fx(dir, &["init", "-q"]);
+            for (name, text) in files {
+                write(dir.join(name), text);
+            }
+            fx(dir, &["add", "."]);
+            fx(dir, &["commit", "-q", "-m", "first"]);
+            if let Some(origin) = origin {
+                fx(dir, &["remote", "add", "origin", origin]);
+            }
+        }
+
+        fn crate_files<'a>(name: &'a str, dependency: Option<&'a str>) -> [(&'a str, String); 2] {
+            // A dependency is named like the package in the directory it points to.
+            let dependency = dependency
+                .map(|path| {
+                    let name = Path::new(path).file_name().and_then(OsStr::to_str).unwrap();
+                    format!("{name} = {{ path = \"{path}\" }}\n")
+                })
+                .unwrap_or_default();
+            [
+                (
+                    "Cargo.toml",
+                    format!(
+                        "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                     [dependencies]\n{dependency}"
+                    ),
+                ),
+                ("src/lib.rs", String::new()),
+            ]
+        }
+
+        fn crate_repo(dir: &Path, origin: Option<&str>, dependency: Option<&str>) {
+            let files = crate_files(dir.file_name().and_then(OsStr::to_str).unwrap(), dependency);
+            let files: Vec<(&str, &str)> = files.iter().map(|(n, t)| (*n, t.as_str())).collect();
+            repo(dir, origin, &files);
+        }
+
+        #[test]
+        fn a_snapshot_holds_the_changes_and_the_untracked_files_but_not_the_ignored_ones() {
+            let base = Scratch::new("tree");
+            let dir = base.0.join("griasdi");
+            repo(
+                &dir,
+                Some("git@github.com:Griasdi/griasdi.git"),
+                &[("tracked.txt", "one\n"), (".gitignore", "ignored/\n")],
+            );
+            write(dir.join("tracked.txt"), "two\n");
+            write(dir.join("untracked.txt"), "new\n");
+            write(dir.join("ignored/junk"), "junk\n");
+            // A commit made here would be signed with this program, which fails:
+            // a snapshot must not depend on the developer's signing setup.
+            fx(&dir, &["config", "commit.gpgsign", "true"]);
+            fx(&dir, &["config", "gpg.program", "false"]);
+            let status_before = fx(&dir, &["status", "--porcelain"]);
+
+            let snapshot = take(&dir).expect("snapshot");
+
+            assert_eq!(snapshot.origin, "git@github.com:Griasdi/griasdi.git");
+            assert_eq!(snapshot.dirs.len(), 1);
+            assert_eq!(snapshot.dirs[0].dir, "griasdi");
+            let sha = &snapshot.dirs[0].sha;
+            assert_eq!(sha.len(), 40, "{sha}");
+            let files: Vec<String> = fx(&dir, &["ls-tree", "-r", "--name-only", sha])
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(files, [".gitignore", "tracked.txt", "untracked.txt",]);
+            assert_eq!(fx(&dir, &["show", &format!("{sha}:tracked.txt")]), "two");
+            // No parent and no signature.
+            let object = fx(&dir, &["cat-file", "-p", sha]);
+            assert!(!object.contains("parent "), "{object}");
+            assert!(!object.contains("gpgsig"), "{object}");
+
+            // The checkout itself is as it was, and no ref is left behind.
+            assert_eq!(fx(&dir, &["status", "--porcelain"]), status_before);
+            assert_eq!(fx(&dir, &["for-each-ref", BUNDLE_REF]), "");
+
+            // What the runner does with the bundle: fetch it into a repository
+            // of its own and check the commit out.
+            let runner = base.0.join("runner");
+            std::fs::create_dir_all(&runner).expect("runner directory");
+            fx(&runner, &["init", "-q"]);
+            let bundle = snapshot.bundles[0].to_string_lossy().into_owned();
+            fx(
+                &runner,
+                &[
+                    "fetch",
+                    "-q",
+                    "--no-tags",
+                    &bundle,
+                    "+refs/zci-manual/*:refs/zci-manual/*",
+                ],
+            );
+            fx(&runner, &["checkout", "-q", "--force", "--detach", sha]);
+            assert_eq!(
+                std::fs::read_to_string(runner.join("tracked.txt")).unwrap(),
+                "two\n"
+            );
+            assert!(runner.join("untracked.txt").is_file());
+            assert!(!runner.join("ignored").exists());
+
+            let upload = snapshot.upload(&["build-x".to_owned(), "check-x".to_owned()]);
+            assert_eq!(upload.jobs, ["build-x", "check-x"]);
+            assert_eq!(upload.summary, "first");
+            assert_eq!(
+                upload.sizes,
+                [std::fs::metadata(&snapshot.bundles[0]).unwrap().len()]
+            );
+            assert!(upload.actor.contains('@'), "{}", upload.actor);
+
+            let temp = snapshot._temp.0.clone();
+            drop(snapshot);
+            assert!(!temp.exists(), "the bundles go with the snapshot");
+        }
+
+        #[test]
+        fn a_repository_without_commits_and_without_an_origin_is_refused_by_name() {
+            let base = Scratch::new("origin");
+            let dir = base.0.join("fresh");
+            std::fs::create_dir_all(&dir).unwrap();
+            fx(&dir, &["init", "-q"]);
+            write(dir.join("a.txt"), "a\n");
+            let refused = take(&dir).err().expect("no origin");
+            assert_eq!(
+                refused,
+                "a manual run needs an origin remote to name the repository"
+            );
+
+            // With one, a repository that has no commit yet still snapshots.
+            fx(
+                &dir,
+                &["remote", "add", "origin", "https://u:secret@host/o/r.git"],
+            );
+            let snapshot = take(&dir).expect("unborn HEAD");
+            assert_eq!(snapshot.upload(&[]).summary, "working tree");
+            assert_eq!(snapshot.origin, "https://host/o/r.git");
+            let files = fx(
+                &dir,
+                &["ls-tree", "-r", "--name-only", &snapshot.dirs[0].sha],
+            );
+            assert!(files.contains("a.txt"), "{files}");
+        }
+
+        #[test]
+        fn a_path_outside_a_checkout_is_refused() {
+            let base = Scratch::new("outside");
+            let err = take(&base.0).err().expect("not a repository");
+            assert!(err.contains("is not inside a git checkout"), "{err}");
+            let err = take(&base.0.join("missing")).err().expect("missing");
+            assert!(err.contains("is not a directory"), "{err}");
+        }
+
+        #[test]
+        fn a_sub_directory_call_snapshots_the_whole_checkout() {
+            let base = Scratch::new("sub");
+            let dir = base.0.join("proj");
+            repo(
+                &dir,
+                Some("https://example.invalid/o/proj.git"),
+                &[("crates/foo/a.txt", "a\n"), ("top.txt", "t\n")],
+            );
+            let snapshot = take(&dir.join("crates/foo")).expect("snapshot");
+            assert_eq!(snapshot.dirs[0].dir, "proj");
+            let sha = &snapshot.dirs[0].sha;
+            assert_eq!(fx(&dir, &["show", &format!("{sha}:top.txt")]), "t");
+        }
+
+        #[test]
+        fn the_subject_is_the_head_commits_or_working_tree() {
+            let base = Scratch::new("summary");
+            let dir = base.0.join("proj");
+            repo(&dir, None, &[("a.txt", "a\n")]);
+            assert_eq!(summary(&dir), "first");
+            fx(
+                &dir,
+                &["commit", "-q", "--allow-empty", "-m", &"x".repeat(500)],
+            );
+            let long = summary(&dir);
+            assert_eq!(long.chars().count(), SUMMARY_CHARS + 3);
+            assert!(long.ends_with("..."));
+
+            let fresh = base.0.join("fresh");
+            std::fs::create_dir_all(&fresh).unwrap();
+            fx(&fresh, &["init", "-q"]);
+            assert_eq!(summary(&fresh), "working tree");
+        }
+
+        #[test]
+        fn a_path_dependency_two_levels_up_is_refused() {
+            let base = Scratch::new("far");
+            crate_repo(&base.0.join("util"), None, None);
+            let app = base.0.join("a/b/app");
+            crate_repo(
+                &app,
+                Some("https://example.invalid/o/app.git"),
+                Some("../../../util"),
+            );
+            let err = take(&app).err().expect("not a sibling");
+            assert!(
+                err.starts_with("path dependency ") && err.contains("is not a sibling checkout of"),
+                "{err}"
+            );
+            assert!(err.contains("util") && err.contains("app"), "{err}");
+        }
+
+        #[test]
+        fn sibling_path_dependencies_ride_along_with_their_uncommitted_changes() {
+            let base = Scratch::new("siblings");
+            let util = base.0.join("util");
+            crate_repo(&util, None, None);
+            write(util.join("src/lib.rs"), "pub fn answer() -> u32 { 42 }\n");
+            let app = base.0.join("app");
+            crate_repo(
+                &app,
+                Some("https://example.invalid/o/app.git"),
+                Some("../util"),
+            );
+
+            let snapshot = take(&app).expect("snapshot");
+
+            let names: Vec<&str> = snapshot.dirs.iter().map(|d| d.dir.as_str()).collect();
+            assert_eq!(names, ["app", "util"]);
+            assert_eq!(snapshot.bundles.len(), 2);
+            assert_eq!(snapshot.upload(&["x".to_owned()]).sizes.len(), 2);
+            let sha = &snapshot.dirs[1].sha;
+            assert_eq!(
+                fx(&util, &["show", &format!("{sha}:src/lib.rs")]),
+                "pub fn answer() -> u32 { 42 }"
+            );
+        }
+
+        #[test]
+        fn a_directory_name_a_manual_run_cannot_carry_is_refused() {
+            let base = Scratch::new("names");
+            let dir = base.0.join("with space");
+            repo(&dir, Some("https://example.invalid/o/r.git"), &[("a", "a")]);
+            let err = take(&dir).err().expect("invalid name");
+            assert!(err.contains("not one a manual run can carry"), "{err}");
+        }
     }
 }

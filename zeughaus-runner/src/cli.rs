@@ -345,53 +345,6 @@ mod tests {
         list.iter().map(|s| s.to_string()).collect()
     }
 
-    /// The push must be in the runner's hands when `send` returns: the
-    /// process exits right after, and the first version of this command lost
-    /// every trigger by closing the connection with the bytes still in
-    /// flight. Real loopback QUIC with the runner's own listener.
-    #[tokio::test]
-    async fn a_trigger_is_delivered_before_send_returns() {
-        let state = std::env::temp_dir().join(format!("zeughaus-cli-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&state);
-        let transport = crate::transport::Transport::start(
-            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-            &state,
-        )
-        .await
-        .expect("listener");
-        let puller = transport
-            .listener()
-            .puller(TRIGGERS_PATH)
-            .expect("trigger endpoint");
-        let (tx, rx) = std::sync::mpsc::sync_channel(4);
-        tokio::spawn(crate::transport::accept_triggers(puller, tx));
-
-        let command = parse_trigger(&[
-            transport.url().to_string(),
-            "42".to_string(),
-            "payload".to_string(),
-        ])
-        .expect("parsed");
-        let line = command.send(&state).await.expect("sent");
-        assert_eq!(line, "triggered node 42");
-
-        // Already queued, or the send returned before delivery.
-        let received =
-            tokio::task::spawn_blocking(move || rx.recv_timeout(std::time::Duration::from_secs(5)))
-                .await
-                .expect("join")
-                .expect("the press reached the runner");
-        assert_eq!(
-            received,
-            TriggerRequest {
-                node_id: 42,
-                payload: Some("payload".to_string()),
-                external: true,
-            }
-        );
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
     #[test]
     fn trigger_takes_an_optional_payload() {
         let bare = parse_trigger(&args(&["weida://x/", "7"])).unwrap();
@@ -461,5 +414,59 @@ mod tests {
         assert!(check_serve_args(&args(&["--version"])).is_err());
         assert!(check_serve_args(&args(&["status"])).is_err());
         assert!(check_serve_args(&args(&["--keep-runs"])).is_err());
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        /// The push must be in the runner's hands when `send` returns: the
+        /// process exits right after, and the first version of this command lost
+        /// every trigger by closing the connection with the bytes still in
+        /// flight. Real loopback QUIC with the runner's own listener.
+        #[tokio::test]
+        async fn a_trigger_is_delivered_before_send_returns() {
+            let state = std::env::temp_dir().join(format!("zeughaus-cli-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&state);
+            let transport = crate::transport::Transport::start(
+                std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+                &state,
+            )
+            .await
+            .expect("listener");
+            let puller = transport
+                .listener()
+                .puller(TRIGGERS_PATH)
+                .expect("trigger endpoint");
+            let (tx, rx) = std::sync::mpsc::sync_channel(4);
+            tokio::spawn(crate::transport::accept_triggers(puller, tx));
+
+            let command = parse_trigger(&[
+                transport.url().to_string(),
+                "42".to_string(),
+                "payload".to_string(),
+            ])
+            .expect("parsed");
+            let line = command.send(&state).await.expect("sent");
+            assert_eq!(line, "triggered node 42");
+
+            // Already queued, or the send returned before delivery.
+            let received = tokio::task::spawn_blocking(move || {
+                rx.recv_timeout(std::time::Duration::from_secs(5))
+            })
+            .await
+            .expect("join")
+            .expect("the press reached the runner");
+            assert_eq!(
+                received,
+                TriggerRequest {
+                    node_id: 42,
+                    payload: Some("payload".to_string()),
+                    external: true,
+                }
+            );
+            let _ = std::fs::remove_dir_all(&state);
+        }
     }
 }

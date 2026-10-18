@@ -894,14 +894,11 @@ pub async fn serve(replier: Replier, server: Arc<CiServer>) {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-
-    use zeughaus_link::MachineState;
     use zeughaus_link::enlist::{Offer, Place};
 
     use super::*;
     use crate::event::{CiEvent, EventKind};
     use crate::header::JobDef;
-    use crate::runners::Connected;
     use crate::scheduler::JobStatus;
 
     const FINGERPRINT: &str =
@@ -996,14 +993,6 @@ mod tests {
         }
     }
 
-    fn store(state: &Path, pipeline: &Pipeline) {
-        let path = state
-            .join("ci/pipelines")
-            .join(&pipeline.repo)
-            .join(format!("{}.json", pipeline.number));
-        crate::files::write_json(&path, pipeline).expect("write the record");
-    }
-
     fn server(state: &Path) -> CiServer {
         server_with(state, "")
     }
@@ -1016,26 +1005,6 @@ mod tests {
             Arc::new(Runners::new()),
             Arc::new(Transcripts::new(state.to_path_buf())),
         )
-    }
-
-    fn connect(server: &CiServer, name: &str, busy: Option<MachineState>) {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        server.runners.insert(
-            name,
-            Connected {
-                tx,
-                offer: Offer {
-                    os: "linux".to_owned(),
-                    arch: "x86_64".to_owned(),
-                    cpus: 4,
-                    containers: false,
-                    machines: Vec::new(),
-                },
-                busy,
-                machines: BTreeMap::new(),
-                since: 1,
-            },
-        );
     }
 
     /// A queued event lands in the channel its ref's pipelines went to, so a
@@ -1055,14 +1024,6 @@ mod tests {
             .map(|q| (q.channel.as_str(), q.actor.as_str()))
             .collect();
         assert_eq!(channels, [("dev", "rerun of #4"), ("feature/x", "test")]);
-    }
-
-    fn open(server: &CiServer, repo: &str, number: u64, job: &str) -> CiReply {
-        server.answer(CiRequest::OpenTranscript {
-            repo: repo.to_owned(),
-            number,
-            job: job.to_owned(),
-        })
     }
 
     #[test]
@@ -1174,364 +1135,6 @@ mod tests {
     }
 
     #[test]
-    fn the_overview_lists_channels_runners_and_what_runs_where() {
-        let state = scratch("overview");
-        let win11 = Place::Machine {
-            name: "win11".to_owned(),
-        };
-        store(
-            &state,
-            &pipeline(
-                "view",
-                1,
-                "dev",
-                PipelineStatus::Succeeded,
-                vec![job("build", JobStatus::Succeeded, Some("alpha"), None)],
-            ),
-        );
-        store(
-            &state,
-            &pipeline(
-                "view",
-                2,
-                "dev",
-                PipelineStatus::Running,
-                vec![
-                    job(
-                        "build",
-                        JobStatus::Running,
-                        Some("alpha"),
-                        Some(Place::Host),
-                    ),
-                    job("windows", JobStatus::Starting, Some("alpha"), Some(win11)),
-                    job("mac", JobStatus::Running, Some("beta"), Some(Place::Host)),
-                    job("test", JobStatus::Pending, None, None),
-                ],
-            ),
-        );
-        store(
-            &state,
-            &pipeline(
-                "view",
-                3,
-                "release",
-                PipelineStatus::Failed,
-                vec![job("build", JobStatus::Failed, Some("alpha"), None)],
-            ),
-        );
-        store(
-            &state,
-            &pipeline("other", 1, "dev", PipelineStatus::Succeeded, Vec::new()),
-        );
-        let server = server(&state);
-        connect(
-            &server,
-            "alpha",
-            Some(MachineState {
-                busy: true,
-                mode: BusyMode::Busy,
-            }),
-        );
-        server.runners.set_machine("alpha", "win11", "running");
-
-        let overview = |server: &CiServer| match server.answer(CiRequest::Overview) {
-            CiReply::Overview { overview } => overview,
-            other => panic!("unexpected reply {other:?}"),
-        };
-        let seen = overview(&server);
-        let channel = |repo: &str, channel: &str, latest: u64, status: &str| ChannelView {
-            repo: repo.to_owned(),
-            channel: channel.to_owned(),
-            latest,
-            status: status.to_owned(),
-        };
-        assert_eq!(
-            seen.platforms,
-            [
-                ("linux-amd64".to_owned(), "alpha".to_owned()),
-                ("windows-amd64".to_owned(), "win11".to_owned()),
-            ]
-        );
-        assert_eq!(
-            seen.channels,
-            [
-                channel("other", "dev", 1, "succeeded"),
-                channel("view", "dev", 2, "running"),
-                channel("view", "release", 3, "failed"),
-            ]
-        );
-        let running = |job: &str| MachineJob {
-            repo: "view".to_owned(),
-            channel: "dev".to_owned(),
-            number: 2,
-            job: job.to_owned(),
-        };
-        let machines: Vec<_> = seen
-            .machines
-            .iter()
-            .map(|m| {
-                (
-                    m.name.as_str(),
-                    m.kind.as_str(),
-                    m.status.as_str(),
-                    m.jobs.clone(),
-                )
-            })
-            .collect();
-        // Runners by name, offline ones too, then the machines they report.
-        assert_eq!(
-            machines,
-            [
-                ("alpha", "runner", "busy (set)", vec![running("build")]),
-                ("beta", "runner", "offline", vec![running("mac")]),
-                ("win11", "windows-vm", "running", vec![running("windows")]),
-            ]
-        );
-
-        // A runner that never reported a busy state is just online; one that
-        // did and is on the automatic mode shows the measurement alone.
-        connect(&server, "beta", None);
-        assert_eq!(overview(&server).machines[1].status, "online");
-        connect(
-            &server,
-            "beta",
-            Some(MachineState {
-                busy: false,
-                mode: BusyMode::Auto,
-            }),
-        );
-        assert_eq!(overview(&server).machines[1].status, "free");
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_name_that_is_no_repository_reads_nothing() {
-        let state = scratch("names");
-        store(
-            &state,
-            &pipeline("view", 1, "dev", PipelineStatus::Succeeded, Vec::new()),
-        );
-        let server = server(&state);
-        // A repository's records, the long way round through the path.
-        let sneaky = "../../ci/pipelines/view";
-        assert_eq!(
-            server.answer(CiRequest::Pipelines {
-                repo: sneaky.to_owned(),
-                channel: "dev".to_owned(),
-                before: None,
-                limit: 10,
-            }),
-            CiReply::Pipelines {
-                pipelines: Vec::new()
-            }
-        );
-        assert_eq!(
-            server.answer(CiRequest::Pipeline {
-                repo: sneaky.to_owned(),
-                number: 1
-            }),
-            CiReply::Pipeline { pipeline: None }
-        );
-        let CiReply::Pipeline { pipeline } = server.answer(CiRequest::Pipeline {
-            repo: "view".to_owned(),
-            number: 1,
-        }) else {
-            panic!("expected a pipeline reply");
-        };
-        assert_eq!(pipeline.map(|p| p.number), Some(1));
-        assert_eq!(open(&server, sneaky, 1, "j0"), error("no such job"));
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_pipeline_is_found_by_the_prefix_of_its_sha_in_any_channel_newest_first() {
-        let state = scratch("find");
-        let with_sha = |number, channel: &str, sha: &str| {
-            let mut record = pipeline("view", number, channel, PipelineStatus::Running, Vec::new());
-            record.sha = Some(sha.to_owned());
-            store(&state, &record);
-        };
-        with_sha(2, "dev", "abcdef0123456789abcdef0123456789abcdef01");
-        // A rerun of the same commit, and a manual run of another one.
-        with_sha(9, "release", "abcdef0123456789abcdef0123456789abcdef01");
-        with_sha(10, "nightly", "1234567890abcdef1234567890abcdef12345678");
-        let server = server(&state);
-        let find = |sha: &str| match server.answer(CiRequest::Find {
-            repo: "view".to_owned(),
-            sha: sha.to_owned(),
-        }) {
-            CiReply::Pipeline { pipeline } => pipeline.map(|p| (p.number, p.channel)),
-            other => panic!("unexpected reply {other:?}"),
-        };
-
-        assert_eq!(find("abcdef0"), Some((9, "release".to_owned())));
-        assert_eq!(find("ABCD"), Some((9, "release".to_owned())));
-        assert_eq!(find("1234"), Some((10, "nightly".to_owned())));
-        assert_eq!(find("ffff"), None);
-
-        for bad in ["abc", "xyz1", "", &"a".repeat(41)] {
-            assert_eq!(
-                server.answer(CiRequest::Find {
-                    repo: "view".to_owned(),
-                    sha: bad.to_owned(),
-                }),
-                error("sha must be 4 to 40 hex digits"),
-                "{bad:?}"
-            );
-        }
-        assert_eq!(
-            server.answer(CiRequest::Find {
-                repo: "../view".to_owned(),
-                sha: "abcd".to_owned(),
-            }),
-            error("no such repository")
-        );
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    /// The origin remote of a checkout of the repository `view`, as
-    /// `ci.toml` spells it.
-    const VIEW_ORIGIN: &str = "ssh://git@git.example.org/me/view.git";
-
-    /// `ci.toml` tables for the repository `view`, which has a forge, and
-    /// `plain`, which has none and a default branch of its own.
-    fn repos() -> String {
-        format!(
-            "[repos.view]\nurl = '{VIEW_ORIGIN}'\nforge = \"forgejo\"\nslug = \"me/view\"\n\
-             api = \"https://git.example.org\"\n\
-             [repos.plain]\nurl = '/srv/git/plain.git'\ndefault_branch = \"trunk\"\n"
-        )
-    }
-
-    /// What a `Repo` request answers: the view, or `None` for an origin no
-    /// repository has.
-    fn ask_repo(
-        server: &CiServer,
-        origin: &str,
-        sha: Option<&str>,
-        jobs: bool,
-    ) -> Option<RepoView> {
-        match server.answer(CiRequest::Repo {
-            origin: origin.to_owned(),
-            sha: sha.map(str::to_owned),
-            jobs,
-        }) {
-            CiReply::Repo { repo } => repo.map(|view| *view),
-            other => panic!("unexpected reply {other:?}"),
-        }
-    }
-
-    /// The view of the repository `view`.
-    fn view_of(server: &CiServer, sha: Option<&str>, jobs: bool) -> RepoView {
-        ask_repo(server, VIEW_ORIGIN, sha, jobs).expect("the repository is configured")
-    }
-
-    #[test]
-    fn a_repository_is_found_by_its_origin_in_any_spelling_of_its_url() {
-        let state = scratch("repo-origin");
-        let server = server_with(&state, &repos());
-        let named = |origin: &str| ask_repo(&server, origin, None, false).map(|view| view.name);
-
-        // `ci.toml` has the ssh form; a checkout may have another.
-        for origin in [
-            VIEW_ORIGIN,
-            "git@git.example.org:me/view.git",
-            "https://git.example.org/me/view",
-            "https://git.example.org/me/view.git/",
-        ] {
-            assert_eq!(named(origin).as_deref(), Some("view"), "{origin}");
-        }
-        assert_eq!(named("/srv/git/plain.git").as_deref(), Some("plain"));
-        assert_eq!(named("https://git.example.org/me/other"), None);
-        assert_eq!(named("https://git.example.org/me"), None);
-        assert_eq!(named("/tmp/view"), None);
-
-        // What `ci.toml` says of the repository and of what builds where.
-        let view = view_of(&server, None, false);
-        assert_eq!(
-            (view.forge.as_str(), view.default_branch.as_str()),
-            ("forgejo me/view", "main")
-        );
-        let plain = ask_repo(&server, "/srv/git/plain.git", None, false).expect("plain");
-        assert_eq!(
-            (plain.forge.as_str(), plain.default_branch.as_str()),
-            ("none", "trunk")
-        );
-        assert_eq!(
-            view.platforms,
-            [
-                ("linux-amd64".to_owned(), "alpha".to_owned()),
-                ("windows-amd64".to_owned(), "win11".to_owned()),
-            ]
-        );
-
-        // The runners are those of `ci.toml`, with the state they report.
-        let runners = |server: &CiServer| {
-            let view = view_of(server, None, false);
-            view.machines
-                .into_iter()
-                .map(|machine| (machine.name, machine.status))
-                .collect::<Vec<_>>()
-        };
-        let pair = |name: &str, status: &str| (name.to_owned(), status.to_owned());
-        assert_eq!(
-            runners(&server),
-            [pair("alpha", "offline"), pair("beta", "offline")]
-        );
-        connect(&server, "alpha", None);
-        assert_eq!(
-            runners(&server),
-            [pair("alpha", "online"), pair("beta", "offline")]
-        );
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_repo_request_names_an_origin_and_a_sha_within_bounds() {
-        let state = scratch("repo-bounds");
-        let server = server_with(&state, &repos());
-        let reply = |origin: &str, sha: Option<&str>| {
-            server.answer(CiRequest::Repo {
-                origin: origin.to_owned(),
-                sha: sha.map(str::to_owned),
-                jobs: false,
-            })
-        };
-
-        for origin in [String::new(), "a".repeat(MAX_ORIGIN_BYTES + 1)] {
-            assert_eq!(
-                reply(&origin, None),
-                error(&format!("origin must be 1 to {MAX_ORIGIN_BYTES} bytes")),
-                "{} bytes",
-                origin.len()
-            );
-        }
-        // The longest origin is looked up, and no repository has it.
-        assert_eq!(
-            reply(&"a".repeat(MAX_ORIGIN_BYTES), None),
-            CiReply::Repo { repo: None }
-        );
-
-        for bad in ["abc", "xyz1", "", &"a".repeat(41)] {
-            assert_eq!(
-                reply(VIEW_ORIGIN, Some(bad)),
-                error("sha must be 4 to 40 hex digits"),
-                "{bad:?}"
-            );
-        }
-        for good in ["abcd", "ABCDEF0", &"0".repeat(40)] {
-            assert!(
-                matches!(
-                    reply(VIEW_ORIGIN, Some(good)),
-                    CiReply::Repo { repo: Some(_) }
-                ),
-                "{good:?}"
-            );
-        }
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
     fn a_commit_id_is_matched_by_its_start_whatever_the_case_of_the_record() {
         let mut record = pipeline("view", 1, "dev", PipelineStatus::Running, Vec::new());
         record.sha = Some("ABCDEF0123456789ABCDEF0123456789ABCDEF01".to_owned());
@@ -1545,340 +1148,6 @@ mod tests {
         ));
         record.sha = None;
         assert!(!has_sha(&record, "abcd"));
-    }
-
-    #[test]
-    fn the_view_has_the_newest_pipeline_of_the_sha_and_the_channels_of_its_repository_only() {
-        let state = scratch("repo-head");
-        let with_sha = |repo: &str, number, channel: &str, sha: &str| {
-            let mut record = pipeline(repo, number, channel, PipelineStatus::Succeeded, Vec::new());
-            record.sha = Some(sha.to_owned());
-            store(&state, &record);
-        };
-        with_sha("view", 2, "dev", "abcdef0123456789abcdef0123456789abcdef01");
-        // A rerun of the same commit, another commit, and the first one in
-        // another repository.
-        with_sha(
-            "view",
-            9,
-            "release",
-            "abcdef0123456789abcdef0123456789abcdef01",
-        );
-        with_sha(
-            "view",
-            10,
-            "nightly",
-            "1234567890abcdef1234567890abcdef12345678",
-        );
-        with_sha(
-            "plain",
-            11,
-            "dev",
-            "abcdef0123456789abcdef0123456789abcdef01",
-        );
-        let server = server_with(&state, &repos());
-        let head = |sha: Option<&str>| {
-            view_of(&server, sha, false)
-                .head
-                .map(|head| (head.repo, head.number, head.channel))
-        };
-
-        let rerun = Some(("view".to_owned(), 9, "release".to_owned()));
-        assert_eq!(head(Some("abcdef0")), rerun);
-        assert_eq!(
-            head(Some("ABCDEF0123456789ABCDEF0123456789ABCDEF01")),
-            rerun
-        );
-        assert_eq!(
-            head(Some("1234")),
-            Some(("view".to_owned(), 10, "nightly".to_owned()))
-        );
-        assert_eq!(head(Some("ffff")), None);
-        assert_eq!(head(None), None);
-
-        let channel = |channel: &str, latest| ChannelView {
-            repo: "view".to_owned(),
-            channel: channel.to_owned(),
-            latest,
-            status: "succeeded".to_owned(),
-        };
-        assert_eq!(
-            view_of(&server, None, false).channels,
-            [
-                channel("dev", 2),
-                channel("nightly", 10),
-                channel("release", 9)
-            ]
-        );
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn the_default_branch_is_green_or_red_since_the_pipeline_that_broke_it() {
-        let state = scratch("repo-branch");
-        let server = server_with(&state, &repos());
-        // A run of `repo` on `branch` whose `check` job ended as `check`.
-        // Both jobs have a pattern of their own, so neither is a deploy
-        // job, which the streak would also name.
-        let run = |repo: &str, number: u64, branch: &str, check: JobStatus| {
-            let mut jobs = vec![
-                job("build", JobStatus::Succeeded, None, None),
-                job("check", check, None, None),
-            ];
-            for job in &mut jobs {
-                job.def.on = vec!["push main".to_owned()];
-            }
-            let mut record = pipeline(repo, number, "dev", PipelineStatus::Failed, jobs);
-            record.event.git_ref = branch.to_owned();
-            record.sha = Some(format!("{number}{}", "a".repeat(39)));
-            record.created = crate::now_secs();
-            store(&state, &record);
-        };
-        let branch = |server: &CiServer| view_of(server, None, false).branch;
-
-        // Nothing has run yet.
-        assert_eq!(branch(&server), "green");
-        run("view", 1, "main", JobStatus::Succeeded);
-        assert_eq!(branch(&server), "green");
-        run("view", 2, "main", JobStatus::Failed);
-        run("view", 3, "main", JobStatus::Failed);
-        assert_eq!(
-            branch(&server),
-            "check red since #2 (2aaaaaa, 0 min, 2 pipelines)"
-        );
-        // Another branch breaking says nothing about this one.
-        run("view", 4, "feature/x", JobStatus::Succeeded);
-        assert_eq!(
-            branch(&server),
-            "check red since #2 (2aaaaaa, 0 min, 2 pipelines)"
-        );
-        run("view", 5, "main", JobStatus::Succeeded);
-        assert_eq!(branch(&server), "green");
-
-        // The default branch is the one `ci.toml` names: `plain` has `trunk`.
-        run("plain", 1, "main", JobStatus::Failed);
-        let plain = |server: &CiServer| {
-            ask_repo(server, "/srv/git/plain.git", None, false)
-                .expect("plain")
-                .branch
-        };
-        assert_eq!(plain(&server), "green");
-        run("plain", 2, "trunk", JobStatus::Failed);
-        assert_eq!(
-            plain(&server),
-            "check red since #2 (2aaaaaa, 0 min, 1 pipeline)"
-        );
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    const BUILD: (&str, &str) = (
-        ".zeughaus-ci/build.sh",
-        "# /// ci\n# on = [\"push main\", \"tag v*\"]\n# ///\necho build\n",
-    );
-    const CHECK: (&str, &str) = (
-        ".zeughaus-ci/check.sh",
-        "# /// ci\n# needs = [\"build\"]\n# image = \"trixie\"\n# when_busy = \"freeze\"\n# ///\necho check\n",
-    );
-    const TRIXIE: (&str, &str) = (".zeughaus-ci/trixie.Containerfile", "FROM scratch\n");
-    const PUBLISH: (&str, &str) = (
-        ".zeughaus-ci/publish.sh",
-        "# /// ci\n# needs = [\"check\"]\n# channels = [\"dev\"]\n# secrets = [\"TOKEN\", \"OTHER_TOKEN\"]\n# ///\necho publish\n",
-    );
-    const LINUX: (&str, &str) = (
-        ".zeughaus-ci/linux.sh",
-        "# /// ci\n# on = [\"push main\"]\n# platform = \"linux-amd64\"\n# ///\necho linux\n",
-    );
-    const MAC: (&str, &str) = (
-        ".zeughaus-ci/mac.sh",
-        "# /// ci\n# on = [\"push main\"]\n# platform = \"darwin-arm64\"\n# ///\necho mac\n",
-    );
-    const WINDOWS: (&str, &str) = (
-        ".zeughaus-ci/windows.ps1",
-        "# /// ci\n# on = [\"push main\"]\n# machine = \"win11\"\n# ///\nWrite-Output windows\n",
-    );
-    const WINDOWS_AMD64: (&str, &str) = (
-        ".zeughaus-ci/windows-amd64.ps1",
-        "# /// ci\n# on = [\"push main\"]\n# platform = \"windows-amd64\"\n# ///\nWrite-Output windows\n",
-    );
-    const CHANNELS: (&str, &str) = (
-        ".zeughaus-ci/channels.toml",
-        "[[channel]]\nname = \"dev\"\non = [\"push main\"]\n",
-    );
-
-    /// The scheduler's mirror of the repository `view`, a bare repository
-    /// with the branch `main` of a work tree that committed `commits`,
-    /// oldest first: a commit's `.zeughaus-ci/` holds the files it lists.
-    /// Returns the commit ids. No commit leaves a mirror with nothing in it.
-    fn mirror_with(state: &Path, commits: &[&[(&str, &str)]]) -> Vec<String> {
-        let author: Vec<(String, String)> = [
-            ("GIT_AUTHOR_NAME", "t"),
-            ("GIT_AUTHOR_EMAIL", "t@t"),
-            ("GIT_COMMITTER_NAME", "t"),
-            ("GIT_COMMITTER_EMAIL", "t@t"),
-        ]
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value.to_owned()))
-        .collect();
-        let git = |dir: &Path, args: &[&str]| {
-            scheduler::git(dir, args, &author).unwrap_or_else(|e| panic!("{e}"))
-        };
-        let work = state.join("work");
-        std::fs::create_dir_all(&work).expect("create the work tree");
-        git(&work, &["init", "-q", "-b", "main"]);
-        let mut ids = Vec::new();
-        for files in commits {
-            let _ = std::fs::remove_dir_all(work.join(CI_DIR));
-            for (path, text) in *files {
-                let path = work.join(path);
-                std::fs::create_dir_all(path.parent().expect("a file in a folder"))
-                    .expect("create the folder");
-                std::fs::write(&path, text).expect("write the file");
-            }
-            git(&work, &["add", "-A"]);
-            git(&work, &["commit", "-q", "--allow-empty", "-m", "snapshot"]);
-            ids.push(git(&work, &["rev-parse", "HEAD"]).trim().to_owned());
-        }
-        let mirror = scheduler::mirror_dir(state, "view");
-        std::fs::create_dir_all(&mirror).expect("create the mirror");
-        git(&mirror, &["init", "--bare", "-q", "-b", "main"]);
-        if !ids.is_empty() {
-            let from = work.to_string_lossy();
-            git(
-                &mirror,
-                &["fetch", "-q", &from, "+refs/heads/*:refs/heads/*"],
-            );
-        }
-        ids
-    }
-
-    #[test]
-    fn the_jobs_are_read_at_the_asked_commit_else_at_the_head_of_the_default_branch() {
-        let state = scratch("repo-jobs-at");
-        let ids = mirror_with(
-            &state,
-            &[
-                &[BUILD, CHECK, TRIXIE, CHANNELS],
-                &[BUILD, CHECK, TRIXIE, CHANNELS, PUBLISH, LINUX],
-            ],
-        );
-        let server = server_with(&state, &repos());
-        let read = |sha: Option<&str>| {
-            let view = view_of(&server, sha, true);
-            let mut names: Vec<&str> = view.jobs.iter().map(|job| job.name.as_str()).collect();
-            names.sort_unstable();
-            (
-                view.jobs_sha.clone(),
-                names.join(" "),
-                view.jobs_note.clone(),
-            )
-        };
-        let old = (
-            Some(ids[0].clone()),
-            "build check".to_owned(),
-            String::new(),
-        );
-        let head = (
-            Some(ids[1].clone()),
-            "build check linux publish".to_owned(),
-            String::new(),
-        );
-
-        // The commit asked for, whole or by its start.
-        assert_eq!(read(Some(&ids[0])), old);
-        assert_eq!(read(Some(&ids[0][..8])), old);
-        assert_eq!(read(Some(&ids[0][..8].to_uppercase())), old);
-        assert_eq!(read(Some(&ids[1])), head);
-        // One the mirror does not have, or none: the head of `main`.
-        assert_eq!(read(Some(&"f".repeat(40))), head);
-        assert_eq!(read(None), head);
-
-        // Without the jobs asked for, git is not run and nothing is said.
-        let bare = view_of(&server, Some(&ids[0]), false);
-        assert_eq!(
-            (bare.jobs_sha, bare.jobs.len(), bare.jobs_note),
-            (None, 0, String::new())
-        );
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn each_job_says_where_it_runs_what_it_needs_and_whether_run_jobs_takes_it() {
-        let state = scratch("repo-jobs-place");
-        mirror_with(
-            &state,
-            &[&[
-                BUILD,
-                CHECK,
-                TRIXIE,
-                PUBLISH,
-                LINUX,
-                MAC,
-                WINDOWS,
-                WINDOWS_AMD64,
-                CHANNELS,
-            ]],
-        );
-        let server = server_with(&state, &repos());
-        let view = view_of(&server, None, true);
-        assert_eq!(view.jobs_note, "");
-        let job = |name: &str| {
-            view.jobs
-                .iter()
-                .find(|job| job.name == name)
-                .unwrap_or_else(|| panic!("no job {name}"))
-        };
-        // The runner, where on it, and whether a manual run takes the job.
-        let placed = |name: &str| {
-            let job = job(name);
-            (job.runner.as_str(), job.at.as_str(), job.manual)
-        };
-        assert_eq!(placed("build"), ("alpha", "host", true));
-        assert_eq!(placed("check"), ("alpha", "image:trixie", true));
-        assert_eq!(placed("publish"), ("alpha", "host", true));
-        assert_eq!(placed("linux"), ("alpha", "host", true));
-        // A machine is a Windows VM, which a manual run does not take.
-        assert_eq!(placed("windows"), ("alpha", "machine:win11", false));
-        assert_eq!(placed("windows-amd64"), ("alpha", "machine:win11", false));
-        // A platform `ci.toml` has no entry for runs nowhere.
-        assert_eq!(placed("mac"), ("", "", false));
-        assert_eq!(
-            job("mac").placement,
-            ".zeughaus-ci/mac.sh: platform darwin-arm64 is not in ci.toml [platforms]"
-        );
-        let unplaced: Vec<&str> = view
-            .jobs
-            .iter()
-            .filter(|job| !job.placement.is_empty())
-            .map(|job| job.name.as_str())
-            .collect();
-        assert_eq!(unplaced, ["mac"]);
-
-        // The header as written.
-        let build = job("build");
-        assert_eq!(
-            (build.file.as_str(), build.place.as_str()),
-            ("build.sh", "host")
-        );
-        assert_eq!(build.on, ["push main", "tag v*"]);
-        assert_eq!(build.when_busy, "wait");
-        assert!(build.needs.is_empty() && build.secrets.is_empty());
-        let check = job("check");
-        assert_eq!(check.place, "image:trixie");
-        assert_eq!(
-            (check.needs.as_slice(), check.when_busy.as_str()),
-            (&["build".to_owned()][..], "freeze")
-        );
-        let publish = job("publish");
-        assert_eq!(publish.secrets, ["TOKEN", "OTHER_TOKEN"]);
-        assert_eq!(
-            (publish.needs.as_slice(), publish.channels.as_slice()),
-            (&["check".to_owned()][..], &["dev".to_owned()][..])
-        );
-        assert!(publish.on.is_empty());
-        assert_eq!(job("linux").place, "platform:linux-amd64");
-        assert_eq!(job("windows").place, "machine:win11");
-        assert_eq!(job("windows-amd64").place, "platform:windows-amd64");
-        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]
@@ -1905,415 +1174,6 @@ mod tests {
             ("", "", false)
         );
         assert_eq!(lost.placement, "git show: no such path");
-    }
-
-    #[test]
-    fn a_repository_the_ci_has_not_fetched_has_no_jobs_to_show_and_says_why() {
-        let state = scratch("repo-jobs-unfetched");
-        let server = server_with(&state, &repos());
-        let view = view_of(&server, Some(&"a".repeat(40)), true);
-        assert_eq!(
-            (view.jobs_sha, view.jobs.len(), view.jobs_note.as_str()),
-            (
-                None,
-                0,
-                "the CI has not fetched view yet; it does with its first event"
-            )
-        );
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn jobs_that_cannot_be_read_are_replaced_by_the_reason() {
-        let state = scratch("repo-jobs-note");
-        let server = server_with(&state, &repos());
-        let note = |sha: Option<&str>| {
-            let view = view_of(&server, sha, true);
-            assert!(view.jobs.is_empty());
-            (view.jobs_sha, view.jobs_note)
-        };
-
-        // A mirror that is set up and has no commit yet.
-        assert!(mirror_with(&state, &[]).is_empty());
-        assert_eq!(
-            note(None),
-            (
-                None,
-                "no commit of view to read .zeughaus-ci/ from".to_owned()
-            )
-        );
-
-        let ids = mirror_with(
-            &state,
-            &[
-                &[("README", "view\n")],
-                &[(
-                    ".zeughaus-ci/bad.sh",
-                    "# /// ci\n# nonsense = 1\n# ///\necho\n",
-                )],
-            ],
-        );
-        // No folder, then a header the CI cannot read.
-        assert_eq!(
-            note(Some(&ids[0])),
-            (
-                Some(ids[0].clone()),
-                format!("{} has no job in .zeughaus-ci/", &ids[0][..7])
-            )
-        );
-        let (sha, text) = note(Some(&ids[1]));
-        assert_eq!(sha, Some(ids[1].clone()));
-        let reason = format!("{} .zeughaus-ci/: .zeughaus-ci/bad.sh: ", &ids[1][..7]);
-        assert!(text.starts_with(&reason), "{text}");
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_transcript_opens_for_a_job_that_has_output_or_is_running() {
-        let state = scratch("open");
-        store(
-            &state,
-            &pipeline(
-                "view",
-                1,
-                "dev",
-                PipelineStatus::Running,
-                vec![
-                    job("done", JobStatus::Succeeded, Some("alpha"), None),
-                    job("live", JobStatus::Running, Some("alpha"), None),
-                    job("waiting", JobStatus::Pending, None, None),
-                    job("empty", JobStatus::Failed, Some("alpha"), None),
-                ],
-            ),
-        );
-        let kept = transcript_dir(&state, "view", 1, "done");
-        std::fs::create_dir_all(&kept).expect("create the store");
-        std::fs::write(kept.join("wal"), "").expect("write the kept WAL");
-        let server = server(&state);
-
-        let CiReply::Transcript { terminal } = open(&server, "view", 1, "done") else {
-            panic!("a job with a stored WAL opens");
-        };
-        // The same job is the same terminal.
-        assert_eq!(
-            open(&server, "view", 1, "done"),
-            CiReply::Transcript { terminal }
-        );
-        assert!(matches!(
-            open(&server, "view", 1, "live"),
-            CiReply::Transcript { .. }
-        ));
-        assert_eq!(
-            open(&server, "view", 1, "waiting"),
-            error("waiting has no transcript")
-        );
-        assert_eq!(
-            open(&server, "view", 1, "empty"),
-            error("empty has no transcript")
-        );
-        assert_eq!(open(&server, "view", 1, "nope"), error("no such job"));
-        assert_eq!(open(&server, "view", 9, "done"), error("no such job"));
-
-        // Closing is the editor's, and idempotent.
-        for _ in 0..2 {
-            assert_eq!(
-                server.answer(CiRequest::CloseTranscript { terminal }),
-                CiReply::Closed
-            );
-        }
-        assert!(!server.transcripts.exists(TerminalId(terminal)));
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_rerun_queues_the_same_event_pinned_to_the_recorded_sha() {
-        let state = scratch("rerun");
-        let mut record = pipeline("view", 4, "dev", PipelineStatus::Failed, Vec::new());
-        record.event.delivery = Some("abc".to_owned());
-        store(&state, &record);
-        let server = server(&state);
-
-        assert_eq!(
-            server.answer(CiRequest::Rerun {
-                repo: "view".to_owned(),
-                number: 4,
-            }),
-            CiReply::Accepted
-        );
-        event::drain_inbox(&state);
-        let queued = event::queued(&state);
-        assert_eq!(queued.len(), 1);
-        let queued = &queued[0].1;
-        assert_eq!(queued.sha, record.sha);
-        assert_eq!(queued.actor, "rerun of #4");
-        assert_eq!(queued.delivery, None);
-        assert_eq!(
-            (queued.kind, queued.git_ref.as_str(), queued.cron.as_ref()),
-            (record.event.kind, "main", None)
-        );
-
-        let unknown = |repo: &str, number| {
-            server.answer(CiRequest::Rerun {
-                repo: repo.to_owned(),
-                number,
-            })
-        };
-        assert_eq!(unknown("view", 9), error("no such pipeline"));
-        assert_eq!(unknown("../view", 4), error("no such pipeline"));
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_cancel_is_left_for_the_scheduler_when_the_pipeline_runs() {
-        let state = scratch("cancel");
-        store(
-            &state,
-            &pipeline("view", 1, "dev", PipelineStatus::Running, Vec::new()),
-        );
-        store(
-            &state,
-            &pipeline("view", 2, "dev", PipelineStatus::Succeeded, Vec::new()),
-        );
-        let server = server(&state);
-        let cancel = |number| {
-            server.answer(CiRequest::Cancel {
-                repo: "view".to_owned(),
-                number,
-            })
-        };
-
-        assert_eq!(cancel(1), CiReply::Accepted);
-        assert_eq!(event::drain_cancels(&state), [("view".to_owned(), 1)]);
-        assert_eq!(cancel(2), error("the pipeline is not running"));
-        assert_eq!(cancel(3), error("no such pipeline"));
-        assert!(event::drain_cancels(&state).is_empty());
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_manual_run_cannot_be_rerun() {
-        let state = scratch("rerun-manual");
-        let mut record = pipeline("view", 4, "dev", PipelineStatus::Failed, Vec::new());
-        record.event.kind = EventKind::Manual;
-        record.event.git_ref = "main".to_owned();
-        record.event.upload = Some("0123456789abcdef".to_owned());
-        store(&state, &record);
-        let server = server(&state);
-        assert_eq!(
-            server.answer(CiRequest::Rerun {
-                repo: "view".to_owned(),
-                number: 4,
-            }),
-            error("a manual run cannot be rerun; start a new one")
-        );
-        event::drain_inbox(&state);
-        assert!(event::queued(&state).is_empty());
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_jobs_log_is_its_last_lines_and_says_whether_it_ended() {
-        let state = scratch("log");
-        let dir = transcript_dir(&state, "view", 3, "build");
-        std::fs::create_dir_all(&dir).expect("create the transcript directory");
-        let server = server(&state);
-        let ask = |repo: &str, job: &str, tail| {
-            server.answer(CiRequest::Log {
-                repo: repo.to_owned(),
-                number: 3,
-                job: job.to_owned(),
-                tail,
-                timestamps: false,
-            })
-        };
-        let log = |tail| match ask("view", "build", tail) {
-            CiReply::Log { text, finished } => (text, finished),
-            other => panic!("unexpected reply {other:?}"),
-        };
-
-        assert_eq!(ask("view", "build", 10), error("no output for build of #3"));
-        let mut wal =
-            zeughaus_terminal::wal::WalWriter::open(&dir.join("wal"), None).expect("open the WAL");
-        wal.append(1, b"\x1b[32mone\x1b[0m\r\ntwo\r\n")
-            .expect("append");
-        wal.append(2, b"three\r\nfour\r\n").expect("append");
-
-        // The escape sequences are gone, only the end is asked for, and the
-        // job still runs.
-        assert_eq!(log(2), ("three\nfour\n".to_owned(), false));
-        assert_eq!(log(100), ("one\ntwo\nthree\nfour\n".to_owned(), false));
-        assert_eq!(log(0), (String::new(), false));
-        std::fs::write(dir.join("exit"), "code=0\n").expect("write the exit record");
-        assert_eq!(log(1), ("four\n".to_owned(), true));
-
-        // Names that are no job read nothing.
-        assert_eq!(ask("../view", "build", 10), error("no such job"));
-        assert_eq!(ask("view", "../build", 10), error("no such job"));
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_jobs_log_can_start_every_line_with_the_time_it_began() {
-        let state = scratch("log-times");
-        let dir = transcript_dir(&state, "view", 3, "build");
-        std::fs::create_dir_all(&dir).expect("create the transcript directory");
-        let server = server(&state);
-        let log = |tail| match server.answer(CiRequest::Log {
-            repo: "view".to_owned(),
-            number: 3,
-            job: "build".to_owned(),
-            tail,
-            timestamps: true,
-        }) {
-            CiReply::Log { text, finished } => (text, finished),
-            other => panic!("unexpected reply {other:?}"),
-        };
-        let mut writer = wal::WalWriter::open(&dir.join("wal"), None).expect("open the WAL");
-        // The first output is the origin. "slow" begins in the first chunk
-        // and ends in the second, a blank line has no text to stamp, and
-        // the last line has no line feed yet.
-        writer
-            .append(10_000_000, b"\x1b[32mone\x1b[0m\r\nsl")
-            .expect("append");
-        writer
-            .append(11_500_000, b"ow\r\n\r\ntwo\r\n")
-            .expect("append");
-        writer.append(75_800_000, b"three").expect("append");
-
-        assert_eq!(
-            log(100),
-            (
-                "[+     0.0s] one\n[+     0.0s] slow\n[+     1.5s] two\n[+    65.8s] three\n"
-                    .to_owned(),
-                false
-            )
-        );
-        assert_eq!(
-            log(2),
-            ("[+     1.5s] two\n[+    65.8s] three\n".to_owned(), false)
-        );
-        assert_eq!(log(0), (String::new(), false));
-        std::fs::write(dir.join("exit"), "code=0\n").expect("write the exit record");
-        assert_eq!(log(1), ("[+    65.8s] three\n".to_owned(), true));
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_jobs_timing_names_the_lines_the_longest_pauses_follow() {
-        let state = scratch("timing");
-        let mut build = job("build", JobStatus::Succeeded, Some("alpha"), None);
-        // The CI's record of the end: 140 s past the epoch.
-        build.finished = Some(140);
-        let idle = job("idle", JobStatus::Pending, None, None);
-        store(
-            &state,
-            &pipeline(
-                "view",
-                3,
-                "dev",
-                PipelineStatus::Succeeded,
-                vec![build.clone(), idle],
-            ),
-        );
-        let dir = transcript_dir(&state, "view", 3, "build");
-        std::fs::create_dir_all(&dir).expect("create the transcript directory");
-        let server = server(&state);
-        let ask = |repo: &str, number, job: &str, top| {
-            server.answer(CiRequest::Timing {
-                repo: repo.to_owned(),
-                number,
-                job: job.to_owned(),
-                top,
-            })
-        };
-        let timing = |top| match ask("view", 3, "build", top) {
-            CiReply::Timing { timing } => timing,
-            other => panic!("unexpected reply {other:?}"),
-        };
-
-        assert_eq!(
-            ask("view", 3, "build", 5),
-            error("no output for build of #3")
-        );
-        let mut writer = wal::WalWriter::open(&dir.join("wal"), None).expect("open the WAL");
-        writer.append(100_000_000, b"start\r\n").expect("append");
-        writer
-            .append(100_200_000, b"compiling a\r\n")
-            .expect("append");
-        writer
-            .append(130_200_000, b"compiling b\r\n")
-            .expect("append");
-        writer.append(131_000_000, b"link\r\n").expect("append");
-
-        // The pause after "compiling a" is 30 s and the one after "link"
-        // runs to the end of the job, 9 s; times are from the first output.
-        let two = timing(2);
-        assert_eq!((two.lines, two.span_ms), (4, 40_000));
-        assert_eq!(
-            two.slowest,
-            vec![
-                TimedLine {
-                    at_ms: 200,
-                    took_ms: 30_000,
-                    text: "compiling a".to_owned()
-                },
-                TimedLine {
-                    at_ms: 31_000,
-                    took_ms: 9_000,
-                    text: "link".to_owned()
-                },
-            ]
-        );
-        assert!(!two.finished && !two.truncated);
-        // The number of lines asked for is kept within what a reply allows.
-        assert_eq!(timing(0).slowest.len(), 1);
-        assert_eq!(timing(1000).slowest.len(), 4);
-        std::fs::write(dir.join("exit"), "code=0\n").expect("write the exit record");
-        assert!(timing(1).finished);
-
-        // A job the record has no end for is still running: its last line
-        // has stood until now.
-        let mut running = build;
-        running.finished = None;
-        store(
-            &state,
-            &pipeline("view", 3, "dev", PipelineStatus::Running, vec![running]),
-        );
-        let now = timing(1);
-        assert!(now.span_ms > 1_000_000_000, "{now:?}");
-
-        // No such pipeline, job or name; a job without output.
-        assert_eq!(ask("view", 9, "build", 5), error("no such job"));
-        assert_eq!(ask("view", 3, "nope", 5), error("no such job"));
-        assert_eq!(ask("view", 3, "../build", 5), error("no such job"));
-        assert_eq!(ask("../view", 3, "build", 5), error("no such job"));
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn a_job_without_output_in_its_record_has_nothing_to_time() {
-        let state = scratch("timing-idle");
-        store(
-            &state,
-            &pipeline(
-                "view",
-                3,
-                "dev",
-                PipelineStatus::Running,
-                vec![job("idle", JobStatus::Pending, None, None)],
-            ),
-        );
-        let server = server(&state);
-        assert_eq!(
-            server.answer(CiRequest::Timing {
-                repo: "view".to_owned(),
-                number: 3,
-                job: "idle".to_owned(),
-                top: 5,
-            }),
-            error("no output for idle of #3")
-        );
-        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]
@@ -2374,43 +1234,6 @@ mod tests {
     }
 
     #[test]
-    fn a_window_that_opens_inside_a_line_drops_the_rest_of_it() {
-        let state = scratch("window");
-        let dir = transcript_dir(&state, "view", 3, "build");
-        std::fs::create_dir_all(&dir).expect("create the transcript directory");
-        let mut writer = wal::WalWriter::open(&dir.join("wal"), None).expect("open the WAL");
-        writer.append(1_000_000, b"alpha\nbe").expect("append");
-        writer.append(2_000_000, b"ta\ngamma\n").expect("append");
-        writer.append(3_000_000, b"delta\n").expect("append");
-        let line = |at, text: &str| (at, text.to_owned());
-
-        let all = timed_tail(&dir, 1 << 20).expect("the whole log");
-        assert!(!all.truncated);
-        assert_eq!(all.origin, Some(1_000_000));
-        assert_eq!(
-            all.lines,
-            [
-                line(1_000_000, "alpha"),
-                line(1_000_000, "beta"),
-                line(2_000_000, "gamma"),
-                line(3_000_000, "delta"),
-            ]
-        );
-
-        // Seven bytes need the second record whole, and its first line is
-        // the end of "beta", which began in the record left out. The origin
-        // is still the log's first output.
-        let tail = timed_tail(&dir, 7).expect("the last records");
-        assert!(tail.truncated);
-        assert_eq!(tail.origin, Some(1_000_000));
-        assert_eq!(
-            tail.lines,
-            [line(2_000_000, "gamma"), line(3_000_000, "delta")]
-        );
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
     fn the_last_lines_of_a_text_are_cut_at_a_line_start_within_the_byte_limit() {
         assert_eq!(last_lines("a\nb\nc\n", 2, 100), "b\nc\n");
         assert_eq!(last_lines("a\nb\nc", 2, 100), "b\nc");
@@ -2423,5 +1246,1197 @@ mod tests {
         assert_eq!(last_lines("aaaa\nbb\ncc\n", 10, 5), "cc\n");
         assert_eq!(last_lines("aaaa\nbb\ncc\n", 10, 100), "aaaa\nbb\ncc\n");
         assert_eq!(last_lines("\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}", 1, 3), "\u{e9}");
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+        use crate::runners::Connected;
+        use zeughaus_link::MachineState;
+
+        fn store(state: &Path, pipeline: &Pipeline) {
+            let path = state
+                .join("ci/pipelines")
+                .join(&pipeline.repo)
+                .join(format!("{}.json", pipeline.number));
+            crate::files::write_json(&path, pipeline).expect("write the record");
+        }
+
+        fn connect(server: &CiServer, name: &str, busy: Option<MachineState>) {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            server.runners.insert(
+                name,
+                Connected {
+                    tx,
+                    offer: Offer {
+                        os: "linux".to_owned(),
+                        arch: "x86_64".to_owned(),
+                        cpus: 4,
+                        containers: false,
+                        machines: Vec::new(),
+                    },
+                    busy,
+                    machines: BTreeMap::new(),
+                    since: 1,
+                },
+            );
+        }
+
+        fn open(server: &CiServer, repo: &str, number: u64, job: &str) -> CiReply {
+            server.answer(CiRequest::OpenTranscript {
+                repo: repo.to_owned(),
+                number,
+                job: job.to_owned(),
+            })
+        }
+
+        #[test]
+        fn the_overview_lists_channels_runners_and_what_runs_where() {
+            let state = scratch("overview");
+            let win11 = Place::Machine {
+                name: "win11".to_owned(),
+            };
+            store(
+                &state,
+                &pipeline(
+                    "view",
+                    1,
+                    "dev",
+                    PipelineStatus::Succeeded,
+                    vec![job("build", JobStatus::Succeeded, Some("alpha"), None)],
+                ),
+            );
+            store(
+                &state,
+                &pipeline(
+                    "view",
+                    2,
+                    "dev",
+                    PipelineStatus::Running,
+                    vec![
+                        job(
+                            "build",
+                            JobStatus::Running,
+                            Some("alpha"),
+                            Some(Place::Host),
+                        ),
+                        job("windows", JobStatus::Starting, Some("alpha"), Some(win11)),
+                        job("mac", JobStatus::Running, Some("beta"), Some(Place::Host)),
+                        job("test", JobStatus::Pending, None, None),
+                    ],
+                ),
+            );
+            store(
+                &state,
+                &pipeline(
+                    "view",
+                    3,
+                    "release",
+                    PipelineStatus::Failed,
+                    vec![job("build", JobStatus::Failed, Some("alpha"), None)],
+                ),
+            );
+            store(
+                &state,
+                &pipeline("other", 1, "dev", PipelineStatus::Succeeded, Vec::new()),
+            );
+            let server = server(&state);
+            connect(
+                &server,
+                "alpha",
+                Some(MachineState {
+                    busy: true,
+                    mode: BusyMode::Busy,
+                }),
+            );
+            server.runners.set_machine("alpha", "win11", "running");
+
+            let overview = |server: &CiServer| match server.answer(CiRequest::Overview) {
+                CiReply::Overview { overview } => overview,
+                other => panic!("unexpected reply {other:?}"),
+            };
+            let seen = overview(&server);
+            let channel = |repo: &str, channel: &str, latest: u64, status: &str| ChannelView {
+                repo: repo.to_owned(),
+                channel: channel.to_owned(),
+                latest,
+                status: status.to_owned(),
+            };
+            assert_eq!(
+                seen.platforms,
+                [
+                    ("linux-amd64".to_owned(), "alpha".to_owned()),
+                    ("windows-amd64".to_owned(), "win11".to_owned()),
+                ]
+            );
+            assert_eq!(
+                seen.channels,
+                [
+                    channel("other", "dev", 1, "succeeded"),
+                    channel("view", "dev", 2, "running"),
+                    channel("view", "release", 3, "failed"),
+                ]
+            );
+            let running = |job: &str| MachineJob {
+                repo: "view".to_owned(),
+                channel: "dev".to_owned(),
+                number: 2,
+                job: job.to_owned(),
+            };
+            let machines: Vec<_> = seen
+                .machines
+                .iter()
+                .map(|m| {
+                    (
+                        m.name.as_str(),
+                        m.kind.as_str(),
+                        m.status.as_str(),
+                        m.jobs.clone(),
+                    )
+                })
+                .collect();
+            // Runners by name, offline ones too, then the machines they report.
+            assert_eq!(
+                machines,
+                [
+                    ("alpha", "runner", "busy (set)", vec![running("build")]),
+                    ("beta", "runner", "offline", vec![running("mac")]),
+                    ("win11", "windows-vm", "running", vec![running("windows")]),
+                ]
+            );
+
+            // A runner that never reported a busy state is just online; one that
+            // did and is on the automatic mode shows the measurement alone.
+            connect(&server, "beta", None);
+            assert_eq!(overview(&server).machines[1].status, "online");
+            connect(
+                &server,
+                "beta",
+                Some(MachineState {
+                    busy: false,
+                    mode: BusyMode::Auto,
+                }),
+            );
+            assert_eq!(overview(&server).machines[1].status, "free");
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_name_that_is_no_repository_reads_nothing() {
+            let state = scratch("names");
+            store(
+                &state,
+                &pipeline("view", 1, "dev", PipelineStatus::Succeeded, Vec::new()),
+            );
+            let server = server(&state);
+            // A repository's records, the long way round through the path.
+            let sneaky = "../../ci/pipelines/view";
+            assert_eq!(
+                server.answer(CiRequest::Pipelines {
+                    repo: sneaky.to_owned(),
+                    channel: "dev".to_owned(),
+                    before: None,
+                    limit: 10,
+                }),
+                CiReply::Pipelines {
+                    pipelines: Vec::new()
+                }
+            );
+            assert_eq!(
+                server.answer(CiRequest::Pipeline {
+                    repo: sneaky.to_owned(),
+                    number: 1
+                }),
+                CiReply::Pipeline { pipeline: None }
+            );
+            let CiReply::Pipeline { pipeline } = server.answer(CiRequest::Pipeline {
+                repo: "view".to_owned(),
+                number: 1,
+            }) else {
+                panic!("expected a pipeline reply");
+            };
+            assert_eq!(pipeline.map(|p| p.number), Some(1));
+            assert_eq!(open(&server, sneaky, 1, "j0"), error("no such job"));
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_pipeline_is_found_by_the_prefix_of_its_sha_in_any_channel_newest_first() {
+            let state = scratch("find");
+            let with_sha = |number, channel: &str, sha: &str| {
+                let mut record =
+                    pipeline("view", number, channel, PipelineStatus::Running, Vec::new());
+                record.sha = Some(sha.to_owned());
+                store(&state, &record);
+            };
+            with_sha(2, "dev", "abcdef0123456789abcdef0123456789abcdef01");
+            // A rerun of the same commit, and a manual run of another one.
+            with_sha(9, "release", "abcdef0123456789abcdef0123456789abcdef01");
+            with_sha(10, "nightly", "1234567890abcdef1234567890abcdef12345678");
+            let server = server(&state);
+            let find = |sha: &str| match server.answer(CiRequest::Find {
+                repo: "view".to_owned(),
+                sha: sha.to_owned(),
+            }) {
+                CiReply::Pipeline { pipeline } => pipeline.map(|p| (p.number, p.channel)),
+                other => panic!("unexpected reply {other:?}"),
+            };
+
+            assert_eq!(find("abcdef0"), Some((9, "release".to_owned())));
+            assert_eq!(find("ABCD"), Some((9, "release".to_owned())));
+            assert_eq!(find("1234"), Some((10, "nightly".to_owned())));
+            assert_eq!(find("ffff"), None);
+
+            for bad in ["abc", "xyz1", "", &"a".repeat(41)] {
+                assert_eq!(
+                    server.answer(CiRequest::Find {
+                        repo: "view".to_owned(),
+                        sha: bad.to_owned(),
+                    }),
+                    error("sha must be 4 to 40 hex digits"),
+                    "{bad:?}"
+                );
+            }
+            assert_eq!(
+                server.answer(CiRequest::Find {
+                    repo: "../view".to_owned(),
+                    sha: "abcd".to_owned(),
+                }),
+                error("no such repository")
+            );
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        /// The origin remote of a checkout of the repository `view`, as
+        /// `ci.toml` spells it.
+        const VIEW_ORIGIN: &str = "ssh://git@git.example.org/me/view.git";
+
+        /// `ci.toml` tables for the repository `view`, which has a forge, and
+        /// `plain`, which has none and a default branch of its own.
+        fn repos() -> String {
+            format!(
+                "[repos.view]\nurl = '{VIEW_ORIGIN}'\nforge = \"forgejo\"\nslug = \"me/view\"\n\
+                 api = \"https://git.example.org\"\n\
+                 [repos.plain]\nurl = '/srv/git/plain.git'\ndefault_branch = \"trunk\"\n"
+            )
+        }
+
+        /// What a `Repo` request answers: the view, or `None` for an origin no
+        /// repository has.
+        fn ask_repo(
+            server: &CiServer,
+            origin: &str,
+            sha: Option<&str>,
+            jobs: bool,
+        ) -> Option<RepoView> {
+            match server.answer(CiRequest::Repo {
+                origin: origin.to_owned(),
+                sha: sha.map(str::to_owned),
+                jobs,
+            }) {
+                CiReply::Repo { repo } => repo.map(|view| *view),
+                other => panic!("unexpected reply {other:?}"),
+            }
+        }
+
+        /// The view of the repository `view`.
+        fn view_of(server: &CiServer, sha: Option<&str>, jobs: bool) -> RepoView {
+            ask_repo(server, VIEW_ORIGIN, sha, jobs).expect("the repository is configured")
+        }
+
+        #[test]
+        fn a_repository_is_found_by_its_origin_in_any_spelling_of_its_url() {
+            let state = scratch("repo-origin");
+            let server = server_with(&state, &repos());
+            let named = |origin: &str| ask_repo(&server, origin, None, false).map(|view| view.name);
+
+            // `ci.toml` has the ssh form; a checkout may have another.
+            for origin in [
+                VIEW_ORIGIN,
+                "git@git.example.org:me/view.git",
+                "https://git.example.org/me/view",
+                "https://git.example.org/me/view.git/",
+            ] {
+                assert_eq!(named(origin).as_deref(), Some("view"), "{origin}");
+            }
+            assert_eq!(named("/srv/git/plain.git").as_deref(), Some("plain"));
+            assert_eq!(named("https://git.example.org/me/other"), None);
+            assert_eq!(named("https://git.example.org/me"), None);
+            assert_eq!(named("/tmp/view"), None);
+
+            // What `ci.toml` says of the repository and of what builds where.
+            let view = view_of(&server, None, false);
+            assert_eq!(
+                (view.forge.as_str(), view.default_branch.as_str()),
+                ("forgejo me/view", "main")
+            );
+            let plain = ask_repo(&server, "/srv/git/plain.git", None, false).expect("plain");
+            assert_eq!(
+                (plain.forge.as_str(), plain.default_branch.as_str()),
+                ("none", "trunk")
+            );
+            assert_eq!(
+                view.platforms,
+                [
+                    ("linux-amd64".to_owned(), "alpha".to_owned()),
+                    ("windows-amd64".to_owned(), "win11".to_owned()),
+                ]
+            );
+
+            // The runners are those of `ci.toml`, with the state they report.
+            let runners = |server: &CiServer| {
+                let view = view_of(server, None, false);
+                view.machines
+                    .into_iter()
+                    .map(|machine| (machine.name, machine.status))
+                    .collect::<Vec<_>>()
+            };
+            let pair = |name: &str, status: &str| (name.to_owned(), status.to_owned());
+            assert_eq!(
+                runners(&server),
+                [pair("alpha", "offline"), pair("beta", "offline")]
+            );
+            connect(&server, "alpha", None);
+            assert_eq!(
+                runners(&server),
+                [pair("alpha", "online"), pair("beta", "offline")]
+            );
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_repo_request_names_an_origin_and_a_sha_within_bounds() {
+            let state = scratch("repo-bounds");
+            let server = server_with(&state, &repos());
+            let reply = |origin: &str, sha: Option<&str>| {
+                server.answer(CiRequest::Repo {
+                    origin: origin.to_owned(),
+                    sha: sha.map(str::to_owned),
+                    jobs: false,
+                })
+            };
+
+            for origin in [String::new(), "a".repeat(MAX_ORIGIN_BYTES + 1)] {
+                assert_eq!(
+                    reply(&origin, None),
+                    error(&format!("origin must be 1 to {MAX_ORIGIN_BYTES} bytes")),
+                    "{} bytes",
+                    origin.len()
+                );
+            }
+            // The longest origin is looked up, and no repository has it.
+            assert_eq!(
+                reply(&"a".repeat(MAX_ORIGIN_BYTES), None),
+                CiReply::Repo { repo: None }
+            );
+
+            for bad in ["abc", "xyz1", "", &"a".repeat(41)] {
+                assert_eq!(
+                    reply(VIEW_ORIGIN, Some(bad)),
+                    error("sha must be 4 to 40 hex digits"),
+                    "{bad:?}"
+                );
+            }
+            for good in ["abcd", "ABCDEF0", &"0".repeat(40)] {
+                assert!(
+                    matches!(
+                        reply(VIEW_ORIGIN, Some(good)),
+                        CiReply::Repo { repo: Some(_) }
+                    ),
+                    "{good:?}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn the_view_has_the_newest_pipeline_of_the_sha_and_the_channels_of_its_repository_only() {
+            let state = scratch("repo-head");
+            let with_sha = |repo: &str, number, channel: &str, sha: &str| {
+                let mut record =
+                    pipeline(repo, number, channel, PipelineStatus::Succeeded, Vec::new());
+                record.sha = Some(sha.to_owned());
+                store(&state, &record);
+            };
+            with_sha("view", 2, "dev", "abcdef0123456789abcdef0123456789abcdef01");
+            // A rerun of the same commit, another commit, and the first one in
+            // another repository.
+            with_sha(
+                "view",
+                9,
+                "release",
+                "abcdef0123456789abcdef0123456789abcdef01",
+            );
+            with_sha(
+                "view",
+                10,
+                "nightly",
+                "1234567890abcdef1234567890abcdef12345678",
+            );
+            with_sha(
+                "plain",
+                11,
+                "dev",
+                "abcdef0123456789abcdef0123456789abcdef01",
+            );
+            let server = server_with(&state, &repos());
+            let head = |sha: Option<&str>| {
+                view_of(&server, sha, false)
+                    .head
+                    .map(|head| (head.repo, head.number, head.channel))
+            };
+
+            let rerun = Some(("view".to_owned(), 9, "release".to_owned()));
+            assert_eq!(head(Some("abcdef0")), rerun);
+            assert_eq!(
+                head(Some("ABCDEF0123456789ABCDEF0123456789ABCDEF01")),
+                rerun
+            );
+            assert_eq!(
+                head(Some("1234")),
+                Some(("view".to_owned(), 10, "nightly".to_owned()))
+            );
+            assert_eq!(head(Some("ffff")), None);
+            assert_eq!(head(None), None);
+
+            let channel = |channel: &str, latest| ChannelView {
+                repo: "view".to_owned(),
+                channel: channel.to_owned(),
+                latest,
+                status: "succeeded".to_owned(),
+            };
+            assert_eq!(
+                view_of(&server, None, false).channels,
+                [
+                    channel("dev", 2),
+                    channel("nightly", 10),
+                    channel("release", 9)
+                ]
+            );
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn the_default_branch_is_green_or_red_since_the_pipeline_that_broke_it() {
+            let state = scratch("repo-branch");
+            let server = server_with(&state, &repos());
+            // A run of `repo` on `branch` whose `check` job ended as `check`.
+            // Both jobs have a pattern of their own, so neither is a deploy
+            // job, which the streak would also name.
+            let run = |repo: &str, number: u64, branch: &str, check: JobStatus| {
+                let mut jobs = vec![
+                    job("build", JobStatus::Succeeded, None, None),
+                    job("check", check, None, None),
+                ];
+                for job in &mut jobs {
+                    job.def.on = vec!["push main".to_owned()];
+                }
+                let mut record = pipeline(repo, number, "dev", PipelineStatus::Failed, jobs);
+                record.event.git_ref = branch.to_owned();
+                record.sha = Some(format!("{number}{}", "a".repeat(39)));
+                record.created = crate::now_secs();
+                store(&state, &record);
+            };
+            let branch = |server: &CiServer| view_of(server, None, false).branch;
+
+            // Nothing has run yet.
+            assert_eq!(branch(&server), "green");
+            run("view", 1, "main", JobStatus::Succeeded);
+            assert_eq!(branch(&server), "green");
+            run("view", 2, "main", JobStatus::Failed);
+            run("view", 3, "main", JobStatus::Failed);
+            assert_eq!(
+                branch(&server),
+                "check red since #2 (2aaaaaa, 0 min, 2 pipelines)"
+            );
+            // Another branch breaking says nothing about this one.
+            run("view", 4, "feature/x", JobStatus::Succeeded);
+            assert_eq!(
+                branch(&server),
+                "check red since #2 (2aaaaaa, 0 min, 2 pipelines)"
+            );
+            run("view", 5, "main", JobStatus::Succeeded);
+            assert_eq!(branch(&server), "green");
+
+            // The default branch is the one `ci.toml` names: `plain` has `trunk`.
+            run("plain", 1, "main", JobStatus::Failed);
+            let plain = |server: &CiServer| {
+                ask_repo(server, "/srv/git/plain.git", None, false)
+                    .expect("plain")
+                    .branch
+            };
+            assert_eq!(plain(&server), "green");
+            run("plain", 2, "trunk", JobStatus::Failed);
+            assert_eq!(
+                plain(&server),
+                "check red since #2 (2aaaaaa, 0 min, 1 pipeline)"
+            );
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        const BUILD: (&str, &str) = (
+            ".zeughaus-ci/build.sh",
+            "# /// ci\n# on = [\"push main\", \"tag v*\"]\n# ///\necho build\n",
+        );
+
+        const CHECK: (&str, &str) = (
+            ".zeughaus-ci/check.sh",
+            "# /// ci\n# needs = [\"build\"]\n# image = \"trixie\"\n# when_busy = \"freeze\"\n# ///\necho check\n",
+        );
+
+        const TRIXIE: (&str, &str) = (".zeughaus-ci/trixie.Containerfile", "FROM scratch\n");
+
+        const PUBLISH: (&str, &str) = (
+            ".zeughaus-ci/publish.sh",
+            "# /// ci\n# needs = [\"check\"]\n# channels = [\"dev\"]\n# secrets = [\"TOKEN\", \"OTHER_TOKEN\"]\n# ///\necho publish\n",
+        );
+
+        const LINUX: (&str, &str) = (
+            ".zeughaus-ci/linux.sh",
+            "# /// ci\n# on = [\"push main\"]\n# platform = \"linux-amd64\"\n# ///\necho linux\n",
+        );
+
+        const MAC: (&str, &str) = (
+            ".zeughaus-ci/mac.sh",
+            "# /// ci\n# on = [\"push main\"]\n# platform = \"darwin-arm64\"\n# ///\necho mac\n",
+        );
+
+        const WINDOWS: (&str, &str) = (
+            ".zeughaus-ci/windows.ps1",
+            "# /// ci\n# on = [\"push main\"]\n# machine = \"win11\"\n# ///\nWrite-Output windows\n",
+        );
+
+        const WINDOWS_AMD64: (&str, &str) = (
+            ".zeughaus-ci/windows-amd64.ps1",
+            "# /// ci\n# on = [\"push main\"]\n# platform = \"windows-amd64\"\n# ///\nWrite-Output windows\n",
+        );
+
+        const CHANNELS: (&str, &str) = (
+            ".zeughaus-ci/channels.toml",
+            "[[channel]]\nname = \"dev\"\non = [\"push main\"]\n",
+        );
+
+        /// The scheduler's mirror of the repository `view`, a bare repository
+        /// with the branch `main` of a work tree that committed `commits`,
+        /// oldest first: a commit's `.zeughaus-ci/` holds the files it lists.
+        /// Returns the commit ids. No commit leaves a mirror with nothing in it.
+        fn mirror_with(state: &Path, commits: &[&[(&str, &str)]]) -> Vec<String> {
+            let author: Vec<(String, String)> = [
+                ("GIT_AUTHOR_NAME", "t"),
+                ("GIT_AUTHOR_EMAIL", "t@t"),
+                ("GIT_COMMITTER_NAME", "t"),
+                ("GIT_COMMITTER_EMAIL", "t@t"),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect();
+            let git = |dir: &Path, args: &[&str]| {
+                scheduler::git(dir, args, &author).unwrap_or_else(|e| panic!("{e}"))
+            };
+            let work = state.join("work");
+            std::fs::create_dir_all(&work).expect("create the work tree");
+            git(&work, &["init", "-q", "-b", "main"]);
+            let mut ids = Vec::new();
+            for files in commits {
+                let _ = std::fs::remove_dir_all(work.join(CI_DIR));
+                for (path, text) in *files {
+                    let path = work.join(path);
+                    std::fs::create_dir_all(path.parent().expect("a file in a folder"))
+                        .expect("create the folder");
+                    std::fs::write(&path, text).expect("write the file");
+                }
+                git(&work, &["add", "-A"]);
+                git(&work, &["commit", "-q", "--allow-empty", "-m", "snapshot"]);
+                ids.push(git(&work, &["rev-parse", "HEAD"]).trim().to_owned());
+            }
+            let mirror = scheduler::mirror_dir(state, "view");
+            std::fs::create_dir_all(&mirror).expect("create the mirror");
+            git(&mirror, &["init", "--bare", "-q", "-b", "main"]);
+            if !ids.is_empty() {
+                let from = work.to_string_lossy();
+                git(
+                    &mirror,
+                    &["fetch", "-q", &from, "+refs/heads/*:refs/heads/*"],
+                );
+            }
+            ids
+        }
+
+        #[test]
+        fn the_jobs_are_read_at_the_asked_commit_else_at_the_head_of_the_default_branch() {
+            let state = scratch("repo-jobs-at");
+            let ids = mirror_with(
+                &state,
+                &[
+                    &[BUILD, CHECK, TRIXIE, CHANNELS],
+                    &[BUILD, CHECK, TRIXIE, CHANNELS, PUBLISH, LINUX],
+                ],
+            );
+            let server = server_with(&state, &repos());
+            let read = |sha: Option<&str>| {
+                let view = view_of(&server, sha, true);
+                let mut names: Vec<&str> = view.jobs.iter().map(|job| job.name.as_str()).collect();
+                names.sort_unstable();
+                (
+                    view.jobs_sha.clone(),
+                    names.join(" "),
+                    view.jobs_note.clone(),
+                )
+            };
+            let old = (
+                Some(ids[0].clone()),
+                "build check".to_owned(),
+                String::new(),
+            );
+            let head = (
+                Some(ids[1].clone()),
+                "build check linux publish".to_owned(),
+                String::new(),
+            );
+
+            // The commit asked for, whole or by its start.
+            assert_eq!(read(Some(&ids[0])), old);
+            assert_eq!(read(Some(&ids[0][..8])), old);
+            assert_eq!(read(Some(&ids[0][..8].to_uppercase())), old);
+            assert_eq!(read(Some(&ids[1])), head);
+            // One the mirror does not have, or none: the head of `main`.
+            assert_eq!(read(Some(&"f".repeat(40))), head);
+            assert_eq!(read(None), head);
+
+            // Without the jobs asked for, git is not run and nothing is said.
+            let bare = view_of(&server, Some(&ids[0]), false);
+            assert_eq!(
+                (bare.jobs_sha, bare.jobs.len(), bare.jobs_note),
+                (None, 0, String::new())
+            );
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn each_job_says_where_it_runs_what_it_needs_and_whether_run_jobs_takes_it() {
+            let state = scratch("repo-jobs-place");
+            mirror_with(
+                &state,
+                &[&[
+                    BUILD,
+                    CHECK,
+                    TRIXIE,
+                    PUBLISH,
+                    LINUX,
+                    MAC,
+                    WINDOWS,
+                    WINDOWS_AMD64,
+                    CHANNELS,
+                ]],
+            );
+            let server = server_with(&state, &repos());
+            let view = view_of(&server, None, true);
+            assert_eq!(view.jobs_note, "");
+            let job = |name: &str| {
+                view.jobs
+                    .iter()
+                    .find(|job| job.name == name)
+                    .unwrap_or_else(|| panic!("no job {name}"))
+            };
+            // The runner, where on it, and whether a manual run takes the job.
+            let placed = |name: &str| {
+                let job = job(name);
+                (job.runner.as_str(), job.at.as_str(), job.manual)
+            };
+            assert_eq!(placed("build"), ("alpha", "host", true));
+            assert_eq!(placed("check"), ("alpha", "image:trixie", true));
+            assert_eq!(placed("publish"), ("alpha", "host", true));
+            assert_eq!(placed("linux"), ("alpha", "host", true));
+            // A machine is a Windows VM, which a manual run does not take.
+            assert_eq!(placed("windows"), ("alpha", "machine:win11", false));
+            assert_eq!(placed("windows-amd64"), ("alpha", "machine:win11", false));
+            // A platform `ci.toml` has no entry for runs nowhere.
+            assert_eq!(placed("mac"), ("", "", false));
+            assert_eq!(
+                job("mac").placement,
+                ".zeughaus-ci/mac.sh: platform darwin-arm64 is not in ci.toml [platforms]"
+            );
+            let unplaced: Vec<&str> = view
+                .jobs
+                .iter()
+                .filter(|job| !job.placement.is_empty())
+                .map(|job| job.name.as_str())
+                .collect();
+            assert_eq!(unplaced, ["mac"]);
+
+            // The header as written.
+            let build = job("build");
+            assert_eq!(
+                (build.file.as_str(), build.place.as_str()),
+                ("build.sh", "host")
+            );
+            assert_eq!(build.on, ["push main", "tag v*"]);
+            assert_eq!(build.when_busy, "wait");
+            assert!(build.needs.is_empty() && build.secrets.is_empty());
+            let check = job("check");
+            assert_eq!(check.place, "image:trixie");
+            assert_eq!(
+                (check.needs.as_slice(), check.when_busy.as_str()),
+                (&["build".to_owned()][..], "freeze")
+            );
+            let publish = job("publish");
+            assert_eq!(publish.secrets, ["TOKEN", "OTHER_TOKEN"]);
+            assert_eq!(
+                (publish.needs.as_slice(), publish.channels.as_slice()),
+                (&["check".to_owned()][..], &["dev".to_owned()][..])
+            );
+            assert!(publish.on.is_empty());
+            assert_eq!(job("linux").place, "platform:linux-amd64");
+            assert_eq!(job("windows").place, "machine:win11");
+            assert_eq!(job("windows-amd64").place, "platform:windows-amd64");
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_repository_the_ci_has_not_fetched_has_no_jobs_to_show_and_says_why() {
+            let state = scratch("repo-jobs-unfetched");
+            let server = server_with(&state, &repos());
+            let view = view_of(&server, Some(&"a".repeat(40)), true);
+            assert_eq!(
+                (view.jobs_sha, view.jobs.len(), view.jobs_note.as_str()),
+                (
+                    None,
+                    0,
+                    "the CI has not fetched view yet; it does with its first event"
+                )
+            );
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn jobs_that_cannot_be_read_are_replaced_by_the_reason() {
+            let state = scratch("repo-jobs-note");
+            let server = server_with(&state, &repos());
+            let note = |sha: Option<&str>| {
+                let view = view_of(&server, sha, true);
+                assert!(view.jobs.is_empty());
+                (view.jobs_sha, view.jobs_note)
+            };
+
+            // A mirror that is set up and has no commit yet.
+            assert!(mirror_with(&state, &[]).is_empty());
+            assert_eq!(
+                note(None),
+                (
+                    None,
+                    "no commit of view to read .zeughaus-ci/ from".to_owned()
+                )
+            );
+
+            let ids = mirror_with(
+                &state,
+                &[
+                    &[("README", "view\n")],
+                    &[(
+                        ".zeughaus-ci/bad.sh",
+                        "# /// ci\n# nonsense = 1\n# ///\necho\n",
+                    )],
+                ],
+            );
+            // No folder, then a header the CI cannot read.
+            assert_eq!(
+                note(Some(&ids[0])),
+                (
+                    Some(ids[0].clone()),
+                    format!("{} has no job in .zeughaus-ci/", &ids[0][..7])
+                )
+            );
+            let (sha, text) = note(Some(&ids[1]));
+            assert_eq!(sha, Some(ids[1].clone()));
+            let reason = format!("{} .zeughaus-ci/: .zeughaus-ci/bad.sh: ", &ids[1][..7]);
+            assert!(text.starts_with(&reason), "{text}");
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_transcript_opens_for_a_job_that_has_output_or_is_running() {
+            let state = scratch("open");
+            store(
+                &state,
+                &pipeline(
+                    "view",
+                    1,
+                    "dev",
+                    PipelineStatus::Running,
+                    vec![
+                        job("done", JobStatus::Succeeded, Some("alpha"), None),
+                        job("live", JobStatus::Running, Some("alpha"), None),
+                        job("waiting", JobStatus::Pending, None, None),
+                        job("empty", JobStatus::Failed, Some("alpha"), None),
+                    ],
+                ),
+            );
+            let kept = transcript_dir(&state, "view", 1, "done");
+            std::fs::create_dir_all(&kept).expect("create the store");
+            std::fs::write(kept.join("wal"), "").expect("write the kept WAL");
+            let server = server(&state);
+
+            let CiReply::Transcript { terminal } = open(&server, "view", 1, "done") else {
+                panic!("a job with a stored WAL opens");
+            };
+            // The same job is the same terminal.
+            assert_eq!(
+                open(&server, "view", 1, "done"),
+                CiReply::Transcript { terminal }
+            );
+            assert!(matches!(
+                open(&server, "view", 1, "live"),
+                CiReply::Transcript { .. }
+            ));
+            assert_eq!(
+                open(&server, "view", 1, "waiting"),
+                error("waiting has no transcript")
+            );
+            assert_eq!(
+                open(&server, "view", 1, "empty"),
+                error("empty has no transcript")
+            );
+            assert_eq!(open(&server, "view", 1, "nope"), error("no such job"));
+            assert_eq!(open(&server, "view", 9, "done"), error("no such job"));
+
+            // Closing is the editor's, and idempotent.
+            for _ in 0..2 {
+                assert_eq!(
+                    server.answer(CiRequest::CloseTranscript { terminal }),
+                    CiReply::Closed
+                );
+            }
+            assert!(!server.transcripts.exists(TerminalId(terminal)));
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_rerun_queues_the_same_event_pinned_to_the_recorded_sha() {
+            let state = scratch("rerun");
+            let mut record = pipeline("view", 4, "dev", PipelineStatus::Failed, Vec::new());
+            record.event.delivery = Some("abc".to_owned());
+            store(&state, &record);
+            let server = server(&state);
+
+            assert_eq!(
+                server.answer(CiRequest::Rerun {
+                    repo: "view".to_owned(),
+                    number: 4,
+                }),
+                CiReply::Accepted
+            );
+            event::drain_inbox(&state);
+            let queued = event::queued(&state);
+            assert_eq!(queued.len(), 1);
+            let queued = &queued[0].1;
+            assert_eq!(queued.sha, record.sha);
+            assert_eq!(queued.actor, "rerun of #4");
+            assert_eq!(queued.delivery, None);
+            assert_eq!(
+                (queued.kind, queued.git_ref.as_str(), queued.cron.as_ref()),
+                (record.event.kind, "main", None)
+            );
+
+            let unknown = |repo: &str, number| {
+                server.answer(CiRequest::Rerun {
+                    repo: repo.to_owned(),
+                    number,
+                })
+            };
+            assert_eq!(unknown("view", 9), error("no such pipeline"));
+            assert_eq!(unknown("../view", 4), error("no such pipeline"));
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_cancel_is_left_for_the_scheduler_when_the_pipeline_runs() {
+            let state = scratch("cancel");
+            store(
+                &state,
+                &pipeline("view", 1, "dev", PipelineStatus::Running, Vec::new()),
+            );
+            store(
+                &state,
+                &pipeline("view", 2, "dev", PipelineStatus::Succeeded, Vec::new()),
+            );
+            let server = server(&state);
+            let cancel = |number| {
+                server.answer(CiRequest::Cancel {
+                    repo: "view".to_owned(),
+                    number,
+                })
+            };
+
+            assert_eq!(cancel(1), CiReply::Accepted);
+            assert_eq!(event::drain_cancels(&state), [("view".to_owned(), 1)]);
+            assert_eq!(cancel(2), error("the pipeline is not running"));
+            assert_eq!(cancel(3), error("no such pipeline"));
+            assert!(event::drain_cancels(&state).is_empty());
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_manual_run_cannot_be_rerun() {
+            let state = scratch("rerun-manual");
+            let mut record = pipeline("view", 4, "dev", PipelineStatus::Failed, Vec::new());
+            record.event.kind = EventKind::Manual;
+            record.event.git_ref = "main".to_owned();
+            record.event.upload = Some("0123456789abcdef".to_owned());
+            store(&state, &record);
+            let server = server(&state);
+            assert_eq!(
+                server.answer(CiRequest::Rerun {
+                    repo: "view".to_owned(),
+                    number: 4,
+                }),
+                error("a manual run cannot be rerun; start a new one")
+            );
+            event::drain_inbox(&state);
+            assert!(event::queued(&state).is_empty());
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_jobs_log_is_its_last_lines_and_says_whether_it_ended() {
+            let state = scratch("log");
+            let dir = transcript_dir(&state, "view", 3, "build");
+            std::fs::create_dir_all(&dir).expect("create the transcript directory");
+            let server = server(&state);
+            let ask = |repo: &str, job: &str, tail| {
+                server.answer(CiRequest::Log {
+                    repo: repo.to_owned(),
+                    number: 3,
+                    job: job.to_owned(),
+                    tail,
+                    timestamps: false,
+                })
+            };
+            let log = |tail| match ask("view", "build", tail) {
+                CiReply::Log { text, finished } => (text, finished),
+                other => panic!("unexpected reply {other:?}"),
+            };
+
+            assert_eq!(ask("view", "build", 10), error("no output for build of #3"));
+            let mut wal = zeughaus_terminal::wal::WalWriter::open(&dir.join("wal"), None)
+                .expect("open the WAL");
+            wal.append(1, b"\x1b[32mone\x1b[0m\r\ntwo\r\n")
+                .expect("append");
+            wal.append(2, b"three\r\nfour\r\n").expect("append");
+
+            // The escape sequences are gone, only the end is asked for, and the
+            // job still runs.
+            assert_eq!(log(2), ("three\nfour\n".to_owned(), false));
+            assert_eq!(log(100), ("one\ntwo\nthree\nfour\n".to_owned(), false));
+            assert_eq!(log(0), (String::new(), false));
+            std::fs::write(dir.join("exit"), "code=0\n").expect("write the exit record");
+            assert_eq!(log(1), ("four\n".to_owned(), true));
+
+            // Names that are no job read nothing.
+            assert_eq!(ask("../view", "build", 10), error("no such job"));
+            assert_eq!(ask("view", "../build", 10), error("no such job"));
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_jobs_log_can_start_every_line_with_the_time_it_began() {
+            let state = scratch("log-times");
+            let dir = transcript_dir(&state, "view", 3, "build");
+            std::fs::create_dir_all(&dir).expect("create the transcript directory");
+            let server = server(&state);
+            let log = |tail| match server.answer(CiRequest::Log {
+                repo: "view".to_owned(),
+                number: 3,
+                job: "build".to_owned(),
+                tail,
+                timestamps: true,
+            }) {
+                CiReply::Log { text, finished } => (text, finished),
+                other => panic!("unexpected reply {other:?}"),
+            };
+            let mut writer = wal::WalWriter::open(&dir.join("wal"), None).expect("open the WAL");
+            // The first output is the origin. "slow" begins in the first chunk
+            // and ends in the second, a blank line has no text to stamp, and
+            // the last line has no line feed yet.
+            writer
+                .append(10_000_000, b"\x1b[32mone\x1b[0m\r\nsl")
+                .expect("append");
+            writer
+                .append(11_500_000, b"ow\r\n\r\ntwo\r\n")
+                .expect("append");
+            writer.append(75_800_000, b"three").expect("append");
+
+            assert_eq!(
+                log(100),
+                (
+                    "[+     0.0s] one\n[+     0.0s] slow\n[+     1.5s] two\n[+    65.8s] three\n"
+                        .to_owned(),
+                    false
+                )
+            );
+            assert_eq!(
+                log(2),
+                ("[+     1.5s] two\n[+    65.8s] three\n".to_owned(), false)
+            );
+            assert_eq!(log(0), (String::new(), false));
+            std::fs::write(dir.join("exit"), "code=0\n").expect("write the exit record");
+            assert_eq!(log(1), ("[+    65.8s] three\n".to_owned(), true));
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_jobs_timing_names_the_lines_the_longest_pauses_follow() {
+            let state = scratch("timing");
+            let mut build = job("build", JobStatus::Succeeded, Some("alpha"), None);
+            // The CI's record of the end: 140 s past the epoch.
+            build.finished = Some(140);
+            let idle = job("idle", JobStatus::Pending, None, None);
+            store(
+                &state,
+                &pipeline(
+                    "view",
+                    3,
+                    "dev",
+                    PipelineStatus::Succeeded,
+                    vec![build.clone(), idle],
+                ),
+            );
+            let dir = transcript_dir(&state, "view", 3, "build");
+            std::fs::create_dir_all(&dir).expect("create the transcript directory");
+            let server = server(&state);
+            let ask = |repo: &str, number, job: &str, top| {
+                server.answer(CiRequest::Timing {
+                    repo: repo.to_owned(),
+                    number,
+                    job: job.to_owned(),
+                    top,
+                })
+            };
+            let timing = |top| match ask("view", 3, "build", top) {
+                CiReply::Timing { timing } => timing,
+                other => panic!("unexpected reply {other:?}"),
+            };
+
+            assert_eq!(
+                ask("view", 3, "build", 5),
+                error("no output for build of #3")
+            );
+            let mut writer = wal::WalWriter::open(&dir.join("wal"), None).expect("open the WAL");
+            writer.append(100_000_000, b"start\r\n").expect("append");
+            writer
+                .append(100_200_000, b"compiling a\r\n")
+                .expect("append");
+            writer
+                .append(130_200_000, b"compiling b\r\n")
+                .expect("append");
+            writer.append(131_000_000, b"link\r\n").expect("append");
+
+            // The pause after "compiling a" is 30 s and the one after "link"
+            // runs to the end of the job, 9 s; times are from the first output.
+            let two = timing(2);
+            assert_eq!((two.lines, two.span_ms), (4, 40_000));
+            assert_eq!(
+                two.slowest,
+                vec![
+                    TimedLine {
+                        at_ms: 200,
+                        took_ms: 30_000,
+                        text: "compiling a".to_owned()
+                    },
+                    TimedLine {
+                        at_ms: 31_000,
+                        took_ms: 9_000,
+                        text: "link".to_owned()
+                    },
+                ]
+            );
+            assert!(!two.finished && !two.truncated);
+            // The number of lines asked for is kept within what a reply allows.
+            assert_eq!(timing(0).slowest.len(), 1);
+            assert_eq!(timing(1000).slowest.len(), 4);
+            std::fs::write(dir.join("exit"), "code=0\n").expect("write the exit record");
+            assert!(timing(1).finished);
+
+            // A job the record has no end for is still running: its last line
+            // has stood until now.
+            let mut running = build;
+            running.finished = None;
+            store(
+                &state,
+                &pipeline("view", 3, "dev", PipelineStatus::Running, vec![running]),
+            );
+            let now = timing(1);
+            assert!(now.span_ms > 1_000_000_000, "{now:?}");
+
+            // No such pipeline, job or name; a job without output.
+            assert_eq!(ask("view", 9, "build", 5), error("no such job"));
+            assert_eq!(ask("view", 3, "nope", 5), error("no such job"));
+            assert_eq!(ask("view", 3, "../build", 5), error("no such job"));
+            assert_eq!(ask("../view", 3, "build", 5), error("no such job"));
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_job_without_output_in_its_record_has_nothing_to_time() {
+            let state = scratch("timing-idle");
+            store(
+                &state,
+                &pipeline(
+                    "view",
+                    3,
+                    "dev",
+                    PipelineStatus::Running,
+                    vec![job("idle", JobStatus::Pending, None, None)],
+                ),
+            );
+            let server = server(&state);
+            assert_eq!(
+                server.answer(CiRequest::Timing {
+                    repo: "view".to_owned(),
+                    number: 3,
+                    job: "idle".to_owned(),
+                    top: 5,
+                }),
+                error("no output for idle of #3")
+            );
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_window_that_opens_inside_a_line_drops_the_rest_of_it() {
+            let state = scratch("window");
+            let dir = transcript_dir(&state, "view", 3, "build");
+            std::fs::create_dir_all(&dir).expect("create the transcript directory");
+            let mut writer = wal::WalWriter::open(&dir.join("wal"), None).expect("open the WAL");
+            writer.append(1_000_000, b"alpha\nbe").expect("append");
+            writer.append(2_000_000, b"ta\ngamma\n").expect("append");
+            writer.append(3_000_000, b"delta\n").expect("append");
+            let line = |at, text: &str| (at, text.to_owned());
+
+            let all = timed_tail(&dir, 1 << 20).expect("the whole log");
+            assert!(!all.truncated);
+            assert_eq!(all.origin, Some(1_000_000));
+            assert_eq!(
+                all.lines,
+                [
+                    line(1_000_000, "alpha"),
+                    line(1_000_000, "beta"),
+                    line(2_000_000, "gamma"),
+                    line(3_000_000, "delta"),
+                ]
+            );
+
+            // Seven bytes need the second record whole, and its first line is
+            // the end of "beta", which began in the record left out. The origin
+            // is still the log's first output.
+            let tail = timed_tail(&dir, 7).expect("the last records");
+            assert!(tail.truncated);
+            assert_eq!(tail.origin, Some(1_000_000));
+            assert_eq!(
+                tail.lines,
+                [line(2_000_000, "gamma"), line(3_000_000, "delta")]
+            );
+            let _ = std::fs::remove_dir_all(&state);
+        }
     }
 }

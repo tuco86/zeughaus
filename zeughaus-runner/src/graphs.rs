@@ -750,36 +750,6 @@ async fn write_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    use weida::{ClientTls, EndpointAddr, Runtime, RuntimeConfig, Trust};
-    use zeughaus_link::{GRAPH_PATH, credentials};
-
-    use crate::transport::Transport;
-
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-
-    /// A state directory that removes itself.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(tag: &str) -> TempDir {
-            let mut path = std::env::temp_dir();
-            path.push(format!(
-                "zeughaus-graphs-{tag}-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            let _ = std::fs::remove_dir_all(&path);
-            TempDir(path)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
 
     fn node(id: u64, parent: u64) -> NodeData {
         NodeData {
@@ -989,161 +959,198 @@ mod tests {
         assert!(all.contains("b.zgh: skipping edge 11"), "{all}");
     }
 
-    #[test]
-    fn persisted_graphs_load_back_one_file_per_graph() {
-        let dir = TempDir::new("persist");
-        let (service, _changes, initial) = GraphService::load(&dir.0);
-        assert!(initial.nodes.is_empty());
-        for edit in [
-            create(node(1, 0)),
-            create(node(2, 1)),
-            create(node(5, 0)),
-            create(node(6, 5)),
-            connect(edge(10, 2, 1)),
-        ] {
-            service.edit("test", edit).expect("edit");
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use weida::{ClientTls, EndpointAddr, Runtime, RuntimeConfig, Trust};
+        use zeughaus_link::{GRAPH_PATH, credentials};
+
+        use crate::transport::Transport;
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        /// A state directory that removes itself.
+        struct TempDir(PathBuf);
+
+        impl TempDir {
+            fn new(tag: &str) -> TempDir {
+                let mut path = std::env::temp_dir();
+                path.push(format!(
+                    "zeughaus-graphs-{tag}-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                let _ = std::fs::remove_dir_all(&path);
+                TempDir(path)
+            }
         }
-        service.persist(true);
 
-        let mut files: Vec<String> = std::fs::read_dir(dir.0.join("graphs"))
-            .expect("graphs dir")
-            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-            .collect();
-        files.sort();
-        assert_eq!(files, vec!["1.zgh", "5.zgh"]);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
 
-        let (_, expected) = service.snapshot();
-        let (_again, _rx, loaded) = GraphService::load(&dir.0);
-        assert_eq!(loaded, expected);
+        #[test]
+        fn persisted_graphs_load_back_one_file_per_graph() {
+            let dir = TempDir::new("persist");
+            let (service, _changes, initial) = GraphService::load(&dir.0);
+            assert!(initial.nodes.is_empty());
+            for edit in [
+                create(node(1, 0)),
+                create(node(2, 1)),
+                create(node(5, 0)),
+                create(node(6, 5)),
+                connect(edge(10, 2, 1)),
+            ] {
+                service.edit("test", edit).expect("edit");
+            }
+            service.persist(true);
 
-        service
-            .edit("test", GraphEdit::DeleteNode { id: 1 })
-            .expect("delete");
-        service.persist(true);
-        assert!(!dir.0.join("graphs").join("1.zgh").exists());
-        assert!(dir.0.join("graphs").join("5.zgh").exists());
-    }
+            let mut files: Vec<String> = std::fs::read_dir(dir.0.join("graphs"))
+                .expect("graphs dir")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .collect();
+            files.sort();
+            assert_eq!(files, vec!["1.zgh", "5.zgh"]);
 
-    #[test]
-    fn an_unreadable_file_is_skipped_and_left_alone() {
-        let dir = TempDir::new("broken");
-        std::fs::create_dir_all(dir.0.join("graphs")).expect("dir");
-        let broken = dir.0.join("graphs").join("1.zgh");
-        std::fs::write(&broken, "not json").expect("write");
-        let (service, _rx, initial) = GraphService::load(&dir.0);
-        assert!(initial.nodes.is_empty());
-        service.edit("test", create(node(2, 0))).expect("edit");
-        service.persist(true);
-        assert_eq!(std::fs::read_to_string(&broken).expect("kept"), "not json");
-    }
+            let (_, expected) = service.snapshot();
+            let (_again, _rx, loaded) = GraphService::load(&dir.0);
+            assert_eq!(loaded, expected);
 
-    fn loopback() -> std::net::SocketAddr {
-        std::net::SocketAddr::from(([127, 0, 0, 1], 0))
-    }
+            service
+                .edit("test", GraphEdit::DeleteNode { id: 1 })
+                .expect("delete");
+            service.persist(true);
+            assert!(!dir.0.join("graphs").join("1.zgh").exists());
+            assert!(dir.0.join("graphs").join("5.zgh").exists());
+        }
 
-    struct Editor {
-        request: OutgoingTransfer,
-        reply: weida::IncomingTransfer,
-    }
+        #[test]
+        fn an_unreadable_file_is_skipped_and_left_alone() {
+            let dir = TempDir::new("broken");
+            std::fs::create_dir_all(dir.0.join("graphs")).expect("dir");
+            let broken = dir.0.join("graphs").join("1.zgh");
+            std::fs::write(&broken, "not json").expect("write");
+            let (service, _rx, initial) = GraphService::load(&dir.0);
+            assert!(initial.nodes.is_empty());
+            service.edit("test", create(node(2, 0))).expect("edit");
+            service.persist(true);
+            assert_eq!(std::fs::read_to_string(&broken).expect("kept"), "not json");
+        }
 
-    impl Editor {
-        async fn send(&mut self, message: GraphMessage) {
-            write_message(&mut self.request, &message)
+        fn loopback() -> std::net::SocketAddr {
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0))
+        }
+
+        struct Editor {
+            request: OutgoingTransfer,
+            reply: weida::IncomingTransfer,
+        }
+
+        impl Editor {
+            async fn send(&mut self, message: GraphMessage) {
+                write_message(&mut self.request, &message)
+                    .await
+                    .expect("write");
+            }
+
+            async fn next(&mut self) -> GraphMessage {
+                tokio::time::timeout(Duration::from_secs(20), read_message(&mut self.reply))
+                    .await
+                    .expect("a frame within 20 s")
+                    .expect("a readable frame")
+                    .expect("an open stream")
+            }
+        }
+
+        async fn attach(requester: &weida::Requester) -> Editor {
+            let (mut request, reply) = requester.open(TransferMeta::default()).await.expect("open");
+            write_message(&mut request, &GraphMessage::Attach { major: GRAPH_MAJOR })
                 .await
-                .expect("write");
+                .expect("attach");
+            let reply = reply.recv().await.expect("reply half");
+            Editor { request, reply }
         }
 
-        async fn next(&mut self) -> GraphMessage {
-            tokio::time::timeout(Duration::from_secs(20), read_message(&mut self.reply))
-                .await
-                .expect("a frame within 20 s")
-                .expect("a readable frame")
-                .expect("an open stream")
-        }
-    }
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn editors_see_each_others_changes_and_only_the_sender_a_refusal() {
+            let dir = TempDir::new("protocol");
+            let transport = Transport::start(loopback(), &dir.0).await.expect("start");
+            let (graphs, _changes, _initial) = GraphService::load(&dir.0);
+            let replier = transport
+                .listener()
+                .replier(GRAPH_PATH)
+                .expect("graph endpoint");
+            tokio::spawn(graphs.clone().accept(replier));
 
-    async fn attach(requester: &weida::Requester) -> Editor {
-        let (mut request, reply) = requester.open(TransferMeta::default()).await.expect("open");
-        write_message(&mut request, &GraphMessage::Attach { major: GRAPH_MAJOR })
-            .await
-            .expect("attach");
-        let reply = reply.recv().await.expect("reply half");
-        Editor { request, reply }
-    }
+            let mut addr = EndpointAddr::parse(transport.url()).expect("announced url");
+            addr.path = GRAPH_PATH.to_owned();
+            let url = addr.to_string();
+            let identity = credentials::load_client_identity(&dir.0).expect("client identity");
+            let runtime = Runtime::new(RuntimeConfig::default()).expect("client runtime");
+            let mut editors = Vec::new();
+            for _ in 0..2 {
+                let requester = runtime
+                    .requester(ClientTls::new(Trust::by_address()).with_identity(identity.clone()));
+                requester.connect(&url).await.expect("connect");
+                editors.push((attach(&requester).await, requester));
+            }
+            let [(a, _ra), (b, _rb)] = &mut editors[..] else {
+                unreachable!()
+            };
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn editors_see_each_others_changes_and_only_the_sender_a_refusal() {
-        let dir = TempDir::new("protocol");
-        let transport = Transport::start(loopback(), &dir.0).await.expect("start");
-        let (graphs, _changes, _initial) = GraphService::load(&dir.0);
-        let replier = transport
-            .listener()
-            .replier(GRAPH_PATH)
-            .expect("graph endpoint");
-        tokio::spawn(graphs.clone().accept(replier));
+            for editor in [&mut *a, &mut *b] {
+                assert_eq!(
+                    editor.next().await,
+                    GraphMessage::Attached {
+                        revision: 0,
+                        document: GraphDocument::default()
+                    }
+                );
+            }
 
-        let mut addr = EndpointAddr::parse(transport.url()).expect("announced url");
-        addr.path = GRAPH_PATH.to_owned();
-        let url = addr.to_string();
-        let identity = credentials::load_client_identity(&dir.0).expect("client identity");
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("client runtime");
-        let mut editors = Vec::new();
-        for _ in 0..2 {
-            let requester = runtime
-                .requester(ClientTls::new(Trust::by_address()).with_identity(identity.clone()));
-            requester.connect(&url).await.expect("connect");
-            editors.push((attach(&requester).await, requester));
-        }
-        let [(a, _ra), (b, _rb)] = &mut editors[..] else {
-            unreachable!()
-        };
+            a.send(GraphMessage::Edit {
+                request: 1,
+                edit: create(node(1, 0)),
+            })
+            .await;
+            let created = GraphMessage::Changed {
+                revision: 1,
+                change: GraphChange::NodeUpsert { node: node(1, 0) },
+            };
+            assert_eq!(a.next().await, created);
+            assert_eq!(b.next().await, created);
 
-        for editor in [&mut *a, &mut *b] {
+            a.send(GraphMessage::Edit {
+                request: 2,
+                edit: connect(edge(9, 1, 404)),
+            })
+            .await;
             assert_eq!(
-                editor.next().await,
-                GraphMessage::Attached {
-                    revision: 0,
-                    document: GraphDocument::default()
+                a.next().await,
+                GraphMessage::Refused {
+                    request: 2,
+                    message: "node 404 does not exist".to_owned()
                 }
             );
+
+            // B's next frame is the following change, so no refusal came its way.
+            a.send(GraphMessage::Edit {
+                request: 3,
+                edit: create(node(2, 0)),
+            })
+            .await;
+            let second = GraphMessage::Changed {
+                revision: 2,
+                change: GraphChange::NodeUpsert { node: node(2, 0) },
+            };
+            assert_eq!(a.next().await, second);
+            assert_eq!(b.next().await, second);
         }
-
-        a.send(GraphMessage::Edit {
-            request: 1,
-            edit: create(node(1, 0)),
-        })
-        .await;
-        let created = GraphMessage::Changed {
-            revision: 1,
-            change: GraphChange::NodeUpsert { node: node(1, 0) },
-        };
-        assert_eq!(a.next().await, created);
-        assert_eq!(b.next().await, created);
-
-        a.send(GraphMessage::Edit {
-            request: 2,
-            edit: connect(edge(9, 1, 404)),
-        })
-        .await;
-        assert_eq!(
-            a.next().await,
-            GraphMessage::Refused {
-                request: 2,
-                message: "node 404 does not exist".to_owned()
-            }
-        );
-
-        // B's next frame is the following change, so no refusal came its way.
-        a.send(GraphMessage::Edit {
-            request: 3,
-            edit: create(node(2, 0)),
-        })
-        .await;
-        let second = GraphMessage::Changed {
-            revision: 2,
-            change: GraphChange::NodeUpsert { node: node(2, 0) },
-        };
-        assert_eq!(a.next().await, second);
-        assert_eq!(b.next().await, second);
     }
 }

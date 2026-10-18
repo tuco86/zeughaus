@@ -834,14 +834,6 @@ impl ExecutableNode for SqlNode {
 mod tests {
     use super::*;
 
-    fn temp_db(name: &str) -> String {
-        let path = std::env::temp_dir().join(format!("zeughaus-db-test-{name}.sqlite"));
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
-        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
-        path.to_string_lossy().into_owned()
-    }
-
     fn set(node: &mut dyn ExecutableNode, name: &str, text: &str) {
         node.set_parameter(name, Value::new(text.to_string()))
             .expect("set");
@@ -864,466 +856,6 @@ mod tests {
             node.ddl(),
             "CREATE TABLE IF NOT EXISTS \"orders\" (\"id\" INTEGER PRIMARY KEY, \"customer_id\" INTEGER, \"total\" REAL, FOREIGN KEY(\"customer_id\") REFERENCES \"customers\"(\"id\"))"
         );
-    }
-
-    /// A relation on a field that is no longer there must not reach the
-    /// statement: `FOREIGN KEY` on a column the statement does not declare is
-    /// a syntax error, and the wire outlives the field by one edit.
-    #[test]
-    fn a_relation_on_a_removed_field_is_dropped_from_the_ddl() {
-        let mut node = TableNode::new();
-        set(&mut node, "name", "orders");
-        set(&mut node, RELATIONS, "customer_id -> customers.id");
-        set(&mut node, "columns", "id:int");
-        assert_eq!(
-            node.ddl(),
-            "CREATE TABLE IF NOT EXISTS \"orders\" (\"id\" INTEGER PRIMARY KEY)"
-        );
-    }
-
-    /// Every field is a pin, and a bidirectional one carrying the column's own
-    /// type: that is what a relation attaches to on either border, and what
-    /// keeps a wire between two fields of different types from landing.
-    #[test]
-    fn a_tables_pins_follow_its_fields() {
-        let mut node = TableNode::new();
-        set(&mut node, "columns", "id:int\nx:float\ntag:str\nok:bool");
-        let pins = node.pin_definitions();
-        let names: Vec<&str> = pins.iter().map(|p| &*p.name).collect();
-        assert_eq!(names, vec!["id", "x", "tag", "ok", "table", "ddl"]);
-        assert!(pins[..4].iter().all(|p| p.direction == PinDirection::Both));
-        let types: Vec<&Ty> = pins[..4].iter().map(|p| &p.ty).collect();
-        assert_eq!(types, vec![&Ty::Int, &Ty::Float, &Ty::Str, &Ty::Bool]);
-    }
-
-    /// An insert takes one input per column except the rowid, which SQLite
-    /// assigns.
-    #[test]
-    fn an_inserts_pins_skip_the_id_column() {
-        let mut node = InsertNode::new();
-        set(&mut node, "columns", "id:int\nts:float\nx:float");
-        let names: Vec<&str> = node.pin_definitions().iter().map(|p| &*p.name).collect();
-        assert_eq!(names, vec!["table", "insert", "ts", "x", "id", "count"]);
-    }
-
-    /// The whole path, through the node API: create the table, insert on a
-    /// trigger, read the row back.
-    #[test]
-    fn a_row_written_on_a_trigger_is_read_back_by_a_query() {
-        let path = temp_db("roundtrip");
-
-        let mut table = TableNode::new();
-        set(&mut table, DB_PATH, &path);
-        set(&mut table, "name", "samples");
-        set(&mut table, "columns", "id:int\nx:float");
-        let mut table_ctx = ctx();
-        table
-            .execute(&InputSet::new(), &mut table_ctx)
-            .expect("create");
-        let outputs = table_ctx.take_outputs();
-        let handle = outputs.get("table").expect("table handle").clone();
-        assert!(
-            outputs
-                .get("ddl")
-                .and_then(Value::downcast_ref::<String>)
-                .is_some_and(|ddl| ddl.contains("INTEGER PRIMARY KEY"))
-        );
-
-        let mut insert = InsertNode::new();
-        set(&mut insert, DB_PATH, &path);
-        set(&mut insert, "columns", "id:int\nx:float");
-
-        // No trigger: nothing is written, and the outputs stay where they were.
-        let mut inputs = InputSet::new();
-        inputs.insert("table", handle.clone());
-        inputs.insert("x", Value::new(1.5_f64));
-        let mut quiet = ctx();
-        insert.execute(&inputs, &mut quiet).expect("no-op");
-        assert_eq!(
-            quiet
-                .take_outputs()
-                .get("count")
-                .and_then(Value::downcast_ref::<i64>),
-            Some(&0)
-        );
-
-        // Trigger: one row.
-        inputs.mark_changed("insert");
-        let mut writing = ctx();
-        insert.execute(&inputs, &mut writing).expect("insert");
-        let written = writing.take_outputs();
-        assert_eq!(
-            written.get("count").and_then(Value::downcast_ref::<i64>),
-            Some(&1)
-        );
-        assert_eq!(
-            written.get("id").and_then(Value::downcast_ref::<i64>),
-            Some(&1)
-        );
-
-        // The same reading again is another row: two deliveries are two rows.
-        let mut again = ctx();
-        insert.execute(&inputs, &mut again).expect("insert");
-        assert_eq!(
-            again
-                .take_outputs()
-                .get("count")
-                .and_then(Value::downcast_ref::<i64>),
-            Some(&2)
-        );
-
-        let mut query = QueryNode::new();
-        set(&mut query, DB_PATH, &path);
-        set(&mut query, "limit", "1");
-        let mut run = InputSet::new();
-        run.insert("table", handle);
-        run.mark_changed("run");
-        let mut query_ctx = ctx();
-        query.execute(&run, &mut query_ctx).expect("query");
-        let read = query_ctx.take_outputs();
-        assert_eq!(
-            read.get("count").and_then(Value::downcast_ref::<i64>),
-            Some(&1)
-        );
-        let rows = read
-            .get("rows")
-            .and_then(Value::downcast_ref::<String>)
-            .expect("rows");
-        let parsed: serde_json::Value = serde_json::from_str(rows).expect("json");
-        assert_eq!(parsed[0]["x"], serde_json::json!(1.5));
-        assert_eq!(parsed[0]["id"], serde_json::json!(2));
-    }
-
-    /// A field added to a table whose file already exists reaches the file:
-    /// designing a schema is iterative, and starting over for one more column
-    /// is not a workbench.
-    #[test]
-    fn a_new_field_is_added_to_a_table_that_already_exists() {
-        let path = temp_db("addcolumn");
-        let mut node = TableNode::new();
-        set(&mut node, DB_PATH, &path);
-        set(&mut node, "name", "samples");
-        set(&mut node, "columns", "id:int\nx:float");
-        node.execute(&InputSet::new(), &mut ctx()).expect("create");
-
-        set(&mut node, "columns", "id:int\nx:float\ntag:str");
-        node.execute(&InputSet::new(), &mut ctx()).expect("migrate");
-        // Running again with nothing new to do must stay a no-op rather than
-        // trying to add the column twice.
-        node.execute(&InputSet::new(), &mut ctx())
-            .expect("idempotent");
-
-        // The pooled connection is shared with the node, so the guard has to
-        // be dropped before anything executes again.
-        let columns: Vec<(String, String)> = {
-            let conn = open(&path).expect("open");
-            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-            let mut statement = conn
-                .prepare("PRAGMA table_info(\"samples\")")
-                .expect("pragma");
-            statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-                })
-                .expect("rows")
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .expect("columns")
-        };
-        assert_eq!(
-            columns,
-            vec![
-                ("id".to_string(), "INTEGER".to_string()),
-                ("x".to_string(), "REAL".to_string()),
-                ("tag".to_string(), "TEXT".to_string()),
-            ]
-        );
-    }
-
-    /// A table renamed in the graph is renamed in the file, with its rows.
-    /// Creating the new name and leaving the old table behind is what this
-    /// replaces -- two tables, the data in the one nothing writes to.
-    #[test]
-    fn a_renamed_table_takes_its_rows_with_it() {
-        let path = temp_db("tablerename");
-        let mut node = TableNode::new();
-        set(&mut node, DB_PATH, &path);
-        set(&mut node, "name", "samples");
-        set(&mut node, "columns", "id:int\nx:float");
-        node.execute(&InputSet::new(), &mut ctx()).expect("create");
-        {
-            let conn = open(&path).expect("open");
-            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-            conn.execute_batch("INSERT INTO \"samples\" (\"x\") VALUES (1.5)")
-                .expect("row");
-        }
-
-        // What the editor derives from the edit it saw.
-        set(&mut node, "name", "readings");
-        set(&mut node, RENAMED_FROM, "samples");
-        node.execute(&InputSet::new(), &mut ctx()).expect("rename");
-        // The parameter stays in the store, so the next pass sees it again and
-        // must find nothing to do.
-        node.execute(&InputSet::new(), &mut ctx())
-            .expect("idempotent");
-
-        let (tables, value) = {
-            let conn = open(&path).expect("open");
-            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-            let mut statement = conn
-                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
-                .expect("master");
-            let tables: Vec<String> = statement
-                .query_map([], |row| row.get::<_, String>(0))
-                .expect("rows")
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .expect("tables");
-            let value: f64 = conn
-                .query_row("SELECT \"x\" FROM \"readings\"", [], |row| row.get(0))
-                .expect("value");
-            (tables, value)
-        };
-        assert_eq!(tables, vec!["readings".to_string()]);
-        assert_eq!(value, 1.5);
-    }
-
-    /// The rename is skipped when the file has nothing to rename: a second
-    /// runner, a fresh file, and a node whose old table someone dropped all
-    /// have to be able to run the same parameter without failing.
-    #[test]
-    fn a_rename_with_nothing_to_rename_is_a_no_op() {
-        let path = temp_db("tablerename-noop");
-        let mut node = TableNode::new();
-        set(&mut node, DB_PATH, &path);
-        set(&mut node, "name", "readings");
-        set(&mut node, "columns", "id:int\nx:float");
-        set(&mut node, RENAMED_FROM, "samples");
-        node.execute(&InputSet::new(), &mut ctx()).expect("create");
-
-        let tables = {
-            let conn = open(&path).expect("open");
-            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-            let mut statement = conn
-                .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
-                .expect("master");
-            statement
-                .query_map([], |row| row.get::<_, String>(0))
-                .expect("rows")
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .expect("tables")
-        };
-        assert_eq!(tables, vec!["readings".to_string()]);
-    }
-
-    /// A field renamed in the graph is renamed in the file, with its data.
-    /// Without this the same edit reads as one column dropped and another
-    /// added, which is refused -- so fixing a typo would be a dead end.
-    #[test]
-    fn a_renamed_field_renames_the_column_and_keeps_its_data() {
-        let path = temp_db("rename");
-        let mut node = TableNode::new();
-        set(&mut node, DB_PATH, &path);
-        set(&mut node, "name", "samples");
-        set(&mut node, "columns", "id:int\nx:float");
-        node.execute(&InputSet::new(), &mut ctx()).expect("create");
-        {
-            let conn = open(&path).expect("open");
-            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-            conn.execute_batch("INSERT INTO \"samples\" (\"x\") VALUES (1.5)")
-                .expect("row");
-        }
-
-        // Two renames before the next pass, as typing produces them: they
-        // collapse, because the file still holds the first name.
-        set(&mut node, "columns", "id:int\ny:float");
-        set(&mut node, "columns", "id:int\nspan:float");
-        node.execute(&InputSet::new(), &mut ctx()).expect("rename");
-        // A second pass has nothing left to rename and must not fail.
-        node.execute(&InputSet::new(), &mut ctx())
-            .expect("idempotent");
-
-        let (columns, value) = {
-            let conn = open(&path).expect("open");
-            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-            let columns = table_columns(&conn, "samples").expect("columns");
-            let value: f64 = conn
-                .query_row("SELECT \"span\" FROM \"samples\"", [], |row| row.get(0))
-                .expect("value");
-            (columns, value)
-        };
-        assert_eq!(
-            columns,
-            vec![
-                ("id".to_string(), "INTEGER".to_string()),
-                ("span".to_string(), "REAL".to_string()),
-            ]
-        );
-        assert_eq!(value, 1.5);
-    }
-
-    /// A rename is read off the file, so a process that never saw the earlier
-    /// edits finishes the job. This is the standby taking over mid-chain: the
-    /// owner applied `x -> y` and died, and the new owner's node declares `z`
-    /// with no idea that `x` ever existed.
-    #[test]
-    fn a_process_that_never_saw_the_rename_still_applies_it() {
-        let path = temp_db("midchain");
-        let mut owner = TableNode::new();
-        set(&mut owner, DB_PATH, &path);
-        set(&mut owner, "name", "samples");
-        set(&mut owner, "columns", "id:int\nx:float");
-        owner.execute(&InputSet::new(), &mut ctx()).expect("create");
-        set(&mut owner, "columns", "id:int\ny:float");
-        owner.execute(&InputSet::new(), &mut ctx()).expect("x -> y");
-
-        // A fresh node, as a standby's would be: it has never held `x`.
-        let mut standby = TableNode::new();
-        set(&mut standby, DB_PATH, &path);
-        set(&mut standby, "name", "samples");
-        set(&mut standby, "columns", "id:int\nz:float");
-        standby
-            .execute(&InputSet::new(), &mut ctx())
-            .expect("y -> z");
-
-        let columns = {
-            let conn = open(&path).expect("open");
-            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-            table_columns(&conn, "samples").expect("columns")
-        };
-        assert_eq!(
-            columns,
-            vec![
-                ("id".to_string(), "INTEGER".to_string()),
-                ("z".to_string(), "REAL".to_string()),
-            ]
-        );
-    }
-
-    /// What counts as a rename and what does not. Guessing wrong here moves
-    /// someone's data under a name they did not choose.
-    #[test]
-    fn a_rename_is_one_column_gone_and_one_arrived_of_the_same_type() {
-        let file = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
-            pairs
-                .iter()
-                .map(|(n, t)| (n.to_string(), t.to_string()))
-                .collect()
-        };
-        let declared = |pairs: &[(&str, ColTy)]| -> Vec<(String, ColTy)> {
-            pairs.iter().map(|(n, t)| (n.to_string(), *t)).collect()
-        };
-        let have = file(&[("id", "INTEGER"), ("x", "REAL")]);
-
-        assert_eq!(
-            renamed_column(&have, &declared(&[("id", ColTy::Int), ("y", ColTy::Float)])),
-            Some(("x".to_string(), "y".to_string()))
-        );
-        // Nothing changed, a field added, a field removed: not renames.
-        assert_eq!(
-            renamed_column(&have, &declared(&[("id", ColTy::Int), ("x", ColTy::Float)])),
-            None
-        );
-        assert_eq!(
-            renamed_column(
-                &have,
-                &declared(&[("id", ColTy::Int), ("x", ColTy::Float), ("y", ColTy::Str)])
-            ),
-            None
-        );
-        assert_eq!(
-            renamed_column(&have, &declared(&[("id", ColTy::Int)])),
-            None
-        );
-        // Two of each is ambiguous, and a different type is not the same
-        // column under another name.
-        assert_eq!(
-            renamed_column(&have, &declared(&[("a", ColTy::Int), ("b", ColTy::Float)])),
-            None
-        );
-        assert_eq!(
-            renamed_column(&have, &declared(&[("id", ColTy::Int), ("y", ColTy::Str)])),
-            None
-        );
-    }
-
-    /// A field removed from the node is dropped from the file, with the data
-    /// of the columns beside it untouched. A retype is the one edit left that
-    /// SQLite cannot do in place, and it has to say so.
-    #[test]
-    fn retyping_is_refused_and_dropping_drops() {
-        let path = temp_db("mismatch");
-        let mut node = TableNode::new();
-        set(&mut node, DB_PATH, &path);
-        set(&mut node, "name", "samples");
-        set(&mut node, "columns", "id:int\nx:float\nnote:str");
-        node.execute(&InputSet::new(), &mut ctx()).expect("create");
-        {
-            let conn = open(&path).expect("open");
-            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-            conn.execute_batch("INSERT INTO \"samples\" (\"x\", \"note\") VALUES (1.5, 'hi')")
-                .expect("row");
-        }
-
-        // The field is removed in the graph, so the column goes.
-        set(&mut node, "columns", "id:int\nx:float");
-        node.execute(&InputSet::new(), &mut ctx()).expect("drop");
-        // And the next pass has nothing left to do.
-        node.execute(&InputSet::new(), &mut ctx())
-            .expect("idempotent");
-
-        let (columns, value) = {
-            let conn = open(&path).expect("open");
-            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-            let columns = table_columns(&conn, "samples").expect("columns");
-            let value: f64 = conn
-                .query_row("SELECT \"x\" FROM \"samples\"", [], |row| row.get(0))
-                .expect("value");
-            (columns, value)
-        };
-        assert_eq!(
-            columns,
-            vec![
-                ("id".to_string(), "INTEGER".to_string()),
-                ("x".to_string(), "REAL".to_string()),
-            ]
-        );
-        assert_eq!(value, 1.5);
-
-        let mut retyped = TableNode::new();
-        set(&mut retyped, DB_PATH, &path);
-        set(&mut retyped, "name", "samples");
-        set(&mut retyped, "columns", "id:int\nx:str");
-        let error = retyped
-            .execute(&InputSet::new(), &mut ctx())
-            .expect_err("retyped column");
-        assert!(
-            error
-                .to_string()
-                .contains("x is REAL in the file, not TEXT")
-        );
-    }
-
-    /// What SQLite will not drop, the user has to read from SQLite: the
-    /// primary key is the column every table of these nodes has, and its
-    /// refusal names the reason.
-    #[test]
-    fn a_column_sqlite_refuses_to_drop_reports_its_reason() {
-        let path = temp_db("undroppable");
-        let mut node = TableNode::new();
-        set(&mut node, DB_PATH, &path);
-        set(&mut node, "name", "samples");
-        set(&mut node, "columns", "id:int\nx:float");
-        node.execute(&InputSet::new(), &mut ctx()).expect("create");
-
-        set(&mut node, "columns", "x:float");
-        let error = node
-            .execute(&InputSet::new(), &mut ctx())
-            .expect_err("primary key");
-        let text = error.to_string();
-        assert!(
-            text.contains("cannot drop column id from table samples"),
-            "{text}"
-        );
-        assert!(text.to_lowercase().contains("primary key"), "{text}");
     }
 
     /// A node outside a database has no file, and the message has to say what
@@ -1405,39 +937,513 @@ mod tests {
         assert!(node.ddl().contains("\"samples\""));
     }
 
-    /// A statement that returns no rows still reports what it did.
+    /// A relation on a field that is no longer there must not reach the
+    /// statement: `FOREIGN KEY` on a column the statement does not declare is
+    /// a syntax error, and the wire outlives the field by one edit.
     #[test]
-    fn raw_sql_reports_rows_for_a_query_and_changes_for_a_statement() {
-        let path = temp_db("rawsql");
-        let mut node = SqlNode::new();
-        set(&mut node, DB_PATH, &path);
-        let mut run = InputSet::new();
-        run.mark_changed("run");
+    fn a_relation_on_a_removed_field_is_dropped_from_the_ddl() {
+        let mut node = TableNode::new();
+        set(&mut node, "name", "orders");
+        set(&mut node, RELATIONS, "customer_id -> customers.id");
+        set(&mut node, "columns", "id:int");
+        assert_eq!(
+            node.ddl(),
+            "CREATE TABLE IF NOT EXISTS \"orders\" (\"id\" INTEGER PRIMARY KEY)"
+        );
+    }
 
-        set(&mut node, "sql", "CREATE TABLE t (a INTEGER)");
-        node.execute(&run, &mut ctx()).expect("create");
-        set(&mut node, "sql", "INSERT INTO t (a) VALUES (1), (2)");
-        let mut inserting = ctx();
-        node.execute(&run, &mut inserting).expect("insert");
-        assert_eq!(
-            inserting
-                .take_outputs()
-                .get("count")
-                .and_then(Value::downcast_ref::<i64>),
-            Some(&2)
-        );
+    /// Every field is a pin, and a bidirectional one carrying the column's own
+    /// type: that is what a relation attaches to on either border, and what
+    /// keeps a wire between two fields of different types from landing.
+    #[test]
+    fn a_tables_pins_follow_its_fields() {
+        let mut node = TableNode::new();
+        set(&mut node, "columns", "id:int\nx:float\ntag:str\nok:bool");
+        let pins = node.pin_definitions();
+        let names: Vec<&str> = pins.iter().map(|p| &*p.name).collect();
+        assert_eq!(names, vec!["id", "x", "tag", "ok", "table", "ddl"]);
+        assert!(pins[..4].iter().all(|p| p.direction == PinDirection::Both));
+        let types: Vec<&Ty> = pins[..4].iter().map(|p| &p.ty).collect();
+        assert_eq!(types, vec![&Ty::Int, &Ty::Float, &Ty::Str, &Ty::Bool]);
+    }
 
-        set(&mut node, "sql", "SELECT a FROM t ORDER BY a");
-        let mut reading = ctx();
-        node.execute(&run, &mut reading).expect("select");
-        let read = reading.take_outputs();
+    /// An insert takes one input per column except the rowid, which SQLite
+    /// assigns.
+    #[test]
+    fn an_inserts_pins_skip_the_id_column() {
+        let mut node = InsertNode::new();
+        set(&mut node, "columns", "id:int\nts:float\nx:float");
+        let names: Vec<&str> = node.pin_definitions().iter().map(|p| &*p.name).collect();
+        assert_eq!(names, vec!["table", "insert", "ts", "x", "id", "count"]);
+    }
+
+    /// What counts as a rename and what does not. Guessing wrong here moves
+    /// someone's data under a name they did not choose.
+    #[test]
+    fn a_rename_is_one_column_gone_and_one_arrived_of_the_same_type() {
+        let file = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(n, t)| (n.to_string(), t.to_string()))
+                .collect()
+        };
+        let declared = |pairs: &[(&str, ColTy)]| -> Vec<(String, ColTy)> {
+            pairs.iter().map(|(n, t)| (n.to_string(), *t)).collect()
+        };
+        let have = file(&[("id", "INTEGER"), ("x", "REAL")]);
+
         assert_eq!(
-            read.get("count").and_then(Value::downcast_ref::<i64>),
-            Some(&2)
+            renamed_column(&have, &declared(&[("id", ColTy::Int), ("y", ColTy::Float)])),
+            Some(("x".to_string(), "y".to_string()))
+        );
+        // Nothing changed, a field added, a field removed: not renames.
+        assert_eq!(
+            renamed_column(&have, &declared(&[("id", ColTy::Int), ("x", ColTy::Float)])),
+            None
         );
         assert_eq!(
-            read.get("rows").and_then(Value::downcast_ref::<String>),
-            Some(&"[{\"a\":1},{\"a\":2}]".to_string())
+            renamed_column(
+                &have,
+                &declared(&[("id", ColTy::Int), ("x", ColTy::Float), ("y", ColTy::Str)])
+            ),
+            None
         );
+        assert_eq!(
+            renamed_column(&have, &declared(&[("id", ColTy::Int)])),
+            None
+        );
+        // Two of each is ambiguous, and a different type is not the same
+        // column under another name.
+        assert_eq!(
+            renamed_column(&have, &declared(&[("a", ColTy::Int), ("b", ColTy::Float)])),
+            None
+        );
+        assert_eq!(
+            renamed_column(&have, &declared(&[("id", ColTy::Int), ("y", ColTy::Str)])),
+            None
+        );
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        fn temp_db(name: &str) -> String {
+            let path = std::env::temp_dir().join(format!("zeughaus-db-test-{name}.sqlite"));
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+            let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+            path.to_string_lossy().into_owned()
+        }
+
+        /// The whole path, through the node API: create the table, insert on a
+        /// trigger, read the row back.
+        #[test]
+        fn a_row_written_on_a_trigger_is_read_back_by_a_query() {
+            let path = temp_db("roundtrip");
+
+            let mut table = TableNode::new();
+            set(&mut table, DB_PATH, &path);
+            set(&mut table, "name", "samples");
+            set(&mut table, "columns", "id:int\nx:float");
+            let mut table_ctx = ctx();
+            table
+                .execute(&InputSet::new(), &mut table_ctx)
+                .expect("create");
+            let outputs = table_ctx.take_outputs();
+            let handle = outputs.get("table").expect("table handle").clone();
+            assert!(
+                outputs
+                    .get("ddl")
+                    .and_then(Value::downcast_ref::<String>)
+                    .is_some_and(|ddl| ddl.contains("INTEGER PRIMARY KEY"))
+            );
+
+            let mut insert = InsertNode::new();
+            set(&mut insert, DB_PATH, &path);
+            set(&mut insert, "columns", "id:int\nx:float");
+
+            // No trigger: nothing is written, and the outputs stay where they were.
+            let mut inputs = InputSet::new();
+            inputs.insert("table", handle.clone());
+            inputs.insert("x", Value::new(1.5_f64));
+            let mut quiet = ctx();
+            insert.execute(&inputs, &mut quiet).expect("no-op");
+            assert_eq!(
+                quiet
+                    .take_outputs()
+                    .get("count")
+                    .and_then(Value::downcast_ref::<i64>),
+                Some(&0)
+            );
+
+            // Trigger: one row.
+            inputs.mark_changed("insert");
+            let mut writing = ctx();
+            insert.execute(&inputs, &mut writing).expect("insert");
+            let written = writing.take_outputs();
+            assert_eq!(
+                written.get("count").and_then(Value::downcast_ref::<i64>),
+                Some(&1)
+            );
+            assert_eq!(
+                written.get("id").and_then(Value::downcast_ref::<i64>),
+                Some(&1)
+            );
+
+            // The same reading again is another row: two deliveries are two rows.
+            let mut again = ctx();
+            insert.execute(&inputs, &mut again).expect("insert");
+            assert_eq!(
+                again
+                    .take_outputs()
+                    .get("count")
+                    .and_then(Value::downcast_ref::<i64>),
+                Some(&2)
+            );
+
+            let mut query = QueryNode::new();
+            set(&mut query, DB_PATH, &path);
+            set(&mut query, "limit", "1");
+            let mut run = InputSet::new();
+            run.insert("table", handle);
+            run.mark_changed("run");
+            let mut query_ctx = ctx();
+            query.execute(&run, &mut query_ctx).expect("query");
+            let read = query_ctx.take_outputs();
+            assert_eq!(
+                read.get("count").and_then(Value::downcast_ref::<i64>),
+                Some(&1)
+            );
+            let rows = read
+                .get("rows")
+                .and_then(Value::downcast_ref::<String>)
+                .expect("rows");
+            let parsed: serde_json::Value = serde_json::from_str(rows).expect("json");
+            assert_eq!(parsed[0]["x"], serde_json::json!(1.5));
+            assert_eq!(parsed[0]["id"], serde_json::json!(2));
+        }
+
+        /// A field added to a table whose file already exists reaches the file:
+        /// designing a schema is iterative, and starting over for one more column
+        /// is not a workbench.
+        #[test]
+        fn a_new_field_is_added_to_a_table_that_already_exists() {
+            let path = temp_db("addcolumn");
+            let mut node = TableNode::new();
+            set(&mut node, DB_PATH, &path);
+            set(&mut node, "name", "samples");
+            set(&mut node, "columns", "id:int\nx:float");
+            node.execute(&InputSet::new(), &mut ctx()).expect("create");
+
+            set(&mut node, "columns", "id:int\nx:float\ntag:str");
+            node.execute(&InputSet::new(), &mut ctx()).expect("migrate");
+            // Running again with nothing new to do must stay a no-op rather than
+            // trying to add the column twice.
+            node.execute(&InputSet::new(), &mut ctx())
+                .expect("idempotent");
+
+            // The pooled connection is shared with the node, so the guard has to
+            // be dropped before anything executes again.
+            let columns: Vec<(String, String)> = {
+                let conn = open(&path).expect("open");
+                let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+                let mut statement = conn
+                    .prepare("PRAGMA table_info(\"samples\")")
+                    .expect("pragma");
+                statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                    })
+                    .expect("rows")
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .expect("columns")
+            };
+            assert_eq!(
+                columns,
+                vec![
+                    ("id".to_string(), "INTEGER".to_string()),
+                    ("x".to_string(), "REAL".to_string()),
+                    ("tag".to_string(), "TEXT".to_string()),
+                ]
+            );
+        }
+
+        /// A table renamed in the graph is renamed in the file, with its rows.
+        /// Creating the new name and leaving the old table behind is what this
+        /// replaces -- two tables, the data in the one nothing writes to.
+        #[test]
+        fn a_renamed_table_takes_its_rows_with_it() {
+            let path = temp_db("tablerename");
+            let mut node = TableNode::new();
+            set(&mut node, DB_PATH, &path);
+            set(&mut node, "name", "samples");
+            set(&mut node, "columns", "id:int\nx:float");
+            node.execute(&InputSet::new(), &mut ctx()).expect("create");
+            {
+                let conn = open(&path).expect("open");
+                let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+                conn.execute_batch("INSERT INTO \"samples\" (\"x\") VALUES (1.5)")
+                    .expect("row");
+            }
+
+            // What the editor derives from the edit it saw.
+            set(&mut node, "name", "readings");
+            set(&mut node, RENAMED_FROM, "samples");
+            node.execute(&InputSet::new(), &mut ctx()).expect("rename");
+            // The parameter stays in the store, so the next pass sees it again and
+            // must find nothing to do.
+            node.execute(&InputSet::new(), &mut ctx())
+                .expect("idempotent");
+
+            let (tables, value) = {
+                let conn = open(&path).expect("open");
+                let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+                let mut statement = conn
+                    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                    .expect("master");
+                let tables: Vec<String> = statement
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .expect("rows")
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .expect("tables");
+                let value: f64 = conn
+                    .query_row("SELECT \"x\" FROM \"readings\"", [], |row| row.get(0))
+                    .expect("value");
+                (tables, value)
+            };
+            assert_eq!(tables, vec!["readings".to_string()]);
+            assert_eq!(value, 1.5);
+        }
+
+        /// The rename is skipped when the file has nothing to rename: a second
+        /// runner, a fresh file, and a node whose old table someone dropped all
+        /// have to be able to run the same parameter without failing.
+        #[test]
+        fn a_rename_with_nothing_to_rename_is_a_no_op() {
+            let path = temp_db("tablerename-noop");
+            let mut node = TableNode::new();
+            set(&mut node, DB_PATH, &path);
+            set(&mut node, "name", "readings");
+            set(&mut node, "columns", "id:int\nx:float");
+            set(&mut node, RENAMED_FROM, "samples");
+            node.execute(&InputSet::new(), &mut ctx()).expect("create");
+
+            let tables = {
+                let conn = open(&path).expect("open");
+                let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+                let mut statement = conn
+                    .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+                    .expect("master");
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .expect("rows")
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .expect("tables")
+            };
+            assert_eq!(tables, vec!["readings".to_string()]);
+        }
+
+        /// A field renamed in the graph is renamed in the file, with its data.
+        /// Without this the same edit reads as one column dropped and another
+        /// added, which is refused -- so fixing a typo would be a dead end.
+        #[test]
+        fn a_renamed_field_renames_the_column_and_keeps_its_data() {
+            let path = temp_db("rename");
+            let mut node = TableNode::new();
+            set(&mut node, DB_PATH, &path);
+            set(&mut node, "name", "samples");
+            set(&mut node, "columns", "id:int\nx:float");
+            node.execute(&InputSet::new(), &mut ctx()).expect("create");
+            {
+                let conn = open(&path).expect("open");
+                let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+                conn.execute_batch("INSERT INTO \"samples\" (\"x\") VALUES (1.5)")
+                    .expect("row");
+            }
+
+            // Two renames before the next pass, as typing produces them: they
+            // collapse, because the file still holds the first name.
+            set(&mut node, "columns", "id:int\ny:float");
+            set(&mut node, "columns", "id:int\nspan:float");
+            node.execute(&InputSet::new(), &mut ctx()).expect("rename");
+            // A second pass has nothing left to rename and must not fail.
+            node.execute(&InputSet::new(), &mut ctx())
+                .expect("idempotent");
+
+            let (columns, value) = {
+                let conn = open(&path).expect("open");
+                let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+                let columns = table_columns(&conn, "samples").expect("columns");
+                let value: f64 = conn
+                    .query_row("SELECT \"span\" FROM \"samples\"", [], |row| row.get(0))
+                    .expect("value");
+                (columns, value)
+            };
+            assert_eq!(
+                columns,
+                vec![
+                    ("id".to_string(), "INTEGER".to_string()),
+                    ("span".to_string(), "REAL".to_string()),
+                ]
+            );
+            assert_eq!(value, 1.5);
+        }
+
+        /// A rename is read off the file, so a process that never saw the earlier
+        /// edits finishes the job. This is the standby taking over mid-chain: the
+        /// owner applied `x -> y` and died, and the new owner's node declares `z`
+        /// with no idea that `x` ever existed.
+        #[test]
+        fn a_process_that_never_saw_the_rename_still_applies_it() {
+            let path = temp_db("midchain");
+            let mut owner = TableNode::new();
+            set(&mut owner, DB_PATH, &path);
+            set(&mut owner, "name", "samples");
+            set(&mut owner, "columns", "id:int\nx:float");
+            owner.execute(&InputSet::new(), &mut ctx()).expect("create");
+            set(&mut owner, "columns", "id:int\ny:float");
+            owner.execute(&InputSet::new(), &mut ctx()).expect("x -> y");
+
+            // A fresh node, as a standby's would be: it has never held `x`.
+            let mut standby = TableNode::new();
+            set(&mut standby, DB_PATH, &path);
+            set(&mut standby, "name", "samples");
+            set(&mut standby, "columns", "id:int\nz:float");
+            standby
+                .execute(&InputSet::new(), &mut ctx())
+                .expect("y -> z");
+
+            let columns = {
+                let conn = open(&path).expect("open");
+                let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+                table_columns(&conn, "samples").expect("columns")
+            };
+            assert_eq!(
+                columns,
+                vec![
+                    ("id".to_string(), "INTEGER".to_string()),
+                    ("z".to_string(), "REAL".to_string()),
+                ]
+            );
+        }
+
+        /// A field removed from the node is dropped from the file, with the data
+        /// of the columns beside it untouched. A retype is the one edit left that
+        /// SQLite cannot do in place, and it has to say so.
+        #[test]
+        fn retyping_is_refused_and_dropping_drops() {
+            let path = temp_db("mismatch");
+            let mut node = TableNode::new();
+            set(&mut node, DB_PATH, &path);
+            set(&mut node, "name", "samples");
+            set(&mut node, "columns", "id:int\nx:float\nnote:str");
+            node.execute(&InputSet::new(), &mut ctx()).expect("create");
+            {
+                let conn = open(&path).expect("open");
+                let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+                conn.execute_batch("INSERT INTO \"samples\" (\"x\", \"note\") VALUES (1.5, 'hi')")
+                    .expect("row");
+            }
+
+            // The field is removed in the graph, so the column goes.
+            set(&mut node, "columns", "id:int\nx:float");
+            node.execute(&InputSet::new(), &mut ctx()).expect("drop");
+            // And the next pass has nothing left to do.
+            node.execute(&InputSet::new(), &mut ctx())
+                .expect("idempotent");
+
+            let (columns, value) = {
+                let conn = open(&path).expect("open");
+                let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+                let columns = table_columns(&conn, "samples").expect("columns");
+                let value: f64 = conn
+                    .query_row("SELECT \"x\" FROM \"samples\"", [], |row| row.get(0))
+                    .expect("value");
+                (columns, value)
+            };
+            assert_eq!(
+                columns,
+                vec![
+                    ("id".to_string(), "INTEGER".to_string()),
+                    ("x".to_string(), "REAL".to_string()),
+                ]
+            );
+            assert_eq!(value, 1.5);
+
+            let mut retyped = TableNode::new();
+            set(&mut retyped, DB_PATH, &path);
+            set(&mut retyped, "name", "samples");
+            set(&mut retyped, "columns", "id:int\nx:str");
+            let error = retyped
+                .execute(&InputSet::new(), &mut ctx())
+                .expect_err("retyped column");
+            assert!(
+                error
+                    .to_string()
+                    .contains("x is REAL in the file, not TEXT")
+            );
+        }
+
+        /// What SQLite will not drop, the user has to read from SQLite: the
+        /// primary key is the column every table of these nodes has, and its
+        /// refusal names the reason.
+        #[test]
+        fn a_column_sqlite_refuses_to_drop_reports_its_reason() {
+            let path = temp_db("undroppable");
+            let mut node = TableNode::new();
+            set(&mut node, DB_PATH, &path);
+            set(&mut node, "name", "samples");
+            set(&mut node, "columns", "id:int\nx:float");
+            node.execute(&InputSet::new(), &mut ctx()).expect("create");
+
+            set(&mut node, "columns", "x:float");
+            let error = node
+                .execute(&InputSet::new(), &mut ctx())
+                .expect_err("primary key");
+            let text = error.to_string();
+            assert!(
+                text.contains("cannot drop column id from table samples"),
+                "{text}"
+            );
+            assert!(text.to_lowercase().contains("primary key"), "{text}");
+        }
+
+        /// A statement that returns no rows still reports what it did.
+        #[test]
+        fn raw_sql_reports_rows_for_a_query_and_changes_for_a_statement() {
+            let path = temp_db("rawsql");
+            let mut node = SqlNode::new();
+            set(&mut node, DB_PATH, &path);
+            let mut run = InputSet::new();
+            run.mark_changed("run");
+
+            set(&mut node, "sql", "CREATE TABLE t (a INTEGER)");
+            node.execute(&run, &mut ctx()).expect("create");
+            set(&mut node, "sql", "INSERT INTO t (a) VALUES (1), (2)");
+            let mut inserting = ctx();
+            node.execute(&run, &mut inserting).expect("insert");
+            assert_eq!(
+                inserting
+                    .take_outputs()
+                    .get("count")
+                    .and_then(Value::downcast_ref::<i64>),
+                Some(&2)
+            );
+
+            set(&mut node, "sql", "SELECT a FROM t ORDER BY a");
+            let mut reading = ctx();
+            node.execute(&run, &mut reading).expect("select");
+            let read = reading.take_outputs();
+            assert_eq!(
+                read.get("count").and_then(Value::downcast_ref::<i64>),
+                Some(&2)
+            );
+            assert_eq!(
+                read.get("rows").and_then(Value::downcast_ref::<String>),
+                Some(&"[{\"a\":1},{\"a\":2}]".to_string())
+            );
+        }
     }
 }

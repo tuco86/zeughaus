@@ -435,8 +435,14 @@ push only after the gate:
 
 - `cargo fmt --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`
+- `cargo nextest run --workspace --profile ci`
+- `cargo test --doc --workspace`
 - `cargo check --target wasm32-unknown-unknown -p zeughaus`
+
+Inner loop: `cargo nextest run -p <crate>` (unit tier) and `--profile
+integration -p <crate>` when I/O code changed. An I/O test lives in a `mod
+io` inside its `#[cfg(test)] mod tests`; `.config/nextest.toml` holds the
+tiers and their time limits.
 
 A change to a crate's manifest or to what it includes also passes
 `cargo publish --workspace --dry-run` (a repeated one only after clearing

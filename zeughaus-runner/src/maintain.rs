@@ -511,30 +511,37 @@ mod tests {
         assert_eq!(Outcome::Exit(3).label(), "exit 3");
     }
 
-    #[test]
-    fn the_report_names_every_task() {
-        let dir = std::env::temp_dir().join(format!("zeughaus-maintain-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(report_at(&dir, 0).unwrap().starts_with("no tasks"));
-        std::fs::write(
-            dir.join(CONFIG_FILE),
-            "[[task]]\nname = \"ok\"\ncommand = [\"a\"]\nevery_minutes = 5\n\
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        #[test]
+        fn the_report_names_every_task() {
+            let dir =
+                std::env::temp_dir().join(format!("zeughaus-maintain-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            assert!(report_at(&dir, 0).unwrap().starts_with("no tasks"));
+            std::fs::write(
+                dir.join(CONFIG_FILE),
+                "[[task]]\nname = \"ok\"\ncommand = [\"a\"]\nevery_minutes = 5\n\
              [[task]]\nname = \"bad\"\ncommand = [\"b\"]\nevery_minutes = 5\n\
              [[task]]\nname = \"new\"\ncommand = [\"c\"]\nevery_minutes = 5\n",
-        )
-        .unwrap();
-        files::write_json(&state_path(&dir, "ok"), &state(1_000)).unwrap();
-        let mut failed = state(1_000);
-        failed.code = Some(3);
-        files::write_json(&state_path(&dir, "bad"), &failed).unwrap();
-        let report = report_at(&dir, 1_000 + 7_300).unwrap();
-        let lines: Vec<&str> = report.lines().collect();
-        assert_eq!(lines[0], "ok  every 5 min  ok  2 h ago  /runs/7");
-        assert_eq!(lines[1], "bad  every 5 min  exit 3  2 h ago  /runs/7");
-        assert_eq!(lines[2], "new  every 5 min  never");
-        std::fs::write(dir.join(CONFIG_FILE), "[[task]]\nname = \"x\"\n").unwrap();
-        assert!(report_at(&dir, 0).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+            )
+            .unwrap();
+            files::write_json(&state_path(&dir, "ok"), &state(1_000)).unwrap();
+            let mut failed = state(1_000);
+            failed.code = Some(3);
+            files::write_json(&state_path(&dir, "bad"), &failed).unwrap();
+            let report = report_at(&dir, 1_000 + 7_300).unwrap();
+            let lines: Vec<&str> = report.lines().collect();
+            assert_eq!(lines[0], "ok  every 5 min  ok  2 h ago  /runs/7");
+            assert_eq!(lines[1], "bad  every 5 min  exit 3  2 h ago  /runs/7");
+            assert_eq!(lines[2], "new  every 5 min  never");
+            std::fs::write(dir.join(CONFIG_FILE), "[[task]]\nname = \"x\"\n").unwrap();
+            assert!(report_at(&dir, 0).is_err());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

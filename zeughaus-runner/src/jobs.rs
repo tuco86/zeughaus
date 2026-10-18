@@ -393,188 +393,195 @@ pub async fn serve_hold(replier: Replier, host: Arc<JobHost>) {
 /// own tests: it drives `/bin/sh`.
 #[cfg(all(test, unix))]
 mod tests {
-    use std::collections::HashMap;
-    use std::io;
-
-    use zeughaus_core::{DomainPlugin, InputSet, NodeContext, NodeId, Press, Value};
-    use zeughaus_job::JobPlugin;
-    use zeughaus_terminal::wal;
-
     use super::*;
 
-    /// A run's output bytes: its WAL.
-    fn run_output(run_dir: &Path) -> io::Result<Vec<u8>> {
-        wal::read_bytes(&run_dir.join("wal"))
-    }
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-    fn fresh_state_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zeughaus-jobs-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    }
+        use std::collections::HashMap;
+        use std::io;
 
-    /// Configure a `job.run` node for `sh -c <script>`, press it, and run
-    /// its deferred work to the end as the host loop would.
-    fn run_script(plugin: &JobPlugin, script: &str) -> HashMap<String, Value> {
-        let mut node = plugin.create_node("job.run").expect("job.run exists");
-        // Single quotes group the script into one argument; the scripts here
-        // contain none themselves.
-        node.set_parameter("command", Value::new(format!("/bin/sh -c '{script}'")))
-            .unwrap();
-        node.set_parameter(
-            "fire",
-            Value::new(Press {
-                payload: "payload-text".to_string(),
-                external: false,
-            }),
-        )
-        .unwrap();
-        let mut ctx = NodeContext::new(NodeId(1));
-        node.execute(&InputSet::new(), &mut ctx).unwrap();
-        ctx.take_deferred()
-            .expect("a run is deferred, not answered inline")
-            .run()
-            .expect("the run completes")
-    }
+        use zeughaus_core::{DomainPlugin, InputSet, NodeContext, NodeId, Press, Value};
+        use zeughaus_job::JobPlugin;
+        use zeughaus_terminal::wal;
 
-    /// The run's output once it contains `needle`, or as it is after five
-    /// seconds. A run is over when its child exited, and what it printed just
-    /// before can still be on its way into the WAL.
-    fn output_with(run_dir: &Path, needle: &str) -> String {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let log =
-                String::from_utf8_lossy(&run_output(run_dir).unwrap_or_default()).into_owned();
-            if log.contains(needle) || std::time::Instant::now() >= deadline {
-                return log;
-            }
-            std::thread::sleep(POLL);
+        /// A run's output bytes: its WAL.
+        fn run_output(run_dir: &Path) -> io::Result<Vec<u8>> {
+            wal::read_bytes(&run_dir.join("wal"))
         }
-    }
 
-    #[test]
-    fn a_failed_run_records_its_code_and_closes_its_terminal() {
-        let state_dir = fresh_state_dir("e2e");
-        let mux = MuxService::new(
-            crate::mux::incarnation(),
-            Vec::new(),
-            zeughaus_terminal::TerminalHost::Local,
-        );
-        let host = Arc::new(JobHost::new(
-            mux.clone(),
-            state_dir.clone(),
-            DEFAULT_KEEP_RUNS,
-        ));
-        let plugin = JobPlugin::new(Arc::clone(&host) as Arc<dyn ProcessHost>);
+        fn fresh_state_dir(name: &str) -> PathBuf {
+            let dir =
+                std::env::temp_dir().join(format!("zeughaus-jobs-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            dir
+        }
 
-        // First run: fails with 3. The run is over with its program, so its
-        // terminal, the first the mux handed out, is gone, and the exit record
-        // and the WAL say what happened.
-        let outputs = run_script(
-            &plugin,
-            "echo marker-one got=$ZEUGHAUS_PAYLOAD in=$ZEUGHAUS_RUN_DIR; exit 3",
-        );
-        assert_eq!(outputs["failed"].downcast_ref::<i64>(), Some(&3));
-        assert!(!outputs.contains_key("ok"));
-        let run_dir = PathBuf::from(outputs["dir"].downcast_ref::<String>().unwrap());
-        assert_eq!(run_dir, state_dir.join("runs").join("1"));
-        let log = output_with(&run_dir, "marker-one got=payload-text in=");
-        assert!(
-            log.contains("marker-one got=payload-text in="),
-            "log was: {log:?}"
-        );
-        assert!(
-            log.contains(&format!("in={}", run_dir.display())),
-            "log was: {log:?}"
-        );
-        let exit = std::fs::read_to_string(run_dir.join("exit")).unwrap();
-        assert!(
-            exit.starts_with("code=3\nkilled=false\n"),
-            "exit was: {exit:?}"
-        );
-        assert!(!run_dir.join("code").exists());
-        assert!(
-            mux.session(TerminalId(1)).is_none(),
-            "the failed run's terminal is closed"
-        );
-        assert_eq!(host.live_runs(), 0);
-
-        // Second run: succeeds, and ends the same way.
-        let outputs = run_script(&plugin, "echo marker-two");
-        assert_eq!(outputs["ok"].downcast_ref::<bool>(), Some(&true));
-        let run_dir = PathBuf::from(outputs["dir"].downcast_ref::<String>().unwrap());
-        assert_eq!(run_dir, state_dir.join("runs").join("2"));
-        assert!(output_with(&run_dir, "marker-two").contains("marker-two"));
-        assert!(!run_dir.join("code").exists());
-        assert!(mux.session(TerminalId(2)).is_none());
-
-        // A restarted host continues the numbering past what is on disk.
-        let restarted = JobHost::new(mux, state_dir.clone(), DEFAULT_KEEP_RUNS);
-        assert_eq!(
-            restarted.new_run_dir().unwrap(),
-            state_dir.join("runs").join("3")
-        );
-
-        let _ = std::fs::remove_dir_all(&state_dir);
-    }
-
-    #[test]
-    fn a_held_host_starts_nothing() {
-        let state_dir = fresh_state_dir("held");
-        let mux = MuxService::new(
-            crate::mux::incarnation(),
-            Vec::new(),
-            zeughaus_terminal::TerminalHost::Local,
-        );
-        let host = Arc::new(JobHost::new(mux, state_dir.clone(), DEFAULT_KEEP_RUNS));
-        host.hold(true);
-        let plugin = JobPlugin::new(Arc::clone(&host) as Arc<dyn ProcessHost>);
-        let mut node = plugin.create_node("job.run").unwrap();
-        node.set_parameter("command", Value::new("/bin/true".to_string()))
+        /// Configure a `job.run` node for `sh -c <script>`, press it, and run
+        /// its deferred work to the end as the host loop would.
+        fn run_script(plugin: &JobPlugin, script: &str) -> HashMap<String, Value> {
+            let mut node = plugin.create_node("job.run").expect("job.run exists");
+            // Single quotes group the script into one argument; the scripts here
+            // contain none themselves.
+            node.set_parameter("command", Value::new(format!("/bin/sh -c '{script}'")))
+                .unwrap();
+            node.set_parameter(
+                "fire",
+                Value::new(Press {
+                    payload: "payload-text".to_string(),
+                    external: false,
+                }),
+            )
             .unwrap();
-        node.set_parameter("fire", Value::new(Press::default()))
-            .unwrap();
-        let mut ctx = NodeContext::new(NodeId(1));
-        let err = node.execute(&InputSet::new(), &mut ctx).unwrap_err();
-        assert!(err.to_string().contains("held"), "was: {err}");
-        assert!(ctx.take_deferred().is_none());
-        assert!(!state_dir.join("runs").exists());
-    }
+            let mut ctx = NodeContext::new(NodeId(1));
+            node.execute(&InputSet::new(), &mut ctx).unwrap();
+            ctx.take_deferred()
+                .expect("a run is deferred, not answered inline")
+                .run()
+                .expect("the run completes")
+        }
 
-    #[test]
-    fn only_successful_runs_beyond_the_newest_are_pruned() {
-        let state_dir = fresh_state_dir("prune");
-        let runs = state_dir.join("runs");
-        let record = |id: u64, exit: Option<&str>| {
-            let dir = runs.join(id.to_string());
-            std::fs::create_dir_all(&dir).unwrap();
-            if let Some(exit) = exit {
-                std::fs::write(dir.join("exit"), exit).unwrap();
+        /// The run's output once it contains `needle`, or as it is after five
+        /// seconds. A run is over when its child exited, and what it printed just
+        /// before can still be on its way into the WAL.
+        fn output_with(run_dir: &Path, needle: &str) -> String {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let log =
+                    String::from_utf8_lossy(&run_output(run_dir).unwrap_or_default()).into_owned();
+                if log.contains(needle) || std::time::Instant::now() >= deadline {
+                    return log;
+                }
+                std::thread::sleep(POLL);
             }
-        };
-        // Oldest to newest: green, red, green, no record (cut short), green,
-        // green.
-        record(1, Some("code=0\nkilled=false\n"));
-        record(2, Some("code=3\nkilled=false\n"));
-        record(3, Some("code=0\nkilled=false\n"));
-        record(4, None);
-        record(5, Some("code=0\nkilled=false\n"));
-        record(6, Some("code=0\nkilled=false\n"));
+        }
 
-        let mux = MuxService::new(
-            crate::mux::incarnation(),
-            Vec::new(),
-            zeughaus_terminal::TerminalHost::Local,
-        );
-        let host = JobHost::new(mux, state_dir.clone(), 2);
-        let fresh = host.new_run_dir().unwrap();
-        assert_eq!(fresh, runs.join("7"));
+        #[test]
+        fn a_failed_run_records_its_code_and_closes_its_terminal() {
+            let state_dir = fresh_state_dir("e2e");
+            let mux = MuxService::new(
+                crate::mux::incarnation(),
+                Vec::new(),
+                zeughaus_terminal::TerminalHost::Local,
+            );
+            let host = Arc::new(JobHost::new(
+                mux.clone(),
+                state_dir.clone(),
+                DEFAULT_KEEP_RUNS,
+            ));
+            let plugin = JobPlugin::new(Arc::clone(&host) as Arc<dyn ProcessHost>);
 
-        let left = run_ids(&runs);
-        // The two newest green runs stay, the older green ones go, and the
-        // failed one, the recordless one and the new one are untouched.
-        assert_eq!(left, vec![7, 6, 5, 4, 2]);
+            // First run: fails with 3. The run is over with its program, so its
+            // terminal, the first the mux handed out, is gone, and the exit record
+            // and the WAL say what happened.
+            let outputs = run_script(
+                &plugin,
+                "echo marker-one got=$ZEUGHAUS_PAYLOAD in=$ZEUGHAUS_RUN_DIR; exit 3",
+            );
+            assert_eq!(outputs["failed"].downcast_ref::<i64>(), Some(&3));
+            assert!(!outputs.contains_key("ok"));
+            let run_dir = PathBuf::from(outputs["dir"].downcast_ref::<String>().unwrap());
+            assert_eq!(run_dir, state_dir.join("runs").join("1"));
+            let log = output_with(&run_dir, "marker-one got=payload-text in=");
+            assert!(
+                log.contains("marker-one got=payload-text in="),
+                "log was: {log:?}"
+            );
+            assert!(
+                log.contains(&format!("in={}", run_dir.display())),
+                "log was: {log:?}"
+            );
+            let exit = std::fs::read_to_string(run_dir.join("exit")).unwrap();
+            assert!(
+                exit.starts_with("code=3\nkilled=false\n"),
+                "exit was: {exit:?}"
+            );
+            assert!(!run_dir.join("code").exists());
+            assert!(
+                mux.session(TerminalId(1)).is_none(),
+                "the failed run's terminal is closed"
+            );
+            assert_eq!(host.live_runs(), 0);
 
-        let _ = std::fs::remove_dir_all(&state_dir);
+            // Second run: succeeds, and ends the same way.
+            let outputs = run_script(&plugin, "echo marker-two");
+            assert_eq!(outputs["ok"].downcast_ref::<bool>(), Some(&true));
+            let run_dir = PathBuf::from(outputs["dir"].downcast_ref::<String>().unwrap());
+            assert_eq!(run_dir, state_dir.join("runs").join("2"));
+            assert!(output_with(&run_dir, "marker-two").contains("marker-two"));
+            assert!(!run_dir.join("code").exists());
+            assert!(mux.session(TerminalId(2)).is_none());
+
+            // A restarted host continues the numbering past what is on disk.
+            let restarted = JobHost::new(mux, state_dir.clone(), DEFAULT_KEEP_RUNS);
+            assert_eq!(
+                restarted.new_run_dir().unwrap(),
+                state_dir.join("runs").join("3")
+            );
+
+            let _ = std::fs::remove_dir_all(&state_dir);
+        }
+
+        #[test]
+        fn a_held_host_starts_nothing() {
+            let state_dir = fresh_state_dir("held");
+            let mux = MuxService::new(
+                crate::mux::incarnation(),
+                Vec::new(),
+                zeughaus_terminal::TerminalHost::Local,
+            );
+            let host = Arc::new(JobHost::new(mux, state_dir.clone(), DEFAULT_KEEP_RUNS));
+            host.hold(true);
+            let plugin = JobPlugin::new(Arc::clone(&host) as Arc<dyn ProcessHost>);
+            let mut node = plugin.create_node("job.run").unwrap();
+            node.set_parameter("command", Value::new("/bin/true".to_string()))
+                .unwrap();
+            node.set_parameter("fire", Value::new(Press::default()))
+                .unwrap();
+            let mut ctx = NodeContext::new(NodeId(1));
+            let err = node.execute(&InputSet::new(), &mut ctx).unwrap_err();
+            assert!(err.to_string().contains("held"), "was: {err}");
+            assert!(ctx.take_deferred().is_none());
+            assert!(!state_dir.join("runs").exists());
+        }
+
+        #[test]
+        fn only_successful_runs_beyond_the_newest_are_pruned() {
+            let state_dir = fresh_state_dir("prune");
+            let runs = state_dir.join("runs");
+            let record = |id: u64, exit: Option<&str>| {
+                let dir = runs.join(id.to_string());
+                std::fs::create_dir_all(&dir).unwrap();
+                if let Some(exit) = exit {
+                    std::fs::write(dir.join("exit"), exit).unwrap();
+                }
+            };
+            // Oldest to newest: green, red, green, no record (cut short), green,
+            // green.
+            record(1, Some("code=0\nkilled=false\n"));
+            record(2, Some("code=3\nkilled=false\n"));
+            record(3, Some("code=0\nkilled=false\n"));
+            record(4, None);
+            record(5, Some("code=0\nkilled=false\n"));
+            record(6, Some("code=0\nkilled=false\n"));
+
+            let mux = MuxService::new(
+                crate::mux::incarnation(),
+                Vec::new(),
+                zeughaus_terminal::TerminalHost::Local,
+            );
+            let host = JobHost::new(mux, state_dir.clone(), 2);
+            let fresh = host.new_run_dir().unwrap();
+            assert_eq!(fresh, runs.join("7"));
+
+            let left = run_ids(&runs);
+            // The two newest green runs stay, the older green ones go, and the
+            // failed one, the recordless one and the new one are untouched.
+            assert_eq!(left, vec![7, 6, 5, 4, 2]);
+
+            let _ = std::fs::remove_dir_all(&state_dir);
+        }
     }
 }

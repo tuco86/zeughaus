@@ -286,55 +286,8 @@ fn read(path: &Path) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
 
-    const SEED: [u8; 32] = [7; 32];
-    const OTHER: [u8; 32] = [9; 32];
-
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
-    }
-
-    /// A directory that removes itself.
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        fn new(tag: &str) -> Scratch {
-            let path =
-                std::env::temp_dir().join(format!("zeughaus-release-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).expect("scratch directory");
-            Scratch(path)
-        }
-
-        /// A file of `bytes` named `name` in the directory.
-        fn file(&self, name: &str, bytes: &[u8]) -> PathBuf {
-            let path = self.0.join(name);
-            std::fs::write(&path, bytes).expect("write");
-            path
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn bundle(scratch: &Scratch, files: Vec<PathBuf>) -> Bundle {
-        Bundle {
-            channel: "dev".into(),
-            build: 7,
-            sha: "0123456789abcdef0123456789abcdef01234567".into(),
-            version: "0.0.0".into(),
-            out: scratch.0.join("bundle"),
-            files,
-        }
-    }
-
-    fn two_archives(scratch: &Scratch) -> Vec<PathBuf> {
-        vec![
-            scratch.file("zeughaus-0.0.0-windows-amd64.zip", b"windows archive"),
-            scratch.file("zeughaus-0.0.0-linux-amd64.tar.gz", b"linux archive"),
-        ]
     }
 
     #[test]
@@ -457,173 +410,228 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_bundle_verifies_and_a_tampered_one_does_not() {
-        let scratch = Scratch::new("bundle");
-        let bundle = bundle(&scratch, two_archives(&scratch));
-        let keys = [manifest::public_key(&SEED)];
-        let line = bundle.run(&SEED, &keys).unwrap();
-        assert!(
-            line.starts_with("bundled dev build 7, 2 artifacts into "),
-            "{line}"
-        );
-        let out = &bundle.out;
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-        assert_eq!(
-            verify(&keys, out),
-            Ok("ok dev build 7, 2 artifacts".to_owned())
-        );
-        let mut names: Vec<_> = std::fs::read_dir(out)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        names.sort();
-        assert_eq!(
-            names,
-            [
-                "SHA256SUMS",
-                "manifest.json",
-                "manifest.sig",
-                "zeughaus-0.0.0-linux-amd64.tar.gz",
-                "zeughaus-0.0.0-windows-amd64.zip",
-            ]
-        );
-        assert_eq!(std::fs::read(out.join("manifest.sig")).unwrap().len(), 64);
-        // `sha256sum -c` format, in platform order.
-        let sums = std::fs::read_to_string(out.join("SHA256SUMS")).unwrap();
-        let lines: Vec<&str> = sums.lines().collect();
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].ends_with("  zeughaus-0.0.0-linux-amd64.tar.gz"));
-        assert!(lines[1].ends_with("  zeughaus-0.0.0-windows-amd64.zip"));
-        let manifest = manifest::parse(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap();
-        assert_eq!(manifest.artifacts[0].platform, "linux-amd64");
-        assert_eq!(manifest.artifacts[1].platform, "windows-amd64");
-        assert_eq!(
-            lines[0],
-            format!(
-                "{}  {}",
-                manifest.artifacts[0].sha256, manifest.artifacts[0].file
-            )
-        );
+        const SEED: [u8; 32] = [7; 32];
 
-        // A foreign key is not trusted.
-        let err = verify(&[manifest::public_key(&OTHER)], out).unwrap_err();
-        assert!(err.contains("no trusted key"), "{err}");
+        const OTHER: [u8; 32] = [9; 32];
 
-        // One flipped byte of the manifest.
-        let manifest_path = out.join("manifest.json");
-        let original = std::fs::read(&manifest_path).unwrap();
-        let mut flipped = original.clone();
-        flipped[30] ^= 1;
-        std::fs::write(&manifest_path, &flipped).unwrap();
-        assert!(verify(&keys, out).is_err());
-        std::fs::write(&manifest_path, &original).unwrap();
-        assert!(verify(&keys, out).is_ok());
+        /// A directory that removes itself.
+        struct Scratch(PathBuf);
 
-        // One flipped byte of an archive: same size, other digest.
-        let archive = out.join("zeughaus-0.0.0-linux-amd64.tar.gz");
-        let mut bytes = std::fs::read(&archive).unwrap();
-        bytes[0] ^= 1;
-        std::fs::write(&archive, &bytes).unwrap();
-        let err = verify(&keys, out).unwrap_err();
-        assert!(err.contains("sha256"), "{err}");
-        // A truncated one.
-        std::fs::write(&archive, b"short").unwrap();
-        let err = verify(&keys, out).unwrap_err();
-        assert!(err.contains("bytes"), "{err}");
-        // A missing one.
-        std::fs::remove_file(&archive).unwrap();
-        assert!(verify(&keys, out).is_err());
-    }
+        impl Scratch {
+            fn new(tag: &str) -> Scratch {
+                let path = std::env::temp_dir()
+                    .join(format!("zeughaus-release-{tag}-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&path);
+                std::fs::create_dir_all(&path).expect("scratch directory");
+                Scratch(path)
+            }
 
-    #[test]
-    fn a_bundle_refuses_what_cannot_be_a_release() {
-        let scratch = Scratch::new("refuse");
-        let keys = [manifest::public_key(&SEED)];
-
-        // A file that is not an archive of a platform of this version.
-        let stray = scratch.file("zeughaus-0.0.0-plan9-amd64.tar.gz", b"x");
-        let err = bundle(&scratch, vec![stray]).run(&SEED, &keys).unwrap_err();
-        assert!(err.contains("plan9"), "{err}");
-        assert!(!scratch.0.join("bundle").exists(), "nothing is made");
-
-        // Two archives of one platform.
-        let first = scratch.file("zeughaus-0.0.0-linux-amd64.tar.gz", b"a");
-        let err = bundle(&scratch, vec![first.clone(), first])
-            .run(&SEED, &keys)
-            .unwrap_err();
-        assert!(err.contains("more than one"), "{err}");
-
-        // A version, channel or commit the manifest would refuse.
-        let archive = scratch.file("zeughaus-0.0.0-linux-amd64.tar.gz", b"a");
-        let mut wrong = bundle(&scratch, vec![archive.clone()]);
-        wrong.channel = "Dev".into();
-        assert!(wrong.run(&SEED, &keys).unwrap_err().contains("channel"));
-        let mut wrong = bundle(&scratch, vec![archive.clone()]);
-        wrong.sha = "HEAD".into();
-        assert!(wrong.run(&SEED, &keys).unwrap_err().contains("sha"));
-        assert!(
-            !scratch.0.join("bundle").exists(),
-            "a failure leaves nothing"
-        );
-
-        // An existing directory is never reused.
-        std::fs::create_dir(scratch.0.join("bundle")).unwrap();
-        let err = bundle(&scratch, vec![archive.clone()])
-            .run(&SEED, &keys)
-            .unwrap_err();
-        assert!(err.contains("already exists"), "{err}");
-        assert!(scratch.0.join("bundle").exists(), "the existing one stays");
-        std::fs::remove_dir(scratch.0.join("bundle")).unwrap();
-
-        // A key that is not in TRUSTED_KEYS.
-        let err = bundle(&scratch, vec![archive])
-            .run(&SEED, &[manifest::public_key(&OTHER)])
-            .unwrap_err();
-        assert_eq!(err, "the signing key is not in TRUSTED_KEYS");
-        assert!(
-            !scratch.0.join("bundle").exists(),
-            "nothing unverifiable stays"
-        );
-    }
-
-    #[test]
-    fn keygen_writes_a_seed_once() {
-        let scratch = Scratch::new("keygen");
-        let file = scratch.0.join("update-key.hex");
-        let line = keygen(&file).unwrap();
-
-        let text = std::fs::read_to_string(&file).unwrap();
-        assert!(text.ends_with('\n'));
-        assert_eq!(text.trim().len(), 64);
-        assert!(
-            text.trim()
-                .bytes()
-                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        );
-        let seed = parse_seed(&text).unwrap();
-        let public: Vec<String> = manifest::public_key(&seed)
-            .iter()
-            .map(|byte| format!("0x{byte:02x}"))
-            .collect();
-        assert_eq!(
-            line,
-            format!("public key for TRUSTED_KEYS: [{}],", public.join(", "))
-        );
-        assert!(!line.contains(text.trim()), "the seed is never printed");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
+            /// A file of `bytes` named `name` in the directory.
+            fn file(&self, name: &str, bytes: &[u8]) -> PathBuf {
+                let path = self.0.join(name);
+                std::fs::write(&path, bytes).expect("write");
+                path
+            }
         }
 
-        let err = keygen(&file).unwrap_err();
-        assert!(err.contains("refusing"), "{err}");
-        assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
-            text,
-            "the key stays"
-        );
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn bundle(scratch: &Scratch, files: Vec<PathBuf>) -> Bundle {
+            Bundle {
+                channel: "dev".into(),
+                build: 7,
+                sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                version: "0.0.0".into(),
+                out: scratch.0.join("bundle"),
+                files,
+            }
+        }
+
+        fn two_archives(scratch: &Scratch) -> Vec<PathBuf> {
+            vec![
+                scratch.file("zeughaus-0.0.0-windows-amd64.zip", b"windows archive"),
+                scratch.file("zeughaus-0.0.0-linux-amd64.tar.gz", b"linux archive"),
+            ]
+        }
+
+        #[test]
+        fn a_bundle_verifies_and_a_tampered_one_does_not() {
+            let scratch = Scratch::new("bundle");
+            let bundle = bundle(&scratch, two_archives(&scratch));
+            let keys = [manifest::public_key(&SEED)];
+            let line = bundle.run(&SEED, &keys).unwrap();
+            assert!(
+                line.starts_with("bundled dev build 7, 2 artifacts into "),
+                "{line}"
+            );
+            let out = &bundle.out;
+
+            assert_eq!(
+                verify(&keys, out),
+                Ok("ok dev build 7, 2 artifacts".to_owned())
+            );
+            let mut names: Vec<_> = std::fs::read_dir(out)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            assert_eq!(
+                names,
+                [
+                    "SHA256SUMS",
+                    "manifest.json",
+                    "manifest.sig",
+                    "zeughaus-0.0.0-linux-amd64.tar.gz",
+                    "zeughaus-0.0.0-windows-amd64.zip",
+                ]
+            );
+            assert_eq!(std::fs::read(out.join("manifest.sig")).unwrap().len(), 64);
+            // `sha256sum -c` format, in platform order.
+            let sums = std::fs::read_to_string(out.join("SHA256SUMS")).unwrap();
+            let lines: Vec<&str> = sums.lines().collect();
+            assert_eq!(lines.len(), 2);
+            assert!(lines[0].ends_with("  zeughaus-0.0.0-linux-amd64.tar.gz"));
+            assert!(lines[1].ends_with("  zeughaus-0.0.0-windows-amd64.zip"));
+            let manifest =
+                manifest::parse(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap();
+            assert_eq!(manifest.artifacts[0].platform, "linux-amd64");
+            assert_eq!(manifest.artifacts[1].platform, "windows-amd64");
+            assert_eq!(
+                lines[0],
+                format!(
+                    "{}  {}",
+                    manifest.artifacts[0].sha256, manifest.artifacts[0].file
+                )
+            );
+
+            // A foreign key is not trusted.
+            let err = verify(&[manifest::public_key(&OTHER)], out).unwrap_err();
+            assert!(err.contains("no trusted key"), "{err}");
+
+            // One flipped byte of the manifest.
+            let manifest_path = out.join("manifest.json");
+            let original = std::fs::read(&manifest_path).unwrap();
+            let mut flipped = original.clone();
+            flipped[30] ^= 1;
+            std::fs::write(&manifest_path, &flipped).unwrap();
+            assert!(verify(&keys, out).is_err());
+            std::fs::write(&manifest_path, &original).unwrap();
+            assert!(verify(&keys, out).is_ok());
+
+            // One flipped byte of an archive: same size, other digest.
+            let archive = out.join("zeughaus-0.0.0-linux-amd64.tar.gz");
+            let mut bytes = std::fs::read(&archive).unwrap();
+            bytes[0] ^= 1;
+            std::fs::write(&archive, &bytes).unwrap();
+            let err = verify(&keys, out).unwrap_err();
+            assert!(err.contains("sha256"), "{err}");
+            // A truncated one.
+            std::fs::write(&archive, b"short").unwrap();
+            let err = verify(&keys, out).unwrap_err();
+            assert!(err.contains("bytes"), "{err}");
+            // A missing one.
+            std::fs::remove_file(&archive).unwrap();
+            assert!(verify(&keys, out).is_err());
+        }
+
+        #[test]
+        fn a_bundle_refuses_what_cannot_be_a_release() {
+            let scratch = Scratch::new("refuse");
+            let keys = [manifest::public_key(&SEED)];
+
+            // A file that is not an archive of a platform of this version.
+            let stray = scratch.file("zeughaus-0.0.0-plan9-amd64.tar.gz", b"x");
+            let err = bundle(&scratch, vec![stray]).run(&SEED, &keys).unwrap_err();
+            assert!(err.contains("plan9"), "{err}");
+            assert!(!scratch.0.join("bundle").exists(), "nothing is made");
+
+            // Two archives of one platform.
+            let first = scratch.file("zeughaus-0.0.0-linux-amd64.tar.gz", b"a");
+            let err = bundle(&scratch, vec![first.clone(), first])
+                .run(&SEED, &keys)
+                .unwrap_err();
+            assert!(err.contains("more than one"), "{err}");
+
+            // A version, channel or commit the manifest would refuse.
+            let archive = scratch.file("zeughaus-0.0.0-linux-amd64.tar.gz", b"a");
+            let mut wrong = bundle(&scratch, vec![archive.clone()]);
+            wrong.channel = "Dev".into();
+            assert!(wrong.run(&SEED, &keys).unwrap_err().contains("channel"));
+            let mut wrong = bundle(&scratch, vec![archive.clone()]);
+            wrong.sha = "HEAD".into();
+            assert!(wrong.run(&SEED, &keys).unwrap_err().contains("sha"));
+            assert!(
+                !scratch.0.join("bundle").exists(),
+                "a failure leaves nothing"
+            );
+
+            // An existing directory is never reused.
+            std::fs::create_dir(scratch.0.join("bundle")).unwrap();
+            let err = bundle(&scratch, vec![archive.clone()])
+                .run(&SEED, &keys)
+                .unwrap_err();
+            assert!(err.contains("already exists"), "{err}");
+            assert!(scratch.0.join("bundle").exists(), "the existing one stays");
+            std::fs::remove_dir(scratch.0.join("bundle")).unwrap();
+
+            // A key that is not in TRUSTED_KEYS.
+            let err = bundle(&scratch, vec![archive])
+                .run(&SEED, &[manifest::public_key(&OTHER)])
+                .unwrap_err();
+            assert_eq!(err, "the signing key is not in TRUSTED_KEYS");
+            assert!(
+                !scratch.0.join("bundle").exists(),
+                "nothing unverifiable stays"
+            );
+        }
+
+        #[test]
+        fn keygen_writes_a_seed_once() {
+            let scratch = Scratch::new("keygen");
+            let file = scratch.0.join("update-key.hex");
+            let line = keygen(&file).unwrap();
+
+            let text = std::fs::read_to_string(&file).unwrap();
+            assert!(text.ends_with('\n'));
+            assert_eq!(text.trim().len(), 64);
+            assert!(
+                text.trim()
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            );
+            let seed = parse_seed(&text).unwrap();
+            let public: Vec<String> = manifest::public_key(&seed)
+                .iter()
+                .map(|byte| format!("0x{byte:02x}"))
+                .collect();
+            assert_eq!(
+                line,
+                format!("public key for TRUSTED_KEYS: [{}],", public.join(", "))
+            );
+            assert!(!line.contains(text.trim()), "the seed is never printed");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600);
+            }
+
+            let err = keygen(&file).unwrap_err();
+            assert!(err.contains("refusing"), "{err}");
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                text,
+                "the key stays"
+            );
+        }
     }
 }

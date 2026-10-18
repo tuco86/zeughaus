@@ -450,288 +450,6 @@ pub fn check(secrets: &Secrets, config: &CiConfig) -> Result<Vec<String>, String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::thread::JoinHandle;
-
-    const LOGIN_URL: &str = "/v1/auth/approle/login";
-    const READ_URL: &str = "/v1/secret/data/zeughaus/ci";
-
-    /// An OpenBao that answers logins and counts them, and answers the reads of
-    /// `zeughaus/ci` as its script says; the script gets the 0-based read number.
-    struct Stub {
-        addr: String,
-        logins: Arc<AtomicUsize>,
-        reads: Arc<AtomicUsize>,
-        login_body: Arc<Mutex<String>>,
-        stop: Arc<AtomicBool>,
-        thread: Option<JoinHandle<()>>,
-    }
-
-    impl Stub {
-        fn start(script: impl Fn(usize) -> (u16, String) + Send + 'static) -> Stub {
-            let server = tiny_http::Server::http("127.0.0.1:0").expect("bind the stub");
-            let addr = format!(
-                "http://{}",
-                server.server_addr().to_ip().expect("an ip address")
-            );
-            let logins = Arc::new(AtomicUsize::new(0));
-            let reads = Arc::new(AtomicUsize::new(0));
-            let login_body = Arc::new(Mutex::new(String::new()));
-            let stop = Arc::new(AtomicBool::new(false));
-            let thread = {
-                let (logins, reads, login_body, stop) = (
-                    Arc::clone(&logins),
-                    Arc::clone(&reads),
-                    Arc::clone(&login_body),
-                    Arc::clone(&stop),
-                );
-                std::thread::spawn(move || {
-                    while !stop.load(Ordering::SeqCst) {
-                        let Ok(Some(mut request)) = server.recv_timeout(Duration::from_millis(20))
-                        else {
-                            continue;
-                        };
-                        let url = request.url().to_owned();
-                        let (code, body) = match url.as_str() {
-                            LOGIN_URL => {
-                                logins.fetch_add(1, Ordering::SeqCst);
-                                let mut text = String::new();
-                                let _ = request.as_reader().read_to_string(&mut text);
-                                *login_body.lock().unwrap() = text;
-                                (200, r#"{"auth":{"client_token":"tok"}}"#.to_owned())
-                            }
-                            READ_URL => script(reads.fetch_add(1, Ordering::SeqCst)),
-                            _ => (500, String::new()),
-                        };
-                        let _ = request
-                            .respond(tiny_http::Response::from_string(body).with_status_code(code));
-                    }
-                })
-            };
-            Stub {
-                addr,
-                logins,
-                reads,
-                login_body,
-                stop,
-                thread: Some(thread),
-            }
-        }
-
-        fn secrets(&self, ttl: u64) -> Arc<Secrets> {
-            Secrets::with_secret_id(config(&self.addr, ttl), "sid-1".to_owned())
-        }
-
-        fn logins(&self) -> usize {
-            self.logins.load(Ordering::SeqCst)
-        }
-
-        fn reads(&self) -> usize {
-            self.reads.load(Ordering::SeqCst)
-        }
-    }
-
-    impl Drop for Stub {
-        fn drop(&mut self) {
-            self.stop.store(true, Ordering::SeqCst);
-            if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
-            }
-        }
-    }
-
-    fn config(addr: &str, ttl: u64) -> SecretsConfig {
-        SecretsConfig {
-            addr: addr.to_owned(),
-            mount: "secret".to_owned(),
-            path: "zeughaus/ci".to_owned(),
-            role_id: "role-1".to_owned(),
-            cache_ttl_seconds: ttl,
-            timeout_seconds: 5,
-        }
-    }
-
-    fn document(data: Value) -> (u16, String) {
-        (200, json!({ "data": { "data": data } }).to_string())
-    }
-
-    #[test]
-    fn logs_in_and_reads_a_value() {
-        let stub = Stub::start(|_| document(json!({ "A": "alpha" })));
-        let secrets = stub.secrets(30);
-        assert_eq!(secrets.get("A").unwrap(), "alpha");
-        assert_eq!(stub.logins(), 1);
-        assert_eq!(stub.reads(), 1);
-        let body: Value = serde_json::from_str(&stub.login_body.lock().unwrap()).unwrap();
-        assert_eq!(body, json!({ "role_id": "role-1", "secret_id": "sid-1" }));
-    }
-
-    #[test]
-    fn a_forbidden_read_logs_in_once_more() {
-        let stub = Stub::start(|n| {
-            if n == 0 {
-                (403, r#"{"errors":["permission denied"]}"#.to_owned())
-            } else {
-                document(json!({ "A": "alpha" }))
-            }
-        });
-        let secrets = stub.secrets(30);
-        assert_eq!(secrets.get("A").unwrap(), "alpha");
-        assert_eq!(stub.logins(), 2);
-        assert_eq!(stub.reads(), 2);
-    }
-
-    #[test]
-    fn a_read_forbidden_after_the_second_login_is_denied() {
-        let stub = Stub::start(|_| (403, "{}".to_owned()));
-        let secrets = stub.secrets(30);
-        assert_eq!(
-            secrets.get("A").unwrap_err(),
-            SecretError::Unavailable(
-                "openbao: secret/zeughaus/ci denied (policy zeughaus-ci)".to_owned()
-            )
-        );
-        assert_eq!(stub.logins(), 2);
-        assert_eq!(stub.reads(), 2);
-    }
-
-    #[test]
-    fn a_missing_document_is_absent() {
-        let stub = Stub::start(|_| (404, r#"{"errors":[]}"#.to_owned()));
-        assert_eq!(
-            stub.secrets(30).get("A").unwrap_err(),
-            SecretError::Absent("openbao: no document secret/zeughaus/ci".to_owned())
-        );
-    }
-
-    #[test]
-    fn a_missing_field_is_absent() {
-        let stub = Stub::start(|_| document(json!({ "A": "alpha" })));
-        assert_eq!(
-            stub.secrets(30).get("B").unwrap_err(),
-            SecretError::Absent("openbao: no field B in secret/zeughaus/ci".to_owned())
-        );
-    }
-
-    #[test]
-    fn a_sealed_openbao_is_unavailable() {
-        let stub = Stub::start(|_| (503, r#"{"errors":["Vault is sealed"]}"#.to_owned()));
-        let error = stub.secrets(30).get("A").unwrap_err();
-        assert_eq!(
-            error,
-            SecretError::Unavailable(format!("openbao {} is sealed", stub.addr))
-        );
-    }
-
-    #[test]
-    fn a_closed_port_is_unreachable() {
-        let port = {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap().port()
-        };
-        let addr = format!("http://127.0.0.1:{port}");
-        let secrets = Secrets::with_secret_id(config(&addr, 30), "sid-1".to_owned());
-        match secrets.get("A").unwrap_err() {
-            SecretError::Unavailable(text) => {
-                assert!(
-                    text.starts_with(&format!("openbao {addr} unreachable (")),
-                    "{text}"
-                );
-                assert!(text.ends_with("); A not read"), "{text}");
-            }
-            other => panic!("unexpected {other:?}"),
-        }
-        match secrets.fields().unwrap_err() {
-            SecretError::Unavailable(text) => {
-                assert!(text.ends_with("); document not read"), "{text}");
-            }
-            other => panic!("unexpected {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_rejected_login_is_unavailable() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = format!("http://{}", server.server_addr().to_ip().unwrap());
-        let thread = std::thread::spawn(move || {
-            let request = server.recv().unwrap();
-            let _ = request.respond(tiny_http::Response::from_string("{}").with_status_code(400));
-        });
-        let secrets = Secrets::with_secret_id(config(&addr, 30), "sid-1".to_owned());
-        assert_eq!(
-            secrets.get("A").unwrap_err(),
-            SecretError::Unavailable(
-                "openbao login rejected (secret_id revoked or expired?)".to_owned()
-            )
-        );
-        thread.join().unwrap();
-    }
-
-    #[test]
-    fn a_value_over_several_lines_is_refused_without_being_shown() {
-        let stub = Stub::start(|_| document(json!({ "A": "a\nb" })));
-        let error = stub.secrets(30).get("A").unwrap_err();
-        assert_eq!(
-            error,
-            SecretError::Absent("openbao: A in secret/zeughaus/ci spans several lines".to_owned())
-        );
-        assert!(!error.to_string().contains("a\nb"));
-    }
-
-    #[test]
-    fn one_line_end_is_stripped() {
-        let stub = Stub::start(|_| document(json!({ "A": "x\n", "B": "y\r\n", "C": "z\n\n" })));
-        let secrets = stub.secrets(30);
-        assert_eq!(secrets.get("A").unwrap(), "x");
-        assert_eq!(secrets.get("B").unwrap(), "y");
-        assert!(matches!(secrets.get("C"), Err(SecretError::Absent(_))));
-    }
-
-    #[test]
-    fn a_value_that_is_not_a_string_is_absent() {
-        let stub = Stub::start(|_| document(json!({ "A": 7 })));
-        assert_eq!(
-            stub.secrets(30).get("A").unwrap_err(),
-            SecretError::Absent("openbao: A in secret/zeughaus/ci is not a string".to_owned())
-        );
-    }
-
-    #[test]
-    fn the_document_is_cached_for_its_ttl() {
-        let stub = Stub::start(|_| document(json!({ "A": "alpha", "B": "beta" })));
-        let secrets = stub.secrets(30);
-        assert_eq!(secrets.get("A").unwrap(), "alpha");
-        assert_eq!(secrets.get("B").unwrap(), "beta");
-        assert_eq!(secrets.fields().unwrap().len(), 2);
-        assert_eq!(stub.reads(), 1);
-        assert_eq!(stub.logins(), 1);
-    }
-
-    #[test]
-    fn a_zero_ttl_reads_every_time_and_reuses_the_token() {
-        let stub = Stub::start(|_| document(json!({ "A": "alpha" })));
-        let secrets = stub.secrets(0);
-        assert_eq!(secrets.get("A").unwrap(), "alpha");
-        assert_eq!(secrets.get("A").unwrap(), "alpha");
-        assert_eq!(stub.reads(), 2);
-        assert_eq!(stub.logins(), 1);
-    }
-
-    #[test]
-    fn a_failed_read_does_not_serve_the_old_value() {
-        let stub = Stub::start(|n| {
-            if n == 0 {
-                document(json!({ "A": "alpha" }))
-            } else {
-                (503, "{}".to_owned())
-            }
-        });
-        let secrets = stub.secrets(0);
-        assert_eq!(secrets.get("A").unwrap(), "alpha");
-        assert!(matches!(secrets.get("A"), Err(SecretError::Unavailable(_))));
-    }
-
     #[test]
     fn without_a_config_every_read_is_absent() {
         let secrets = Secrets::new(None, Path::new("/nonexistent"));
@@ -746,56 +464,349 @@ mod tests {
         assert_eq!(secrets.document(), "(no [secrets])");
     }
 
-    #[test]
-    fn debug_shows_no_state() {
-        let stub = Stub::start(|_| document(json!({ "A": "alpha" })));
-        let secrets = stub.secrets(30);
-        secrets.get("A").unwrap();
-        let text = format!("{secrets:?}");
-        assert!(!text.contains("alpha") && !text.contains("tok") && !text.contains("sid-1"));
-    }
-
     /// The runner every parsed config needs.
     const RUNNERS: &str = "default_runner = \"r\"\n[runners.r]\n\
         fingerprint = \"sha256:0000000000000000000000000000000000000000000000000000000000000001\"\n";
-
-    fn ci_config(addr: &str) -> CiConfig {
-        CiConfig::parse(&format!(
-            "{RUNNERS}[secrets]\naddr = \"{addr}\"\npath = \"zeughaus/ci\"\nrole_id = \"role-1\"\n\
-             [repos.a]\nurl = \"x\"\nfetch_token = \"A\"\nstatus_token = \"B\"\n\
-             [repos.a.grants]\nC = [\"tag v*\"]\nA = [\"tag v*\"]\n"
-        ))
-        .unwrap()
-    }
-
-    #[test]
-    fn check_lists_every_name_and_the_unreferenced_fields() {
-        let stub = Stub::start(|_| document(json!({ "A": "1", "B": "2", "C": "3", "Z": "4" })));
-        let lines = check(&stub.secrets(30), &ci_config(&stub.addr)).unwrap();
-        assert_eq!(lines, ["A ok", "B ok", "C ok", "unreferenced: Z"]);
-    }
-
-    #[test]
-    fn check_fails_on_a_missing_name() {
-        let stub = Stub::start(|_| document(json!({ "A": "1" })));
-        let error = check(&stub.secrets(30), &ci_config(&stub.addr)).unwrap_err();
-        assert_eq!(
-            error,
-            "A ok\nB missing\nC missing\nmissing in secret/zeughaus/ci: B, C"
-        );
-    }
-
-    #[test]
-    fn check_fails_with_the_message_when_the_document_cannot_be_read() {
-        let stub = Stub::start(|_| (404, "{}".to_owned()));
-        let error = check(&stub.secrets(30), &ci_config(&stub.addr)).unwrap_err();
-        assert_eq!(error, "openbao: no document secret/zeughaus/ci");
-    }
 
     #[test]
     fn check_without_secrets_or_names_is_empty() {
         let secrets = Secrets::new(None, Path::new("/nonexistent"));
         let config = CiConfig::parse(RUNNERS).unwrap();
         assert_eq!(check(&secrets, &config).unwrap(), Vec::<String>::new());
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::thread::JoinHandle;
+
+        const LOGIN_URL: &str = "/v1/auth/approle/login";
+
+        const READ_URL: &str = "/v1/secret/data/zeughaus/ci";
+
+        /// An OpenBao that answers logins and counts them, and answers the reads of
+        /// `zeughaus/ci` as its script says; the script gets the 0-based read number.
+        struct Stub {
+            addr: String,
+            logins: Arc<AtomicUsize>,
+            reads: Arc<AtomicUsize>,
+            login_body: Arc<Mutex<String>>,
+            stop: Arc<AtomicBool>,
+            thread: Option<JoinHandle<()>>,
+        }
+
+        impl Stub {
+            fn start(script: impl Fn(usize) -> (u16, String) + Send + 'static) -> Stub {
+                let server = tiny_http::Server::http("127.0.0.1:0").expect("bind the stub");
+                let addr = format!(
+                    "http://{}",
+                    server.server_addr().to_ip().expect("an ip address")
+                );
+                let logins = Arc::new(AtomicUsize::new(0));
+                let reads = Arc::new(AtomicUsize::new(0));
+                let login_body = Arc::new(Mutex::new(String::new()));
+                let stop = Arc::new(AtomicBool::new(false));
+                let thread = {
+                    let (logins, reads, login_body, stop) = (
+                        Arc::clone(&logins),
+                        Arc::clone(&reads),
+                        Arc::clone(&login_body),
+                        Arc::clone(&stop),
+                    );
+                    std::thread::spawn(move || {
+                        while !stop.load(Ordering::SeqCst) {
+                            let Ok(Some(mut request)) =
+                                server.recv_timeout(Duration::from_millis(20))
+                            else {
+                                continue;
+                            };
+                            let url = request.url().to_owned();
+                            let (code, body) = match url.as_str() {
+                                LOGIN_URL => {
+                                    logins.fetch_add(1, Ordering::SeqCst);
+                                    let mut text = String::new();
+                                    let _ = request.as_reader().read_to_string(&mut text);
+                                    *login_body.lock().unwrap() = text;
+                                    (200, r#"{"auth":{"client_token":"tok"}}"#.to_owned())
+                                }
+                                READ_URL => script(reads.fetch_add(1, Ordering::SeqCst)),
+                                _ => (500, String::new()),
+                            };
+                            let _ = request.respond(
+                                tiny_http::Response::from_string(body).with_status_code(code),
+                            );
+                        }
+                    })
+                };
+                Stub {
+                    addr,
+                    logins,
+                    reads,
+                    login_body,
+                    stop,
+                    thread: Some(thread),
+                }
+            }
+
+            fn secrets(&self, ttl: u64) -> Arc<Secrets> {
+                Secrets::with_secret_id(config(&self.addr, ttl), "sid-1".to_owned())
+            }
+
+            fn logins(&self) -> usize {
+                self.logins.load(Ordering::SeqCst)
+            }
+
+            fn reads(&self) -> usize {
+                self.reads.load(Ordering::SeqCst)
+            }
+        }
+
+        impl Drop for Stub {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::SeqCst);
+                if let Some(thread) = self.thread.take() {
+                    let _ = thread.join();
+                }
+            }
+        }
+
+        fn config(addr: &str, ttl: u64) -> SecretsConfig {
+            SecretsConfig {
+                addr: addr.to_owned(),
+                mount: "secret".to_owned(),
+                path: "zeughaus/ci".to_owned(),
+                role_id: "role-1".to_owned(),
+                cache_ttl_seconds: ttl,
+                timeout_seconds: 5,
+            }
+        }
+
+        fn document(data: Value) -> (u16, String) {
+            (200, json!({ "data": { "data": data } }).to_string())
+        }
+
+        #[test]
+        fn logs_in_and_reads_a_value() {
+            let stub = Stub::start(|_| document(json!({ "A": "alpha" })));
+            let secrets = stub.secrets(30);
+            assert_eq!(secrets.get("A").unwrap(), "alpha");
+            assert_eq!(stub.logins(), 1);
+            assert_eq!(stub.reads(), 1);
+            let body: Value = serde_json::from_str(&stub.login_body.lock().unwrap()).unwrap();
+            assert_eq!(body, json!({ "role_id": "role-1", "secret_id": "sid-1" }));
+        }
+
+        #[test]
+        fn a_forbidden_read_logs_in_once_more() {
+            let stub = Stub::start(|n| {
+                if n == 0 {
+                    (403, r#"{"errors":["permission denied"]}"#.to_owned())
+                } else {
+                    document(json!({ "A": "alpha" }))
+                }
+            });
+            let secrets = stub.secrets(30);
+            assert_eq!(secrets.get("A").unwrap(), "alpha");
+            assert_eq!(stub.logins(), 2);
+            assert_eq!(stub.reads(), 2);
+        }
+
+        #[test]
+        fn a_read_forbidden_after_the_second_login_is_denied() {
+            let stub = Stub::start(|_| (403, "{}".to_owned()));
+            let secrets = stub.secrets(30);
+            assert_eq!(
+                secrets.get("A").unwrap_err(),
+                SecretError::Unavailable(
+                    "openbao: secret/zeughaus/ci denied (policy zeughaus-ci)".to_owned()
+                )
+            );
+            assert_eq!(stub.logins(), 2);
+            assert_eq!(stub.reads(), 2);
+        }
+
+        #[test]
+        fn a_missing_document_is_absent() {
+            let stub = Stub::start(|_| (404, r#"{"errors":[]}"#.to_owned()));
+            assert_eq!(
+                stub.secrets(30).get("A").unwrap_err(),
+                SecretError::Absent("openbao: no document secret/zeughaus/ci".to_owned())
+            );
+        }
+
+        #[test]
+        fn a_missing_field_is_absent() {
+            let stub = Stub::start(|_| document(json!({ "A": "alpha" })));
+            assert_eq!(
+                stub.secrets(30).get("B").unwrap_err(),
+                SecretError::Absent("openbao: no field B in secret/zeughaus/ci".to_owned())
+            );
+        }
+
+        #[test]
+        fn a_sealed_openbao_is_unavailable() {
+            let stub = Stub::start(|_| (503, r#"{"errors":["Vault is sealed"]}"#.to_owned()));
+            let error = stub.secrets(30).get("A").unwrap_err();
+            assert_eq!(
+                error,
+                SecretError::Unavailable(format!("openbao {} is sealed", stub.addr))
+            );
+        }
+
+        #[test]
+        fn a_closed_port_is_unreachable() {
+            let port = {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.local_addr().unwrap().port()
+            };
+            let addr = format!("http://127.0.0.1:{port}");
+            let secrets = Secrets::with_secret_id(config(&addr, 30), "sid-1".to_owned());
+            match secrets.get("A").unwrap_err() {
+                SecretError::Unavailable(text) => {
+                    assert!(
+                        text.starts_with(&format!("openbao {addr} unreachable (")),
+                        "{text}"
+                    );
+                    assert!(text.ends_with("); A not read"), "{text}");
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+            match secrets.fields().unwrap_err() {
+                SecretError::Unavailable(text) => {
+                    assert!(text.ends_with("); document not read"), "{text}");
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_rejected_login_is_unavailable() {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let addr = format!("http://{}", server.server_addr().to_ip().unwrap());
+            let thread = std::thread::spawn(move || {
+                let request = server.recv().unwrap();
+                let _ =
+                    request.respond(tiny_http::Response::from_string("{}").with_status_code(400));
+            });
+            let secrets = Secrets::with_secret_id(config(&addr, 30), "sid-1".to_owned());
+            assert_eq!(
+                secrets.get("A").unwrap_err(),
+                SecretError::Unavailable(
+                    "openbao login rejected (secret_id revoked or expired?)".to_owned()
+                )
+            );
+            thread.join().unwrap();
+        }
+
+        #[test]
+        fn a_value_over_several_lines_is_refused_without_being_shown() {
+            let stub = Stub::start(|_| document(json!({ "A": "a\nb" })));
+            let error = stub.secrets(30).get("A").unwrap_err();
+            assert_eq!(
+                error,
+                SecretError::Absent(
+                    "openbao: A in secret/zeughaus/ci spans several lines".to_owned()
+                )
+            );
+            assert!(!error.to_string().contains("a\nb"));
+        }
+
+        #[test]
+        fn one_line_end_is_stripped() {
+            let stub = Stub::start(|_| document(json!({ "A": "x\n", "B": "y\r\n", "C": "z\n\n" })));
+            let secrets = stub.secrets(30);
+            assert_eq!(secrets.get("A").unwrap(), "x");
+            assert_eq!(secrets.get("B").unwrap(), "y");
+            assert!(matches!(secrets.get("C"), Err(SecretError::Absent(_))));
+        }
+
+        #[test]
+        fn a_value_that_is_not_a_string_is_absent() {
+            let stub = Stub::start(|_| document(json!({ "A": 7 })));
+            assert_eq!(
+                stub.secrets(30).get("A").unwrap_err(),
+                SecretError::Absent("openbao: A in secret/zeughaus/ci is not a string".to_owned())
+            );
+        }
+
+        #[test]
+        fn the_document_is_cached_for_its_ttl() {
+            let stub = Stub::start(|_| document(json!({ "A": "alpha", "B": "beta" })));
+            let secrets = stub.secrets(30);
+            assert_eq!(secrets.get("A").unwrap(), "alpha");
+            assert_eq!(secrets.get("B").unwrap(), "beta");
+            assert_eq!(secrets.fields().unwrap().len(), 2);
+            assert_eq!(stub.reads(), 1);
+            assert_eq!(stub.logins(), 1);
+        }
+
+        #[test]
+        fn a_zero_ttl_reads_every_time_and_reuses_the_token() {
+            let stub = Stub::start(|_| document(json!({ "A": "alpha" })));
+            let secrets = stub.secrets(0);
+            assert_eq!(secrets.get("A").unwrap(), "alpha");
+            assert_eq!(secrets.get("A").unwrap(), "alpha");
+            assert_eq!(stub.reads(), 2);
+            assert_eq!(stub.logins(), 1);
+        }
+
+        #[test]
+        fn a_failed_read_does_not_serve_the_old_value() {
+            let stub = Stub::start(|n| {
+                if n == 0 {
+                    document(json!({ "A": "alpha" }))
+                } else {
+                    (503, "{}".to_owned())
+                }
+            });
+            let secrets = stub.secrets(0);
+            assert_eq!(secrets.get("A").unwrap(), "alpha");
+            assert!(matches!(secrets.get("A"), Err(SecretError::Unavailable(_))));
+        }
+
+        #[test]
+        fn debug_shows_no_state() {
+            let stub = Stub::start(|_| document(json!({ "A": "alpha" })));
+            let secrets = stub.secrets(30);
+            secrets.get("A").unwrap();
+            let text = format!("{secrets:?}");
+            assert!(!text.contains("alpha") && !text.contains("tok") && !text.contains("sid-1"));
+        }
+
+        fn ci_config(addr: &str) -> CiConfig {
+            CiConfig::parse(&format!(
+                "{RUNNERS}[secrets]\naddr = \"{addr}\"\npath = \"zeughaus/ci\"\nrole_id = \"role-1\"\n\
+                 [repos.a]\nurl = \"x\"\nfetch_token = \"A\"\nstatus_token = \"B\"\n\
+                 [repos.a.grants]\nC = [\"tag v*\"]\nA = [\"tag v*\"]\n"
+            ))
+            .unwrap()
+        }
+
+        #[test]
+        fn check_lists_every_name_and_the_unreferenced_fields() {
+            let stub = Stub::start(|_| document(json!({ "A": "1", "B": "2", "C": "3", "Z": "4" })));
+            let lines = check(&stub.secrets(30), &ci_config(&stub.addr)).unwrap();
+            assert_eq!(lines, ["A ok", "B ok", "C ok", "unreferenced: Z"]);
+        }
+
+        #[test]
+        fn check_fails_on_a_missing_name() {
+            let stub = Stub::start(|_| document(json!({ "A": "1" })));
+            let error = check(&stub.secrets(30), &ci_config(&stub.addr)).unwrap_err();
+            assert_eq!(
+                error,
+                "A ok\nB missing\nC missing\nmissing in secret/zeughaus/ci: B, C"
+            );
+        }
+
+        #[test]
+        fn check_fails_with_the_message_when_the_document_cannot_be_read() {
+            let stub = Stub::start(|_| (404, "{}".to_owned()));
+            let error = check(&stub.secrets(30), &ci_config(&stub.addr)).unwrap_err();
+            assert_eq!(error, "openbao: no document secret/zeughaus/ci");
+        }
     }
 }

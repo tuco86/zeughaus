@@ -434,110 +434,114 @@ async fn fetch_page(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
-    use zeughaus_terminal::wal::WalWriter;
-
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "zeughaus-transcripts-{name}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create the scratch directory");
-        dir
-    }
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+        use std::time::Instant;
+        use zeughaus_terminal::wal::WalWriter;
 
-    fn text_of(session: &Session) -> String {
-        session
-            .head(0)
-            .rows
-            .iter()
-            .flat_map(|row| row.spans.iter().map(|span| span.text.as_str()))
-            .collect()
-    }
-
-    fn until(what: &str, mut done: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !done() {
-            assert!(Instant::now() < deadline, "timed out waiting for {what}");
-            std::thread::sleep(Duration::from_millis(20));
+        fn scratch(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "zeughaus-transcripts-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create the scratch directory");
+            dir
         }
-    }
 
-    #[test]
-    fn a_transcript_follows_the_wal_and_ends_with_the_recorded_exit() {
-        let state = scratch("follow");
-        let transcripts = Transcripts::new(state.clone());
-        let dir = transcript_dir(&state, "view", 1, "build");
-        std::fs::create_dir_all(&dir).expect("create the transcript directory");
-
-        // Opened before the run wrote anything: the follower waits for it.
-        let id = transcripts.open("view", 1, "build");
-        let session = transcripts.session(id).expect("the screen is open");
-        let mut wal = WalWriter::open(&dir.join("wal"), None).expect("open the WAL");
-        wal.append(1, b"first\r\n").expect("append");
-        until("the first line", || text_of(&session).contains("first"));
-        assert_eq!(session.exit(), None);
-
-        wal.append(2, b"second").expect("append");
-        std::fs::write(dir.join("exit"), "code=3\n").expect("write the exit");
-        until("the exit", || session.exit().is_some());
-        assert_eq!(session.exit(), Some(ExitState::Exited { code: 3 }));
-        let text = text_of(&session);
-        assert!(
-            text.contains("first") && text.contains("second"),
-            "output written before the exit is shown: {text:?}"
-        );
-        let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn transcripts_are_reused_and_the_one_used_longest_ago_makes_room() {
-        let state = scratch("lru");
-        let transcripts = Transcripts::new(state.clone());
-
-        let first = transcripts.open("view", 1, "j0");
-        assert_eq!(
-            transcripts.open("view", 1, "j0"),
-            first,
-            "same job, same screen"
-        );
-        let mut ids = vec![first];
-        for i in 1..MAX_TRANSCRIPTS {
-            ids.push(transcripts.open("view", 1, &format!("j{i}")));
+        fn text_of(session: &Session) -> String {
+            session
+                .head(0)
+                .rows
+                .iter()
+                .flat_map(|row| row.spans.iter().map(|span| span.text.as_str()))
+                .collect()
         }
-        assert!(ids.iter().all(|id| transcripts.exists(*id)));
 
-        // One more closes j0, the oldest.
-        let last = transcripts.open("view", 1, &format!("j{MAX_TRANSCRIPTS}"));
-        assert!(!transcripts.exists(first));
-        assert!(transcripts.exists(ids[1]) && transcripts.exists(last));
+        fn until(what: &str, mut done: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !done() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
 
-        // Using j1 makes j2 the oldest; opening j0 again takes j2's place.
-        assert_eq!(transcripts.open("view", 1, "j1"), ids[1]);
-        let again = transcripts.open("view", 1, "j0");
-        assert_ne!(again, first, "a closed screen is a new one");
-        assert!(!transcripts.exists(ids[2]) && transcripts.exists(ids[1]));
+        #[test]
+        fn a_transcript_follows_the_wal_and_ends_with_the_recorded_exit() {
+            let state = scratch("follow");
+            let transcripts = Transcripts::new(state.clone());
+            let dir = transcript_dir(&state, "view", 1, "build");
+            std::fs::create_dir_all(&dir).expect("create the transcript directory");
 
-        // Closing is idempotent.
-        transcripts.close(ids[1]);
-        assert!(!transcripts.exists(ids[1]));
-        transcripts.close(ids[1]);
-        transcripts.close(TerminalId(123_456));
-        let _ = std::fs::remove_dir_all(&state);
-    }
+            // Opened before the run wrote anything: the follower waits for it.
+            let id = transcripts.open("view", 1, "build");
+            let session = transcripts.session(id).expect("the screen is open");
+            let mut wal = WalWriter::open(&dir.join("wal"), None).expect("open the WAL");
+            wal.append(1, b"first\r\n").expect("append");
+            until("the first line", || text_of(&session).contains("first"));
+            assert_eq!(session.exit(), None);
 
-    #[test]
-    fn the_exit_file_names_a_code_or_none() {
-        let dir = scratch("exit");
-        assert_eq!(read_exit(&dir), None);
-        std::fs::write(dir.join("exit"), "code=0\n").expect("write");
-        assert_eq!(read_exit(&dir), Some(ExitState::Exited { code: 0 }));
-        std::fs::write(dir.join("exit"), "code=none\n").expect("write");
-        assert_eq!(read_exit(&dir), Some(ExitState::Killed));
-        let _ = std::fs::remove_dir_all(&dir);
+            wal.append(2, b"second").expect("append");
+            std::fs::write(dir.join("exit"), "code=3\n").expect("write the exit");
+            until("the exit", || session.exit().is_some());
+            assert_eq!(session.exit(), Some(ExitState::Exited { code: 3 }));
+            let text = text_of(&session);
+            assert!(
+                text.contains("first") && text.contains("second"),
+                "output written before the exit is shown: {text:?}"
+            );
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn transcripts_are_reused_and_the_one_used_longest_ago_makes_room() {
+            let state = scratch("lru");
+            let transcripts = Transcripts::new(state.clone());
+
+            let first = transcripts.open("view", 1, "j0");
+            assert_eq!(
+                transcripts.open("view", 1, "j0"),
+                first,
+                "same job, same screen"
+            );
+            let mut ids = vec![first];
+            for i in 1..MAX_TRANSCRIPTS {
+                ids.push(transcripts.open("view", 1, &format!("j{i}")));
+            }
+            assert!(ids.iter().all(|id| transcripts.exists(*id)));
+
+            // One more closes j0, the oldest.
+            let last = transcripts.open("view", 1, &format!("j{MAX_TRANSCRIPTS}"));
+            assert!(!transcripts.exists(first));
+            assert!(transcripts.exists(ids[1]) && transcripts.exists(last));
+
+            // Using j1 makes j2 the oldest; opening j0 again takes j2's place.
+            assert_eq!(transcripts.open("view", 1, "j1"), ids[1]);
+            let again = transcripts.open("view", 1, "j0");
+            assert_ne!(again, first, "a closed screen is a new one");
+            assert!(!transcripts.exists(ids[2]) && transcripts.exists(ids[1]));
+
+            // Closing is idempotent.
+            transcripts.close(ids[1]);
+            assert!(!transcripts.exists(ids[1]));
+            transcripts.close(ids[1]);
+            transcripts.close(TerminalId(123_456));
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn the_exit_file_names_a_code_or_none() {
+            let dir = scratch("exit");
+            assert_eq!(read_exit(&dir), None);
+            std::fs::write(dir.join("exit"), "code=0\n").expect("write");
+            assert_eq!(read_exit(&dir), Some(ExitState::Exited { code: 0 }));
+            std::fs::write(dir.join("exit"), "code=none\n").expect("write");
+            assert_eq!(read_exit(&dir), Some(ExitState::Killed));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

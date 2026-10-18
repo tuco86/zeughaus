@@ -253,91 +253,8 @@ pub async fn serve_snapshots(replier: Replier, snapshot: Arc<Mutex<Snapshot>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    use weida::{ClientTls, Trust};
-    use zeughaus_link::SNAPSHOT_PATH;
-
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-
-    /// A state directory that removes itself, so the tests below start from
-    /// no credentials at all rather than from the developer's own.
-    struct TempState(PathBuf);
-
-    impl TempState {
-        fn new(tag: &str) -> TempState {
-            let mut path = std::env::temp_dir();
-            path.push(format!(
-                "zeughaus-runner-{tag}-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            let _ = std::fs::remove_dir_all(&path);
-            TempState(path)
-        }
-    }
-
-    impl Drop for TempState {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn loopback() -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], 0))
-    }
-
-    fn pinned(url: &str) -> Fingerprint {
-        EndpointAddr::parse(url)
-            .expect("announced url")
-            .peer
-            .expect("a pinned fingerprint")
-    }
-
-    /// Why the identity is a file: an editor pins what the URL named, and a
-    /// runner that re-keyed on restart would be a different peer to every one
-    /// of them -- which is also what would defeat weida's transparent redial.
-    #[tokio::test]
-    async fn the_announced_fingerprint_survives_a_restart() {
-        let state = TempState::new("restart");
-        let first = Transport::start(loopback(), &state.0).await.expect("start");
-        let before = pinned(first.url());
-        drop(first);
-
-        let second = Transport::start(loopback(), &state.0)
-            .await
-            .expect("restart");
-        assert_eq!(before, pinned(second.url()));
-    }
-
-    /// Authorization is the handshake: this listener carries terminal
-    /// endpoints, so a client whose key was never pinned must not reach an
-    /// endpoint at all -- and the key the runner bootstrapped must.
-    #[tokio::test]
-    async fn only_a_trusted_client_gets_a_connection() {
-        let state = TempState::new("mtls");
-        let transport = Transport::start(loopback(), &state.0).await.expect("start");
-        let _replier = transport
-            .listener()
-            .replier(SNAPSHOT_PATH)
-            .expect("snapshot endpoint");
-        let mut addr = EndpointAddr::parse(transport.url()).expect("announced url");
-        addr.path = SNAPSHOT_PATH.to_owned();
-        let url = addr.to_string();
-
-        let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
-        let anonymous = client.requester(ClientTls::new(Trust::by_address()));
-        let refused =
-            tokio::time::timeout(std::time::Duration::from_secs(10), anonymous.connect(&url))
-                .await
-                .expect("the handshake must fail rather than hang");
-        assert!(refused.is_err(), "an anonymous editor must be refused");
-
-        let identity = credentials::load_client_identity(&state.0).expect("bootstrapped client");
-        let trusted = client.requester(ClientTls::new(Trust::by_address()).with_identity(identity));
-        trusted.connect(&url).await.expect("the pinned client");
-    }
+    use weida::Trust;
 
     #[test]
     fn an_unspecified_bind_address_is_announced_as_loopback() {
@@ -400,5 +317,99 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel::<TriggerRequest>(1);
         drop(rx);
         assert_eq!(offer(&tx, press(1)), Intake::Gone);
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use weida::ClientTls;
+        use zeughaus_link::SNAPSHOT_PATH;
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        /// A state directory that removes itself, so the tests below start from
+        /// no credentials at all rather than from the developer's own.
+        struct TempState(PathBuf);
+
+        impl TempState {
+            fn new(tag: &str) -> TempState {
+                let mut path = std::env::temp_dir();
+                path.push(format!(
+                    "zeughaus-runner-{tag}-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                let _ = std::fs::remove_dir_all(&path);
+                TempState(path)
+            }
+        }
+
+        impl Drop for TempState {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn loopback() -> SocketAddr {
+            SocketAddr::from(([127, 0, 0, 1], 0))
+        }
+
+        fn pinned(url: &str) -> Fingerprint {
+            EndpointAddr::parse(url)
+                .expect("announced url")
+                .peer
+                .expect("a pinned fingerprint")
+        }
+
+        /// Why the identity is a file: an editor pins what the URL named, and a
+        /// runner that re-keyed on restart would be a different peer to every one
+        /// of them -- which is also what would defeat weida's transparent redial.
+        #[tokio::test]
+        async fn the_announced_fingerprint_survives_a_restart() {
+            let state = TempState::new("restart");
+            let first = Transport::start(loopback(), &state.0).await.expect("start");
+            let before = pinned(first.url());
+            drop(first);
+
+            let second = Transport::start(loopback(), &state.0)
+                .await
+                .expect("restart");
+            assert_eq!(before, pinned(second.url()));
+        }
+
+        /// Authorization is the handshake: this listener carries terminal
+        /// endpoints, so a client whose key was never pinned must not reach an
+        /// endpoint at all -- and the key the runner bootstrapped must.
+        #[tokio::test]
+        async fn only_a_trusted_client_gets_a_connection() {
+            let state = TempState::new("mtls");
+            let transport = Transport::start(loopback(), &state.0).await.expect("start");
+            let _replier = transport
+                .listener()
+                .replier(SNAPSHOT_PATH)
+                .expect("snapshot endpoint");
+            let mut addr = EndpointAddr::parse(transport.url()).expect("announced url");
+            addr.path = SNAPSHOT_PATH.to_owned();
+            let url = addr.to_string();
+
+            let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
+            let anonymous = client.requester(ClientTls::new(Trust::by_address()));
+            let refused =
+                tokio::time::timeout(std::time::Duration::from_secs(10), anonymous.connect(&url))
+                    .await
+                    .expect("the handshake must fail rather than hang");
+            assert!(refused.is_err(), "an anonymous editor must be refused");
+
+            let identity =
+                credentials::load_client_identity(&state.0).expect("bootstrapped client");
+            let trusted =
+                client.requester(ClientTls::new(Trust::by_address()).with_identity(identity));
+            trusted.connect(&url).await.expect("the pinned client");
+        }
     }
 }

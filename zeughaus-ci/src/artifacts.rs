@@ -529,85 +529,93 @@ mod tests {
         assert!(producer_for(&none, "a", "y", unassigned).is_err());
     }
 
-    const FP: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
-    const UPLOAD: &str = "0123456789abcdef";
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
 
-    /// A service over a state directory that holds pipeline `demo` #3 (a
-    /// manual run, or a push) with an upload of two bundles.
-    fn service_with(kind: &str) -> (ArtifactService, PathBuf) {
-        use zeughaus_link::enlist::UploadDir;
-        use zeughaus_link::manual::RunUpload;
+        const FP: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
 
-        let state = std::env::temp_dir().join(format!("zci-bundles-{kind}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&state);
-        let record = serde_json::json!({
-            "repo": "demo", "number": 3, "key": "", "sha": null, "status": "running",
-            "created": 0, "jobs": [],
-            "event": {
-                "repo": "demo", "kind": kind, "git_ref": "main", "sha": null, "cron": null,
-                "actor": "a", "delivery": null, "upload": UPLOAD, "received": 0,
-            },
-        });
-        crate::files::write_json(&state.join("ci/pipelines/demo/3.json"), &record).unwrap();
-        let dir = |name: &str| UploadDir {
-            dir: name.to_owned(),
-            sha: "a".repeat(40),
-        };
-        let upload = RunUpload {
-            origin: "git@example.org:me/demo.git".to_owned(),
-            actor: "a".to_owned(),
-            summary: "true".to_owned(),
-            jobs: vec!["build".to_owned()],
-            dirs: vec![dir("demo"), dir("lib")],
-            sizes: vec![5, 3],
-        };
-        std::fs::create_dir_all(manual::upload_dir(&state, UPLOAD)).unwrap();
-        std::fs::write(manual::bundle_path(&state, UPLOAD, 0), b"first").unwrap();
-        std::fs::write(manual::bundle_path(&state, UPLOAD, 1), b"lib").unwrap();
-        manual::write_upload(&state, UPLOAD, &upload).unwrap();
-        let config = CiConfig::parse(&format!(
-            "default_runner = \"x\"\n[runners.x]\nfingerprint = \"{FP}\"\n"
-        ))
-        .unwrap();
-        let service =
-            ArtifactService::new(state.clone(), Arc::new(config), Arc::new(Runners::new()));
-        (service, state)
-    }
+        const UPLOAD: &str = "0123456789abcdef";
 
-    /// A runner gets the bundles of the manual run it is assigned, and of no
-    /// other run: not another runner's, not a push's, not a path.
-    #[test]
-    fn a_manual_bundle_goes_only_to_the_runner_assigned_the_run() {
-        let (service, state) = service_with("manual");
-        let run = "demo.3.build";
-        let path = |index| manual::bundle_path(&state, UPLOAD, index);
+        /// A service over a state directory that holds pipeline `demo` #3 (a
+        /// manual run, or a push) with an upload of two bundles.
+        fn service_with(kind: &str) -> (ArtifactService, PathBuf) {
+            use zeughaus_link::enlist::UploadDir;
+            use zeughaus_link::manual::RunUpload;
 
-        assert!(service.bundle_for("x", run, 0).is_err(), "not assigned yet");
-        service.runners.assign(run, "x");
-        assert_eq!(service.bundle_for("x", run, 0), Ok(path(0)));
-        assert_eq!(service.bundle_for("x", run, 1), Ok(path(1)));
-        assert!(service.bundle_for("x", run, 2).is_err(), "no third bundle");
-        assert!(service.bundle_for("y", run, 0).is_err(), "another runner");
-        for bad in [
-            "demo.4.build",
-            "../demo.3.build",
-            "demo.3.../build",
-            "demo",
-            "",
-        ] {
-            assert!(service.bundle_for("x", bad, 0).is_err(), "{bad:?}");
+            let state =
+                std::env::temp_dir().join(format!("zci-bundles-{kind}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&state);
+            let record = serde_json::json!({
+                "repo": "demo", "number": 3, "key": "", "sha": null, "status": "running",
+                "created": 0, "jobs": [],
+                "event": {
+                    "repo": "demo", "kind": kind, "git_ref": "main", "sha": null, "cron": null,
+                    "actor": "a", "delivery": null, "upload": UPLOAD, "received": 0,
+                },
+            });
+            crate::files::write_json(&state.join("ci/pipelines/demo/3.json"), &record).unwrap();
+            let dir = |name: &str| UploadDir {
+                dir: name.to_owned(),
+                sha: "a".repeat(40),
+            };
+            let upload = RunUpload {
+                origin: "git@example.org:me/demo.git".to_owned(),
+                actor: "a".to_owned(),
+                summary: "true".to_owned(),
+                jobs: vec!["build".to_owned()],
+                dirs: vec![dir("demo"), dir("lib")],
+                sizes: vec![5, 3],
+            };
+            std::fs::create_dir_all(manual::upload_dir(&state, UPLOAD)).unwrap();
+            std::fs::write(manual::bundle_path(&state, UPLOAD, 0), b"first").unwrap();
+            std::fs::write(manual::bundle_path(&state, UPLOAD, 1), b"lib").unwrap();
+            manual::write_upload(&state, UPLOAD, &upload).unwrap();
+            let config = CiConfig::parse(&format!(
+                "default_runner = \"x\"\n[runners.x]\nfingerprint = \"{FP}\"\n"
+            ))
+            .unwrap();
+            let service =
+                ArtifactService::new(state.clone(), Arc::new(config), Arc::new(Runners::new()));
+            (service, state)
         }
-        service.runners.unassign(run);
-        assert!(
-            service.bundle_for("x", run, 0).is_err(),
-            "no longer assigned"
-        );
-        let _ = std::fs::remove_dir_all(&state);
 
-        // The same upload named by a pipeline that is no manual run.
-        let (service, state) = service_with("push");
-        service.runners.assign(run, "x");
-        assert!(service.bundle_for("x", run, 0).is_err());
-        let _ = std::fs::remove_dir_all(&state);
+        /// A runner gets the bundles of the manual run it is assigned, and of no
+        /// other run: not another runner's, not a push's, not a path.
+        #[test]
+        fn a_manual_bundle_goes_only_to_the_runner_assigned_the_run() {
+            let (service, state) = service_with("manual");
+            let run = "demo.3.build";
+            let path = |index| manual::bundle_path(&state, UPLOAD, index);
+
+            assert!(service.bundle_for("x", run, 0).is_err(), "not assigned yet");
+            service.runners.assign(run, "x");
+            assert_eq!(service.bundle_for("x", run, 0), Ok(path(0)));
+            assert_eq!(service.bundle_for("x", run, 1), Ok(path(1)));
+            assert!(service.bundle_for("x", run, 2).is_err(), "no third bundle");
+            assert!(service.bundle_for("y", run, 0).is_err(), "another runner");
+            for bad in [
+                "demo.4.build",
+                "../demo.3.build",
+                "demo.3.../build",
+                "demo",
+                "",
+            ] {
+                assert!(service.bundle_for("x", bad, 0).is_err(), "{bad:?}");
+            }
+            service.runners.unassign(run);
+            assert!(
+                service.bundle_for("x", run, 0).is_err(),
+                "no longer assigned"
+            );
+            let _ = std::fs::remove_dir_all(&state);
+
+            // The same upload named by a pipeline that is no manual run.
+            let (service, state) = service_with("push");
+            service.runners.assign(run, "x");
+            assert!(service.bundle_for("x", run, 0).is_err());
+            let _ = std::fs::remove_dir_all(&state);
+        }
     }
 }

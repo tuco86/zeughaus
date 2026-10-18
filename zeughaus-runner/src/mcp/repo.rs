@@ -274,114 +274,11 @@ fn runners_line(view: &RepoView) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use zeughaus_link::{ChannelView, JobView, MachineView, PipelineView};
 
     use super::*;
 
     const HEAD: &str = "3635dad0123456789abcdef0123456789abcdef0";
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    /// A directory under the system's temporary one, removed on drop.
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        fn new(tag: &str) -> Scratch {
-            let path = std::env::temp_dir().join(format!(
-                "zeughaus-mcp-repo-{tag}-{}-{}",
-                std::process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            ));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).expect("scratch directory");
-            Scratch(path)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// Git as a test fixture runs it: its own identity, whatever the
-    /// developer has configured.
-    fn fx(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(["-c", "user.name=fx", "-c", "user.email=fx@example.invalid"])
-            .args(["-c", "commit.gpgsign=false"])
-            .args(args)
-            .output()
-            .expect("run git");
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
-    }
-
-    fn same_directory(a: &Path, b: &Path) -> bool {
-        std::fs::canonicalize(a).expect("a") == std::fs::canonicalize(b).expect("b")
-    }
-
-    #[test]
-    fn a_checkout_is_named_by_its_origin_without_credentials_and_by_its_head() {
-        let base = Scratch::new("named");
-        fx(&base.0, &["init", "-q"]);
-        fx(
-            &base.0,
-            &[
-                "remote",
-                "add",
-                "origin",
-                "https://hannes:secret@git.example.invalid/o/demo.git",
-            ],
-        );
-        fx(&base.0, &["commit", "-q", "--allow-empty", "-m", "first"]);
-        std::fs::create_dir_all(base.0.join("sub")).expect("subdirectory");
-
-        // From the top and from a directory inside it: the same checkout.
-        for path in [base.0.clone(), base.0.join("sub")] {
-            let found = checkout(&path).expect("a checkout");
-            assert!(same_directory(&found.root, &base.0), "{:?}", found.root);
-            assert_eq!(found.origin, "https://git.example.invalid/o/demo.git");
-            assert_eq!(found.head, Some(fx(&base.0, &["rev-parse", "HEAD"])));
-        }
-    }
-
-    #[test]
-    fn a_checkout_without_a_commit_has_no_head() {
-        let base = Scratch::new("unborn");
-        fx(&base.0, &["init", "-q"]);
-        fx(
-            &base.0,
-            &["remote", "add", "origin", "git@example.invalid:o/demo.git"],
-        );
-        let found = checkout(&base.0).expect("a checkout");
-        assert_eq!(found.origin, "git@example.invalid:o/demo.git");
-        assert_eq!(found.head, None);
-    }
-
-    #[test]
-    fn what_is_no_checkout_or_has_no_origin_is_refused_with_the_reason() {
-        let base = Scratch::new("refused");
-        let err = checkout(&base.0).expect_err("not a repository");
-        assert!(err.contains("is not inside a git checkout"), "{err}");
-        let err = checkout(&base.0.join("missing")).expect_err("missing");
-        assert!(err.contains("is not a directory"), "{err}");
-
-        fx(&base.0, &["init", "-q"]);
-        let err = checkout(&base.0).expect_err("no origin");
-        assert!(
-            err.ends_with("has no origin remote, so no CI repository can be named"),
-            "{err}"
-        );
-    }
 
     fn job_def(name: &str, on: &[&str], needs: &[&str], runner: &str, at: &str) -> JobDefView {
         let owned = |list: &[&str]| list.iter().map(|item| (*item).to_owned()).collect();
@@ -736,5 +633,114 @@ mod tests {
     #[test]
     fn the_text_is_ascii() {
         assert!(describe(&zeughaus(), Some(HEAD)).is_ascii());
+    }
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        use std::process::Command;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        /// A directory under the system's temporary one, removed on drop.
+        struct Scratch(PathBuf);
+
+        impl Scratch {
+            fn new(tag: &str) -> Scratch {
+                let path = std::env::temp_dir().join(format!(
+                    "zeughaus-mcp-repo-{tag}-{}-{}",
+                    std::process::id(),
+                    COUNTER.fetch_add(1, Ordering::Relaxed)
+                ));
+                let _ = std::fs::remove_dir_all(&path);
+                std::fs::create_dir_all(&path).expect("scratch directory");
+                Scratch(path)
+            }
+        }
+
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        /// Git as a test fixture runs it: its own identity, whatever the
+        /// developer has configured.
+        fn fx(dir: &Path, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .current_dir(dir)
+                .args(["-c", "user.name=fx", "-c", "user.email=fx@example.invalid"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+
+        fn same_directory(a: &Path, b: &Path) -> bool {
+            std::fs::canonicalize(a).expect("a") == std::fs::canonicalize(b).expect("b")
+        }
+
+        #[test]
+        fn a_checkout_is_named_by_its_origin_without_credentials_and_by_its_head() {
+            let base = Scratch::new("named");
+            fx(&base.0, &["init", "-q"]);
+            fx(
+                &base.0,
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://hannes:secret@git.example.invalid/o/demo.git",
+                ],
+            );
+            fx(&base.0, &["commit", "-q", "--allow-empty", "-m", "first"]);
+            std::fs::create_dir_all(base.0.join("sub")).expect("subdirectory");
+
+            // From the top and from a directory inside it: the same checkout.
+            for path in [base.0.clone(), base.0.join("sub")] {
+                let found = checkout(&path).expect("a checkout");
+                assert!(same_directory(&found.root, &base.0), "{:?}", found.root);
+                assert_eq!(found.origin, "https://git.example.invalid/o/demo.git");
+                assert_eq!(found.head, Some(fx(&base.0, &["rev-parse", "HEAD"])));
+            }
+        }
+
+        #[test]
+        fn a_checkout_without_a_commit_has_no_head() {
+            let base = Scratch::new("unborn");
+            fx(&base.0, &["init", "-q"]);
+            fx(
+                &base.0,
+                &["remote", "add", "origin", "git@example.invalid:o/demo.git"],
+            );
+            let found = checkout(&base.0).expect("a checkout");
+            assert_eq!(found.origin, "git@example.invalid:o/demo.git");
+            assert_eq!(found.head, None);
+        }
+
+        #[test]
+        fn what_is_no_checkout_or_has_no_origin_is_refused_with_the_reason() {
+            let base = Scratch::new("refused");
+            let err = checkout(&base.0).expect_err("not a repository");
+            assert!(err.contains("is not inside a git checkout"), "{err}");
+            let err = checkout(&base.0.join("missing")).expect_err("missing");
+            assert!(err.contains("is not a directory"), "{err}");
+
+            fx(&base.0, &["init", "-q"]);
+            let err = checkout(&base.0).expect_err("no origin");
+            assert!(
+                err.ends_with("has no origin remote, so no CI repository can be named"),
+                "{err}"
+            );
+        }
     }
 }

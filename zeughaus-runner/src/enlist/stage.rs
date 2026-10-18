@@ -123,19 +123,25 @@ pub fn engine(engine: Engine, args: &[&str]) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_linked_tree_shares_its_files_and_keeps_its_shape() {
-        use std::os::unix::fs::MetadataExt;
-        let base = std::env::temp_dir().join(format!("zci-link-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let from = base.join("from");
-        std::fs::create_dir_all(from.join("sub")).unwrap();
-        std::fs::write(from.join("sub/a"), "a").unwrap();
-        let to = base.join("to");
-        link_tree(&from, &to).unwrap();
-        let same = std::fs::metadata(from.join("sub/a")).unwrap().ino()
-            == std::fs::metadata(to.join("sub/a")).unwrap().ino();
-        let _ = std::fs::remove_dir_all(&base);
-        assert!(same);
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+
+        #[test]
+        fn a_linked_tree_shares_its_files_and_keeps_its_shape() {
+            use std::os::unix::fs::MetadataExt;
+            let base = std::env::temp_dir().join(format!("zci-link-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let from = base.join("from");
+            std::fs::create_dir_all(from.join("sub")).unwrap();
+            std::fs::write(from.join("sub/a"), "a").unwrap();
+            let to = base.join("to");
+            link_tree(&from, &to).unwrap();
+            let same = std::fs::metadata(from.join("sub/a")).unwrap().ino()
+                == std::fs::metadata(to.join("sub/a")).unwrap().ino();
+            let _ = std::fs::remove_dir_all(&base);
+            assert!(same);
+        }
     }
 }
