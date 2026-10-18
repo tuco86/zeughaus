@@ -162,6 +162,12 @@ fn validate(
             "exactly one of `on` and `needs` must be non-empty".into(),
         ));
     }
+    if !job.channels.is_empty() && !job.on.is_empty() {
+        return Err(fail(
+            "`channels` is for a job with `needs`; a job with `on` is selected by its own patterns"
+                .into(),
+        ));
+    }
     for need in &job.needs {
         if !all.contains_key(need) {
             return Err(fail(format!("needs unknown job `{need}`")));
@@ -285,10 +291,11 @@ fn topological(by_name: BTreeMap<String, JobDef>) -> Result<Vec<JobDef>, String>
         .collect())
 }
 
-/// The jobs `event` runs: those with a matching `on`, then every job whose
-/// needs are all selected, repeated until nothing changes. `jobs` must be in
-/// topological order (as `load_jobs` returns them); so is the result.
-pub fn select(jobs: &[JobDef], event: &CiEvent) -> Vec<String> {
+/// The jobs `event` runs in `channel`: those with a matching `on`, then every
+/// job whose needs are all selected and whose `channels` allow `channel`,
+/// repeated until nothing changes. `jobs` must be in topological order (as
+/// `load_jobs` returns them); so is the result.
+pub fn select(jobs: &[JobDef], event: &CiEvent, channel: &str) -> Vec<String> {
     let mut selected: BTreeSet<&str> = jobs
         .iter()
         .filter(|j| {
@@ -303,6 +310,7 @@ pub fn select(jobs: &[JobDef], event: &CiEvent) -> Vec<String> {
             .filter(|j| {
                 !selected.contains(j.name.as_str())
                     && !j.needs.is_empty()
+                    && (j.channels.is_empty() || j.channels.iter().any(|c| c == channel))
                     && j.needs.iter().all(|n| selected.contains(n.as_str()))
             })
             .map(|j| j.name.as_str())
@@ -578,6 +586,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_needs_job_with_channels_runs_only_in_those() {
+        let jobs = load(&[
+            file("box.sh", "on = [\"push main\", \"cron 0 4 * * *\"]"),
+            file("after.sh", "needs = [\"box\"]\nchannels = [\"nightly\"]"),
+            file("always.sh", "needs = [\"box\"]"),
+        ])
+        .unwrap();
+        let push = ev(EventKind::Push, "main", None);
+        let cron = ev(EventKind::Cron, "main", Some("0 4 * * *"));
+        assert_eq!(select(&jobs, &push, "dev"), ["box", "always"]);
+        assert_eq!(select(&jobs, &cron, "nightly"), ["box", "after", "always"]);
+    }
+
+    #[test]
+    fn channels_with_on_is_refused() {
+        let err = load(&[file(
+            "a.sh",
+            "on = [\"push main\"]\nchannels = [\"nightly\"]",
+        )])
+        .unwrap_err();
+        assert!(
+            err.contains("`channels` is for a job with `needs`"),
+            "{err}"
+        );
+    }
+
     fn sample() -> Vec<JobDef> {
         load(&[
             file("hello.sh", "on = [\"push main\"]"),
@@ -594,11 +629,11 @@ mod tests {
     fn select_follows_needs() {
         let jobs = sample();
         assert_eq!(
-            select(&jobs, &ev(EventKind::Push, "main", None)),
+            select(&jobs, &ev(EventKind::Push, "main", None), "dev"),
             ["box", "hello", "after"]
         );
         assert_eq!(
-            select(&jobs, &ev(EventKind::Tag, "v1", None)),
+            select(&jobs, &ev(EventKind::Tag, "v1", None), "tags"),
             ["box", "only-tag"]
         );
     }
@@ -607,22 +642,33 @@ mod tests {
     fn job_is_excluded_when_one_need_is_not_selected() {
         let jobs = sample();
         // `after` needs hello, which a tag does not select.
-        let tag = select(&jobs, &ev(EventKind::Tag, "v1", None));
+        let tag = select(&jobs, &ev(EventKind::Tag, "v1", None), "tags");
         assert!(tag.contains(&"box".to_string()));
         assert!(!tag.contains(&"hello".to_string()));
         assert!(!tag.contains(&"after".to_string()));
         assert!(!tag.contains(&"pub".to_string()));
-        assert!(select(&jobs, &ev(EventKind::Push, "dev", None)).is_empty());
+        assert!(select(&jobs, &ev(EventKind::Push, "dev", None), "dev").is_empty());
     }
 
     #[test]
     fn select_cron_and_schedules() {
         let jobs = sample();
         assert_eq!(
-            select(&jobs, &ev(EventKind::Cron, "main", Some("0  4 * * *"))),
+            select(
+                &jobs,
+                &ev(EventKind::Cron, "main", Some("0  4 * * *")),
+                "cron"
+            ),
             ["nightly"]
         );
-        assert!(select(&jobs, &ev(EventKind::Cron, "main", Some("0 5 * * *"))).is_empty());
+        assert!(
+            select(
+                &jobs,
+                &ev(EventKind::Cron, "main", Some("0 5 * * *")),
+                "cron"
+            )
+            .is_empty()
+        );
         assert_eq!(cron_schedules(&jobs), ["0 4 * * *"]);
     }
 }

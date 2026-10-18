@@ -750,6 +750,9 @@ holds these keys:
 
 - `on`: `push <glob>`, `tag <glob>`, or `cron <5 fields>`;
 - `needs`: exactly one of `on` and `needs` is set;
+- `channels`: only with `needs`; the channels the job is added in (names from
+  `channels.toml`, or `tags`, `cron`, `try`); without it a job with `needs`
+  runs in every channel that selects what it needs;
 - `image` (a `.zeughaus-ci/<image>.Containerfile`), `machine` (a runner or
   a Windows VM of one, by name) or `platform` (a key of `ci.toml`
   `[platforms]`, exclusive with `machine`); none means the host of the
@@ -762,7 +765,8 @@ holds these keys:
 Files without a header are helpers. `zeughaus-ci check` validates a folder and
 `zeughaus-ci plan` shows what an event selects, both without a service
 (`header.rs`, `pipeline.rs`). The selection is the jobs whose `on` matches the
-event, plus every job whose `needs` are all selected.
+event, plus every job whose `needs` are all selected and whose `channels`, when
+it names any, include the event's channel.
 
 **Where a job runs** is decided once, when its pipeline is set up
 (`scheduler.rs`, `place_job`), and kept in the job's record as `runner` and

@@ -28,6 +28,10 @@ pub struct JobDef {
     pub file: String,
     pub on: Vec<String>,
     pub needs: Vec<String>,
+    /// The channels a job with `needs` is added in; empty means every channel
+    /// that selects a job it needs. Only meaningful together with `needs`.
+    #[serde(default)]
+    pub channels: Vec<String>,
     pub image: Option<String>,
     pub machine: Option<String>,
     /// A platform of `ci.toml` `[platforms]`: the job runs where that platform
@@ -63,6 +67,8 @@ struct JobHeader {
     on: Vec<String>,
     #[serde(default)]
     needs: Vec<String>,
+    #[serde(default)]
+    channels: Vec<String>,
     image: Option<String>,
     machine: Option<String>,
     platform: Option<String>,
@@ -201,6 +207,7 @@ pub fn parse_job(file_name: &str, text: &str) -> Result<Option<JobDef>, String> 
         platform: header.platform,
         context: header.context,
         cache: header.cache,
+        channels: header.channels,
         secrets: header.secrets,
         when_busy: header.when_busy,
         env: header.env,

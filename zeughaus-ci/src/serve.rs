@@ -572,6 +572,7 @@ mod tests {
                 platform: None,
                 context: None,
                 cache: Vec::new(),
+                channels: Vec::new(),
                 secrets: Vec::new(),
                 when_busy: Default::default(),
                 env: Default::default(),

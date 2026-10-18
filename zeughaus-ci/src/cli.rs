@@ -30,7 +30,7 @@ use std::process::ExitCode;
 use zeughaus_link::credentials;
 
 use crate::CI_DIR;
-use crate::channels::Channels;
+use crate::channels::{CHANNELS_FILE, Channels, TRY_CHANNEL};
 use crate::config::CiConfig;
 use crate::event::{self, CiEvent, EventKind};
 use crate::excerpt;
@@ -117,6 +117,23 @@ fn load_dir(dir: &Path) -> Result<(Vec<JobDef>, Channels), String> {
     Ok((jobs, Channels::from_files(&files)?))
 }
 
+/// Every channel a job names exists: in `channels.toml`, or one of the
+/// fallback names an event without a listed channel gets.
+fn check_job_channels(jobs: &[JobDef], channels: &Channels) -> Result<(), String> {
+    let known = |c: &str| {
+        matches!(c, "tags" | "cron" | TRY_CHANNEL) || channels.names().any(|(name, ..)| name == c)
+    };
+    for job in jobs {
+        if let Some(c) = job.channels.iter().find(|c| !known(c)) {
+            return Err(format!(
+                "{CI_DIR}/{}: channel `{c}` is not in {CHANNELS_FILE} and is no fallback name (tags, cron, try)",
+                job.file
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validates the folder as a pipeline would, placement included when the
 /// state directory has a `ci.toml`: whether `freeze` fits a job's `platform`
 /// or `machine` depends on what `ci.toml` maps it to.
@@ -128,6 +145,7 @@ fn check(state_dir: &Path, args: &[String]) -> Result<(), String> {
     };
     let dir = Path::new(dir);
     let (jobs, channels) = load_dir(dir)?;
+    check_job_channels(&jobs, &channels)?;
     let config = match CiConfig::load(state_dir) {
         Ok(Some(config)) => Some(config),
         Ok(None) => {
@@ -245,7 +263,7 @@ fn plan(args: &[String]) -> Result<(), String> {
     let event = parse_event("", kind, rest, "main")?;
     let (jobs, channels) = load_dir(Path::new(dir))?;
     println!("channel {}", channels.of(&event));
-    let selected = pipeline::select(&jobs, &event);
+    let selected = pipeline::select(&jobs, &event, &channels.of(&event));
     if selected.is_empty() {
         println!("no jobs");
     } else {
@@ -421,4 +439,30 @@ fn secrets_check(state_dir: &Path, args: &[String]) -> Result<(), String> {
         println!("{line}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job_in(channels: &str) -> JobDef {
+        let text = format!("# /// ci\n# needs = [\"a\"]\n# channels = [{channels}]\n# ///\n");
+        header::parse_job("b.sh", &text).unwrap().unwrap()
+    }
+
+    #[test]
+    fn a_job_may_name_listed_channels_and_the_fallback_names_only() {
+        let channels = Channels::from_files(&[(
+            CHANNELS_FILE.to_owned(),
+            "[[channel]]\nname = \"nightly\"\non = [\"cron *\"]\n".to_owned(),
+        )])
+        .unwrap();
+        let ok = job_in("\"nightly\", \"tags\", \"cron\", \"try\"");
+        assert!(check_job_channels(&[ok], &channels).is_ok());
+        let err = check_job_channels(&[job_in("\"nightlyy\"")], &channels).unwrap_err();
+        assert!(
+            err.contains("channel `nightlyy` is not in channels.toml"),
+            "{err}"
+        );
+    }
 }

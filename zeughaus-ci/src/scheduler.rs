@@ -902,7 +902,7 @@ impl Scheduler {
             return Ok(None);
         }
         let jobs = pipeline::load_jobs(&files, &containerfiles)?;
-        let selected = pipeline::select(&jobs, event);
+        let selected = pipeline::select(&jobs, event, &pipeline.channel);
         let mut planned = Vec::new();
         for def in jobs.into_iter().filter(|job| selected.contains(&job.name)) {
             let (runner, place) = place_job(&self.config, name, &def, |image| {
@@ -970,6 +970,7 @@ impl Scheduler {
             platform: None,
             context: Some(TRY_WORKSPACE.to_owned()),
             cache: Vec::new(),
+            channels: Vec::new(),
             secrets: Vec::new(),
             when_busy: WhenBusy::Wait,
             env: BTreeMap::new(),
@@ -2520,6 +2521,7 @@ mod tests {
             platform: platform.map(str::to_owned),
             context: None,
             cache: Vec::new(),
+            channels: Vec::new(),
             secrets: Vec::new(),
             when_busy: WhenBusy::Wait,
             env: Default::default(),
