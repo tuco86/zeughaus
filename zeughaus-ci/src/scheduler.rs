@@ -46,6 +46,10 @@ const ALERT_CAUSE_CHARS: usize = 200;
 /// A job's note, and the forge's description, when its pipeline was cancelled.
 const CANCELLED: &str = "cancelled";
 
+/// The error of a transfer that was still open when its job ended without
+/// starting.
+const ABANDONED: &str = "the job ended before the set arrived";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JobStatus {
@@ -175,6 +179,22 @@ impl JobRecord {
             return None;
         }
         self.excerpt.as_deref().and_then(excerpt::cause)
+    }
+
+    /// Ends the transfers still open when the job ended without its program
+    /// starting. Its runner drops what was on its way (`DropPrefetch`) and
+    /// the CI ignores reports about an ended job, so no report would end
+    /// them, and editors would show the set as moving for good. Uses the
+    /// job's end as their end; `true` when one was open.
+    fn abandon_transfers(&mut self) -> bool {
+        let at = self.finished.unwrap_or_else(crate::now_secs);
+        let mut any = false;
+        for transfer in self.transfers.iter_mut().filter(|t| t.finished.is_none()) {
+            transfer.finished = Some(at);
+            transfer.error = Some(ABANDONED.to_owned());
+            any = true;
+        }
+        any
     }
 }
 
@@ -315,6 +335,21 @@ fn backfill_subjects(state_dir: &Path, changes: &Sender<CiChange>) {
                 pipeline.subject = subject.clone();
                 pipeline.save(state_dir, changes);
             }
+        }
+    }
+}
+
+/// Ends the transfers that stored records of ended jobs still hold open
+/// (see [`JobRecord::abandon_transfers`]). Idempotent: a record without one
+/// is not written.
+fn close_abandoned_transfers(state_dir: &Path, changes: &Sender<CiChange>) {
+    for mut pipeline in load_pipelines(state_dir) {
+        let mut changed = false;
+        for job in pipeline.jobs.iter_mut().filter(|j| j.status.is_terminal()) {
+            changed |= job.abandon_transfers();
+        }
+        if changed {
+            pipeline.save(state_dir, changes);
         }
     }
 }
@@ -534,6 +569,7 @@ impl Scheduler {
     /// connects, and that report settles the job.
     fn recover(&mut self) {
         backfill_subjects(&self.state_dir, &self.changes);
+        close_abandoned_transfers(&self.state_dir, &self.changes);
         manual::remove_stale(&self.state_dir, manual::STALE_AFTER);
         for pipeline in load_pipelines(&self.state_dir) {
             if pipeline.status != PipelineStatus::Running {
@@ -1181,6 +1217,7 @@ impl Scheduler {
                     pipeline.jobs[ji].status = JobStatus::Skipped;
                     pipeline.jobs[ji].note = note.clone();
                     pipeline.jobs[ji].finished = Some(crate::now_secs());
+                    pipeline.jobs[ji].abandon_transfers();
                     pipeline.save(&self.state_dir, &self.changes);
                     self.drop_prefetch(pi, ji);
                     let pipeline = self.running[pi].clone();
@@ -1263,6 +1300,7 @@ impl Scheduler {
         job.status = JobStatus::Failed;
         job.note = note.clone();
         job.finished = Some(crate::now_secs());
+        job.abandon_transfers();
         let name = job.def.name.clone();
         pipeline.save(&self.state_dir, &self.changes);
         self.drop_prefetch(pi, ji);
@@ -1284,6 +1322,7 @@ impl Scheduler {
         job.status = JobStatus::Skipped;
         job.note = note.clone();
         job.finished = Some(crate::now_secs());
+        job.abandon_transfers();
         let name = job.def.name.clone();
         pipeline.save(&self.state_dir, &self.changes);
         self.drop_prefetch(pi, ji);
@@ -1344,6 +1383,7 @@ impl Scheduler {
         job.status = JobStatus::Skipped;
         job.note = CANCELLED.to_owned();
         job.finished = Some(crate::now_secs());
+        job.abandon_transfers();
         let name = job.def.name.clone();
         pipeline.save(&self.state_dir, &self.changes);
         self.drop_prefetch(pi, ji);
@@ -3903,6 +3943,77 @@ mod tests {
             s.running.push(p);
             s.fail_job(4, 1, "cannot fetch inputs of a".to_owned(), State::Error);
             assert!(y.try_recv().is_err());
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_job_that_ends_before_it_starts_leaves_no_transfer_open() {
+            let state = scratch("abandoned-transfers");
+            let mut s = scheduler(&state);
+            let open = TransferRecord {
+                need: "a".to_owned(),
+                started: 1,
+                finished: None,
+                bytes: None,
+                error: None,
+            };
+            let assert_closed = |b: &JobRecord| {
+                assert!(b.status.is_terminal(), "{:?}", b.status);
+                assert_eq!(b.transfers.len(), 1);
+                assert_eq!(b.transfers[0].finished, b.finished);
+                assert_eq!(b.transfers[0].error.as_deref(), Some(ABANDONED));
+            };
+
+            // `b` was receiving `a` when its other need `c` failed.
+            let mut p = two_jobs("x");
+            p.jobs.push(record("c", &[], "x", JobStatus::Failed));
+            p.jobs[1].def.needs.push("c".to_owned());
+            p.jobs[1].transfers.push(open.clone());
+            s.running.push(p);
+            s.advance();
+            assert_closed(&s.running[0].jobs[1]);
+            // The record on disk is the one the editors are told about.
+            assert_closed(&load_pipeline(&state, "view", 7).unwrap().jobs[1]);
+
+            // Cancelled, failed while staging, and skipped for its runner.
+            let mut p = two_jobs("x");
+            p.number = 8;
+            p.cancelled = true;
+            p.jobs[1].transfers.push(open.clone());
+            s.running.push(p);
+            s.apply_cancel(1);
+            assert_closed(&s.running[1].jobs[1]);
+            let mut p = two_jobs("x");
+            p.number = 9;
+            p.jobs[1].status = JobStatus::Starting;
+            p.jobs[1].assigned = Some(5);
+            p.jobs[1].transfers.push(open.clone());
+            s.running.push(p);
+            s.fail_job(2, 1, "cannot fetch inputs of a".to_owned(), State::Error);
+            assert_closed(&s.running[2].jobs[1]);
+            let mut p = two_jobs("x");
+            p.number = 10;
+            p.jobs[1].transfers.push(open.clone());
+            s.running.push(p);
+            s.skip_offline(3, 1, "y");
+            assert_closed(&s.running[3].jobs[1]);
+
+            // A stored record of an ended job is repaired at start; a job
+            // still waiting keeps its transfer open.
+            let mut p = two_jobs("x");
+            p.number = 11;
+            p.jobs[1].status = JobStatus::Skipped;
+            p.jobs[1].finished = Some(20);
+            p.jobs[1].transfers.push(open.clone());
+            let mut waiting = record("d", &["a"], "y", JobStatus::Pending);
+            waiting.transfers.push(open.clone());
+            p.jobs.push(waiting);
+            p.save(&state, &s.changes);
+            close_abandoned_transfers(&state, &s.changes);
+            let saved = load_pipeline(&state, "view", 11).unwrap();
+            assert_closed(&saved.jobs[1]);
+            assert_eq!(saved.jobs[1].transfers[0].finished, Some(20));
+            assert_eq!(saved.jobs[2].transfers, vec![open]);
             let _ = std::fs::remove_dir_all(&state);
         }
 

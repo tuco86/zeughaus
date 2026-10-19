@@ -977,6 +977,11 @@ set into `inputs/`, waits for it if it is still going, and downloads again if
 it failed. A job that ends without being assigned (skipped, cancelled or
 failed) after a fetch began gets its runner a `DropPrefetch { consumer }`;
 `Forget`, a failed staging and the start of a runner remove what is left.
+The CI ignores transfer reports about a job that has ended, so a job that
+ends before its program starts closes its open transfers itself, at its own
+end and with the error `the job ended before the set arrived`; at start the
+CI closes such transfers in stored records too. Otherwise editors would show
+those sets as moving for good.
 Once every job that needs a set has ended (succeeded, failed or skipped), and
 at once for a set nobody needs, the CI sends the producing runner
 `DropArtifacts { run }`; a runner's `Hello` lists the sets it holds, and the

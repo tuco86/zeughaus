@@ -193,6 +193,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outputs from the future. The container now sets its clock from the host's
   (5 ms ahead) before the job starts, and a job whose image cannot do that
   gets a warning in its log.
+- CI: a job that ends before its program starts (skipped because a need
+  failed, cancelled, failed while staging, or skipped for an offline
+  runner) no longer shows an input as still arriving. Its runner's report
+  of that transfer's end came after the job had ended and was ignored, so
+  the CI tab animated the cable and `ci_timing` said `receiving` for good.
+  Such transfers now end with the job, and the CI closes them in stored
+  records when it starts.
 
 ## [0.2.1] - 2026-10-16
 
