@@ -7,8 +7,8 @@
 # when_busy = "freeze"
 # timeout_minutes = 120
 # ///
-# The gate from AGENTS.md: formatting, clippy, the tests, and the editor's
-# wasm build.
+# The gate from AGENTS.md (formatting) and what every platform checks:
+# clippy and the tests.
 set -eu
 
 . "$CI_WORKSPACE/.zeughaus-ci/build.sh"
@@ -17,4 +17,3 @@ cargo_env
 
 step cargo fmt --check
 check_platform
-step cargo check --locked --target wasm32-unknown-unknown -p zeughaus

@@ -162,8 +162,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI: zeughaus's own pipeline is a build job and a check job per platform
   (`build-<p>`, `check-<p>` for `linux-amd64`, `linux-arm64`, `darwin-arm64`
   and `windows-amd64`; the check `needs` its build and finds its `target/`
-  warm). Every platform now runs clippy with `-D warnings` and the workspace
-  tests, and `linux-amd64` also `cargo fmt --check` and the wasm check;
+  warm). Every platform now runs clippy with `-D warnings`, the doctests and
+  the unit tier of the tests on a push or manual run, both tiers on the
+  nightly cron and a tag, and `linux-amd64` also `cargo fmt --check`;
   `publish` needs all eight jobs. The old `gate`, `linux-amd64`,
   `linux-arm64`, `darwin-arm64` and `windows-amd64` jobs and the
   `windows-runner` channel are gone, and a push to a branch other than

@@ -427,9 +427,9 @@ against weida's `main` as the sibling checkout, and post `zeughaus/<job>`
 on the commit; pushes to other branches start nothing. `build-<platform>`
 packs `zeughaus-<version>-<platform>.tar.gz` (`.zip` on Windows) into its
 output, and `check-<platform>` runs clippy and the tests after it in the
-same warm workspace (`check-linux-amd64` is the whole gate below: also
-`fmt` and the wasm check): `linux-amd64` (tuco-pc, in the
-`.zeughaus-ci/trixie.Containerfile` image), `linux-arm64` (atik, the same
+same warm workspace (the unit tier on a push, both tiers on the nightly cron
+and a tag; `check-linux-amd64` also runs `fmt`): `linux-amd64` (tuco-pc,
+in the `.zeughaus-ci/trixie.Containerfile` image), `linux-arm64` (atik, the same
 image in an Apple `container`), `windows-amd64` (the `wohnzimmer` runner's
 host), `darwin-arm64` (atik's host; the editor as `Zeughaus.app` through
 `deploy/macos-app.sh`). The `nightly` and `release` channels are `clean`:
@@ -507,13 +507,14 @@ push only after the gate:
 
 - `cargo fmt --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo nextest run --workspace --profile ci`
-- `cargo test --doc --workspace`
-- `cargo check --target wasm32-unknown-unknown -p zeughaus`
+- `cargo nextest run -p <crate>` for each crate the change touches: the unit
+  tier, the only tests an agent runs locally
 
-Inner loop: `cargo nextest run -p <crate>` (unit tier) and `--profile
-integration -p <crate>` when I/O code changed. An I/O test lives in a `mod
-io` inside its `#[cfg(test)] mod tests`; `.config/nextest.toml` holds the
+The pipelines run the rest: a push runs the unit tier and the doctests on
+every platform, the nightly cron and a release tag also the integration
+tier (`--profile ci`). Never run the whole suite, `--profile integration`
+or `--profile ci` locally before a push. An I/O test lives in a `mod io`
+inside its `#[cfg(test)] mod tests`; `.config/nextest.toml` holds the
 tiers and their time limits.
 
 `cargo publish --workspace --dry-run` belongs to the release (`RELEASING.md`

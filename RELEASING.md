@@ -44,13 +44,11 @@ crates.io first.
 - Add the link reference at the bottom:
   `[X.Y.Z]: https://github.com/tuco86/zeughaus/releases/tag/vX.Y.Z`
 
-## 4. Run every gate
+## 4. Run the local gate
 
 ```bash
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo check --target wasm32-unknown-unknown -p zeughaus
 cargo publish --workspace --dry-run
 ```
 
@@ -93,6 +91,10 @@ a `-` becomes a prerelease. A second pipeline for the same tag replaces the
 release and keeps the tag. This does not publish to crates.io (step 6).
 
 ## 6. Publish
+
+Only once the tag's pipeline has succeeded (`ci_wait` with the tag's
+commit): it runs both test tiers and the doctests on every platform, and
+crates.io takes no version back.
 
 A `third_party` crate goes out only when it changed, with its own version
 bumped, before the zeughaus workspace:

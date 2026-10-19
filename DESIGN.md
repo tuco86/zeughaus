@@ -608,8 +608,10 @@ results keyed by (pin, tier, sequence).
   screen, resize, deltas, eviction, exit; the pipeline's CPU side
   (`iced_terminal`) for shaping and instance caches.
 - The gate before a push: `cargo fmt --check`, `cargo clippy --workspace
-  --all-targets -- -D warnings`, `cargo test --workspace`,
-  `cargo check --target wasm32-unknown-unknown -p zeughaus`.
+  --all-targets -- -D warnings` and the unit tier (`cargo nextest run -p
+  <crate>`) of the crates the change touches. The pipelines run the rest: a
+  push the unit tier and the doctests on every platform, the nightly cron and
+  a release tag both tiers (section 14).
 
 ## 13. Jobs: processes the runner owns
 
@@ -1429,11 +1431,12 @@ cannot include files outside its directory. The build number
 that reads it in the shared workspace. A binary made anywhere else has
 build 0. Per platform one check job, `check-<platform>`, `needs` the build
 job, so it runs in the workspace the build left, at the same place: it runs
-`cargo clippy --workspace
---all-targets -- -D warnings` and `cargo test --workspace` (`check_platform`
-in `build.sh`; `windows.ps1` for the Windows jobs), and on `linux-amd64`
-also `cargo fmt --check` and `cargo check --target wasm32-unknown-unknown -p
-zeughaus`. Every OS therefore passes the gate. The build is a release build
+`cargo clippy --workspace --all-targets -- -D warnings`, the tests (`cargo
+nextest run --workspace`: the unit tier on a push or manual run, `--profile
+ci` with the integration tier on the nightly cron and a tag) and `cargo test
+--workspace --doc` (`check_platform` in `build.sh`; `windows.ps1` for the
+Windows jobs), and on `linux-amd64` also `cargo fmt --check`. Every OS
+therefore passes the gate. The build is a release build
 and the check a dev one, so they share the workspace's cargo home and
 checkouts but no compiled units: the order puts the archive out early (the
 CI moves it towards `publish` while the checks run) and skips the check of a

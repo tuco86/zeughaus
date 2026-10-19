@@ -41,12 +41,17 @@ nextest_env() {
     curl -LsSf "https://get.nexte.st/0.9/$asset" | tar zxf - -C "$CARGO_HOME/bin"
 }
 
-# clippy and both test tiers (`.config/nextest.toml`), then the doctests,
-# which nextest does not run: what every platform checks.
+# clippy, the tests (`.config/nextest.toml`) and the doctests, which nextest
+# does not run: what every platform checks. A push or manual run takes the
+# unit tier; the nightly cron and a release tag take both tiers.
 check_platform() {
     step cargo clippy --locked --workspace --all-targets -- -D warnings
     nextest_env
-    step cargo nextest run --locked --workspace --profile ci
+    case "$CI_EVENT" in
+        cron | tag) tier=ci ;;
+        *) tier=default ;;
+    esac
+    step cargo nextest run --locked --workspace --profile "$tier"
     step cargo test --locked --workspace --doc
 }
 

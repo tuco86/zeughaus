@@ -15,7 +15,7 @@ default-filter = 'test(/(^|::)io::/)'
 slow-timeout = { period = "10s", terminate-after = 1 }
 global-timeout = "5m"
 
-# Both tiers, as every CI check runs them.
+# Both tiers, as the nightly and release checks run them.
 [profile.ci]
 default-filter = 'all()'
 slow-timeout = { period = "10s", terminate-after = 1 }
