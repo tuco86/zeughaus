@@ -204,7 +204,8 @@ function block(c: CiContext): string | undefined {
       return wrap(
         "zeughaus-ci, the user's own CI, builds this checkout (state at session start; ci_repo for now):",
         c.text,
-        "skill://zeughaus-ci says how to debug a job or platform with run_jobs and how jobs are written.",
+        "Tests before a push: only the unit tier of the crates or packages the change touches (Rust: cargo nextest run -p <crate>; Python: uv run pytest tests/unit). Never the whole suite, the integration or the end-to-end tier locally: the push pipeline runs what its jobs select right after the push, and integration and end-to-end tests belong to the nightly and release pipelines.",
+        "Builds and tests on another platform go through run_jobs, never by hand over ssh; skill://zeughaus-ci says how to debug a job or platform with it and how jobs are written.",
       );
     case "unknown":
       return wrap(

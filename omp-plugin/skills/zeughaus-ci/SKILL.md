@@ -18,7 +18,15 @@ zeughaus-ci is the user's own CI. Its runners are the machines they own, one per
 - `HEAD <sha7>: no pipeline` means the commit is not pushed, or no job's `on` selects it.
 - An origin the CI does not know (`<origin> is no repository of the CI's ci.toml`): pushes start no pipeline and `run_jobs` is refused. Tell the user; do not work around it.
 
-## 2. Debug a job or another platform
+## 2. Tests before a push: the unit tier only
+
+- Run the unit tests of the crates or packages your change touches, and nothing more: Rust `cargo nextest run -p <crate>` (nextest's default profile is the unit tier where `.config/nextest.toml` defines tiers), Python `uv run pytest tests/unit`.
+- Never run the whole suite locally: no `cargo test --workspace`, `--profile ci` or `--profile integration`, no end-to-end run, even where the project's `AGENTS.md` lists them in a gate.
+- Why: the push pipeline runs the tests again right after the push, on every platform, and a local whole-suite run costs minutes per change.
+- What runs where: a push runs what its jobs select (zeughaus: the unit tier and the doctests); the nightly cron and a release tag also run the integration and end-to-end tiers. Their failures reach you like any other (section 5).
+- An integration or end-to-end failure from nightly or release: reproduce it with `run_jobs` of that platform's check job, its test command temporarily switched to the integration tier and filtered to the failing test (section 4), not locally.
+
+## 3. Debug a job or another platform
 
 - Run `run_jobs` with the platform's pair: `jobs=["build-<p>", "check-<p>"]`. The platforms are in the job table (zeughaus: `linux-amd64`, `linux-arm64`, `darwin-arm64`, `windows-amd64`).
 - `run_jobs` snapshots the checkout at `path` (default: the working directory) as it is on disk: HEAD's commit, uncommitted changes, untracked files that are not ignored, and the Cargo path dependencies beside it (`../weida`). It uploads that and runs the named jobs in the warm workspace of their place, the one the pipeline builds in. The second run is incremental.
@@ -30,14 +38,14 @@ zeughaus-ci is the user's own CI. Its runners are the machines they own, one per
 - Runs for different platforms are independent: issue them as parallel `run_jobs` calls, one pair per platform. The jobs of a repository at one place share one workspace and run one after another, oldest first, so two runs for the same platform queue.
 - Never cross-compile locally for it, build over ssh, push to test, or rerun a pipeline to look at one job.
 
-## 3. Narrow a failure without a commit
+## 4. Narrow a failure without a commit
 
-- A manual run executes the jobs of the working tree. Edit the job file under `.zeughaus-ci/` temporarily (a test filter, `--nocapture`, `-v`, `RUST_BACKTRACE=1`) and `run_jobs` that one job.
+- A manual run executes the jobs of the working tree. Edit the job file under `.zeughaus-ci/` temporarily (a test filter, another test tier such as nextest's `--profile ci`, `--nocapture`, `-v`, `RUST_BACKTRACE=1`) and `run_jobs` that one job.
 - Undo the edit before committing: `git checkout -- .zeughaus-ci/<file>`, when the temporary edit was the file's only change.
 - A job that hangs: `ci_log` with `timestamps` shows where its output stopped. `ci_timing` with `job` names the lines the longest pauses follow; while the job runs, the last pause lasts until now, so that line is the stuck step or test. Then `ci_cancel` the pipeline: it kills the running jobs and skips the rest.
 - A job without `timeout_minutes` may run 240 minutes and holds its place's workspace meanwhile; every later job at that place waits.
 
-## 4. After a push
+## 5. After a push
 
 - The zeughaus-ci extension watches the pipeline of the pushed commit. It reports the first failed job into the session as a message that starts your turn (job, place, cause, excerpt), and a success as a line with your next turn. Do not poll. `/zeughaus` shows the state in the TUI.
 - On a failure: `ci_log` for the job's output; `run_jobs` with that job reproduces it from the working tree.
@@ -45,7 +53,7 @@ zeughaus-ci is the user's own CI. Its runners are the machines they own, one per
 - A push starts a pipeline only when some job's `on` matches the ref (zeughaus: pushes to `main`, tags `v*`, the 03:00 cron). A push to another branch starts nothing; that is not a failure.
 - Manual runs post no forge status and cannot be rerun. `ci_rerun` queues the event of a pipeline a push or a cron started, pinned to its commit.
 
-## 5. What manual runs do not have
+## 6. What manual runs do not have
 
 - Secrets: none of a job's `secrets` is given. A job that needs one to build cannot run there.
 - A `needs` on a job you did not name is dropped: the job runs without waiting for it and finds no `$CI_INPUTS/<need>`. Name the build too when a check needs its output.
@@ -53,7 +61,7 @@ zeughaus-ci is the user's own CI. Its runners are the machines they own, one per
 - A job's `on` is not consulted: any job of the working tree's `.zeughaus-ci/` can be named, one to 16 per call.
 - The run lands in the channel a push to the default branch selects, and is never `clean`: workspaces stay warm.
 
-## 6. Writing jobs
+## 7. Writing jobs
 
 - Read `skill://zeughaus-ci/reference/pipelines.md` (how to shape a pipeline for this CI, zeughaus's own as the example, a review checklist) and `skill://zeughaus-ci/reference/jobs.md` (header keys, channels, placement, environment, job notes).
 - Validate before pushing, where the binary exists: `zeughaus-ci check` (header rules, channels, ignored keys; placement too where the state directory has the CI's `ci.toml`) and `zeughaus-ci plan .zeughaus-ci push main` (the channel and the jobs an event selects).

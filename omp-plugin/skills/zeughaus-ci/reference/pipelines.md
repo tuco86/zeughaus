@@ -9,7 +9,7 @@ zeughaus's own `.zeughaus-ci/` is the worked example: one Rust workspace, built 
 | `channels.toml` | `dev` on `push main`; `nightly` on `cron *` and `release` on `tag v*`, both `clean` |
 | `trixie.Containerfile` | The image of the Linux jobs: `rust:1.99.1-trixie`, the libraries the workspace links, clippy, rustfmt and the wasm target |
 | `build-<p>.sh`, `build-windows-amd64.ps1` | The release archive of platform `<p>`, written to `$CI_OUTPUT` |
-| `check-<p>.sh`, `check-windows-amd64.ps1` | The gate of `<p>`: clippy and the tests. `check-linux-amd64` also runs `fmt` and the wasm build |
+| `check-<p>.sh`, `check-windows-amd64.ps1` | The gate of `<p>`: clippy, the tests (the unit tier on a push or manual run, both tiers nightly and on a tag) and the doctests. `check-linux-amd64` also runs `fmt` |
 | `publish.sh` | Needs all eight; bundles, signs and publishes the archives. The only job with release secrets |
 | `build.sh`, `weida.sh`, `windows.ps1` | Helpers without a header; the jobs source them |
 
@@ -117,6 +117,12 @@ FROM docker.io/library/rust:1.99.1-trixie
 - A runner that someone works on has a `[busy]` table in its enlist.toml (zeughaus: tuco-pc, measured by GPU load). Give its container jobs `when_busy = "freeze"`.
 - Why: a running `freeze` job is paused while the runner is busy and resumed when it is free again; a `wait` job (the default) is only held back before it starts. A host job cannot be paused: `freeze` on a host placement is refused when the pipeline is set up. Apple's `container` cannot pause, so there the job runs on.
 
+### 12. Unit tests on a push, every tier nightly and on a release
+
+- A check job runs the unit tier on `push` and `manual`, and the integration and end-to-end tiers too on `cron` and `tag`: it chooses by `CI_EVENT`. zeughaus: `check_platform` in `build.sh` and `check-windows-amd64.ps1` run `cargo nextest run --profile default` or `--profile ci`; the doctests run on every event.
+- Why: agents run only the unit tier of the touched crates before a push, so the push pipeline is where that tier runs on every platform, fast enough to answer the push. The I/O tiers are slower and depend on the machine; they run once a day in `clean` workspaces and before a release is published.
+- A manual run follows a push, so `run_jobs` reproduces the push pipeline. For an integration failure, edit the job's test command temporarily (skill section 4).
+
 ## Review checklist
 
 Walk a repository's `.zeughaus-ci/` with these; every hit is a finding.
@@ -130,3 +136,4 @@ Walk a repository's `.zeughaus-ci/` with these; every hit is a finding.
 - A cache lives in a tracked or non-ignored path: `git clean -ffd` deletes it before every job, or it gets committed.
 - A job has no `timeout_minutes` and can hang: it holds its place's workspace for the default 240 minutes while every later job at that place waits.
 - A job is not part of a `build-<p>` / `check-<p>` pair where agents will look for one.
+- A check job runs the integration or end-to-end tier on a push, or no `cron` or `tag` event ever runs it.

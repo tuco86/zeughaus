@@ -81,7 +81,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after a `git push` and reports its first failure into the session, shows
   the state in the status line and as `/zeughaus`, and ships the
   `zeughaus-ci` skill: the debug loop with `run_jobs` and how to shape a
-  pipeline for the CI.
+  pipeline for the CI. Its system prompt block and skill tell the agent to
+  run only the unit tier of the crates or packages it touched before a
+  push; the pipelines run the rest.
 
 ### Changed
 
