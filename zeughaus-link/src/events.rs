@@ -94,6 +94,10 @@ pub enum RuntimeEvent {
         channel: String,
         number: u64,
     },
+    /// A plan or proposal of a repository was stored, changed state or was
+    /// deleted. Carries only the repository; an editor asks `/ci` for the
+    /// documents. Only the CI sends it, on [`TOPIC_CI`].
+    CiDocs { seq: u64, repo: String },
 }
 
 impl RuntimeEvent {
@@ -212,7 +216,8 @@ pub const TOPIC_ERROR: &str = "error";
 /// runner raises for a failed maintenance task.
 pub const TOPIC_MACHINE: &str = "machine";
 
-/// Topic of [`RuntimeEvent::CiPipeline`] and the CI's [`RuntimeEvent::Alert`]
+/// Topic of [`RuntimeEvent::CiPipeline`], [`RuntimeEvent::CiDocs`] and the
+/// CI's [`RuntimeEvent::Alert`]
 /// (a runner's alerts go out on [`TOPIC_MACHINE`]).
 pub const TOPIC_CI: &str = "ci";
 
@@ -287,6 +292,10 @@ mod tests {
                 repo: "griasdi".to_owned(),
                 channel: "dev".to_owned(),
                 number: 138,
+            },
+            RuntimeEvent::CiDocs {
+                seq: 17,
+                repo: "griasdi".to_owned(),
             },
         ];
         for event in events {

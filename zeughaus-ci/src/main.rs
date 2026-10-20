@@ -6,6 +6,7 @@ mod channels;
 mod cleanup;
 mod cli;
 mod config;
+mod docs;
 mod enlist;
 mod event;
 mod excerpt;

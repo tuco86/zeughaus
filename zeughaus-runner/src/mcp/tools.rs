@@ -1341,6 +1341,7 @@ mod tests {
                 ("linux-amd64".to_owned(), "tuco-pc".to_owned()),
                 ("windows-amd64".to_owned(), "wohnzimmer".to_owned()),
             ],
+            repos: Vec::new(),
         };
         assert_eq!(
             status_text(&overview, 1_000),
@@ -1355,6 +1356,7 @@ mod tests {
             machines: Vec::new(),
             queued: Vec::new(),
             platforms: Vec::new(),
+            repos: Vec::new(),
         };
         assert_eq!(
             status_text(&empty, 0),
@@ -1818,6 +1820,7 @@ mod tests {
                     jobs: Vec::new(),
                 }],
                 platforms: vec![("linux-amd64".to_owned(), "agent".to_owned())],
+                docs: Vec::new(),
             }
         }
 

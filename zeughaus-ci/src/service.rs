@@ -261,6 +261,7 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
         }
         Err(e) => return Err(format!("no artifact service: {e}")),
     }
+    let (docs_tx, docs_rx) = std::sync::mpsc::channel::<String>();
     match listener.replier(CI_PATH) {
         Ok(replier) => {
             let server = CiServer::new(
@@ -268,6 +269,7 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
                 Arc::clone(&config),
                 Arc::clone(&runners),
                 Arc::clone(&transcripts),
+                docs_tx,
             );
             rt.spawn(serve::serve(replier, Arc::new(server)));
         }
@@ -323,6 +325,9 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
         while let Ok(change) = changes.try_recv() {
             events.change(change);
         }
+        while let Ok(repo) = docs_rx.try_recv() {
+            events.docs(repo);
+        }
         std::thread::sleep(DRAIN_INTERVAL);
     }
 }
@@ -355,6 +360,11 @@ impl Events {
             channel: change.channel,
             number: change.number,
         });
+    }
+
+    fn docs(&mut self, repo: String) {
+        let seq = self.next_seq();
+        self.emit(RuntimeEvent::CiDocs { seq, repo });
     }
 
     fn next_seq(&self) -> u64 {

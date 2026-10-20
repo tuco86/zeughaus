@@ -375,6 +375,9 @@ impl App {
             }) => {
                 return self.apply_ci_event(&key, repo, channel, number);
             }
+            Traffic::Event(RuntimeEvent::CiDocs { .. }) => {
+                // Nothing in this editor shows plans or proposals yet.
+            }
             Traffic::Lost => {
                 if let Some(link) = self.runtime.links.get_mut(&key) {
                     link.traffic_live = false;

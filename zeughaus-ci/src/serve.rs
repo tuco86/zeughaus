@@ -20,15 +20,16 @@ use zeughaus_link::ci::{
 };
 use zeughaus_link::enlist::Place;
 use zeughaus_link::{
-    BusyMode, ChannelView, CiOverview, CiReply, CiRequest, JobDefView, JobTiming, JobView,
-    MAX_CI_REPLY_BYTES, MAX_CI_REQUEST_BYTES, MachineJob, MachineView, PipelineView, QueuedView,
-    RepoView, TimedLine, TransferView,
+    BusyMode, ChannelView, CiOverview, CiReply, CiRequest, DocState, JobDefView, JobTiming,
+    JobView, MAX_CI_REPLY_BYTES, MAX_CI_REQUEST_BYTES, MachineJob, MachineView, PipelineView,
+    QueuedView, RepoView, TimedLine, TransferView,
 };
 use zeughaus_mux::TerminalId;
 use zeughaus_terminal::wal;
 
 use crate::CI_DIR;
 use crate::config::{CiConfig, Forge, RepoConfig, valid_name};
+use crate::docs;
 use crate::event::{self, EventKind};
 use crate::excerpt;
 use crate::header::{JobDef, when_busy_name};
@@ -61,6 +62,13 @@ pub struct CiServer {
     config: Arc<CiConfig>,
     runners: Arc<Runners>,
     transcripts: Arc<Transcripts>,
+    /// Held by every request that changes a document: requests run on the
+    /// blocking pool, and numbering and the one-plan-in-progress rule must
+    /// not race.
+    docs: std::sync::Mutex<()>,
+    /// The repository of each document change, for the service to announce
+    /// on `/events`.
+    docs_changed: std::sync::mpsc::Sender<String>,
 }
 
 impl CiServer {
@@ -69,12 +77,15 @@ impl CiServer {
         config: Arc<CiConfig>,
         runners: Arc<Runners>,
         transcripts: Arc<Transcripts>,
+        docs_changed: std::sync::mpsc::Sender<String>,
     ) -> CiServer {
         CiServer {
             state_dir,
             config,
             runners,
             transcripts,
+            docs: std::sync::Mutex::new(()),
+            docs_changed,
         }
     }
 
@@ -124,7 +135,81 @@ impl CiServer {
                 top,
             } => self.timing(&repo, number, &job, top),
             CiRequest::Repo { origin, sha, jobs } => self.repo(&origin, sha.as_deref(), jobs),
+            CiRequest::Docs { repo } => CiReply::Docs {
+                docs: docs::list(&self.state_dir, &self.config, &repo),
+            },
+            CiRequest::Doc { repo, number } => CiReply::Doc {
+                doc: docs::load(&self.state_dir, &self.config, &repo, number).map(Box::new),
+            },
+            CiRequest::DocCreate {
+                repo,
+                kind,
+                title,
+                body,
+                source,
+                proposals,
+            } => {
+                let new = docs::NewDoc {
+                    kind,
+                    title: &title,
+                    body: &body,
+                    source: &source,
+                    proposals: &proposals,
+                };
+                let made = self.change_docs(&repo, |state, config, now| {
+                    docs::create(state, config, &repo, new, now).map(|number| (number, true))
+                });
+                match made {
+                    Ok(number) => CiReply::DocCreated { number },
+                    Err(e) => error(&e),
+                }
+            }
+            CiRequest::DocState {
+                repo,
+                number,
+                state,
+            } => accepted(self.change_docs(&repo, |dir, config, now| {
+                docs::set_state(dir, config, &repo, number, state, now).map(|()| ((), true))
+            })),
+            CiRequest::DocDelete { repo, number } => {
+                accepted(self.change_docs(&repo, |dir, config, _| {
+                    docs::delete(dir, config, &repo, number).map(|()| ((), true))
+                }))
+            }
+            // A master asks every few seconds; only a claim that took a plan
+            // is announced.
+            CiRequest::PlanClaim { repo } => {
+                match self.change_docs(&repo, |dir, config, now| {
+                    docs::claim(dir, config, &repo, now).map(|doc| {
+                        let took = doc.is_some();
+                        (doc, took)
+                    })
+                }) {
+                    Ok(doc) => CiReply::Doc {
+                        doc: doc.map(Box::new),
+                    },
+                    Err(e) => error(&e),
+                }
+            }
         }
+    }
+
+    /// Runs one change of `repo`'s documents under the lock and announces
+    /// it when the change says it changed something.
+    fn change_docs<T>(
+        &self,
+        repo: &str,
+        change: impl FnOnce(&Path, &CiConfig, u64) -> Result<(T, bool), String>,
+    ) -> Result<T, String> {
+        let _held = self
+            .docs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (done, changed) = change(&self.state_dir, &self.config, crate::now_secs())?;
+        if changed {
+            let _ = self.docs_changed.send(repo.to_owned());
+        }
+        Ok(done)
     }
 
     /// The records of `repo`. The name comes from a request and is joined
@@ -156,6 +241,7 @@ impl CiServer {
             machines: self.machine_views(&pipelines),
             queued: queued_views(&pipelines, &queued),
             platforms: self.platforms(),
+            repos: docs::summary(&self.state_dir, &self.config),
         }
     }
 
@@ -352,6 +438,18 @@ impl CiServer {
                 jobs_note: read.note,
                 machines: self.machine_views(&pipelines),
                 platforms: self.platforms(),
+                docs: docs::list(&self.state_dir, &self.config, name)
+                    .into_iter()
+                    .filter(|doc| {
+                        matches!(
+                            doc.state,
+                            DocState::Open
+                                | DocState::Saved
+                                | DocState::Approved
+                                | DocState::InProgress
+                        )
+                    })
+                    .collect(),
             })),
         }
     }
@@ -475,6 +573,13 @@ impl CiServer {
 fn error(message: &str) -> CiReply {
     CiReply::Error {
         message: message.to_owned(),
+    }
+}
+
+fn accepted(result: Result<(), String>) -> CiReply {
+    match result {
+        Ok(()) => CiReply::Accepted,
+        Err(e) => error(&e),
     }
 }
 
@@ -1083,6 +1188,7 @@ mod tests {
             config(tables),
             Arc::new(Runners::new()),
             Arc::new(Transcripts::new(state.to_path_buf())),
+            std::sync::mpsc::channel().0,
         )
     }
 
@@ -2628,6 +2734,62 @@ mod tests {
                 tail.lines,
                 [line(2_000_000, "gamma"), line(3_000_000, "delta")]
             );
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_stored_document_is_counted_listed_and_announced() {
+            let state = scratch("docs");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let server = CiServer::new(
+                state.clone(),
+                config("[repos.demo]\nurl = \"https://git.example.org/o/demo.git\"\n"),
+                Arc::new(Runners::new()),
+                Arc::new(Transcripts::new(state.clone())),
+                tx,
+            );
+            let made = server.answer(CiRequest::DocCreate {
+                repo: "demo".to_owned(),
+                kind: zeughaus_link::DocKind::Plan,
+                title: "  Smoke plan ".to_owned(),
+                body: "# Smoke plan\n".to_owned(),
+                source: "demo".to_owned(),
+                proposals: Vec::new(),
+            });
+            assert_eq!(made, CiReply::DocCreated { number: 1 });
+            assert_eq!(rx.try_recv(), Ok("demo".to_owned()));
+
+            let CiReply::Overview { overview } = server.answer(CiRequest::Overview) else {
+                panic!("no overview");
+            };
+            assert_eq!(
+                overview.repos,
+                vec![zeughaus_link::RepoDocsView {
+                    repo: "demo".to_owned(),
+                    origin: "git.example.org/o/demo".to_owned(),
+                    default_branch: "main".to_owned(),
+                    awaiting: 1,
+                    queued: 0,
+                    running: None,
+                    proposals: 0,
+                }]
+            );
+            let CiReply::Docs { docs } = server.answer(CiRequest::Docs {
+                repo: "demo".to_owned(),
+            }) else {
+                panic!("no docs");
+            };
+            assert_eq!(docs.len(), 1);
+            assert_eq!(docs[0].title, "Smoke plan");
+            assert_eq!(docs[0].state, DocState::Saved);
+            assert!(docs[0].body.is_empty());
+
+            // A claim that finds nothing approved changes nothing to announce.
+            let none = server.answer(CiRequest::PlanClaim {
+                repo: "demo".to_owned(),
+            });
+            assert_eq!(none, CiReply::Doc { doc: None });
+            assert!(rx.try_recv().is_err());
             let _ = std::fs::remove_dir_all(&state);
         }
     }

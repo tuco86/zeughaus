@@ -173,48 +173,17 @@ pub fn subject(summary: &str) -> String {
         .collect()
 }
 
-/// A repository URL reduced to what names it: lowercase, without scheme,
-/// user, `.git` and trailing slashes, an scp-style `host:path` as
-/// `host/path`. `git@github.com:Griasdi/Griasdi.git` and
-/// `https://github.com/griasdi/griasdi` come out the same.
-pub fn normalize_url(url: &str) -> String {
-    let lower = url.trim().to_lowercase();
-    let address = match lower.split_once("://") {
-        Some((_scheme, rest)) => rest.to_owned(),
-        // scp-style: `host:path`, where the host holds no `/` (a local path
-        // that has a `:` further in is no host).
-        None => match lower.split_once(':') {
-            Some((host, path)) if !host.contains('/') => format!("{host}/{path}"),
-            _ => lower,
-        },
-    };
-    // The user (and password) belong to the authority, which ends at the
-    // first `/`.
-    let path_at = address.find('/').unwrap_or(address.len());
-    let (authority, path) = address.split_at(path_at);
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    let joined = format!("{host}{path}");
-    let trimmed = joined.trim_end_matches('/');
-    trimmed
-        .strip_suffix(".git")
-        .unwrap_or(trimmed)
-        .trim_end_matches('/')
-        .to_owned()
-}
-
 /// The repository of `ci.toml` whose `url` is the same repository as
 /// `origin`, with its name.
 pub(crate) fn repo_of<'a>(
     config: &'a CiConfig,
     origin: &str,
 ) -> Result<(&'a str, &'a RepoConfig), String> {
-    let wanted = normalize_url(origin);
+    let wanted = zeughaus_link::ci::normalize_origin(origin);
     config
         .repos
         .iter()
-        .find(|(_, repo)| normalize_url(&repo.url) == wanted)
+        .find(|(_, repo)| zeughaus_link::ci::normalize_origin(&repo.url) == wanted)
         .map(|(name, repo)| (name.as_str(), repo))
         .ok_or_else(|| format!("{origin} is no repository of ci.toml"))
 }
@@ -519,33 +488,6 @@ mod tests {
                 .collect(),
             sizes: sizes.to_vec(),
         }
-    }
-
-    #[test]
-    fn one_repository_is_named_the_same_by_every_url_form() {
-        let same = [
-            "git@github.com:griasdi/griasdi.git",
-            "https://github.com/Griasdi/Griasdi.git",
-            "https://github.com/griasdi/griasdi",
-            "ssh://git@github.com/Griasdi/griasdi.git/",
-            "https://user:token@github.com/griasdi/griasdi.git",
-            " HTTP://GitHub.com/griasdi/griasdi.git\n",
-        ];
-        for url in same {
-            assert_eq!(normalize_url(url), "github.com/griasdi/griasdi", "{url}");
-        }
-        // Another repository, another host or another port is another name.
-        assert_ne!(
-            normalize_url("git@github.com:griasdi/weida.git"),
-            normalize_url("git@github.com:griasdi/griasdi.git")
-        );
-        assert_eq!(
-            normalize_url("ssh://git@git.example.org:2222/o/r.git"),
-            "git.example.org:2222/o/r"
-        );
-        // A local checkout is its path, with or without the scheme.
-        assert_eq!(normalize_url("/tmp/zh-fx/demo.git"), "/tmp/zh-fx/demo");
-        assert_eq!(normalize_url("file:///tmp/zh-fx/demo"), "/tmp/zh-fx/demo");
     }
 
     #[test]

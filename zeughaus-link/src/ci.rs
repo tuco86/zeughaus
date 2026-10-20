@@ -12,8 +12,15 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Largest request the runner reads: a few identifiers.
-pub const MAX_CI_REQUEST_BYTES: usize = 4096;
+/// The largest body of one plan or proposal, in bytes.
+pub const MAX_DOC_BYTES: usize = 256 << 10;
+
+/// The longest title of one plan or proposal, in bytes.
+pub const MAX_DOC_TITLE_BYTES: usize = 200;
+
+/// Largest request the runner reads: a few identifiers, or one document
+/// (JSON escaping can double a body).
+pub const MAX_CI_REQUEST_BYTES: usize = MAX_DOC_BYTES * 2 + (16 << 10);
 
 /// Largest reply an editor reads: up to 50 pipelines of a few dozen jobs.
 pub const MAX_CI_REPLY_BYTES: usize = 4 << 20;
@@ -102,6 +109,38 @@ pub enum CiRequest {
         sha: Option<String>,
         jobs: bool,
     },
+    /// Every plan and proposal of a repository, bodies empty, in number
+    /// order. Answers [`CiReply::Docs`].
+    Docs { repo: String },
+    /// One document with its body; answers [`CiReply::Doc`], `None` when it
+    /// does not exist.
+    Doc { repo: String, number: u64 },
+    /// Stores a new document. A plan may name the open proposals it was made
+    /// from; they become `planned`. Answers [`CiReply::DocCreated`].
+    DocCreate {
+        repo: String,
+        /// Renamed on the wire: `kind` is the request's own tag.
+        #[serde(rename = "doc_kind")]
+        kind: DocKind,
+        title: String,
+        body: String,
+        source: String,
+        #[serde(default)]
+        proposals: Vec<u64>,
+    },
+    /// Moves a document to another state, where the state machine allows
+    /// it. Answers [`CiReply::Accepted`].
+    DocState {
+        repo: String,
+        number: u64,
+        state: DocState,
+    },
+    /// Deletes a finished document. Answers [`CiReply::Accepted`].
+    DocDelete { repo: String, number: u64 },
+    /// The oldest approved plan becomes `in_progress` and comes back with its
+    /// body; answers [`CiReply::Doc`], `None` when nothing is approved, an
+    /// error while a plan is in progress.
+    PlanClaim { repo: String },
 }
 
 /// Lines of a job's output, counted from 1 over the lines that have text.
@@ -216,6 +255,16 @@ pub enum CiReply {
     Repo {
         repo: Option<Box<RepoView>>,
     },
+    Docs {
+        docs: Vec<DocView>,
+    },
+    /// Boxed: a document with its body is far larger than most replies.
+    Doc {
+        doc: Option<Box<DocView>>,
+    },
+    DocCreated {
+        number: u64,
+    },
     Error {
         message: String,
     },
@@ -233,6 +282,209 @@ pub struct CiOverview {
     /// runner or machine that builds it, for a client that picks a target.
     #[serde(default)]
     pub platforms: Vec<(String, String)>,
+    /// Every repository of `ci.toml` and its documents, in name order.
+    #[serde(default)]
+    pub repos: Vec<RepoDocsView>,
+}
+
+/// What a plan or a proposal is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocKind {
+    /// A change another project's session asks this repository for.
+    Proposal,
+    /// A finished plan of work in this repository.
+    Plan,
+}
+
+/// Where a document stands. A proposal is `open`, then `planned` or
+/// `dismissed`; a plan is `saved`, `approved`, `in_progress`, then `done`,
+/// or `rejected`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocState {
+    Open,
+    Planned,
+    Dismissed,
+    Saved,
+    Approved,
+    InProgress,
+    Done,
+    Rejected,
+}
+
+impl DocState {
+    /// The wire name: `in_progress`, `open`, ...
+    pub fn name(self) -> &'static str {
+        match self {
+            DocState::Open => "open",
+            DocState::Planned => "planned",
+            DocState::Dismissed => "dismissed",
+            DocState::Saved => "saved",
+            DocState::Approved => "approved",
+            DocState::InProgress => "in_progress",
+            DocState::Done => "done",
+            DocState::Rejected => "rejected",
+        }
+    }
+}
+
+impl DocKind {
+    /// The wire name: `proposal` or `plan`.
+    pub fn name(self) -> &'static str {
+        match self {
+            DocKind::Proposal => "proposal",
+            DocKind::Plan => "plan",
+        }
+    }
+}
+
+/// One plan or proposal of a repository. The CI stores exactly this.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocView {
+    pub repo: String,
+    /// Per repository, shared by both kinds, never reused.
+    pub number: u64,
+    pub kind: DocKind,
+    pub title: String,
+    pub state: DocState,
+    /// A proposal: the source project's checkout directory name; a plan: the
+    /// repository itself.
+    pub source: String,
+    /// Seconds since the UNIX epoch.
+    pub created: u64,
+    /// The last state change.
+    pub changed: u64,
+    /// A plan: when it was approved; orders the queue.
+    #[serde(default)]
+    pub approved: Option<u64>,
+    /// A plan: the proposals it was made from.
+    #[serde(default)]
+    pub proposals: Vec<u64>,
+    /// A proposal: the plan that took it up.
+    #[serde(default)]
+    pub plan: Option<u64>,
+    /// Empty in lists.
+    #[serde(default)]
+    pub body: String,
+}
+
+/// One repository of `ci.toml` and how many of its documents wait for whom.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoDocsView {
+    pub repo: String,
+    /// The repository url as [`normalize_origin`] gives it: `host/owner/name`.
+    pub origin: String,
+    pub default_branch: String,
+    /// Plans in `saved`.
+    pub awaiting: u32,
+    /// Plans in `approved`.
+    pub queued: u32,
+    /// The plan in `in_progress`.
+    pub running: Option<u64>,
+    /// Proposals in `open`.
+    pub proposals: u32,
+}
+
+/// The groups a repository's documents are shown in, in this order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocGroup {
+    /// Plans in `saved`.
+    Awaiting,
+    /// Plans in `approved`, the next one first.
+    Queue,
+    /// The plan in `in_progress`.
+    InProgress,
+    /// Proposals in `open`.
+    Proposals,
+    /// Everything else, newest change first.
+    History,
+}
+
+impl DocGroup {
+    pub fn title(self) -> &'static str {
+        match self {
+            DocGroup::Awaiting => "Awaiting approval",
+            DocGroup::Queue => "Queue",
+            DocGroup::InProgress => "In progress",
+            DocGroup::Proposals => "Open proposals",
+            DocGroup::History => "History",
+        }
+    }
+
+    fn of(doc: &DocView) -> DocGroup {
+        match (doc.kind, doc.state) {
+            (DocKind::Plan, DocState::Saved) => DocGroup::Awaiting,
+            (DocKind::Plan, DocState::Approved) => DocGroup::Queue,
+            (DocKind::Plan, DocState::InProgress) => DocGroup::InProgress,
+            (DocKind::Proposal, DocState::Open) => DocGroup::Proposals,
+            _ => DocGroup::History,
+        }
+    }
+}
+
+/// `docs` in their groups, the empty groups left out: the queue in the
+/// order a master takes it, the history newest change first, the rest by
+/// number.
+pub fn doc_groups(docs: &[DocView]) -> Vec<(DocGroup, Vec<&DocView>)> {
+    let mut groups = Vec::new();
+    for group in [
+        DocGroup::Awaiting,
+        DocGroup::Queue,
+        DocGroup::InProgress,
+        DocGroup::Proposals,
+        DocGroup::History,
+    ] {
+        let mut members: Vec<&DocView> = docs
+            .iter()
+            .filter(|doc| DocGroup::of(doc) == group)
+            .collect();
+        match group {
+            DocGroup::Queue => members.sort_by_key(|doc| (doc.approved.unwrap_or(0), doc.number)),
+            DocGroup::History => members.sort_by_key(|doc| {
+                (
+                    std::cmp::Reverse(doc.changed),
+                    std::cmp::Reverse(doc.number),
+                )
+            }),
+            _ => members.sort_by_key(|doc| doc.number),
+        }
+        if !members.is_empty() {
+            groups.push((group, members));
+        }
+    }
+    groups
+}
+
+/// A repository URL reduced to what names it: lowercase, without scheme,
+/// user, `.git` and trailing slashes, an scp-style `host:path` as
+/// `host/path`. `git@github.com:Griasdi/Griasdi.git` and
+/// `https://github.com/griasdi/griasdi` come out the same.
+pub fn normalize_origin(url: &str) -> String {
+    let lower = url.trim().to_lowercase();
+    let address = match lower.split_once("://") {
+        Some((_scheme, rest)) => rest.to_owned(),
+        // scp-style: `host:path`, where the host holds no `/` (a local path
+        // that has a `:` further in is no host).
+        None => match lower.split_once(':') {
+            Some((host, path)) if !host.contains('/') => format!("{host}/{path}"),
+            _ => lower,
+        },
+    };
+    // The user (and password) belong to the authority, which ends at the
+    // first `/`.
+    let path_at = address.find('/').unwrap_or(address.len());
+    let (authority, path) = address.split_at(path_at);
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let joined = format!("{host}{path}");
+    let trimmed = joined.trim_end_matches('/');
+    trimmed
+        .strip_suffix(".git")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/')
+        .to_owned()
 }
 
 /// An event that has no pipeline yet.
@@ -407,6 +659,10 @@ pub struct RepoView {
     pub jobs_note: String,
     pub machines: Vec<MachineView>,
     pub platforms: Vec<(String, String)>,
+    /// The repository's documents in `open`, `saved`, `approved` and
+    /// `in_progress`, bodies empty.
+    #[serde(default)]
+    pub docs: Vec<DocView>,
 }
 
 /// One job of a repository's `.zeughaus-ci/` and where it would run.
@@ -600,6 +856,33 @@ mod tests {
                 sha: None,
                 jobs: false,
             },
+            CiRequest::Docs {
+                repo: "griasdi".to_owned(),
+            },
+            CiRequest::Doc {
+                repo: "griasdi".to_owned(),
+                number: 3,
+            },
+            CiRequest::DocCreate {
+                repo: "griasdi".to_owned(),
+                kind: DocKind::Plan,
+                title: "Plan".to_owned(),
+                body: "# Plan\n".to_owned(),
+                source: "griasdi".to_owned(),
+                proposals: vec![1, 2],
+            },
+            CiRequest::DocState {
+                repo: "griasdi".to_owned(),
+                number: 3,
+                state: DocState::InProgress,
+            },
+            CiRequest::DocDelete {
+                repo: "griasdi".to_owned(),
+                number: 3,
+            },
+            CiRequest::PlanClaim {
+                repo: "griasdi".to_owned(),
+            },
         ];
         for request in requests {
             assert_eq!(CiRequest::decode(&request.encode()), Some(request));
@@ -646,6 +929,15 @@ mod tests {
                         received: 1,
                     }],
                     platforms: vec![("linux-amd64".to_owned(), "tuco-pc".to_owned())],
+                    repos: vec![RepoDocsView {
+                        repo: "griasdi".to_owned(),
+                        origin: "github.com/griasdi/griasdi".to_owned(),
+                        default_branch: "main".to_owned(),
+                        awaiting: 1,
+                        queued: 2,
+                        running: Some(4),
+                        proposals: 3,
+                    }],
                 },
             },
             CiReply::Pipelines {
@@ -708,8 +1000,15 @@ mod tests {
                     jobs_note: String::new(),
                     machines: Vec::new(),
                     platforms: vec![("linux-amd64".to_owned(), "tuco-pc".to_owned())],
+                    docs: vec![doc()],
                 })),
             },
+            CiReply::Docs { docs: vec![doc()] },
+            CiReply::Doc {
+                doc: Some(Box::new(doc())),
+            },
+            CiReply::Doc { doc: None },
+            CiReply::DocCreated { number: 5 },
             CiReply::Error {
                 message: "no such job".to_owned(),
             },
@@ -826,5 +1125,101 @@ mod tests {
             Some(CiReply::Overview { overview }) => assert!(overview.platforms.is_empty()),
             other => panic!("{other:?}"),
         }
+    }
+
+    fn doc() -> DocView {
+        DocView {
+            repo: "griasdi".to_owned(),
+            number: 3,
+            kind: DocKind::Proposal,
+            title: "Expose the clock".to_owned(),
+            state: DocState::Planned,
+            source: "weida".to_owned(),
+            created: 10,
+            changed: 20,
+            approved: None,
+            proposals: Vec::new(),
+            plan: Some(4),
+            body: "Body".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_doc_create_carries_its_kind_beside_the_request_tag() {
+        let wire = CiRequest::DocCreate {
+            repo: "r".to_owned(),
+            kind: DocKind::Proposal,
+            title: "t".to_owned(),
+            body: "b".to_owned(),
+            source: "s".to_owned(),
+            proposals: Vec::new(),
+        }
+        .encode();
+        let value: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(value["kind"], "doc_create");
+        assert_eq!(value["doc_kind"], "proposal");
+    }
+
+    #[test]
+    fn one_repository_is_named_the_same_by_every_url_form() {
+        let same = [
+            "git@github.com:griasdi/griasdi.git",
+            "https://github.com/Griasdi/Griasdi.git",
+            "https://github.com/griasdi/griasdi",
+            "ssh://git@github.com/Griasdi/griasdi.git/",
+            "https://user:token@github.com/griasdi/griasdi.git",
+            " HTTP://GitHub.com/griasdi/griasdi.git\n",
+        ];
+        for url in same {
+            assert_eq!(normalize_origin(url), "github.com/griasdi/griasdi", "{url}");
+        }
+        // Another repository, another host or another port is another name.
+        assert_ne!(
+            normalize_origin("git@github.com:griasdi/weida.git"),
+            normalize_origin("git@github.com:griasdi/griasdi.git")
+        );
+        assert_eq!(
+            normalize_origin("ssh://git@git.example.org:2222/o/r.git"),
+            "git.example.org:2222/o/r"
+        );
+        // A local checkout is its path, with or without the scheme.
+        assert_eq!(normalize_origin("/tmp/zh-fx/demo.git"), "/tmp/zh-fx/demo");
+        assert_eq!(
+            normalize_origin("file:///tmp/zh-fx/demo"),
+            "/tmp/zh-fx/demo"
+        );
+    }
+
+    #[test]
+    fn documents_group_in_queue_order_with_the_newest_history_first() {
+        let make = |number, kind, state, approved: Option<u64>, changed| DocView {
+            number,
+            kind,
+            state,
+            approved,
+            changed,
+            ..doc()
+        };
+        let docs = vec![
+            make(1, DocKind::Plan, DocState::Done, None, 5),
+            make(2, DocKind::Plan, DocState::Approved, Some(30), 30),
+            make(3, DocKind::Proposal, DocState::Open, None, 1),
+            make(4, DocKind::Plan, DocState::Approved, Some(20), 20),
+            make(5, DocKind::Proposal, DocState::Dismissed, None, 9),
+            make(6, DocKind::Plan, DocState::Saved, None, 2),
+        ];
+        let groups: Vec<(DocGroup, Vec<u64>)> = doc_groups(&docs)
+            .into_iter()
+            .map(|(group, docs)| (group, docs.iter().map(|doc| doc.number).collect()))
+            .collect();
+        assert_eq!(
+            groups,
+            vec![
+                (DocGroup::Awaiting, vec![6]),
+                (DocGroup::Queue, vec![4, 2]),
+                (DocGroup::Proposals, vec![3]),
+                (DocGroup::History, vec![5, 1]),
+            ]
+        );
     }
 }

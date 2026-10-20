@@ -429,6 +429,7 @@ mod tests {
                 ("linux-arm64".to_owned(), "atik".to_owned()),
                 ("windows-amd64".to_owned(), "win11".to_owned()),
             ],
+            docs: Vec::new(),
         }
     }
 

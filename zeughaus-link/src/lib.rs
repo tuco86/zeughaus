@@ -9,7 +9,7 @@
 //! and pure pixel math, no I/O, so the runtime's server and the editor's
 //! client cannot disagree about the protocol.
 //!
-//! One listener, ten paths, each a different weida pattern:
+//! One listener, fourteen paths, each a different weida pattern:
 //!
 //! | path | pattern | carries |
 //! |---|---|---|
@@ -19,6 +19,7 @@
 //! | [`TRIGGERS_PATH`] | push/pull | [`events::TriggerRequest`] from an editor |
 //! | [`RUNS_PATH`] | req/rep | [`runs`]: a range of one file of one run |
 //! | [`HOLD_PATH`] | req/rep | [`runs::HoldRequest`]: start no new runs |
+//! | [`AGENT_PATH`] | req/rep | [`agent`]: open a plan or master agent session in a terminal |
 //! | [`BUSY_PATH`] | req/rep | [`machine::BusyRequest`]: override the CI busy measurement |
 //! | [`CI_PATH`] | req/rep | [`ci`]: channels, pipelines, machines, job transcripts |
 //! | [`ENLIST_PATH`] | one long exchange per runner | [`enlist`]: a runner takes assignments from the CI and streams output |
@@ -31,6 +32,7 @@
 //! files that hold the runner's identity and the client keys it trusts, and
 //! the endpoint file through which a local editor finds its runner.
 
+pub mod agent;
 pub mod ci;
 pub mod credentials;
 pub mod enlist;
@@ -41,10 +43,12 @@ pub mod machine;
 pub mod manual;
 pub mod runs;
 
+pub use agent::{AgentReply, AgentRequest, AgentSession, MAX_AGENT_BYTES};
 pub use ci::{
-    ChannelView, CiOverview, CiReply, CiRequest, JobDefView, JobTiming, JobView,
-    MAX_CI_REPLY_BYTES, MAX_CI_REQUEST_BYTES, MachineJob, MachineView, PipelineView, QueuedView,
-    RepoView, TimedLine, TransferView,
+    ChannelView, CiOverview, CiReply, CiRequest, DocGroup, DocKind, DocState, DocView, JobDefView,
+    JobTiming, JobView, MAX_CI_REPLY_BYTES, MAX_CI_REQUEST_BYTES, MAX_DOC_BYTES,
+    MAX_DOC_TITLE_BYTES, MachineJob, MachineView, PipelineView, QueuedView, RepoDocsView, RepoView,
+    TimedLine, TransferView, doc_groups, normalize_origin,
 };
 pub use events::{
     ErrorRow, MAX_EVENT_BYTES, MAX_SNAPSHOT_BYTES, MAX_TRIGGER_BYTES, OutputRow, RejectionRow,
@@ -82,6 +86,11 @@ pub const RUNS_PATH: &str = "/runs";
 /// Req/Rep endpoint that holds and releases the runner: held, it starts no
 /// new run and lets the live ones finish.
 pub const HOLD_PATH: &str = "/hold";
+
+/// Req/Rep endpoint an editor opens an agent session on: a plan or master
+/// session of a repository, in a terminal of the runner's mux. Served only
+/// by a runner that has a mux, on Unix.
+pub const AGENT_PATH: &str = "/agent";
 
 /// Req/Rep endpoint that overrides a CI runner's busy measurement. Served
 /// only by a runner that runs CI.
