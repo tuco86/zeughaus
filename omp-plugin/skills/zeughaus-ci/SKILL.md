@@ -5,7 +5,7 @@ description: "Repo has .zeughaus-ci/: debug a job or platform with run_jobs, CI 
 
 # zeughaus-ci
 
-zeughaus-ci is the user's own CI. Its runners are the machines they own, one per platform. A repository's jobs are scripts in its `.zeughaus-ci/` folder. You reach the CI through the tools of the MCP server `zeughaus`: `ci_repo`, `ci_status`, `ci_pipelines`, `ci_pipeline`, `ci_log`, `ci_timing`, `ci_wait`, `ci_rerun`, `ci_cancel`, `run_jobs`.
+zeughaus-ci is the user's own CI. Its runners are the machines they own, one per platform. A repository's jobs are scripts in its `.zeughaus-ci/` folder. You reach the CI through the tools of the MCP server `zeughaus`: `ci_repo`, `ci_status`, `ci_pipelines`, `ci_pipeline`, `ci_log`, `ci_timing`, `ci_wait`, `ci_rerun`, `ci_cancel`, `run_jobs`, `docs`, `doc_read`, `proposal_write`, `plan_done`.
 
 ## 1. Orient
 
@@ -66,3 +66,11 @@ zeughaus-ci is the user's own CI. Its runners are the machines they own, one per
 - Read `skill://zeughaus-ci/reference/pipelines.md` (how to shape a pipeline for this CI, zeughaus's own as the example, a review checklist) and `skill://zeughaus-ci/reference/jobs.md` (header keys, channels, placement, environment, job notes).
 - Validate before pushing, where the binary exists: `zeughaus-ci check` (header rules, channels, ignored keys; placement too where the state directory has the CI's `ci.toml`) and `zeughaus-ci plan .zeughaus-ci push main` (the channel and the jobs an event selects).
 - Without the binary, `run_jobs` validates on the CI: a header error ends the run as `error`, with the message as the pipeline's note.
+
+## 8. Plans and proposals
+
+- Plans and proposals of a repository live in the CI, numbered per repository. `docs` lists them (awaiting approval, the queue, in progress, open proposals, history); `doc_read` reads one with its text. The `<zeughaus-ci>` block names the open proposals and the plans that wait or run.
+- A plan made from proposals names them in one line directly under its title: `Proposals: #3, #5`. Saving the plan, or executing it from its review, marks them planned.
+- The user stores a finished plan with `/zeughaus save`; it waits in the desktop's Plans tab for approval, and the repository's master session executes approved plans one after another.
+- A change another repository of the CI needs: `proposal_write` with `path` = that repository's checkout (or `repo` = its name), a one-line title and the body (what changed here and why, what the receiving project would change, what this project does afterwards, the checks). A repository the CI does not build gets a `PROPOSAL-<source>-<topic>.md` in its root instead; the tool's refusal says where.
+- A session executing a plan from zeughaus (the master tells it the number) calls `plan_done` once its work is committed and pushed, and not before.

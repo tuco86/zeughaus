@@ -4,13 +4,17 @@
 //   system prompt as a <zeughaus-ci> block and into the status line;
 // - after a `git push` of this checkout polls `zeughaus-runner ci find --json` and reports the
 //   first failed job of the pushed commit's pipeline into the session, or its success;
-// - answers /zeughaus with the current state.
+// - answers /zeughaus with the current state, and /zeughaus save stores the session's plan in
+//   the CI (`zeughaus-runner ci plan-save`) and starts a fresh session;
+// - marks the proposals a plan names as planned when the plan is executed from its review;
+// - in a session a master started on a plan (`ZEUGHAUS_PLAN=<repo>#<n>`), ends the session once
+//   that plan is done and the agent is idle, so the master goes on with the next one.
 //
 // The factory only registers: `omp plugin install` runs it against a throwaway API, so it must
 // do no work at load. Every handler skips subagents, which have prompts of their own. Nothing
 // here may reject out of a detached promise or a timer: omp ends the whole session on it.
 
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -29,8 +33,16 @@ interface Ctx {
     notify(message: string, level: "info" | "warning" | "error"): void;
     setStatus(key: string, text: string | undefined): void;
   };
+  sessionManager: { getArtifactsDir(): string | undefined | null };
   setInterval(callback: () => unknown, ms: number): unknown;
   clearTimer(timer: unknown): void;
+  isIdle(): boolean;
+  shutdown(): void | Promise<void>;
+}
+/** A command handler's context has what changes the session too. */
+interface CommandCtx extends Ctx {
+  waitForIdle(): Promise<void>;
+  newSession(): Promise<unknown>;
 }
 interface ToolResultEvent {
   toolName: string;
@@ -49,6 +61,11 @@ interface Events {
     event: ToolResultEvent,
     ctx: Ctx,
   ) => Promise<{ additionalContext: string } | undefined>;
+  plan_review_requested: (
+    event: { planFilePath: string; planContent: string; title: string },
+    ctx: Ctx,
+  ) => void;
+  plan_review_resolved: (event: { choice?: string }, ctx: Ctx) => void;
 }
 interface Pi {
   on<E extends keyof Events>(event: E, handler: Events[E]): void;
@@ -63,7 +80,7 @@ interface Pi {
   ): void;
   registerCommand(
     name: string,
-    command: { description: string; handler: (args: string, ctx: Ctx) => Promise<void> },
+    command: { description: string; handler: (args: string, ctx: CommandCtx) => Promise<void> },
   ): void;
 }
 
@@ -206,6 +223,7 @@ function block(c: CiContext): string | undefined {
         c.text,
         "Tests before a push: only the unit tier of the crates or packages the change touches (Rust: cargo nextest run -p <crate>; Python: uv run pytest tests/unit). Never the whole suite, the integration or the end-to-end tier locally: the push pipeline runs what its jobs select right after the push, and integration and end-to-end tests belong to the nightly and release pipelines.",
         "Builds and tests on another platform go through run_jobs, never by hand over ssh; skill://zeughaus-ci says how to debug a job or platform with it and how jobs are written.",
+        'Plans and proposals of this repository live in the CI: read them with the zeughaus MCP tools docs and doc_read. A plan made from proposals names them in a line "Proposals: #3, #5" directly under its title. The user stores a finished plan with /zeughaus save.',
       );
     case "unknown":
       return wrap(
@@ -494,6 +512,53 @@ async function pushedHead(
   return undefined;
 }
 
+// ---- Plans ----------------------------------------------------------------------------------
+
+/** A plan file path as omp names it: `local://<name>` in the session's artifacts, or a path. */
+function resolvePlan(path: string, ctx: Ctx): string | undefined {
+  if (path.startsWith("local://")) {
+    const artifacts = ctx.sessionManager.getArtifactsDir();
+    return artifacts ? join(artifacts, "local", path.slice("local://".length)) : undefined;
+  }
+  return resolve(ctx.cwd, path);
+}
+
+/** The newest `*plan.md` among the session's local artifacts, the one omp's own review picks. */
+function newestPlan(ctx: Ctx): string | undefined {
+  const artifacts = ctx.sessionManager.getArtifactsDir();
+  if (!artifacts) return undefined;
+  const dir = join(artifacts, "local");
+  let newest: { path: string; mtime: number } | undefined;
+  try {
+    for (const name of readdirSync(dir)) {
+      if (!/plan\.md$/i.test(name)) continue;
+      const path = join(dir, name);
+      const mtime = statSync(path).mtimeMs;
+      if (!newest || mtime > newest.mtime) newest = { path, mtime };
+    }
+  } catch {
+    // No local artifacts yet.
+  }
+  return newest?.path;
+}
+
+/** `ZEUGHAUS_PLAN=<repo>#<n>`: the plan a master started this session on. */
+function masterPlan(): { repo: string; number: number } | undefined {
+  const m = /^([a-z0-9][a-z0-9-]*)#([1-9][0-9]*)$/.exec(process.env.ZEUGHAUS_PLAN ?? "");
+  return m ? { repo: m[1] as string, number: Number(m[2]) } : undefined;
+}
+
+/** One field of a JSON object a `zeughaus-runner ci --json` command printed; `undefined` else. */
+function jsonField(stdout: string, key: string): unknown {
+  let value: unknown;
+  try {
+    value = JSON.parse(stdout);
+  } catch {
+    return undefined;
+  }
+  return value !== null && typeof value === "object" ? Reflect.get(value, key) : undefined;
+}
+
 // ---- The extension --------------------------------------------------------------------------
 
 export default function zeughausCi(pi: Pi): void {
@@ -503,6 +568,11 @@ export default function zeughausCi(pi: Pi): void {
   let latest: CiContext = { kind: "none" };
   let progress: Progress | undefined;
   let watch: Watch | undefined;
+  // The plan file the last plan review showed, resolved against the session that showed it:
+  // executing a plan starts another session, whose artifacts are elsewhere.
+  let planFile: string | undefined;
+  // The master's plan, once it is being watched for `done`.
+  let master: { timer: unknown; busy: boolean } | undefined;
 
   const isMain = (ctx: Ctx): boolean => !ctx.agent || ctx.agent.kind === "main";
 
@@ -620,10 +690,59 @@ export default function zeughausCi(pi: Pi): void {
     w.timer = ctx.setInterval(() => poll(w), POLL_MS);
   };
 
+  /** Ends the session once the master's plan is done and the agent has nothing left to do. */
+  const watchMaster = (ctx: Ctx, plan: { repo: string; number: number }): void => {
+    if (master) return;
+    const m = { timer: undefined as unknown, busy: false };
+    master = m;
+    m.timer = ctx.setInterval(async () => {
+      if (m.busy || master !== m) return;
+      m.busy = true;
+      try {
+        const args = ["ci", "doc", "--json", plan.repo, String(plan.number)];
+        const r = await exec(pi, RUNNER, args, ctx.cwd, FIND_TIMEOUT_MS);
+        if (r.code !== 0 || master !== m) return;
+        const state = jsonField(r.stdout, "state");
+        if (state !== "done" || !ctx.isIdle()) return;
+        ctx.clearTimer(m.timer);
+        master = undefined;
+        ctx.ui.notify(`plan #${plan.number} done; ending this session for the master`, "info");
+        await ctx.shutdown();
+      } catch {
+        // A timer must not reject; the next round asks again.
+      } finally {
+        m.busy = false;
+      }
+    }, POLL_MS);
+  };
+
   pi.on("session_start", (_event, ctx) => {
     if (!isMain(ctx)) return;
     // Not awaited: a slow CI must not hold up the session; before_agent_start waits for it.
     void prime(ctx).catch(() => undefined);
+    const plan = masterPlan();
+    if (plan) watchMaster(ctx, plan);
+  });
+
+  pi.on("plan_review_requested", (event, ctx) => {
+    if (!isMain(ctx) || typeof event.planFilePath !== "string") return;
+    planFile = resolvePlan(event.planFilePath, ctx);
+  });
+
+  // A plan executed straight from its review takes up the proposals it names, as a saved one
+  // does when it is stored.
+  pi.on("plan_review_resolved", (event, ctx) => {
+    if (!isMain(ctx) || !["execute", "compact", "keep"].includes(event.choice ?? "")) return;
+    const path = planFile ?? newestPlan(ctx);
+    if (!path) return;
+    void (async () => {
+      const c = await contextFor(ctx.cwd);
+      if (c.kind !== "repo") return;
+      const r = await exec(pi, RUNNER, ["ci", "planned", c.view.name, path], c.root, FIND_TIMEOUT_MS);
+      if (r.code !== 0) {
+        ctx.ui.notify(`zeughaus-ci: proposals not marked planned: ${failure(r, "ci planned")}`, "warning");
+      }
+    })().catch(() => undefined);
   });
 
   // A new or resumed session in this process: its prompt block and status are its own, and the
@@ -668,8 +787,17 @@ export default function zeughausCi(pi: Pi): void {
   });
 
   pi.registerCommand("zeughaus", {
-    description: "zeughaus-ci state of this checkout",
-    handler: async (_args, ctx) => {
+    description: "zeughaus-ci state of this checkout; `save` stores the session's plan in the CI",
+    handler: async (args, ctx) => {
+      const sub = args.trim();
+      if (sub === "save") {
+        await savePlan(ctx);
+        return;
+      }
+      if (sub !== "") {
+        ctx.ui.notify("usage: /zeughaus [save]", "warning");
+        return;
+      }
       // Only the status line and this answer are fresh; the prompt block stays as it was.
       latest = await loadContext(pi, ctx.cwd);
       if (!watch) progress = undefined;
@@ -677,4 +805,35 @@ export default function zeughausCi(pi: Pi): void {
       ctx.ui.notify(explain(latest), "info");
     },
   });
+
+  /** Stores the session's plan in the CI and starts a fresh session for what comes next. */
+  const savePlan = async (ctx: CommandCtx): Promise<void> => {
+    const c = await contextFor(ctx.cwd);
+    if (c.kind !== "repo") {
+      ctx.ui.notify("this checkout is no repository of the CI; use Save and quit", "warning");
+      return;
+    }
+    const path = planFile ?? newestPlan(ctx);
+    if (!path || !existsSync(path)) {
+      ctx.ui.notify("no plan file in this session", "warning");
+      return;
+    }
+    const r = await exec(
+      pi,
+      RUNNER,
+      ["ci", "plan-save", "--json", c.view.name, path],
+      c.root,
+      CONTEXT_TIMEOUT_MS,
+    );
+    const number = r.code === 0 ? jsonField(r.stdout, "number") : undefined;
+    if (typeof number !== "number") {
+      const why = r.code === 0 ? `${RUNNER} gave an unreadable answer` : failure(r, "ci plan-save");
+      ctx.ui.notify(why, "error");
+      return;
+    }
+    ctx.ui.notify(`saved plan #${number} to zeughaus`, "info");
+    planFile = undefined;
+    await ctx.waitForIdle();
+    await ctx.newSession();
+  };
 }
