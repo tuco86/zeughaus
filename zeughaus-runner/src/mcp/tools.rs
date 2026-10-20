@@ -1,4 +1,4 @@
-//! The ten tools, the schemas an agent sees and the text they answer with.
+//! The fourteen tools, the schemas an agent sees and the text they answer with.
 //!
 //! The text is for a model, so it is short, one fact per line and in a shape
 //! that is the same every time. The functions that build it take the records
@@ -14,10 +14,12 @@ use serde_json::{Value, json};
 use zeughaus_link::ci::{LineSpan, MAX_PIPELINES_PER_REQUEST, MAX_TIMING_LINES, TIMING_READ_BYTES};
 use zeughaus_link::manual::{MAX_MANUAL_JOBS, RunReply};
 use zeughaus_link::{
-    CiOverview, CiReply, CiRequest, JobTiming, JobView, PipelineView, TransferView,
+    CiOverview, CiReply, CiRequest, DocKind, DocState, DocView, JobTiming, JobView, PipelineView,
+    TransferView,
 };
 
 use super::client::Client;
+use super::docs;
 use super::repo;
 use super::rpc::Tools;
 use super::snapshot;
@@ -32,7 +34,10 @@ for a pipeline or one job, also for the pipeline a push is about to start; ci_st
 ci_pipelines, ci_pipeline and ci_log show the CI's state and output; ci_timing says where the \
 time went. ci_repo says which repository of the CI the current checkout is, its jobs and where \
 each runs, and whether HEAD and the default branch are green; in such a checkout `repo` can be \
-omitted.";
+omitted. Plans and proposals of a repository live in the CI too: docs lists them, doc_read reads \
+one, proposal_write stores a proposal for another repository of the CI (instead of a \
+PROPOSAL-*.md in its root), and a session executing a plan from zeughaus calls plan_done once its \
+work is committed and pushed.";
 
 /// Pipelines listed when the call gives no limit.
 const DEFAULT_PIPELINES: u32 = 10;
@@ -264,6 +269,94 @@ impl Toolbox {
         }
     }
 
+    /// `docs`: a repository's plans and proposals, one line each.
+    async fn docs(&self, args: RepoOnlyArgs) -> Result<String, String> {
+        let repo = self.repo_or_checkout(args.repo).await?;
+        match self
+            .client
+            .ci(CiRequest::Docs { repo: repo.clone() })
+            .await?
+        {
+            CiReply::Docs { docs } if docs.is_empty() => {
+                Ok(format!("no plans or proposals in {repo}"))
+            }
+            CiReply::Docs { docs } => Ok(docs::docs_text(&docs, now())),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// `doc_read`: one plan or proposal with its body.
+    async fn doc_read(&self, args: PipelineArgs) -> Result<String, String> {
+        let repo = self.repo_or_checkout(args.repo).await?;
+        let doc = read_doc(&self.client, &repo, args.number).await?;
+        Ok(docs::doc_text(&doc, now()))
+    }
+
+    /// `proposal_write`: stores a proposal for another repository of the
+    /// CI, from the project this server works in.
+    async fn proposal_write(&self, args: ProposalArgs) -> Result<String, String> {
+        let ProposalArgs {
+            path,
+            repo,
+            title,
+            body,
+        } = args;
+        self.client.configured()?;
+        let repo = match (path, repo) {
+            (Some(path), None) => {
+                let checkout = self.checkout_of(Some(&path)).await?;
+                match repo::ask(&self.client, &checkout, false).await? {
+                    Some(view) => view.name,
+                    None => {
+                        return Err(format!(
+                            "{} is no repository of the CI; write \
+                             PROPOSAL-<source>-<topic>.md into {} instead",
+                            checkout.origin,
+                            checkout.root.display()
+                        ));
+                    }
+                }
+            }
+            (None, Some(repo)) => repo,
+            _ => return Err("name the receiving project: path of its checkout or repo".to_owned()),
+        };
+        let own = self.checkout_path(None)?;
+        let root = tokio::task::spawn_blocking(move || snapshot::toplevel(&own))
+            .await
+            .map_err(|e| format!("the checkout could not be read: {e}"))??;
+        let source = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("{} has no name to give as the source", root.display()))?
+            .to_owned();
+        let request = CiRequest::DocCreate {
+            repo: repo.clone(),
+            kind: DocKind::Proposal,
+            title,
+            body,
+            source,
+            proposals: Vec::new(),
+        };
+        match self.client.ci(request).await? {
+            CiReply::DocCreated { number } => Ok(format!("proposal #{number} stored in {repo}")),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// `plan_done`: the plan this session executed is finished.
+    async fn plan_done(&self, args: PipelineArgs) -> Result<String, String> {
+        let repo = self.repo_or_checkout(args.repo).await?;
+        let request = CiRequest::DocState {
+            repo: repo.clone(),
+            number: args.number,
+            state: DocState::Done,
+        };
+        match self.client.ci(request).await? {
+            CiReply::Accepted => Ok(format!("plan #{} of {repo} is done", args.number)),
+            other => Err(unexpected(&other)),
+        }
+    }
+
     /// Looks at a pipeline, named by its number or by the sha of its commit,
     /// until it has settled (or, with `job`, until that job has) or the wait
     /// has passed, and answers as `ci_pipeline` does. Named by neither, it is
@@ -464,6 +557,19 @@ pub(super) async fn find(
     }
 }
 
+/// Document `number` of `repo` with its body.
+pub(super) async fn read_doc(client: &Client, repo: &str, number: u64) -> Result<DocView, String> {
+    let request = CiRequest::Doc {
+        repo: repo.to_owned(),
+        number,
+    };
+    match client.ci(request).await? {
+        CiReply::Doc { doc: Some(doc) } => Ok(*doc),
+        CiReply::Doc { doc: None } => Err(format!("no document #{number} in {repo}")),
+        other => Err(unexpected(&other)),
+    }
+}
+
 impl Tools for Toolbox {
     fn instructions(&self) -> &'static str {
         INSTRUCTIONS
@@ -488,6 +594,10 @@ impl Tools for Toolbox {
             "ci_cancel" => self.cancel(arguments_of(arguments)?).await,
             "ci_wait" => self.ci_wait(arguments_of(arguments)?).await,
             "run_jobs" => self.run_jobs(arguments_of(arguments)?).await,
+            "docs" => self.docs(arguments_of(arguments)?).await,
+            "doc_read" => self.doc_read(arguments_of(arguments)?).await,
+            "proposal_write" => self.proposal_write(arguments_of(arguments)?).await,
+            "plan_done" => self.plan_done(arguments_of(arguments)?).await,
             other => Err(format!(
                 "unknown tool {other:?}; the tools are {}",
                 definitions()
@@ -511,6 +621,21 @@ struct NoArguments {}
 #[serde(deny_unknown_fields)]
 struct RepoArgs {
     path: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepoOnlyArgs {
+    repo: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposalArgs {
+    path: Option<String>,
+    repo: Option<String>,
+    title: String,
+    body: String,
 }
 
 #[derive(Deserialize)]
@@ -942,6 +1067,11 @@ fn definitions() -> Vec<Value> {
         "minimum": 1,
         "description": "Pipeline number.",
     });
+    let doc_number = json!({
+        "type": "integer",
+        "minimum": 1,
+        "description": "Number of the plan or proposal, as docs lists it.",
+    });
     let wait = |what: &str| {
         json!({
             "type": "integer",
@@ -1142,6 +1272,61 @@ fn definitions() -> Vec<Value> {
             &["jobs"],
             false,
         ),
+        tool(
+            "docs",
+            "The plans and proposals of a repository, one line each, grouped: awaiting \
+             approval, the queue of approved plans in the order they run, in progress, open \
+             proposals, then the history.",
+            json!({ "repo": repo }),
+            &[],
+            true,
+        ),
+        tool(
+            "doc_read",
+            "One plan or proposal of a repository with its whole text: number, kind, state, \
+             title, where it came from, its age, then the body.",
+            json!({ "repo": repo, "number": doc_number }),
+            &["number"],
+            true,
+        ),
+        tool(
+            "proposal_write",
+            "Store a proposal for another repository of the CI: what changed in this project \
+             and why, what the receiving project would change, and the checks. It waits there \
+             as an open proposal until a plan takes it up. Name the receiving project by the \
+             path of its checkout or by its repository name. Answers with its number.",
+            json!({
+                "path": {
+                    "type": "string",
+                    "description": "The receiving project's checkout, for example \
+                                    ~/work/git.doodleshnookie.net/tuco86/weida. Not together \
+                                    with repo.",
+                },
+                "repo": {
+                    "type": "string",
+                    "description": "The receiving repository's name as ci_status lists it, \
+                                    instead of path.",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "One line, at most 200 bytes.",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "The proposal in Markdown.",
+                },
+            }),
+            &["title", "body"],
+            false,
+        ),
+        tool(
+            "plan_done",
+            "Mark the plan this session executed as done, once its work is committed and \
+             pushed. The plan must be in progress.",
+            json!({ "repo": repo, "number": doc_number }),
+            &["number"],
+            false,
+        ),
     ]
 }
 
@@ -1210,7 +1395,7 @@ mod tests {
     }
 
     #[test]
-    fn there_are_ten_tools_and_each_takes_an_object() {
+    fn there_are_fourteen_tools_and_each_takes_an_object() {
         let definitions = definitions();
         let names: Vec<&str> = definitions
             .iter()
@@ -1228,7 +1413,11 @@ mod tests {
                 "ci_wait",
                 "ci_rerun",
                 "ci_cancel",
-                "run_jobs"
+                "run_jobs",
+                "docs",
+                "doc_read",
+                "proposal_write",
+                "plan_done"
             ]
         );
         for tool in &definitions {
@@ -1915,6 +2104,18 @@ mod tests {
                             pipelines: vec![view],
                         }
                     }
+                    CiRequest::Docs { .. } => CiReply::Docs {
+                        docs: vec![fake_doc(false)],
+                    },
+                    CiRequest::Doc { number: 2, .. } => CiReply::Doc {
+                        doc: Some(Box::new(fake_doc(true))),
+                    },
+                    CiRequest::Doc { .. } => CiReply::Doc { doc: None },
+                    CiRequest::DocCreate { .. } => CiReply::DocCreated { number: 7 },
+                    CiRequest::DocState { number: 2, .. } => CiReply::Accepted,
+                    CiRequest::DocState { number, .. } => CiReply::Error {
+                        message: format!("no document #{number} in demo"),
+                    },
                     _ => CiReply::Error {
                         message: "not served by the fake".to_owned(),
                     },
@@ -2442,6 +2643,161 @@ mod tests {
                 .await
                 .expect_err("the fake refuses");
             assert_eq!(err, "not served by the fake");
+        }
+
+        /// Plan #2 of the fake: saved an hour after the epoch.
+        fn fake_doc(body: bool) -> DocView {
+            DocView {
+                repo: "demo".to_owned(),
+                number: 2,
+                kind: DocKind::Plan,
+                title: "Smoke plan".to_owned(),
+                state: DocState::Saved,
+                source: "demo".to_owned(),
+                created: 3600,
+                changed: 3600,
+                approved: None,
+                proposals: Vec::new(),
+                plan: None,
+                body: if body {
+                    "# Smoke plan\n".to_owned()
+                } else {
+                    String::new()
+                },
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_document_tools_list_and_read_plans() {
+            let ci = fake_ci("docs", 0, None).await;
+            let tools = toolbox_for(&ci);
+
+            let list = tools
+                .call("docs", json!({ "repo": "demo" }))
+                .await
+                .expect("docs");
+            assert!(
+                list.starts_with("Awaiting approval:\n  #2 plan saved: Smoke plan ("),
+                "{list}"
+            );
+
+            let read = tools
+                .call("doc_read", json!({ "repo": "demo", "number": 2 }))
+                .await
+                .expect("doc");
+            assert!(
+                read.starts_with("#2 plan saved: Smoke plan\nfrom demo\ncreated "),
+                "{read}"
+            );
+            assert!(read.ends_with(" ago\n\n# Smoke plan\n"), "{read}");
+
+            let err = tools
+                .call("doc_read", json!({ "repo": "demo", "number": 9 }))
+                .await
+                .expect_err("no such document");
+            assert_eq!(err, "no document #9 in demo");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn plan_done_marks_the_plan_done() {
+            let ci = fake_ci("done", 0, None).await;
+            let tools = toolbox_for(&ci);
+            let text = tools
+                .call("plan_done", json!({ "repo": "demo", "number": 2 }))
+                .await
+                .expect("done");
+            assert_eq!(text, "plan #2 of demo is done");
+            assert_eq!(
+                ci.seen.asked.lock().unwrap().last(),
+                Some(&CiRequest::DocState {
+                    repo: "demo".to_owned(),
+                    number: 2,
+                    state: DocState::Done,
+                })
+            );
+            let err = tools
+                .call("plan_done", json!({ "repo": "demo", "number": 5 }))
+                .await
+                .expect_err("refused");
+            assert_eq!(err, "no document #5 in demo");
+        }
+
+        /// A proposal names its receiver by the path of its checkout; the
+        /// source is the checkout this server works in.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_proposal_goes_to_the_repository_of_the_named_checkout() {
+            let ci = fake_ci("proposal", 0, None).await;
+            let receiving = checkout("proposal-to");
+            let own = std::env::temp_dir().join(format!(
+                "zeughaus-mcp-proposal-from-{}/weida",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(own.parent().unwrap());
+            std::fs::create_dir_all(own.join("src")).unwrap();
+            fx(&own, &["init", "-q"]);
+            let tools = toolbox_for(&ci).working_in(own.join("src"));
+
+            let text = tools
+                .call(
+                    "proposal_write",
+                    json!({ "path": receiving, "title": "Expose the clock", "body": "Why." }),
+                )
+                .await
+                .expect("stored");
+            assert_eq!(text, "proposal #7 stored in demo");
+            assert_eq!(
+                ci.seen.asked.lock().unwrap().last(),
+                Some(&CiRequest::DocCreate {
+                    repo: "demo".to_owned(),
+                    kind: DocKind::Proposal,
+                    title: "Expose the clock".to_owned(),
+                    body: "Why.".to_owned(),
+                    source: "weida".to_owned(),
+                    proposals: Vec::new(),
+                })
+            );
+
+            for both_or_neither in [
+                json!({ "title": "t", "body": "b" }),
+                json!({ "path": receiving, "repo": "demo", "title": "t", "body": "b" }),
+            ] {
+                let err = tools
+                    .call("proposal_write", both_or_neither)
+                    .await
+                    .expect_err("no receiver");
+                assert_eq!(
+                    err,
+                    "name the receiving project: path of its checkout or repo"
+                );
+            }
+
+            // A checkout of no repository of the CI: write the file instead.
+            fx(
+                &receiving,
+                &[
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "git@example.invalid:o/other.git",
+                ],
+            );
+            let err = tools
+                .call(
+                    "proposal_write",
+                    json!({ "path": receiving, "title": "t", "body": "b" }),
+                )
+                .await
+                .expect_err("not in the CI");
+            assert_eq!(
+                err,
+                format!(
+                    "git@example.invalid:o/other.git is no repository of the CI; write \
+                     PROPOSAL-<source>-<topic>.md into {} instead",
+                    receiving.display()
+                )
+            );
+            let _ = std::fs::remove_dir_all(receiving.parent().unwrap());
+            let _ = std::fs::remove_dir_all(own.parent().unwrap());
         }
 
         /// Git as a test fixture runs it: its own identity, whatever the

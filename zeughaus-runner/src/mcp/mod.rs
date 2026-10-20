@@ -19,12 +19,14 @@
 //! script that is no MCP client; [`cli`] answers them on stdout.
 //!
 //! - [`rpc`]: the JSON-RPC framing and the calls running in parallel;
-//! - [`tools`]: the ten tools and the text they answer with;
+//! - [`tools`]: the fourteen tools and the text they answer with;
+//! - [`docs`]: plans and proposals as text, and what a plan file names;
 //! - [`client`]: the CI's `/ci` and `/manual` exchanges;
 //! - [`repo`]: a checkout, and the CI's view of the repository it belongs to;
 //! - [`snapshot`]: a working tree and its path dependencies as git bundles.
 
 mod client;
+mod docs;
 mod repo;
 mod rpc;
 mod snapshot;
@@ -37,10 +39,10 @@ use std::time::Duration;
 
 use serde::Serialize;
 use tokio::io::BufReader;
-use zeughaus_link::RepoView;
+use zeughaus_link::{CiReply, CiRequest, DocKind, DocState, RepoView};
 
 use self::client::{Client, Link};
-use self::tools::{Toolbox, find, is_sha_prefix, one_line, pipeline_text};
+use self::tools::{Toolbox, find, is_sha_prefix, one_line, pipeline_text, read_doc, unexpected};
 
 /// How long the process waits for work on the blocking pool once the session
 /// is over. The pool holds the blocking read of stdin, which only ends when
@@ -113,11 +115,12 @@ const EXIT_BAD_INPUT: u8 = 1;
 const EXIT_NO_ANSWER: u8 = 2;
 const EXIT_NOT_A_REPOSITORY: u8 = 3;
 
-/// `zeughaus-runner ci repo|find`: one question to the CI, answered on
-/// stdout, for a script that is no MCP client (an agent's extension asks
-/// them at session start and after a push). The CI is dialled as `mcp` does
-/// without `--ci`, and the reason of every failure is one line on stderr
-/// (the first, when usage follows).
+/// `zeughaus-runner ci repo|find|doc|plan-save|planned`: one question to
+/// the CI, answered on stdout, for a script that is no MCP client (an
+/// agent's extension asks them at session start, after a push and when a
+/// plan is saved). The CI is dialled as `mcp` does without `--ci`, and the
+/// reason of every failure is one line on stderr (the first, when usage
+/// follows).
 ///
 /// - `ci repo [--json] [<path>]`: which repository of the CI the checkout
 ///   at `path` (default: the working directory) is, as the `ci_repo` tool
@@ -126,10 +129,18 @@ const EXIT_NOT_A_REPOSITORY: u8 = 3;
 /// - `ci find [--json] <repo> <sha>`: the newest pipeline of a commit, as
 ///   `ci_pipeline` tells it. `--json` prints the pipeline's record, or
 ///   `null` when there is none.
+/// - `ci doc [--json] <repo> <number>`: one plan or proposal, as `doc_read`
+///   tells it; `--json` prints its record with the body.
+/// - `ci plan-save [--json] <repo> <file>`: stores the plan in `file`,
+///   titled by its first heading, taking up the proposals its `Proposals:`
+///   line names. `--json` prints `{"repo": .., "number": ..}`.
+/// - `ci planned <repo> <file>`: marks the proposals that the plan in
+///   `file` names as planned, for a plan executed without being saved.
 ///
-/// Exit 0: answered. 1: the arguments or the directory were wrong. 2: no CI
-/// is configured, or it could not be asked. 3: `ci repo` only, no repository
-/// of the CI has the checkout's origin.
+/// Exit 0: answered. 1: the arguments, the directory or the file were
+/// wrong. 2: no CI is configured, it could not be asked, or it refused
+/// (no such document, a state that cannot change). 3: `ci repo` only, no
+/// repository of the CI has the checkout's origin.
 pub fn cli(args: &[String], state_dir: &Path) -> ExitCode {
     let command = match parse_ci(args) {
         Ok(command) => command,
@@ -181,18 +192,33 @@ enum CiCommand {
         repo: String,
         sha: String,
     },
+    Doc {
+        json: bool,
+        repo: String,
+        number: u64,
+    },
+    PlanSave {
+        json: bool,
+        repo: String,
+        file: PathBuf,
+    },
+    Planned {
+        repo: String,
+        file: PathBuf,
+    },
 }
 
 /// The arguments that follow `ci`.
 fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
+    const SUBCOMMANDS: &str = "repo, find, doc, plan-save or planned";
     let Some((subcommand, rest)) = args.split_first() else {
-        return Err("ci needs a subcommand: repo or find".to_owned());
+        return Err(format!("ci needs a subcommand: {SUBCOMMANDS}"));
     };
     let mut json = false;
     let mut operands: Vec<&String> = Vec::new();
     for arg in rest {
         match arg.as_str() {
-            "--json" => json = true,
+            "--json" if subcommand != "planned" => json = true,
             flag if flag.len() > 1 && flag.starts_with('-') => {
                 return Err(format!("unknown flag {flag:?} for ci {subcommand}"));
             }
@@ -213,7 +239,27 @@ fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
         }),
         ("find", [_, sha]) => Err(format!("sha {sha:?} is not 4 to 40 hex digits")),
         ("find", _) => Err("ci find takes a repository name and a sha".to_owned()),
-        (other, _) => Err(format!("unknown ci subcommand {other:?}: repo or find")),
+        ("doc", [repo, number]) => match number.parse::<u64>() {
+            Ok(number) if number >= 1 => Ok(CiCommand::Doc {
+                json,
+                repo: (*repo).clone(),
+                number,
+            }),
+            _ => Err(format!("{number:?} is no document number")),
+        },
+        ("doc", _) => Err("ci doc takes a repository name and a number".to_owned()),
+        ("plan-save", [repo, file]) => Ok(CiCommand::PlanSave {
+            json,
+            repo: (*repo).clone(),
+            file: PathBuf::from(file),
+        }),
+        ("plan-save", _) => Err("ci plan-save takes a repository name and a file".to_owned()),
+        ("planned", [repo, file]) => Ok(CiCommand::Planned {
+            repo: (*repo).clone(),
+            file: PathBuf::from(file),
+        }),
+        ("planned", _) => Err("ci planned takes a repository name and a file".to_owned()),
+        (other, _) => Err(format!("unknown ci subcommand {other:?}: {SUBCOMMANDS}")),
     }
 }
 
@@ -246,6 +292,29 @@ impl Failure {
 struct RepoAnswer<'a> {
     repo: &'a RepoView,
     text: &'a str,
+}
+
+/// The line `ci plan-save --json` prints.
+#[derive(Serialize)]
+struct SavedAnswer<'a> {
+    repo: &'a str,
+    number: u64,
+}
+
+/// The plan in `file`; an empty one is no plan.
+fn read_plan(file: &Path) -> Result<String, Failure> {
+    let body = std::fs::read_to_string(file)
+        .map_err(|e| Failure::bad_input(format!("cannot read {}: {e}", file.display())))?;
+    if body.trim().is_empty() {
+        return Err(Failure::bad_input(format!("{} is empty", file.display())));
+    }
+    Ok(body)
+}
+
+fn encoded<T: Serialize>(value: &T) -> Result<String, Failure> {
+    serde_json::to_string(value)
+        .map(|line| format!("{line}\n"))
+        .map_err(|e| Failure::no_answer(format!("cannot encode the answer: {e}")))
 }
 
 /// Runs one `ci` command. `Ok` is what goes to stdout, newline included.
@@ -296,6 +365,63 @@ async fn ci_answer(client: &Client, command: CiCommand) -> Result<String, Failur
                     None => format!("no pipeline of {sha} in {repo}\n"),
                 })
             }
+        }
+        CiCommand::Doc { json, repo, number } => {
+            let doc = read_doc(client, &repo, number)
+                .await
+                .map_err(Failure::no_answer)?;
+            if json {
+                encoded(&doc)
+            } else {
+                Ok(format!(
+                    "{}\n",
+                    docs::doc_text(&doc, crate::enlist::now_secs()).trim_end()
+                ))
+            }
+        }
+        CiCommand::PlanSave { json, repo, file } => {
+            let body = read_plan(&file)?;
+            let proposals = docs::proposals_named(&body).map_err(Failure::bad_input)?;
+            let request = CiRequest::DocCreate {
+                repo: repo.clone(),
+                kind: DocKind::Plan,
+                title: docs::plan_title(&body),
+                source: repo.clone(),
+                body,
+                proposals,
+            };
+            let number = match client.ci(request).await.map_err(Failure::no_answer)? {
+                CiReply::DocCreated { number } => number,
+                other => return Err(Failure::no_answer(unexpected(&other))),
+            };
+            if json {
+                encoded(&SavedAnswer {
+                    repo: &repo,
+                    number,
+                })
+            } else {
+                Ok(format!("saved plan #{number} of {repo}\n"))
+            }
+        }
+        CiCommand::Planned { repo, file } => {
+            let body = read_plan(&file)?;
+            let numbers = docs::proposals_named(&body).map_err(Failure::bad_input)?;
+            if numbers.is_empty() {
+                return Ok("the plan names no proposals\n".to_owned());
+            }
+            for &number in &numbers {
+                let request = CiRequest::DocState {
+                    repo: repo.clone(),
+                    number,
+                    state: DocState::Planned,
+                };
+                match client.ci(request).await.map_err(Failure::no_answer)? {
+                    CiReply::Accepted => {}
+                    other => return Err(Failure::no_answer(unexpected(&other))),
+                }
+            }
+            let marked: Vec<String> = numbers.iter().map(|n| format!("#{n}")).collect();
+            Ok(format!("marked {} planned\n", marked.join(", ")))
         }
     }
 }
@@ -357,6 +483,29 @@ mod tests {
                 sha: "3635dad".to_owned()
             })
         );
+        assert_eq!(
+            parse_ci(&args(&["doc", "--json", "demo", "3"])),
+            Ok(CiCommand::Doc {
+                json: true,
+                repo: "demo".to_owned(),
+                number: 3
+            })
+        );
+        assert_eq!(
+            parse_ci(&args(&["plan-save", "demo", "/tmp/p.md", "--json"])),
+            Ok(CiCommand::PlanSave {
+                json: true,
+                repo: "demo".to_owned(),
+                file: PathBuf::from("/tmp/p.md")
+            })
+        );
+        assert_eq!(
+            parse_ci(&args(&["planned", "demo", "/tmp/p.md"])),
+            Ok(CiCommand::Planned {
+                repo: "demo".to_owned(),
+                file: PathBuf::from("/tmp/p.md")
+            })
+        );
     }
 
     #[test]
@@ -376,6 +525,13 @@ mod tests {
                 &["find", "zeughaus", "xyz1"][..],
                 "is not 4 to 40 hex digits",
             ),
+            (&["doc", "demo", "0"][..], "\"0\" is no document number"),
+            (&["doc", "demo"][..], "ci doc takes"),
+            (&["plan-save", "demo"][..], "ci plan-save takes"),
+            (
+                &["planned", "--json", "demo", "f"][..],
+                "unknown flag \"--json\" for ci planned",
+            ),
             (
                 &["find", "zeughaus", "abc"][..],
                 "is not 4 to 40 hex digits",
@@ -394,8 +550,8 @@ mod tests {
         use serde_json::{Value, json};
         use tokio::io::{AsyncReadExt, BufReader};
 
-        /// What the agent sees of a runner that has no CI: ten tools, and an
-        /// error with the reason from every call.
+        /// What the agent sees of a runner that has no CI: fourteen tools, and
+        /// an error with the reason from every call.
         #[tokio::test]
         async fn a_session_without_a_ci_lists_the_tools_and_explains_every_call() {
             let link = Link::resolve(None, Path::new("/nonexistent/zeughaus-state"));
@@ -431,7 +587,7 @@ mod tests {
             };
 
             assert_eq!(by_id(1)["result"]["serverInfo"]["name"], "zeughaus");
-            assert_eq!(by_id(2)["result"]["tools"].as_array().unwrap().len(), 10);
+            assert_eq!(by_id(2)["result"]["tools"].as_array().unwrap().len(), 14);
             let status = &by_id(3)["result"];
             assert_eq!(status["isError"], true);
             let text = status["content"][0]["text"].as_str().unwrap();

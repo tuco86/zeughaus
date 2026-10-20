@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use zeughaus_link::{CiReply, CiRequest, JobDefView, RepoView};
+use zeughaus_link::{CiReply, CiRequest, DocKind, DocState, JobDefView, RepoView};
 
 use super::client::Client;
 use super::snapshot::{git, toplevel, without_credentials};
@@ -125,7 +125,33 @@ pub fn describe(view: &RepoView, head: Option<&str>) -> String {
                 .map(|(platform, target)| format!("{platform} -> {target}"))
         )
     ));
+    lines.extend(doc_lines(view));
     lines.join("\n")
+}
+
+/// The open proposals and the plans that wait or run, each line left out
+/// when it has none.
+fn doc_lines(view: &RepoView) -> Vec<String> {
+    let proposals: Vec<String> = view
+        .docs
+        .iter()
+        .filter(|doc| doc.kind == DocKind::Proposal && doc.state == DocState::Open)
+        .map(|doc| format!("#{} {} (from {})", doc.number, doc.title, doc.source))
+        .collect();
+    let plans: Vec<String> = view
+        .docs
+        .iter()
+        .filter(|doc| doc.kind == DocKind::Plan)
+        .map(|doc| format!("#{} {} {}", doc.number, doc.state.name(), doc.title))
+        .collect();
+    let mut lines = Vec::new();
+    if !proposals.is_empty() {
+        lines.push(format!("Open proposals: {}", proposals.join(", ")));
+    }
+    if !plans.is_empty() {
+        lines.push(format!("Plans: {}", plans.join(", ")));
+    }
+    lines
 }
 
 /// `items` joined by commas, or `none`.
@@ -452,6 +478,38 @@ mod tests {
                 "runners: atik online, sadala online, tuco-pc free, tuco-pc-hannes online, wohnzimmer online; machines: win11 off\n",
                 "platforms: darwin-arm64 -> atik, linux-amd64 -> tuco-pc, linux-arm64 -> atik, windows-amd64 -> win11",
             )
+        );
+    }
+
+    #[test]
+    fn open_proposals_and_waiting_plans_close_the_description() {
+        let doc = |number, kind, state, title: &str| zeughaus_link::DocView {
+            repo: "zeughaus".to_owned(),
+            number,
+            kind,
+            title: title.to_owned(),
+            state,
+            source: "weida".to_owned(),
+            created: 0,
+            changed: 0,
+            approved: None,
+            proposals: Vec::new(),
+            plan: None,
+            body: String::new(),
+        };
+        let mut view = zeughaus();
+        view.docs = vec![
+            doc(1, DocKind::Plan, DocState::Approved, "Store plans"),
+            doc(3, DocKind::Proposal, DocState::Open, "Expose the clock"),
+            doc(4, DocKind::Plan, DocState::Saved, "Plans tab"),
+        ];
+        let text = describe(&view, Some(HEAD));
+        assert!(
+            text.ends_with(
+                "\nOpen proposals: #3 Expose the clock (from weida)\n\
+                 Plans: #1 approved Store plans, #4 saved Plans tab"
+            ),
+            "{text}"
         );
     }
 

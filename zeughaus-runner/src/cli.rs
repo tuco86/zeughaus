@@ -3,8 +3,8 @@
 //! `timeout` as the deadline a host CI job runs under, `release` as the tool
 //! that makes and checks signed release bundles, `mcp` as the server that
 //! gives an agent the CI's pipelines and try runs as tools, `ci` as the
-//! answer to a script that asks that CI about a checkout or a commit, and
-//! `version`, `update` and `install` for the self-updater.
+//! answer to a script that asks that CI about a checkout, a commit or a
+//! plan, and `version`, `update` and `install` for the self-updater.
 //!
 //! `trigger` and `hold` talk to the endpoint a runner printed at start
 //! (`[runner] weida endpoint weida://sha256:<fp>@host:port/`) with the client
@@ -18,6 +18,9 @@
 //! zeughaus-runner mcp [--ci <url>]
 //! zeughaus-runner ci repo [--json] [<path>]
 //! zeughaus-runner ci find [--json] <repo> <sha>
+//! zeughaus-runner ci doc [--json] <repo> <number>
+//! zeughaus-runner ci plan-save [--json] <repo> <file>
+//! zeughaus-runner ci planned <repo> <file>
 //! zeughaus-runner maintain
 //! zeughaus-runner timeout <seconds> -- <program> [args..]
 //! zeughaus-runner release keygen <file>
@@ -47,6 +50,9 @@ usage: zeughaus-runner [--state-dir <dir>] [--feed-addr <host:port>] [--keep-run
        zeughaus-runner mcp [--ci <url>]
        zeughaus-runner ci repo [--json] [<path>]
        zeughaus-runner ci find [--json] <repo> <sha>
+       zeughaus-runner ci doc [--json] <repo> <number>
+       zeughaus-runner ci plan-save [--json] <repo> <file>
+       zeughaus-runner ci planned <repo> <file>
        zeughaus-runner maintain
        zeughaus-runner timeout <seconds> -- <program> [args..]
        zeughaus-runner release keygen <file>
