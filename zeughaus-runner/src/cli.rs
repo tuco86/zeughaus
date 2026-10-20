@@ -4,7 +4,9 @@
 //! that makes and checks signed release bundles, `mcp` as the server that
 //! gives an agent the CI's pipelines and try runs as tools, `ci` as the
 //! answer to a script that asks that CI about a checkout, a commit or a
-//! plan, and `version`, `update` and `install` for the self-updater.
+//! plan, `plan` and `master` as the agent sessions an editor opens in a
+//! runner's terminal, and `version`, `update` and `install` for the
+//! self-updater.
 //!
 //! `trigger` and `hold` talk to the endpoint a runner printed at start
 //! (`[runner] weida endpoint weida://sha256:<fp>@host:port/`) with the client
@@ -21,6 +23,8 @@
 //! zeughaus-runner ci doc [--json] <repo> <number>
 //! zeughaus-runner ci plan-save [--json] <repo> <file>
 //! zeughaus-runner ci planned <repo> <file>
+//! zeughaus-runner plan <repo> --branch <branch>
+//! zeughaus-runner master <repo> [--branch <branch>]
 //! zeughaus-runner maintain
 //! zeughaus-runner timeout <seconds> -- <program> [args..]
 //! zeughaus-runner release keygen <file>
@@ -53,6 +57,8 @@ usage: zeughaus-runner [--state-dir <dir>] [--feed-addr <host:port>] [--keep-run
        zeughaus-runner ci doc [--json] <repo> <number>
        zeughaus-runner ci plan-save [--json] <repo> <file>
        zeughaus-runner ci planned <repo> <file>
+       zeughaus-runner plan <repo> --branch <branch>
+       zeughaus-runner master <repo> [--branch <branch>]
        zeughaus-runner maintain
        zeughaus-runner timeout <seconds> -- <program> [args..]
        zeughaus-runner release keygen <file>
@@ -128,6 +134,10 @@ pub fn run(args: &[String], state_dir: &Path) -> Option<ExitCode> {
         // A question to the CI that is answered on stdout: it starts no
         // server and takes no lock, so a script can ask beside a runner.
         Some("ci") => return Some(crate::mcp::cli(&positional[1..], state_dir)),
+        // An agent session in the terminal it was started in: it runs until
+        // the session ends, beside the runner that started it.
+        Some("plan") => return Some(crate::agents::plan(&positional[1..], state_dir)),
+        Some("master") => return Some(crate::agents::master(&positional[1..], state_dir)),
         Some("trigger") => parse_trigger(&positional[1..]),
         Some("hold") => parse_hold(&positional[1..]),
         Some("maintain") => return Some(maintain(&positional[1..], state_dir)),

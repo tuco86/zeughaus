@@ -728,7 +728,7 @@ fn now() -> u64 {
     crate::enlist::now_secs()
 }
 
-pub(super) fn unexpected(reply: &CiReply) -> String {
+pub(crate) fn unexpected(reply: &CiReply) -> String {
     format!("the CI answered something else than asked: {reply:?}")
 }
 

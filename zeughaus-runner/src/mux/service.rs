@@ -334,6 +334,26 @@ impl MuxService {
             .map(|(id, _)| *id)
     }
 
+    /// A terminal whose child still runs and that was started as `label`.
+    pub fn find_labeled(&self, label: &str) -> Option<TerminalId> {
+        // The lock order `snapshot` takes, and `meta` last.
+        let sessions = self
+            .inner
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let meta = self.inner.meta.lock().unwrap_or_else(|e| e.into_inner());
+        meta.iter()
+            .filter(|(id, meta)| {
+                meta.label == label
+                    && sessions
+                        .get(id)
+                        .is_some_and(|session| session.exit().is_none())
+            })
+            .map(|(id, _)| *id)
+            .min()
+    }
+
     /// Starts a terminal the runner owns: a job's process, not a pane's
     /// shell. `placement` says whether a pane shows it from the start; a
     /// detached one waits for a client to attach it. Closing a pane that

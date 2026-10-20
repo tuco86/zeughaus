@@ -11,6 +11,7 @@
 //! This runner executes every graph of its own document. An editor attached
 //! to several runners shows several documents side by side.
 
+mod agents;
 mod cli;
 mod enlist;
 mod feed;
@@ -330,6 +331,19 @@ fn main() -> ExitCode {
                     rt.spawn(jobs::serve_hold(replier, Arc::clone(host)));
                 }
                 Err(e) => eprintln!("[runner] no hold service: {e}"),
+            }
+        }
+        // Agent sessions run in terminals of the mux; the sessions drive
+        // omp through a Unix exec and a Unix shell's PATH.
+        #[cfg(unix)]
+        if let (Some(service), Ok(exe)) = (&mux_service, exe.as_ref()) {
+            match listener.replier(zeughaus_link::AGENT_PATH) {
+                Ok(replier) => {
+                    let agents =
+                        agents::Agents::new(service.clone(), state_dir.clone(), exe.clone());
+                    rt.spawn(agents::serve(replier, Arc::new(agents)));
+                }
+                Err(e) => eprintln!("[runner] no agent service: {e}"),
             }
         }
         // Enlisting makes this runner execute the CI's jobs as its own; without

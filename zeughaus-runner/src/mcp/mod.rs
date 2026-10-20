@@ -25,9 +25,9 @@
 //! - [`repo`]: a checkout, and the CI's view of the repository it belongs to;
 //! - [`snapshot`]: a working tree and its path dependencies as git bundles.
 
-mod client;
+pub(crate) mod client;
 mod docs;
-mod repo;
+pub(crate) mod repo;
 mod rpc;
 mod snapshot;
 mod tools;
@@ -42,7 +42,8 @@ use tokio::io::BufReader;
 use zeughaus_link::{CiReply, CiRequest, DocKind, DocState, RepoView};
 
 use self::client::{Client, Link};
-use self::tools::{Toolbox, find, is_sha_prefix, one_line, pipeline_text, read_doc, unexpected};
+pub(crate) use self::tools::unexpected;
+use self::tools::{Toolbox, find, is_sha_prefix, one_line, pipeline_text, read_doc};
 
 /// How long the process waits for work on the blocking pool once the session
 /// is over. The pool holds the blocking read of stdin, which only ends when
