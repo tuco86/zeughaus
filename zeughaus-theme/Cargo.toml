@@ -29,3 +29,6 @@ terminal = ["dep:iced_terminal", "dep:zeughaus-mux"]
 # feature, and a crate cannot ask a dependency whether it was: a host that
 # draws SVGs turns this on and gets the delegating catalog with it.
 svg = ["iced/svg"]
+# The same for `iced::widget::markdown` and its table: a host that renders
+# Markdown turns this on and gets their catalogs.
+markdown = ["iced/markdown"]

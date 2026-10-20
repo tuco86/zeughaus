@@ -375,8 +375,10 @@ impl App {
             }) => {
                 return self.apply_ci_event(&key, repo, channel, number);
             }
-            Traffic::Event(RuntimeEvent::CiDocs { .. }) => {
-                // Nothing in this editor shows plans or proposals yet.
+            // A plan or proposal of a repository changed: its Plans tab asks
+            // for the documents again.
+            Traffic::Event(RuntimeEvent::CiDocs { repo, .. }) => {
+                return self.apply_ci_docs_event(&key, repo);
             }
             Traffic::Lost => {
                 if let Some(link) = self.runtime.links.get_mut(&key) {

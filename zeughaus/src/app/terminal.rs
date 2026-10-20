@@ -465,17 +465,8 @@ impl App {
             TerminalAction::ScrollBy(lines) => self.scroll_terminal(&key, terminal, lines),
             TerminalAction::Copy(text) => iced::clipboard::write(text),
             TerminalAction::OpenLink(url) => {
-                // Only a Ctrl+click on the link gets here, and only schemes
-                // that name something to show: a terminal-supplied target
-                // must not become an arbitrary launcher invocation.
-                let scheme = url.split_once(':').map(|(scheme, _)| scheme);
-                let result = match scheme.map(str::to_ascii_lowercase).as_deref() {
-                    Some("http" | "https" | "file") => {
-                        open::that_detached(&url).map_err(|e| e.to_string())
-                    }
-                    _ => Err("only http, https and file links are opened".to_owned()),
-                };
-                if let Err(e) = result {
+                // Only a Ctrl+click on the link gets here.
+                if let Err(e) = open_link(&url) {
                     eprintln!("[mux] link {url}: {e}");
                     self.hint = Some((format!("{url}: {e}"), iced::time::Instant::now()));
                 }
@@ -720,6 +711,17 @@ impl App {
                 ..container::Style::default()
             })
             .into()
+    }
+}
+
+/// Opens a link the user activated with the platform's handler. Only schemes
+/// that name something to show: a link from a terminal or a document must
+/// not become an arbitrary launcher invocation.
+pub(super) fn open_link(url: &str) -> Result<(), String> {
+    let scheme = url.split_once(':').map(|(scheme, _)| scheme);
+    match scheme.map(str::to_ascii_lowercase).as_deref() {
+        Some("http" | "https" | "file") => open::that_detached(url).map_err(|e| e.to_string()),
+        _ => Err("only http, https and file links are opened".to_owned()),
     }
 }
 

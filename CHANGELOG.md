@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Plans and proposals live in the CI, numbered per repository
+  (`<state-dir>/ci/docs/<repo>/`). The MCP server gains `docs`, `doc_read`,
+  `proposal_write` (a proposal for another repository of the CI instead of
+  a `PROPOSAL-*.md`) and `plan_done`; `zeughaus-runner ci doc|plan-save|
+  planned` serve scripts, and `ci repo` names open proposals and waiting
+  plans. A CI section's repository group starts with a Plans tab: the
+  documents by state, the selected one as Markdown, Approve, Reject,
+  Requeue, Mark done, Dismiss and Delete, and the buttons `Plan session`
+  and `Master`, which open `zeughaus-runner plan` (omp in plan mode in a
+  clean `<checkout>-plan` worktree of the default branch) or
+  `zeughaus-runner master` (claims the approved plans one after another and
+  runs omp on each in the main checkout) in the own runner's `Triggered`
+  group. The omp plugin (0.2.0) adds `/zeughaus save`, marks the proposals
+  an executed plan names as planned, and ends a master's session once its
+  plan is done.
 - A runner on Windows enlists into the CI. It runs `.ps1` jobs on its own
   host under its `timeout` subcommand, which a job object backs on
   Windows. `ci.toml` marks such a runner `os = "windows"`; the CI places

@@ -111,8 +111,8 @@ no runner's workspace shows); a section's terminal, graph and folder
 glyphs (tooltips say which) add a terminal tab, a graph that runner
 executes, or a coloured group. A `CI <label>` section for each CI the editor
 dials (the `ci = [..]` URLs) holds a `Runners` tab with the enlisted runners
-and their machines and a locked group
-per repository with one tab per channel (pipelines one row each, newest on
+and their machines and a locked group per repository of `ci.toml` with
+its Plans tab (below) and one tab per channel (pipelines one row each, newest on
 top and open with its jobs, a cable animating while its artifact set moves,
 failures with their cause and log excerpt,
 `Rerun` and `Cancel`; pressing a job shows its transcript read-only, live
@@ -170,13 +170,34 @@ continue with `ci_wait`. `ci_repo` says which repository of the CI the
 checkout is (by its origin), whether its default branch and `HEAD` are
 green, and every job of its `.zeughaus-ci/` with the runner and place it
 runs at; in such a checkout `repo` can be omitted from every other tool,
-and `ci_wait` without a number or sha waits for `HEAD`. Nothing but
+and `ci_wait` without a number or sha waits for `HEAD`. `docs`, `doc_read`,
+`proposal_write` and `plan_done` read and write the repository's plans and
+proposals (below). Nothing but
 protocol messages is written to its stdout.
-`zeughaus-runner [--state-dir <dir>] ci repo [--json] [<path>]` and `ci
-find [--json] <repo> <sha>` answer the same for a script (exit 3: the
-origin is no repository of `ci.toml`; 2: no CI or no answer); the
+`zeughaus-runner [--state-dir <dir>] ci repo [--json] [<path>]`, `ci
+find [--json] <repo> <sha>`, `ci doc [--json] <repo> <n>`, `ci plan-save
+[--json] <repo> <file>` and `ci planned <repo> <file>` answer the same for
+a script (exit 3: the origin is no repository of `ci.toml`; 2: no CI, no
+answer or a refusal); the
 `zeughaus-ci` omp plugin in `omp-plugin/` uses them for its session
-context and its push watch.
+context, its push watch and `/zeughaus save`.
+
+Plans and proposals: the CI keeps them per repository in
+`<state-dir>/ci/docs/<repo>/<n>.json` (numbers shared by both kinds, never
+reused). A proposal is `open`, then `planned` (a plan names it in a
+`Proposals: #3, #5` line under its title) or `dismissed`; a plan is
+`saved`, `approved` in the editor, `in_progress` once a master claims it
+(only one per repository), then `done` (`plan_done`) or `rejected`. Each
+change is announced as `CiDocs` on `/events`. A CI section's repository
+group starts with its Plans tab, whose `Plan session` and `Master` buttons
+ask the editor's own runner on `/agent` (Unix) to open `zeughaus-runner
+plan <repo>` or `master <repo>` in a terminal of its `Triggered` group, in
+the checkout `~/work/<origin>` (`$ZEUGHAUS_WORK` overrides `~/work`):
+`plan` brings the detached worktree `<checkout>-plan` to `origin/<default
+branch>` and execs omp in plan mode there; `master` claims approved plans
+one after another and runs `omp @<plan> <instruction>` with
+`ZEUGHAUS_PLAN=<repo>#<n>` in the main checkout, waiting while the
+checkout is dirty or a plan is in progress.
 
 A runner also runs the tasks of `<state-dir>/maintain.toml` (`[[task]]` with
 `name`, `command` as an argv, `every_minutes` and `timeout_minutes`,

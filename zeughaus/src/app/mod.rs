@@ -260,6 +260,10 @@ pub struct App {
     /// key (its fingerprint). Runner links have none.
     #[cfg(not(target_arch = "wasm32"))]
     ci: BTreeMap<RunnerKey, ci::CiClient>,
+    /// A terminal a runner just opened for this editor (an agent session),
+    /// whose tab comes to the front once that runner's workspace shows it.
+    #[cfg(not(target_arch = "wasm32"))]
+    reveal: Option<(RunnerKey, zeughaus_mux::TerminalId)>,
     /// Running without a window (`zeughaus --headless`): nobody sits in front
     /// of a file dialog, and rfd would open one on the desktop of whoever
     /// started the process.
@@ -401,6 +405,8 @@ impl App {
             mux: BTreeMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             ci: BTreeMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            reveal: None,
             #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
             headless: false,
             #[cfg(not(target_arch = "wasm32"))]
@@ -696,6 +702,8 @@ impl App {
         let asked = self.sync_ci_sections();
         #[cfg(target_arch = "wasm32")]
         let asked = Task::none();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.reveal_opened_terminal();
         if let Some(graph) = self.pending_graph_focus
             && ((self.workspace.show_graph(graph) && !self.awaits_runner_tab(graph))
                 || !self.nodes.contains_key(&graph))

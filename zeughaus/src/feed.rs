@@ -27,10 +27,11 @@ use tokio::io::AsyncReadExt;
 use weida::{PeerEvent, PeerEvents, Requester, TransferMeta};
 use zeughaus_core::Image;
 use zeughaus_link::{
-    BUSY_PATH, BusyMode, BusyRequest, CI_PATH, CiReply, CiRequest, EVENTS_PATH, FEED_PATH,
-    FeedRequest, FrameHeader, HOLD_PATH, HoldReply, HoldRequest, MAX_BUSY_BYTES,
-    MAX_CI_REPLY_BYTES, MAX_EVENT_BYTES, MAX_HOLD_BYTES, MAX_SNAPSHOT_BYTES, MachineState,
-    RuntimeEvent, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, TriggerRequest, ladder,
+    AGENT_PATH, AgentReply, AgentRequest, BUSY_PATH, BusyMode, BusyRequest, CI_PATH, CiReply,
+    CiRequest, EVENTS_PATH, FEED_PATH, FeedRequest, FrameHeader, HOLD_PATH, HoldReply, HoldRequest,
+    MAX_AGENT_BYTES, MAX_BUSY_BYTES, MAX_CI_REPLY_BYTES, MAX_EVENT_BYTES, MAX_HOLD_BYTES,
+    MAX_SNAPSHOT_BYTES, MachineState, RuntimeEvent, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH,
+    TriggerRequest, ladder,
 };
 
 use crate::transport::{Endpoint, QUIC, client_tls, explain, first_dial, gave_up, policy};
@@ -392,6 +393,24 @@ pub async fn hold(endpoint: Endpoint, held: bool) -> Result<HoldReply, String> {
         .await
         .map_err(|e| format!("hold: {e}"))?;
     HoldReply::decode(&encoded).ok_or_else(|| "hold: malformed".to_owned())
+}
+
+/// Opens a plan or master agent session on a runner, and reports the
+/// terminal it runs in.
+pub async fn agent(endpoint: Endpoint, request: AgentRequest) -> Result<AgentReply, String> {
+    let quic = QUIC.as_ref().ok_or("no QUIC runtime")?;
+    let url = endpoint.path(AGENT_PATH)?;
+    let requester = quic.requester(client_tls());
+    first_dial(&url, || requester.connect(&url)).await?;
+    let reply = requester
+        .request(&request.encode())
+        .await
+        .map_err(|e| format!("agent: {e}"))?;
+    let encoded = reply
+        .collect(MAX_AGENT_BYTES)
+        .await
+        .map_err(|e| format!("agent: {e}"))?;
+    AgentReply::decode(&encoded).ok_or_else(|| "agent: malformed".to_owned())
 }
 
 /// Sets a CI runner's busy mode, and reports the machine's state after it.

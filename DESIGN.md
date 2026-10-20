@@ -1625,6 +1625,22 @@ trial (a build that does not stay up is replaced by the previous one after 3
 starts and refused until a newer one is published) and `update rollback`
 by hand. `release bundle` and `release verify` exist on every platform.
 
+**Plans and proposals.** The CI also stores the documents an agent workflow
+passes around: proposals (one project asks another for a change) and plans
+(a finished plan of work). `zeughaus-ci/src/docs.rs` keeps each as the
+`DocView` the editor shows, in `<state-dir>/ci/docs/<repo>/<n>.json`, and the
+last number in `last`, so a deleted number is never given out again. The
+state machine (`docs::allowed`) is the whole contract: a proposal goes from
+`open` to `planned` or `dismissed`; a plan from `saved` to `approved` or
+`rejected`, `approved` to `rejected`, `in_progress` to `done` or back to
+`approved`. Only `PlanClaim` moves a plan to `in_progress`: the oldest
+approved one, refused while another is in progress, which is what keeps one
+master working in a checkout. The `/ci` server serializes every mutation
+behind one lock and announces each on `/events` as `CiDocs`. The runner's
+`/agent` path (Unix, `zeughaus-link::agent`) opens the `plan` and `master`
+sessions in its mux; their labels (`master <repo>`) are how a second request
+finds the running one.
+
 ## 15. Not built
 
 Kept here so they are not mistaken for descriptions of the code:

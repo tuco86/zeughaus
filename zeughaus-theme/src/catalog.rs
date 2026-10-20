@@ -18,6 +18,11 @@ use iced::widget::{
 // feature, which this crate's `svg` feature turns on.
 #[cfg(feature = "svg")]
 use iced::widget::svg;
+// `iced::widget::markdown` and the table it draws exist only when iced was
+// built with its `markdown` feature, which this crate's `markdown` feature
+// turns on.
+#[cfg(feature = "markdown")]
+use iced::widget::{markdown, table};
 
 use crate::Theme;
 
@@ -126,6 +131,16 @@ impl pane_grid::Catalog for Theme {
 
 #[cfg(feature = "svg")]
 forward_with_status!(svg);
+
+#[cfg(feature = "markdown")]
+forward!(table);
+
+#[cfg(feature = "markdown")]
+impl markdown::Catalog for Theme {
+    fn code_block<'a>() -> <Self as container::Catalog>::Class<'a> {
+        Box::new(|theme: &Theme| container::dark(theme.base()))
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -48,6 +48,7 @@ use crate::transport::Endpoint;
 use crate::workspace::{self, RunnerKey, Surface, TabRef};
 
 mod cables;
+mod plans;
 
 /// The id of the Runners view, its tab and its pane. Every other id of a
 /// section comes from its client's counter, which starts above this.
@@ -139,6 +140,8 @@ pub(super) struct CiClient {
     next_id: u64,
     repos: BTreeMap<String, Repo>,
     views: BTreeMap<u64, ChannelState>,
+    /// The Plans tab of each repository, by its view id.
+    plans: BTreeMap<u64, plans::PlansState>,
     /// Pipelines being fetched after a change event, and whether another
     /// change arrived meanwhile: a reply older than the last event would
     /// otherwise be the last word.
@@ -148,9 +151,12 @@ pub(super) struct CiClient {
     last_overview: Option<std::time::Instant>,
 }
 
-/// A repository: its group in the tab bar and the views of its channels.
+/// A repository: its group in the tab bar, its Plans tab and the views of
+/// its channels.
 struct Repo {
     group: u64,
+    /// The view id of its Plans tab, the group's first.
+    plans: u64,
     /// Channel name to view id.
     channels: BTreeMap<String, u64>,
 }
@@ -479,6 +485,7 @@ impl CiClient {
             next_id: RUNNERS + 1,
             repos: BTreeMap::new(),
             views: BTreeMap::new(),
+            plans: BTreeMap::new(),
             fetching: HashMap::new(),
             last_overview: None,
         }
@@ -521,7 +528,7 @@ impl CiClient {
     }
 
     /// The section's snapshot: the Runners tab, then a locked group per
-    /// repository with a tab per channel.
+    /// repository with its Plans tab and a tab per channel.
     fn snapshot(&self, theme: &Theme) -> WorkspaceSnapshot {
         let mut items = vec![WorkspaceItem::Tab(TabSnapshot {
             id: TabId(RUNNERS),
@@ -533,21 +540,27 @@ impl CiClient {
             },
         })];
         for (repo, known) in &self.repos {
-            let tabs: Vec<TabSnapshot> = known
-                .channels
-                .values()
-                .filter_map(|view| Some((*view, self.views.get(view)?)))
-                .map(|(view, state)| TabSnapshot {
-                    id: TabId(view),
-                    title: state.channel.clone(),
-                    accent_rgba: self.accent(state, theme),
-                    root: state.root(view),
-                })
-                .collect();
-            // A locked group exists only while it holds a tab, as on a runner.
-            if tabs.is_empty() {
-                continue;
-            }
+            let mut tabs = vec![TabSnapshot {
+                id: TabId(known.plans),
+                title: "Plans".to_owned(),
+                accent_rgba: self.plans_accent(repo, theme),
+                root: PaneNode::Leaf {
+                    pane_id: PaneId(known.plans),
+                    surface: Surface::Ci(known.plans),
+                },
+            }];
+            tabs.extend(
+                known
+                    .channels
+                    .values()
+                    .filter_map(|view| Some((*view, self.views.get(view)?)))
+                    .map(|(view, state)| TabSnapshot {
+                        id: TabId(view),
+                        title: state.channel.clone(),
+                        accent_rgba: self.accent(state, theme),
+                        root: state.root(view),
+                    }),
+            );
             items.push(WorkspaceItem::Group(GroupSnapshot {
                 id: GroupId(known.group),
                 name: repo.clone(),
@@ -559,20 +572,29 @@ impl CiClient {
         workspace::ci_snapshot(items)
     }
 
-    /// The view of a channel, with ids minted for it and its repository the
-    /// first time either is seen.
-    fn view_of(&mut self, repo: &str, channel: &str) -> u64 {
+    /// A repository, with ids minted for its group and its Plans tab the
+    /// first time it is seen.
+    fn repo_of(&mut self, repo: &str) -> &mut Repo {
         if !self.repos.contains_key(repo) {
             let group = self.mint();
+            let plans = self.mint();
+            self.plans.insert(plans, plans::PlansState::new(repo));
             self.repos.insert(
                 repo.to_owned(),
                 Repo {
                     group,
+                    plans,
                     channels: BTreeMap::new(),
                 },
             );
         }
-        if let Some(&view) = self.repos[repo].channels.get(channel) {
+        self.repos.get_mut(repo).expect("inserted above")
+    }
+
+    /// The view of a channel, with ids minted for it and its repository the
+    /// first time either is seen.
+    fn view_of(&mut self, repo: &str, channel: &str) -> u64 {
+        if let Some(&view) = self.repo_of(repo).channels.get(channel) {
             return view;
         }
         let view = self.mint();
@@ -605,8 +627,21 @@ impl CiClient {
             Ok(overview) => {
                 self.error = None;
                 self.last_overview = Some(std::time::Instant::now());
-                // Sorted, so that the same channels get the same ids in every
-                // session: a restart brings the tab in front back.
+                // Sorted, so that the same repositories and channels get the
+                // same ids in every session: a restart brings the tab in
+                // front back. A repository is known by its channels or by
+                // being in `ci.toml`, which the overview's `repos` lists.
+                let mut repos: Vec<&str> = overview
+                    .channels
+                    .iter()
+                    .map(|c| c.repo.as_str())
+                    .chain(overview.repos.iter().map(|r| r.repo.as_str()))
+                    .collect();
+                repos.sort_unstable();
+                repos.dedup();
+                for &repo in &repos {
+                    self.repo_of(repo);
+                }
                 let mut channels: Vec<(&str, &str)> = overview
                     .channels
                     .iter()
@@ -616,7 +651,7 @@ impl CiClient {
                 for &(repo, channel) in &channels {
                     self.view_of(repo, channel);
                 }
-                tasks.extend(self.forget_unlisted(&channels));
+                tasks.extend(self.forget_unlisted(&repos, &channels));
                 self.overview = Some(overview);
                 // The first page of a channel no view has loaded yet, and of
                 // one whose last attempt failed.
@@ -629,6 +664,17 @@ impl CiClient {
                 for view in behind {
                     tasks.push(self.ask_pipelines(key, view, false));
                 }
+                // The documents of every repository whose Plans tab has not
+                // loaded them, or whose last attempt failed.
+                let behind: Vec<u64> = self
+                    .plans
+                    .iter()
+                    .filter(|(_, state)| state.behind())
+                    .map(|(view, _)| *view)
+                    .collect();
+                for view in behind {
+                    tasks.push(self.ask_docs(key, view));
+                }
             }
             Err(e) => self.error = Some(e),
         }
@@ -640,9 +686,9 @@ impl CiClient {
 
     /// Drops the views of channels the runner no longer lists (a repository
     /// taken out of `ci.toml`, a channel whose last pipeline was pruned) and
-    /// the groups left empty, closing the transcripts they held. `listed` is
-    /// sorted.
-    fn forget_unlisted(&mut self, listed: &[(&str, &str)]) -> Vec<Task<Message>> {
+    /// the repositories neither listed nor left with a channel, closing the
+    /// transcripts they held. `repos` and `listed` are sorted.
+    fn forget_unlisted(&mut self, repos: &[&str], listed: &[(&str, &str)]) -> Vec<Task<Message>> {
         let mut tasks = Vec::new();
         for (repo, known) in &mut self.repos {
             known.channels.retain(|channel, view| {
@@ -663,7 +709,14 @@ impl CiClient {
                 false
             });
         }
-        self.repos.retain(|_, known| !known.channels.is_empty());
+        let plans = &mut self.plans;
+        self.repos.retain(|repo, known| {
+            let keep = !known.channels.is_empty() || repos.binary_search(&repo.as_str()).is_ok();
+            if !keep {
+                plans.remove(&known.plans);
+            }
+            keep
+        });
         self.fetching
             .retain(|(repo, _), _| self.repos.contains_key(repo));
         tasks
@@ -1065,6 +1118,16 @@ impl App {
 
     /// What a runner's CI answered, or what the user did in its views.
     pub(super) fn apply_ci(&mut self, key: RunnerKey, message: CiMsg) -> Task<Message> {
+        match message {
+            CiMsg::OpenAgent { view, session } => return self.open_agent(&key, view, session),
+            CiMsg::AgentOpened {
+                view,
+                runner,
+                result,
+            } => return self.agent_opened(&key, view, runner, result),
+            CiMsg::OpenLink(url) => return self.open_doc_link(&url),
+            _ => {}
+        }
         let Some(client) = self.ci.get_mut(&key) else {
             return Task::none();
         };
@@ -1135,6 +1198,22 @@ impl App {
                 } else {
                     client.ask_overview(&key)
                 }
+            }
+            CiMsg::Docs { view, result } => client.docs_arrived(&key, view, result),
+            CiMsg::Select { view, number } => client.select(&key, view, number),
+            CiMsg::Shown {
+                view,
+                number,
+                result,
+            } => {
+                client.shown_arrived(view, number, result);
+                Task::none()
+            }
+            CiMsg::DocAct { view, request } => client.doc_act(&key, view, request),
+            CiMsg::DocActed { view, result } => client.doc_acted(&key, view, result),
+            // Answered above: they need more of the editor than this client.
+            CiMsg::OpenAgent { .. } | CiMsg::AgentOpened { .. } | CiMsg::OpenLink(_) => {
+                Task::none()
             }
         }
     }
@@ -1334,6 +1413,11 @@ impl App {
         for view in shown {
             tasks.push(client.ask_pipelines(key, view, false));
         }
+        let plans: Vec<u64> = client.plans.keys().copied().collect();
+        for view in plans {
+            client.restart_docs(view);
+            tasks.push(client.ask_docs(key, view));
+        }
         tasks.push(self.reopen_ci_transcripts(key));
         Task::batch(tasks)
     }
@@ -1365,11 +1449,15 @@ impl App {
         Task::batch(tasks)
     }
 
-    /// What a CI pane is called: its section's Runners tab or its channel.
+    /// What a CI pane is called: its section's Runners tab, a repository's
+    /// Plans tab or a channel.
     pub(super) fn ci_pane_title(&self, section: &RunnerKey, view: u64) -> String {
         let client = section.ci_runner().and_then(|runner| self.ci.get(&runner));
         match client {
             Some(_) if view == RUNNERS => "Runners".to_owned(),
+            Some(client) if client.plans.contains_key(&view) => {
+                format!("{} / Plans", client.plans[&view].repo)
+            }
             Some(client) => client.views.get(&view).map_or_else(
                 || "CI".to_owned(),
                 |state| format!("{} / {}", state.repo, state.channel),
@@ -1394,7 +1482,7 @@ impl App {
         })
     }
 
-    /// One CI pane: the Runners tab, or a channel.
+    /// One CI pane: the Runners tab, a repository's Plans tab, or a channel.
     pub(super) fn ci_view(&self, section: &RunnerKey, view: u64) -> Element<'_, Message, Theme> {
         let Some((runner, client)) = section
             .ci_runner()
@@ -1404,6 +1492,9 @@ impl App {
         };
         if view == RUNNERS {
             return self.runners_view(runner, client);
+        }
+        if let Some(state) = client.plans.get(&view) {
+            return self.plans_view(runner, client, view, state);
         }
         match client.views.get(&view) {
             Some(state) => self.channel_view(runner, client, view, state),

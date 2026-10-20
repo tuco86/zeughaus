@@ -384,6 +384,47 @@ pub enum CiMsg {
         cancel: bool,
         result: Result<(), String>,
     },
+    /// A repository's plans and proposals, bodies empty, for its Plans tab.
+    Docs {
+        view: u64,
+        result: Result<Vec<zeughaus_link::DocView>, String>,
+    },
+    /// The user picked a document in a Plans tab.
+    Select {
+        view: u64,
+        number: u64,
+    },
+    /// One document with its body; `None` when the CI no longer has it.
+    Shown {
+        view: u64,
+        number: u64,
+        result: Result<Option<Box<zeughaus_link::DocView>>, String>,
+    },
+    /// The user moved a document to another state or deleted it: a
+    /// `DocState` or `DocDelete` request.
+    DocAct {
+        view: u64,
+        request: zeughaus_link::CiRequest,
+    },
+    /// What the CI answered it.
+    DocActed {
+        view: u64,
+        result: Result<(), String>,
+    },
+    /// The user asked for an agent session of the Plans tab's repository on
+    /// this editor's own runner.
+    OpenAgent {
+        view: u64,
+        session: zeughaus_link::AgentSession,
+    },
+    /// What that runner answered; `runner` is its key.
+    AgentOpened {
+        view: u64,
+        runner: crate::workspace::RunnerKey,
+        result: Result<zeughaus_link::AgentReply, String>,
+    },
+    /// The user pressed a link in a document.
+    OpenLink(String),
 }
 
 #[cfg(test)]
