@@ -12,11 +12,14 @@
 //! A checkout is found by the repository's origin under the work root,
 //! `~/work/<host>/<owner>/<repo>`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 #[cfg(not(unix))]
 use std::process::ExitCode;
 
 /// The directory checkouts live under: `$ZEUGHAUS_WORK`, else `~/work`.
+#[cfg(unix)]
 pub fn work_root() -> Option<PathBuf> {
     if let Some(root) = std::env::var_os("ZEUGHAUS_WORK").filter(|root| !root.is_empty()) {
         return Some(PathBuf::from(root));
@@ -29,6 +32,7 @@ pub fn work_root() -> Option<PathBuf> {
 /// The checkout of `origin` (`host/owner/name`, as `normalize_origin` gives
 /// it) under `root`. The origin comes from a peer, so it must be a relative
 /// path of at least three plain segments.
+#[cfg(unix)]
 pub fn checkout_of(root: &Path, origin: &str) -> Result<PathBuf, String> {
     let refused = || format!("{origin:?} names no checkout under the work root");
     if origin.is_empty()
@@ -53,6 +57,7 @@ pub fn checkout_of(root: &Path, origin: &str) -> Result<PathBuf, String> {
 }
 
 /// The worktree plans are made in: `<checkout>-plan` beside the checkout.
+#[cfg(unix)]
 pub fn plan_dir(checkout: &Path) -> PathBuf {
     let mut name = checkout
         .file_name()
@@ -63,6 +68,7 @@ pub fn plan_dir(checkout: &Path) -> PathBuf {
 }
 
 /// `<repo> [--branch <branch>]`, the arguments both sessions take.
+#[cfg(unix)]
 fn parse_args(args: &[String]) -> Result<(String, Option<String>), String> {
     let mut repo = None;
     let mut branch = None;
@@ -528,7 +534,7 @@ mod unix {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

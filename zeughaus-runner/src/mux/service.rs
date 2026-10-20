@@ -335,6 +335,8 @@ impl MuxService {
     }
 
     /// A terminal whose child still runs and that was started as `label`.
+    /// Only agent sessions look for one, and they exist on Unix only.
+    #[cfg(unix)]
     pub fn find_labeled(&self, label: &str) -> Option<TerminalId> {
         // The lock order `snapshot` takes, and `meta` last.
         let sessions = self
