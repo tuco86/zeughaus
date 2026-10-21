@@ -8,13 +8,16 @@
 //   the CI (`zeughaus-runner ci plan-save`) and starts a fresh session;
 // - marks the proposals a plan names as planned when the plan is executed from its review;
 // - in a session a master started on a plan (`ZEUGHAUS_PLAN=<repo>#<n>`), ends the session once
-//   that plan is done and the agent is idle, so the master goes on with the next one.
+//   that plan is done and the agent is idle, so the master goes on with the next one;
+// - in a session `zeughaus-runner plan` started (`ZEUGHAUS_PLAN_SESSION=<repo>`), replaces omp's
+//   plan review with its own menu when the agent proposes: Save and approve, Save (both store
+//   the plan in the CI and end the session) or Refine (planning goes on).
 //
 // The factory only registers: `omp plugin install` runs it against a throwaway API, so it must
 // do no work at load. Every handler skips subagents, which have prompts of their own. Nothing
 // here may reject out of a detached promise or a timer: omp ends the whole session on it.
 
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -32,11 +35,15 @@ interface Ctx {
   ui: {
     notify(message: string, level: "info" | "warning" | "error"): void;
     setStatus(key: string, text: string | undefined): void;
+    select(title: string, options: string[]): Promise<string | number | undefined>;
+    editor(title: string, prefill?: string): Promise<string | undefined>;
   };
   sessionManager: { getArtifactsDir(): string | undefined | null };
   setInterval(callback: () => unknown, ms: number): unknown;
+  setTimeout(callback: () => unknown, ms: number): unknown;
   clearTimer(timer: unknown): void;
   isIdle(): boolean;
+  abort(): void;
   shutdown(): void | Promise<void>;
 }
 /** A command handler's context has what changes the session too. */
@@ -61,6 +68,10 @@ interface Events {
     event: ToolResultEvent,
     ctx: Ctx,
   ) => Promise<{ additionalContext: string } | undefined>;
+  tool_call: (
+    event: { toolName: string; input: Record<string, unknown> },
+    ctx: Ctx,
+  ) => Promise<{ block: true; reason: string } | undefined>;
   plan_review_requested: (
     event: { planFilePath: string; planContent: string; title: string },
     ctx: Ctx,
@@ -548,6 +559,29 @@ function masterPlan(): { repo: string; number: number } | undefined {
   return m ? { repo: m[1] as string, number: Number(m[2]) } : undefined;
 }
 
+/** `ZEUGHAUS_PLAN_SESSION=<repo>`, `ZEUGHAUS_PROPOSAL=<n>`: a planning session `zeughaus-runner plan` started. */
+function planSession(): { repo: string; proposal?: number } | undefined {
+  const repo = process.env.ZEUGHAUS_PLAN_SESSION ?? "";
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(repo)) return undefined;
+  const proposal = process.env.ZEUGHAUS_PROPOSAL ?? "";
+  return /^[1-9][0-9]*$/.test(proposal) ? { repo, proposal: Number(proposal) } : { repo };
+}
+
+/** A plan's title: its first `# ` heading. */
+function planTitleOf(body: string): string {
+  const line = body.split("\n").find((l) => l.startsWith("# "));
+  return line?.slice(2).trim() || "Untitled plan";
+}
+
+/** The proposals the `Proposals:` line near a plan's top names, as the CI reads them. */
+function proposalsNamed(body: string): number[] {
+  const line = body
+    .split("\n")
+    .slice(0, 20)
+    .find((l) => l.startsWith("Proposals:"));
+  return line ? [...line.matchAll(/#(\d+)/g)].map((m) => Number(m[1])) : [];
+}
+
 /** One field of a JSON object a `zeughaus-runner ci --json` command printed; `undefined` else. */
 function jsonField(stdout: string, key: string): unknown {
   let value: unknown;
@@ -743,6 +777,82 @@ export default function zeughausCi(pi: Pi): void {
         ctx.ui.notify(`zeughaus-ci: proposals not marked planned: ${failure(r, "ci planned")}`, "warning");
       }
     })().catch(() => undefined);
+  });
+
+  // In a session `zeughaus-runner plan` started, proposing a plan opens zeughaus's menu instead of
+  // omp's review: the propose write is answered by blocking it, so omp's review never opens.
+  const MENU = ["Save and approve", "Save", "Refine"];
+  pi.on("tool_call", async (event, ctx) => {
+    const session = planSession();
+    if (!session || !isMain(ctx) || !ctx.hasUI) return undefined;
+    if (event.toolName !== "write" || event.input.path !== "xd://propose") return undefined;
+    try {
+      const slug = String(event.input.content ?? "").trim();
+      const named = slug ? resolvePlan(`local://${slug}-plan.md`, ctx) : undefined;
+      const path = named && existsSync(named) ? named : newestPlan(ctx);
+      // No plan: omp's own propose handler says what is missing.
+      if (!path) return undefined;
+      const body = readFileSync(path, "utf8");
+      if (body.trim() === "") return undefined;
+      const n = session.proposal;
+      if (n !== undefined && !proposalsNamed(body).includes(n)) {
+        return {
+          block: true,
+          reason: `Put the line \`Proposals: #${n}\` directly under the plan's title, then propose again.`,
+        };
+      }
+      const title = planTitleOf(body);
+      let note = "";
+      for (;;) {
+        const picked = await ctx.ui.select(`${note}Plan "${title}"`, MENU);
+        const index =
+          typeof picked === "number" ? picked : picked === undefined ? -1 : MENU.indexOf(picked);
+        if (index === 0 || index === 1) {
+          const args = ["ci", "plan-save", "--json", ...(index === 0 ? ["--approve"] : [])];
+          const r = await exec(pi, RUNNER, [...args, session.repo, path], ctx.cwd, CONTEXT_TIMEOUT_MS);
+          const number = r.code === 0 ? jsonField(r.stdout, "number") : undefined;
+          if (typeof number !== "number") {
+            note = `Saving failed: ${r.code === 0 ? "unreadable answer" : failure(r, "ci plan-save")}. `;
+            continue;
+          }
+          const approveFailed = jsonField(r.stdout, "approve_failed");
+          let message = `saved plan #${number}`;
+          let level: "info" | "warning" = "info";
+          if (jsonField(r.stdout, "approved") === true) {
+            message = `saved and approved plan #${number}`;
+          } else if (typeof approveFailed === "string") {
+            message = `saved plan #${number}; approving it failed: ${approveFailed}; approve it in the Plans tab`;
+            level = "warning";
+          }
+          ctx.ui.notify(message, level);
+          planFile = undefined;
+          // After this handler returned: omp ends a session only once the agent is idle, and
+          // the agent would otherwise carry on after the blocked call, so its turn is aborted.
+          ctx.setTimeout(() => {
+            ctx.abort();
+            return ctx.shutdown();
+          }, 0);
+          return { block: true, reason: `${message}. This session ends now; do nothing more.` };
+        }
+        if (index === 2) {
+          const feedback = (await ctx.ui.editor("What should change in the plan?"))?.trim();
+          if (feedback) {
+            return {
+              block: true,
+              reason: `The user has not taken the plan yet and asks for changes:\n${feedback}\nRevise the plan file, then propose it again.`,
+            };
+          }
+        }
+        return {
+          block: true,
+          reason:
+            "The user has not taken the plan yet and will say in the conversation what to change. End your turn now without proposing again.",
+        };
+      }
+    } catch (e) {
+      ctx.ui.notify(`zeughaus-ci: ${String(e)}`, "error");
+      return undefined;
+    }
   });
 
   // A new or resumed session in this process: its prompt block and status are its own, and the
