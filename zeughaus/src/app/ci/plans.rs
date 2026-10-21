@@ -364,12 +364,14 @@ impl App {
         (link.kind == LinkKind::Runner).then(|| (key, link.endpoint.clone()))
     }
 
-    /// Asks the own runner to open a session of the Plans tab's repository.
+    /// Asks the own runner to open a session of the Plans tab's repository,
+    /// a planning one with `proposal` planning that open proposal.
     pub(super) fn open_agent(
         &mut self,
         key: &RunnerKey,
         view: u64,
         session: AgentSession,
+        proposal: Option<u64>,
     ) -> Task<Message> {
         let own = self.own_runner();
         let Some(client) = self.ci.get_mut(key) else {
@@ -400,6 +402,7 @@ impl App {
             repo: state.repo.clone(),
             origin: summary.origin.clone(),
             default_branch: summary.default_branch.clone(),
+            proposal,
         };
         state.notice = None;
         let key = key.clone();
@@ -531,7 +534,14 @@ impl App {
             let mut pressed = action_button(glyph, words);
             if own {
                 pressed = pressed.on_press_with(move || {
-                    Message::Ci(runner.clone(), CiMsg::OpenAgent { view, session })
+                    Message::Ci(
+                        runner.clone(),
+                        CiMsg::OpenAgent {
+                            view,
+                            session,
+                            proposal: None,
+                        },
+                    )
                 });
             }
             let words = if own {
@@ -642,6 +652,26 @@ impl App {
             meta.push_str(&format!(" \u{b7} from proposals {}", named.join(", ")));
         }
         let mut buttons = row![].spacing(SP_2);
+        if doc.kind == DocKind::Proposal && doc.state == DocState::Open {
+            let number = doc.number;
+            let mut pressed = action_button(EDIT, "Plan");
+            let what = if self.own_runner().is_some() {
+                pressed = pressed.on_press_with(move || {
+                    Message::Ci(
+                        runner.clone(),
+                        CiMsg::OpenAgent {
+                            view,
+                            session: AgentSession::Plan,
+                            proposal: Some(number),
+                        },
+                    )
+                });
+                "omp plans it in plan mode in the -plan worktree"
+            } else {
+                "no runner of this editor's state directory"
+            };
+            buttons = buttons.push(tip(pressed, what.to_owned()));
+        }
         for (glyph, words, what, to) in actions(doc) {
             let request = match to {
                 Some(state) => CiRequest::DocState {

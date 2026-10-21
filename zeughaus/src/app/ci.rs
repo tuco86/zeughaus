@@ -1119,7 +1119,11 @@ impl App {
     /// What a runner's CI answered, or what the user did in its views.
     pub(super) fn apply_ci(&mut self, key: RunnerKey, message: CiMsg) -> Task<Message> {
         match message {
-            CiMsg::OpenAgent { view, session } => return self.open_agent(&key, view, session),
+            CiMsg::OpenAgent {
+                view,
+                session,
+                proposal,
+            } => return self.open_agent(&key, view, session, proposal),
             CiMsg::AgentOpened {
                 view,
                 runner,

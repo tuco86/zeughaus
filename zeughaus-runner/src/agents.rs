@@ -1,9 +1,11 @@
 //! Agent sessions an editor opens on its own runner, each in a terminal of
 //! the runner's locked `Triggered` group (closing the tab ends it):
 //!
-//! - `plan <repo>`: omp in plan mode in `<checkout>-plan`, a detached
-//!   worktree of the repository's default branch that this keeps clean and
-//!   current, so planning never touches the main checkout or its `target/`.
+//! - `plan <repo> [--proposal <n>]`: omp in plan mode in `<checkout>-plan`,
+//!   a detached worktree of the repository's default branch that this keeps
+//!   clean and current, so planning never touches the main checkout or its
+//!   `target/`. With a proposal, omp starts planning that open proposal of
+//!   the CI at once.
 //! - `master <repo>`: the loop that claims the repository's approved plans
 //!   from the CI one after another and executes each with omp in the main
 //!   checkout. One session works in a checkout at a time: the CI refuses a
@@ -67,17 +69,32 @@ pub fn plan_dir(checkout: &Path) -> PathBuf {
     checkout.with_file_name(name)
 }
 
-/// `<repo> [--branch <branch>]`, the arguments both sessions take.
+/// What both sessions are started with.
 #[cfg(unix)]
-fn parse_args(args: &[String]) -> Result<(String, Option<String>), String> {
+#[derive(Debug, PartialEq, Eq)]
+struct SessionArgs {
+    repo: String,
+    branch: Option<String>,
+    proposal: Option<u64>,
+}
+
+/// `<repo> [--branch <branch>] [--proposal <n>]`, the arguments both
+/// sessions take.
+#[cfg(unix)]
+fn parse_args(args: &[String]) -> Result<SessionArgs, String> {
     let mut repo = None;
     let mut branch = None;
+    let mut proposal = None;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--branch" => match rest.next() {
                 Some(value) if !value.is_empty() => branch = Some(value.clone()),
                 _ => return Err("--branch needs a branch".to_owned()),
+            },
+            "--proposal" => match rest.next().and_then(|value| value.parse::<u64>().ok()) {
+                Some(number) if number >= 1 => proposal = Some(number),
+                _ => return Err("--proposal needs a document number".to_owned()),
             },
             flag if flag.starts_with('-') => return Err(format!("unknown flag {flag:?}")),
             _ if repo.is_none() => repo = Some(arg.clone()),
@@ -88,7 +105,11 @@ fn parse_args(args: &[String]) -> Result<(String, Option<String>), String> {
     if !crate::names::valid_name(&repo) {
         return Err(format!("{repo:?} is no repository name"));
     }
-    Ok((repo, branch))
+    Ok(SessionArgs {
+        repo,
+        branch,
+        proposal,
+    })
 }
 
 /// The plan-mode overlay `plan` starts omp with.
@@ -106,6 +127,17 @@ fn instruction(repo: &str, number: u64) -> String {
         "Execute the attached approved zeughaus plan #{number} of {repo} from top to bottom. \
          When its work is complete (gate passed, committed and pushed as AGENTS.md describes), \
          call the zeughaus MCP tool plan_done with repo {repo} and number {number}."
+    )
+}
+
+/// What `plan` tells omp to do with an attached proposal.
+#[cfg(unix)]
+fn proposal_instruction(repo: &str, number: u64, source: &str) -> String {
+    format!(
+        "Make a plan for the attached zeughaus proposal #{number} of {repo}, written from \
+         {source}. It is a request: check it against this repository before planning. Put the \
+         line `Proposals: #{number}` directly under the plan's title. When the plan is complete, \
+         propose it as plan mode describes; zeughaus then asks the user what to do with it."
     )
 }
 
@@ -133,7 +165,7 @@ mod unix {
 
     use weida::{Replier, TransferMeta};
     use zeughaus_link::{
-        AgentReply, AgentRequest, AgentSession, CiReply, CiRequest, DocState, DocView,
+        AgentReply, AgentRequest, AgentSession, CiReply, CiRequest, DocKind, DocState, DocView,
         MAX_AGENT_BYTES,
     };
     use zeughaus_mux::TerminalId;
@@ -141,7 +173,8 @@ mod unix {
     use zeughaus_terminal::wal::Wal;
 
     use super::{
-        MASTER_POLL, PLAN_MODE, checkout_of, instruction, parse_args, plan_dir, work_root,
+        MASTER_POLL, PLAN_MODE, SessionArgs, checkout_of, instruction, parse_args, plan_dir,
+        proposal_instruction, work_root,
     };
     use crate::mcp::client::{Client, Link};
     use crate::mcp::repo;
@@ -178,9 +211,13 @@ mod unix {
             if !checkout.is_dir() {
                 return refused(format!("no checkout at {}", checkout.display()));
             }
-            let (word, label) = match request.session {
-                AgentSession::Plan => ("plan", format!("plan {}", request.repo)),
-                AgentSession::Master => ("master", format!("master {}", request.repo)),
+            let (word, label) = match (request.session, request.proposal) {
+                (AgentSession::Plan, Some(n)) => ("plan", format!("plan {} #{n}", request.repo)),
+                (AgentSession::Plan, None) => ("plan", format!("plan {}", request.repo)),
+                (AgentSession::Master, Some(_)) => {
+                    return refused("a master session takes no proposal".to_owned());
+                }
+                (AgentSession::Master, None) => ("master", format!("master {}", request.repo)),
             };
             if let Some(TerminalId(terminal)) = self.mux.find_labeled(&label) {
                 return AgentReply::Opened {
@@ -188,17 +225,21 @@ mod unix {
                     existing: true,
                 };
             }
+            let mut args = vec![
+                "--state-dir".to_owned(),
+                self.state_dir.to_string_lossy().into_owned(),
+                word.to_owned(),
+                request.repo.clone(),
+                "--branch".to_owned(),
+                request.default_branch.clone(),
+            ];
+            if let Some(n) = request.proposal {
+                args.extend(["--proposal".to_owned(), n.to_string()]);
+            }
             let profile = Profile {
                 label,
                 program: Some(self.exe.clone()),
-                args: vec![
-                    "--state-dir".to_owned(),
-                    self.state_dir.to_string_lossy().into_owned(),
-                    word.to_owned(),
-                    request.repo.clone(),
-                    "--branch".to_owned(),
-                    request.default_branch.clone(),
-                ],
+                args,
                 cwd: Some(checkout),
                 env: Vec::new(),
                 scrollback_rows: 20_000,
@@ -294,18 +335,30 @@ mod unix {
             .to_owned())
     }
 
-    /// `zeughaus-runner plan <repo> --branch <b>` in the main checkout:
-    /// brings `<checkout>-plan` to the default branch and replaces itself
-    /// with omp in plan mode there.
+    /// `zeughaus-runner plan <repo> --branch <b> [--proposal <n>]` in the
+    /// main checkout: brings `<checkout>-plan` to the default branch and
+    /// replaces itself with omp in plan mode there, planning proposal `n`
+    /// of the CI when one is named.
     pub fn plan(args: &[String], state_dir: &Path) -> ExitCode {
         let fail = |message: String| {
             eprintln!("[plan] {message}");
             ExitCode::FAILURE
         };
-        let branch = match parse_args(args) {
-            Ok((_, Some(branch))) => branch,
-            Ok((_, None)) => return fail("--branch is needed".to_owned()),
+        let (repo, branch, proposal) = match parse_args(args) {
+            Ok(SessionArgs {
+                repo,
+                branch: Some(branch),
+                proposal,
+            }) => (repo, branch, proposal),
+            Ok(SessionArgs { branch: None, .. }) => return fail("--branch is needed".to_owned()),
             Err(e) => return fail(e),
+        };
+        let proposal = match proposal {
+            Some(n) => match fetch_proposal(&repo, n, state_dir) {
+                Ok(doc) => Some(doc),
+                Err(e) => return fail(e),
+            },
+            None => None,
         };
         let checkout = match std::env::current_dir() {
             Ok(dir) => dir,
@@ -342,16 +395,66 @@ mod unix {
         if let Err(e) = crate::files::write_atomic(&overlay, PLAN_MODE.as_bytes()) {
             return fail(e);
         }
-        let error = Command::new("omp")
+        let mut command = Command::new("omp");
+        command
             .arg("--config")
             .arg(&overlay)
-            .current_dir(&dir)
-            .exec();
+            .env("ZEUGHAUS_PLAN_SESSION", &repo)
+            .env("ZEUGHAUS_STATE_DIR", state_dir)
+            .current_dir(&dir);
+        if let Some(doc) = &proposal {
+            let file = state_dir
+                .join("agents")
+                .join(&repo)
+                .join(format!("proposal-{}.md", doc.number));
+            if let Err(e) = crate::files::write_atomic(&file, doc.body.as_bytes()) {
+                return fail(e);
+            }
+            command
+                .arg(format!("@{}", file.display()))
+                .arg(proposal_instruction(&repo, doc.number, &doc.source))
+                .env("ZEUGHAUS_PROPOSAL", doc.number.to_string());
+        }
+        let error = command.exec();
         if error.kind() == std::io::ErrorKind::NotFound {
             fail("omp not found on PATH".to_owned())
         } else {
             fail(format!("cannot start omp: {error}"))
         }
+    }
+
+    /// Proposal `number` of `repo` from the CI, refused unless it is one.
+    fn fetch_proposal(repo: &str, number: u64, state_dir: &Path) -> Result<DocView, String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("cannot start the async runtime: {e}"))?;
+        let client = Client::new(Link::resolve(None, state_dir));
+        let asked = runtime.block_on(async {
+            let asked = client
+                .ci(CiRequest::Doc {
+                    repo: repo.to_owned(),
+                    number,
+                })
+                .await;
+            client.shutdown().await;
+            asked
+        });
+        let doc = match asked? {
+            CiReply::Doc { doc: Some(doc) } => *doc,
+            CiReply::Doc { doc: None } => return Err(format!("no proposal #{number} in {repo}")),
+            other => return Err(crate::mcp::unexpected(&other)),
+        };
+        if doc.kind != DocKind::Proposal {
+            return Err(format!("#{number} of {repo} is a plan, not a proposal"));
+        }
+        if doc.state != DocState::Open {
+            println!(
+                "[plan] proposal #{number} is {}; planning it anyway",
+                doc.state.name()
+            );
+        }
+        Ok(doc)
     }
 
     /// Prints a reason to wait, once while it stays the same.
@@ -376,7 +479,10 @@ mod unix {
             ExitCode::FAILURE
         };
         let repo = match parse_args(args) {
-            Ok((repo, _)) => repo,
+            Ok(SessionArgs {
+                proposal: Some(_), ..
+            }) => return fail("--proposal is for plan only".to_owned()),
+            Ok(SessionArgs { repo, .. }) => repo,
             Err(e) => return fail(e),
         };
         let cwd = match std::env::current_dir() {
@@ -575,16 +681,36 @@ mod tests {
     }
 
     #[test]
-    fn both_sessions_take_a_repository_and_a_branch() {
+    fn both_sessions_take_a_repository_a_branch_and_a_proposal() {
         let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let session = |branch: Option<&str>, proposal: Option<u64>| SessionArgs {
+            repo: "demo".to_owned(),
+            branch: branch.map(str::to_owned),
+            proposal,
+        };
         assert_eq!(
             parse_args(&args(&["demo", "--branch", "main"])),
-            Ok(("demo".to_owned(), Some("main".to_owned())))
+            Ok(session(Some("main"), None))
         );
-        assert_eq!(parse_args(&args(&["demo"])), Ok(("demo".to_owned(), None)));
+        assert_eq!(parse_args(&args(&["demo"])), Ok(session(None, None)));
+        assert_eq!(
+            parse_args(&args(&["demo", "--branch", "main", "--proposal", "4"])),
+            Ok(session(Some("main"), Some(4)))
+        );
         assert!(parse_args(&args(&[])).is_err());
         assert!(parse_args(&args(&["demo", "--branch"])).is_err());
         assert!(parse_args(&args(&["demo", "other"])).is_err());
         assert!(parse_args(&args(&["../x"])).is_err());
+        for bad in [
+            &["demo", "--proposal"][..],
+            &["demo", "--proposal", "0"],
+            &["demo", "--proposal", "x"],
+        ] {
+            assert_eq!(
+                parse_args(&args(bad)),
+                Err("--proposal needs a document number".to_owned()),
+                "{bad:?}"
+            );
+        }
     }
 }

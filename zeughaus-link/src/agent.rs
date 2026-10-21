@@ -1,6 +1,7 @@
 //! Agent sessions an editor opens on its own runner: a planning session in a
-//! repository's `-plan` worktree, or the master session that executes the
-//! approved plans of a repository one after another in its main checkout.
+//! repository's `-plan` worktree, optionally planning one open proposal, or
+//! the master session that executes the approved plans of a repository one
+//! after another in its main checkout.
 //!
 //! One req/rep exchange on [`AGENT_PATH`](crate::AGENT_PATH): an
 //! [`AgentRequest`] in, an [`AgentReply`] out, both JSON. The session runs in
@@ -30,6 +31,9 @@ pub struct AgentRequest {
     pub repo: String,
     pub origin: String,
     pub default_branch: String,
+    /// `Plan` only: the open proposal the session plans, attached to its first prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<u64>,
 }
 
 impl AgentRequest {
@@ -80,13 +84,21 @@ mod tests {
 
     #[test]
     fn an_agent_exchange_round_trips() {
-        let request = AgentRequest {
+        let master = AgentRequest {
             session: AgentSession::Master,
             repo: "demo".to_owned(),
             origin: "git.example.org/o/demo".to_owned(),
             default_branch: "main".to_owned(),
+            proposal: None,
         };
-        assert_eq!(AgentRequest::decode(&request.encode()), Some(request));
+        let plan = AgentRequest {
+            session: AgentSession::Plan,
+            proposal: Some(4),
+            ..master.clone()
+        };
+        for request in [master, plan] {
+            assert_eq!(AgentRequest::decode(&request.encode()), Some(request));
+        }
         for reply in [
             AgentReply::Opened {
                 terminal: 7,
@@ -101,12 +113,23 @@ mod tests {
     }
 
     #[test]
+    fn a_request_without_a_proposal_decodes_as_a_plain_session() {
+        let request = AgentRequest::decode(
+            br#"{"session":"plan","repo":"demo","origin":"o","default_branch":"main"}"#,
+        )
+        .expect("an older editor's request decodes");
+        assert_eq!(request.session, AgentSession::Plan);
+        assert_eq!(request.proposal, None);
+    }
+
+    #[test]
     fn an_oversized_agent_request_decodes_to_nothing() {
         let mut bytes = AgentRequest {
             session: AgentSession::Plan,
             repo: "demo".to_owned(),
             origin: "o".to_owned(),
             default_branch: "main".to_owned(),
+            proposal: None,
         }
         .encode();
         bytes.resize(MAX_AGENT_BYTES + 1, b' ');

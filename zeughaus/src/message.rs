@@ -412,10 +412,11 @@ pub enum CiMsg {
         result: Result<(), String>,
     },
     /// The user asked for an agent session of the Plans tab's repository on
-    /// this editor's own runner.
+    /// this editor's own runner; a planning one plans `proposal` when set.
     OpenAgent {
         view: u64,
         session: zeughaus_link::AgentSession,
+        proposal: Option<u64>,
     },
     /// What that runner answered; `runner` is its key.
     AgentOpened {
