@@ -176,9 +176,9 @@ proposals (below). Nothing but
 protocol messages is written to its stdout.
 `zeughaus-runner [--state-dir <dir>] ci repo [--json] [<path>]`, `ci
 find [--json] <repo> <sha>`, `ci doc [--json] <repo> <n>`, `ci plan-save
-[--json] <repo> <file>` and `ci planned <repo> <file>` answer the same for
-a script (exit 3: the origin is no repository of `ci.toml`; 2: no CI, no
-answer or a refusal); the
+[--json] [--approve] <repo> <file>` and `ci planned <repo> <file>` answer
+the same for a script (exit 3: the origin is no repository of `ci.toml`;
+2: no CI, no answer or a refusal); the
 `zeughaus-ci` omp plugin in `omp-plugin/` uses them for its session
 context, its push watch and `/zeughaus save`.
 
@@ -197,7 +197,13 @@ the checkout `~/work/<origin>` (`$ZEUGHAUS_WORK` overrides `~/work`):
 branch>` and execs omp in plan mode there; `master` claims approved plans
 one after another and runs `omp @<plan> <instruction>` with
 `ZEUGHAUS_PLAN=<repo>#<n>` in the main checkout, waiting while the
-checkout is dirty or a plan is in progress.
+checkout is dirty or a plan is in progress. An open proposal's `Plan`
+button opens `plan <repo> --proposal <n>` (tab `plan <repo> #<n>`), which
+attaches the proposal to omp's first prompt so planning starts at once.
+In every session `plan` starts (`ZEUGHAUS_PLAN_SESSION=<repo>`), the omp
+plugin answers the agent's proposal with its own menu instead of omp's
+review: `Save and approve` and `Save` store the plan (`ci plan-save
+[--approve]`) and end the session, `Refine` keeps planning.
 
 A runner also runs the tasks of `<state-dir>/maintain.toml` (`[[task]]` with
 `name`, `command` as an argv, `every_minutes` and `timeout_minutes`,
