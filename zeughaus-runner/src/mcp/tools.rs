@@ -2113,6 +2113,11 @@ mod tests {
                     CiRequest::Doc { .. } => CiReply::Doc { doc: None },
                     CiRequest::DocCreate { .. } => CiReply::DocCreated { number: 7 },
                     CiRequest::DocState { number: 2, .. } => CiReply::Accepted,
+                    CiRequest::DocState {
+                        number: 7,
+                        state: DocState::Approved,
+                        ..
+                    } => CiReply::Accepted,
                     CiRequest::DocState { number, .. } => CiReply::Error {
                         message: format!("no document #{number} in demo"),
                     },
@@ -3075,6 +3080,38 @@ mod tests {
             assert_eq!(json["repo"]["jobs"][0]["manual"], true);
             client.shutdown().await;
             let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn plan_save_with_approve_stores_and_approves() {
+            let ci = fake_ci("cli-approve", 0, None).await;
+            let file = std::env::temp_dir()
+                .join(format!("zeughaus-mcp-approve-{}.md", std::process::id()));
+            std::fs::write(&file, "# T\n\nbody\n").unwrap();
+            let client = ci_client(&ci);
+            let line = ci_answer(
+                &client,
+                CiCommand::PlanSave {
+                    json: true,
+                    approve: true,
+                    repo: "demo".to_owned(),
+                    file: file.clone(),
+                },
+            )
+            .await
+            .expect("stored and approved");
+            let json: Value = serde_json::from_str(&line).expect("JSON");
+            assert_eq!(json, json!({"repo": "demo", "number": 7, "approved": true}));
+            assert_eq!(
+                ci.seen.asked.lock().unwrap().last(),
+                Some(&CiRequest::DocState {
+                    repo: "demo".to_owned(),
+                    number: 7,
+                    state: DocState::Approved,
+                })
+            );
+            client.shutdown().await;
+            let _ = std::fs::remove_file(&file);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -21,7 +21,7 @@
 //! zeughaus-runner ci repo [--json] [<path>]
 //! zeughaus-runner ci find [--json] <repo> <sha>
 //! zeughaus-runner ci doc [--json] <repo> <number>
-//! zeughaus-runner ci plan-save [--json] <repo> <file>
+//! zeughaus-runner ci plan-save [--json] [--approve] <repo> <file>
 //! zeughaus-runner ci planned <repo> <file>
 //! zeughaus-runner plan <repo> --branch <branch> [--proposal <n>]
 //! zeughaus-runner master <repo> [--branch <branch>]
@@ -55,7 +55,7 @@ usage: zeughaus-runner [--state-dir <dir>] [--feed-addr <host:port>] [--keep-run
        zeughaus-runner ci repo [--json] [<path>]
        zeughaus-runner ci find [--json] <repo> <sha>
        zeughaus-runner ci doc [--json] <repo> <number>
-       zeughaus-runner ci plan-save [--json] <repo> <file>
+       zeughaus-runner ci plan-save [--json] [--approve] <repo> <file>
        zeughaus-runner ci planned <repo> <file>
        zeughaus-runner plan <repo> --branch <branch> [--proposal <n>]
        zeughaus-runner master <repo> [--branch <branch>]

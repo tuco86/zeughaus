@@ -132,16 +132,19 @@ const EXIT_NOT_A_REPOSITORY: u8 = 3;
 ///   `null` when there is none.
 /// - `ci doc [--json] <repo> <number>`: one plan or proposal, as `doc_read`
 ///   tells it; `--json` prints its record with the body.
-/// - `ci plan-save [--json] <repo> <file>`: stores the plan in `file`,
-///   titled by its first heading, taking up the proposals its `Proposals:`
-///   line names. `--json` prints `{"repo": .., "number": ..}`.
+/// - `ci plan-save [--json] [--approve] <repo> <file>`: stores the plan in
+///   `file`, titled by its first heading, taking up the proposals its
+///   `Proposals:` line names; `--approve` approves it for the master right
+///   away. `--json` prints `{"repo": .., "number": .., "approved": ..}`,
+///   with `approve_failed` saying why an asked approval did not go through.
 /// - `ci planned <repo> <file>`: marks the proposals that the plan in
 ///   `file` names as planned, for a plan executed without being saved.
 ///
-/// Exit 0: answered. 1: the arguments, the directory or the file were
-/// wrong. 2: no CI is configured, it could not be asked, or it refused
-/// (no such document, a state that cannot change). 3: `ci repo` only, no
-/// repository of the CI has the checkout's origin.
+/// Exit 0: answered; an `--approve` that the CI refused still exits 0 and
+/// says so, because the plan is stored. 1: the arguments, the directory or
+/// the file were wrong. 2: no CI is configured, it could not be asked, or
+/// it refused (no such document, a state that cannot change). 3: `ci repo`
+/// only, no repository of the CI has the checkout's origin.
 pub fn cli(args: &[String], state_dir: &Path) -> ExitCode {
     let command = match parse_ci(args) {
         Ok(command) => command,
@@ -200,6 +203,7 @@ enum CiCommand {
     },
     PlanSave {
         json: bool,
+        approve: bool,
         repo: String,
         file: PathBuf,
     },
@@ -216,10 +220,12 @@ fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
         return Err(format!("ci needs a subcommand: {SUBCOMMANDS}"));
     };
     let mut json = false;
+    let mut approve = false;
     let mut operands: Vec<&String> = Vec::new();
     for arg in rest {
         match arg.as_str() {
             "--json" if subcommand != "planned" => json = true,
+            "--approve" if subcommand == "plan-save" => approve = true,
             flag if flag.len() > 1 && flag.starts_with('-') => {
                 return Err(format!("unknown flag {flag:?} for ci {subcommand}"));
             }
@@ -251,6 +257,7 @@ fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
         ("doc", _) => Err("ci doc takes a repository name and a number".to_owned()),
         ("plan-save", [repo, file]) => Ok(CiCommand::PlanSave {
             json,
+            approve,
             repo: (*repo).clone(),
             file: PathBuf::from(file),
         }),
@@ -300,6 +307,9 @@ struct RepoAnswer<'a> {
 struct SavedAnswer<'a> {
     repo: &'a str,
     number: u64,
+    approved: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approve_failed: Option<String>,
 }
 
 /// The plan in `file`; an empty one is no plan.
@@ -380,7 +390,12 @@ async fn ci_answer(client: &Client, command: CiCommand) -> Result<String, Failur
                 ))
             }
         }
-        CiCommand::PlanSave { json, repo, file } => {
+        CiCommand::PlanSave {
+            json,
+            approve,
+            repo,
+            file,
+        } => {
             let body = read_plan(&file)?;
             let proposals = docs::proposals_named(&body).map_err(Failure::bad_input)?;
             let request = CiRequest::DocCreate {
@@ -395,11 +410,36 @@ async fn ci_answer(client: &Client, command: CiCommand) -> Result<String, Failur
                 CiReply::DocCreated { number } => number,
                 other => return Err(Failure::no_answer(unexpected(&other))),
             };
+            // The plan is stored either way: a refused approval is said,
+            // not an exit code, and the Plans tab approves it later.
+            let approve_failed = if approve {
+                let request = CiRequest::DocState {
+                    repo: repo.clone(),
+                    number,
+                    state: DocState::Approved,
+                };
+                match client.ci(request).await {
+                    Ok(CiReply::Accepted) => None,
+                    Ok(other) => Some(unexpected(&other)),
+                    Err(e) => Some(e),
+                }
+            } else {
+                None
+            };
+            let approved = approve && approve_failed.is_none();
             if json {
                 encoded(&SavedAnswer {
                     repo: &repo,
                     number,
+                    approved,
+                    approve_failed,
                 })
+            } else if approved {
+                Ok(format!("saved and approved plan #{number} of {repo}\n"))
+            } else if let Some(why) = approve_failed {
+                Ok(format!(
+                    "saved plan #{number} of {repo}; approving it failed: {why}\n"
+                ))
             } else {
                 Ok(format!("saved plan #{number} of {repo}\n"))
             }
@@ -496,8 +536,18 @@ mod tests {
             parse_ci(&args(&["plan-save", "demo", "/tmp/p.md", "--json"])),
             Ok(CiCommand::PlanSave {
                 json: true,
+                approve: false,
                 repo: "demo".to_owned(),
                 file: PathBuf::from("/tmp/p.md")
+            })
+        );
+        assert_eq!(
+            parse_ci(&args(&["plan-save", "--approve", "demo", "f"])),
+            Ok(CiCommand::PlanSave {
+                json: false,
+                approve: true,
+                repo: "demo".to_owned(),
+                file: PathBuf::from("f")
             })
         );
         assert_eq!(
@@ -532,6 +582,10 @@ mod tests {
             (
                 &["planned", "--json", "demo", "f"][..],
                 "unknown flag \"--json\" for ci planned",
+            ),
+            (
+                &["doc", "--approve", "demo", "1"][..],
+                "unknown flag \"--approve\" for ci doc",
             ),
             (
                 &["find", "zeughaus", "abc"][..],
