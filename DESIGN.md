@@ -1075,7 +1075,7 @@ pipeline starts it from nothing, the rest build on it. A manual run is never
 
 **Manual runs** run named jobs of the repository's pipeline from the working
 trees of an editor's agent: uncommitted files and the sibling path
-dependencies of its checkout (`../weida`) included. The agent snapshots its
+dependencies of its checkout included. The agent snapshots its
 checkout and each dependency as a commit without a parent (the tree `git add
 -A` sees) and bundles each under one ref of `refs/zci-manual/`. The CI's
 `/manual` service (`manual.rs`, wire types in `zeughaus_link::manual`,
@@ -1148,7 +1148,7 @@ Then it removes the bundles, touches `.git/zci-last-used` (what the runner's
 budget reads) and starts the job in the workspace: `CI_WORKSPACE` is the
 workspace (`/work` in a container, which always mounts the workspace there)
 and `CI_SIBLINGS` is `<workspace>/.zci-siblings` (`/work/.zci-siblings`), so
-a job finds `../weida` where its script puts it, as `weida.sh` does. The
+a job finds a sibling path dependency where its script links it. The
 runner refuses an upload that has no checkouts, more than `MAX_MANUAL_DIRS`,
 a name or commit that is not plain, or a machine place.
 
@@ -1449,12 +1449,10 @@ platform whose build broke. Every command runs as a step that prints
 `== <command>: <s> s` (`step` in `build.sh`, `Run` in `windows.ps1`), which
 `ci_timing` reads. The toolchain is pinned in `rust-toolchain.toml` and the
 image's `FROM` tag, so all places build with one compiler. The jobs of a
-platform share
-their place and so their workspace; `secrets = ["FORGEJO_READ_TOKEN"]` on
-all of them is for the fetch of weida's `main`; a manual run fetches the
-`weida` of `CI_SIBLINGS` instead. Either way it is checked out in
-`.ci-cache/weida` and `../weida` links there, one stable path for cargo's
-fingerprints.
+platform share their place and so their workspace. weida is a git
+dependency pinned to a commit of its public GitHub mirror (`rev` in the root
+`Cargo.toml`): cargo fetches it into the workspace's cargo home, no job needs
+a secret for it, and a manual run builds the same weida as the pipeline.
 
 |platform|build job and check job|where (`[platforms]` of the production `ci.toml`)|
 |---|---|---|
@@ -1467,9 +1465,8 @@ fingerprints.
 The Linux archives also hold `zeughaus-ci`, which the CI's updater installs.
 `build.sh` (no header, so a helper) is sourced by the Unix build and check
 jobs and by `publish.sh`; `windows.ps1` is the Windows jobs' helper (the
-`Run` function, `CARGO_TARGET_DIR` under `<workspace>\.ci-cache`, and weida:
-a junction at `<workspace>\..\weida` to `CI_SIBLINGS\weida`, else to a clone
-fetched into the cache). Every build job runs on a push to `main`, a `v*`
+`Run` function, `CARGO_TARGET_DIR` under `<workspace>\.ci-cache` and
+`Install-Nextest`). Every build job runs on a push to `main`, a `v*`
 tag and the cron `0 3 * * *`; a check job has no `on`, so it runs with the
 build it needs. A push to any other branch starts nothing, and no channel is
 named after a branch.

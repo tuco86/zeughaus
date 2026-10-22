@@ -1,6 +1,6 @@
 {
   "name": "zeughaus-ci",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "zeughaus-ci in omp: the checkout's CI at session start, push watching, plans saved to the CI, the CI skill",
   "license": "MIT OR Apache-2.0",
   "skills": "./skills/"

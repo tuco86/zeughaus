@@ -54,10 +54,13 @@ zeughaus-record = { path = "zeughaus-record", version = "0.3.0-dev" }
 zeughaus-job = { path = "zeughaus-job", version = "0.3.0-dev" }
 # What travels between a runner and its editors over weida, and the identities
 # both ends present: the graph document, the sample feed, runtime events, path
-# constants and the credentials on disk. The QUIC transport itself lives in a
-# sibling checkout.
+# constants and the credentials on disk.
 zeughaus-link = { path = "zeughaus-link", version = "0.3.0-dev" }
-weida = { path = "../weida/crates/weida", version = "0.1.0-alpha.7" }
+# The QUIC transport, pinned to a commit of its public GitHub mirror so a
+# checkout of weida that is being worked on never changes this build; moving
+# to a newer weida is a change of `rev` here. `version` is what a published
+# zeughaus depends on instead.
+weida = { git = "https://github.com/tuco86/weida.git", rev = "3a6241e5d8f075c321fc79286853e5442f506aa6", version = "0.1.0-alpha.7" }
 zeughaus-runner = { path = "zeughaus-runner", version = "0.3.0-dev" }
 # The CI service: pipelines from webhooks and cron, scheduled onto the runners
 # that enlist into it.

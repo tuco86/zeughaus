@@ -2,7 +2,6 @@
 # /// ci
 # on = ["push main", "tag v*", "cron 0 3 * * *"]
 # platform = "darwin-arm64"
-# secrets = ["FORGEJO_READ_TOKEN"]
 # timeout_minutes = 120
 # ///
 # The darwin-arm64 release archive, built on atik's host: the editor as
@@ -13,7 +12,6 @@ set -eu
 . "$CI_WORKSPACE/.zeughaus-ci/build.sh"
 cargo_env
 export ZEUGHAUS_BUILD="$CI_PIPELINE"
-. "$CI_WORKSPACE/.zeughaus-ci/weida.sh"
 
 triple=aarch64-apple-darwin
 stage_dir

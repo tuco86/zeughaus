@@ -11,7 +11,7 @@ zeughaus's own `.zeughaus-ci/` is the worked example: one Rust workspace, built 
 | `build-<p>.sh`, `build-windows-amd64.ps1` | The release archive of platform `<p>`, written to `$CI_OUTPUT` |
 | `check-<p>.sh`, `check-windows-amd64.ps1` | The gate of `<p>`: clippy, the tests (the unit tier on a push or manual run, both tiers nightly and on a tag) and the doctests. `check-linux-amd64` also runs `fmt` |
 | `publish.sh` | Needs all eight; bundles, signs and publishes the archives. The only job with release secrets |
-| `build.sh`, `weida.sh`, `windows.ps1` | Helpers without a header; the jobs source them |
+| `build.sh`, `windows.ps1` | Helpers without a header; the jobs source them |
 
 `<p>` is `linux-amd64`, `linux-arm64`, `darwin-arm64` or `windows-amd64`. The headers of one pair, `build-linux-amd64.sh` and `check-linux-amd64.sh`:
 
@@ -21,7 +21,6 @@ zeughaus's own `.zeughaus-ci/` is the worked example: one Rust workspace, built 
 # on = ["push main", "tag v*", "cron 0 3 * * *"]
 # platform = "linux-amd64"
 # image = "trixie"
-# secrets = ["FORGEJO_READ_TOKEN"]
 # when_busy = "freeze"
 # timeout_minutes = 120
 # ///
@@ -33,13 +32,12 @@ zeughaus's own `.zeughaus-ci/` is the worked example: one Rust workspace, built 
 # needs = ["build-linux-amd64"]
 # platform = "linux-amd64"
 # image = "trixie"
-# secrets = ["FORGEJO_READ_TOKEN"]
 # when_busy = "freeze"
 # timeout_minutes = 120
 # ///
 ```
 
-The build is selected by its `on`. The check has no `on`: its `needs` select it with the build, and it never runs alone from a push. Both name the platform and the image: a container built from `.zeughaus-ci/trixie.Containerfile` on the runner that ci.toml's `[platforms]` gives `linux-amd64` (tuco-pc). `when_busy = "freeze"` pauses them while that desktop is busy. `FORGEJO_READ_TOKEN` is for fetching weida's `main` (principle 7).
+The build is selected by its `on`. The check has no `on`: its `needs` select it with the build, and it never runs alone from a push. Both name the platform and the image: a container built from `.zeughaus-ci/trixie.Containerfile` on the runner that ci.toml's `[platforms]` gives `linux-amd64` (tuco-pc). `when_busy = "freeze"` pauses them while that desktop is busy. Neither holds a secret: weida is a git dependency on a public mirror (principle 7).
 
 ## Principles
 
@@ -70,19 +68,18 @@ The build is selected by its `on`. The check has no `on`: its `needs` select it 
 
 - Say what must come first with `needs`. zeughaus: `check-<p>` needs `build-<p>`; `publish` needs all eight.
 - Why: without `needs`, jobs at different places run in parallel and jobs at one place queue in the folder's order (topological, ties by name), which no key states. A red job skips only its dependents (`skipped: <need> failed (#<n>)`). `needs` also stages the needed job's `$CI_OUTPUT` as `$CI_INPUTS/<need>`, across runners: `publish` takes the archives of four platforms that way. A need that left no files stages no directory.
-- Build before check is zeughaus's choice, not artifact sharing. The archive is ready early, so the CI can move it to the publishing runner while the checks run, and a red build skips its platform's check. The check runs in the workspace the build left: cargo's home, the downloaded crates and the weida checkout are warm. It does not read the build's output, and it compiles other profiles (`--release` against dev and test). The other order, check first, skips the build when the gate is red; either is valid.
+- Build before check is zeughaus's choice, not artifact sharing. The archive is ready early, so the CI can move it to the publishing runner while the checks run, and a red build skips its platform's check. The check runs in the workspace the build left: cargo's home with the downloaded crates and git dependencies is warm. It does not read the build's output, and it compiles other profiles (`--release` against dev and test). The other order, check first, skips the build when the gate is red; either is valid.
 
 ### 6. Secrets only in publish jobs
 
 - Give `secrets` to the jobs that publish or deploy, and keep build and check jobs free of them where you can. Grant each secret in ci.toml to the events that need it. zeughaus grants the signing key and the GitHub token to `push main`, `cron *` and `tag v*`.
 - Why: a manual run gives no job any secret, so a job that needs one to build cannot be reached by `run_jobs`. A failed job that holds secrets also keeps its cause line out of the forge's commit status.
-- zeughaus's build and check jobs hold only `FORGEJO_READ_TOKEN`, to fetch weida's `main`. `weida.sh` skips that fetch when a manual run brings `weida` in `CI_SIBLINGS`, so they still run there.
 
-### 7. Sibling path dependencies
+### 7. Depend on another repository by a pinned commit
 
-- A job that builds against `../<dir>` uses `$CI_SIBLINGS/<dir>` when `CI_SIBLINGS` is set and fetches the dependency otherwise. Either way the checkout ends in one stable path of the cache, and `../<dir>` links to it: `weida.sh` for the Unix jobs, a junction in `windows.ps1`.
-- Why: a manual run uploads the sibling's working tree to `$CI_SIBLINGS`, and `run_jobs` should test that tree, not the sibling's `main`. The stable path keeps cargo's fingerprints from seeing the sources move between trees of different mtimes, which would rebuild.
-- The fetch token travels in the environment (`GIT_CONFIG_*`), never in argv, and is unset afterwards.
+- A dependency on another of your repositories is a git dependency pinned to a commit (`rev`), on a URL the jobs can fetch without a secret. zeughaus: weida from its public GitHub mirror.
+- Why: a path dependency on a sibling checkout builds whatever that checkout holds, work in progress included, so the same commit builds differently on the workstation, in a pipeline and in a manual run. A pin makes moving to a newer version a commit of its own, and a public URL keeps the jobs free of secrets, so `run_jobs` reaches them.
+- When a sibling path dependency cannot be avoided: a manual run uploads the sibling's working tree to `$CI_SIBLINGS/<dir>`; use it when `CI_SIBLINGS` is set and fetch the dependency otherwise, check it out in one stable path of the cache and link `../<dir>` there, so cargo's fingerprints do not see the sources move. A fetch token travels in the environment (`GIT_CONFIG_*`), never in argv, and is unset afterwards.
 
 ### 8. Pin the toolchain
 

@@ -3,7 +3,6 @@
 # on = ["push main", "tag v*", "cron 0 3 * * *"]
 # platform = "linux-amd64"
 # image = "trixie"
-# secrets = ["FORGEJO_READ_TOKEN"]
 # when_busy = "freeze"
 # timeout_minutes = 120
 # ///
@@ -14,7 +13,6 @@ set -eu
 . "$CI_WORKSPACE/.zeughaus-ci/build.sh"
 cargo_env
 export ZEUGHAUS_BUILD="$CI_PIPELINE"
-. "$CI_WORKSPACE/.zeughaus-ci/weida.sh"
 
 step cargo build --locked --release -p zeughaus -p zeughaus-runner -p zeughaus-ci
 stage_dir

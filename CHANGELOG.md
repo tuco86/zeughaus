@@ -109,6 +109,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- weida is a git dependency pinned to a commit of its public GitHub mirror
+  instead of a path dependency on the sibling checkout `../weida`, so work in
+  progress there no longer changes what zeughaus builds locally or in the
+  CI. The jobs drop `weida.sh`, the `..\weida` junction and the
+  `FORGEJO_READ_TOKEN` they needed to fetch weida's `main`.
 - Every host updates itself from the release channels, the CI's own hosts
   (sadala, the `tuco-pc` service runner) and the Windows runner included;
   `zeughaus-ci` follows a channel too. The updater is the new

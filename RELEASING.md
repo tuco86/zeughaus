@@ -33,9 +33,9 @@ file:
 cargo update --workspace
 ```
 
-`weida` is a path dependency on the sibling checkout with the version of a
-published weida release; a zeughaus release needs that weida version on
-crates.io first.
+`weida` is a git dependency pinned to a commit of its GitHub mirror, with the
+version of a published weida release; a zeughaus release needs that weida
+version on crates.io first, and the published crates depend on it from there.
 
 ## 3. Update the CHANGELOG
 

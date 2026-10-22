@@ -3,7 +3,6 @@
 # on = ["push main", "tag v*", "cron 0 3 * * *"]
 # platform = "linux-arm64"
 # image = "trixie"
-# secrets = ["FORGEJO_READ_TOKEN"]
 # timeout_minutes = 120
 # ///
 # The linux-arm64 release archive, built natively in an Apple `container` on
@@ -14,7 +13,6 @@ set -eu
 . "$CI_WORKSPACE/.zeughaus-ci/build.sh"
 cargo_env
 export ZEUGHAUS_BUILD="$CI_PIPELINE"
-. "$CI_WORKSPACE/.zeughaus-ci/weida.sh"
 
 step cargo build --locked --release -p zeughaus -p zeughaus-runner -p zeughaus-ci
 stage_dir

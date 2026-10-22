@@ -1,7 +1,6 @@
 # /// ci
 # needs = ["build-windows-amd64"]
 # machine = "wohnzimmer"
-# secrets = ["FORGEJO_READ_TOKEN"]
 # timeout_minutes = 180
 # ///
 # clippy, the tests and the doctests on the Windows runner's host, in the

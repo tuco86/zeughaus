@@ -6478,6 +6478,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 [[package]]
 name = "weida"
 version = "0.1.0-alpha.9-dev"
+source = "git+https://github.com/tuco86/weida.git?rev=3a6241e5d8f075c321fc79286853e5442f506aa6#3a6241e5d8f075c321fc79286853e5442f506aa6"
 dependencies = [
  "bytes",
  "futures-io",
@@ -6499,10 +6500,12 @@ dependencies = [
 [[package]]
 name = "weida-core"
 version = "0.1.0-alpha.9-dev"
+source = "git+https://github.com/tuco86/weida.git?rev=3a6241e5d8f075c321fc79286853e5442f506aa6#3a6241e5d8f075c321fc79286853e5442f506aa6"
 
 [[package]]
 name = "weida-protocol"
 version = "0.1.0-alpha.9-dev"
+source = "git+https://github.com/tuco86/weida.git?rev=3a6241e5d8f075c321fc79286853e5442f506aa6#3a6241e5d8f075c321fc79286853e5442f506aa6"
 dependencies = [
  "minicbor",
  "weida-core",
@@ -6511,6 +6514,7 @@ dependencies = [
 [[package]]
 name = "weida-runtime"
 version = "0.1.0-alpha.9-dev"
+source = "git+https://github.com/tuco86/weida.git?rev=3a6241e5d8f075c321fc79286853e5442f506aa6#3a6241e5d8f075c321fc79286853e5442f506aa6"
 dependencies = [
  "tokio",
  "weida-core",
@@ -6520,6 +6524,7 @@ dependencies = [
 [[package]]
 name = "weida-winpipe"
 version = "0.1.0-alpha.9-dev"
+source = "git+https://github.com/tuco86/weida.git?rev=3a6241e5d8f075c321fc79286853e5442f506aa6#3a6241e5d8f075c321fc79286853e5442f506aa6"
 dependencies = [
  "tokio",
  "windows-sys 0.61.2",

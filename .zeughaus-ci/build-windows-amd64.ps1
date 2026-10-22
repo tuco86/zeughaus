@@ -1,7 +1,6 @@
 # /// ci
 # on = ["push main", "tag v*", "cron 0 3 * * *"]
 # machine = "wohnzimmer"
-# secrets = ["FORGEJO_READ_TOKEN"]
 # timeout_minutes = 180
 # ///
 # The windows-amd64 release archive: editor and runner built on the Windows

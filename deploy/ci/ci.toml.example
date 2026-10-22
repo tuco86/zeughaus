@@ -58,8 +58,8 @@ webhook_secret = "GRIASDI_WEBHOOK_SECRET"
 GRIASDI_GITHUB_TOKEN = ["tag v*", "cron *"]
 
 # zeughaus itself, on Forgejo. The bot user `zeughaus-ci` is a collaborator
-# with write on zeughaus (fetch, statuses) and read on weida, the sibling
-# checkout the workspace builds against; jobs get only the read token.
+# with write on zeughaus (fetch, statuses). weida comes from its public GitHub
+# mirror, so the jobs need no token for it.
 [repos.zeughaus]
 url = "https://git.doodleshnookie.net/tuco86/zeughaus.git"
 forge = "forgejo"
@@ -72,7 +72,6 @@ status_token = "FORGEJO_TOKEN"
 webhook_secret = "ZEUGHAUS_WEBHOOK_SECRET"
 
 [repos.zeughaus.grants]
-FORGEJO_READ_TOKEN = ["push *", "tag *", "cron *"]
 ZEUGHAUS_UPDATE_KEY = ["push main", "cron *", "tag v*"]
 ZEUGHAUS_GITHUB_TOKEN = ["push main", "cron *", "tag v*"]
 

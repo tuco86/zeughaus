@@ -29,7 +29,7 @@ zeughaus-ci is the user's own CI. Its runners are the machines they own, one per
 ## 3. Debug a job or another platform
 
 - Run `run_jobs` with the platform's pair: `jobs=["build-<p>", "check-<p>"]`. The platforms are in the job table (zeughaus: `linux-amd64`, `linux-arm64`, `darwin-arm64`, `windows-amd64`).
-- `run_jobs` snapshots the checkout at `path` (default: the working directory) as it is on disk: HEAD's commit, uncommitted changes, untracked files that are not ignored, and the Cargo path dependencies beside it (`../weida`). It uploads that and runs the named jobs in the warm workspace of their place, the one the pipeline builds in. The second run is incremental.
+- `run_jobs` snapshots the checkout at `path` (default: the working directory) as it is on disk: HEAD's commit, uncommitted changes, untracked files that are not ignored, and the Cargo path dependencies beside it (`../<dir>`). It uploads that and runs the named jobs in the warm workspace of their place, the one the pipeline builds in. The second run is incremental.
 - The call answers once the run has settled, within `wait_seconds` (default 540, at most 600). A run still going answers with how to continue: `ci_wait` with the `repo` and `number` it names.
 - Read the answer. Every job has status, place and note. A failed job adds `cause:` (the first of `panicked at`, `error[`, `error:`, `FAILED` in its last 40 lines) and `excerpt:` (those lines).
 - Need more: `ci_log` with `number` and `job`. `tail` counts lines from the end (default 200, at most 5000). `ci_log` has no filter: read the lines for `panicked at`, `error[`, `error:`, `FAILED`. `timestamps` starts every line with the seconds since the job's first output.

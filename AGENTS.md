@@ -48,9 +48,10 @@ third_party/           # its own workspace: wezterm's terminal crates at the pin
 omp-plugin/            # the zeughaus-ci omp plugin (skill + extension); catalog in .omp-plugin/marketplace.json; bump its three versions together
 ```
 
-Sibling checkout this workspace depends on by path: `../weida` (the QUIC
-transport), with the version of a published weida release next to the path.
-The node graph widget is `iced_nodegraph` from crates.io.
+weida (the QUIC transport) is a git dependency on its public GitHub mirror,
+pinned to one commit (`rev` in the root `Cargo.toml`) next to the version of
+a published weida release; a newer weida is a change of that `rev`, never a
+local checkout. The node graph widget is `iced_nodegraph` from crates.io.
 
 Every crate of the workspace is on crates.io under the workspace version;
 `main` carries the next version with a `-dev` suffix. `RELEASING.md` is the
@@ -305,7 +306,7 @@ of that channel's pipelines at each place start from nothing (`git clean
 
 A manual run executes named jobs of a repository's pipeline from the
 uploader's working tree, uncommitted files and sibling path dependencies
-(`../weida`) included. The uploader sends the CI's `/manual` path (editors'
+included. The uploader sends the CI's `/manual` path (editors'
 keys only, wire types in `zeughaus_link::manual`) a `RunUpload` with the job
 names and one git bundle per checkout; the upload's `origin` must be the
 `url` of a repository of `ci.toml`. The CI reads `.zeughaus-ci/` of the
@@ -450,7 +451,7 @@ bundles the platform archives into a signed release directory
 
 This repository is one of its repos: a push to `main`, a `v*` tag and the
 nightly cron (`0 3 * * *`) run a build job and a check job per platform,
-against weida's `main` as the sibling checkout, and post `zeughaus/<job>`
+against the weida commit the root `Cargo.toml` pins, and post `zeughaus/<job>`
 on the commit; pushes to other branches start nothing. `build-<platform>`
 packs `zeughaus-<version>-<platform>.tar.gz` (`.zip` on Windows) into its
 output, and `check-<platform>` runs clippy and the tests after it in the
