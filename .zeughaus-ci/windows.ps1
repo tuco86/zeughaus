@@ -4,14 +4,17 @@
 $ErrorActionPreference = 'Stop'
 
 # Runs a native command and ends the script with its exit code when it fails.
-# Its stderr is shown, not turned into an error (Windows PowerShell 5.1 does
-# that to the stderr of native commands under 'Stop').
+# Its output goes straight to the job's console, not through a pipe: so cargo
+# and nextest see a terminal and color their output, and their UTF-8 is not
+# decoded again with the console codepage. 'Continue' because Windows
+# PowerShell 5.1 turns a native command's stderr into errors under 'Stop'
+# where it captures it.
 function Run([string]$Command, [string[]]$Arguments = @()) {
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     $clock = [Diagnostics.Stopwatch]::StartNew()
     try {
-        & $Command @Arguments 2>&1 | ForEach-Object { Write-Host "$_" }
+        & $Command @Arguments
         $code = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previous
@@ -87,4 +90,4 @@ if ($existing) {
     }
 }
 New-Item -ItemType Junction -Path $link -Target $source | Out-Null
-Run 'git' @('-C', $link, 'log', '--oneline', '-1')
+Run 'git' @('--no-pager', '-C', $link, 'log', '--oneline', '-1')
