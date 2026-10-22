@@ -20,7 +20,7 @@ use std::time::Duration;
 use weida::{Replier, TransferMeta};
 use zeughaus_job::{JobSpec, ProcessHost, RunExit, RunHandle, record_run_end};
 use zeughaus_link::{HoldReply, HoldRequest, MAX_HOLD_BYTES};
-use zeughaus_mux::{ExitState, TerminalId};
+use zeughaus_mux::{Dimensions, ExitState, TerminalId};
 use zeughaus_terminal::Profile;
 use zeughaus_terminal::wal::{Wal, WalWriter};
 
@@ -34,6 +34,16 @@ const POLL: Duration = Duration::from_millis(50);
 /// Scrollback a run's terminal keeps: a failed build is read from its end,
 /// and the last ten thousand rows is where the error is.
 pub(crate) const RUN_SCROLLBACK_ROWS: usize = 10_000;
+
+/// A run's grid until a pane resizes it. ConPTY renders the screen and
+/// hard-wraps every line at this width in the bytes it emits, so the WAL,
+/// `ci_log` and excerpts keep a line whole only up to it; a Unix PTY passes
+/// the bytes through either way. Programs that size their output to the
+/// terminal (rustc diagnostics through cargo) get the width too.
+pub(crate) const RUN_DIMENSIONS: Dimensions = Dimensions {
+    cols: 500,
+    rows: 24,
+};
 
 /// Successful runs kept on disk beyond which older ones are deleted when a
 /// new run starts. Failed runs, and runs that never wrote an exit record
@@ -250,9 +260,13 @@ impl ProcessHost for JobHost {
             env,
             scrollback_rows: RUN_SCROLLBACK_ROWS,
         };
-        let terminal = self
-            .mux
-            .spawn_owned(profile, Wal::At(wal_path), Some(run), placement)?;
+        let terminal = self.mux.spawn_owned(
+            profile,
+            Wal::At(wal_path),
+            RUN_DIMENSIONS,
+            Some(run),
+            placement,
+        )?;
         self.live.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(Run {
             mux: self.mux.clone(),

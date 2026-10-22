@@ -365,23 +365,19 @@ impl MuxService {
     ///
     /// `wal` records every byte the program writes with the time it was
     /// read, which is how a run's output is kept; `run` is what a restarted
-    /// runner needs to finish the run's record.
+    /// runner needs to finish the run's record. `size` is the grid until a
+    /// pane that controls it resizes it.
     pub fn spawn_owned(
         &self,
         profile: Profile,
         wal: Wal,
+        size: Dimensions,
         run: Option<SavedRun>,
         placement: OwnedPlacement,
     ) -> Result<TerminalId, String> {
         let id = TerminalId(self.inner.next_terminal.fetch_add(1, Ordering::Relaxed));
-        let session = Session::spawn(
-            id,
-            &profile,
-            Dimensions { cols: 80, rows: 24 },
-            wal,
-            &self.inner.host,
-        )
-        .map_err(|e| format!("cannot start {}: {e}", profile.label))?;
+        let session = Session::spawn(id, &profile, size, wal, &self.inner.host)
+            .map_err(|e| format!("cannot start {}: {e}", profile.label))?;
         self.follow_title(&session);
         let revision = {
             // The lock order is the one `snapshot` takes: sessions, then
@@ -1853,6 +1849,7 @@ mod tests {
                         scrollback_rows: 100,
                     },
                     Wal::Off,
+                    Dimensions { cols: 80, rows: 24 },
                     None,
                     OwnedPlacement::Detached,
                 )

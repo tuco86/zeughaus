@@ -168,7 +168,7 @@ mod unix {
         AgentReply, AgentRequest, AgentSession, CiReply, CiRequest, DocKind, DocState, DocView,
         MAX_AGENT_BYTES,
     };
-    use zeughaus_mux::TerminalId;
+    use zeughaus_mux::{Dimensions, TerminalId};
     use zeughaus_terminal::Profile;
     use zeughaus_terminal::wal::Wal;
 
@@ -244,10 +244,13 @@ mod unix {
                 env: Vec::new(),
                 scrollback_rows: 20_000,
             };
-            match self
-                .mux
-                .spawn_owned(profile, Wal::Capped, None, OwnedPlacement::Triggered)
-            {
+            match self.mux.spawn_owned(
+                profile,
+                Wal::Capped,
+                Dimensions { cols: 80, rows: 24 },
+                None,
+                OwnedPlacement::Triggered,
+            ) {
                 Ok(TerminalId(terminal)) => AgentReply::Opened {
                     terminal,
                     existing: false,
