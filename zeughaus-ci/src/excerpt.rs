@@ -20,12 +20,15 @@ const TAIL_BYTES: usize = 256 * 1024;
 const CAUSES: [&str; 4] = ["panicked at", "error[", "error:", "FAILED"];
 
 /// Terminal output as the lines a reader sees: escape sequences removed, a
-/// carriage return starting its line over, a backspace taking back a
-/// character, other control characters dropped.
+/// carriage return starting its line over, a backspace moving back one
+/// column, so the next character overwrites and a line end keeps what is
+/// there, other control characters dropped.
 pub fn plain_text(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     let mut out = String::with_capacity(text.len());
-    let mut line = String::new();
+    let mut line: Vec<char> = Vec::new();
+    // The cursor column, in chars.
+    let mut col = 0usize;
     // Set by a carriage return; the next printable character starts the
     // line over, a line feed ends it as it stands (`\r\n`).
     let mut overwrite = false;
@@ -35,28 +38,50 @@ pub fn plain_text(bytes: &[u8]) -> String {
             '\x1b' => skip_escape(&mut chars),
             '\u{9b}' => skip_csi(&mut chars),
             '\n' => {
-                out.push_str(line.trim_end());
+                push_trimmed(&mut out, &line);
                 out.push('\n');
                 line.clear();
+                col = 0;
                 overwrite = false;
             }
-            '\r' => overwrite = true,
-            '\x08' => {
-                line.pop();
+            '\r' => {
+                overwrite = true;
+                col = 0;
             }
-            '\t' => line.push(c),
+            '\x08' => col = col.saturating_sub(1),
+            '\t' => put(&mut line, &mut col, c),
             c if c.is_control() => {}
             c => {
                 if overwrite {
                     line.clear();
+                    col = 0;
                     overwrite = false;
                 }
-                line.push(c);
+                put(&mut line, &mut col, c);
             }
         }
     }
-    out.push_str(line.trim_end());
+    push_trimmed(&mut out, &line);
     out
+}
+
+/// Writes `c` at the cursor and moves it on.
+fn put(line: &mut Vec<char>, col: &mut usize, c: char) {
+    if *col < line.len() {
+        line[*col] = c;
+    } else {
+        line.push(c);
+    }
+    *col += 1;
+}
+
+/// Appends `line` without its trailing whitespace.
+fn push_trimmed(out: &mut String, line: &[char]) {
+    let end = line
+        .iter()
+        .rposition(|c| !c.is_whitespace())
+        .map_or(0, |i| i + 1);
+    out.extend(&line[..end]);
 }
 
 fn skip_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
@@ -201,6 +226,17 @@ mod tests {
             plain_text(raw),
             "   Compiling zeughaus\n100%\nac\nlink \t end"
         );
+    }
+
+    /// ConPTY ends every row it wraps with a backspace: the character before
+    /// it stays.
+    #[test]
+    fn a_backspace_moves_back_without_erasing() {
+        assert_eq!(
+            plain_text(b"until_its\x08\r\n_socket"),
+            "until_its\n_socket"
+        );
+        assert_eq!(plain_text(b"abc\x08\x08X"), "aXc");
     }
 
     #[test]
