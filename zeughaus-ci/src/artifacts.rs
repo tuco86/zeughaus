@@ -495,7 +495,7 @@ mod tests {
     #[test]
     fn a_set_goes_to_the_runner_of_a_job_that_needs_it_and_has_not_ended() {
         let unassigned = |_: &str| None;
-        for status in ["pending", "waiting", "starting", "running", "frozen"] {
+        for status in ["pending", "waiting", "starting", "running"] {
             let pipeline = needs_a(status);
             assert_eq!(
                 producer_for(&pipeline, "a", "y", unassigned),

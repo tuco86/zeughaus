@@ -974,7 +974,7 @@ fn read_exit_record(run_dir: &Path) -> Option<RunExit> {
 
 #[cfg(test)]
 mod tests {
-    use zeughaus_link::enlist::{Checkout, UploadDir, WhenBusy};
+    use zeughaus_link::enlist::{Checkout, UploadDir};
 
     use super::*;
 
@@ -1001,7 +1001,6 @@ mod tests {
             env: Vec::new(),
             secrets: Vec::new(),
             timeout_minutes: 1,
-            when_busy: WhenBusy::Wait,
             inputs: Vec::new(),
             checkout: Checkout::Clean,
             upload: None,

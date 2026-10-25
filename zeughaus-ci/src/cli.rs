@@ -37,7 +37,7 @@ use crate::channels::{CHANNELS_FILE, Channels};
 use crate::config::CiConfig;
 use crate::event::{self, CiEvent, EventKind};
 use crate::excerpt;
-use crate::header::{self, JobDef};
+use crate::header::JobDef;
 use crate::pipeline::{self, Pattern};
 use crate::scheduler::{self, JobStatus, PipelineStatus, place_job, place_name};
 use crate::secrets::{self, Secrets};
@@ -145,10 +145,13 @@ fn ignored_key_warnings(jobs: &[JobDef]) -> Vec<String> {
     jobs.iter()
         .flat_map(|job| {
             job.ignored_keys.iter().map(move |key| {
-                format!(
-                    "{CI_DIR}/{}: `{key}` is ignored: a repository's jobs at one place share one workspace, and a checkout keeps ignored files",
-                    job.file
-                )
+                let why = match *key {
+                    "when_busy" => "no runner is ever busy",
+                    _ => {
+                        "a repository's jobs at one place share one workspace, and a checkout keeps ignored files"
+                    }
+                };
+                format!("{CI_DIR}/{}: `{key}` is ignored: {why}", job.file)
             })
         })
         .collect()
@@ -171,8 +174,7 @@ fn check_job_channels(jobs: &[JobDef], channels: &Channels) -> Result<(), String
 }
 
 /// Validates the folder as a pipeline would, placement included when the
-/// state directory has a `ci.toml`: whether `freeze` fits a job's `platform`
-/// or `machine` depends on what `ci.toml` maps it to.
+/// state directory has a `ci.toml`.
 fn check(state_dir: &Path, args: &[String]) -> Result<(), String> {
     let dir = match args {
         [] => CI_DIR,
@@ -200,34 +202,20 @@ fn check(state_dir: &Path, args: &[String]) -> Result<(), String> {
             None
         }
     };
-    match &config {
-        Some(config) => {
-            let problems: Vec<String> = jobs
-                .iter()
-                .filter_map(|job| {
-                    place_job(config, "check", job, |image| {
-                        let path = dir.join(format!("{image}.Containerfile"));
-                        std::fs::read_to_string(&path)
-                            .map_err(|e| format!("cannot read {}: {e}", path.display()))
-                    })
-                    .err()
+    if let Some(config) = &config {
+        let problems: Vec<String> = jobs
+            .iter()
+            .filter_map(|job| {
+                place_job(config, "check", job, |image| {
+                    let path = dir.join(format!("{image}.Containerfile"));
+                    std::fs::read_to_string(&path)
+                        .map_err(|e| format!("cannot read {}: {e}", path.display()))
                 })
-                .collect();
-            if !problems.is_empty() {
-                return Err(problems.join("\n"));
-            }
-        }
-        None => {
-            for job in jobs.iter().filter(|job| {
-                job.when_busy == zeughaus_link::enlist::WhenBusy::Freeze && job.image.is_none()
-            }) {
-                eprintln!(
-                    "[ci] warning: {CI_DIR}/{}: when_busy = \"freeze\" needs a container or a VM; \
-                     {} must name a VM in ci.toml",
-                    job.file,
-                    place_name(job)
-                );
-            }
+                .err()
+            })
+            .collect();
+        if !problems.is_empty() {
+            return Err(problems.join("\n"));
         }
     }
     for job in jobs {
@@ -236,13 +224,7 @@ fn check(state_dir: &Path, args: &[String]) -> Result<(), String> {
         } else {
             format!("on: {}", job.on.join(", "))
         };
-        println!(
-            "{:<20} {:<20} {:<40} {}",
-            job.name,
-            place_name(&job),
-            triggers,
-            header::when_busy_name(job.when_busy)
-        );
+        println!("{:<20} {:<20} {}", job.name, place_name(&job), triggers);
     }
     for (name, patterns, clean) in channels.names() {
         let on: Vec<String> = patterns.iter().map(Pattern::to_string).collect();
@@ -486,7 +468,7 @@ mod tests {
 
     fn job_in(channels: &str) -> JobDef {
         let text = format!("# /// ci\n# needs = [\"a\"]\n# channels = [{channels}]\n# ///\n");
-        header::parse_job("b.sh", &text).unwrap().unwrap()
+        crate::header::parse_job("b.sh", &text).unwrap().unwrap()
     }
 
     #[test]
@@ -508,16 +490,19 @@ mod tests {
 
     #[test]
     fn the_keys_a_header_carries_for_nothing_are_warned_about() {
-        let text =
-            "# /// ci\n# on = [\"push main\"]\n# context = \"x\"\n# cache = [\".c\"]\n# ///\n";
-        let job = header::parse_job("a.sh", text).unwrap().unwrap();
-        let plain = header::parse_job("b.sh", "# /// ci\n# on = [\"push main\"]\n# ///\n")
+        let text = "# /// ci\n# on = [\"push main\"]\n# context = \"x\"\n# cache = [\".c\"]\n# when_busy = \"freeze\"\n# ///\n";
+        let job = crate::header::parse_job("a.sh", text).unwrap().unwrap();
+        let plain = crate::header::parse_job("b.sh", "# /// ci\n# on = [\"push main\"]\n# ///\n")
             .unwrap()
             .unwrap();
         let warnings = ignored_key_warnings(&[job, plain]);
-        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings.len(), 3);
         assert!(warnings[0].starts_with(".zeughaus-ci/a.sh: `context` is ignored: "));
         assert!(warnings[1].starts_with(".zeughaus-ci/a.sh: `cache` is ignored: "));
+        assert_eq!(
+            warnings[2],
+            ".zeughaus-ci/a.sh: `when_busy` is ignored: no runner is ever busy"
+        );
     }
 
     #[test]

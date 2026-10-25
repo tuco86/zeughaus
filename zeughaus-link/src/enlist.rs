@@ -17,10 +17,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::machine::MachineState;
-
 /// The protocol major a runner and the CI must share.
-pub const ENLIST_MAJOR: u32 = 5;
+pub const ENLIST_MAJOR: u32 = 6;
 
 /// The most one frame body may carry.
 pub const MAX_ENLIST_FRAME_BYTES: usize = 1 << 20;
@@ -48,8 +46,6 @@ pub enum FromRunner {
         /// Run ids of the artifact sets under the runner's `ci/artifacts/`.
         artifacts: Vec<String>,
     },
-    /// The busy state changed.
-    Busy { state: MachineState },
     /// A machine behind the runner (a VM) changed status.
     Machine { name: String, status: String },
     /// The assignment's process is running.
@@ -63,8 +59,6 @@ pub enum FromRunner {
         offset: u64,
         bytes: Vec<u8>,
     },
-    /// The run was paused or resumed because the machine got busy or free.
-    Frozen { run: String, frozen: bool },
     /// The run ended; its log has been sent up to its end.
     Finished { run: String, end: RunEnd },
     /// An input of the run `run`, the consuming job's, moves to this runner:
@@ -185,7 +179,6 @@ pub struct Assignment {
     pub env: Vec<(String, String)>,
     pub secrets: Vec<(String, String)>,
     pub timeout_minutes: u32,
-    pub when_busy: WhenBusy,
     pub inputs: Vec<Input>,
     #[serde(default)]
     pub checkout: Checkout,
@@ -244,19 +237,6 @@ impl Place {
             Place::Machine { name } => format!("machine-{name}"),
         }
     }
-}
-
-/// What a job does while its runner is busy.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum WhenBusy {
-    /// Start only once the runner is free.
-    #[default]
-    Wait,
-    /// Start, and pause while the runner is busy.
-    Freeze,
-    /// Start regardless.
-    Run,
 }
 
 /// The artifacts of a job this one needs.
@@ -473,7 +453,6 @@ fn sample_assignment() -> Assignment {
         env: Vec::new(),
         secrets: Vec::new(),
         timeout_minutes: 1,
-        when_busy: WhenBusy::Wait,
         inputs: Vec::new(),
         checkout: Checkout::Wipe,
         upload: Some(Upload {
@@ -686,20 +665,9 @@ mod id_tests {
         assert_eq!(parse_run_id("a.1"), None);
     }
 
-    #[test]
-    fn when_busy_parses_lowercase() {
-        #[derive(Deserialize)]
-        struct H {
-            when_busy: WhenBusy,
-        }
-        let h: H = serde_json::from_str(r#"{"when_busy":"freeze"}"#).unwrap();
-        assert_eq!(h.when_busy, WhenBusy::Freeze);
-        assert_eq!(WhenBusy::default(), WhenBusy::Wait);
-    }
-
     /// A runner persists its assignments as JSON (`assigned/<run>.json`), so
-    /// one written before places named workspaces, or before checkouts and
-    /// uploads, must still load.
+    /// one written before places named workspaces, before checkouts and
+    /// uploads, or while jobs had a `when_busy`, must still load.
     #[test]
     fn an_assignment_from_an_older_runner_still_loads() {
         let mut old = serde_json::to_value(sample_assignment()).unwrap();
@@ -709,6 +677,7 @@ mod id_tests {
         }
         fields.insert("workspace".to_owned(), "linux".into());
         fields.insert("cache".to_owned(), serde_json::json!([".cache"]));
+        fields.insert("when_busy".to_owned(), "freeze".into());
         let loaded: Assignment = serde_json::from_value(old).unwrap();
         assert_eq!(loaded.checkout, Checkout::Clean);
         assert_eq!(loaded.upload, None);

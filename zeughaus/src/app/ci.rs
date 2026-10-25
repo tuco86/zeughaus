@@ -2291,7 +2291,6 @@ mod glyph {
     pub const RUNNING: char = '\u{ea77}';
     pub const PENDING: char = '\u{ebb5}';
     pub const WAITING: char = '\u{eb7c}';
-    pub const FROZEN: char = '\u{ead1}';
     pub const SKIPPED: char = '\u{eabd}';
     pub const CANCELLED: char = '\u{eba5}';
     pub const BRANCH: char = '\u{ea68}';
@@ -2330,7 +2329,6 @@ fn status_glyph(status: &str) -> char {
         "failed" | "error" => glyph::ERROR,
         "running" | "starting" => glyph::RUNNING,
         "waiting" => glyph::WAITING,
-        "frozen" => glyph::FROZEN,
         "skipped" | "no-jobs" => glyph::SKIPPED,
         "cancelled" => glyph::CANCELLED,
         _ => glyph::PENDING,
@@ -2579,7 +2577,7 @@ enum Tone {
     Good,
     Bad,
     Active,
-    /// Held back: waiting for a runner, paused while it is busy.
+    /// Held back: waiting for a runner or a workspace.
     Wait,
     Idle,
 }
@@ -2590,7 +2588,7 @@ impl Tone {
             "succeeded" => Tone::Good,
             "failed" | "error" => Tone::Bad,
             "running" | "starting" => Tone::Active,
-            "waiting" | "frozen" => Tone::Wait,
+            "waiting" => Tone::Wait,
             _ => Tone::Idle,
         }
     }
@@ -2662,11 +2660,10 @@ fn duration(seconds: u64) -> String {
 /// The colour family of a machine's state word: ready, working, or not
 /// there for jobs.
 fn state_tone(state: &str) -> Tone {
-    // `free (set)`: the word that says how it is, not how it got there.
-    match state.split_whitespace().next() {
-        Some("free" | "ready" | "online") => Tone::Good,
-        Some("booting" | "stopping") => Tone::Active,
-        Some("busy" | "offline") => Tone::Wait,
+    match state {
+        "ready" | "online" => Tone::Good,
+        "booting" | "stopping" => Tone::Active,
+        "offline" => Tone::Wait,
         _ => Tone::Idle,
     }
 }
@@ -2742,14 +2739,6 @@ mod tests {
         assert_eq!(ago(0, 86_400), "1d ago");
         // A runner's clock ahead of this one is not a negative age.
         assert_eq!(ago(500, 100), "just now");
-    }
-
-    #[test]
-    fn state_words_keep_their_tone_with_a_set_marker() {
-        assert!(matches!(state_tone("free (set)"), Tone::Good));
-        assert!(matches!(state_tone("busy (set)"), Tone::Wait));
-        assert!(matches!(state_tone("offline"), Tone::Wait));
-        assert!(matches!(state_tone("off"), Tone::Idle));
     }
 
     #[test]

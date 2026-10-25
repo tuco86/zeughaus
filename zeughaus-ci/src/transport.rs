@@ -74,7 +74,6 @@ pub async fn serve_snapshots(replier: Replier, config: Arc<CiConfig>, seq: Arc<A
 fn snapshot(seq: u64) -> Snapshot {
     Snapshot {
         seq,
-        machine: None,
         ..Snapshot::default()
     }
 }
@@ -88,6 +87,6 @@ mod tests {
         let snapshot = snapshot(7);
         assert_eq!(snapshot.seq, 7);
         assert!(snapshot.outputs.is_empty() && snapshot.errors.is_empty());
-        assert!(snapshot.rejections.is_empty() && snapshot.machine.is_none());
+        assert!(snapshot.rejections.is_empty());
     }
 }

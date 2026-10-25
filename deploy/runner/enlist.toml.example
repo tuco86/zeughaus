@@ -18,13 +18,6 @@ budget_gb = 50
 cpus = 12
 memory = "24g"
 
-# Present: the GPU is measured with nvidia-smi and jobs wait or freeze while
-# it is busy. An editor's busy toggle overrides the measurement.
-[busy]
-gpu_percent = 50
-busy_after_seconds = 60
-free_after_seconds = 300
-
 # A machine behind this runner, named in a job's `machine` key (and in the
 # CI's `runners.<name>.machines`).
 [machines.win11]

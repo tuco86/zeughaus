@@ -21,8 +21,7 @@
 # SSH_PUBKEY is a ':'-separated list of public key files, all authorized.
 # The console is on VNC $VNC while the VM runs; ssh is forwarded to
 # 127.0.0.1:$SSH_PORT and reached as ssh host $SSH_HOST (~/.ssh/config).
-# The zeughaus-ci runner boots and stops it through this script and writes
-# stop/cont to $VM_DIR/monitor.sock to freeze a job.
+# The zeughaus-ci runner boots and stops it through this script.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

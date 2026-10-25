@@ -3,7 +3,6 @@
 # on = ["push main", "tag v*", "cron 0 3 * * *"]
 # platform = "linux-amd64"
 # image = "trixie"
-# when_busy = "freeze"
 # timeout_minutes = 120
 # ///
 # The linux-amd64 release archive: editor, runner and CI binaries built in

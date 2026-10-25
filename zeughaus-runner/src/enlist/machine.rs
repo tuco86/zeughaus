@@ -1,15 +1,10 @@
 //! A machine behind this runner that a CI job can run on: a Windows VM booted
 //! on demand and stopped after an idle timeout.
 //!
-//! A VM is driven through its `vm.sh` (boot, stop) and its HMP monitor socket
-//! (freeze, thaw). One job runs in it at a time; the CI enforces that, and the
-//! lease count here is what keeps the idle stop away while a job is booting
-//! or running.
+//! A VM is driven through its `vm.sh` (boot, stop). One job runs in it at a
+//! time; the CI enforces that, and the lease count here is what keeps the
+//! idle stop away while a job is booting or running.
 
-#[cfg(unix)]
-use std::io::{Read, Write};
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -184,50 +179,6 @@ impl Vm {
             eprintln!("[enlist] machine {}: no stop thread: {e}", self.name);
             self.lock().power = Power::Ready;
         }
-    }
-
-    /// Pauses or resumes the vCPUs.
-    pub fn freeze(&self, freeze: bool) -> Result<(), String> {
-        self.monitor(if freeze { "stop" } else { "cont" })
-    }
-
-    /// Resumes a VM a previous process may have frozen.
-    pub fn thaw_if_running(&self) {
-        if self.config.dir.join("qemu.pid").exists() {
-            let _ = self.monitor("cont");
-        }
-    }
-
-    /// Pauses (`stop`) or resumes (`cont`) every vCPU through the HMP monitor.
-    #[cfg(unix)]
-    fn monitor(&self, command: &str) -> Result<(), String> {
-        let path = self.config.dir.join("monitor.sock");
-        let mut stream = UnixStream::connect(&path)
-            .map_err(|e| format!("cannot connect {}: {e}", path.display()))?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .map_err(|e| e.to_string())?;
-        stream
-            .write_all(format!("{command}\n").as_bytes())
-            .map_err(|e| format!("monitor: {e}"))?;
-        // HMP answers with its prompt once the command ran; reading until
-        // the second prompt (the first greets) keeps the connection open
-        // that long. A timeout leaves it to QEMU, which still runs it.
-        let mut seen = String::new();
-        let mut buf = [0u8; 512];
-        while seen.matches("(qemu)").count() < 2 {
-            match stream.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => seen.push_str(&String::from_utf8_lossy(&buf[..n])),
-            }
-        }
-        Ok(())
-    }
-
-    /// `enlist.toml` refuses machines on a host without unix sockets.
-    #[cfg(not(unix))]
-    fn monitor(&self, _command: &str) -> Result<(), String> {
-        Err("a VM monitor needs a unix host".to_owned())
     }
 
     /// `vm.sh <command>` with this machine's settings, output appended to

@@ -23,15 +23,13 @@
 //! * `link`: the connection and the dispatch of what the CI sends.
 //! * `run`: one assignment from staging to its end, the log delivery and
 //!   the restart of runs a previous process left.
-//! * `control`: the clock of this runner: busy state, freezing, machine
-//!   status and the VM timeout.
+//! * `control`: the clock of this runner: machine status and the VM timeout.
 //! * `artifacts`: the artifact sets that cross to and from the CI, streamed.
 //! * `prefetch`: the sets fetched before their job is assigned.
-//! * `launch`, `machine`, `busy`, `git`, `cleanup`, `stage`: what a run is
-//!   rendered from and housekeeping.
+//! * `launch`, `machine`, `git`, `cleanup`, `stage`: what a run is rendered
+//!   from and housekeeping.
 
 pub mod artifacts;
-pub mod busy;
 pub mod config;
 
 mod cleanup;
@@ -56,7 +54,6 @@ use zeughaus_link::enlist::{Assignment, FromRunner, Offer, RunEnd};
 
 use crate::jobs::JobHost;
 
-use self::busy::Busy;
 use self::config::{EnlistConfig, MachineConfig};
 use self::machine::Vm;
 
@@ -103,13 +100,6 @@ fn tmp_dir(state_dir: &Path) -> PathBuf {
     ci_dir(state_dir).join("tmp")
 }
 
-/// What the rest of the runner shares with the executor.
-pub struct Enlisted {
-    /// The busy measurement, when `enlist.toml` has a `[busy]` section: the
-    /// runner serves it on `/busy` and reports it to its editors.
-    pub busy: Option<Arc<Busy>>,
-}
-
 /// The queue to the CI of the connection that is up, and what the CI said it
 /// already holds of each run's log.
 #[derive(Default)]
@@ -129,12 +119,7 @@ pub struct RunCtl {
     pub abort: AtomicBool,
     /// The CI is done with the run; its delivery thread ends.
     pub forgotten: AtomicBool,
-    /// Paused because the machine got busy.
-    pub frozen: AtomicBool,
-    /// A failed freeze or thaw was said once.
-    pub freeze_warned: AtomicBool,
-    /// Milliseconds a machine job has run unfrozen: the clock its timeout
-    /// follows.
+    /// Milliseconds a machine job has run: the clock its timeout follows.
     pub active_millis: AtomicU64,
     /// The run directory, once the process runs.
     pub live: Mutex<Option<PathBuf>>,
@@ -148,8 +133,6 @@ impl RunCtl {
             assignment,
             abort: Default::default(),
             forgotten: Default::default(),
-            frozen: Default::default(),
-            freeze_warned: Default::default(),
             active_millis: Default::default(),
             live: Mutex::new(None),
             end: Mutex::new(None),
@@ -182,7 +165,6 @@ pub struct Executor {
     /// answers.
     containers: bool,
     machines: BTreeMap<String, Arc<Vm>>,
-    busy: Option<Arc<Busy>>,
     runtime: Runtime,
     tls: ClientTls,
     /// Runs the async parts (artifact transfers) for the threads that
@@ -203,7 +185,7 @@ pub fn start(
     config: EnlistConfig,
     state_dir: &Path,
     exe: PathBuf,
-) -> Result<Enlisted, String> {
+) -> Result<(), String> {
     let identity = credentials::runner_identity(state_dir)?;
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|e| format!("enlist needs the runner's async runtime: {e}"))?;
@@ -234,10 +216,6 @@ pub fn start(
             (name.clone(), Vm::new(name, vm.clone(), state_dir))
         })
         .collect();
-    let busy = config
-        .busy
-        .clone()
-        .map(|busy| self::busy::start(busy, state_dir));
     let cpus = config.cpus.unwrap_or_else(|| {
         std::thread::available_parallelism().map_or(1, |n| u32::try_from(n.get()).unwrap_or(1))
     });
@@ -250,7 +228,6 @@ pub fn start(
         cpus,
         containers,
         machines,
-        busy: busy.clone(),
         runtime,
         tls,
         handle,
@@ -259,9 +236,6 @@ pub fn start(
         mirrors: Mutex::new(HashMap::new()),
         prefetches: prefetch::Prefetches::default(),
     });
-    if executor.containers || !executor.machines.is_empty() {
-        control::thaw_everything(&executor);
-    }
     // An earlier process fetched sets early for jobs it knew of; a job
     // assigned now fetches its inputs itself.
     if let Err(e) = cleanup::remove_tree(&prefetch::prefetch_dir(state_dir)) {
@@ -271,7 +245,7 @@ pub fn start(
     executor.sweep_inputs();
     control::spawn(&executor);
     tokio::spawn(link::keep(Arc::clone(&executor)));
-    Ok(Enlisted { busy })
+    Ok(())
 }
 
 impl Executor {

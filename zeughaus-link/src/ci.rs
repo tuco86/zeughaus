@@ -684,8 +684,6 @@ pub struct JobDefView {
     /// Why the job cannot be placed; empty when it can.
     pub placement: String,
     pub secrets: Vec<String>,
-    /// `wait`, `freeze` or `run`.
-    pub when_busy: String,
     /// Whether a manual run (`run_jobs`) can run it: placed, and not on a
     /// machine.
     pub manual: bool,
@@ -994,7 +992,6 @@ mod tests {
                         at: "host".to_owned(),
                         placement: String::new(),
                         secrets: vec!["ZEUGHAUS_UPDATE_KEY".to_owned()],
-                        when_busy: "wait".to_owned(),
                         manual: true,
                     }],
                     jobs_note: String::new(),

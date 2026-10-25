@@ -1613,36 +1613,6 @@ impl App {
                     Err(e) => e,
                 };
             }
-            Message::CycleBusy(key) => {
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    let Some((endpoint, mode)) = self
-                        .runtime
-                        .links
-                        .get(&key)
-                        .and_then(|link| Some((link.endpoint.clone(), link.machine?.mode)))
-                    else {
-                        self.last_error = "that runner reports no CI machine".to_string();
-                        return Task::none();
-                    };
-                    return Task::perform(feed::set_busy(endpoint, mode.next()), move |reply| {
-                        Message::BusyReplied(key.clone(), reply)
-                    });
-                }
-                #[cfg(target_arch = "wasm32")]
-                let _ = key;
-            }
-            // The runner's event says the same a moment later; taking the
-            // reply now is what makes the toggle answer the click at once.
-            #[cfg(not(target_arch = "wasm32"))]
-            Message::BusyReplied(key, reply) => match reply {
-                Ok(state) => {
-                    if let Some(link) = self.runtime.links.get_mut(&key) {
-                        link.machine = Some(state);
-                    }
-                }
-                Err(e) => self.last_error = e,
-            },
             // File dialogs are native-only (rfd). On wasm these are no-ops;
             // the runners hold the graphs instead.
             Message::SaveGraph => {
@@ -1936,14 +1906,6 @@ impl App {
                 } else if key.as_str() == RunnerKey::LOCAL {
                     controls.push(header_control("graph", GLYPH_GRAPH, "New graph"));
                 }
-                // The busy toggle sits on the runner section whose runner
-                // reports a busy-measuring machine; the CI section has none.
-                #[cfg(not(target_arch = "wasm32"))]
-                if key.ci_runner().is_none()
-                    && let Some(machine) = self.runtime.links.get(key).and_then(|link| link.machine)
-                {
-                    controls.push(busy_control(machine));
-                }
                 let tab = |t| tab_entry(key, t);
                 let items = section
                     .snapshot
@@ -2009,7 +1971,6 @@ impl App {
             on_control: Box::new(|key, control| match control {
                 "graph" => Message::NewGraph(key),
                 "group" => Message::Workspace(W::NewGroup(key)),
-                "busy" => Message::CycleBusy(key),
                 _ => Message::Workspace(W::NewShell(key)),
             }),
             on_press_tab: Box::new(|tab| Message::Workspace(W::PressTab(tab))),
@@ -2840,9 +2801,7 @@ fn unavailable<'a>(what: &'a str, why: &'a str) -> Element<'a, Message, Theme> {
 }
 
 /// Header glyphs from the bundled Nerd Font: codicons for terminal, type
-/// hierarchy (a node graph) and new folder (a group); for the CI machine
-/// Material Design's play circle (free, jobs start) and pause circle (busy,
-/// jobs wait), outlined while measured and filled while set by hand.
+/// hierarchy (a node graph) and new folder (a group).
 const GLYPH_SHELL: char = '\u{ea85}';
 const GLYPH_GRAPH: char = '\u{ebb9}';
 const GLYPH_GROUP: char = '\u{ea80}';
@@ -2862,15 +2821,6 @@ fn tab_glyphs() -> iced_tabs::Glyphs {
         control_size: HEADER_GLYPH_SIZE,
     }
 }
-#[cfg(not(target_arch = "wasm32"))]
-const GLYPH_FREE_MEASURED: char = '\u{f040d}';
-#[cfg(not(target_arch = "wasm32"))]
-const GLYPH_BUSY_MEASURED: char = '\u{f03e6}';
-#[cfg(not(target_arch = "wasm32"))]
-const GLYPH_FREE_SET: char = '\u{f040c}';
-#[cfg(not(target_arch = "wasm32"))]
-const GLYPH_BUSY_SET: char = '\u{f03e5}';
-
 /// A section header control: a glyph with a tooltip that says what it does.
 fn header_control(
     key: &'static str,
@@ -2878,32 +2828,6 @@ fn header_control(
     tip: &'static str,
 ) -> iced_tabs::Control<'static> {
     iced_tabs::Control::new(key, glyph.to_string())
-        .font(crate::font::UI)
-        .tooltip(tip)
-}
-
-/// The busy toggle: what the machine is, filled when set by hand, and in
-/// the tooltip what a click changes it to.
-#[cfg(not(target_arch = "wasm32"))]
-fn busy_control(machine: zeughaus_link::MachineState) -> iced_tabs::Control<'static> {
-    use zeughaus_link::BusyMode;
-
-    let (glyph, tip) = match (machine.mode, machine.busy) {
-        (BusyMode::Auto, true) => (
-            GLYPH_BUSY_MEASURED,
-            "CI machine busy, measured from the GPU. Click: force busy",
-        ),
-        (BusyMode::Auto, false) => (
-            GLYPH_FREE_MEASURED,
-            "CI machine free, measured from the GPU. Click: force busy",
-        ),
-        (BusyMode::Busy, _) => (GLYPH_BUSY_SET, "CI machine forced busy. Click: force free"),
-        (BusyMode::Free, _) => (
-            GLYPH_FREE_SET,
-            "CI machine forced free. Click: back to the GPU measurement",
-        ),
-    };
-    iced_tabs::Control::new("busy", glyph.to_string())
         .font(crate::font::UI)
         .tooltip(tip)
 }

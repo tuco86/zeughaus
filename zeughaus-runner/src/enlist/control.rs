@@ -1,17 +1,14 @@
-//! This runner's own clock: once a second it lets idle machines stop, freezes
-//! or thaws the runs that follow the busy measurement, ends machine jobs
-//! that ran too long and tells the CI what changed.
+//! This runner's own clock: once a second it lets idle machines stop, ends
+//! machine jobs that ran too long and tells the CI what changed.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use zeughaus_link::MachineState;
-use zeughaus_link::enlist::{FromRunner, Place, WhenBusy};
+use zeughaus_link::enlist::{FromRunner, Place};
 
-use super::stage::Engine;
-use super::{Executor, RunCtl, lock, stage};
+use super::{Executor, RunCtl, lock};
 
 const TICK: Duration = Duration::from_secs(1);
 
@@ -19,7 +16,6 @@ const TICK: Duration = Duration::from_secs(1);
 #[derive(Default)]
 struct Told {
     generation: u64,
-    busy: Option<MachineState>,
     machines: BTreeMap<String, &'static str>,
 }
 
@@ -38,41 +34,12 @@ pub fn spawn(exec: &Arc<Executor>) {
                 for vm in exec.machines.values() {
                     vm.tick();
                 }
-                exec.apply_busy();
                 exec.machine_timeouts(elapsed);
                 exec.announce(&mut told);
             }
         });
     if let Err(e) = spawned {
         eprintln!("[enlist] no clock thread: {e}");
-    }
-}
-
-/// Resumes every container and VM a previous process may have frozen.
-pub fn thaw_everything(exec: &Executor) {
-    if exec.containers
-        && Engine::host() == Engine::Podman
-        && let Ok(output) = std::process::Command::new("podman")
-            .args([
-                "ps",
-                "--filter",
-                "status=paused",
-                "--filter",
-                "name=^zci-",
-                "--format",
-                "{{.Names}}",
-            ])
-            .stderr(std::process::Stdio::null())
-            .output()
-    {
-        for name in String::from_utf8_lossy(&output.stdout).lines() {
-            if let Err(e) = stage::engine(Engine::Podman, &["unpause", name]) {
-                eprintln!("[enlist] cannot unpause {name}: {e}");
-            }
-        }
-    }
-    for vm in exec.machines.values() {
-        vm.thaw_if_running();
     }
 }
 
@@ -85,77 +52,12 @@ impl Executor {
             .collect()
     }
 
-    /// Freezes the runs that asked to while the machine is busy, and thaws
-    /// them when it is free again. A host job has nothing to pause: it only
-    /// waits for the machine before it starts, which is the CI's decision.
-    fn apply_busy(&self) {
-        let Some(busy) = &self.busy else {
-            return;
-        };
-        let is_busy = busy.is_busy();
-        for ctl in self.running() {
-            let a = &ctl.assignment;
-            if a.when_busy != WhenBusy::Freeze
-                || matches!(a.place, Place::Host)
-                || ctl.frozen.load(Ordering::SeqCst) == is_busy
-            {
-                continue;
-            }
-            match self.freeze(&ctl, is_busy) {
-                Ok(()) => {
-                    ctl.frozen.store(is_busy, Ordering::SeqCst);
-                    ctl.freeze_warned.store(false, Ordering::SeqCst);
-                    eprintln!(
-                        "[enlist] {}: {}",
-                        a.run,
-                        if is_busy { "frozen" } else { "thawed" }
-                    );
-                    self.send(FromRunner::Frozen {
-                        run: a.run.clone(),
-                        frozen: is_busy,
-                    });
-                }
-                Err(e) => {
-                    if !ctl.freeze_warned.swap(true, Ordering::SeqCst) {
-                        eprintln!(
-                            "[enlist] {}: cannot {}: {e}",
-                            a.run,
-                            if is_busy { "freeze" } else { "thaw" }
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    fn freeze(&self, ctl: &RunCtl, freeze: bool) -> Result<(), String> {
-        let a = &ctl.assignment;
-        match &a.place {
-            Place::Machine { name } => self
-                .machines
-                .get(name)
-                .ok_or_else(|| format!("no machine {name}"))?
-                .freeze(freeze),
-            Place::Container { .. } => match Engine::host() {
-                Engine::Podman => stage::engine(
-                    Engine::Podman,
-                    &[
-                        if freeze { "pause" } else { "unpause" },
-                        &format!("zci-{}", a.run),
-                    ],
-                ),
-                Engine::Apple => Err("apple container cannot pause a container".to_owned()),
-            },
-            Place::Host => Err("a host job cannot be frozen".to_owned()),
-        }
-    }
-
-    /// The timeout of a machine job, whose clock runs only while it is not
-    /// frozen. A host or container job times itself out inside `inner.sh`.
+    /// The timeout of a machine job. A host or container job times itself
+    /// out inside `inner.sh`.
     fn machine_timeouts(&self, elapsed: Duration) {
         for ctl in self.running() {
             let a = &ctl.assignment;
-            if !matches!(a.place, Place::Machine { .. }) || ctl.frozen.load(Ordering::SeqCst) {
+            if !matches!(a.place, Place::Machine { .. }) {
                 continue;
             }
             let Some(run_dir) = ctl.running_in() else {
@@ -184,25 +86,17 @@ impl Executor {
         }
     }
 
-    /// Tells the CI the busy state and the machines' status when they
-    /// changed, and everything again on a connection it has not heard them
-    /// on.
+    /// Tells the CI the machines' status when it changed, and again on a
+    /// connection it has not heard it on.
     fn announce(&self, told: &mut Told) {
         let Some(generation) = self.generation() else {
             return;
         };
-        let fresh = told.generation != generation;
-        if fresh {
+        if told.generation != generation {
             *told = Told {
                 generation,
                 ..Told::default()
             };
-        }
-        if let Some(busy) = &self.busy {
-            let state = busy.state();
-            if told.busy != Some(state) && self.send(FromRunner::Busy { state }) {
-                told.busy = Some(state);
-            }
         }
         for (name, vm) in &self.machines {
             let status = vm.status();
@@ -213,16 +107,6 @@ impl Executor {
                 })
             {
                 told.machines.insert(name.clone(), status);
-            }
-        }
-        if fresh {
-            for ctl in self.running() {
-                if ctl.frozen.load(Ordering::SeqCst) {
-                    self.send(FromRunner::Frozen {
-                        run: ctl.assignment.run.clone(),
-                        frozen: true,
-                    });
-                }
             }
         }
     }

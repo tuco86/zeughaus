@@ -161,7 +161,6 @@ impl EnlistService {
             Connected {
                 tx,
                 offer,
-                busy: None,
                 machines: Default::default(),
                 since: now_secs(),
             },

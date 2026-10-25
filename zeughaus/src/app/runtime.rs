@@ -88,13 +88,6 @@ pub(super) struct RunnerLink {
     /// Which subscription the traffic on screen came from, drawn from the
     /// editor-wide counter so a message names exactly one link.
     pub traffic_epoch: u64,
-    /// The busy state of the machine this runner measures, as it last
-    /// reported it; `None` for a runner that measures none, and while its
-    /// traffic is lost. Always `None` for a CI link.
-    pub machine: Option<zeughaus_link::MachineState>,
-    /// The sequence that state came with. A snapshot sets it outright,
-    /// because a restarted runner counts from zero again.
-    pub machine_seq: u64,
     /// The task holding this runner's graph: its document in, edits out.
     /// Aborts on drop.
     pub graph: Option<iced::task::Handle>,
@@ -247,8 +240,6 @@ impl App {
                 }
                 if let Some(link) = self.runtime.links.get_mut(&key) {
                     link.traffic_live = true;
-                    link.machine = snapshot.machine;
-                    link.machine_seq = snapshot.seq;
                 }
                 self.update_display_values();
                 // Events missed during a gap are not replayed, so the CI views
@@ -353,14 +344,6 @@ impl App {
                     self.record_setting_error(node, &setting, None);
                 }
             }
-            Traffic::Event(RuntimeEvent::Machine { seq, mode, busy }) => {
-                if let Some(link) = self.runtime.links.get_mut(&key)
-                    && seq > link.machine_seq
-                {
-                    link.machine = Some(zeughaus_link::MachineState { mode, busy });
-                    link.machine_seq = seq;
-                }
-            }
             // Not state: nothing to keep, and the window being focused is
             // no reason to hold it back, since nothing on screen says it.
             Traffic::Event(RuntimeEvent::Alert { title, body, .. }) => {
@@ -383,9 +366,6 @@ impl App {
             Traffic::Lost => {
                 if let Some(link) = self.runtime.links.get_mut(&key) {
                     link.traffic_live = false;
-                    // A toggle for a machine nobody answers for would set
-                    // nothing.
-                    link.machine = None;
                 }
                 // Values stay on screen as last-known, because the status bar
                 // says so and a number nobody claims is still the last one
@@ -593,8 +573,6 @@ impl App {
                             traffic: None,
                             traffic_live: false,
                             traffic_epoch: 0,
-                            machine: None,
-                            machine_seq: 0,
                             graph: None,
                             graph_epoch: 0,
                             graph_live: false,

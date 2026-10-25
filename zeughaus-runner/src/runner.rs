@@ -20,8 +20,8 @@ use zeughaus_core::{
     TypeConverters, Value, encode_scalar, occupancy_winner,
 };
 use zeughaus_link::{
-    ErrorRow, GraphChange, MachineState, OutputRow, RejectionRow, RuntimeEvent, Snapshot,
-    TOPIC_EDGE, TOPIC_ERROR, TOPIC_MACHINE, TOPIC_OUTPUT,
+    ErrorRow, GraphChange, OutputRow, RejectionRow, RuntimeEvent, Snapshot, TOPIC_EDGE,
+    TOPIC_ERROR, TOPIC_MACHINE, TOPIC_OUTPUT,
 };
 use zeughaus_runtime::{DeferredWork, GraphExecutor};
 
@@ -298,24 +298,6 @@ impl Runner {
     fn next_seq(&mut self) -> u64 {
         self.seq += 1;
         self.seq
-    }
-
-    /// Tells editors the CI machine's busy state when it changed. Cheap to
-    /// call every turn: an unchanged state publishes nothing.
-    pub fn report_machine(&mut self, state: MachineState) {
-        if !self.published.set_machine(state) {
-            return;
-        }
-        let seq = self.next_seq();
-        self.emit(
-            TOPIC_MACHINE,
-            RuntimeEvent::Machine {
-                seq,
-                mode: state.mode,
-                busy: state.busy,
-            },
-        );
-        self.published.flush(self.seq, &self.snapshot);
     }
 
     /// Tells editors something worth a desktop notification. Not state: no
@@ -850,9 +832,6 @@ pub struct Published {
     /// editor has to learn both from the one snapshot, and kept apart from
     /// them because a refused setting is not a failed run.
     rejections: HashMap<(NodeId, String), String>,
-    /// The CI machine's busy state, as editors were last told. Not about the
-    /// graph.
-    machine: Option<MachineState>,
     /// Whether the snapshot still matches the baseline. Rebuilding is deferred
     /// because one pass touches many nodes and the snapshot only has to be
     /// current when it is read.
@@ -918,16 +897,6 @@ impl Published {
         self.errors = errors;
     }
 
-    /// Records the CI machine's state. `true` when that is news.
-    pub fn set_machine(&mut self, state: MachineState) -> bool {
-        if self.machine == Some(state) {
-            return false;
-        }
-        self.machine = Some(state);
-        self.stale = true;
-        true
-    }
-
     /// Writes the snapshot if the baseline moved since the last call.
     ///
     /// Rebuilt whole rather than patched: the snapshot has to be exactly what
@@ -971,7 +940,6 @@ impl Published {
             outputs,
             errors,
             rejections,
-            machine: self.machine,
         };
         self.stale = false;
     }

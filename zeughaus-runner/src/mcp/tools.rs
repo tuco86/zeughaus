@@ -1984,7 +1984,6 @@ mod tests {
                 at: "host".to_owned(),
                 placement: String::new(),
                 secrets: Vec::new(),
-                when_busy: "wait".to_owned(),
                 manual: true,
             };
             RepoView {

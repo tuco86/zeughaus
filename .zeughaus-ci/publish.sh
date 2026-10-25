@@ -3,7 +3,6 @@
 # needs = ["build-linux-amd64", "build-linux-arm64", "build-windows-amd64", "build-darwin-arm64", "check-linux-amd64", "check-linux-arm64", "check-windows-amd64", "check-darwin-arm64"]
 # machine = "sadala"
 # secrets = ["ZEUGHAUS_UPDATE_KEY", "ZEUGHAUS_GITHUB_TOKEN"]
-# when_busy = "run"
 # timeout_minutes = 60
 # [env]
 # GITHUB_REPO = "tuco86/zeughaus"

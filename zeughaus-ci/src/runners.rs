@@ -8,7 +8,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::mpsc::UnboundedSender;
-use zeughaus_link::MachineState;
 use zeughaus_link::enlist::{Offer, ToRunner};
 
 /// One enlisted runner's connection.
@@ -16,8 +15,6 @@ pub struct Connected {
     /// The `/enlist` exchange's writer; dropping it ends that exchange.
     pub tx: UnboundedSender<ToRunner>,
     pub offer: Offer,
-    /// The runner's busy state, once it reported one.
-    pub busy: Option<MachineState>,
     /// Machine name -> status, as the runner last reported them.
     pub machines: BTreeMap<String, String>,
     /// When it connected, seconds since the epoch.
@@ -28,7 +25,6 @@ pub struct Connected {
 #[derive(Debug, Clone)]
 pub struct RunnerView {
     pub offer: Offer,
-    pub busy: Option<MachineState>,
     pub machines: BTreeMap<String, String>,
     pub since: u64,
 }
@@ -96,12 +92,6 @@ impl Runners {
             .collect()
     }
 
-    pub fn set_busy(&self, name: &str, state: MachineState) {
-        if let Some(e) = lock(&self.connected).get_mut(name) {
-            e.connected.busy = Some(state);
-        }
-    }
-
     pub fn set_machine(&self, name: &str, machine: &str, status: &str) {
         if let Some(e) = lock(&self.connected).get_mut(name) {
             e.connected
@@ -126,7 +116,6 @@ impl Runners {
 fn view(connected: &Connected) -> RunnerView {
     RunnerView {
         offer: connected.offer.clone(),
-        busy: connected.busy,
         machines: connected.machines.clone(),
         since: connected.since,
     }

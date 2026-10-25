@@ -3,7 +3,6 @@
 # needs = ["build-linux-amd64"]
 # platform = "linux-amd64"
 # image = "trixie"
-# when_busy = "freeze"
 # timeout_minutes = 120
 # ///
 # The gate from AGENTS.md (formatting) and what every platform checks:

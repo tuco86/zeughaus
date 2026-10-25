@@ -3,7 +3,7 @@
 //!
 //! The file is the runner's own business: the CI knows a runner by the
 //! fingerprint it pins in its `ci.toml`, and what a job may use here (a
-//! container engine, a VM, the busy measurement) is whatever this file says.
+//! container engine, a VM) is whatever this file says.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -33,33 +33,10 @@ pub struct EnlistConfig {
     pub budget_gb: u64,
     /// Present: this runner runs jobs in rootless podman containers.
     pub containers: Option<ContainerConfig>,
-    /// Present: this runner measures the GPU and holds jobs while it is busy.
-    pub busy: Option<BusyConfig>,
     /// The machines behind this runner, by the name a job's `machine` key
     /// uses.
     #[serde(default)]
     pub machines: BTreeMap<String, MachineConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct BusyConfig {
-    /// `nvidia-smi` utilization.gpu threshold in percent.
-    pub gpu_percent: u32,
-    /// Mean over this window at or above the threshold means busy.
-    pub busy_after_seconds: u64,
-    /// Mean over this window below the threshold means free.
-    pub free_after_seconds: u64,
-}
-
-impl Default for BusyConfig {
-    fn default() -> Self {
-        Self {
-            gpu_percent: 50,
-            busy_after_seconds: 60,
-            free_after_seconds: 300,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -214,7 +191,7 @@ mod tests {
             EnlistConfig::parse(&format!("ci = \"{}\"\nname = \"sadala\"\n", url())).unwrap();
         assert_eq!(config.name, "sadala");
         assert_eq!(config.budget_gb, 50);
-        assert!(config.containers.is_none() && config.busy.is_none());
+        assert!(config.containers.is_none());
         assert!(config.machines.is_empty());
         assert_eq!(
             config.ci_url("/enlist").unwrap(),
@@ -229,7 +206,6 @@ mod tests {
         let text = format!(
             "ci = \"{}\"\nname = \"tuco-pc\"\ncpus = 16\n\
              [containers]\ncpus = 12\nmemory = \"24g\"\n\
-             [busy]\ngpu_percent = 70\n\
              [machines.win11]\nkind = \"windows-vm\"\nscript = \"/s/vm.sh\"\n\
              dir = \"/d\"\nssh_host = \"win11-ci\"\ncpus = 8\n",
             url()
@@ -237,8 +213,6 @@ mod tests {
         let config = EnlistConfig::parse(&text).unwrap();
         assert_eq!(config.cpus, Some(16));
         assert_eq!(config.containers.unwrap().cpus, 12);
-        let busy = config.busy.unwrap();
-        assert_eq!((busy.gpu_percent, busy.busy_after_seconds), (70, 60));
         let MachineConfig::WindowsVm(vm) = &config.machines["win11"];
         assert_eq!((vm.ssh_host.as_str(), vm.idle_minutes), ("win11-ci", 20));
     }

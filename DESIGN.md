@@ -746,7 +746,7 @@ as `ci = ["<endpoint>"]` next to `remotes` in `zeughaus.toml`. In production:
 | sadala (aarch64) | `zeughaus-ci serve` | `zeughaus-ci` | weida `10.8.0.1:7444`, HTTP `127.0.0.1:8686` | - |
 | sadala | runner | `zeughaus` | `10.8.0.1:7443` | `sadala` |
 | tuco-pc | runner | `hannes` | `10.8.0.10:7443` | `tuco-pc-hannes` |
-| tuco-pc | runner: containers, Windows VM, GPU busy | `zeughaus` | `10.8.0.10:7444` | `tuco-pc` (default runner) |
+| tuco-pc | runner: containers, Windows VM | `zeughaus` | `10.8.0.10:7444` | `tuco-pc` (default runner) |
 | atik (macOS) | runner, launchd agent | `uebelacker` | `10.8.0.7:7443` | `atik` |
 | wohnzimmer (Windows 10) | runner, boot task | `zeughaus` | `10.8.0.12:7443` | `wohnzimmer` (`os = "windows"`) |
 
@@ -763,10 +763,9 @@ holds these keys:
   a Windows VM of one, by name) or `platform` (a key of `ci.toml`
   `[platforms]`, exclusive with `machine`); none means the host of the
   default runner;
-- `cache`, `context`: ignored, with a warning from `zeughaus-ci check`
-  (**Workspaces**);
-- `secrets`, `when_busy` (`wait`/`freeze`/`run`), `env`,
-  `timeout_minutes`.
+- `cache`, `context`, `when_busy`: ignored, with a warning from
+  `zeughaus-ci check` (**Workspaces**; no runner is ever busy);
+- `secrets`, `env`, `timeout_minutes`.
 
 Files without a header are helpers. `zeughaus-ci check` validates a folder and
 `zeughaus-ci plan` shows what an event selects, both without a service
@@ -794,9 +793,7 @@ else none:
   runner. The job is `.ps1`.
 - no target: the host of the default runner.
 
-`when_busy = "freeze"` must resolve to a container or a machine; a host
-placement is an error, since nothing can pause it. The job's environment has
-`CI_PLATFORM` when it has a `platform`.
+The job's environment has `CI_PLATFORM` when it has a `platform`.
 
 A name that is neither a runner nor a machine of one, or the wrong script
 kind, fails the pipeline's setup like an invalid header.
@@ -836,7 +833,7 @@ lists the channels, `plan` starts with the one an event selects, and
 `clean = true` on a channel marks the pipelines it gets `clean` (kept in the
 record): the first of their jobs at a place starts its workspace from nothing (**Workspaces**).
 
-**The enlist protocol** (`zeughaus-link/src/enlist.rs`, `ENLIST_MAJOR` 5) is
+**The enlist protocol** (`zeughaus-link/src/enlist.rs`, `ENLIST_MAJOR` 6) is
 one long exchange on `/enlist` (req/rep) per runner. Frames are a 4-byte
 little-endian length and a postcard body, at most `MAX_ENLIST_FRAME_BYTES`
 (1 MiB), refused before the body is allocated.
@@ -849,9 +846,9 @@ little-endian length and a postcard body, at most `MAX_ENLIST_FRAME_BYTES`
   `ci.toml` gives it (`windows` or not), and answers `Refused { message }` or
   `Welcome { major, offsets }`, where each offset is how many bytes of that
   run's output the CI already holds.
-- The runner then reports `Busy`, `Machine` (a machine's status), `Started`,
+- The runner then reports `Machine` (a machine's status), `Started`,
   `StartFailed`, `Output { run, offset, bytes }` (at most
-  `MAX_OUTPUT_CHUNK`), `Frozen`, `Finished { run, end }` and `Transfer { run,
+  `MAX_OUTPUT_CHUNK`), `Finished { run, end }` and `Transfer { run,
   need, event }` (an input of the run `run` moving to this runner: `Started`,
   `Done { bytes }` or `Failed { message }`); the CI sends `Assign`, `Kill`,
   `Upload`, `Prefetch { run, consumer, need }`, `DropPrefetch { consumer }`
@@ -859,7 +856,7 @@ little-endian length and a postcard body, at most `MAX_ENLIST_FRAME_BYTES`
 - `Assign` carries everything the run needs and the runner has not: the
   repository URL and the fetch token, the commit, the script, the place, the
   environment (`CI`, `CI_REPO`, `CI_REF`, `CI_SHA`, `CI_JOB`, `CI_PLATFORM`, ...), the
-  granted secrets, the timeout, `when_busy`, the inputs and how to check out
+  granted secrets, the timeout, the inputs and how to check out
   the workspace (`Checkout`); the runner derives the workspace's name from
   the place (`Place::workspace`). The runner adds
   the paths and the CPU count (`CI_WORKSPACE`, `CI_OUTPUT`, `CI_INPUTS`,
@@ -944,7 +941,7 @@ it starts the job:
 - **Machine:** over ssh, from a git bundle, in `W:\work\<repo>\<workspace>`.
 
 Host and container jobs time out inside `inner.sh`; a machine job on the
-runner's own clock (`control.rs`), which counts only unfrozen seconds, writes
+runner's own clock (`control.rs`), writes
 `<run>/timeout` and kills the local ssh. `Kill` closes the run's terminal.
 
 **Artifacts** go through `CI_OUTPUT`. An artifact set exists once, on the
@@ -1030,8 +1027,7 @@ leftover `.ci/`; on other refs that stays silent.
 while its runner is not connected (`waiting for runner <R>`), is `Skipped`
 after the runner's `wait_minutes` without it (`runner <R> offline`; the
 forge hears `success`, so an offline Mac never turns a branch red), and
-waits while the runner is busy and its `when_busy` is not `run` (`runner <R>
-busy`), or while its workspace (one job at a time per repository, runner and
+waits while its workspace (one job at a time per repository, runner and
 place) is in use or promised to an earlier job (**Workspaces**), or its
 machine is in use. A container place
 on a runner that offers none, or a machine it does not list, fails the job. A
@@ -1170,31 +1166,8 @@ runner, so either side may restart:
 - A restarted runner reloads `assigned/*.json`, reattaches each run's terminal
   (`adopt_runs`), waits for the `exit` record of those without an end, and
   delivers log and `Finished` after the next `Welcome`. An `Assign` it had
-  not started is lost, and the CI assigns it again. It thaws whatever a
-  previous process froze. `Forget` removes a run's file.
-
-**Busy and freeze** belong to the runner that has a `[busy]` table in its
-`enlist.toml`. `busy.rs` samples `nvidia-smi` every 10 s. The runner counts
-as busy once the mean over `busy_after_seconds` reaches `gpu_percent`, and as
-free again once the mean over `free_after_seconds` is below it. While busy,
-the CI assigns it only `when_busy = "run"` jobs. Running `freeze` jobs of that
-runner are paused, with `podman pause` for a container and HMP `stop` on the
-VM's `monitor.sock` for a machine, and resumed when it is free; the runner
-reports each as `Frozen`. Apple's `container` cannot pause a container: on a
-macOS runner the attempt is logged (`cannot freeze: apple container cannot
-pause a container`) and the job runs on.
-
-The measurement can be overridden. `Busy` holds the GPU's verdict and a
-mode (`auto`, `busy`, `free`; `<state-dir>/ci/busy-mode` of the runner, so a
-restart keeps it); the runner acts on the mode, or under `auto` on the
-measurement. `/busy` (`BusyRequest { mode }` -> `MachineState { mode, busy
-}`, `zeughaus-link/src/machine.rs`) on the runner sets the mode. The runner
-publishes every change as `RuntimeEvent::Machine` on the `machine` topic,
-carries the current state in the snapshot, which it answers only once that
-state is in, and sends it to the CI as `Busy`. So the editor's section of
-that runner shows a control that cycles auto, busy, free: a play circle
-while free, a pause circle while busy, filled when the mode is set by hand.
-A runner without `[busy]` reports no machine and has no control.
+  not started is lost, and the CI assigns it again. `Forget` removes a run's
+  file.
 
 **Machines** (`machine.rs`, a runner's `[machines.<name>]`) are Windows VMs
 (`kind = "windows-vm"`) that run `.ps1` jobs. One is booted on the first job
@@ -1208,12 +1181,12 @@ The runner reports each machine's status to the CI as `Machine`.
 
 **The CI view.** `zeughaus-ci serve` is a weida peer for editors too: `/ci`
 (`CiRequest` -> `CiReply`, `zeughaus-link/src/ci.rs`, `serve.rs`), `/events`,
-`/snapshot` (always `machine: None`, no outputs) and `/mux`. An editor's
+`/snapshot` (no outputs) and `/mux`. An editor's
 key is under `<state-dir>/clients/`; a runner's is pinned by `ci.toml`, and
 each service admits only the kind of peer it is for. `/ci` answers an
 overview (every channel with its newest pipeline, and the machines: every
-configured runner in name order as `kind = "runner"` with `offline`, `online`,
-or `busy`/`free` (with ` (set)` when the mode is set by hand), then each
+configured runner in name order as `kind = "runner"` with `offline` or
+`online`, then each
 machine the connected runners report as `kind = "windows-vm"`, each with the
 jobs active on it as `MachineJob { repo, channel, number, job }`, and the
 `[platforms]` of `ci.toml` as (platform, target) pairs), a channel's pipelines
@@ -1456,7 +1429,7 @@ a secret for it, and a manual run builds the same weida as the pipeline.
 
 |platform|build job and check job|where (`[platforms]` of the production `ci.toml`)|
 |---|---|---|
-| `linux-amd64` | `build-linux-amd64`, `check-linux-amd64` | `platform = "linux-amd64"`: tuco-pc, container `trixie`, `freeze` |
+| `linux-amd64` | `build-linux-amd64`, `check-linux-amd64` | `platform = "linux-amd64"`: tuco-pc, container `trixie` |
 | `linux-arm64` | `build-linux-arm64`, `check-linux-arm64` | `platform = "linux-arm64"`: atik, the same Containerfile in an Apple `container` |
 | `windows-amd64` | `build-windows-amd64`, `check-windows-amd64` | `machine = "wohnzimmer"`, the Windows runner's host (the `windows-amd64` platform stays on the `win11` VM, which griasdi's job needs) |
 | `darwin-arm64` | `build-darwin-arm64`, `check-darwin-arm64` | `platform = "darwin-arm64"`: atik's host; the editor as `Zeughaus.app` (`deploy/macos-app.sh`) and the runner |
@@ -1656,7 +1629,7 @@ Kept here so they are not mistaken for descriptions of the code:
 - A browser editor that reaches runners; the wasm build edits locally.
 - Terminal image protocols; the wire model reserves kinds for them.
 - Jobs of the graph (`job.run`), decided but not built; CI (section 14)
-  has its own webhook intake, freeze, secrets and VM machines:
+  has its own webhook intake, secrets and VM machines:
   - Reading run files in the editor; `/runs` is served, nothing calls it.
   - Webhooks for a graph land on the weida broker once it speaks HTTP and
     are relayed to `/triggers`.

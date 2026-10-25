@@ -207,6 +207,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI: the job header key `cache` has no effect any more. It still parses,
   and `zeughaus-ci check` warns that a repository's jobs at one place share
   one workspace and a checkout keeps ignored files.
+- CI: busy detection. A runner no longer measures its GPU, the editor's
+  busy toggle and the `/busy` path are gone, the CI never holds a job back
+  for a busy runner and freezes no running job. The job header key
+  `when_busy` still parses and `zeughaus-ci check` warns about it; a
+  `[busy]` table in `enlist.toml` is refused, so remove it before the
+  update. The enlist protocol is major 6: runner and CI update together.
 
 ### Fixed
 

@@ -118,10 +118,7 @@ top and open with its jobs, a cable animating while its artifact set moves,
 failures with their cause and log excerpt,
 `Rerun` and `Cancel`; pressing a job shows its transcript read-only, live
 while it runs; Up/Down and Enter walk and open the list, Escape closes the
-transcript). The play/pause circle (filled when set by
-hand) sits on the section of the runner that has `[busy]` (`tuco-pc`) and
-cycles the busy mode through auto (the GPU measurement), busy and
-free. Channels come from `.zeughaus-ci/channels.toml`. Closing a graph's tab
+transcript). Channels come from `.zeughaus-ci/channels.toml`. Closing a graph's tab
 deletes the graph. Double-clicking a
 tab or a group's name renames it; a tab that shows one graph renames the
 graph. A container node's `open` opens its contents in a tab. With the bar
@@ -258,15 +255,15 @@ token and every secret `ci.toml` names. `zeughaus-ci check [DIR]` and `plan
 Five runners enlist, each with an `<state-dir>/enlist.toml`
 (`deploy/runner/enlist.toml.example`: `ci` (the CI's pinned URL, the line in
 its `endpoint` file), `name`, `cpus`, `budget_gb`, and the optional tables
-`[containers]` (podman; Apple `container` on macOS, see below), `[busy]`
-(nvidia-smi) and `[machines.<name>]` (a Windows
-VM)). The CI pins each one by the fingerprint in its own `endpoint` file:
+`[containers]` (podman; Apple `container` on macOS, see below) and
+`[machines.<name>]` (a Windows VM)). The CI pins each one by the fingerprint
+in its own `endpoint` file:
 
 | host | runner | enlisted as | installed by |
 |---|---|---|---|
 | sadala | Unix user `zeughaus`, `10.8.0.1:7443`, binary in `/var/lib/zeughaus/bin` | `sadala` | `deploy/setup-sadala.sh` (also the CI) |
 | tuco-pc | user `hannes`, `10.8.0.10:7443` (a local drop-in of its unit sets `--feed-addr`) | `tuco-pc-hannes` | `sh deploy/bootstrap.sh desktop` |
-| tuco-pc | user `zeughaus` (home `/var/lib/zeughaus`, binary in `/var/lib/zeughaus/bin`), `10.8.0.10:7444`; containers, the `win11` VM, GPU busy | `tuco-pc`, the default runner | `deploy/setup-service-runner.sh --feed-addr 10.8.0.10:7444` |
+| tuco-pc | user `zeughaus` (home `/var/lib/zeughaus`, binary in `/var/lib/zeughaus/bin`), `10.8.0.10:7444`; containers, the `win11` VM | `tuco-pc`, the default runner | `deploy/setup-service-runner.sh --feed-addr 10.8.0.10:7444` |
 | atik (macOS) | launchd agent `net.doodleshnookie.zeughaus-runner`, `10.8.0.7:7443`, log `~/Library/Logs/zeughaus-runner.log` | `atik` | `sh deploy/bootstrap.sh macos` |
 | wohnzimmer (Windows 10, LAN `10.0.0.13`) | user `zeughaus`, boot task `zeughaus-runner` (S4U), `10.8.0.12:7443`, state and log `C:\zeughaus\state` (`runner.log`) | `wohnzimmer`, `os = "windows"`, builds `windows-amd64` | `deploy/setup-windows.sh [--setup] zeughaus@10.8.0.12` |
 
@@ -283,9 +280,8 @@ the runner that lists it
 `machine`), `image = "<image>"` in a container of the default runner, and
 neither on the default runner's host. `image` together with `platform` runs
 the container on the platform's runner, not on the default runner; a
-platform that names a VM cannot have an image. `when_busy = "freeze"` needs
-a container, a machine, or a platform that resolves to one: a host job
-cannot be frozen. The job sees its platform as `CI_PLATFORM`. A runner that
+platform that names a VM cannot have an image. The job sees its platform as
+`CI_PLATFORM`. A runner that
 is not in `ci.toml`, or whose host is not the configured `os`, is refused.
 The Windows VM scripts (`vm/win11/`) are
 installed under `/var/lib/zeughaus/lib/vm/win11` (written by `install
@@ -344,9 +340,8 @@ run behind the host's while files written through the mounts carry the
 host's time, so the container gets `CAP_SYS_TIME` and starts the job through
 `clock.sh`: it sets the clock to the host's stamp on a file it creates in
 the run directory plus 5 ms, and only warns when that fails. The job's
-`inputs` are mounted writable, because `container` has no read-only mount,
-and a job in such a container cannot be frozen: the runner logs that it
-cannot and the job runs on. The runner offers containers only where
+`inputs` are mounted writable, because `container` has no read-only mount.
+The runner offers containers only where
 `[containers]` is in its `enlist.toml` and `container --version` answers.
 
 Updates: no script builds from a checkout or copies binaries. A host is

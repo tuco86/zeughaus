@@ -6,18 +6,8 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use zeughaus_link::enlist::WhenBusy;
 
 use crate::config::{valid_env_name, valid_name};
-
-/// The spelling of `when_busy` in a job header.
-pub fn when_busy_name(when_busy: WhenBusy) -> &'static str {
-    match when_busy {
-        WhenBusy::Wait => "wait",
-        WhenBusy::Freeze => "freeze",
-        WhenBusy::Run => "run",
-    }
-}
 
 /// Serialized into the pipeline record, so a restarted runner starts the
 /// pending jobs from what was selected rather than re-reading the commit.
@@ -41,7 +31,6 @@ pub struct JobDef {
     #[serde(default)]
     pub platform: Option<String>,
     pub secrets: Vec<String>,
-    pub when_busy: WhenBusy,
     pub env: BTreeMap<String, String>,
     pub timeout_minutes: u32,
     /// `sh` or `bash` for `.sh` jobs, `powershell` for `.ps1` jobs.
@@ -64,17 +53,18 @@ struct JobHeader {
     image: Option<String>,
     machine: Option<String>,
     platform: Option<String>,
-    /// `context` and `cache` parse and are ignored: a repository's jobs at
-    /// one place share one workspace, and a checkout keeps ignored files.
-    /// Other repositories' headers still carry them.
+    /// `context`, `cache` and `when_busy` parse and are ignored: a
+    /// repository's jobs at one place share one workspace, a checkout keeps
+    /// ignored files, and no runner is ever busy. Other repositories'
+    /// headers still carry them.
     #[serde(default)]
     context: Option<toml::Value>,
     #[serde(default)]
     cache: Option<toml::Value>,
     #[serde(default)]
-    secrets: Vec<String>,
+    when_busy: Option<toml::Value>,
     #[serde(default)]
-    when_busy: WhenBusy,
+    secrets: Vec<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
     timeout_minutes: Option<u32>,
@@ -180,6 +170,7 @@ pub fn parse_job(file_name: &str, text: &str) -> Result<Option<JobDef>, String> 
     let ignored_keys = [
         ("context", header.context.is_some()),
         ("cache", header.cache.is_some()),
+        ("when_busy", header.when_busy.is_some()),
     ]
     .into_iter()
     .filter_map(|(key, present)| present.then_some(key))
@@ -195,7 +186,6 @@ pub fn parse_job(file_name: &str, text: &str) -> Result<Option<JobDef>, String> 
         platform: header.platform,
         channels: header.channels,
         secrets: header.secrets,
-        when_busy: header.when_busy,
         env: header.env,
         timeout_minutes,
         interpreter,
@@ -207,7 +197,7 @@ pub fn parse_job(file_name: &str, text: &str) -> Result<Option<JobDef>, String> 
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "#!/bin/bash\n# build it\n# /// ci\n# on = [\"push main\"]\n# when_busy = \"freeze\"\n# image = \"ubuntu\"\n# [env]\n# FOO = \"1\"\n# ///\n# trailing comment\necho hi\n";
+    const SAMPLE: &str = "#!/bin/bash\n# build it\n# /// ci\n# on = [\"push main\"]\n# image = \"ubuntu\"\n# [env]\n# FOO = \"1\"\n# ///\n# trailing comment\necho hi\n";
 
     #[test]
     fn extracts_block_between_other_comments() {
@@ -216,7 +206,6 @@ mod tests {
         assert_eq!(job.file, "check.sh");
         assert_eq!(job.on, ["push main"]);
         assert!(job.ignored_keys.is_empty());
-        assert_eq!(job.when_busy, WhenBusy::Freeze);
         assert_eq!(job.image.as_deref(), Some("ubuntu"));
         assert_eq!(job.env["FOO"], "1");
         assert_eq!(job.timeout_minutes, 240);
@@ -301,12 +290,15 @@ mod tests {
     }
 
     #[test]
-    fn context_and_cache_parse_and_are_ignored() {
+    fn context_cache_and_when_busy_parse_and_are_ignored() {
         let wrap = |body: &str| format!("# /// ci\n# on = [\"push main\"]\n# {body}\n# ///\n");
-        let job = parse_job("x.sh", &wrap("context = \"x\"\n# cache = [\".c\"]"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(job.ignored_keys, ["context", "cache"]);
+        let job = parse_job(
+            "x.sh",
+            &wrap("context = \"x\"\n# cache = [\".c\"]\n# when_busy = \"freeze\""),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(job.ignored_keys, ["context", "cache", "when_busy"]);
         let plain = parse_job("x.sh", &wrap("")).unwrap().unwrap();
         assert!(plain.ignored_keys.is_empty());
     }

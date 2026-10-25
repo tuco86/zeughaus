@@ -555,7 +555,7 @@ fn launch_sh_windows_vm(launch: &Launch<'_>) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use zeughaus_link::enlist::{Place, Upload, UploadDir, WhenBusy};
+    use zeughaus_link::enlist::{Place, Upload, UploadDir};
 
     use super::*;
 
@@ -583,7 +583,6 @@ mod tests {
             env: Vec::new(),
             secrets: Vec::new(),
             timeout_minutes: 2,
-            when_busy: WhenBusy::Wait,
             inputs: Vec::new(),
             checkout: Checkout::Clean,
             upload: None,

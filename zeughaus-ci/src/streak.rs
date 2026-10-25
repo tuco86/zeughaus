@@ -156,7 +156,6 @@ mod tests {
     use crate::event::CiEvent;
     use crate::header::JobDef;
     use crate::scheduler::{JobRecord, PipelineStatus};
-    use zeughaus_link::enlist::WhenBusy;
 
     fn job(name: &str, on: &[&str], status: JobStatus) -> JobRecord {
         JobRecord {
@@ -171,7 +170,6 @@ mod tests {
                 ignored_keys: Vec::new(),
                 channels: Vec::new(),
                 secrets: Vec::new(),
-                when_busy: WhenBusy::Wait,
                 env: Default::default(),
                 timeout_minutes: 60,
                 interpreter: "sh".to_owned(),

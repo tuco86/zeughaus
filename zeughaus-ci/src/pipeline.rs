@@ -192,15 +192,6 @@ fn validate(
             return Err(fail(format!("image `{image}` has no {CI_DIR}/{wanted}")));
         }
     }
-    if job.when_busy == zeughaus_link::enlist::WhenBusy::Freeze
-        && job.image.is_none()
-        && job.machine.is_none()
-        && job.platform.is_none()
-    {
-        return Err(fail(
-            "`when_busy = \"freeze\"` requires `image`, `machine` or `platform`".into(),
-        ));
-    }
     for pattern in &job.on {
         Pattern::parse(pattern).map_err(|e| fail(format!("on: {e}")))?;
     }
@@ -375,10 +366,7 @@ mod tests {
         let jobs = load(&[
             file("after.sh", "needs = [\"box\", \"hello\"]"),
             file("hello.sh", "on = [\"push main\"]"),
-            file(
-                "box.sh",
-                "on = [\"push main\"]\nimage = \"ubuntu\"\nwhen_busy = \"freeze\"",
-            ),
+            file("box.sh", "on = [\"push main\"]\nimage = \"ubuntu\""),
             ("lib.sh".into(), "foo() { :; }\n".into()),
         ])
         .unwrap();
@@ -387,13 +375,10 @@ mod tests {
     }
 
     #[test]
-    fn a_platform_places_ps1_freeze_and_image_jobs() {
+    fn a_platform_places_ps1_and_image_jobs() {
         let on = "on = [\"push main\"]";
         let jobs = load(&[
-            file(
-                "win.ps1",
-                &format!("{on}\nplatform = \"windows-amd64\"\nwhen_busy = \"freeze\""),
-            ),
+            file("win.ps1", &format!("{on}\nplatform = \"windows-amd64\"")),
             file(
                 "box.sh",
                 &format!("{on}\nplatform = \"linux-arm64\"\nimage = \"ubuntu\""),
@@ -446,10 +431,6 @@ mod tests {
             (
                 vec![file("a.sh", &format!("{on}\nimage = \"nope\""))],
                 "no .zeughaus-ci/nope.Containerfile",
-            ),
-            (
-                vec![file("a.sh", &format!("{on}\nwhen_busy = \"freeze\""))],
-                "freeze",
             ),
             (vec![file("a.sh", "on = [\"cron 1 2 3\"]")], "on:"),
             (vec![file("a.sh", "on = [\"cron *\"]")], "on:"),

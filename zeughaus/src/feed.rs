@@ -27,11 +27,10 @@ use tokio::io::AsyncReadExt;
 use weida::{PeerEvent, PeerEvents, Requester, TransferMeta};
 use zeughaus_core::Image;
 use zeughaus_link::{
-    AGENT_PATH, AgentReply, AgentRequest, BUSY_PATH, BusyMode, BusyRequest, CI_PATH, CiReply,
-    CiRequest, EVENTS_PATH, FEED_PATH, FeedRequest, FrameHeader, HOLD_PATH, HoldReply, HoldRequest,
-    MAX_AGENT_BYTES, MAX_BUSY_BYTES, MAX_CI_REPLY_BYTES, MAX_EVENT_BYTES, MAX_HOLD_BYTES,
-    MAX_SNAPSHOT_BYTES, MachineState, RuntimeEvent, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH,
-    TriggerRequest, ladder,
+    AGENT_PATH, AgentReply, AgentRequest, CI_PATH, CiReply, CiRequest, EVENTS_PATH, FEED_PATH,
+    FeedRequest, FrameHeader, HOLD_PATH, HoldReply, HoldRequest, MAX_AGENT_BYTES,
+    MAX_CI_REPLY_BYTES, MAX_EVENT_BYTES, MAX_HOLD_BYTES, MAX_SNAPSHOT_BYTES, RuntimeEvent,
+    SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, TriggerRequest, ladder,
 };
 
 use crate::transport::{Endpoint, QUIC, client_tls, explain, first_dial, gave_up, policy};
@@ -411,23 +410,6 @@ pub async fn agent(endpoint: Endpoint, request: AgentRequest) -> Result<AgentRep
         .await
         .map_err(|e| format!("agent: {e}"))?;
     AgentReply::decode(&encoded).ok_or_else(|| "agent: malformed".to_owned())
-}
-
-/// Sets a CI runner's busy mode, and reports the machine's state after it.
-pub async fn set_busy(endpoint: Endpoint, mode: BusyMode) -> Result<MachineState, String> {
-    let quic = QUIC.as_ref().ok_or("no QUIC runtime")?;
-    let url = endpoint.path(BUSY_PATH)?;
-    let requester = quic.requester(client_tls());
-    first_dial(&url, || requester.connect(&url)).await?;
-    let reply = requester
-        .request(&BusyRequest { mode }.encode())
-        .await
-        .map_err(|e| format!("busy: {e}"))?;
-    let encoded = reply
-        .collect(MAX_BUSY_BYTES)
-        .await
-        .map_err(|e| format!("busy: {e}"))?;
-    MachineState::decode(&encoded).ok_or_else(|| "busy: malformed".to_owned())
 }
 
 /// Asks a CI runner one question about its pipelines, machines or job

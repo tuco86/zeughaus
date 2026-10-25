@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeughaus_link::enlist::{
     Assignment, Checkout, FromRunner, Input, InputSource, Place, RunEnd, RunReport, ToRunner,
-    TransferEvent, Upload, WhenBusy, parse_run_id, run_id,
+    TransferEvent, Upload, parse_run_id, run_id,
 };
 
 use crate::channels::{self, Channels};
@@ -54,14 +54,12 @@ const ABANDONED: &str = "the job ended before the set arrived";
 #[serde(rename_all = "lowercase")]
 pub enum JobStatus {
     Pending,
-    /// Pending, held back: the runner is offline or busy, or the workspace or
-    /// machine is in use.
+    /// Pending, held back: the runner is offline, or the workspace or machine
+    /// is in use.
     Waiting,
     /// Handed to a runner, which has not reported the run started.
     Starting,
     Running,
-    /// Running, paused because the runner is busy.
-    Frozen,
     Succeeded,
     Failed,
     Skipped,
@@ -76,10 +74,7 @@ impl JobStatus {
     }
 
     pub fn is_active(self) -> bool {
-        matches!(
-            self,
-            JobStatus::Starting | JobStatus::Running | JobStatus::Frozen
-        )
+        matches!(self, JobStatus::Starting | JobStatus::Running)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -88,7 +83,6 @@ impl JobStatus {
             JobStatus::Waiting => "waiting",
             JobStatus::Starting => "starting",
             JobStatus::Running => "running",
-            JobStatus::Frozen => "frozen",
             JobStatus::Succeeded => "succeeded",
             JobStatus::Failed => "failed",
             JobStatus::Skipped => "skipped",
@@ -1512,9 +1506,6 @@ impl Scheduler {
             }
             _ => {}
         }
-        if view.busy.is_some_and(|state| state.busy) && job.def.when_busy != WhenBusy::Run {
-            return self.set_waiting(pi, ji, format!("runner {runner} busy"));
-        }
         if let Some(note) = self.workspace_wait(pi, ji, &runner) {
             return self.set_waiting(pi, ji, note);
         }
@@ -1651,7 +1642,6 @@ impl Scheduler {
             env,
             secrets,
             timeout_minutes: job.timeout_minutes,
-            when_busy: job.when_busy,
             inputs,
             checkout: checkout_of(pipeline, ji),
             upload,
@@ -1781,7 +1771,6 @@ impl Scheduler {
         match message {
             // The enlist service handles both before they get here.
             FromRunner::Hello { .. } | FromRunner::Output { .. } => {}
-            FromRunner::Busy { state } => self.runners.set_busy(name, state),
             FromRunner::Machine {
                 name: machine,
                 status,
@@ -1820,39 +1809,6 @@ impl Scheduler {
                 };
                 self.runners.unassign(&run);
                 self.fail_job(pi, ji, message, State::Error);
-            }
-            FromRunner::Frozen { run, frozen } => {
-                let Some((pi, ji)) = self.active_on(name, &run) else {
-                    return;
-                };
-                let target = if frozen {
-                    JobStatus::Frozen
-                } else {
-                    JobStatus::Running
-                };
-                let record = &mut self.running[pi].jobs[ji];
-                if record.status == target || record.status == JobStatus::Starting {
-                    return;
-                }
-                record.status = target;
-                record.note = if frozen {
-                    "paused: runner busy".to_owned()
-                } else {
-                    String::new()
-                };
-                let job = record.def.name.clone();
-                self.running[pi].save(&self.state_dir, &self.changes);
-                let pipeline = self.running[pi].clone();
-                let description = if frozen {
-                    format!("paused: runner busy (#{})", pipeline.number)
-                } else {
-                    format!(
-                        "running on {} (#{})",
-                        place_label(&pipeline.jobs[ji]),
-                        pipeline.number
-                    )
-                };
-                self.post(&pipeline, &job, State::Pending, description);
             }
             FromRunner::Finished { run, end } => {
                 if let Some((pi, ji)) = self.active_on(name, &run) {
@@ -2325,11 +2281,6 @@ pub fn place_job(
             _ => {}
         }
     }
-    if place == Place::Host && job.when_busy == WhenBusy::Freeze {
-        return Err(fail(format!(
-            "{what} runs on the host of runner {runner}; when_busy = \"freeze\" needs a container or a machine"
-        )));
-    }
     Ok((runner.to_owned(), place))
 }
 
@@ -2585,7 +2536,6 @@ mod tests {
             ignored_keys: Vec::new(),
             channels: Vec::new(),
             secrets: Vec::new(),
-            when_busy: WhenBusy::Wait,
             env: Default::default(),
             timeout_minutes: 60,
             interpreter: "sh".to_owned(),
@@ -2757,8 +2707,6 @@ mod tests {
 
     #[test]
     fn a_platform_that_cannot_be_placed_is_an_error() {
-        let mut frozen = job("a.sh", None, None, Some("linux-arm64"));
-        frozen.when_busy = WhenBusy::Freeze;
         let cases = [
             (
                 job("a.sh", None, None, Some("plan9")),
@@ -2767,10 +2715,6 @@ mod tests {
             (
                 job("a.sh", Some("arch"), None, Some("windows-amd64")),
                 "platform windows-amd64 (win11) is a Windows VM; an image needs a runner",
-            ),
-            (
-                frozen,
-                "platform linux-arm64 (atik) runs on the host of runner atik; when_busy = \"freeze\" needs a container or a machine",
             ),
         ];
         for (def, expected) in cases {
@@ -2849,7 +2793,6 @@ mod tests {
                     containers,
                     machines: Vec::new(),
                 },
-                busy: None,
                 machines: BTreeMap::new(),
                 since,
             },

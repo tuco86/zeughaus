@@ -20,9 +20,9 @@ use zeughaus_link::ci::{
 };
 use zeughaus_link::enlist::Place;
 use zeughaus_link::{
-    BusyMode, ChannelView, CiOverview, CiReply, CiRequest, DocState, JobDefView, JobTiming,
-    JobView, MAX_CI_REPLY_BYTES, MAX_CI_REQUEST_BYTES, MachineJob, MachineView, PipelineView,
-    QueuedView, RepoView, TimedLine, TransferView,
+    ChannelView, CiOverview, CiReply, CiRequest, DocState, JobDefView, JobTiming, JobView,
+    MAX_CI_REPLY_BYTES, MAX_CI_REQUEST_BYTES, MachineJob, MachineView, PipelineView, QueuedView,
+    RepoView, TimedLine, TransferView,
 };
 use zeughaus_mux::TerminalId;
 use zeughaus_terminal::wal;
@@ -32,7 +32,7 @@ use crate::config::{CiConfig, Forge, RepoConfig, valid_name};
 use crate::docs;
 use crate::event::{self, EventKind};
 use crate::excerpt;
-use crate::header::{JobDef, when_busy_name};
+use crate::header::JobDef;
 use crate::runners::Runners;
 use crate::scheduler::{
     self, JobRecord, Pipeline, PipelineStatus, load_pipeline, load_pipelines, load_repo_pipelines,
@@ -268,19 +268,12 @@ impl CiServer {
                 .filter(|a| a.runner.as_deref() == Some(name) && a.machine.is_none())
                 .map(|a| a.job.clone())
                 .collect();
-            let status = match connected.get(name) {
-                None => "offline".to_owned(),
-                Some(view) => match &view.busy {
-                    Some(state) => {
-                        let mut status = if state.busy { "busy" } else { "free" }.to_owned();
-                        if state.mode != BusyMode::Auto {
-                            status.push_str(" (set)");
-                        }
-                        status
-                    }
-                    None => "online".to_owned(),
-                },
-            };
+            let status = if connected.contains_key(name) {
+                "online"
+            } else {
+                "offline"
+            }
+            .to_owned();
             runners.push(MachineView {
                 name: name.clone(),
                 kind: "runner".to_owned(),
@@ -658,7 +651,6 @@ fn job_def_view(
         at,
         placement,
         secrets: def.secrets.clone(),
-        when_busy: when_busy_name(def.when_busy).to_owned(),
         manual,
     }
 }
@@ -1123,7 +1115,6 @@ mod tests {
                 ignored_keys: Vec::new(),
                 channels: Vec::new(),
                 secrets: Vec::new(),
-                when_busy: Default::default(),
                 env: Default::default(),
                 timeout_minutes: 60,
                 interpreter: "sh".to_owned(),
@@ -1524,7 +1515,6 @@ mod tests {
     mod io {
         use super::*;
         use crate::runners::Connected;
-        use zeughaus_link::MachineState;
 
         fn store(state: &Path, pipeline: &Pipeline) {
             let path = state
@@ -1534,7 +1524,7 @@ mod tests {
             crate::files::write_json(&path, pipeline).expect("write the record");
         }
 
-        fn connect(server: &CiServer, name: &str, busy: Option<MachineState>) {
+        fn connect(server: &CiServer, name: &str) {
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             server.runners.insert(
                 name,
@@ -1547,7 +1537,6 @@ mod tests {
                         containers: false,
                         machines: Vec::new(),
                     },
-                    busy,
                     machines: BTreeMap::new(),
                     since: 1,
                 },
@@ -1613,14 +1602,7 @@ mod tests {
                 &pipeline("other", 1, "dev", PipelineStatus::Succeeded, Vec::new()),
             );
             let server = server(&state);
-            connect(
-                &server,
-                "alpha",
-                Some(MachineState {
-                    busy: true,
-                    mode: BusyMode::Busy,
-                }),
-            );
+            connect(&server, "alpha");
             server.runners.set_machine("alpha", "win11", "running");
 
             let overview = |server: &CiServer| match server.answer(CiRequest::Overview) {
@@ -1671,25 +1653,11 @@ mod tests {
             assert_eq!(
                 machines,
                 [
-                    ("alpha", "runner", "busy (set)", vec![running("build")]),
+                    ("alpha", "runner", "online", vec![running("build")]),
                     ("beta", "runner", "offline", vec![running("mac")]),
                     ("win11", "windows-vm", "running", vec![running("windows")]),
                 ]
             );
-
-            // A runner that never reported a busy state is just online; one that
-            // did and is on the automatic mode shows the measurement alone.
-            connect(&server, "beta", None);
-            assert_eq!(overview(&server).machines[1].status, "online");
-            connect(
-                &server,
-                "beta",
-                Some(MachineState {
-                    busy: false,
-                    mode: BusyMode::Auto,
-                }),
-            );
-            assert_eq!(overview(&server).machines[1].status, "free");
             let _ = std::fs::remove_dir_all(&state);
         }
 
@@ -1868,7 +1836,7 @@ mod tests {
                 runners(&server),
                 [pair("alpha", "offline"), pair("beta", "offline")]
             );
-            connect(&server, "alpha", None);
+            connect(&server, "alpha");
             assert_eq!(
                 runners(&server),
                 [pair("alpha", "online"), pair("beta", "offline")]
@@ -2053,7 +2021,7 @@ mod tests {
 
         const CHECK: (&str, &str) = (
             ".zeughaus-ci/check.sh",
-            "# /// ci\n# needs = [\"build\"]\n# image = \"trixie\"\n# when_busy = \"freeze\"\n# ///\necho check\n",
+            "# /// ci\n# needs = [\"build\"]\n# image = \"trixie\"\n# ///\necho check\n",
         );
 
         const TRIXIE: (&str, &str) = (".zeughaus-ci/trixie.Containerfile", "FROM scratch\n");
@@ -2243,14 +2211,10 @@ mod tests {
                 ("build.sh", "host")
             );
             assert_eq!(build.on, ["push main", "tag v*"]);
-            assert_eq!(build.when_busy, "wait");
             assert!(build.needs.is_empty() && build.secrets.is_empty());
             let check = job("check");
             assert_eq!(check.place, "image:trixie");
-            assert_eq!(
-                (check.needs.as_slice(), check.when_busy.as_str()),
-                (&["build".to_owned()][..], "freeze")
-            );
+            assert_eq!(check.needs, ["build"]);
             let publish = job("publish");
             assert_eq!(publish.secrets, ["TOKEN", "OTHER_TOKEN"]);
             assert_eq!(

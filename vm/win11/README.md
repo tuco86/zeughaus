@@ -4,7 +4,7 @@ The Windows machine of the zeughaus CI: a Windows 11 Pro guest with ssh, no
 display, booted from a read-only golden image into a throwaway overlay, plus
 a persistent cache disk. The `zeughaus-ci` runner owns it: it boots the VM
 on demand through `vm.sh`, runs `prepare.ps1` in the guest after every
-boot, freezes it through the monitor socket and stops it after an idle
+boot and stops it after an idle
 timeout. By hand, everything is driven by `vm.sh`; state lives in
 `/var/lib/zeughaus-ci/vm/win11` (btrfs, `chattr +C` so qcow2 writes do not
 fragment). Guest account, payload directory (`C:\zeughaus`), ISO volume
@@ -68,8 +68,8 @@ The ssh side is one `Host win11-ci` block in `~/.ssh/config`
 them; `vm.sh install` deletes the known-hosts file along with the image.
 
 Control files in `$VM_DIR`: `monitor.sock` (HMP; `screendump`, `sendkey`,
-`system_powerdown`, and `stop`/`cont` which the runner uses to freeze a
-job), `qga.sock` (QEMU guest agent, JSON), `qemu.pid` (the runner checks it
+`system_powerdown`, `stop`/`cont`), `qga.sock` (QEMU guest agent, JSON),
+`qemu.pid` (the runner checks it
 for a live VM).
 
 ## Cache disk

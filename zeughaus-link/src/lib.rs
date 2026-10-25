@@ -9,18 +9,17 @@
 //! and pure pixel math, no I/O, so the runtime's server and the editor's
 //! client cannot disagree about the protocol.
 //!
-//! One listener, fourteen paths, each a different weida pattern:
+//! One listener, thirteen paths, each a different weida pattern:
 //!
 //! | path | pattern | carries |
 //! |---|---|---|
 //! | [`FEED_PATH`] | one exchange per (node, pin) | [`feed`]: scaled frames |
-//! | [`EVENTS_PATH`] | pub/sub | [`events`]: outputs, node errors, edge traffic, the machine |
+//! | [`EVENTS_PATH`] | pub/sub | [`events`]: outputs, node errors, edge traffic, alerts |
 //! | [`SNAPSHOT_PATH`] | req/rep | [`events::Snapshot`] for a late joiner |
 //! | [`TRIGGERS_PATH`] | push/pull | [`events::TriggerRequest`] from an editor |
 //! | [`RUNS_PATH`] | req/rep | [`runs`]: a range of one file of one run |
 //! | [`HOLD_PATH`] | req/rep | [`runs::HoldRequest`]: start no new runs |
 //! | [`AGENT_PATH`] | req/rep | [`agent`]: open a plan or master agent session in a terminal |
-//! | [`BUSY_PATH`] | req/rep | [`machine::BusyRequest`]: override the CI busy measurement |
 //! | [`CI_PATH`] | req/rep | [`ci`]: channels, pipelines, machines, job transcripts |
 //! | [`ENLIST_PATH`] | one long exchange per runner | [`enlist`]: a runner takes assignments from the CI and streams output |
 //! | [`ARTIFACTS_PATH`] | one exchange per transfer | [`enlist::ArtifactRequest`]: a run's artifact set, streamed as chunks |
@@ -39,7 +38,6 @@ pub mod enlist;
 pub mod events;
 pub mod feed;
 pub mod graph;
-pub mod machine;
 pub mod manual;
 pub mod runs;
 
@@ -59,7 +57,6 @@ pub use feed::{
     FeedRequest, FrameHeader, MAX_DIMENSION, MAX_SAMPLES_PER_AXIS, ladder, scale_to_fit,
 };
 pub use graph::{GRAPH_MAJOR, GraphChange, GraphEdit, GraphMessage, MAX_GRAPH_FRAME_BYTES};
-pub use machine::{BusyMode, BusyRequest, MAX_BUSY_BYTES, MachineState};
 pub use runs::{
     HoldReply, HoldRequest, MAX_HOLD_BYTES, MAX_RUN_CHUNK_BYTES, MAX_RUN_REPLY_BYTES,
     MAX_RUN_REQUEST_BYTES, RunFileReply, RunFileRequest,
@@ -91,10 +88,6 @@ pub const HOLD_PATH: &str = "/hold";
 /// session of a repository, in a terminal of the runner's mux. Served only
 /// by a runner that has a mux, on Unix.
 pub const AGENT_PATH: &str = "/agent";
-
-/// Req/Rep endpoint that overrides a CI runner's busy measurement. Served
-/// only by a runner that runs CI.
-pub const BUSY_PATH: &str = "/busy";
 
 /// Req/Rep endpoint a CI runner answers [`ci::CiRequest`]s on: its channels,
 /// pipelines, machines and job transcripts. Served only by a runner that

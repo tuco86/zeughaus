@@ -34,10 +34,9 @@ A header with an `env` table:
 | `machine` | name | A runner of ci.toml (the job runs on its host) or a machine (Windows VM) a runner lists. Exclusive with `image` and `platform` |
 | `platform` | name | `[a-z0-9][a-z0-9-]*`, a key of ci.toml `[platforms]`, whose value is the runner or VM that builds it. Exclusive with `machine`. The job sees it as `CI_PLATFORM` |
 | `secrets` | list of names | Each `[A-Z_][A-Z0-9_]*`. A secret reaches the job as an environment variable of that name when the repository's `grants` in ci.toml release it to the event (`push main`, `tag v*`, `cron *`). Otherwise the job fails with `secret <name> is not granted for <event> <ref>`. A manual run gives none |
-| `when_busy` | `wait`, `freeze`, `run` | Default `wait`. Matters only on a runner with a `[busy]` table (GPU load, a desktop someone uses). `wait` and `freeze` are assigned only while the runner is free. A running `freeze` job is paused while the runner is busy (`podman pause`, or a VM stop) and resumed when it is free again; a running `wait` job is left alone. `run` is assigned even while the runner is busy and never paused. `freeze` needs `image`, `machine` or `platform` in the header and a container or a VM at placement: on a runner's host it is refused when the pipeline is set up, because a host job cannot be paused. Apple's `container` cannot pause either: the job runs on |
 | `env` | table of strings | More variables for the job. Names `[A-Z_][A-Z0-9_]*`, none starting with `CI_` or `ZEUGHAUS_` |
 | `timeout_minutes` | integer | 1..=1440, default 240. At the deadline the job gets SIGTERM and, 60 s later, SIGKILL. Its note is `timed out after <n> min` |
-| `context`, `cache` | any | Parsed and ignored: a repository's jobs at one place share one workspace and a checkout keeps ignored files. `zeughaus-ci check` warns; remove them |
+| `context`, `cache`, `when_busy` | any | Parsed and ignored: a repository's jobs at one place share one workspace, a checkout keeps ignored files, and no runner is ever busy. `zeughaus-ci check` warns; remove them |
 
 Rules across keys:
 
@@ -135,7 +134,7 @@ Besides these: the header's `env`, and the granted `secrets` by name. A `.ps1` j
 |---|---|
 | `pending`, `waiting` | Not assigned yet; `waiting` is held back, the note says why |
 | `starting` | Handed to a runner that has not reported the run started |
-| `running`, `frozen` | Running; paused because the runner is busy |
+| `running` | Running |
 | `succeeded`, `failed`, `skipped` | Ended |
 
 | pipeline status | meaning |
@@ -153,7 +152,6 @@ Besides these: the header's `env`, and the granted `secrets` by name. A `.ps1` j
 |---|---|
 | `waiting for runner <R>` | Its runner is not connected. After the runner's `wait_minutes` (15 unless ci.toml says otherwise) the job is `skipped` with `runner <R> offline` |
 | `waiting for runner <R> (artifacts of <need>)` | The runner that holds a need's output is not connected; skipped the same way |
-| `runner <R> busy` | The runner is busy (GPU load, or set busy by hand) and the job's `when_busy` is not `run` |
 | `workspace <ws> in use by #<n>` | Another job at the same place is running, in pipeline `#<n>` |
 | `workspace <ws> queued for #<n>`, `waiting for <job> in workspace <ws>` | An earlier job at the same place goes first |
 | `skipped: <need> failed (#<n>)`, `skipped: <need> skipped (#<n>)` | A need did not succeed |

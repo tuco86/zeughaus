@@ -42,8 +42,8 @@ use std::time::Duration;
 
 use zeughaus_core::{NodeId, Value, ZeughausError};
 use zeughaus_link::{
-    BUSY_PATH, EVENTS_PATH, FEED_PATH, GRAPH_PATH, GraphChange, HOLD_PATH, MUX_PATH, RUNS_PATH,
-    SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, TriggerRequest, credentials,
+    EVENTS_PATH, FEED_PATH, GRAPH_PATH, GraphChange, HOLD_PATH, MUX_PATH, RUNS_PATH, SNAPSHOT_PATH,
+    Snapshot, TRIGGERS_PATH, TriggerRequest, credentials,
 };
 use zeughaus_runtime::DeferredWork;
 
@@ -277,9 +277,6 @@ fn main() -> ExitCode {
     let (alert_tx, alert_rx) = std::sync::mpsc::channel::<maintain::Alert>();
     // Kept for the restart, which saves the workspace before it `exec`s.
     let mut mux_service: Option<MuxService> = None;
-    // The busy measurement of an enlisted runner that has one, reported to
-    // editors as it changes.
-    let mut busy_handle: Option<Arc<enlist::busy::Busy>> = None;
     let (graphs, graph_rx, initial) = GraphService::load(&state_dir);
     // Registered with the other paths, answered once the loop below starts.
     let mut snapshot_replier = None;
@@ -352,12 +349,11 @@ fn main() -> ExitCode {
             match &job_host {
                 Some(host) => match exe.as_ref() {
                     Ok(exe) => {
-                        match enlist::start(Arc::clone(host), config, &state_dir, exe.clone()) {
-                            Ok(enlisted) => busy_handle = enlisted.busy,
-                            Err(e) => {
-                                eprintln!("[runner] {e}");
-                                return ExitCode::FAILURE;
-                            }
+                        if let Err(e) =
+                            enlist::start(Arc::clone(host), config, &state_dir, exe.clone())
+                        {
+                            eprintln!("[runner] {e}");
+                            return ExitCode::FAILURE;
                         }
                     }
                     Err(e) => {
@@ -402,14 +398,6 @@ fn main() -> ExitCode {
         if let (Some(host), Ok(exe)) = (&job_host, exe.as_ref()) {
             maintain::start(Arc::clone(host), state_dir.clone(), exe.clone(), alert_tx);
         }
-        if let Some(busy) = &busy_handle {
-            match listener.replier(BUSY_PATH) {
-                Ok(replier) => {
-                    rt.spawn(enlist::busy::serve(replier, Arc::clone(busy)));
-                }
-                Err(e) => eprintln!("[runner] no busy service: {e}"),
-            }
-        }
         // The runner that produced a run's files is the one that serves them:
         // they are on this disk and nowhere else.
         match listener.replier(RUNS_PATH) {
@@ -432,9 +420,6 @@ fn main() -> ExitCode {
         Arc::clone(&snapshot),
         job_host.clone(),
     );
-    if let Some(busy) = &busy_handle {
-        runner.report_machine(busy.state());
-    }
     if let Some(replier) = snapshot_replier {
         rt.spawn(transport::serve_snapshots(replier, Arc::clone(&snapshot)));
     }
@@ -555,9 +540,6 @@ fn main() -> ExitCode {
             fired |= runner.trigger(press.node_id, press.payload, press.external);
         }
 
-        if let Some(busy) = &busy_handle {
-            runner.report_machine(busy.state());
-        }
         while let Ok(alert) = alert_rx.try_recv() {
             runner.report_alert(alert.title, alert.body);
         }

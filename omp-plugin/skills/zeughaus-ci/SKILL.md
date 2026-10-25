@@ -10,7 +10,7 @@ zeughaus-ci is the user's own CI. Its runners are the machines they own, one per
 ## 1. Orient
 
 - Read the `<zeughaus-ci>` block of the system prompt first. It is the state at session start: which repository of the CI this checkout is, every job with the runner and place it runs at, whether HEAD and the default branch were green. It does not change during the session.
-- Call `ci_repo` for the state now: the pipeline of HEAD, the channels, the jobs, the runners, the platforms. `ci_status` shows the whole CI: every channel, every runner online or busy, the queue.
+- Call `ci_repo` for the state now: the pipeline of HEAD, the channels, the jobs, the runners, the platforms. `ci_status` shows the whole CI: every channel, every runner online or offline, the queue.
 - In the checkout, leave `repo` out of the other `ci_*` tools. It defaults to the repository of the working directory's checkout.
 - Job names are the file stems of `.zeughaus-ci/`: `build-linux-amd64.sh` is the job `build-linux-amd64`. `run_jobs`, `ci_log` and `needs` use these names.
 - Read a job row as: name, runner, where on it (`host`, `image:<x>` or `machine:<vm>`), then `on <patterns>` or `needs <jobs>`, then `channels <names>`, `secrets <names> (none in run_jobs)` and `run_jobs cannot run it` when they apply. A job the CI cannot place says `cannot be placed: <why>` in place of the runner.
