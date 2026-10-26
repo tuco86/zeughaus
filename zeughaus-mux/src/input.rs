@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::terminal::Dimensions;
+use crate::terminal::{CellPixels, Dimensions};
 
 /// Modifier keys held, as flag bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -142,8 +142,12 @@ pub enum TerminalCommand {
         serial: u64,
         input: MouseInput,
     },
-    /// The controller's view size in cells. Ignored from a viewer.
-    Resize(Dimensions),
+    /// The controller's view size in cells, and one cell's size in device
+    /// pixels for placing images. Ignored from a viewer.
+    Resize {
+        size: Dimensions,
+        cell: CellPixels,
+    },
     /// The rows this client currently shows, for the runner to send
     /// replacements for (a viewer scrolled into scrollback watches those
     /// rows, not the screen).

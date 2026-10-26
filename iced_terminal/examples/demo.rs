@@ -133,6 +133,7 @@ fn head() -> TerminalHead {
             row_seq: 1,
             wrapped,
             spans,
+            images: Vec::new(),
         });
     };
 
@@ -257,5 +258,6 @@ fn head() -> TerminalHead {
         exit: None,
         controller: None,
         input_serial_ack: 0,
+        cell: zeughaus_mux::CellPixels::NOMINAL,
     }
 }

@@ -38,8 +38,8 @@ use iced::{Color, Element, Length, Point, Rectangle, Size, keyboard, window};
 use zeughaus_mux::input::MAX_TEXT_BYTES;
 use zeughaus_mux::view::TerminalView;
 use zeughaus_mux::{
-    CellSpan, CellStyle, Dimensions, KeyInput, KeyKind, MouseInput, MouseKind, StyleFlags,
-    TerminalCommand, Underline,
+    CellPixels, CellSpan, CellStyle, Dimensions, KeyInput, KeyKind, MouseInput, MouseKind,
+    StyleFlags, TerminalCommand, Underline,
 };
 
 use crate::cache::{palette_generation, row_key};
@@ -219,13 +219,13 @@ where
 /// Everything the widget remembers between events.
 #[derive(Debug)]
 struct State {
-    /// The terminal and grid this widget asked the runner for and has not
-    /// seen applied yet, so it asks once while the answer is on its way.
-    /// Keyed by terminal because the state may outlive the widget it was
+    /// The terminal, grid and cell size this widget asked the runner for and
+    /// has not seen applied yet, so it asks once while the answer is on its
+    /// way. Keyed by terminal because the state may outlive the widget it was
     /// made for.
-    sent_grid: Option<(u64, Dimensions)>,
+    sent_grid: Option<(u64, Dimensions, CellPixels)>,
     /// A geometry waiting out the debounce.
-    pending_grid: Option<(Dimensions, Instant)>,
+    pending_grid: Option<((Dimensions, CellPixels), Instant)>,
     selection: Option<Selection>,
     dragging: bool,
     modifiers: keyboard::Modifiers,
@@ -1010,7 +1010,10 @@ where
     }
 
     /// Emits a resize once the geometry stopped moving. A drag over a split
-    /// changes the pane every frame; the child only wants the answer.
+    /// changes the pane every frame; the child only wants the answer. The
+    /// geometry is the grid and the cell in device pixels, so a scale or
+    /// font change that keeps the grid still tells the runner how large
+    /// images are to be placed.
     ///
     /// Whether a resize is owed is decided against the grid the runner
     /// reports, not against what this widget remembers sending: iced keeps
@@ -1028,33 +1031,40 @@ where
             state.pending_grid = None;
             return;
         }
-        let grid = self.grid(bounds);
-        let Some(current) = self.with_view(|view| view.dimensions) else {
+        let wanted = (
+            self.grid(bounds),
+            self.metrics().device_pixels(self.scale_factor),
+        );
+        let Some(current) = self.with_view(|view| (view.dimensions, view.cell)) else {
             return;
         };
-        if grid == current {
+        if wanted == current {
             state.sent_grid = None;
             state.pending_grid = None;
             return;
         }
         // Asked for and not answered yet.
-        if state.sent_grid == Some((self.id, grid)) {
+        if state.sent_grid == Some((self.id, wanted.0, wanted.1)) {
             state.pending_grid = None;
             return;
         }
         match state.pending_grid {
-            Some((pending, at)) if pending == grid => {
+            Some((pending, at)) if pending == wanted => {
                 if now >= at {
-                    state.sent_grid = Some((self.id, grid));
+                    state.sent_grid = Some((self.id, wanted.0, wanted.1));
                     state.pending_grid = None;
-                    self.publish(shell, Action::Command(TerminalCommand::Resize(grid)));
+                    let (size, cell) = wanted;
+                    self.publish(
+                        shell,
+                        Action::Command(TerminalCommand::Resize { size, cell }),
+                    );
                 } else {
                     shell.request_redraw_at(window::RedrawRequest::At(at));
                 }
             }
             _ => {
                 let at = now + RESIZE_DEBOUNCE;
-                state.pending_grid = Some((grid, at));
+                state.pending_grid = Some((wanted, at));
                 shell.request_redraw_at(window::RedrawRequest::At(at));
             }
         }

@@ -1,6 +1,6 @@
 //! The messages, and the exchanges they travel on.
 //!
-//! Three kinds of exchange, all on the one `/mux` path so weida reuses one
+//! Four kinds of exchange, all on the one `/mux` path so weida reuses one
 //! QUIC connection:
 //!
 //! - **Control**, one per client, long-lived. Opens with
@@ -16,6 +16,9 @@
 //!   keystroke behind it.
 //! - **Row fetch**, short: [`RowFetch`] up, [`RowPage`] down, done. On its
 //!   own stream so it cannot head-of-line block the other two.
+//! - **Resource fetch**, short: [`ResourceFetch`] up, [`Resource`] down,
+//!   done. The pixels of an image a row shows, fetched once by its content
+//!   hash, so rows carry only the hash.
 //!
 //! The first frame of an exchange names the exchange; a server that gets
 //! anything else first answers with [`WireError`] and ends it.
@@ -24,7 +27,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::id::{ClientInstanceId, RequestId, RunnerIncarnation, TerminalId};
 use crate::input::TerminalCommand;
-use crate::terminal::{Dimensions, RowData, StableRange, TerminalDelta, TerminalHead};
+use crate::terminal::{
+    Dimensions, ImageKey, ImagePixels, RowData, StableRange, TerminalDelta, TerminalHead,
+};
 use crate::workspace::{TopologyCommand, WorkspaceSnapshot};
 
 /// A capability either side may offer. Unknown ones are ignored; known
@@ -153,6 +158,23 @@ pub struct RowPage {
     pub rows: Vec<RowData>,
 }
 
+/// Asks for the pixels of an image a row of `terminal` shows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceFetch {
+    pub terminal: TerminalId,
+    pub image: ImageKey,
+}
+
+/// Answers it; `pixels` is `None` when the runner no longer holds the image,
+/// cannot serve it as RGBA, or it exceeds [`crate::MAX_IMAGE_SIDE`] or
+/// [`crate::MAX_IMAGE_BYTES`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resource {
+    pub terminal: TerminalId,
+    pub image: ImageKey,
+    pub pixels: Option<ImagePixels>,
+}
+
 /// Why an exchange is being ended by the runner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorCode {
@@ -191,5 +213,7 @@ pub enum Message {
     TerminalCommand(TerminalCommand),
     RowFetch(RowFetch),
     RowPage(RowPage),
+    ResourceFetch(ResourceFetch),
+    Resource(Resource),
     Error(WireError),
 }

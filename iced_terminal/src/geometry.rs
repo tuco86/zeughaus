@@ -12,8 +12,8 @@
 //! PTY accepts.
 
 use iced::{Point, Size};
-use zeughaus_mux::Dimensions;
 use zeughaus_mux::terminal::{MAX_COLS, MAX_ROWS};
+use zeughaus_mux::{CellPixels, Dimensions, MAX_CELL_PIXELS};
 
 /// What one cell of the bundled font measures at one font size.
 ///
@@ -51,6 +51,21 @@ impl CellMetrics {
             width: snap(self.width),
             height: snap(self.height),
             ..self
+        }
+    }
+
+    /// The cell in whole device pixels at `scale`, rounded the way the
+    /// pipeline draws it: what the runner places images by.
+    pub fn device_pixels(self, scale: f32) -> CellPixels {
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        let side = |length: f32| (length * scale).round().clamp(1.0, MAX_CELL_PIXELS as f32) as u16;
+        CellPixels {
+            width: side(self.width),
+            height: side(self.height),
         }
     }
 }

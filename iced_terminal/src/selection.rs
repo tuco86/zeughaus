@@ -274,6 +274,7 @@ mod tests {
             row_seq: 1,
             wrapped,
             spans,
+            images: Vec::new(),
         }
     }
 
@@ -299,6 +300,7 @@ mod tests {
             exit: None,
             controller: None,
             input_serial_ack: 0,
+            cell: zeughaus_mux::CellPixels::NOMINAL,
         };
         TerminalView::from_head(head, 64)
     }

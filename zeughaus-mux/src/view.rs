@@ -9,13 +9,21 @@
 //! everything the transport learns is written here.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 
 use crate::id::TerminalId;
 use crate::message::RowPage;
 use crate::terminal::{
-    Controller, Cursor, CursorShape, Dimensions, ExitState, Modes, Palette, RowData, StableRange,
-    TerminalDelta, TerminalEvent, TerminalHead,
+    CellPixels, Controller, Cursor, CursorShape, Dimensions, ExitState, ImageKey, ImagePixels,
+    Modes, Palette, RowData, StableRange, TerminalDelta, TerminalEvent, TerminalHead,
 };
+
+/// Most images a view holds pixels for.
+const MAX_HELD_IMAGES: usize = 32;
+/// Most image fetches one call to [`TerminalView::missing_images`] starts.
+const MAX_IMAGE_REQUESTS: usize = 8;
+/// Requested keys remembered before the memory starts over.
+const MAX_REQUESTED_IMAGES: usize = 256;
 
 /// Why a delta was not applied. Either way the caller asks for a fresh
 /// head; the distinction is for the log.
@@ -36,6 +44,8 @@ pub struct TerminalView {
     pub epoch: u64,
     pub applied_seq: u64,
     pub dimensions: Dimensions,
+    /// The cell size the runner places images by.
+    pub cell: CellPixels,
     /// The rows the runner's screen shows.
     pub visible: StableRange,
     pub first_retained: i64,
@@ -58,6 +68,11 @@ pub struct TerminalView {
     /// The generation of the newest fetch issued; a page from an older one
     /// may still fill rows nothing newer touched.
     fetch_generation: u64,
+    /// Pixels of images rows show, oldest first.
+    images: Vec<(ImageKey, Arc<ImagePixels>)>,
+    /// Images asked for and not answered with pixels: never asked for again
+    /// until the memory starts over or a fetch failed.
+    requested: BTreeSet<ImageKey>,
 }
 
 impl TerminalView {
@@ -68,6 +83,7 @@ impl TerminalView {
             epoch: head.epoch,
             applied_seq: head.seq,
             dimensions: head.dimensions,
+            cell: head.cell,
             visible: head.visible,
             first_retained: head.first_retained,
             cursor: head.cursor,
@@ -84,6 +100,8 @@ impl TerminalView {
             dirty: BTreeSet::new(),
             events: VecDeque::new(),
             fetch_generation: 0,
+            images: Vec::new(),
+            requested: BTreeSet::new(),
         };
         for row in head.rows {
             view.dirty.insert(row.stable_row);
@@ -100,8 +118,12 @@ impl TerminalView {
         let scroll_top = self.scroll_top;
         let capacity = self.capacity;
         let fetch_generation = self.fetch_generation;
+        let images = std::mem::take(&mut self.images);
+        let requested = std::mem::take(&mut self.requested);
         *self = TerminalView::from_head(head, capacity);
         self.fetch_generation = fetch_generation;
+        self.images = images;
+        self.requested = requested;
         self.scroll_top = scroll_top;
         self.clamp_scroll();
     }
@@ -130,6 +152,12 @@ impl TerminalView {
             && d != self.dimensions
         {
             self.dimensions = d;
+            changed = true;
+        }
+        if let Some(c) = delta.cell
+            && c != self.cell
+        {
+            self.cell = c;
             changed = true;
         }
         if let Some(v) = delta.visible
@@ -232,6 +260,73 @@ impl TerminalView {
     pub fn next_fetch_generation(&mut self) -> u64 {
         self.fetch_generation += 1;
         self.fetch_generation
+    }
+
+    /// Images the viewport shows whose pixels are neither held nor asked
+    /// for, at most a few per call. Each is remembered as asked for.
+    pub fn missing_images(&mut self) -> Vec<ImageKey> {
+        if self.requested.len() > MAX_REQUESTED_IMAGES {
+            self.requested.clear();
+        }
+        let viewport = self.viewport();
+        let mut out = Vec::new();
+        let spans = self
+            .rows
+            .range(viewport.start..viewport.end)
+            .flat_map(|(_, row)| &row.images);
+        for span in spans {
+            if out.len() == MAX_IMAGE_REQUESTS {
+                break;
+            }
+            let key = span.image;
+            let known = self.requested.contains(&key)
+                || out.contains(&key)
+                || self.images.iter().any(|(held, _)| *held == key);
+            if !known {
+                out.push(key);
+            }
+        }
+        self.requested.extend(out.iter().copied());
+        out
+    }
+
+    /// The answer to an image fetch. `None` (the runner cannot serve it)
+    /// keeps the key asked for, so this view does not ask again.
+    pub fn apply_image(&mut self, image: ImageKey, pixels: Option<ImagePixels>) {
+        if let Some(pixels) = pixels {
+            self.images.retain(|(held, _)| *held != image);
+            self.images.push((image, Arc::new(pixels)));
+            self.requested.remove(&image);
+            self.render_revision += 1;
+        }
+        if self.images.len() <= MAX_HELD_IMAGES {
+            return;
+        }
+        let referenced: BTreeSet<ImageKey> = self
+            .rows
+            .values()
+            .flat_map(|row| row.images.iter().map(|span| span.image))
+            .collect();
+        while self.images.len() > MAX_HELD_IMAGES {
+            let victim = self
+                .images
+                .iter()
+                .position(|(held, _)| !referenced.contains(held))
+                .unwrap_or(0);
+            self.images.remove(victim);
+        }
+    }
+
+    /// A fetch failed: the image is asked for again on the next change.
+    pub fn forget_image_request(&mut self, image: ImageKey) {
+        self.requested.remove(&image);
+    }
+
+    pub fn image(&self, image: ImageKey) -> Option<Arc<ImagePixels>> {
+        self.images
+            .iter()
+            .find(|(held, _)| *held == image)
+            .map(|(_, pixels)| pixels.clone())
     }
 
     pub fn row(&self, stable_row: i64) -> Option<&RowData> {
@@ -387,7 +482,7 @@ impl TerminalView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terminal::{CellSpan, CellStyle, Cursor, CursorShape};
+    use crate::terminal::{CellSpan, CellStyle, Cursor, CursorShape, ImageSpan};
 
     fn row(stable_row: i64, seq: u64, text: &str) -> RowData {
         RowData {
@@ -401,6 +496,7 @@ mod tests {
                 style: CellStyle::default(),
                 link: None,
             }],
+            images: vec![],
         }
     }
 
@@ -426,6 +522,7 @@ mod tests {
             exit: None,
             controller: None,
             input_serial_ack: 0,
+            cell: CellPixels::NOMINAL,
         }
     }
 
@@ -445,6 +542,7 @@ mod tests {
             evicted_before: None,
             row_replacements: vec![],
             ordered_events: vec![],
+            cell: None,
         }
     }
 
@@ -591,5 +689,61 @@ mod tests {
         view.apply_head(fresh);
         assert_eq!(view.scroll_top, Some(6), "clamped to what still exists");
         assert_eq!(view.applied_seq, 20);
+    }
+
+    fn image_row(stable_row: i64, image: ImageKey) -> RowData {
+        let mut row = row(stable_row, 9, "");
+        row.spans.clear();
+        row.images.push(ImageSpan {
+            start_col: 0,
+            cell_count: 2,
+            image,
+            source: [0, 0, 20, 20],
+            inset: [0; 4],
+            z_index: 0,
+        });
+        row
+    }
+
+    fn pixels() -> ImagePixels {
+        ImagePixels {
+            width: 1,
+            height: 1,
+            rgba: vec![255, 0, 0, 255],
+        }
+    }
+
+    #[test]
+    fn an_image_a_row_shows_is_asked_for_once_and_dropped_when_no_row_shows_it() {
+        let shown = ImageKey([1; 32]);
+        let mut view = TerminalView::from_head(head(vec![image_row(9, shown)]), 100);
+        assert_eq!(view.missing_images(), vec![shown]);
+        assert!(view.missing_images().is_empty(), "asked for once");
+
+        let revision = view.render_revision;
+        view.apply_image(shown, Some(pixels()));
+        assert_eq!(view.image(shown).as_deref(), Some(&pixels()));
+        assert!(view.render_revision > revision, "new pixels redraw");
+
+        let unshown = |i: u8| ImageKey([i + 2; 32]);
+        for i in 0..MAX_HELD_IMAGES as u8 + 1 {
+            view.apply_image(unshown(i), Some(pixels()));
+        }
+        assert!(view.image(shown).is_some(), "a shown image stays");
+        assert!(view.image(unshown(0)).is_none(), "the oldest unshown goes");
+        assert!(view.image(unshown(1)).is_none());
+        assert!(view.image(unshown(MAX_HELD_IMAGES as u8)).is_some());
+    }
+
+    #[test]
+    fn a_failed_image_fetch_is_asked_for_again_and_a_refused_one_is_not() {
+        let failed = ImageKey([1; 32]);
+        let refused = ImageKey([2; 32]);
+        let mut view =
+            TerminalView::from_head(head(vec![image_row(8, failed), image_row(9, refused)]), 100);
+        assert_eq!(view.missing_images(), vec![failed, refused]);
+        view.forget_image_request(failed);
+        view.apply_image(refused, None);
+        assert_eq!(view.missing_images(), vec![failed]);
     }
 }

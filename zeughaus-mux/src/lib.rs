@@ -43,13 +43,14 @@ pub use input::{
 };
 pub use message::{
     Capability, ClientHello, Command, CommandOutcome, CommandReply, ControlAttach, ControlAttached,
-    ErrorCode, Message, RowFetch, RowPage, ServerHello, TerminalAttach, TerminalAttached,
-    WireError,
+    ErrorCode, Message, Resource, ResourceFetch, RowFetch, RowPage, ServerHello, TerminalAttach,
+    TerminalAttached, WireError,
 };
 pub use terminal::{
-    CellSpan, CellStyle, Controller, Cursor, CursorShape, Dimensions, ExitState, Modes, Palette,
-    RowData, StableRange, StyleFlags, TerminalDelta, TerminalEvent, TerminalHead, Underline,
-    WireColor,
+    CellPixels, CellSpan, CellStyle, Controller, Cursor, CursorShape, Dimensions, ExitState,
+    INSET_UNIT, ImageKey, ImagePixels, ImageSpan, MAX_CELL_PIXELS, MAX_IMAGE_BYTES, MAX_IMAGE_SIDE,
+    Modes, Palette, RowData, StableRange, StyleFlags, TerminalDelta, TerminalEvent, TerminalHead,
+    Underline, WireColor,
 };
 pub use workspace::{
     AttachTarget, Axis, DetachedTerminal, GroupSnapshot, PaneNode, PaneTarget, Side, SurfaceRef,

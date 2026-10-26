@@ -18,17 +18,20 @@
 //! painting for the first time and wrong for a delta, where it would resend
 //! every never-written blank row of the screen forever.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
+use std::sync::Arc;
 
 use termwiz::escape::csi::{CSI, Cursor as CursorMove};
 use termwiz::escape::{Action, ControlCode};
 use termwiz::input::KeyboardEncoding;
+use wezterm_term::image::{ImageCell, ImageData};
 use wezterm_term::{CellAttributes, CellRef, Line, Screen, Terminal, TerminalSize};
 use zeughaus_mux::terminal::{MAX_COLS, MAX_LINK_BYTES, MAX_NOTIFICATION_BYTES, MAX_SPAN_BYTES};
 use zeughaus_mux::{
-    CellSpan, CellStyle, Controller, Cursor, Dimensions, ExitState, KeyInput, Modes, Palette,
-    RowData, StableRange, TerminalDelta, TerminalEvent, TerminalHead, TerminalId,
+    CellPixels, CellSpan, CellStyle, Controller, Cursor, Dimensions, ExitState, INSET_UNIT,
+    ImageKey, ImageSpan, KeyInput, Modes, Palette, RowData, StableRange, TerminalDelta,
+    TerminalEvent, TerminalHead, TerminalId,
 };
 
 use crate::config::Config;
@@ -61,6 +64,12 @@ pub const MAX_DELTA_ROWS: usize = zeughaus_mux::codec::MAX_ROWS_PER_MESSAGE;
 /// from a fresh head anyway.
 const MAX_EVENTS: usize = 1024;
 
+/// Images the registry remembers. A client fetches an image's pixels after
+/// it received a row showing it, so the registry has to outlive the rows
+/// that named an image for about a round trip; the newest ones are what the
+/// screen shows.
+const MAX_REGISTERED_IMAGES: usize = 64;
+
 pub(crate) struct Model {
     terminal: Terminal,
     /// `(seqno, event)`, oldest first. The seqno is the model's at the moment
@@ -81,6 +90,62 @@ pub(crate) struct Model {
     epoch: u64,
     /// The screen `epoch` numbers the rows of.
     alt_screen: bool,
+    /// One cell in device pixels, as the controlling pane reported it.
+    cell: CellPixels,
+    /// The images rows were built with, so a client can fetch their pixels.
+    images: ImageRegistry,
+}
+
+/// The images recent rows showed, by content hash, with their size in pixels.
+///
+/// WezTerm's own image cache is private to `TerminalState`; only the cells
+/// hold the images, and a client asks for the pixels after the row arrived.
+#[derive(Default)]
+struct ImageRegistry {
+    order: VecDeque<ImageKey>,
+    images: HashMap<ImageKey, Registered>,
+}
+
+#[derive(Clone)]
+pub(crate) struct Registered {
+    pub(crate) data: Arc<ImageData>,
+    /// Width and height in pixels; `None` when the data is in a format that
+    /// cannot be decoded, which no row then shows.
+    pub(crate) size: Option<(u32, u32)>,
+}
+
+impl ImageRegistry {
+    /// Remembers `data` as the newest image and returns its size. The size
+    /// is read once per image: for an encoded file it parses the header.
+    fn note(&mut self, key: ImageKey, data: &Arc<ImageData>) -> Option<(u32, u32)> {
+        if let Some(known) = self.images.get(&key) {
+            let size = known.size;
+            if self.order.back() != Some(&key) {
+                self.order.retain(|k| *k != key);
+                self.order.push_back(key);
+            }
+            return size;
+        }
+        let size = data.data().dimensions().ok();
+        self.images.insert(
+            key,
+            Registered {
+                data: data.clone(),
+                size,
+            },
+        );
+        self.order.push_back(key);
+        while self.order.len() > MAX_REGISTERED_IMAGES {
+            if let Some(oldest) = self.order.pop_front() {
+                self.images.remove(&oldest);
+            }
+        }
+        size
+    }
+
+    fn get(&self, key: ImageKey) -> Option<&Registered> {
+        self.images.get(&key)
+    }
 }
 
 impl Model {
@@ -91,7 +156,7 @@ impl Model {
         writer: Box<dyn Write + Send>,
     ) -> Model {
         let terminal = Terminal::new(
-            terminal_size(size),
+            terminal_size(size, CellPixels::NOMINAL),
             Config::new(scrollback),
             "Zeughaus",
             env!("CARGO_PKG_VERSION"),
@@ -107,6 +172,8 @@ impl Model {
             titled: false,
             epoch: FIRST_EPOCH,
             alt_screen: false,
+            cell: CellPixels::NOMINAL,
+            images: ImageRegistry::default(),
         }
     }
 
@@ -144,7 +211,8 @@ impl Model {
         }
     }
 
-    /// Resizes the grid and rewraps the primary screen.
+    /// Resizes the grid and rewraps the primary screen; `cell` is what images
+    /// are placed by from now on.
     ///
     /// A cursor in column zero of a row that does not continue the row above
     /// is a child that ended a line and has not written the next one. WezTerm
@@ -160,7 +228,8 @@ impl Model {
     /// which changes no cell and takes it out of that rule, and back to
     /// column zero after it. Both moves are actions rather than bytes, so a
     /// sequence the child's output left half-parsed is not disturbed.
-    pub(crate) fn resize(&mut self, size: Dimensions) {
+    pub(crate) fn resize(&mut self, size: Dimensions, cell: CellPixels) {
+        self.cell = cell;
         let cursor = self.terminal.cursor_pos();
         let waiting = cursor.x == 0
             && !self.terminal.is_alt_screen_active()
@@ -169,11 +238,20 @@ impl Model {
             self.terminal
                 .perform_actions(vec![Action::CSI(CSI::Cursor(CursorMove::Right(1)))]);
         }
-        self.terminal.resize(terminal_size(size));
+        self.terminal.resize(terminal_size(size, cell));
         if waiting {
             self.terminal
                 .perform_actions(vec![Action::Control(ControlCode::CarriageReturn)]);
         }
+    }
+
+    pub(crate) fn cell(&self) -> CellPixels {
+        self.cell
+    }
+
+    /// An image a row was built with, while the registry still holds it.
+    pub(crate) fn image_data(&self, key: ImageKey) -> Option<Registered> {
+        self.images.get(key).cloned()
     }
 
     /// Whether the screen row `y` is where the row above it wrapped to.
@@ -286,7 +364,7 @@ impl Model {
 
     /// The whole current state a client needs, plus up to `rows_above` rows of
     /// scrollback above the screen.
-    pub(crate) fn head(&self, terminal: TerminalId, rows_above: usize) -> TerminalHead {
+    pub(crate) fn head(&mut self, terminal: TerminalId, rows_above: usize) -> TerminalHead {
         let screen = self.terminal.screen();
         let visible = visible_range(screen);
         let above = rows_above.min(MAX_ROWS_ABOVE) as i64;
@@ -298,6 +376,8 @@ impl Model {
                 end: visible.end,
             },
             None,
+            self.cell,
+            &mut self.images,
             &mut rows,
         );
         TerminalHead {
@@ -315,6 +395,7 @@ impl Model {
             exit: self.exit.clone(),
             controller: self.controller.clone(),
             input_serial_ack: self.input_serial_ack,
+            cell: self.cell,
         }
     }
 
@@ -331,11 +412,18 @@ impl Model {
     /// only a fetch refreshes them. The metadata is always sent -- it is a
     /// few dozen bytes against a row's worth of text, and letting the client
     /// compare is cheaper than keeping per-subscriber copies of it here.
-    pub(crate) fn delta_since(&self, terminal: TerminalId, seq: u64) -> TerminalDelta {
+    pub(crate) fn delta_since(&mut self, terminal: TerminalId, seq: u64) -> TerminalDelta {
         let screen = self.terminal.screen();
         let visible = visible_range(screen);
         let mut row_replacements = Vec::new();
-        collect_rows(screen, retained(screen), Some(seq), &mut row_replacements);
+        collect_rows(
+            screen,
+            retained(screen),
+            Some(seq),
+            self.cell,
+            &mut self.images,
+            &mut row_replacements,
+        );
         if row_replacements.len() > MAX_DELTA_ROWS {
             let excess = row_replacements.len() - MAX_DELTA_ROWS;
             row_replacements.drain(..excess);
@@ -360,6 +448,7 @@ impl Model {
                 .filter(|(at, _)| *at > seq)
                 .map(|(_, event)| event.clone())
                 .collect(),
+            cell: Some(self.cell),
         }
     }
 
@@ -368,7 +457,11 @@ impl Model {
     /// whose request was partly evicted learns how far back it may ask.
     /// `None` when the model is no longer in `epoch`: the range names rows of
     /// the other screen.
-    pub(crate) fn rows(&self, epoch: u64, range: StableRange) -> Option<(u64, i64, Vec<RowData>)> {
+    pub(crate) fn rows(
+        &mut self,
+        epoch: u64,
+        range: StableRange,
+    ) -> Option<(u64, i64, Vec<RowData>)> {
         if epoch != self.epoch {
             return None;
         }
@@ -385,6 +478,8 @@ impl Model {
                 end,
             },
             None,
+            self.cell,
+            &mut self.images,
             &mut rows,
         );
         Some((self.seq(), retained(screen).start, rows))
@@ -408,14 +503,14 @@ impl Model {
     }
 }
 
-fn terminal_size(size: Dimensions) -> TerminalSize {
+/// The grid with its size in pixels, so the terminal places images on cells
+/// and answers a child's pixel queries (`CSI 14 t`, `CSI 16 t`).
+fn terminal_size(size: Dimensions, cell: CellPixels) -> TerminalSize {
     TerminalSize {
         rows: size.rows as usize,
         cols: size.cols as usize,
-        // The runner has no font and no display; a child that wants pixels
-        // (sixel, kitty graphics) is out of scope for this cut anyway.
-        pixel_width: 0,
-        pixel_height: 0,
+        pixel_width: size.cols as usize * cell.width as usize,
+        pixel_height: size.rows as usize * cell.height as usize,
         dpi: 0,
     }
 }
@@ -460,7 +555,14 @@ fn retained(screen: &Screen) -> StableRange {
 /// (`with_phys_lines_mut` has the `saturating_sub` its sibling is missing).
 /// Walking the deque and filtering is a pointer bump per skipped row and
 /// cannot be wrong.
-fn collect_rows(screen: &Screen, range: StableRange, since: Option<u64>, out: &mut Vec<RowData>) {
+fn collect_rows(
+    screen: &Screen,
+    range: StableRange,
+    since: Option<u64>,
+    cell: CellPixels,
+    images: &mut ImageRegistry,
+    out: &mut Vec<RowData>,
+) {
     let retained = retained(screen);
     let start = range.start.clamp(retained.start, retained.end);
     let end = range.end.clamp(start, retained.end);
@@ -476,13 +578,26 @@ fn collect_rows(screen: &Screen, range: StableRange, since: Option<u64>, out: &m
         if since.is_some_and(|since| row_seq <= since) {
             return;
         }
-        out.push(row_data(retained.start + index as i64, row_seq, line));
+        out.push(row_data(
+            retained.start + index as i64,
+            row_seq,
+            line,
+            cell,
+            images,
+        ));
     });
 }
 
 /// One line as spans: adjacent cells with one style and one link, trailing
-/// blanks dropped.
-fn row_data(stable_row: i64, row_seq: u64, line: &Line) -> RowData {
+/// blanks dropped; and the images over its cells, adjacent parts of one image
+/// joined into one span.
+fn row_data(
+    stable_row: i64,
+    row_seq: u64,
+    line: &Line,
+    cell_pixels: CellPixels,
+    registry: &mut ImageRegistry,
+) -> RowData {
     let mut cells: Vec<Piece<'_>> = Vec::new();
     for cell in line.visible_cells() {
         let index = cell.cell_index();
@@ -536,12 +651,99 @@ fn row_data(stable_row: i64, row_seq: u64, line: &Line) -> RowData {
         }
     }
 
+    let mut images: Vec<ImageSpan> = Vec::new();
+    for cell in line.visible_cells() {
+        let index = cell.cell_index();
+        if index >= MAX_COLS as usize || images.len() >= MAX_COLS as usize {
+            break;
+        }
+        let Some(cells) = cell.attrs().images() else {
+            continue;
+        };
+        for image in cells {
+            let Some(part) = image_span(index as u16, &image, cell_pixels, registry) else {
+                continue;
+            };
+            match images.last_mut() {
+                Some(span) if continues(span, &part) => {
+                    span.cell_count += 1;
+                    span.source[2] = part.source[2];
+                    span.inset[2] = part.inset[2];
+                }
+                _ => {
+                    if images.len() == MAX_COLS as usize {
+                        break;
+                    }
+                    images.push(part);
+                }
+            }
+        }
+    }
+
     RowData {
         stable_row,
         row_seq,
         wrapped: line.last_cell_was_wrapped(),
         spans,
+        images,
     }
+}
+
+/// One cell's part of an image as a one-cell span, or `None` for an image
+/// whose size is unknown or whose part is empty.
+fn image_span(
+    col: u16,
+    image: &ImageCell,
+    cell: CellPixels,
+    registry: &mut ImageRegistry,
+) -> Option<ImageSpan> {
+    let data = image.image_data();
+    let key = ImageKey(data.hash());
+    let (width, height) = registry.note(key, data)?;
+    let scale = |at: f32, side: u32| (at * side as f32).round().clamp(0.0, side as f32) as u32;
+    let (top_left, bottom_right) = (image.top_left(), image.bottom_right());
+    let source = [
+        scale(*top_left.x, width),
+        scale(*top_left.y, height),
+        scale(*bottom_right.x, width),
+        scale(*bottom_right.y, height),
+    ];
+    if source[0] >= source[2] || source[1] >= source[3] {
+        return None;
+    }
+    let (left, top, right, bottom) = image.padding();
+    let inset = |padding: u16, side: u16| {
+        (u32::from(padding) * u32::from(INSET_UNIT) / u32::from(side)).min(u32::from(INSET_UNIT))
+            as u16
+    };
+    Some(ImageSpan {
+        start_col: col,
+        cell_count: 1,
+        image: key,
+        source,
+        inset: [
+            inset(left, cell.width),
+            inset(top, cell.height),
+            inset(right, cell.width),
+            inset(bottom, cell.height),
+        ],
+        z_index: image.z_index(),
+    })
+}
+
+/// Whether `next`, one cell wide, is the part of the same image right of
+/// `span`, so the two draw as one quad.
+fn continues(span: &ImageSpan, next: &ImageSpan) -> bool {
+    span.image == next.image
+        && span.z_index == next.z_index
+        && span.start_col as u32 + span.cell_count as u32 == next.start_col as u32
+        && span.source[1] == next.source[1]
+        && span.source[3] == next.source[3]
+        && span.inset[1] == next.inset[1]
+        && span.inset[3] == next.inset[3]
+        && span.source[2] == next.source[0]
+        && span.inset[2] == 0
+        && next.inset[0] == 0
 }
 
 /// A cell's text and attributes, borrowed from the *line* rather than from
@@ -623,11 +825,11 @@ mod tests {
             self.model.advance(bytes.as_bytes());
         }
 
-        fn head(&self) -> TerminalHead {
+        fn head(&mut self) -> TerminalHead {
             self.model.head(TerminalId(1), MAX_ROWS_ABOVE)
         }
 
-        fn visible_rows(&self) -> Vec<RowData> {
+        fn visible_rows(&mut self) -> Vec<RowData> {
             let head = self.model.head(TerminalId(1), 0);
             head.rows
         }
@@ -1057,7 +1259,7 @@ mod tests {
 
     /// Every non-empty row of the screen and its scrollback is one whole
     /// "case N ok", the numbers consecutive.
-    fn assert_whole_case_lines(fixture: &Fixture, context: &str) {
+    fn assert_whole_case_lines(fixture: &mut Fixture, context: &str) {
         let texts: Vec<String> = fixture
             .head()
             .rows
@@ -1100,15 +1302,88 @@ mod tests {
                 for n in 1..=60 {
                     fixture.feed(&format!("case {n} ok\r\n"));
                 }
-                fixture.model.resize(Dimensions {
-                    cols: to.0,
-                    rows: to.1,
-                });
+                fixture.model.resize(
+                    Dimensions {
+                        cols: to.0,
+                        rows: to.1,
+                    },
+                    CellPixels::NOMINAL,
+                );
                 let cursor = fixture.head().cursor;
                 assert_eq!(cursor.x, 0, "{from:?} -> {to:?}: the cursor left column 0");
                 fixture.feed("case 61 ok\r\ncase 62 ok\r\n");
-                assert_whole_case_lines(&fixture, &format!("{from:?} -> {to:?}"));
+                assert_whole_case_lines(&mut fixture, &format!("{from:?} -> {to:?}"));
             }
         }
+    }
+
+    /// A 20x60 px red sixel: ten six-pixel bands.
+    fn red_sixel() -> String {
+        let bands = ["#1!20~"; 10].join("-");
+        format!("\x1bPq\"1;1;20;60#1;2;100;0;0{bands}\x1b\\")
+    }
+
+    #[test]
+    fn a_sixel_is_sent_as_image_spans_and_its_pixels_can_be_fetched() {
+        let mut fixture = Fixture::new(20, 5, 10);
+        fixture.feed(&red_sixel());
+        let rows = fixture.visible_rows();
+        let key = rows[0].images[0].image;
+        for (r, row) in rows.iter().take(3).enumerate() {
+            let top = 20 * r as u32;
+            assert_eq!(
+                row.images,
+                vec![ImageSpan {
+                    start_col: 0,
+                    cell_count: 2,
+                    image: key,
+                    source: [0, top, 20, top + 20],
+                    inset: [0; 4],
+                    z_index: 0,
+                }],
+                "row {r}"
+            );
+        }
+        assert!(rows[3].images.is_empty(), "the image is three cells tall");
+
+        let registered = fixture.model.image_data(key).expect("registered");
+        assert_eq!(registered.size, Some((20, 60)));
+        match &*registered.data.data() {
+            wezterm_term::image::ImageDataType::Rgba8 {
+                width,
+                height,
+                data,
+                ..
+            } => {
+                assert_eq!((*width, *height), (20, 60));
+                assert_eq!(&data[..4], &[255, 0, 0, 255]);
+            }
+            other => panic!("a sixel decodes to RGBA, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_written_over_an_image_takes_its_cells() {
+        let mut fixture = Fixture::new(20, 5, 10);
+        fixture.feed(&red_sixel());
+        fixture.feed("\x1b[2;1HAB");
+        let rows = fixture.visible_rows();
+        assert!(rows[1].images.is_empty(), "{:?}", rows[1].images);
+        assert_eq!(text_of(&rows[1]), "AB");
+        assert_eq!(rows[0].images.len(), 1, "the rows around it keep theirs");
+    }
+
+    #[test]
+    fn the_child_learns_the_cell_pixels_the_pane_reported() {
+        let mut fixture = Fixture::new(20, 5, 10);
+        fixture.model.resize(
+            Dimensions { cols: 20, rows: 5 },
+            CellPixels {
+                width: 9,
+                height: 18,
+            },
+        );
+        fixture.feed("\x1b[16t");
+        fixture.expect_sent(b"\x1b[6;18;9t");
     }
 }

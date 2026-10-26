@@ -1728,7 +1728,11 @@ impl App {
             }
             #[cfg(not(target_arch = "wasm32"))]
             Message::RowPage(epoch, terminal, page) => {
-                self.apply_row_page(epoch, terminal, page);
+                return self.apply_row_page(epoch, terminal, page);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::Resource(epoch, terminal, image, resource) => {
+                self.apply_resource(epoch, terminal, image, resource);
             }
             #[cfg(not(target_arch = "wasm32"))]
             Message::TerminalAction(pane, action) => {

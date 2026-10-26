@@ -1,7 +1,7 @@
 //! The editor's client for the runner's terminal multiplexer: the exchanges
 //! that carry the shared workspace and every terminal's screen.
 //!
-//! Three kinds of task, all on the one [`MUX_PATH`] so weida pools them onto
+//! Four kinds of task, all on the one [`MUX_PATH`] so weida pools them onto
 //! one QUIC connection -- the pool key includes the path, so a second one
 //! would cost a second handshake and a warm attach would stop being warm:
 //!
@@ -13,6 +13,8 @@
 //!   each other.
 //! - [`fetch`], one short exchange per scrollback page, so a fetch cannot
 //!   head-of-line block either of the others.
+//! - [`fetch_resource`], one short exchange per image a row shows, for its
+//!   pixels.
 //!
 //! Nothing here redials. The first dial is [`first_dial`]'s and every later
 //! one is weida's; what a redial does not restore is the application state,
@@ -37,8 +39,8 @@ use zeughaus_mux::message::{Command, ControlAttached};
 use zeughaus_mux::view::TerminalView;
 use zeughaus_mux::{
     ClientHello, ClientInstanceId, CommandReply, FrameHeader, MAJOR, MINOR, Message as Wire,
-    RowFetch, RowPage, RunnerIncarnation, ServerHello, TerminalAttach, TerminalCommand,
-    TerminalHead, WireError, WorkspaceSnapshot,
+    Resource, ResourceFetch, RowFetch, RowPage, RunnerIncarnation, ServerHello, TerminalAttach,
+    TerminalCommand, TerminalHead, WireError, WorkspaceSnapshot,
 };
 
 use crate::transport::{Endpoint, QUIC, client_tls, explain, first_dial, policy};
@@ -619,6 +621,28 @@ pub async fn fetch(endpoint: Endpoint, wanted: RowFetch) -> Result<RowPage, Stri
     }
 }
 
+/// Asks for the pixels of an image a row shows. Its own short exchange: an
+/// image is up to [`zeughaus_mux::MAX_IMAGE_BYTES`].
+pub async fn fetch_resource(endpoint: Endpoint, wanted: ResourceFetch) -> Result<Resource, String> {
+    let quic = QUIC.as_ref().ok_or("no QUIC runtime")?;
+    let url = endpoint.path(MUX_PATH)?;
+    let requester = quic.requester(client_tls());
+    first_dial(&url, || requester.connect(&url)).await?;
+    let (mut request, reply) = requester
+        .open(TransferMeta::default())
+        .await
+        .map_err(|e| format!("resource: open: {e}"))?;
+    write_frame(&mut request, &Wire::ResourceFetch(wanted), 0).await?;
+    request.finish().map_err(|e| format!("resource: {e}"))?;
+    let mut body = reply.recv().await.map_err(|e| format!("resource: {e}"))?;
+    match read_frame(&mut body).await? {
+        Some(Wire::Resource(resource)) => Ok(resource),
+        Some(Wire::Error(error)) => Err(format!("resource: {}", error.message)),
+        Some(other) => Err(format!("resource: answered with {:?}", other.kind())),
+        None => Err("resource: no answer".to_owned()),
+    }
+}
+
 /// Writes one frame. The message is encoded whole first, so a frame is either
 /// written completely or not at all -- a half-written body would desynchronize
 /// the stream for good.
@@ -702,7 +726,10 @@ mod tests {
         assert_eq!(serials.next(), 2);
 
         // A resize is not input and must not consume one.
-        let resize = TerminalCommand::Resize(DEFAULT_GRID);
+        let resize = TerminalCommand::Resize {
+            size: DEFAULT_GRID,
+            cell: zeughaus_mux::CellPixels::NOMINAL,
+        };
         assert_eq!(resize.serial(), None);
         assert_eq!(serials.next(), 2);
     }

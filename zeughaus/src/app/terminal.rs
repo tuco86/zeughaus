@@ -357,7 +357,9 @@ impl App {
         };
         match event {
             TerminalEvent::Ready(sender) => live.commands = Some(sender),
-            TerminalEvent::Changed => {}
+            // The task already wrote the change into the view; what is left
+            // is fetching the pixels of images it newly shows.
+            TerminalEvent::Changed => return self.fetch_images(&key, terminal),
             TerminalEvent::Notification { title, body } => {
                 // A replay says what the job said when it ran, which is not
                 // news.
@@ -415,15 +417,15 @@ impl App {
         epoch: u64,
         terminal: zeughaus_mux::TerminalId,
         page: Result<zeughaus_mux::RowPage, String>,
-    ) {
+    ) -> Task<Message> {
         let Some(key) = self.mux_key(epoch) else {
-            return;
+            return Task::none();
         };
         let page = match page {
             Ok(page) => page,
             Err(e) => {
                 eprintln!("[mux] {terminal}: {e}");
-                return;
+                return Task::none();
             }
         };
         if let Some(live) = self
@@ -433,6 +435,71 @@ impl App {
             && let Some(view) = live.view.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
         {
             view.apply_page(page);
+        }
+        self.fetch_images(&key, terminal)
+    }
+
+    /// Fetches the pixels of images the terminal's viewport shows and its
+    /// view neither holds nor has asked for.
+    fn fetch_images(
+        &mut self,
+        key: &RunnerKey,
+        terminal: zeughaus_mux::TerminalId,
+    ) -> Task<Message> {
+        let Some(endpoint) = self.runtime.links.get(key).map(|l| l.endpoint.clone()) else {
+            return Task::none();
+        };
+        let Some(mux) = self.mux.get(key) else {
+            return Task::none();
+        };
+        let epoch = mux.epoch;
+        let Some(live) = mux.terminals.get(&terminal) else {
+            return Task::none();
+        };
+        let missing = match live.view.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            Some(view) => view.missing_images(),
+            None => return Task::none(),
+        };
+        Task::batch(missing.into_iter().map(|image| {
+            Task::perform(
+                mux::fetch_resource(
+                    endpoint.clone(),
+                    zeughaus_mux::ResourceFetch { terminal, image },
+                ),
+                move |resource| Message::Resource(epoch, terminal, image, resource),
+            )
+        }))
+    }
+
+    /// An image's pixels, or why they did not arrive.
+    pub(super) fn apply_resource(
+        &mut self,
+        epoch: u64,
+        terminal: zeughaus_mux::TerminalId,
+        image: zeughaus_mux::ImageKey,
+        resource: Result<zeughaus_mux::Resource, String>,
+    ) {
+        let Some(key) = self.mux_key(epoch) else {
+            return;
+        };
+        let Some(live) = self
+            .mux
+            .get_mut(&key)
+            .and_then(|mux| mux.terminals.get_mut(&terminal))
+        else {
+            return;
+        };
+        let mut guard = live.view.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(view) = guard.as_mut() else {
+            return;
+        };
+        match resource {
+            Ok(resource) if resource.image == image => view.apply_image(image, resource.pixels),
+            Ok(_) => view.forget_image_request(image),
+            Err(e) => {
+                eprintln!("[mux] {terminal}: {e}");
+                view.forget_image_request(image);
+            }
         }
     }
 
@@ -451,7 +518,7 @@ impl App {
         let replay = pane.runner.ci_runner();
         let key = replay.clone().unwrap_or_else(|| pane.runner.clone());
         match action {
-            TerminalAction::Command(command @ zeughaus_mux::TerminalCommand::Resize(_)) => {
+            TerminalAction::Command(command @ zeughaus_mux::TerminalCommand::Resize { .. }) => {
                 self.send_input(&key, terminal, command);
                 Task::none()
             }
@@ -573,6 +640,8 @@ impl App {
                 move |page| Message::RowPage(epoch, terminal, page),
             ));
         }
+        drop(guard);
+        tasks.push(self.fetch_images(key, terminal));
         Task::batch(tasks)
     }
 

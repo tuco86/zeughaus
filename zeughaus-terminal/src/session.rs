@@ -27,11 +27,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::watch;
+use wezterm_term::image::ImageDataType;
 use wezterm_term::{Alert, AlertHandler};
 use zeughaus_mux::input::MAX_TEXT_BYTES;
 use zeughaus_mux::{
-    Controller, Dimensions, ExitState, RowData, StableRange, TerminalCommand, TerminalDelta,
-    TerminalEvent, TerminalHead, TerminalId,
+    CellPixels, Controller, Dimensions, ExitState, ImageKey, ImagePixels, MAX_IMAGE_BYTES,
+    MAX_IMAGE_SIDE, RowData, StableRange, TerminalCommand, TerminalDelta, TerminalEvent,
+    TerminalHead, TerminalId,
 };
 
 use crate::config::MAX_SCROLLBACK_ROWS;
@@ -610,6 +612,54 @@ impl Session {
         self.inner.model().size()
     }
 
+    /// One cell in device pixels, as the controlling pane last reported it.
+    pub fn cell(&self) -> CellPixels {
+        self.inner.model().cell()
+    }
+
+    /// The pixels of an image a row was built with, as RGBA (the first frame
+    /// of an animation). `None` when the image is no longer remembered, its
+    /// format cannot be decoded, or it is larger than the wire carries. An
+    /// encoded file is decoded here, outside the model's lock; a caller on an
+    /// async runtime runs this on a blocking thread.
+    pub fn image(&self, key: ImageKey) -> Option<ImagePixels> {
+        let registered = self.inner.model().image_data(key)?;
+        let (width, height) = registered.size?;
+        let bytes = width as usize * height as usize * 4;
+        if width > MAX_IMAGE_SIDE || height > MAX_IMAGE_SIDE || bytes > MAX_IMAGE_BYTES {
+            return None;
+        }
+        let encoded = match &*registered.data.data() {
+            ImageDataType::Rgba8 { data, .. } => Ok(data.clone()),
+            ImageDataType::AnimRgba8 { frames, .. } => Ok(frames.first()?.clone()),
+            ImageDataType::EncodedFile(file) => Err(file.clone()),
+            _ => return None,
+        };
+        let rgba = match encoded {
+            Ok(rgba) => rgba,
+            Err(file) => match ImageDataType::EncodedFile(file).decode() {
+                ImageDataType::Rgba8 {
+                    data,
+                    width: w,
+                    height: h,
+                    ..
+                } if (w, h) == (width, height) => data,
+                ImageDataType::AnimRgba8 {
+                    frames,
+                    width: w,
+                    height: h,
+                    ..
+                } if (w, h) == (width, height) => frames.into_iter().next()?,
+                _ => return None,
+            },
+        };
+        (rgba.len() == bytes).then_some(ImagePixels {
+            width,
+            height,
+            rgba,
+        })
+    }
+
     pub fn id(&self) -> TerminalId {
         self.inner.id
     }
@@ -735,14 +785,20 @@ impl Session {
                     .map_err(|e| e.to_string())?;
                 model.note_serial(*serial);
             }
-            TerminalCommand::Resize(size) => {
+            TerminalCommand::Resize { size, cell } => {
                 if !size.is_valid() {
                     return Err(format!("refusing a {}x{} grid", size.cols, size.rows));
+                }
+                if !cell.is_valid() {
+                    return Err(format!("refusing a {}x{} px cell", cell.width, cell.height));
                 }
                 // The model first: it rewraps and reports the damage. The
                 // kernel second: that is what wakes the child with SIGWINCH,
                 // and by then the screen it will draw into is the right one.
-                self.inner.model().resize(*size);
+                // The PTY keeps a size of 0 pixels: a child reads the pixel
+                // size from the terminal (`CSI 14 t`, `CSI 16 t`), and a shim
+                // of an older build only knows grids.
+                self.inner.model().resize(*size, *cell);
                 match &self.inner.io {
                     Io::Local { master, .. } => master
                         .lock()

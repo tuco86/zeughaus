@@ -270,6 +270,15 @@ pub enum Message {
         zeughaus_mux::TerminalId,
         Result<zeughaus_mux::RowPage, String>,
     ),
+    /// The answer to an image fetch: the epoch of the runner link, the
+    /// terminal and the image it asked for.
+    #[cfg(not(target_arch = "wasm32"))]
+    Resource(
+        u64,
+        zeughaus_mux::TerminalId,
+        zeughaus_mux::ImageKey,
+        Result<zeughaus_mux::Resource, String>,
+    ),
     // A terminal pane reported what the user did in it. Carries the pane
     // rather than the terminal: focus is a property of the pane, and the
     // terminal it shows is one lookup away in the workspace.

@@ -26,11 +26,12 @@ use zeughaus_mux::message::{Capability, Command, ErrorCode};
 use zeughaus_mux::workspace::ProfileId;
 use zeughaus_mux::{
     ClientHello, ClientInstanceId, CommandOutcome, CommandReply, ControlAttach, Controller,
-    Dimensions, MAJOR, MINOR, Message, RequestId, RowFetch, RunnerIncarnation, ServerHello,
-    TerminalAttach, TerminalCommand, TerminalId, TopologyCommand, WireError, WorkspaceSnapshot,
+    Dimensions, MAJOR, MINOR, Message, RequestId, ResourceFetch, RowFetch, RunnerIncarnation,
+    ServerHello, TerminalAttach, TerminalCommand, TerminalId, TopologyCommand, WireError,
+    WorkspaceSnapshot,
 };
 use zeughaus_terminal::frames::{ReadError, read_frame, write_frame};
-use zeughaus_terminal::serve::{fetch_rows, stream_terminal};
+use zeughaus_terminal::serve::{fetch_resource, fetch_rows, stream_terminal};
 use zeughaus_terminal::wal::Wal;
 use zeughaus_terminal::{Profile, Session, TerminalHost};
 
@@ -496,6 +497,7 @@ impl MuxService {
                     .await
             }
             Message::RowFetch(fetch) => self.serve_fetch(fetch, &mut reply).await,
+            Message::ResourceFetch(fetch) => self.serve_resource(fetch, &mut reply).await,
             other => Err(WireError {
                 code: ErrorCode::Protocol,
                 message: format!("{:?} cannot open an exchange", other.kind()),
@@ -606,7 +608,10 @@ impl MuxService {
             reply,
             || {
                 if self.controls(terminal, client) {
-                    let _ = session.apply(&TerminalCommand::Resize(attach.size));
+                    let _ = session.apply(&TerminalCommand::Resize {
+                        size: attach.size,
+                        cell: session.cell(),
+                    });
                 }
             },
             || !self.exists(terminal),
@@ -631,9 +636,9 @@ impl MuxService {
                 };
                 match command {
                     TerminalCommand::Viewport { .. } => {}
-                    TerminalCommand::Resize(d) => {
+                    command @ TerminalCommand::Resize { .. } => {
                         if self.acquire_if_free(terminal, client, &principal, &session)
-                            && let Err(e) = session.apply(&TerminalCommand::Resize(d))
+                            && let Err(e) = session.apply(&command)
                         {
                             eprintln!("[mux] {terminal}: resize refused: {e}");
                         }
@@ -679,6 +684,26 @@ impl MuxService {
                 .await
                 .map_err(|e| gone(&e)),
         }
+    }
+
+    async fn serve_resource(
+        &self,
+        fetch: ResourceFetch,
+        reply: &mut weida::OutgoingTransfer,
+    ) -> Result<(), WireError> {
+        let session = self.session(fetch.terminal).ok_or(WireError {
+            code: ErrorCode::UnknownTerminal,
+            message: format!("no {}", fetch.terminal),
+        })?;
+        // An iTerm2 image is decoded on the way out, which is no work for
+        // the runtime's threads.
+        let resource = tokio::task::spawn_blocking(move || fetch_resource(&session, &fetch))
+            .await
+            .map_err(|e| WireError {
+                code: ErrorCode::Limit,
+                message: format!("serving an image failed: {e}"),
+            })?;
+        write_frame(reply, &resource, 0).await.map_err(|e| gone(&e))
     }
 
     // --- state -------------------------------------------------------------
@@ -1369,10 +1394,10 @@ mod tests {
 
             // Resize as the controller.
             term.send(
-                Message::TerminalCommand(TerminalCommand::Resize(Dimensions {
-                    cols: 60,
-                    rows: 12,
-                })),
+                Message::TerminalCommand(TerminalCommand::Resize {
+                    size: Dimensions { cols: 60, rows: 12 },
+                    cell: zeughaus_mux::CellPixels::NOMINAL,
+                }),
                 0,
             )
             .await;

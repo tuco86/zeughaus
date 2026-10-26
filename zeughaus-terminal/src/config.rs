@@ -9,10 +9,11 @@
 //! runner's).
 //!
 //! Everything not answered here keeps the trait's default, and the defaults
-//! that matter are deliberate: no kitty graphics (the renderer draws no
-//! images), no title reporting (a program that can read the title back can
-//! exfiltrate it), no CSI-u as the default encoding (it would reach every
-//! program, whether it asked or not).
+//! that matter are deliberate: no kitty graphics (the wire's image spans do
+//! not model its placements, deletes and placeholders; sixel and iTerm2
+//! images are drawn), no title reporting (a program that can read the title
+//! back can exfiltrate it), no CSI-u as the default encoding (it would reach
+//! every program, whether it asked or not).
 
 use std::sync::Arc;
 

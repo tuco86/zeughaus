@@ -26,10 +26,11 @@ use std::fmt;
 use serde::de::DeserializeOwned;
 
 use crate::input::{MAX_TEXT_BYTES, TerminalCommand};
-use crate::message::{ControlAttached, MAX_FETCH_ROWS, Message, RowFetch, RowPage};
+use crate::message::{ControlAttached, MAX_FETCH_ROWS, Message, Resource, RowFetch, RowPage};
 use crate::terminal::{
-    Dimensions, MAX_COLS, MAX_LINK_BYTES, MAX_NOTIFICATION_BYTES, MAX_ROWS, MAX_SPAN_BYTES,
-    RowData, TerminalDelta, TerminalEvent, TerminalHead,
+    CellPixels, Dimensions, INSET_UNIT, MAX_COLS, MAX_IMAGE_BYTES, MAX_IMAGE_SIDE, MAX_LINK_BYTES,
+    MAX_NOTIFICATION_BYTES, MAX_ROWS, MAX_SPAN_BYTES, RowData, TerminalDelta, TerminalEvent,
+    TerminalHead,
 };
 use crate::workspace::{
     MAX_TITLE_BYTES, MAX_TREE_DEPTH, MIN_RATIO, PaneNode, TopologyCommand, WorkspaceSnapshot,
@@ -37,7 +38,7 @@ use crate::workspace::{
 
 /// Protocol version. A major mismatch refuses the attach; a minor is the
 /// lower of the two sides'.
-pub const MAJOR: u8 = 3;
+pub const MAJOR: u8 = 4;
 pub const MINOR: u8 = 0;
 
 const MAGIC: [u8; 2] = *b"ZM";
@@ -80,10 +81,9 @@ pub enum Kind {
     TerminalCommand = 0x14,
     RowFetch = 0x20,
     RowPage = 0x21,
-    /// Reserved for image resources. No body type yet; a frame of this
-    /// kind decodes to [`CodecError::Unsupported`].
+    /// Asks for an image's pixels by its content hash.
     ResourceFetch = 0x30,
-    /// Reserved, see [`Kind::ResourceFetch`].
+    /// An image's pixels, answering [`Kind::ResourceFetch`].
     Resource = 0x31,
     Error = 0x7f,
 }
@@ -130,7 +130,7 @@ impl Kind {
             }
             Kind::ControlAttached => MAX_BODY,
             Kind::ResourceFetch => SMALL,
-            Kind::Resource => LARGE,
+            Kind::Resource => MAX_BODY,
         }
     }
 }
@@ -222,8 +222,6 @@ pub enum CodecError {
         length: u32,
         max: u32,
     },
-    /// A reserved kind with no body type.
-    Unsupported(Kind),
     /// The body did not decode as the kind's type.
     Body(String),
     /// The body decoded but breaks a bound.
@@ -240,7 +238,6 @@ impl fmt::Display for CodecError {
             CodecError::TooLong { kind, length, max } => {
                 write!(f, "{kind:?} body of {length} bytes exceeds {max}")
             }
-            CodecError::Unsupported(k) => write!(f, "{k:?} frames are reserved"),
             CodecError::Body(e) => write!(f, "malformed body: {e}"),
             CodecError::Invalid(what) => write!(f, "invalid body: {what}"),
         }
@@ -264,6 +261,8 @@ impl Message {
             Message::TerminalCommand(_) => Kind::TerminalCommand,
             Message::RowFetch(_) => Kind::RowFetch,
             Message::RowPage(_) => Kind::RowPage,
+            Message::ResourceFetch(_) => Kind::ResourceFetch,
+            Message::Resource(_) => Kind::Resource,
             Message::Error(_) => Kind::Error,
         }
     }
@@ -285,6 +284,8 @@ impl Message {
             Message::TerminalCommand(m) => postcard::to_stdvec(m),
             Message::RowFetch(m) => postcard::to_stdvec(m),
             Message::RowPage(m) => postcard::to_stdvec(m),
+            Message::ResourceFetch(m) => postcard::to_stdvec(m),
+            Message::Resource(m) => postcard::to_stdvec(m),
             Message::Error(m) => postcard::to_stdvec(m),
         }
         .map_err(|e| CodecError::Body(e.to_string()))?;
@@ -324,8 +325,9 @@ impl Message {
             Kind::TerminalCommand => Message::TerminalCommand(from(body)?),
             Kind::RowFetch => Message::RowFetch(from(body)?),
             Kind::RowPage => Message::RowPage(from(body)?),
+            Kind::ResourceFetch => Message::ResourceFetch(from(body)?),
+            Kind::Resource => Message::Resource(from(body)?),
             Kind::Error => Message::Error(from(body)?),
-            Kind::ResourceFetch | Kind::Resource => return Err(CodecError::Unsupported(kind)),
         };
         message.validate()?;
         Ok(message)
@@ -384,6 +386,8 @@ impl Message {
             Message::TerminalCommand(m) => validate_terminal_command(m)?,
             Message::RowFetch(m) => validate_fetch(m)?,
             Message::RowPage(m) => validate_page(m)?,
+            Message::ResourceFetch(_) => {}
+            Message::Resource(m) => validate_resource(m)?,
             Message::Error(m) => {
                 if m.message.len() > MAX_TITLE_BYTES {
                     return Err(CodecError::Invalid("error message too long"));
@@ -492,6 +496,14 @@ fn validate_dimensions(d: Dimensions) -> Result<(), CodecError> {
     }
 }
 
+fn validate_cell(cell: CellPixels) -> Result<(), CodecError> {
+    if cell.is_valid() {
+        Ok(())
+    } else {
+        Err(CodecError::Invalid("cell pixels out of range"))
+    }
+}
+
 fn validate_row(row: &RowData) -> Result<(), CodecError> {
     if row.spans.len() > MAX_COLS as usize {
         return Err(CodecError::Invalid("too many spans in a row"));
@@ -512,6 +524,23 @@ fn validate_row(row: &RowData) -> Result<(), CodecError> {
             return Err(CodecError::Invalid("span past the widest row"));
         }
     }
+    if row.images.len() > MAX_COLS as usize {
+        return Err(CodecError::Invalid("too many images in a row"));
+    }
+    for image in &row.images {
+        if image.cell_count == 0
+            || image.start_col as u32 + image.cell_count as u32 > MAX_COLS as u32
+        {
+            return Err(CodecError::Invalid("image span past the widest row"));
+        }
+        let [left, top, right, bottom] = image.source;
+        if left >= right || top >= bottom {
+            return Err(CodecError::Invalid("empty image source"));
+        }
+        if image.inset.iter().any(|&inset| inset > INSET_UNIT) {
+            return Err(CodecError::Invalid("image inset past its cell"));
+        }
+    }
     Ok(())
 }
 
@@ -524,6 +553,7 @@ fn validate_rows(rows: &[RowData]) -> Result<(), CodecError> {
 
 fn validate_head(h: &TerminalHead) -> Result<(), CodecError> {
     validate_dimensions(h.dimensions)?;
+    validate_cell(h.cell)?;
     if h.visible.len() > MAX_ROWS as u64 {
         return Err(CodecError::Invalid("visible range too tall"));
     }
@@ -542,6 +572,9 @@ fn validate_delta(d: &TerminalDelta) -> Result<(), CodecError> {
     }
     if let Some(dim) = d.dimensions {
         validate_dimensions(dim)?;
+    }
+    if let Some(cell) = d.cell {
+        validate_cell(cell)?;
     }
     if d.visible.is_some_and(|v| v.len() > MAX_ROWS as u64) {
         return Err(CodecError::Invalid("visible range too tall"));
@@ -569,7 +602,10 @@ fn validate_terminal_command(c: &TerminalCommand) -> Result<(), CodecError> {
                 return Err(CodecError::Invalid("text too long"));
             }
         }
-        TerminalCommand::Resize(d) => validate_dimensions(*d)?,
+        TerminalCommand::Resize { size, cell } => {
+            validate_dimensions(*size)?;
+            validate_cell(*cell)?;
+        }
         TerminalCommand::Viewport { rows, .. } => {
             if *rows == 0 || *rows > MAX_ROWS {
                 return Err(CodecError::Invalid("viewport height out of range"));
@@ -596,6 +632,19 @@ fn validate_page(p: &RowPage) -> Result<(), CodecError> {
     validate_rows(&p.rows)
 }
 
+fn validate_resource(r: &Resource) -> Result<(), CodecError> {
+    let Some(p) = &r.pixels else {
+        return Ok(());
+    };
+    if p.width == 0 || p.height == 0 || p.width > MAX_IMAGE_SIDE || p.height > MAX_IMAGE_SIDE {
+        return Err(CodecError::Invalid("image size out of range"));
+    }
+    if p.rgba.len() != p.width as usize * p.height as usize * 4 || p.rgba.len() > MAX_IMAGE_BYTES {
+        return Err(CodecError::Invalid("image pixels do not match its size"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,7 +663,7 @@ mod tests {
         assert_eq!(
             bytes,
             [
-                b'Z', b'M', 3, 0, 0x12, 0x00, 0, 0, 0x04, 0x03, 0x02, 0x00, 0x88, 0x77, 0x66, 0x55,
+                b'Z', b'M', 4, 0, 0x12, 0x00, 0, 0, 0x04, 0x03, 0x02, 0x00, 0x88, 0x77, 0x66, 0x55,
                 0x44, 0x33, 0x22, 0x11
             ]
         );
@@ -716,6 +765,14 @@ mod tests {
                     },
                     link: None,
                 }],
+                images: vec![ImageSpan {
+                    start_col: 4,
+                    cell_count: 2,
+                    image: ImageKey([7; 32]),
+                    source: [0, 20, 20, 40],
+                    inset: [0, 0, 1024, 0],
+                    z_index: -1,
+                }],
             }],
             exit: None,
             controller: Some(Controller {
@@ -723,6 +780,7 @@ mod tests {
                 principal: "sha256:ab".into(),
             }),
             input_serial_ack: 7,
+            cell: CellPixels::NOMINAL,
         }
     }
 
@@ -916,6 +974,10 @@ mod tests {
                     body: "done".into(),
                 },
             ],
+            cell: Some(CellPixels {
+                width: 9,
+                height: 18,
+            }),
         }));
         round_trip(Message::TerminalCommand(TerminalCommand::Key {
             serial: 1,
@@ -949,18 +1011,32 @@ mod tests {
             seq: 41,
             rows: head().rows,
         }));
+        round_trip(Message::TerminalCommand(TerminalCommand::Resize {
+            size: Dimensions { cols: 80, rows: 24 },
+            cell: CellPixels::NOMINAL,
+        }));
+        round_trip(Message::ResourceFetch(ResourceFetch {
+            terminal: TerminalId(3),
+            image: ImageKey([7; 32]),
+        }));
+        round_trip(Message::Resource(Resource {
+            terminal: TerminalId(3),
+            image: ImageKey([7; 32]),
+            pixels: Some(ImagePixels {
+                width: 2,
+                height: 1,
+                rgba: vec![255, 0, 0, 255, 0, 255, 0, 128],
+            }),
+        }));
+        round_trip(Message::Resource(Resource {
+            terminal: TerminalId(3),
+            image: ImageKey([7; 32]),
+            pixels: None,
+        }));
         round_trip(Message::Error(WireError {
             code: ErrorCode::Unauthorized,
             message: "no".into(),
         }));
-    }
-
-    #[test]
-    fn a_reserved_kind_has_no_body() {
-        assert_eq!(
-            Message::decode(Kind::Resource, &[]),
-            Err(CodecError::Unsupported(Kind::Resource))
-        );
     }
 
     #[test]
@@ -1038,6 +1114,29 @@ mod tests {
         assert_eq!(
             Message::decode(Kind::TerminalHead, &bytes),
             Err(CodecError::Invalid("cursor outside the grid"))
+        );
+
+        let mut wide_image = head();
+        wide_image.rows[0].images[0].start_col = MAX_COLS - 1;
+        let bytes = postcard::to_stdvec(&wide_image).unwrap();
+        assert_eq!(
+            Message::decode(Kind::TerminalHead, &bytes),
+            Err(CodecError::Invalid("image span past the widest row"))
+        );
+
+        let short_pixels = Resource {
+            terminal: TerminalId(3),
+            image: ImageKey([7; 32]),
+            pixels: Some(ImagePixels {
+                width: 2,
+                height: 2,
+                rgba: vec![0; 12],
+            }),
+        };
+        let bytes = postcard::to_stdvec(&short_pixels).unwrap();
+        assert_eq!(
+            Message::decode(Kind::Resource, &bytes),
+            Err(CodecError::Invalid("image pixels do not match its size"))
         );
 
         let fetch = RowFetch {

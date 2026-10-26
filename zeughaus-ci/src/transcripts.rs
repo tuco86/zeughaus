@@ -18,12 +18,12 @@ use weida::{IncomingRequest, Replier, TransferMeta};
 use zeughaus_mux::message::ControlAttached;
 use zeughaus_mux::{
     Capability, CommandOutcome, CommandReply, ControlAttach, Dimensions, ErrorCode, ExitState,
-    MAJOR, MINOR, Message, RowFetch, RunnerIncarnation, ServerHello, TerminalAttach,
+    MAJOR, MINOR, Message, ResourceFetch, RowFetch, RunnerIncarnation, ServerHello, TerminalAttach,
     TerminalCommand, TerminalId, WireError, WorkspaceSnapshot,
 };
 use zeughaus_terminal::Session;
 use zeughaus_terminal::frames::{ReadError, read_frame, write_frame};
-use zeughaus_terminal::serve::{fetch_rows, stream_terminal};
+use zeughaus_terminal::serve::{fetch_resource, fetch_rows, stream_terminal};
 use zeughaus_terminal::wal::Follower;
 
 use crate::config::CiConfig;
@@ -280,6 +280,7 @@ async fn exchange(mut request: IncomingRequest, config: &CiConfig, transcripts: 
             terminal(transcripts, attach, &mut body, &mut reply, canceled).await
         }
         Message::RowFetch(fetch) => fetch_page(transcripts, &fetch, &mut reply).await,
+        Message::ResourceFetch(fetch) => fetch_image(transcripts, fetch, &mut reply).await,
         other => Err(error(
             ErrorCode::Protocol,
             format!("{:?} cannot open an exchange", other.kind()),
@@ -376,8 +377,8 @@ async fn terminal(
         .session(id)
         .ok_or_else(|| error(ErrorCode::UnknownTerminal, format!("no {id}")))?;
     let acked = AtomicU64::new(0);
-    let resize = |size| {
-        if let Err(e) = session.apply(&TerminalCommand::Resize(size)) {
+    let resize = |command: &TerminalCommand| {
+        if let Err(e) = session.apply(command) {
             eprintln!("[ci] {id}: resize refused: {e}");
         }
     };
@@ -386,13 +387,20 @@ async fn terminal(
         &attach,
         &acked,
         reply,
-        || resize(attach.size),
+        || {
+            resize(&TerminalCommand::Resize {
+                size: attach.size,
+                cell: session.cell(),
+            })
+        },
         || !transcripts.exists(id),
     );
     let reading = async {
         loop {
             match read_frame(body).await {
-                Ok((_, Message::TerminalCommand(TerminalCommand::Resize(size)))) => resize(size),
+                Ok((_, Message::TerminalCommand(command @ TerminalCommand::Resize { .. }))) => {
+                    resize(&command)
+                }
                 Ok(_) => {}
                 Err(ReadError::Ended) | Err(ReadError::Io(_)) => return Ok(()),
                 Err(ReadError::Codec(e)) => {
@@ -430,6 +438,25 @@ async fn fetch_page(
             Ok(())
         }
     }
+}
+
+async fn fetch_image(
+    transcripts: &Transcripts,
+    fetch: ResourceFetch,
+    reply: &mut weida::OutgoingTransfer,
+) -> Result<(), WireError> {
+    let session = transcripts
+        .session(fetch.terminal)
+        .ok_or_else(|| error(ErrorCode::UnknownTerminal, format!("no {}", fetch.terminal)))?;
+    // An iTerm2 image is decoded on the way out, which is no work for the
+    // runtime's threads.
+    let resource = tokio::task::spawn_blocking(move || fetch_resource(&session, &fetch))
+        .await
+        .map_err(|e| error(ErrorCode::Limit, format!("serving an image failed: {e}")))?;
+    if let Err(e) = write_frame(reply, &resource, 0).await {
+        eprintln!("[ci] {e}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

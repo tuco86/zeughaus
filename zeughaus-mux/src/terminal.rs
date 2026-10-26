@@ -36,6 +36,67 @@ impl Dimensions {
     }
 }
 
+/// One cell of a pane in device pixels: what the runner places images by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CellPixels {
+    pub width: u16,
+    pub height: u16,
+}
+
+/// Largest cell side either side accepts, in device pixels.
+pub const MAX_CELL_PIXELS: u16 = 512;
+
+impl CellPixels {
+    /// Used until a controlling pane reports its own.
+    pub const NOMINAL: CellPixels = CellPixels {
+        width: 10,
+        height: 20,
+    };
+
+    /// Whether both sides are within `1..=MAX_CELL_PIXELS`.
+    pub fn is_valid(self) -> bool {
+        (1..=MAX_CELL_PIXELS).contains(&self.width) && (1..=MAX_CELL_PIXELS).contains(&self.height)
+    }
+}
+
+/// The content hash of an image: wezterm's SHA-256 of its RGBA pixels, or of
+/// the file a child sent when the runner keeps it encoded (iTerm2 images).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ImageKey(pub [u8; 32]);
+
+/// Part of an image drawn over adjacent cells of one row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageSpan {
+    pub start_col: u16,
+    pub cell_count: u16,
+    pub image: ImageKey,
+    /// The part of the image shown, in image pixels: left, top, right,
+    /// bottom (exclusive).
+    pub source: [u32; 4],
+    /// Where inside the span's cells the image starts and ends, in
+    /// 1/[`INSET_UNIT`] of a cell: left, top, right, bottom.
+    pub inset: [u16; 4],
+    /// Drawing order among images: lower first.
+    pub z_index: i32,
+}
+
+/// One cell side in [`ImageSpan::inset`] units.
+pub const INSET_UNIT: u16 = 4096;
+
+/// An image's pixels: RGBA8, rows top to bottom.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImagePixels {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Largest side a `Resource` carries.
+pub const MAX_IMAGE_SIDE: u32 = 8192;
+/// Largest pixel buffer a `Resource` carries: a frame's body bound less room
+/// for the rest of the message.
+pub const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024 - 4096;
+
 /// A contiguous range of stable rows, `start..end`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StableRange {
@@ -310,6 +371,8 @@ pub struct RowData {
     /// which selection and rewrap treat as one.
     pub wrapped: bool,
     pub spans: Vec<CellSpan>,
+    /// Images drawn under the text, in column order.
+    pub images: Vec<ImageSpan>,
 }
 
 /// Why a child is no longer running.
@@ -370,6 +433,8 @@ pub struct TerminalHead {
     pub controller: Option<Controller>,
     /// The highest input serial from this client the runner has applied.
     pub input_serial_ack: u64,
+    /// The cell size images are placed by.
+    pub cell: CellPixels,
 }
 
 /// Something that happened in order and must not be coalesced away: an exit,
@@ -411,6 +476,7 @@ pub struct TerminalDelta {
     pub evicted_before: Option<i64>,
     pub row_replacements: Vec<RowData>,
     pub ordered_events: Vec<TerminalEvent>,
+    pub cell: Option<CellPixels>,
 }
 
 impl TerminalDelta {
@@ -456,6 +522,7 @@ mod tests {
             evicted_before: None,
             row_replacements: vec![],
             ordered_events: vec![],
+            cell: None,
         };
         assert!(delta.applies_to(1, 10));
         assert!(!delta.applies_to(1, 9), "a gap needs a fresh head");

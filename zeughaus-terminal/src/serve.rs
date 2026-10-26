@@ -1,13 +1,16 @@
 //! The read-only half of serving a terminal over mux frames: the head, the
-//! deltas that follow it, and row fetches. Who may type, and the control
-//! leases that decide it, belong to the caller.
+//! deltas that follow it, row fetches and image fetches. Who may type, and
+//! the control leases that decide it, belong to the caller.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWrite;
 use zeughaus_mux::message::ErrorCode;
-use zeughaus_mux::{Message, RowFetch, RowPage, TerminalAttach, TerminalAttached, WireError};
+use zeughaus_mux::{
+    Message, Resource, ResourceFetch, RowFetch, RowPage, TerminalAttach, TerminalAttached,
+    WireError,
+};
 
 use crate::Session;
 use crate::frames::write_frame;
@@ -121,5 +124,16 @@ pub fn fetch_rows(session: &Session, fetch: &RowFetch) -> Message {
         first_retained,
         seq,
         rows,
+    })
+}
+
+/// The reply to an image fetch: its pixels, or `None` in their place when
+/// the session cannot serve them. May decode an image file: an async caller
+/// runs it on a blocking thread.
+pub fn fetch_resource(session: &Session, fetch: &ResourceFetch) -> Message {
+    Message::Resource(Resource {
+        terminal: fetch.terminal,
+        image: fetch.image,
+        pixels: session.image(fetch.image),
     })
 }
