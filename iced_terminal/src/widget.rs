@@ -46,7 +46,9 @@ use crate::cache::{palette_generation, row_key};
 use crate::font;
 use crate::geometry::{cell_at, grid_size};
 use crate::input::{self, Chord, Platform};
-use crate::pipeline::{CursorSpec, Frame, FrameRow, Highlight, TerminalPrimitive, default_colors};
+use crate::pipeline::{
+    CursorSpec, Frame, FrameImage, FrameRow, Highlight, TerminalPrimitive, default_colors,
+};
 use crate::selection::{self, GridPoint, Mode, Selection};
 use crate::style::{Catalog, Style, StyleFn};
 
@@ -1116,12 +1118,11 @@ where
             .filter(|preedit| !preedit.is_empty() && self.focused);
 
         let mut lines = Vec::with_capacity(usize::from(grid.rows));
+        let mut images = Vec::new();
         for index in 0..grid.rows {
             let stable = top + i64::from(index);
-            let mut spans = view
-                .row(stable)
-                .map(|row| row.spans.clone())
-                .unwrap_or_default();
+            let row = view.row(stable);
+            let mut spans = row.map(|row| row.spans.clone()).unwrap_or_default();
             if let Some(preedit) = preedit.filter(|_| stable == cursor_row) {
                 overlay_preedit(&mut spans, view.cursor.x, preedit, grid.cols);
             }
@@ -1129,6 +1130,23 @@ where
                 key: row_key(&spans, self.font_size),
                 spans,
             });
+            for span in row.map_or(&[][..], |row| &row.images) {
+                // Until its pixels arrived an image is not drawn; the cells
+                // show what is under it.
+                let Some(pixels) = view.image(span.image) else {
+                    continue;
+                };
+                images.push(FrameImage {
+                    row: index,
+                    start_col: span.start_col,
+                    cell_count: span.cell_count,
+                    source: span.source,
+                    inset: span.inset,
+                    z_index: span.z_index,
+                    image: span.image,
+                    pixels,
+                });
+            }
         }
 
         let selection = state
@@ -1165,6 +1183,7 @@ where
             palette,
             reverse_video: view.modes.reverse_video,
             lines,
+            images,
             selection,
             selection_color: style.selection,
             cursor,
@@ -1186,6 +1205,7 @@ where
             palette,
             reverse_video: false,
             lines: Vec::new(),
+            images: Vec::new(),
             selection: Vec::new(),
             selection_color: style.selection,
             cursor: None,

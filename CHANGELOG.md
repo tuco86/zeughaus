@@ -106,6 +106,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pipeline for the CI. Its system prompt block and skill tell the agent to
   run only the unit tier of the crates or packages it touched before a
   push; the pipelines run the rest.
+- Terminal panes draw sixel and iTerm2 images (an omp chart below a table
+  used to be a gap of empty rows). The controlling pane reports its cell
+  size in device pixels with every resize, rows carry image spans, and an
+  editor fetches each image's pixels once by content hash on the new
+  `ResourceFetch`/`Resource` exchange. The mux protocol major is 4: an
+  editor and a runner or CI of different builds refuse to attach until both
+  have updated. Kitty graphics stay off.
 
 ### Changed
 

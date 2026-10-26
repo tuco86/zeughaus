@@ -424,13 +424,14 @@ topology. The codec is a fixed frame header (length, protocol version, stable
 numeric kind, flags, request id) over `postcard` bodies, every length bounded
 before allocation; golden tests pin the header and the kind numbers.
 
-**Three exchange kinds** ride one pooled QUIC connection, told apart by their
+**Four exchange kinds** ride one pooled QUIC connection, told apart by their
 first frame. A *control* exchange per client carries the attach (hello,
 topology, one head per terminal, so the first paint is one round trip), the
 structural commands with correlated, deduplicated replies, and every later
 snapshot. A *terminal* exchange per attached terminal is full duplex: input
-up, deltas down. *Row fetches* are short exchanges of their own so a
-scrollback page cannot block a keystroke. A delta is computed per subscriber
+up, deltas down. *Row fetches* and *resource fetches* (an image's pixels)
+are short exchanges of their own so a scrollback page or an image cannot
+block a keystroke. A delta is computed per subscriber
 from the last sequence number that subscriber received and carries every
 retained row written since, so a slow client gets fewer, larger deltas and
 never a queue; output is coalesced at a 12 ms cadence. The client
@@ -446,6 +447,21 @@ numbers belong to one screen: the primary and the alternate screen count
 theirs independently, so every switch between them starts a new epoch, and
 the runner answers it with a fresh head instead of a delta. Fetches and
 pages name their epoch; a stale one is refused.
+
+**Images.** Sixel and iTerm2 images are drawn; kitty graphics stay off,
+because its placements, deletes and unicode placeholders are not what a row
+carries. The controlling pane reports its cell in device pixels with every
+resize (`TerminalCommand::Resize { size, cell }`), the runner gives
+`wezterm-term` the grid's size in pixels from it, so images land on cells
+and a child's `CSI 14 t`/`CSI 16 t` is answered; the PTY itself keeps a
+size of 0 pixels. A row carries `ImageSpan`s: which image (its content
+hash), which part of it in image pixels, over which cells, inset within
+them. The runner remembers the 64 images rows were last built with; a
+client fetches each image's RGBA pixels once (`ResourceFetch`/`Resource`,
+at most 8192 px a side and 16 MiB), holds 32 per terminal, and
+`iced_terminal` draws them as textures through its glyph pipeline, above
+the cell backgrounds and below the selection and the text. Text written
+over an image replaces it cell by cell, as in any terminal.
 
 **Keys and alerts.** A key travels as semantics (key, modifiers, press or
 release) and is encoded in the runner, where the modes are known:
@@ -1627,7 +1643,6 @@ Kept here so they are not mistaken for descriptions of the code:
   needed.
 - Rich per-type inspection widgets on edges; nodes show text or a frame.
 - A browser editor that reaches runners; the wasm build edits locally.
-- Terminal image protocols; the wire model reserves kinds for them.
 - Jobs of the graph (`job.run`), decided but not built; CI (section 14)
   has its own webhook intake, secrets and VM machines:
   - Reading run files in the editor; `/runs` is served, nothing calls it.

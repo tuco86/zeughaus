@@ -4,8 +4,10 @@
 //! 3200 cells, every one of which may have its own colours, and all of them
 //! may change in one frame. So the widget submits a single
 //! [`iced_wgpu::primitive::Primitive`] and this module turns a frame
-//! description into four instanced draws: backgrounds, the selection, glyphs
-//! from a shared atlas, and decorations plus the cursor, in that order.
+//! description into instanced draws: backgrounds, images, the selection,
+//! glyphs from a shared atlas, and decorations plus the cursor, in that
+//! order. Images are textures of their own, drawn by the glyph pipeline as
+//! colour glyphs, so they sit under the selection and the text.
 //!
 //! The work that must not happen per frame is shaping. A row is shaped once
 //! per distinct content (see [`crate::cache`]), its GPU instances are built
@@ -18,6 +20,7 @@
 //! too, and the per-surface buffers hang off it under the widget's id.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use bytemuck::{Pod, Zeroable};
@@ -25,7 +28,10 @@ use iced::advanced::graphics::text::{cosmic_text, font_system};
 use iced::{Color, Rectangle};
 use iced_graphics::Viewport;
 use iced_wgpu::primitive::{Pipeline, Primitive};
-use zeughaus_mux::{CellSpan, CellStyle, CursorShape, Palette, StyleFlags, Underline, WireColor};
+use zeughaus_mux::{
+    CellSpan, CellStyle, CursorShape, INSET_UNIT, ImageKey, ImagePixels, Palette, StyleFlags,
+    Underline, WireColor,
+};
 
 use crate::cache::{InstanceKey, Lru, RowKey, Shelf, char_columns};
 use crate::geometry::CellMetrics;
@@ -38,6 +44,9 @@ const SHAPE_CACHE_ROWS: usize = 4096;
 const INSTANCE_CACHE_ROWS: usize = 2048;
 /// The glyph atlas is a fixed square. Full means rebuild, never grow.
 const ATLAS_SIZE: u32 = 2048;
+/// Image textures kept across frames, shared by every surface. Beyond this
+/// the least recently drawn go and are uploaded again if they come back.
+const MAX_IMAGE_TEXTURES: usize = 64;
 
 const KIND_SOLID: u32 = 0;
 const KIND_CURLY: u32 = 1;
@@ -68,6 +77,8 @@ pub(crate) struct Frame {
     pub palette_generation: u64,
     pub reverse_video: bool,
     pub lines: Vec<FrameRow>,
+    /// The images over the visible rows whose pixels the view holds.
+    pub images: Vec<FrameImage>,
     pub selection: Vec<Highlight>,
     /// What the cells under the selection are filled with. The host's theme
     /// decides it: no terminal protocol names a selection colour, because the
@@ -81,6 +92,22 @@ pub(crate) struct Frame {
 pub(crate) struct FrameRow {
     pub key: RowKey,
     pub spans: Vec<CellSpan>,
+}
+
+/// Part of an image over adjacent cells of one screen row.
+#[derive(Debug)]
+pub(crate) struct FrameImage {
+    pub row: u16,
+    pub start_col: u16,
+    pub cell_count: u16,
+    /// The part of the image shown, in image pixels: left, top, right, bottom.
+    pub source: [u32; 4],
+    /// Where the image starts and ends inside the cells, in
+    /// 1/[`INSET_UNIT`] of a cell: left, top, right, bottom.
+    pub inset: [u16; 4],
+    pub z_index: i32,
+    pub image: ImageKey,
+    pub pixels: Arc<ImagePixels>,
 }
 
 /// A run of cells on one screen row to tint.
@@ -130,6 +157,19 @@ impl Primitive for TerminalPrimitive {
         render_pass.set_bind_group(0, &view.bind_group, &[]);
         view.base.draw(render_pass);
         view.backgrounds.draw(render_pass);
+
+        if !view.image_draws.is_empty() {
+            render_pass.set_pipeline(&pipeline.glyph);
+            render_pass.set_bind_group(0, &view.bind_group, &[]);
+            for (key, range) in &view.image_draws {
+                if let Some(texture) = pipeline.textures.get(key) {
+                    render_pass.set_bind_group(1, &texture.bind_group, &[]);
+                    view.images.draw_range(render_pass, range.clone());
+                }
+            }
+            render_pass.set_pipeline(&pipeline.quad);
+            render_pass.set_bind_group(0, &view.bind_group, &[]);
+        }
         view.selection.draw(render_pass);
 
         render_pass.set_pipeline(&pipeline.glyph);
@@ -420,6 +460,79 @@ impl Atlas {
 /// The atlas ran out of room.
 struct Full;
 
+/// One image's pixels on the GPU, bound the way the atlas is.
+struct ImageTexture {
+    /// Kept alive for the bind group's view of it.
+    _texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    /// The pipeline's frame clock when it was last drawn.
+    used: u64,
+}
+
+impl ImageTexture {
+    /// Uploads `pixels` with their colour converted the way colour glyphs
+    /// are, so an image and an emoji next to it match.
+    fn upload(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        atlas: &Atlas,
+        pixels: &ImagePixels,
+        used: u64,
+    ) -> Self {
+        let size = wgpu::Extent3d {
+            width: pixels.width,
+            height: pixels.height,
+            depth_or_array_layers: 1,
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iced_terminal image"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let table = &*SRGB_TO_LINEAR;
+        let linear: Vec<u8> = pixels
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| {
+                [
+                    table[p[0] as usize],
+                    table[p[1] as usize],
+                    table[p[2] as usize],
+                    p[3],
+                ]
+            })
+            .collect();
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &linear,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(pixels.width * 4),
+                rows_per_image: Some(pixels.height),
+            },
+            size,
+        );
+        let bind_group = Atlas::bind_group(device, &atlas.layout, &texture, &atlas.sampler);
+        ImageTexture {
+            _texture: texture,
+            bind_group,
+            used,
+        }
+    }
+}
+
 // ------------------------------------------------------- instance buffer ---
 
 /// A GPU buffer that grows to fit and is written from the first changed
@@ -492,6 +605,19 @@ impl InstanceBuffer {
         render_pass.set_vertex_buffer(0, buffer.slice(..));
         render_pass.draw(0..6, 0..self.len);
     }
+
+    /// Draws the instances of `range` that were written.
+    fn draw_range(&self, render_pass: &mut wgpu::RenderPass<'_>, range: Range<u32>) {
+        let Some(buffer) = &self.buffer else {
+            return;
+        };
+        let end = range.end.min(self.len);
+        if range.start >= end {
+            return;
+        }
+        render_pass.set_vertex_buffer(0, buffer.slice(..));
+        render_pass.draw(0..6, range.start..end);
+    }
 }
 
 // ----------------------------------------------------------- view state ----
@@ -525,6 +651,10 @@ struct ViewState {
     decorations: InstanceBuffer,
     selection: InstanceBuffer,
     cursor: InstanceBuffer,
+    /// Rewritten whole every frame: a screen shows a handful of images.
+    images: InstanceBuffer,
+    /// Runs of `images` that share one texture, in drawing order.
+    image_draws: Vec<(ImageKey, Range<u32>)>,
     rows: Vec<CachedRow>,
     cpu_backgrounds: Vec<QuadInstance>,
     cpu_glyphs: Vec<GlyphInstance>,
@@ -575,6 +705,11 @@ impl ViewState {
                 std::mem::size_of::<QuadInstance>(),
                 "iced_terminal cursor",
             ),
+            images: InstanceBuffer::new(
+                std::mem::size_of::<GlyphInstance>(),
+                "iced_terminal images",
+            ),
+            image_draws: Vec::new(),
             rows: Vec::new(),
             cpu_backgrounds: Vec::new(),
             cpu_glyphs: Vec::new(),
@@ -596,6 +731,9 @@ pub(crate) struct TerminalPipeline {
     instances: Lru<InstanceKey, Arc<RowInstances>>,
     views: HashMap<u64, ViewState>,
     swash: Mutex<cosmic_text::SwashCache>,
+    textures: HashMap<ImageKey, ImageTexture>,
+    /// Bumped by every prepare: what `ImageTexture::used` counts in.
+    texture_clock: u64,
 }
 
 impl Pipeline for TerminalPipeline {
@@ -712,6 +850,8 @@ impl Pipeline for TerminalPipeline {
             instances: Lru::new(INSTANCE_CACHE_ROWS),
             views: HashMap::new(),
             swash: Mutex::new(cosmic_text::SwashCache::new()),
+            textures: HashMap::new(),
+            texture_clock: 0,
         }
     }
 }
@@ -751,6 +891,7 @@ impl TerminalPipeline {
             let state = ViewState::new(device, &self.uniform_layout);
             let _ = self.views.insert(id, state);
         }
+        self.stage_images(frame, device, queue);
 
         let mut built: Vec<(InstanceKey, Arc<RowInstances>)> = Vec::with_capacity(shaped.len());
         for (index, row) in frame.lines.iter().enumerate() {
@@ -884,6 +1025,10 @@ impl TerminalPipeline {
         let cursor = cursor_quads(frame, cell_width, cell_height);
         view.cursor.write(device, queue, &cursor, 0);
 
+        let (images, draws) = image_instances(frame, &self.textures, cell_width, cell_height);
+        view.images.write(device, queue, &images, 0);
+        view.image_draws = draws;
+
         if view.uniform_size != size {
             view.uniform_size = size;
             queue.write_buffer(
@@ -987,6 +1132,38 @@ impl TerminalPipeline {
                 None => None,
             };
             let _ = self.atlas.glyphs.insert(key, entry);
+        }
+    }
+
+    /// Uploads the frame's images that have no texture yet, then drops the
+    /// least recently drawn textures beyond [`MAX_IMAGE_TEXTURES`]. An image
+    /// larger than the device's textures is not drawn.
+    fn stage_images(&mut self, frame: &Frame, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.texture_clock += 1;
+        let clock = self.texture_clock;
+        let max_side = device.limits().max_texture_dimension_2d;
+        for image in &frame.images {
+            if let Some(texture) = self.textures.get_mut(&image.image) {
+                texture.used = clock;
+                continue;
+            }
+            if image.pixels.width > max_side || image.pixels.height > max_side {
+                continue;
+            }
+            let texture = ImageTexture::upload(device, queue, &self.atlas, &image.pixels, clock);
+            let _ = self.textures.insert(image.image, texture);
+        }
+        while self.textures.len() > MAX_IMAGE_TEXTURES {
+            let oldest = self
+                .textures
+                .iter()
+                .filter(|(_, texture)| texture.used != clock)
+                .min_by_key(|(_, texture)| texture.used)
+                .map(|(key, _)| *key);
+            let Some(oldest) = oldest else {
+                break;
+            };
+            let _ = self.textures.remove(&oldest);
         }
     }
 
@@ -1144,6 +1321,65 @@ impl GlyphInstance {
             ..*self
         }
     }
+}
+
+/// One colour-glyph instance per frame image that has a texture, in drawing
+/// order (`z_index`, then image), and the runs of instances per texture.
+fn image_instances(
+    frame: &Frame,
+    textures: &HashMap<ImageKey, ImageTexture>,
+    cell_width: f32,
+    cell_height: f32,
+) -> (Vec<GlyphInstance>, Vec<(ImageKey, Range<u32>)>) {
+    let unit = f32::from(INSET_UNIT);
+    let mut placed: Vec<(i32, ImageKey, GlyphInstance)> = frame
+        .images
+        .iter()
+        .filter(|image| textures.contains_key(&image.image))
+        .filter_map(|image| {
+            let [left, top, right, bottom] = image.inset.map(f32::from);
+            let rect = [
+                f32::from(image.start_col) * cell_width + left * cell_width / unit,
+                f32::from(image.row) * cell_height + top * cell_height / unit,
+                f32::from(image.cell_count) * cell_width - (left + right) * cell_width / unit,
+                cell_height - (top + bottom) * cell_height / unit,
+            ];
+            if rect[2] <= 0.0 || rect[3] <= 0.0 {
+                return None;
+            }
+            let width = image.pixels.width as f32;
+            let height = image.pixels.height as f32;
+            let [x0, y0, x1, y1] = image.source.map(|v| v as f32);
+            let instance = GlyphInstance {
+                rect,
+                uv: [
+                    x0 / width,
+                    y0 / height,
+                    (x1 - x0) / width,
+                    (y1 - y0) / height,
+                ],
+                color: [1.0; 4],
+                flags: FLAG_COLOR_GLYPH,
+                padding: [0; 3],
+            };
+            Some((image.z_index, image.image, instance))
+        })
+        .collect();
+    placed.sort_by_key(|(z_index, key, _)| (*z_index, *key));
+
+    let mut draws: Vec<(ImageKey, Range<u32>)> = Vec::new();
+    for (index, (_, key, _)) in placed.iter().enumerate() {
+        let index = index as u32;
+        match draws.last_mut() {
+            Some((last, range)) if last == key => range.end = index + 1,
+            _ => draws.push((*key, index..index + 1)),
+        }
+    }
+    let instances = placed
+        .into_iter()
+        .map(|(_, _, instance)| instance)
+        .collect();
+    (instances, draws)
 }
 
 // --------------------------------------------------------------- shaping ---
@@ -1471,6 +1707,7 @@ mod tests {
             palette_generation: 0,
             reverse_video: false,
             lines: Vec::new(),
+            images: Vec::new(),
             selection: Vec::new(),
             selection_color: Color::from_rgb(0.3, 0.3, 0.8),
             cursor: None,
@@ -1527,6 +1764,7 @@ mod tests {
                         spans: Vec::new(),
                     },
                 ],
+                images: Vec::new(),
                 selection: vec![Highlight {
                     row: 1,
                     from: 0,
@@ -1812,6 +2050,138 @@ mod tests {
                 for pixel in pixels[start..start + width as usize * 4].as_chunks::<4>().0 {
                     assert_eq!(pixel[3], 255, "the background is opaque everywhere");
                     assert_eq!(pixel[..3], expected, "nothing but the background is drawn");
+                }
+            }
+        }
+
+        /// An image's pixels reach the cells its span names, and only those.
+        #[test]
+        fn an_image_reaches_the_target_texture() {
+            let Some((_turn, device, queue)) = headless_device() else {
+                eprintln!("iced_terminal: no wgpu adapter, skipping the GPU smoke test");
+                return;
+            };
+
+            let format = wgpu::TextureFormat::Rgba8Unorm;
+            let mut pipeline = TerminalPipeline::new(&device, &queue, format);
+            let red = ImagePixels {
+                width: 16,
+                height: 16,
+                rgba: [255, 0, 0, 255].repeat(16 * 16),
+            };
+            let frame = Frame {
+                images: vec![FrameImage {
+                    row: 0,
+                    start_col: 1,
+                    cell_count: 2,
+                    source: [0, 0, 16, 16],
+                    inset: [0; 4],
+                    z_index: 0,
+                    image: ImageKey([1; 32]),
+                    pixels: Arc::new(red),
+                }],
+                ..test_frame()
+            };
+            // Two rows of eight 8x16 cells.
+            let (width, height) = (64u32, 32u32);
+            let bounds = Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: width as f32,
+                height: height as f32,
+            };
+            let viewport = Viewport::with_physical_size(iced::Size::new(width, height), 1.0);
+            let primitive = TerminalPrimitive {
+                id: 9,
+                frame: Arc::new(frame),
+            };
+            primitive.prepare(&mut pipeline, &device, &queue, &bounds, &viewport);
+
+            let target = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("image target"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+            let bytes_per_row = (width * 4).div_ceil(256) * 256;
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("image readback"),
+                size: u64::from(bytes_per_row) * u64::from(height),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("image pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &target_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_viewport(0.0, 0.0, width as f32, height as f32, 0.0, 1.0);
+                assert!(primitive.draw(&pipeline, &mut pass));
+            }
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &target,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(bytes_per_row),
+                        rows_per_image: Some(height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let _ = queue.submit([encoder.finish()]);
+            readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let pixels = readback.slice(..).get_mapped_range().to_vec();
+
+            let background = shader_color(Palette::default().background, 1.0);
+            let background = [
+                (background[0] * 255.0).round() as u8,
+                (background[1] * 255.0).round() as u8,
+                (background[2] * 255.0).round() as u8,
+            ];
+            for y in 0..height as usize {
+                for x in 0..width as usize {
+                    let at = y * bytes_per_row as usize + x * 4;
+                    let pixel = &pixels[at..at + 3];
+                    let in_image = (8..24).contains(&x) && y < 16;
+                    if in_image {
+                        assert_eq!(pixel, [255, 0, 0], "inside the image at {x},{y}");
+                    } else {
+                        assert_eq!(pixel, background, "outside the image at {x},{y}");
+                    }
                 }
             }
         }
