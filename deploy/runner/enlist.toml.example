@@ -11,6 +11,9 @@ name = "tuco-pc"
 cpus = 16
 # Size limit of the host workspaces under <state-dir>/ci/work.
 budget_gb = 50
+# Size limit of the blob cache under <state-dir>/ci/blobs: the files of the
+# artifact sets this runner fetched, kept so a file is fetched once.
+blob_cache_gb = 8
 
 # Present: this runner runs `image = ...` jobs in rootless podman containers.
 # [containers] and [machines] need a unix host; a Windows runner refuses them.

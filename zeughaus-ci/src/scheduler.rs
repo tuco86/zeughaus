@@ -159,7 +159,11 @@ pub struct TransferRecord {
     pub need: String,
     pub started: u64,
     pub finished: Option<u64>,
+    /// The sum of the set's file sizes.
     pub bytes: Option<u64>,
+    /// The compressed blob bytes that crossed the wire for it.
+    #[serde(default)]
+    pub moved: Option<u64>,
     pub error: Option<String>,
 }
 
@@ -1429,7 +1433,7 @@ impl Scheduler {
         let ready = *self.ready_since.entry(key.clone()).or_insert(now);
 
         // Inputs: what a need left, from this runner's own disk when the need
-        // ran here, else relayed by the CI from the need's runner, which has
+        // ran here, else through the CI from the need's runner, which has
         // to be connected for that.
         let mut inputs = Vec::new();
         for need in &job.def.needs {
@@ -1852,15 +1856,17 @@ impl Scheduler {
                     started: now,
                     finished: None,
                     bytes: None,
+                    moved: None,
                     error: None,
                 });
             }
-            TransferEvent::Done { bytes } => {
+            TransferEvent::Done { bytes, moved } => {
                 let Some(transfer) = open_transfer(job, &need) else {
                     return;
                 };
                 transfer.finished = Some(now);
                 transfer.bytes = Some(bytes);
+                transfer.moved = Some(moved);
             }
             TransferEvent::Failed { message } => {
                 let Some(transfer) = open_transfer(job, &need) else {
@@ -3689,13 +3695,30 @@ mod tests {
             let open = transfers(&s);
             assert_eq!(open.len(), 1);
             assert_eq!((open[0].need.as_str(), open[0].finished), ("a", None));
-            s.handle(report("x", "a", TransferEvent::Done { bytes: 99 }));
+            s.handle(report(
+                "x",
+                "a",
+                TransferEvent::Done {
+                    bytes: 99,
+                    moved: 9,
+                },
+            ));
             assert_eq!(transfers(&s), open, "x is not the runner of b");
 
-            s.handle(report("y", "a", TransferEvent::Done { bytes: 10 }));
+            s.handle(report(
+                "y",
+                "a",
+                TransferEvent::Done {
+                    bytes: 10,
+                    moved: 4,
+                },
+            ));
             let done = transfers(&s);
             assert_eq!(done.len(), 1);
-            assert_eq!((done[0].bytes, done[0].error.as_deref()), (Some(10), None));
+            assert_eq!(
+                (done[0].bytes, done[0].moved, done[0].error.as_deref()),
+                (Some(10), Some(4), None)
+            );
             assert!(done[0].finished.is_some());
 
             // A new attempt replaces one that never ended; a failure keeps its
@@ -3739,6 +3762,7 @@ mod tests {
                 started: 6,
                 finished: None,
                 bytes: None,
+                moved: None,
                 error: None,
             });
             s.running.push(p);
@@ -3818,6 +3842,7 @@ mod tests {
                 started: 1,
                 finished: Some(2),
                 bytes: Some(3),
+                moved: Some(1),
                 error: None,
             };
             // `a` left a set and `b` took it early; `c` failed, so `b` is skipped.
@@ -3898,6 +3923,7 @@ mod tests {
                 started: 1,
                 finished: None,
                 bytes: None,
+                moved: None,
                 error: None,
             };
             let assert_closed = |b: &JobRecord| {
@@ -4049,6 +4075,7 @@ mod tests {
                 started: 51,
                 finished: None,
                 bytes: None,
+                moved: None,
                 error: None,
             });
             s.running.push(p);

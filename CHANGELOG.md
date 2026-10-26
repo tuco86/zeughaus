@@ -116,6 +116,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CI: artifact sets move by content instead of as one tar. A set is a
+  manifest of its files by BLAKE3 root (new crate `zeughaus-blobs`); the CI
+  keeps a store of zstd-compressed files (3 days, 2 GiB) and every runner a
+  cache of the files it fetched (7 days, `blob_cache_gb` in `enlist.toml`,
+  8 GiB by default). The producing runner uploads only the files the CI
+  lacks, compressed, and a consuming runner downloads only the files its
+  cache lacks, so a file that did not change crosses an uplink at most
+  once. `ci_timing` shows per input how many compressed bytes moved next
+  to the set's size. The enlist protocol is major 7: CI and runners refuse
+  each other until both run this build.
 - weida is a git dependency pinned to a commit of its public GitHub mirror
   instead of a path dependency on the sibling checkout `../weida`, so work in
   progress there no longer changes what zeughaus builds locally or in the

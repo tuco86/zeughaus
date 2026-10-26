@@ -903,6 +903,7 @@ fn job_view(job: &JobRecord) -> JobView {
                 started: t.started,
                 finished: t.finished,
                 bytes: t.bytes,
+                moved: t.moved,
                 error: t.error.clone(),
             })
             .collect(),

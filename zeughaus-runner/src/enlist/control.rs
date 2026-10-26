@@ -1,5 +1,6 @@
 //! This runner's own clock: once a second it lets idle machines stop, ends
-//! machine jobs that ran too long and tells the CI what changed.
+//! machine jobs that ran too long and tells the CI what changed; once an
+//! hour it sweeps the blob cache.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -11,6 +12,10 @@ use zeughaus_link::enlist::{FromRunner, Place};
 use super::{Executor, RunCtl, lock};
 
 const TICK: Duration = Duration::from_secs(1);
+
+/// How often the blob cache is swept, and how young a blob or set it leaves
+/// alone.
+const SWEEP_EVERY: Duration = Duration::from_secs(3600);
 
 /// What the CI was last told on one connection.
 #[derive(Default)]
@@ -27,6 +32,7 @@ pub fn spawn(exec: &Arc<Executor>) {
         .spawn(move || {
             let mut last = Instant::now();
             let mut told = Told::default();
+            let mut since_sweep = Duration::ZERO;
             loop {
                 std::thread::sleep(TICK);
                 let elapsed = last.elapsed();
@@ -36,6 +42,11 @@ pub fn spawn(exec: &Arc<Executor>) {
                 }
                 exec.machine_timeouts(elapsed);
                 exec.announce(&mut told);
+                since_sweep += elapsed;
+                if since_sweep >= SWEEP_EVERY {
+                    since_sweep = Duration::ZERO;
+                    exec.sweep_blobs(SWEEP_EVERY);
+                }
             }
         });
     if let Err(e) = spawned {

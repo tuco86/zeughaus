@@ -1,0 +1,18 @@
+[package]
+name = "zeughaus-blobs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Content-addressed artifact files of zeughaus CI: manifests, blob stores, materialization and sweeping"
+
+[dependencies]
+# The manifest and its encoding are wire types of the enlist protocol.
+zeughaus-link = { workspace = true, features = ["tokio"] }
+# A file's root is its BLAKE3 hash, the same id weida gives a blob.
+blake3 = "1.8"
+# Blobs travel and rest on the CI zstd-compressed.
+zstd = "0.13"
+hex = "0.4"

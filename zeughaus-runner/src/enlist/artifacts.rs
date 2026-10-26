@@ -1,25 +1,31 @@
-//! Artifact sets crossing to and from the CI.
+//! Artifact sets crossing to and from the CI, file by file.
 //!
 //! An artifact set lives on the runner that produced it, under
 //! `ci/artifacts/<run>`, until the CI says `DropArtifacts`. A job that needs
-//! another job's set and runs on another runner gets it relayed by the CI's
-//! `/artifacts` service, which stores nothing: the consumer's `Download` makes
-//! the CI ask the producer to `Upload` as one `transfer`, and the CI relays
-//! those chunks to the consumer. One exchange per transfer: an
-//! [`ArtifactRequest`] frame, then the chunks of the set in whichever
-//! direction the request names (`zeughaus_link::enlist` has the framing).
+//! another job's set and runs on another runner gets it through the CI's
+//! `/artifacts` service, which keeps the set's files by content
+//! (`zeughaus_link::enlist` has the exchanges and their framing):
 //!
-//! A set is never a file in transit. The producer's upload thread writes the
-//! tar into a [`ChunkWriter`] and a task sends what it fills; the consumer's
-//! task receives, and its thread unpacks from a [`ChunkReader`] as the chunks
-//! arrive. A short queue sits between thread and task at both ends, so reading
-//! and writing files overlaps with moving bytes, and neither runner needs the
-//! disk space of a second copy.
+//! * When the CI lacks a set it says `Upload`; the producer hashes the set
+//!   into a manifest and `Offer`s it, and sends the files the CI names, each
+//!   compressed, as `Blobs`. A file the CI holds from an earlier set never
+//!   leaves this runner again.
+//! * A consumer reads the set's `Manifest`, `Fetch`es the files its blob
+//!   cache (`ci/blobs`) lacks, and copies the set out of the cache into its
+//!   destination. The set is recorded under `ci/blob-sets`, which keeps its
+//!   files in the cache for the next pipeline.
 //!
-//! The bundles of a manual run come the same way from the CI itself, which
-//! stored them (`ManualBundle`), straight into the run's own directory: they
-//! go with it.
+//! A blob is never a file in transit on this side's wire queue: the
+//! producer's upload thread compresses into a [`ChunkWriter`] while a task
+//! sends what it fills; the consumer's task receives, and its thread writes
+//! each chunk into the cache as it arrives. A short queue sits between thread
+//! and task at both ends, so reading and writing files overlaps with moving
+//! bytes.
+//!
+//! The bundles of a manual run come from the CI itself, which stored them
+//! (`ManualBundle`), straight into the run's own directory: they go with it.
 
+use std::collections::HashMap;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,32 +33,64 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use weida::{OutgoingTransfer, ReplyStream, TransferMeta};
+use zeughaus_blobs::{Root, compress_file, manifest_of, materialize, missing, record_set};
 use zeughaus_link::ARTIFACTS_PATH;
 use zeughaus_link::enlist::{
-    ARTIFACT_CHUNK, ArtifactReply, ArtifactRequest, FromRunner, MAX_ARTIFACT_BYTES, TransferEvent,
-    read_chunk, read_frame, write_chunk, write_end, write_frame,
+    ARTIFACT_CHUNK, ArtifactReply, ArtifactRequest, BlobHead, FromRunner, MAX_ARTIFACT_BYTES,
+    MAX_MANIFEST_BYTES, MAX_SET_ENTRIES, SetEntry, SetManifest, TransferEvent, decode_roots,
+    encode_roots, read_chunk, read_frame, write_chunk, write_end, write_frame,
 };
 
 use super::cleanup::remove_tree;
 use super::run::safe_run;
-use super::{Executor, artifacts_dir};
+use super::{Executor, artifacts_dir, blob_sets_dir};
 
 /// Chunks that wait between the thread that reads or writes files and the
 /// task that moves the bytes.
 const QUEUE: usize = 4;
 
-/// What the thread that packs a set hands to the task that sends it.
+/// The zstd level of an upload. The uplink is the bottleneck, and level 9
+/// still compresses at tens of MB/s.
+const UPLOAD_LEVEL: i32 = 9;
+
+/// What the thread that compresses blobs hands to the task that sends them.
 enum Piece {
+    /// The next blob begins.
+    Head(BlobHead),
     Bytes(Vec<u8>),
-    /// The tar is complete.
+    /// The blob is complete.
+    BlobEnd,
+    /// Every blob is sent.
     End,
 }
 
-/// What the task that receives a set hands to the thread that unpacks it.
+/// What the task that receives hands to the thread that writes.
 enum Received {
+    /// The next blob begins.
+    Head(BlobHead),
     Bytes(Vec<u8>),
-    /// The end marker arrived.
+    /// The blob's end marker arrived.
+    BlobEnd,
+    /// The end marker of the body arrived, or after the last blob, its end.
     End,
+}
+
+/// How the body of a reply after `Sending` is framed.
+#[derive(Clone, Copy)]
+enum Body {
+    /// Chunks up to one end marker.
+    Chunks,
+    /// Blobs: a [`BlobHead`] frame, chunks and an end marker each, until the
+    /// reply ends.
+    Blobs,
+}
+
+/// What fetching one input moved.
+pub(super) struct Fetched {
+    /// The sum of the set's file sizes.
+    pub bytes: u64,
+    /// The compressed bytes that crossed the wire.
+    pub moved: u64,
 }
 
 impl Executor {
@@ -89,8 +127,8 @@ impl Executor {
         }
     }
 
-    /// Sends the artifacts of `run` to the CI as `transfer`, on a thread of
-    /// its own.
+    /// Offers the artifacts of `run` to the CI as `transfer` and sends the
+    /// files it lacks, on a thread of its own.
     pub fn upload(self: &Arc<Self>, run: String, transfer: u64) {
         let exec = Arc::clone(self);
         let spawned = std::thread::Builder::new()
@@ -105,19 +143,38 @@ impl Executor {
         }
     }
 
-    /// Packs the set on this thread while a task sends what is packed.
+    /// Hashes the set and offers it, then compresses on this thread what the
+    /// CI lacks while a task sends what is compressed.
     fn upload_blocking(self: &Arc<Self>, run: &str, transfer: u64) -> Result<(), String> {
-        let dir = match self.set_dir(run) {
-            Ok(dir) => dir,
+        let listed = self.set_dir(run).and_then(|dir| manifest_of(&dir));
+        let (manifest, sources) = match listed {
+            Ok(listed) => listed,
             Err(e) => {
-                // The CI holds a download waiting for this transfer: tell it
-                // now rather than let it time out.
-                if let Err(report) = self
-                    .handle
-                    .block_on(self.send_unavailable(run, transfer, &e))
-                {
-                    eprintln!("[enlist] {run}: cannot report the set unavailable: {report}");
-                }
+                self.report_unavailable(run, transfer, &e);
+                return Err(e);
+            }
+        };
+        let wanted = self
+            .handle
+            .block_on(self.offer_set(run, transfer, &manifest))?;
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let sizes = sizes_of(&manifest);
+        let blobs: Result<Vec<(BlobHead, PathBuf)>, String> = wanted
+            .iter()
+            .map(|root| match (sizes.get(root), sources.get(root)) {
+                (Some(&size), Some(path)) => Ok((BlobHead { root: *root, size }, path.clone())),
+                _ => Err(format!(
+                    "the CI asked for {}, which is no file of {run}",
+                    hex::encode(root)
+                )),
+            })
+            .collect();
+        let blobs = match blobs {
+            Ok(blobs) => blobs,
+            Err(e) => {
+                self.report_unavailable(run, transfer, &e);
                 return Err(e);
             }
         };
@@ -127,7 +184,7 @@ impl Executor {
         let sender = self
             .handle
             .spawn(async move { exec.send_stream(&name, transfer, rx).await });
-        let packed = pack(&dir, tx);
+        let packed = compress_blobs(&blobs, tx);
         let sent = self
             .handle
             .block_on(sender)
@@ -137,10 +194,59 @@ impl Executor {
             // The writer fails like this only when the sender stopped first,
             // and the sender's error says why.
             Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
-                sent.and(Err(format!("cannot pack {}: {e}", dir.display())))
+                sent.and(Err(format!("cannot compress {run}: {e}")))
             }
-            Err(e) => Err(format!("cannot pack {}: {e}", dir.display())),
+            Err(e) => Err(format!("cannot compress {run}: {e}")),
         }
+    }
+
+    /// The CI holds a fill waiting for this transfer: tell it now rather than
+    /// let it time out.
+    fn report_unavailable(&self, run: &str, transfer: u64, message: &str) {
+        if let Err(report) = self
+            .handle
+            .block_on(self.send_unavailable(run, transfer, message))
+        {
+            eprintln!("[enlist] {run}: cannot report the set unavailable: {report}");
+        }
+    }
+
+    /// Offers the manifest of `run` as `transfer`; the CI answers with the
+    /// roots it lacks.
+    async fn offer_set(
+        &self,
+        run: &str,
+        transfer: u64,
+        manifest: &SetManifest,
+    ) -> Result<Vec<Root>, String> {
+        let (mut out, reply) = self.open_exchange().await?;
+        let request = ArtifactRequest::Offer {
+            run: run.to_owned(),
+            transfer,
+        };
+        write_frame(&mut out, &request).await?;
+        for chunk in manifest.encode().chunks(ARTIFACT_CHUNK) {
+            write_chunk(&mut out, chunk).await?;
+        }
+        write_end(&mut out).await?;
+        out.finish().map_err(|e| format!("finish: {e}"))?;
+        let mut body = reply.recv().await.map_err(|e| format!("reply: {e}"))?;
+        match read_frame::<_, ArtifactReply>(&mut body).await? {
+            Some(ArtifactReply::Sending) => {}
+            Some(ArtifactReply::Error { message }) => return Err(message),
+            Some(ArtifactReply::Done) | None => {
+                return Err("the CI did not answer the offer".to_owned());
+            }
+        }
+        let mut roots = Vec::new();
+        let mut chunk = Vec::new();
+        while read_chunk(&mut body, &mut chunk).await? {
+            if roots.len() + chunk.len() > 32 * MAX_SET_ENTRIES {
+                return Err("the CI asked for more blobs than a set holds".to_owned());
+            }
+            roots.extend_from_slice(&chunk);
+        }
+        decode_roots(&roots)
     }
 
     /// The directory of `run`'s artifact set.
@@ -187,8 +293,8 @@ impl Executor {
         verdict(reply, "report").await
     }
 
-    /// Opens the exchange for `transfer` and sends what `pieces` yields as
-    /// the chunks of the upload, up to the end of the set.
+    /// Opens the `Blobs` exchange for `transfer` and sends what `pieces`
+    /// yields, up to the last blob.
     async fn send_stream(
         &self,
         run: &str,
@@ -196,7 +302,7 @@ impl Executor {
         mut pieces: mpsc::Receiver<Piece>,
     ) -> Result<(), String> {
         let (mut out, reply) = self.open_exchange().await?;
-        let request = ArtifactRequest::Upload {
+        let request = ArtifactRequest::Blobs {
             run: run.to_owned(),
             transfer,
         };
@@ -204,35 +310,35 @@ impl Executor {
         let mut ended = false;
         while let Some(piece) = pieces.recv().await {
             match piece {
+                Piece::Head(head) => write_frame(&mut out, &head).await?,
                 Piece::Bytes(bytes) => write_chunk(&mut out, &bytes).await?,
+                Piece::BlobEnd => write_end(&mut out).await?,
                 Piece::End => {
-                    write_end(&mut out).await?;
                     ended = true;
                     break;
                 }
             }
         }
-        // A set that was never completed is finished without its end marker:
-        // the CI answers it and the download that waits for it sees the break.
+        // Blobs that were never completed end the body early: the CI sees a
+        // blob cut short, or fewer blobs than it asked for.
         out.finish().map_err(|e| format!("finish: {e}"))?;
         let confirmed = verdict(reply, "upload").await;
         if !ended {
-            return Err("packing the set failed".to_owned());
+            return Err("compressing the set failed".to_owned());
         }
         confirmed
     }
 
     /// Fetches the set of `run` into `dest` as the input `need` of the job
     /// `consumer`, and tells the CI how it went: the transfer is what an
-    /// editor shows of a job that waits for its inputs. Returns the bytes
-    /// received.
+    /// editor shows of a job that waits for its inputs.
     pub(super) fn fetch_input(
         self: &Arc<Self>,
         consumer: &str,
         need: &str,
         run: &str,
         dest: &Path,
-    ) -> Result<u64, String> {
+    ) -> Result<Fetched, String> {
         let report = |event| {
             self.send(FromRunner::Transfer {
                 run: consumer.to_owned(),
@@ -243,7 +349,10 @@ impl Executor {
         report(TransferEvent::Started);
         let fetched = self.download(run, dest);
         report(match &fetched {
-            Ok(bytes) => TransferEvent::Done { bytes: *bytes },
+            Ok(fetched) => TransferEvent::Done {
+                bytes: fetched.bytes,
+                moved: fetched.moved,
+            },
             Err(message) => TransferEvent::Failed {
                 message: message.clone(),
             },
@@ -251,20 +360,37 @@ impl Executor {
         fetched
     }
 
-    /// Fetches the artifacts of `run` from the CI, which relays them from the
-    /// runner that produced them, and unpacks them into `dest` as they
-    /// arrive. Returns the bytes received. Called on the thread that prepares
-    /// a job.
-    pub fn download(self: &Arc<Self>, run: &str, dest: &Path) -> Result<u64, String> {
-        let request = ArtifactRequest::Download {
+    /// Fetches the artifacts of `run` through the CI: its manifest, then the
+    /// blobs the cache lacks, and copies the set out of the cache into
+    /// `dest`. Called on the thread that prepares a job.
+    fn download(self: &Arc<Self>, run: &str, dest: &Path) -> Result<Fetched, String> {
+        let request = ArtifactRequest::Manifest {
             run: run.to_owned(),
         };
-        let (mut reader, task) = self.receive(request);
-        let unpacked = unpack(&mut reader, dest);
-        let bytes = reader.bytes;
+        let (rx, task) = self.receive(request, None, Body::Chunks);
+        let mut reader = ChunkReader::new(rx);
+        let read = read_to_limit(&mut reader, MAX_MANIFEST_BYTES);
         drop(reader);
         self.finish_receiving(task);
-        unpacked.map(|()| bytes)
+        let manifest = SetManifest::decode(&read?)?;
+
+        let wanted = missing(&manifest, &self.blobs);
+        let mut moved = 0;
+        if !wanted.is_empty() {
+            let roots: Vec<Root> = wanted.iter().map(|(root, _)| *root).collect();
+            let request = ArtifactRequest::Fetch {
+                run: run.to_owned(),
+            };
+            let (rx, task) = self.receive(request, Some(encode_roots(&roots)), Body::Blobs);
+            let stored = store_blobs(&self.blobs, &wanted, rx);
+            self.finish_receiving(task);
+            moved = stored?;
+        }
+        let bytes = materialize(&manifest, &self.blobs, dest)?;
+        if let Err(e) = record_set(&blob_sets_dir(&self.state_dir), run, &manifest) {
+            eprintln!("[enlist] {run}: the blob cache does not keep the set: {e}");
+        }
+        Ok(Fetched { bytes, moved })
     }
 
     /// Fetches bundle `index` of the manual run `run` from the CI, which stored
@@ -285,22 +411,29 @@ impl Executor {
             run: run.to_owned(),
             index,
         };
-        let (mut reader, task) = self.receive(request);
+        let (rx, task) = self.receive(request, None, Body::Chunks);
+        let mut reader = ChunkReader::new(rx);
         let saved = save(&mut reader, dest);
         drop(reader);
         self.finish_receiving(task);
         saved
     }
 
-    /// Starts the exchange for `request` on a task of the runtime. Returns the
-    /// reader of what the CI answers with, and the task that feeds it.
-    fn receive(self: &Arc<Self>, request: ArtifactRequest) -> (ChunkReader, JoinHandle<()>) {
+    /// Starts the exchange for `request` on a task of the runtime, with
+    /// `upload` as chunks after the request frame. Returns the queue of what
+    /// the CI answers with, read as `mode` says, and the task that feeds it.
+    fn receive(
+        self: &Arc<Self>,
+        request: ArtifactRequest,
+        upload: Option<Vec<u8>>,
+        mode: Body,
+    ) -> (mpsc::Receiver<Result<Received, String>>, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(QUEUE);
         let exec = Arc::clone(self);
         let task = self
             .handle
-            .spawn(async move { exec.receive_stream(request, tx).await });
-        (ChunkReader::new(rx), task)
+            .spawn(async move { exec.receive_stream(request, upload, mode, tx).await });
+        (rx, task)
     }
 
     /// Ends the task of [`Executor::receive`] and waits until it is gone and
@@ -319,9 +452,11 @@ impl Executor {
     async fn receive_stream(
         &self,
         request: ArtifactRequest,
+        upload: Option<Vec<u8>>,
+        mode: Body,
         tx: mpsc::Sender<Result<Received, String>>,
     ) {
-        if let Err(message) = self.pass_chunks(request, &tx).await {
+        if let Err(message) = self.pass_chunks(request, upload, mode, &tx).await {
             let _ = tx.send(Err(message)).await;
         }
     }
@@ -329,10 +464,18 @@ impl Executor {
     async fn pass_chunks(
         &self,
         request: ArtifactRequest,
+        upload: Option<Vec<u8>>,
+        mode: Body,
         tx: &mpsc::Sender<Result<Received, String>>,
     ) -> Result<(), String> {
         let (mut out, reply) = self.open_exchange().await?;
         write_frame(&mut out, &request).await?;
+        if let Some(upload) = upload {
+            for chunk in upload.chunks(ARTIFACT_CHUNK) {
+                write_chunk(&mut out, chunk).await?;
+            }
+            write_end(&mut out).await?;
+        }
         out.finish().map_err(|e| format!("finish: {e}"))?;
         let mut body = reply.recv().await.map_err(|e| format!("reply: {e}"))?;
         match read_frame::<_, ArtifactReply>(&mut body).await? {
@@ -344,18 +487,35 @@ impl Executor {
         }
         let mut chunk = Vec::new();
         let mut total = 0u64;
-        while read_chunk(&mut body, &mut chunk).await? {
-            total += chunk.len() as u64;
-            if total > MAX_ARTIFACT_BYTES {
-                return Err(format!("more than {MAX_ARTIFACT_BYTES} bytes"));
+        // Each send fails only when the reader is gone: nobody wants the rest.
+        loop {
+            if let Body::Blobs = mode {
+                match read_frame::<_, BlobHead>(&mut body).await? {
+                    Some(head) => {
+                        if tx.send(Ok(Received::Head(head))).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    None => break,
+                }
             }
-            if tx
-                .send(Ok(Received::Bytes(std::mem::take(&mut chunk))))
-                .await
-                .is_err()
-            {
-                // The reader is gone: nobody wants the rest.
-                return Ok(());
+            while read_chunk(&mut body, &mut chunk).await? {
+                total += chunk.len() as u64;
+                if total > MAX_ARTIFACT_BYTES {
+                    return Err(format!("more than {MAX_ARTIFACT_BYTES} bytes"));
+                }
+                let bytes = Received::Bytes(std::mem::take(&mut chunk));
+                if tx.send(Ok(bytes)).await.is_err() {
+                    return Ok(());
+                }
+            }
+            match mode {
+                Body::Chunks => break,
+                Body::Blobs => {
+                    if tx.send(Ok(Received::BlobEnd)).await.is_err() {
+                        return Ok(());
+                    }
+                }
             }
         }
         let _ = tx.send(Ok(Received::End)).await;
@@ -373,28 +533,96 @@ async fn verdict(reply: ReplyStream, what: &str) -> Result<(), String> {
     }
 }
 
-/// Packs the contents of `dir` as a tar into the chunks of `tx`, ending with
-/// the end of the set. Blocks while the sender is behind, so it runs on a
-/// thread, never in a task.
-fn pack(dir: &Path, tx: mpsc::Sender<Piece>) -> io::Result<()> {
-    let mut builder = tar::Builder::new(ChunkWriter::new(tx));
-    builder.append_dir_all(".", dir)?;
-    // Finishes the tar: its two closing blocks.
-    builder.into_inner()?.finish()
+/// The size of every root of `manifest`.
+fn sizes_of(manifest: &SetManifest) -> HashMap<Root, u64> {
+    manifest
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            SetEntry::File { root, size, .. } => Some((*root, *size)),
+            SetEntry::Dir { .. } => None,
+        })
+        .collect()
 }
 
-/// Unpacks the set that `reader` yields into `dest`, which is created, and
-/// reads on to its end marker. Paths that would leave `dest` are refused by
-/// the tar reader.
-fn unpack(reader: &mut ChunkReader, dest: &Path) -> Result<(), String> {
-    let failed = |e: io::Error| format!("cannot unpack into {}: {}", dest.display(), causes(&e));
-    std::fs::create_dir_all(dest).map_err(|e| format!("cannot create {}: {e}", dest.display()))?;
-    tar::Archive::new(&mut *reader)
-        .unpack(dest)
-        .map_err(failed)?;
-    // The tar reader stops at the first of the two closing blocks; what is
-    // left of the set, and the end marker, are still to come.
-    reader.drain().map_err(failed)
+/// Compresses each blob into the pieces of `tx`: its head, its chunks and its
+/// end, then the end of all of them. Blocks while the sender is behind, so it
+/// runs on a thread, never in a task.
+fn compress_blobs(blobs: &[(BlobHead, PathBuf)], tx: mpsc::Sender<Piece>) -> io::Result<()> {
+    let mut writer = ChunkWriter::new(tx);
+    for (head, path) in blobs {
+        writer.send(Piece::Head(*head))?;
+        compress_file(path, UPLOAD_LEVEL, &mut writer)?;
+        writer.end_blob()?;
+    }
+    writer.send(Piece::End)
+}
+
+/// Writes the blobs the receiving task passes on into `store`, each checked
+/// against the one asked for next. Returns the compressed bytes received.
+fn store_blobs(
+    store: &zeughaus_blobs::Store,
+    wanted: &[(Root, u64)],
+    mut rx: mpsc::Receiver<Result<Received, String>>,
+) -> Result<u64, String> {
+    let mut moved = 0u64;
+    let mut stored = 0;
+    let mut current = None;
+    loop {
+        match rx.blocking_recv() {
+            Some(Ok(Received::Head(head))) => {
+                let next = wanted
+                    .get(stored)
+                    .map(|&(root, size)| BlobHead { root, size });
+                if current.is_some() || next != Some(head) {
+                    return Err(format!(
+                        "blob {stored} the CI sent is not the one asked for"
+                    ));
+                }
+                let receiving = store
+                    .receive(head.root, head.size)
+                    .map_err(|e| format!("blob {}: {e}", hex::encode(head.root)))?;
+                current = Some(receiving);
+            }
+            Some(Ok(Received::Bytes(bytes))) => {
+                moved += bytes.len() as u64;
+                current
+                    .as_mut()
+                    .ok_or("the CI sent bytes outside a blob")?
+                    .write(&bytes)?;
+            }
+            Some(Ok(Received::BlobEnd)) => {
+                current
+                    .take()
+                    .ok_or("the CI ended a blob it did not begin")?
+                    .finish()?;
+                stored += 1;
+            }
+            Some(Ok(Received::End)) if stored == wanted.len() => return Ok(moved),
+            Some(Ok(Received::End)) => {
+                return Err(format!("the CI sent {stored} of {} blobs", wanted.len()));
+            }
+            Some(Err(message)) => return Err(message),
+            None => return Err("the transfer ended early".to_owned()),
+        }
+    }
+}
+
+/// What `reader` yields up to its end marker, at most `limit` bytes.
+fn read_to_limit(reader: &mut ChunkReader, limit: usize) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    loop {
+        let chunk = reader.fill_buf().map_err(|e| e.to_string())?;
+        if chunk.is_empty() {
+            return Ok(out);
+        }
+        if out.len() + chunk.len() > limit {
+            return Err(format!("more than {limit} bytes"));
+        }
+        out.extend_from_slice(chunk);
+        let n = chunk.len();
+        reader.consume(n);
+    }
 }
 
 /// Writes the set that `reader` yields, byte for byte, into the file `dest`.
@@ -413,22 +641,10 @@ fn save(reader: &mut ChunkReader, dest: &Path) -> Result<(), String> {
     }
 }
 
-/// `e` and the causes below it: the tar reader names what it was doing and
-/// keeps the reason out of its own words.
-fn causes(e: &io::Error) -> String {
-    let mut text = e.to_string();
-    let mut cause = std::error::Error::source(e);
-    while let Some(inner) = cause {
-        text = format!("{text}: {inner}");
-        cause = inner.source();
-    }
-    text
-}
-
-/// Receives the tar a [`tar::Builder`] writes, cuts it into chunks of
+/// Takes the zstd bytes of one blob after another, cuts them into chunks of
 /// [`ARTIFACT_CHUNK`] bytes and hands them to the task that sends them. Where
-/// a chunk ends is not the tar's business: a write fills the chunk that is
-/// open and starts the next.
+/// a chunk ends is not the encoder's business: a write fills the chunk that
+/// is open and starts the next.
 struct ChunkWriter {
     tx: mpsc::Sender<Piece>,
     buf: Vec<u8>,
@@ -448,13 +664,13 @@ impl ChunkWriter {
         }
     }
 
-    /// Hands on the chunk that is open and ends the set.
-    fn finish(mut self) -> io::Result<()> {
+    /// Hands on the chunk that is open and ends the blob.
+    fn end_blob(&mut self) -> io::Result<()> {
         if !self.buf.is_empty() {
-            let last = std::mem::take(&mut self.buf);
+            let last = std::mem::replace(&mut self.buf, Vec::with_capacity(ARTIFACT_CHUNK));
             self.send(Piece::Bytes(last))?;
         }
-        self.send(Piece::End)
+        self.send(Piece::BlobEnd)
     }
 
     fn send(&self, piece: Piece) -> io::Result<()> {
@@ -483,7 +699,7 @@ impl Write for ChunkWriter {
         Ok(bytes.len())
     }
 
-    /// The open chunk waits for more bytes until [`ChunkWriter::finish`].
+    /// The open chunk waits for more bytes until [`ChunkWriter::end_blob`].
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -500,8 +716,6 @@ struct ChunkReader {
     pos: usize,
     /// The end marker arrived.
     ended: bool,
-    /// Bytes received so far.
-    bytes: u64,
 }
 
 impl ChunkReader {
@@ -511,18 +725,6 @@ impl ChunkReader {
             cur: Vec::new(),
             pos: 0,
             ended: false,
-            bytes: 0,
-        }
-    }
-
-    /// Reads and drops what is left of the set, up to its end marker.
-    fn drain(&mut self) -> io::Result<()> {
-        loop {
-            let n = self.fill_buf()?.len();
-            if n == 0 {
-                return Ok(());
-            }
-            self.consume(n);
         }
     }
 }
@@ -535,11 +737,13 @@ impl BufRead for ChunkReader {
             }
             match self.rx.blocking_recv() {
                 Some(Ok(Received::Bytes(bytes))) => {
-                    self.bytes += bytes.len() as u64;
                     self.cur = bytes;
                     self.pos = 0;
                 }
                 Some(Ok(Received::End)) => self.ended = true,
+                Some(Ok(Received::Head(_) | Received::BlobEnd)) => {
+                    return Err(io::Error::other("the CI sent a blob where none belongs"));
+                }
                 Some(Err(message)) => return Err(io::Error::other(message)),
                 None => return Err(io::Error::other("the transfer ended early")),
             }
@@ -573,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn the_writer_cuts_the_tar_into_full_chunks() {
+    fn the_writer_cuts_a_blob_into_full_chunks_and_ends_it() {
         let (tx, mut rx) = mpsc::channel(8);
         let data = pattern(2 * ARTIFACT_CHUNK + 5);
         let mut writer = ChunkWriter::new(tx);
@@ -581,21 +785,25 @@ mod tests {
         for part in data.chunks(300_000) {
             writer.write_all(part).unwrap();
         }
-        writer.finish().unwrap();
+        writer.end_blob().unwrap();
+        // An empty blob is only its end.
+        writer.end_blob().unwrap();
+        drop(writer);
 
-        let (mut sizes, mut joined, mut ended) = (Vec::new(), Vec::new(), false);
+        let (mut sizes, mut joined, mut ends) = (Vec::new(), Vec::new(), 0);
         while let Some(piece) = rx.blocking_recv() {
             match piece {
                 Piece::Bytes(bytes) => {
                     sizes.push(bytes.len());
                     joined.extend_from_slice(&bytes);
                 }
-                Piece::End => ended = true,
+                Piece::BlobEnd => ends += 1,
+                Piece::Head(_) | Piece::End => panic!("the writer sent a frame of its own"),
             }
         }
         assert_eq!(sizes, [ARTIFACT_CHUNK, ARTIFACT_CHUNK, 5]);
         assert_eq!(joined, data);
-        assert!(ended);
+        assert_eq!(ends, 2);
     }
 
     #[test]
@@ -628,139 +836,109 @@ mod tests {
             dir
         }
 
-        /// The tar of a small set, closing blocks included.
-        fn tar_of(dir: &Path) -> Vec<u8> {
-            let mut bytes = Vec::new();
-            let mut builder = tar::Builder::new(&mut bytes);
-            builder.append_dir_all(".", dir).unwrap();
-            builder.finish().unwrap();
-            drop(builder);
-            bytes
+        /// Bytes that do not compress, so a blob takes several chunks.
+        fn noise(len: usize) -> Vec<u8> {
+            let mut state = 0x9e37_79b9_7f4a_7c15u64;
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state as u8
+                })
+                .collect()
         }
 
-        /// A set whose big file crosses two chunk boundaries.
-        fn make_set(dir: &Path) {
-            std::fs::create_dir_all(dir.join("sub/deeper")).unwrap();
-            std::fs::write(dir.join("a"), "one").unwrap();
-            std::fs::write(dir.join("sub/b"), "two").unwrap();
-            let big = pattern(2 * ARTIFACT_CHUNK + 12_345);
-            std::fs::write(dir.join("sub/deeper/big"), big).unwrap();
+        /// Writes `bytes` to `path` and answers its head.
+        fn file(path: &Path, bytes: &[u8]) -> BlobHead {
+            std::fs::write(path, bytes).unwrap();
+            let (size, root) = zeughaus_blobs::hash_file(path).unwrap();
+            BlobHead { root, size }
         }
 
-        /// Carries the pieces of a [`ChunkWriter`] through the chunk framing, as
-        /// the CI's relay and a receiving task do, to the queue of a
-        /// [`ChunkReader`]. The stream between them is small, so the sender has
-        /// to wait for the reader.
-        fn through_the_wire(
-            rt: &tokio::runtime::Runtime,
-            mut pieces: mpsc::Receiver<Piece>,
-        ) -> mpsc::Receiver<Result<Received, String>> {
-            let (tx, rx) = mpsc::channel(QUEUE);
-            rt.spawn(async move {
-                let (mut near, mut far) = tokio::io::duplex(64 << 10);
-                let sending = async move {
-                    while let Some(piece) = pieces.recv().await {
-                        match piece {
-                            Piece::Bytes(bytes) => write_chunk(&mut near, &bytes).await.unwrap(),
-                            Piece::End => {
-                                write_end(&mut near).await.unwrap();
-                                break;
-                            }
-                        }
-                    }
-                };
-                let receiving = async move {
-                    let mut chunk = Vec::new();
-                    loop {
-                        let next = match read_chunk(&mut far, &mut chunk).await {
-                            Ok(true) => Ok(Received::Bytes(std::mem::take(&mut chunk))),
-                            Ok(false) => Ok(Received::End),
-                            Err(e) => Err(e),
-                        };
-                        let last = !matches!(next, Ok(Received::Bytes(_)));
-                        tx.send(next).await.unwrap();
-                        if last {
-                            break;
-                        }
-                    }
-                };
-                tokio::join!(sending, receiving);
-            });
-            rx
-        }
-
+        /// What the producer compresses is what the consumer's cache holds,
+        /// and the bytes it counts as moved are the compressed ones.
         #[test]
-        fn an_artifact_set_survives_a_round_trip_through_the_chunks() {
-            let base = scratch("round-trip");
-            let from = base.join("from");
-            make_set(&from);
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .unwrap();
-
-            let (tx, pieces) = mpsc::channel(QUEUE);
-            let packer = std::thread::spawn({
-                let from = from.clone();
-                move || pack(&from, tx)
+        fn compressed_blobs_arrive_whole_in_the_cache() {
+            let base = scratch("blobs");
+            let big = noise(2 * ARTIFACT_CHUNK + 12_345);
+            let small = b"a small file".repeat(1000);
+            let blobs = [
+                (file(&base.join("big"), &big), base.join("big")),
+                (file(&base.join("small"), &small), base.join("small")),
+            ];
+            let wanted: Vec<(Root, u64)> = blobs.iter().map(|(h, _)| (h.root, h.size)).collect();
+            let (pieces_tx, mut pieces) = mpsc::channel(QUEUE);
+            let (tx, rx) = mpsc::channel(QUEUE);
+            let compressing = std::thread::spawn(move || compress_blobs(&blobs, pieces_tx));
+            // Stands in for the wire: what the CI streams is what was sent.
+            let carrying = std::thread::spawn(move || {
+                let mut sent = 0u64;
+                while let Some(piece) = pieces.blocking_recv() {
+                    let received = match piece {
+                        Piece::Head(head) => Received::Head(head),
+                        Piece::Bytes(bytes) => {
+                            sent += bytes.len() as u64;
+                            Received::Bytes(bytes)
+                        }
+                        Piece::BlobEnd => Received::BlobEnd,
+                        Piece::End => Received::End,
+                    };
+                    tx.blocking_send(Ok(received)).unwrap();
+                }
+                sent
             });
-            let mut reader = ChunkReader::new(through_the_wire(&rt, pieces));
-            let to = base.join("to");
-            unpack(&mut reader, &to).unwrap();
-            packer.join().unwrap().unwrap();
+            let store = zeughaus_blobs::Store::open(&base.join("cache"), false).unwrap();
 
-            assert_eq!(std::fs::read(to.join("a")).unwrap(), b"one");
-            assert_eq!(std::fs::read(to.join("sub/b")).unwrap(), b"two");
-            assert_eq!(
-                std::fs::read(to.join("sub/deeper/big")).unwrap(),
-                pattern(2 * ARTIFACT_CHUNK + 12_345)
-            );
-            assert!(reader.ended, "the end marker was read");
-            assert!(reader.bytes > 2 * ARTIFACT_CHUNK as u64);
+            let moved = store_blobs(&store, &wanted, rx).unwrap();
+
+            compressing.join().unwrap().unwrap();
+            assert_eq!(moved, carrying.join().unwrap());
+            assert!(moved < (big.len() + small.len()) as u64);
+            assert_eq!(std::fs::read(store.path(&wanted[0].0)).unwrap(), big);
+            assert_eq!(std::fs::read(store.path(&wanted[1].0)).unwrap(), small);
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// The cache takes only the blobs asked for, in their order, and all
+        /// of them.
+        #[test]
+        fn the_cache_refuses_other_blobs_and_too_few() {
+            let base = scratch("refused-blobs");
+            let store = zeughaus_blobs::Store::open(&base.join("cache"), false).unwrap();
+            let asked = file(&base.join("asked"), b"asked for");
+            let other = file(&base.join("other"), b"another");
+            let mut zst = Vec::new();
+            zeughaus_blobs::compress_file(&base.join("asked"), 3, &mut zst).unwrap();
+            let wanted = [(asked.root, asked.size)];
+            let run = |items: Vec<Received>| {
+                let (tx, rx) = mpsc::channel(items.len() + 1);
+                for item in items {
+                    tx.blocking_send(Ok(item)).unwrap();
+                }
+                drop(tx);
+                store_blobs(&store, &wanted, rx)
+            };
+
+            let err = run(vec![Received::Head(other)]).unwrap_err();
+            assert!(err.contains("not the one asked for"), "{err}");
+            let err = run(vec![Received::End]).unwrap_err();
+            assert!(err.contains("sent 0 of 1 blobs"), "{err}");
+            let err = run(vec![Received::Head(asked), Received::Bytes(zst)]).unwrap_err();
+            assert!(err.contains("ended early"), "{err}");
+            assert!(!store.has(&asked.root, asked.size));
             let _ = std::fs::remove_dir_all(&base);
         }
 
         #[test]
-        fn a_set_that_stops_before_its_end_marker_is_not_a_set() {
-            let base = scratch("short");
-            let from = base.join("from");
-            make_set(&from);
-            // Every file is there; the tar's closing blocks and the end marker
-            // are not. A reader that took the end of the stream for the end of
-            // the set would accept this.
-            let mut tar = tar_of(&from);
-            tar.truncate(tar.len() - 1024);
-
-            let (tx, rx) = mpsc::channel(QUEUE);
-            tx.blocking_send(Ok(Received::Bytes(tar))).unwrap();
-            drop(tx);
-            let to = base.join("to");
-            let err = unpack(&mut ChunkReader::new(rx), &to).unwrap_err();
-            assert!(err.contains("the transfer ended early"), "{err}");
-            let _ = std::fs::remove_dir_all(&base);
-        }
-
-        #[test]
-        fn what_the_ci_says_is_the_reason_the_set_did_not_arrive() {
+        fn what_the_ci_says_is_the_reason_the_bundle_did_not_arrive() {
             let base = scratch("refused");
             let (tx, rx) = mpsc::channel(QUEUE);
-            tx.blocking_send(Err("runner x: view.7.a left no artifacts".to_owned()))
-                .unwrap();
-            let err = unpack(&mut ChunkReader::new(rx), &base.join("to")).unwrap_err();
-            assert!(err.contains("view.7.a left no artifacts"), "{err}");
-
-            // Also when the failure comes in the middle of a file, where the tar
-            // reader wraps it.
-            let from = base.join("from");
-            make_set(&from);
-            let tar = tar_of(&from);
-            let (tx, rx) = mpsc::channel(QUEUE);
-            tx.blocking_send(Ok(Received::Bytes(tar[..ARTIFACT_CHUNK].to_vec())))
+            tx.blocking_send(Ok(Received::Bytes(b"part".to_vec())))
                 .unwrap();
             tx.blocking_send(Err("the CI went away".to_owned()))
                 .unwrap();
-            let err = unpack(&mut ChunkReader::new(rx), &base.join("to2")).unwrap_err();
+            let err = save(&mut ChunkReader::new(rx), &base.join("bundle")).unwrap_err();
             assert!(err.contains("the CI went away"), "{err}");
             let _ = std::fs::remove_dir_all(&base);
         }

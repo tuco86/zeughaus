@@ -900,8 +900,8 @@ own, after the runner is no longer held (`zeughaus-runner hold`):
 2. Stage the inputs into `<run>/inputs/<need>/`, one thread per input:
    hard-linked from this runner's `ci/artifacts/<run>/` when the need ran
    here, else moved from what the runner fetched early (**Artifacts**), else
-   downloaded through the CI's relay and unpacked as the chunks arrive,
-   reported to the CI as a `Transfer`.
+   fetched through the CI (manifest, then the files its blob cache lacks)
+   and copied out of the cache, reported to the CI as a `Transfer`.
 3. Write the secrets as files under `$XDG_RUNTIME_DIR/zeughaus-ci/<run>/`
    (`ci/tmp/<run>` where there is no `XDG_RUNTIME_DIR`, as on macOS), which
    the launcher removes.
@@ -960,33 +960,52 @@ Host and container jobs time out inside `inner.sh`; a machine job on the
 runner's own clock (`control.rs`), writes
 `<run>/timeout` and kills the local ssh. `Kill` closes the run's terminal.
 
-**Artifacts** go through `CI_OUTPUT`. An artifact set exists once, on the
-runner that made it, and only as long as a job needs it; there is no
-retention count on either side. A runner keeps a successful run's set and
-hard-links it as `CI_INPUTS/<need>/` for a job of its own that needs it. For a
-job on another runner, the CI is a relay: the consumer's runner opens
-`Download { run }` on `/artifacts` (req/rep, `ArtifactRequest`/`ArtifactReply`),
-the CI checks that it is assigned a job that needs the run and sends the
-producing runner `Upload { run, transfer }`; that runner answers on an
-exchange of its own with `Upload { run, transfer }` and the set, which the CI
-relays into the waiting download as it arrives and never stores (or
-`Unavailable`, which fails the download at once; nothing for ten minutes
-fails it too). The set is a tar sent as chunks: a `u32` little-endian length
-in `1..=ARTIFACT_CHUNK` (1 MiB) and that many bytes, ended by a length of 0.
-No size is announced and no file is made in transit: the producer packs while
-it sends and the consumer unpacks while it receives, a short queue between
-the thread that works on files and the task that moves the bytes. Every hop
-refuses a running total above `MAX_ARTIFACT_BYTES`, and a body that ends
-without the 0 is a broken transfer. A consumer is assigned only while the
-producing runner is connected. A set does not wait for its consumer: when
+**Artifacts** go through `CI_OUTPUT`. An artifact set exists as a directory
+on the runner that made it, and only as long as a job needs it. A runner
+keeps a successful run's set and hard-links it as `CI_INPUTS/<need>/` for a
+job of its own that needs it. For a job on another runner, the CI is the hub
+and moves the set by content (`zeughaus-blobs`): a set is a `SetManifest`
+(every directory, and every file by path, size, BLAKE3 root and executable
+bit; symlinks followed), and its files travel as blobs named by their root.
+The CI keeps a store of zstd-compressed blobs under `ci/blobs` and each
+manifest it holds under `ci/sets/<run>.set` (3 days and 2 GiB, swept at
+start and hourly); every runner keeps a cache of raw blobs under `ci/blobs`
+with its sets under `ci/blob-sets` (7 days and `blob_cache_gb` of
+`enlist.toml`, default 8 GiB, swept the same way). A sweep removes the
+blobs no kept set names and, over the budget, the oldest sets.
+
+The consumer's runner asks for `Manifest { run }` on `/artifacts` (req/rep,
+`ArtifactRequest`/`ArtifactReply`); the CI checks that it is assigned a job
+that needs the run. When the CI holds no set of the run, it fills it once
+for every consumer: it sends the producing runner `Upload { run, transfer }`,
+which hashes the set and answers on an exchange of its own with `Offer {
+run, transfer }` and the encoded manifest (or `Unavailable`, which fails the
+fill at once; no offer for ten minutes fails it too). The CI answers with
+the roots its store lacks, and the producer sends exactly those as `Blobs {
+run, transfer }`, each a `BlobHead` frame and its zstd bytes (level 9). The
+CI checks each blob's size and root as it decompresses it, stores it, and
+records the set; then the consumer gets the manifest, asks for the roots its
+cache lacks with `Fetch { run }` and gets them compressed as stored. It
+checks and keeps them raw, copies the set out of the cache into its
+destination (a reflink or clone where the filesystem has them, so a job
+never changes the cache) and records the set in its cache. So a file
+crosses a runner's uplink once, and not again while the CI holds it; a
+consumer fetches nothing its cache holds. The `Transfer` it reports carries
+the set's size (`bytes`) and the compressed bytes that crossed the wire for
+it (`moved`), which `ci_timing` shows. Bodies are chunks: a `u32`
+little-endian length in `1..=ARTIFACT_CHUNK` (1 MiB) and that many bytes,
+ended by a length of 0. Every hop refuses a running total above
+`MAX_ARTIFACT_BYTES`, and a body that ends without the 0 is a broken
+transfer. A consumer is assigned only while the producing runner is
+connected. A set does not wait for its consumer: when
 a job that left one ends and a job that needs it is still pending on another
 runner (waiting for its other needs, or for its runner), the CI sends that
-runner `Prefetch { run, consumer, need }`. The runner downloads the set as
+runner `Prefetch { run, consumer, need }`. The runner fetches the set as
 the consumer's input into `ci/prefetch/<consumer>/<need>/` on a thread of its
-own and reports it as a `Transfer`; the check on `Download` then admits the
+own and reports it as a `Transfer`; the check on `Manifest` then admits the
 runner of any job that needs the set and has not ended, not only of one that
 is assigned it. The consumer's staging claims the fetch once: it moves the
-set into `inputs/`, waits for it if it is still going, and downloads again if
+set into `inputs/`, waits for it if it is still going, and fetches again if
 it failed. A job that ends without being assigned (skipped, cancelled or
 failed) after a fetch began gets its runner a `DropPrefetch { consumer }`;
 `Forget`, a failed staging and the start of a runner remove what is left.

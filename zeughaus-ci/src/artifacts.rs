@@ -1,31 +1,36 @@
-//! The `/artifacts` service: the CI relays a finished job's artifact set from
-//! the runner that holds it to the runner of a job that needs it, without a
-//! copy on this side, and hands a runner the bundles of the manual run it was
-//! assigned.
+//! The `/artifacts` service: the CI is the hub every artifact set passes
+//! through on its way from the runner that made it to the runners of the
+//! jobs that need it, and hands a runner the bundles of the manual run it
+//! was assigned.
 //!
-//! A consuming runner opens a `Download`; the CI asks the producing runner
-//! for the set with [`ToRunner::Upload`] under a transfer number, and that
-//! runner answers on an exchange of its own with `Upload` (the chunks of the
-//! set follow) or `Unavailable`. The upload's chunks are relayed into the
-//! waiting download's reply as they arrive, so the producer packs and the
-//! consumer unpacks while the set moves. One exchange moves one set; the
-//! request is one frame ([`ArtifactRequest`]), an upload's chunks follow it,
-//! a download's follow the reply frame ([`ArtifactReply`]), framed as
-//! `zeughaus_link::enlist` describes. A `ManualBundle` is answered the same way,
-//! from the file the `/manual` service stored.
+//! The CI keeps a store of zstd-compressed blobs under `ci/blobs` and the
+//! manifest of each set it holds under `ci/sets`. A consumer asks for a
+//! set's `Manifest`; when the CI holds none yet, it asks the producing runner
+//! with [`ToRunner::Upload`] under a transfer number, and that runner offers
+//! the set's manifest on an exchange of its own (`Offer`, or `Unavailable`).
+//! The CI answers with the roots its store lacks, and the producer sends only
+//! those, compressed (`Blobs`). Once they are stored the set is recorded and
+//! the consumer gets the manifest, then `Fetch`es the blobs its own cache
+//! lacks. So a file crosses the producer's uplink once, and not again while
+//! the store holds it. Framing is as `zeughaus_link::enlist` describes. A
+//! `ManualBundle` is answered as chunks from the file the `/manual` service
+//! stored.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::oneshot;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{OnceCell, oneshot};
 use weida::{IncomingRequest, IncomingTransfer, Replier, TransferMeta};
+use zeughaus_blobs::{Retention, Root, Store, read_set, record_set};
 use zeughaus_link::enlist::{
-    ARTIFACT_CHUNK, ArtifactReply, ArtifactRequest, MAX_ARTIFACT_BYTES, ToRunner, parse_run_id,
-    read_chunk, read_frame, run_id, write_chunk, write_end, write_frame,
+    ARTIFACT_CHUNK, ArtifactReply, ArtifactRequest, BlobHead, MAX_ARTIFACT_BYTES,
+    MAX_MANIFEST_BYTES, MAX_SET_ENTRIES, SetEntry, SetManifest, ToRunner, decode_roots,
+    encode_roots, parse_run_id, read_chunk, read_frame, run_id, write_chunk, write_end,
+    write_frame,
 };
 
 use crate::config::{CiConfig, valid_name};
@@ -34,35 +39,55 @@ use crate::runners::Runners;
 use crate::scheduler::{JobStatus, Pipeline, load_pipeline};
 use crate::transport::principal_of;
 
-/// How long a download waits for the producing runner to open its upload. The
-/// producer packs while it sends, so this is the time to be told, to connect
-/// and to pack the first chunk, not to pack the whole set.
+/// Time until the producer offers the manifest, and again until it starts
+/// sending the blobs the CI asked for. It hashes the set before it offers,
+/// so this covers being told, connecting and hashing, not the transfer.
 const UPLOAD_WAIT: Duration = Duration::from_secs(600);
+
+/// How long the store keeps a set.
+const SET_KEEP: Duration = Duration::from_secs(3 * 86400);
+
+/// Bytes of compressed blobs the store may hold. sadala's disk is small and
+/// holds a runner's cache too.
+const STORE_BUDGET: u64 = 2 << 30;
+
+/// A fill of one run's set, shared by every request for it.
+type Fill = Arc<OnceCell<Result<(), String>>>;
 
 pub struct ArtifactService {
     state_dir: PathBuf,
     config: Arc<CiConfig>,
     runners: Arc<Runners>,
     next_transfer: AtomicU64,
-    /// Downloads waiting for their upload, by transfer number.
+    store: Arc<Store>,
+    sets: PathBuf,
+    /// The fill in flight for a run, so concurrent consumers ask its
+    /// producer once.
+    fills: Mutex<HashMap<String, Fill>>,
+    /// Fills waiting for their producer, by transfer number.
     waiting: Mutex<HashMap<u64, Waiting>>,
 }
 
-/// A download that asked a producing runner for a set.
+/// A fill that asked a producing runner for a set.
 struct Waiting {
     run: String,
     runner: String,
-    offer: oneshot::Sender<Offer>,
+    /// The offered manifest, once the producer offered it and the CI asked
+    /// for `missing`.
+    manifest: Option<SetManifest>,
+    missing: Vec<(Root, u64)>,
+    /// Told when the producer's offer asked for blobs; dropped when it asked
+    /// for none.
+    offered: Option<oneshot::Sender<()>>,
+    done: Option<oneshot::Sender<Result<(), String>>>,
 }
 
-/// What the producing runner answered.
-enum Offer {
-    /// The set's chunks follow on `body`; `done` hears how the relay went.
-    Tar {
-        body: IncomingTransfer,
-        done: oneshot::Sender<Result<(), String>>,
-    },
-    Unavailable(String),
+impl Waiting {
+    fn finish(&mut self, outcome: Result<(), String>) {
+        if let Some(done) = self.done.take() {
+            let _ = done.send(outcome);
+        }
+    }
 }
 
 impl ArtifactService {
@@ -70,13 +95,38 @@ impl ArtifactService {
         state_dir: PathBuf,
         config: Arc<CiConfig>,
         runners: Arc<Runners>,
-    ) -> ArtifactService {
-        ArtifactService {
+    ) -> Result<ArtifactService, String> {
+        let blobs = state_dir.join("ci/blobs");
+        let store = Store::open(&blobs, true)
+            .map_err(|e| format!("cannot open {}: {e}", blobs.display()))?;
+        Ok(ArtifactService {
+            sets: state_dir.join("ci/sets"),
             state_dir,
             config,
             runners,
             next_transfer: AtomicU64::new(0),
+            store: Arc::new(store),
+            fills: Mutex::new(HashMap::new()),
             waiting: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Keeps the store within [`SET_KEEP`] and [`STORE_BUDGET`], leaving
+    /// alone what is younger than `grace`.
+    pub fn sweep(&self, grace: Duration) {
+        let retention = Retention {
+            keep: SET_KEEP,
+            budget: STORE_BUDGET,
+            grace,
+        };
+        let swept = zeughaus_blobs::sweep(&self.store, &self.sets, &retention);
+        if swept.sets > 0 || swept.blobs > 0 {
+            eprintln!(
+                "[ci] artifact store: removed {} sets, {} blobs, {} MB",
+                swept.sets,
+                swept.blobs,
+                swept.bytes >> 20
+            );
         }
     }
 
@@ -126,9 +176,11 @@ impl ArtifactService {
             }
         };
         let outcome = match first {
-            ArtifactRequest::Upload { run, transfer } => {
-                let relayed = self.upload(&runner, &run, transfer, body).await;
-                answer(&mut reply, &runner, &run, relayed).await
+            ArtifactRequest::Offer { run, transfer } => {
+                self.offer(&runner, &run, transfer, body, &mut reply).await
+            }
+            ArtifactRequest::Blobs { run, transfer } => {
+                self.blobs(&runner, &run, transfer, body, &mut reply).await
             }
             ArtifactRequest::Unavailable {
                 run,
@@ -137,10 +189,13 @@ impl ArtifactService {
             } => {
                 let passed = self
                     .take_waiting(&runner, &run, transfer)
-                    .map(|waiting| drop(waiting.offer.send(Offer::Unavailable(message))));
+                    .map(|mut waiting| {
+                        waiting.finish(Err(format!("runner {runner}: {message}")));
+                    });
                 answer(&mut reply, &runner, &run, passed).await
             }
-            ArtifactRequest::Download { run } => self.download(&runner, &run, &mut reply).await,
+            ArtifactRequest::Manifest { run } => self.manifest(&runner, &run, &mut reply).await,
+            ArtifactRequest::Fetch { run } => self.fetch(&runner, &run, body, &mut reply).await,
             ArtifactRequest::ManualBundle { run, index } => {
                 self.manual_bundle(&runner, &run, index, &mut reply).await
             }
@@ -151,42 +206,265 @@ impl ArtifactService {
         let _ = reply.finish();
     }
 
-    /// The waiting download `transfer`, when it asked `runner` for `run`.
+    /// The fill `transfer`, when it asked `runner` for `run`.
     fn take_waiting(&self, runner: &str, run: &str, transfer: u64) -> Result<Waiting, String> {
         let mut waiting = lock(&self.waiting);
         match waiting.get(&transfer) {
             Some(w) if w.run == run && w.runner == runner => {}
-            _ => {
-                return Err(format!(
-                    "no download waits for {run} as transfer {transfer}"
-                ));
-            }
+            _ => return Err(format!("no fill waits for {run} as transfer {transfer}")),
         }
         Ok(waiting.remove(&transfer).expect("checked above"))
     }
 
-    /// Hands the upload's body to its download and waits until the download
-    /// has relayed it on.
-    async fn upload(
+    /// The manifest of `run`'s set, filled from its producer when the store
+    /// does not hold it yet. Concurrent callers share one fill; a failed fill
+    /// is tried again by the next caller.
+    async fn ensure_stored(&self, run: &str, producer: &str) -> Result<SetManifest, String> {
+        if let Some(manifest) = read_set(&self.sets, run)? {
+            return Ok(manifest);
+        }
+        let cell = Arc::clone(lock(&self.fills).entry(run.to_owned()).or_default());
+        let filled = cell.get_or_init(|| self.fill(run, producer)).await.clone();
+        {
+            let mut fills = lock(&self.fills);
+            if fills.get(run).is_some_and(|c| Arc::ptr_eq(c, &cell)) {
+                fills.remove(run);
+            }
+        }
+        filled?;
+        read_set(&self.sets, run)?.ok_or_else(|| format!("the set of {run} is gone"))
+    }
+
+    /// Asks `producer` for the set of `run` and waits until it is stored.
+    async fn fill(&self, run: &str, producer: &str) -> Result<(), String> {
+        let transfer = self.next_transfer.fetch_add(1, Ordering::Relaxed);
+        let (offered, offered_rx) = oneshot::channel();
+        let (done, done_rx) = oneshot::channel();
+        lock(&self.waiting).insert(
+            transfer,
+            Waiting {
+                run: run.to_owned(),
+                runner: producer.to_owned(),
+                manifest: None,
+                missing: Vec::new(),
+                offered: Some(offered),
+                done: Some(done),
+            },
+        );
+        let filled = self
+            .await_fill(run, producer, transfer, offered_rx, done_rx)
+            .await;
+        lock(&self.waiting).remove(&transfer);
+        filled
+    }
+
+    async fn await_fill(
+        &self,
+        run: &str,
+        producer: &str,
+        transfer: u64,
+        offered: oneshot::Receiver<()>,
+        mut done: oneshot::Receiver<Result<(), String>>,
+    ) -> Result<(), String> {
+        let abandoned = || format!("the upload of {run} from runner {producer} was abandoned");
+        let asked = self.runners.send(
+            producer,
+            ToRunner::Upload {
+                run: run.to_owned(),
+                transfer,
+            },
+        );
+        if !asked {
+            return Err(format!(
+                "runner {producer}, which holds {run}, is not connected"
+            ));
+        }
+        let minutes = UPLOAD_WAIT.as_secs() / 60;
+        // Closed: the offer needed no blobs, or the fill failed; `done` says
+        // which.
+        if tokio::time::timeout(UPLOAD_WAIT, offered).await.is_err() {
+            return Err(format!(
+                "runner {producer} did not offer {run} within {minutes} minutes"
+            ));
+        }
+        if let Ok(outcome) = tokio::time::timeout(UPLOAD_WAIT, &mut done).await {
+            return outcome.unwrap_or_else(|_| Err(abandoned()));
+        }
+        // Still waiting here means the blobs never came; once their exchange
+        // took the entry, it runs as long as its stream lives.
+        if lock(&self.waiting).remove(&transfer).is_some() {
+            return Err(format!(
+                "runner {producer} offered {run} but sent no blobs within {minutes} minutes"
+            ));
+        }
+        done.await.unwrap_or_else(|_| Err(abandoned()))
+    }
+
+    /// The producer offers the manifest of the set `transfer` asked for; the
+    /// reply names the blobs the store lacks.
+    async fn offer(
         &self,
         runner: &str,
         run: &str,
         transfer: u64,
-        body: IncomingTransfer,
+        mut body: IncomingTransfer,
+        reply: &mut weida::OutgoingTransfer,
     ) -> Result<(), String> {
-        let waiting = self.take_waiting(runner, run, transfer)?;
-        let (done, outcome) = oneshot::channel();
-        if waiting.offer.send(Offer::Tar { body, done }).is_err() {
-            return Err(format!("the download of {run} ended before the upload"));
+        let expected = matches!(
+            lock(&self.waiting).get(&transfer),
+            Some(w) if w.run == run && w.runner == runner && w.offered.is_some()
+        );
+        if !expected {
+            let message = format!("no fill waits for an offer of {run} as transfer {transfer}");
+            return write_frame(reply, &ArtifactReply::Error { message }).await;
         }
-        outcome
-            .await
-            .unwrap_or_else(|_| Err(format!("the download of {run} ended")))
+        match self.read_offer(run, &mut body).await {
+            Ok((manifest, missing)) if missing.is_empty() => {
+                let recorded = record(&self.sets, run, manifest).await;
+                if let Ok(mut waiting) = self.take_waiting(runner, run, transfer) {
+                    waiting.finish(recorded.clone());
+                }
+                match recorded {
+                    Ok(()) => {
+                        write_frame(reply, &ArtifactReply::Sending).await?;
+                        write_end(reply).await?;
+                        flush(reply).await
+                    }
+                    Err(message) => write_frame(reply, &ArtifactReply::Error { message }).await,
+                }
+            }
+            Ok((manifest, missing)) => {
+                let roots: Vec<Root> = missing.iter().map(|(root, _)| *root).collect();
+                let asked = match lock(&self.waiting).get_mut(&transfer) {
+                    Some(entry) => {
+                        entry.manifest = Some(manifest);
+                        entry.missing = missing;
+                        if let Some(offered) = entry.offered.take() {
+                            let _ = offered.send(());
+                        }
+                        true
+                    }
+                    None => false,
+                };
+                if !asked {
+                    let message = format!("the fill of {run} gave up waiting");
+                    return write_frame(reply, &ArtifactReply::Error { message }).await;
+                }
+                write_frame(reply, &ArtifactReply::Sending).await?;
+                send_bytes(reply, &encode_roots(&roots)).await?;
+                write_end(reply).await?;
+                flush(reply).await
+            }
+            Err(message) => {
+                eprintln!("[ci] {runner}: offer of {run} refused: {message}");
+                if let Ok(mut waiting) = self.take_waiting(runner, run, transfer) {
+                    waiting.finish(Err(message.clone()));
+                }
+                write_frame(reply, &ArtifactReply::Error { message }).await
+            }
+        }
     }
 
-    /// Asks the runner that holds `run`'s set for it and streams its upload
-    /// into `reply`.
-    async fn download(
+    /// The offered manifest and the blobs of it the store lacks.
+    async fn read_offer(
+        &self,
+        run: &str,
+        body: &mut IncomingTransfer,
+    ) -> Result<(SetManifest, Vec<(Root, u64)>), String> {
+        let bytes = read_body(body, MAX_MANIFEST_BYTES)
+            .await
+            .map_err(|e| format!("the manifest of {run}: {e}"))?;
+        let manifest =
+            SetManifest::decode(&bytes).map_err(|e| format!("the manifest of {run}: {e}"))?;
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || {
+            let missing = zeughaus_blobs::missing(&manifest, &store);
+            (manifest, missing)
+        })
+        .await
+        .map_err(|e| format!("the store failed: {e}"))
+    }
+
+    /// The producer sends the blobs its offer was asked for.
+    async fn blobs(
+        &self,
+        runner: &str,
+        run: &str,
+        transfer: u64,
+        mut body: IncomingTransfer,
+        reply: &mut weida::OutgoingTransfer,
+    ) -> Result<(), String> {
+        let taken = {
+            let mut waiting = lock(&self.waiting);
+            match waiting.get(&transfer) {
+                Some(w) if w.run == run && w.runner == runner && w.manifest.is_some() => {
+                    waiting.remove(&transfer)
+                }
+                _ => None,
+            }
+        };
+        let Some(mut waiting) = taken else {
+            let message = format!("no offer of {run} waits for its blobs as transfer {transfer}");
+            return write_frame(reply, &ArtifactReply::Error { message }).await;
+        };
+        let mut stored = self.receive_blobs(run, &waiting.missing, &mut body).await;
+        if stored.is_ok() {
+            let manifest = waiting.manifest.take().expect("checked above");
+            stored = record(&self.sets, run, manifest).await;
+        }
+        waiting.finish(stored.clone());
+        answer(reply, runner, run, stored).await
+    }
+
+    /// Reads each blob of `missing` from `body` into the store, in order,
+    /// and then the end of the body.
+    async fn receive_blobs(
+        &self,
+        run: &str,
+        missing: &[(Root, u64)],
+        body: &mut IncomingTransfer,
+    ) -> Result<(), String> {
+        let joined = |e: tokio::task::JoinError| format!("the store failed: {e}");
+        let mut chunk = Vec::new();
+        let mut total = 0u64;
+        for (i, &(root, size)) in missing.iter().enumerate() {
+            let head = read_frame::<_, BlobHead>(body)
+                .await?
+                .ok_or_else(|| format!("the upload of {run} ended after {i} blobs"))?;
+            if head != (BlobHead { root, size }) {
+                return Err(format!("blob {i} of {run} is not the one asked for"));
+            }
+            let store = Arc::clone(&self.store);
+            let mut receiving = tokio::task::spawn_blocking(move || store.receive(root, size))
+                .await
+                .map_err(joined)?
+                .map_err(|e| format!("blob {}: {e}", hex::encode(root)))?;
+            while read_chunk(body, &mut chunk).await? {
+                total += chunk.len() as u64;
+                if total > MAX_ARTIFACT_BYTES {
+                    return Err(format!("more than {MAX_ARTIFACT_BYTES} bytes"));
+                }
+                let bytes = std::mem::take(&mut chunk);
+                (receiving, chunk) = tokio::task::spawn_blocking(move || {
+                    receiving.write(&bytes).map(|()| (receiving, bytes))
+                })
+                .await
+                .map_err(joined)??;
+            }
+            tokio::task::spawn_blocking(move || receiving.finish())
+                .await
+                .map_err(joined)??;
+        }
+        match read_frame::<_, BlobHead>(body).await? {
+            None => Ok(()),
+            Some(_) => Err(format!(
+                "the upload of {run} sent more blobs than asked for"
+            )),
+        }
+    }
+
+    /// The manifest of `run`'s set, for a runner whose job needs it.
+    async fn manifest(
         &self,
         requester: &str,
         run: &str,
@@ -196,57 +474,78 @@ impl ArtifactService {
             Ok(producer) => producer,
             Err(message) => return write_frame(reply, &ArtifactReply::Error { message }).await,
         };
-        let transfer = self.next_transfer.fetch_add(1, Ordering::Relaxed);
-        let (offer, offered) = oneshot::channel();
-        lock(&self.waiting).insert(
-            transfer,
-            Waiting {
-                run: run.to_owned(),
-                runner: producer.clone(),
-                offer,
-            },
-        );
-        let asked = self.runners.send(
-            &producer,
-            ToRunner::Upload {
-                run: run.to_owned(),
-                transfer,
-            },
-        );
-        let offered = if asked {
-            Some(tokio::time::timeout(UPLOAD_WAIT, offered).await)
-        } else {
-            None
+        let manifest = match self.ensure_stored(run, &producer).await {
+            Ok(manifest) => manifest,
+            Err(message) => return write_frame(reply, &ArtifactReply::Error { message }).await,
         };
-        lock(&self.waiting).remove(&transfer);
-        let refused = |message: String| ArtifactReply::Error { message };
-        let (mut body, done) = match offered {
-            Some(Ok(Ok(Offer::Tar { body, done }))) => (body, done),
-            Some(Ok(Ok(Offer::Unavailable(message)))) => {
-                return write_frame(reply, &refused(format!("runner {producer}: {message}"))).await;
-            }
-            None => {
-                let message = format!("runner {producer}, which holds {run}, is not connected");
-                return write_frame(reply, &refused(message)).await;
-            }
-            Some(Ok(Err(_))) => {
-                let message = format!("the upload of {run} from runner {producer} was abandoned");
-                return write_frame(reply, &refused(message)).await;
-            }
-            Some(Err(_)) => {
-                let message = format!(
-                    "runner {producer} did not send {run} within {} minutes",
-                    UPLOAD_WAIT.as_secs() / 60
-                );
-                return write_frame(reply, &refused(message)).await;
-            }
+        write_frame(reply, &ArtifactReply::Sending).await?;
+        send_bytes(reply, &manifest.encode()).await?;
+        write_end(reply).await?;
+        flush(reply).await
+    }
+
+    /// The blobs of `run`'s set the requester names, compressed as stored.
+    async fn fetch(
+        &self,
+        requester: &str,
+        run: &str,
+        mut body: IncomingTransfer,
+        reply: &mut weida::OutgoingTransfer,
+    ) -> Result<(), String> {
+        let wanted = match self.wanted(requester, run, &mut body).await {
+            Ok(wanted) => wanted,
+            Err(message) => return write_frame(reply, &ArtifactReply::Error { message }).await,
         };
-        let relayed = match write_frame(reply, &ArtifactReply::Sending).await {
-            Ok(()) => relay(&mut body, reply, MAX_ARTIFACT_BYTES).await,
-            Err(e) => Err(e),
-        };
-        let _ = done.send(relayed.clone());
-        relayed
+        write_frame(reply, &ArtifactReply::Sending).await?;
+        let mut chunk = vec![0u8; ARTIFACT_CHUNK];
+        for head in wanted {
+            let path = self.store.path(&head.root);
+            write_frame(reply, &head).await?;
+            // Without its end marker the consumer sees a broken transfer.
+            let mut file = tokio::fs::File::open(&path)
+                .await
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            loop {
+                let n = file
+                    .read(&mut chunk)
+                    .await
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                if n == 0 {
+                    break;
+                }
+                write_chunk(reply, &chunk[..n]).await?;
+            }
+            write_end(reply).await?;
+        }
+        flush(reply).await
+    }
+
+    /// The blobs a `Fetch` names, each a file of the set the CI holds.
+    async fn wanted(
+        &self,
+        requester: &str,
+        run: &str,
+        body: &mut IncomingTransfer,
+    ) -> Result<Vec<BlobHead>, String> {
+        self.producer_for(requester, run)?;
+        let manifest = read_set(&self.sets, run)?
+            .ok_or_else(|| format!("the CI holds no set of {run}; ask for its manifest first"))?;
+        let bytes = read_body(body, 32 * MAX_SET_ENTRIES).await?;
+        let sizes: HashMap<Root, u64> = manifest
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                SetEntry::File { root, size, .. } => Some((*root, *size)),
+                SetEntry::Dir { .. } => None,
+            })
+            .collect();
+        decode_roots(&bytes)?
+            .into_iter()
+            .map(|root| match sizes.get(&root) {
+                Some(&size) => Ok(BlobHead { root, size }),
+                None => Err(format!("{} is no file of {run}", hex::encode(root))),
+            })
+            .collect()
     }
 
     /// The runner holding `run`'s set, when `requester` runs a job that needs
@@ -367,7 +666,7 @@ fn producer_for(
     Ok(producer.clone())
 }
 
-/// The reply to an upload or an `Unavailable`.
+/// The reply to a `Blobs` or an `Unavailable`.
 async fn answer(
     reply: &mut weida::OutgoingTransfer,
     runner: &str,
@@ -377,41 +676,46 @@ async fn answer(
     match outcome {
         Ok(()) => write_frame(reply, &ArtifactReply::Done).await,
         Err(message) => {
-            eprintln!("[ci] {runner}: artifacts of {run} not relayed: {message}");
+            eprintln!("[ci] {runner}: artifacts of {run} not stored: {message}");
             write_frame(reply, &ArtifactReply::Error { message }).await
         }
     }
 }
 
-/// Copies the chunks of `body` to `out` as they arrive, then the end marker.
-/// A body that ends before its end marker, or whose chunks add up to more
-/// than `limit` bytes, is an error, and `out` gets no end marker: whoever
-/// reads it sees a broken transfer.
-async fn relay(
-    body: &mut (impl AsyncRead + Unpin),
-    out: &mut (impl AsyncWrite + Unpin),
-    limit: u64,
-) -> Result<(), String> {
+/// The chunks of `body` up to its end marker, at most `limit` bytes of them.
+async fn read_body(body: &mut (impl AsyncRead + Unpin), limit: usize) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
     let mut chunk = Vec::new();
-    let mut total = 0u64;
-    while read_chunk(body, &mut chunk)
-        .await
-        .map_err(|e| format!("upload failed: {e}"))?
-    {
-        total += chunk.len() as u64;
-        if total > limit {
+    while read_chunk(body, &mut chunk).await? {
+        if out.len() + chunk.len() > limit {
             return Err(format!("more than {limit} bytes"));
         }
-        write_chunk(out, &chunk)
-            .await
-            .map_err(|e| format!("download failed: {e}"))?;
+        out.extend_from_slice(&chunk);
     }
-    write_end(out)
+    Ok(out)
+}
+
+/// `bytes` as chunks, without the end marker.
+async fn send_bytes(reply: &mut weida::OutgoingTransfer, bytes: &[u8]) -> Result<(), String> {
+    for chunk in bytes.chunks(ARTIFACT_CHUNK) {
+        write_chunk(reply, chunk).await?;
+    }
+    Ok(())
+}
+
+async fn flush(reply: &mut weida::OutgoingTransfer) -> Result<(), String> {
+    reply
+        .flush()
         .await
-        .map_err(|e| format!("download failed: {e}"))?;
-    out.flush()
+        .map_err(|e| format!("the reply failed: {e}"))
+}
+
+/// Records `manifest` as the set of `run`, off the async threads.
+async fn record(sets: &Path, run: &str, manifest: SetManifest) -> Result<(), String> {
+    let (sets, run) = (sets.to_owned(), run.to_owned());
+    tokio::task::spawn_blocking(move || record_set(&sets, &run, &manifest))
         .await
-        .map_err(|e| format!("download failed: {e}"))
+        .map_err(|e| format!("the store failed: {e}"))?
 }
 
 /// A poisoned lock still holds a consistent map: every critical section is a
@@ -424,45 +728,19 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
-    /// The bytes of a transfer of `parts` as chunks, with or without its end
-    /// marker.
-    async fn chunks(parts: &[&[u8]], end: bool) -> Vec<u8> {
+    #[tokio::test]
+    async fn a_body_cut_short_or_over_its_limit_is_refused() {
         let mut wire = Vec::new();
-        for part in parts {
-            write_chunk(&mut wire, part).await.unwrap();
-        }
-        if end {
-            write_end(&mut wire).await.unwrap();
-        }
-        wire
-    }
+        write_chunk(&mut wire, b"0123").await.unwrap();
+        write_chunk(&mut wire, b"456789").await.unwrap();
+        let cut = wire.clone();
+        write_end(&mut wire).await.unwrap();
 
-    #[tokio::test]
-    async fn a_relayed_set_keeps_its_chunks_and_its_end_marker() {
-        let wire = chunks(&[b"0123", b"456789"], true).await;
-        let mut body: &[u8] = &wire;
-        let mut out = Vec::new();
-        relay(&mut body, &mut out, 100).await.expect("relay");
-        assert_eq!(out, wire);
-    }
-
-    #[tokio::test]
-    async fn a_set_cut_short_or_over_the_limit_is_passed_on_without_its_marker() {
-        // The upload stops before its end marker.
-        let wire = chunks(&[b"0123", b"456789"], false).await;
-        let mut body: &[u8] = &wire;
-        let mut out = Vec::new();
-        let err = relay(&mut body, &mut out, 100).await.unwrap_err();
-        assert!(err.contains("before the end"), "{err}");
-        assert_eq!(out, wire, "what arrived is passed on, nothing more");
-
-        // The chunk that takes the total over the limit is not passed on.
-        let wire = chunks(&[b"0123", b"456789"], true).await;
-        let mut body: &[u8] = &wire;
-        let mut out = Vec::new();
-        let err = relay(&mut body, &mut out, 9).await.unwrap_err();
+        assert_eq!(read_body(&mut &wire[..], 10).await.unwrap(), b"0123456789");
+        let err = read_body(&mut &wire[..], 9).await.unwrap_err();
         assert!(err.contains("more than 9 bytes"), "{err}");
-        assert_eq!(out, chunks(&[b"0123"], false).await);
+        let err = read_body(&mut &cut[..], 100).await.unwrap_err();
+        assert!(err.contains("before the end"), "{err}");
     }
 
     /// Pipeline `demo` #1: `a` ran on `x` and left artifacts; `b` needs it
@@ -577,7 +855,8 @@ mod tests {
             ))
             .unwrap();
             let service =
-                ArtifactService::new(state.clone(), Arc::new(config), Arc::new(Runners::new()));
+                ArtifactService::new(state.clone(), Arc::new(config), Arc::new(Runners::new()))
+                    .unwrap();
             (service, state)
         }
 

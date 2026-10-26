@@ -13,6 +13,8 @@ description = "The zeughaus CI: schedules pipelines onto enlisted runners and sh
 # wire types both ends share.
 weida.workspace = true
 zeughaus-link = { workspace = true, features = ["tokio"] }
+# Artifact sets by content: the CI's compressed blob store and its sweep.
+zeughaus-blobs.workspace = true
 # Job transcripts are read-only terminals: the mux wire model, and fed
 # sessions that render the stored output.
 zeughaus-mux.workspace = true

@@ -252,12 +252,29 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
     }
     match listener.replier(ARTIFACTS_PATH) {
         Ok(replier) => {
-            let service = Arc::new(ArtifactService::new(
+            let service = ArtifactService::new(
                 state_dir.to_path_buf(),
                 Arc::clone(&config),
                 Arc::clone(&runners),
-            ));
-            rt.spawn(service.accept(replier));
+            )
+            .map_err(|e| format!("no artifact service: {e}"))?;
+            let service = Arc::new(service);
+            service.sweep(Duration::ZERO);
+            rt.spawn(Arc::clone(&service).accept(replier));
+            rt.spawn(async move {
+                let mut hourly = tokio::time::interval(Duration::from_secs(3600));
+                hourly.tick().await;
+                loop {
+                    hourly.tick().await;
+                    let service = Arc::clone(&service);
+                    let swept = tokio::task::spawn_blocking(move || {
+                        service.sweep(Duration::from_secs(3600));
+                    });
+                    if let Err(e) = swept.await {
+                        eprintln!("[ci] artifact store sweep failed: {e}");
+                    }
+                }
+            });
         }
         Err(e) => return Err(format!("no artifact service: {e}")),
     }

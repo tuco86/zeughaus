@@ -109,7 +109,8 @@ pub const GRAPH_PATH: &str = "/graph";
 /// carrying [`enlist::FromRunner`] and [`enlist::ToRunner`] frames.
 pub const ENLIST_PATH: &str = "/enlist";
 
-/// Req/Rep endpoint a run's artifact tar travels on, one exchange per transfer.
+/// Req/Rep endpoint a run's artifact set travels on: its manifest and the
+/// blobs a side lacks, one exchange per step.
 pub const ARTIFACTS_PATH: &str = "/artifacts";
 
 /// The exchange an agent uploads a working-tree snapshot on, to run named

@@ -65,8 +65,9 @@ tokio = { version = "1", features = [
 toml.workspace = true
 # The basic-auth header a mirror fetch presents.
 base64 = "0.23"
-# Artifact sets leave and enter the runner as tar files.
-tar.workspace = true
+# Artifact sets leave and enter the runner by content: manifests, the blob
+# cache and its sweep.
+zeughaus-blobs.workspace = true
 # Release bundles and the self-update: the manifest and the updater live in
 # `zeughaus-update`; `release keygen` draws its seed from `ring` and writes
 # it as hex.

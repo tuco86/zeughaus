@@ -122,13 +122,16 @@ impl Executor {
     /// The body of the thread of [`Executor::prefetch`].
     fn fetch_early(self: &Arc<Self>, run: &str, consumer: &str, need: &str, early: &Prefetch) {
         let dest = prefetch_dir(&self.state_dir).join(consumer).join(need);
-        // The set is exactly what the tar holds: nothing a fetch that died
+        // The set is exactly what its manifest holds: nothing a fetch that died
         // halfway left may be in it.
         let fetched = cleanup::remove_tree(&dest)
             .map_err(|e| format!("cannot remove {}: {e}", dest.display()))
             .and_then(|()| self.fetch_input(consumer, need, run, &dest));
         match &fetched {
-            Ok(bytes) => eprintln!("[enlist] {consumer}: {need} fetched early, {bytes} bytes"),
+            Ok(fetched) => eprintln!(
+                "[enlist] {consumer}: {need} fetched early, {} bytes, {} moved",
+                fetched.bytes, fetched.moved
+            ),
             Err(e) => eprintln!("[enlist] {consumer}: {need} not fetched early: {e}"),
         }
         early.finish(fetched.map(|_| ()));

@@ -2820,6 +2820,7 @@ mod tests {
             started: 10,
             finished,
             bytes: finished.map(|_| 5),
+            moved: finished.map(|_| 2),
             error: None,
         }
     }

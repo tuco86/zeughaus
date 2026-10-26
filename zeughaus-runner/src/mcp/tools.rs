@@ -962,25 +962,29 @@ fn timing_text(pipeline: &PipelineView) -> String {
     text
 }
 
-/// `    input <need>: <size> MB in <s> s`, with `(fetched early)` when the
-/// set was there before the job was assigned; `failed: <error>` or
-/// `receiving` in place of both when it did not arrive or has not yet.
+/// `    input <need>: <size> MB in <s> s`, then `, <m> MB moved` when fewer
+/// compressed bytes crossed the wire than the set holds, and `(fetched
+/// early)` when the set was there before the job was assigned; `failed:
+/// <error>` or `receiving` in place of all of it when it did not arrive or
+/// has not yet.
 fn transfer_line(transfer: &TransferView, assigned: Option<u64>) -> String {
+    let mb = |bytes: u64| format!("{:.1} MB", bytes as f64 / 1e6);
     let what = match (&transfer.error, transfer.finished) {
         (Some(error), _) => format!("failed: {}", one_line(error)),
         (None, None) => "receiving".to_owned(),
         (None, Some(finished)) => {
-            let size = transfer.bytes.map_or_else(
-                || "-".to_owned(),
-                |bytes| format!("{:.1} MB", bytes as f64 / 1e6),
-            );
+            let size = transfer.bytes.map_or_else(|| "-".to_owned(), mb);
+            let moved = match transfer.moved {
+                Some(moved) if Some(moved) != transfer.bytes => format!(", {} moved", mb(moved)),
+                _ => String::new(),
+            };
             let early = if assigned.is_some_and(|assigned| finished <= assigned) {
                 " (fetched early)"
             } else {
                 ""
             };
             format!(
-                "{size} in {} s{early}",
+                "{size} in {} s{moved}{early}",
                 finished.saturating_sub(transfer.started)
             )
         }
@@ -1621,6 +1625,7 @@ mod tests {
             started,
             finished,
             bytes,
+            moved: bytes,
             error: error.map(str::to_owned),
         };
         let a = timed("a", "succeeded", [Some(45_000), Some(45_002), Some(45_010)]);
@@ -1628,7 +1633,9 @@ mod tests {
         // `a` reached the runner of `c` while `b` still ran, before `c` was
         // assigned.
         let mut c = timed("c", "succeeded", [Some(45_030), Some(45_031), Some(45_040)]);
-        c.transfers = vec![transfer("a", 45_010, Some(45_016), Some(300_000_000), None)];
+        let mut early = transfer("a", 45_010, Some(45_016), Some(300_000_000), None);
+        early.moved = Some(2_100_000);
+        c.transfers = vec![early];
         // `d` fetched what `c` made after it was assigned, or in the very
         // second it was; one input broke and another is still on its way.
         let mut d = timed("d", "failed", [Some(45_040), Some(45_046), Some(45_058)]);
@@ -1658,7 +1665,7 @@ mod tests {
                 "  a                    succeeded assigned +0 s started +2 s ended +10 s staging 2 s ran 8 s\n",
                 "  b                    succeeded assigned +0 s started +1 s ended +30 s staging 1 s ran 29 s\n",
                 "  c                    succeeded assigned +30 s started +31 s ended +40 s staging 1 s ran 9 s\n",
-                "    input a: 300.0 MB in 6 s (fetched early)\n",
+                "    input a: 300.0 MB in 6 s, 2.1 MB moved (fetched early)\n",
                 "  d                    failed    assigned +40 s started +46 s ended +58 s staging 6 s ran 12 s\n",
                 "    input c: 1.5 MB in 4 s\n",
                 "    input x: failed: the upload ended before the end of the set\n",

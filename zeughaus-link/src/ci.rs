@@ -576,7 +576,11 @@ pub struct TransferView {
     pub need: String,
     pub started: u64,
     pub finished: Option<u64>,
+    /// The sum of the set's file sizes.
     pub bytes: Option<u64>,
+    /// The compressed blob bytes that crossed the wire for it.
+    #[serde(default)]
+    pub moved: Option<u64>,
     pub error: Option<String>,
 }
 
@@ -767,6 +771,7 @@ mod tests {
                         started: 1_700_000_021,
                         finished: Some(1_700_000_024),
                         bytes: Some(300_000_000),
+                        moved: Some(2_000_000),
                         error: None,
                     }],
                 },

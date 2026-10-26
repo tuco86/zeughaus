@@ -24,6 +24,7 @@ build of the editor compiles and edits locally (it reaches no runner yet).
 zeughaus/              # binary: the iced editor; edits the graph and views results, never executes
 zeughaus-runner/       # binary: headless process that executes the graph, owns the terminals, runs the CI jobs it is assigned and follows a release channel; `install` writes a host's profile, `update status|rollback` and `version` report and undo updates, `release` makes and checks signed bundles; `mcp` gives an agent the CI and manual job runs as tools
 zeughaus-ci/           # binary: the CI service; schedules pipelines onto enlisted runners, webhook intake, manual-run uploads, stored transcripts; follows a release channel itself (`install ci`, `update`, `version`)
+zeughaus-blobs/        # artifact sets by content: manifests of files by BLAKE3 root, the CI's compressed blob store and the runners' raw caches, materialization, sweeping
 zeughaus-update/       # the self-updater both binaries share: signed manifest, fetch, preflight, install with `.previous`, trial and rollback, and the helpers of the `install` profiles (`host`)
 zeughaus-core/         # Ty/Typed/Value, pins, ExecutableNode/DomainPlugin, settings, scalar wire encoding, graph document types
 zeughaus-runtime/      # GraphExecutor: topology, node instances, edge cache, dirty set, async work, node errors
@@ -254,7 +255,8 @@ token and every secret `ci.toml` names. `zeughaus-ci check [DIR]` and `plan
 
 Five runners enlist, each with an `<state-dir>/enlist.toml`
 (`deploy/runner/enlist.toml.example`: `ci` (the CI's pinned URL, the line in
-its `endpoint` file), `name`, `cpus`, `budget_gb`, and the optional tables
+its `endpoint` file), `name`, `cpus`, `budget_gb`, `blob_cache_gb` (the
+artifact file cache, 8 by default), and the optional tables
 `[containers]` (podman; Apple `container` on macOS, see below) and
 `[machines.<name>]` (a Windows VM)). The CI pins each one by the fingerprint
 in its own `endpoint` file:

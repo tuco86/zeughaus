@@ -5,20 +5,23 @@
 //! little-endian length followed by a postcard body of at most
 //! [`MAX_ENLIST_FRAME_BYTES`].
 //!
-//! An artifact set (a tar) or a try bundle moves on an
-//! [`crate::ARTIFACTS_PATH`] exchange as chunks that follow the frame that
-//! announces it: an [`ArtifactRequest::Upload`] (producer to CI) or an
-//! [`ArtifactReply::Sending`] (CI to consumer). A chunk is a `u32`
-//! little-endian length in `1..=`[`ARTIFACT_CHUNK`] and that many bytes; a
-//! length of 0 ends the set. A body that ends without the 0 is a broken
-//! transfer, and every hop refuses a running total above
-//! [`MAX_ARTIFACT_BYTES`]. The size is not announced, so the sender packs
-//! while it sends and the receiver unpacks while it receives.
+//! An artifact set is a [`SetManifest`]: every file of the set by path, size
+//! and BLAKE3 root. Its files move as blobs, each once per hop and only when
+//! the receiving end lacks it: the producer offers the manifest
+//! ([`ArtifactRequest::Offer`]) and sends the blobs the CI names
+//! ([`ArtifactRequest::Blobs`]); a consumer reads the manifest
+//! ([`ArtifactRequest::Manifest`]) and fetches the blobs its cache lacks
+//! ([`ArtifactRequest::Fetch`]). Manifests, root lists, blobs and try bundles
+//! travel as chunks: a chunk is a `u32` little-endian length in
+//! `1..=`[`ARTIFACT_CHUNK`] and that many bytes; a length of 0 ends the body.
+//! A blob is a [`BlobHead`] frame followed by its zstd bytes as chunks. A body
+//! that ends without the 0 is a broken transfer, and every hop refuses a
+//! running total above [`MAX_ARTIFACT_BYTES`].
 
 use serde::{Deserialize, Serialize};
 
 /// The protocol major a runner and the CI must share.
-pub const ENLIST_MAJOR: u32 = 6;
+pub const ENLIST_MAJOR: u32 = 7;
 
 /// The most one frame body may carry.
 pub const MAX_ENLIST_FRAME_BYTES: usize = 1 << 20;
@@ -27,7 +30,8 @@ pub const MAX_ENLIST_FRAME_BYTES: usize = 1 << 20;
 /// [`MAX_ENLIST_FRAME_BYTES`] so the frame around it still fits.
 pub const MAX_OUTPUT_CHUNK: usize = 256 << 10;
 
-/// The largest artifact set, counted in bytes of tar, either side accepts.
+/// The largest artifact set, counted as the sum of its file sizes, and the
+/// most bytes one artifact exchange carries.
 pub const MAX_ARTIFACT_BYTES: u64 = 4 << 30;
 
 /// The most bytes one chunk of an artifact transfer carries.
@@ -75,9 +79,11 @@ pub enum FromRunner {
 pub enum TransferEvent {
     /// The runner began to fetch the set.
     Started,
-    /// The set arrived and is unpacked; `bytes` is the size of its tar.
+    /// The set arrived and is in place: `bytes` is the sum of its file
+    /// sizes, `moved` the compressed blob bytes that crossed the wire for it.
     Done {
         bytes: u64,
+        moved: u64,
     },
     Failed {
         message: String,
@@ -132,8 +138,8 @@ pub enum ToRunner {
     Kill {
         run: String,
     },
-    /// A job on another runner is downloading the run's artifacts now: send
-    /// them on [`crate::ARTIFACTS_PATH`] as `transfer`.
+    /// A job on another runner needs the run's artifacts now: offer the set
+    /// of `run` to the CI as `transfer` on [`crate::ARTIFACTS_PATH`].
     Upload {
         run: String,
         transfer: u64,
@@ -251,7 +257,7 @@ pub struct Input {
 pub enum InputSource {
     /// On this runner, from a run it executed.
     Local { run: String },
-    /// On the runner that executed `run`, relayed by the CI on
+    /// On the runner that executed `run`, through the CI on
     /// [`crate::ARTIFACTS_PATH`].
     Ci { run: String },
 }
@@ -259,27 +265,197 @@ pub enum InputSource {
 /// First frame of an [`crate::ARTIFACTS_PATH`] exchange.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArtifactRequest {
-    /// The producing runner answers [`ToRunner::Upload`]; the chunks of the
-    /// set follow, which the CI relays to the waiting download as they
-    /// arrive.
-    Upload { run: String, transfer: u64 },
-    /// The producing runner cannot send what `transfer` asked for.
+    /// Producer, answering [`ToRunner::Upload`]: the set's encoded
+    /// [`SetManifest`] follows as chunks and an end marker. Reply: `Sending`,
+    /// then the concatenated roots the CI lacks ([`encode_roots`]) as chunks
+    /// and an end marker; or `Error`.
+    Offer { run: String, transfer: u64 },
+    /// Producer, after `Offer`: for each missing root in the order the CI
+    /// named, a [`BlobHead`] frame, the blob's zstd bytes as chunks and an end
+    /// marker; then the request body ends. Reply: `Done` or `Error`.
+    Blobs { run: String, transfer: u64 },
+    /// Producer: cannot send what `transfer` asked for. Reply: `Done` or
+    /// `Error`.
     Unavailable {
         run: String,
         transfer: u64,
         message: String,
     },
-    /// A consuming runner fetches `run`'s artifacts for a job it was assigned.
-    Download { run: String },
+    /// Consumer: the set's encoded [`SetManifest`]. Reply: `Sending`, chunks,
+    /// end marker; or `Error`.
+    Manifest { run: String },
+    /// Consumer: the concatenated roots it wants follow as chunks and an end
+    /// marker. Reply: `Sending`, then per root, in that order, a [`BlobHead`]
+    /// frame, the zstd bytes as chunks and an end marker; or `Error`.
+    Fetch { run: String },
     /// A runner fetches bundle `index` of the manual run `run` it was
     /// assigned.
     ManualBundle { run: String, index: u32 },
 }
 
-/// The CI's answer; after `Sending`, the chunks of the set follow.
+/// The most entries one [`SetManifest`] holds.
+pub const MAX_SET_ENTRIES: usize = 200_000;
+
+/// The most bytes an encoded [`SetManifest`] takes.
+pub const MAX_MANIFEST_BYTES: usize = 32 << 20;
+
+/// The longest path of a [`SetEntry`].
+pub const MAX_SET_PATH_BYTES: usize = 4096;
+
+/// The files of an artifact set, parents before their children.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetManifest {
+    pub entries: Vec<SetEntry>,
+}
+
+/// One entry of a [`SetManifest`]. `path` is relative, its components joined
+/// with `/`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SetEntry {
+    Dir {
+        path: String,
+    },
+    /// `root` is the BLAKE3 hash of the file's bytes.
+    File {
+        path: String,
+        size: u64,
+        root: [u8; 32],
+        executable: bool,
+    },
+}
+
+impl SetEntry {
+    pub fn path(&self) -> &str {
+        match self {
+            SetEntry::Dir { path } | SetEntry::File { path, .. } => path,
+        }
+    }
+}
+
+/// Announces one blob in a `Blobs` request or a `Fetch` reply; its zstd
+/// bytes follow as chunks and an end marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobHead {
+    pub root: [u8; 32],
+    /// The blob's size uncompressed.
+    pub size: u64,
+}
+
+impl SetManifest {
+    /// Refuses a manifest no receiver may materialize: too many entries, a
+    /// path that is empty, too long, absolute or climbs out, a path twice,
+    /// one root with two sizes, or more than [`MAX_ARTIFACT_BYTES`] of files.
+    pub fn check(&self) -> Result<(), String> {
+        use std::collections::{HashMap, HashSet};
+
+        if self.entries.len() > MAX_SET_ENTRIES {
+            return Err(format!(
+                "a set of {} entries exceeds {MAX_SET_ENTRIES}",
+                self.entries.len()
+            ));
+        }
+        let mut paths = HashSet::with_capacity(self.entries.len());
+        let mut sizes: HashMap<[u8; 32], u64> = HashMap::new();
+        let mut total = 0u64;
+        for entry in &self.entries {
+            let path = entry.path();
+            check_set_path(path)?;
+            if !paths.insert(path) {
+                return Err(format!("{path}: twice in the set"));
+            }
+            if let SetEntry::File { size, root, .. } = entry {
+                if *sizes.entry(*root).or_insert(*size) != *size {
+                    return Err(format!("{path}: its content has another size elsewhere"));
+                }
+                total = total.saturating_add(*size);
+                if total > MAX_ARTIFACT_BYTES {
+                    return Err(format!(
+                        "{path}: the set exceeds {MAX_ARTIFACT_BYTES} bytes"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The sum of the file sizes.
+    pub fn files(&self) -> u64 {
+        self.entries
+            .iter()
+            .map(|entry| match entry {
+                SetEntry::File { size, .. } => *size,
+                SetEntry::Dir { .. } => 0,
+            })
+            .sum()
+    }
+
+    #[cfg(feature = "tokio")]
+    pub fn encode(&self) -> Vec<u8> {
+        // Serializing plain strings, integers and arrays into a Vec cannot
+        // fail.
+        postcard::to_stdvec(self).expect("a manifest encodes")
+    }
+
+    /// Inverse of [`SetManifest::encode`]; the result passed
+    /// [`SetManifest::check`].
+    #[cfg(feature = "tokio")]
+    pub fn decode(bytes: &[u8]) -> Result<SetManifest, String> {
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(format!(
+                "a manifest of {} bytes exceeds {MAX_MANIFEST_BYTES}",
+                bytes.len()
+            ));
+        }
+        let manifest: SetManifest =
+            postcard::from_bytes(bytes).map_err(|e| format!("decode manifest: {e}"))?;
+        manifest.check()?;
+        Ok(manifest)
+    }
+}
+
+fn check_set_path(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("an empty path in the set".to_owned());
+    }
+    if path.len() > MAX_SET_PATH_BYTES {
+        return Err(format!("{path}: longer than {MAX_SET_PATH_BYTES} bytes"));
+    }
+    if path.starts_with('/') || path.contains(['\\', '\0', ':']) {
+        return Err(format!("{path}: not a relative path of the set"));
+    }
+    if path
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(format!("{path}: an empty, `.` or `..` component"));
+    }
+    Ok(())
+}
+
+/// The roots of a `Fetch` request or an `Offer` reply, concatenated.
+pub fn encode_roots(roots: &[[u8; 32]]) -> Vec<u8> {
+    roots.concat()
+}
+
+/// Inverse of [`encode_roots`]; refuses a length that is no multiple of 32
+/// and more than [`MAX_SET_ENTRIES`] roots.
+pub fn decode_roots(bytes: &[u8]) -> Result<Vec<[u8; 32]>, String> {
+    if !bytes.len().is_multiple_of(32) {
+        return Err(format!("{} bytes are no list of roots", bytes.len()));
+    }
+    if bytes.len() / 32 > MAX_SET_ENTRIES {
+        return Err(format!(
+            "{} roots exceed {MAX_SET_ENTRIES}",
+            bytes.len() / 32
+        ));
+    }
+    Ok(bytes.as_chunks::<32>().0.to_vec())
+}
+
+/// The CI's answer; after `Sending`, the body the request names follows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArtifactReply {
-    /// An upload reached its download, or an `Unavailable` was passed on.
+    /// The offered blobs are stored, or an `Unavailable` was passed on.
     Done,
     Sending,
     Error {
@@ -592,7 +768,10 @@ mod tests {
     async fn a_transfer_report_round_trips() {
         let events = [
             TransferEvent::Started,
-            TransferEvent::Done { bytes: 3 << 30 },
+            TransferEvent::Done {
+                bytes: 3 << 30,
+                moved: 1 << 20,
+            },
             TransferEvent::Failed {
                 message: "the CI is gone".to_owned(),
             },
@@ -641,6 +820,136 @@ mod tests {
             assert_eq!(
                 read_frame::<_, ToRunner>(&mut r).await.unwrap(),
                 Some(command)
+            );
+        }
+    }
+
+    fn file(path: &str, size: u64, byte: u8) -> SetEntry {
+        SetEntry::File {
+            path: path.to_owned(),
+            size,
+            root: [byte; 32],
+            executable: false,
+        }
+    }
+
+    fn dir(path: &str) -> SetEntry {
+        SetEntry::Dir {
+            path: path.to_owned(),
+        }
+    }
+
+    fn nested() -> SetManifest {
+        SetManifest {
+            entries: vec![
+                dir("a"),
+                dir("a/b"),
+                file("a/b/c.txt", 3, 1),
+                file("a/same", 3, 1),
+                file("top", 0, 2),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_nested_tree_passes_the_check() {
+        nested().check().unwrap();
+        assert_eq!(nested().files(), 6);
+    }
+
+    #[test]
+    fn a_path_that_leaves_the_set_or_repeats_is_refused() {
+        for bad in ["/a", "a/../b", "a//b", "a\\b", "c:x", "./a", "a/", ""] {
+            let manifest = SetManifest {
+                entries: vec![file(bad, 1, 1)],
+            };
+            assert!(manifest.check().is_err(), "{bad:?} passed");
+        }
+        let twice = SetManifest {
+            entries: vec![dir("a"), file("a", 1, 1)],
+        };
+        assert!(twice.check().unwrap_err().contains("twice"));
+    }
+
+    #[test]
+    fn one_root_with_two_sizes_is_refused() {
+        let manifest = SetManifest {
+            entries: vec![file("a", 1, 7), file("b", 2, 7)],
+        };
+        let err = manifest.check().unwrap_err();
+        assert!(err.starts_with("b:"), "{err}");
+    }
+
+    #[test]
+    fn a_set_above_the_artifact_limit_is_refused() {
+        let manifest = SetManifest {
+            entries: vec![file("a", MAX_ARTIFACT_BYTES, 1), file("b", 1, 2)],
+        };
+        assert!(manifest.check().unwrap_err().contains("exceeds"));
+        let at_limit = SetManifest {
+            entries: vec![file("a", MAX_ARTIFACT_BYTES - 1, 1), file("b", 1, 2)],
+        };
+        at_limit.check().unwrap();
+    }
+
+    #[test]
+    fn a_manifest_round_trips_and_a_truncated_one_is_refused() {
+        let bytes = nested().encode();
+        assert_eq!(SetManifest::decode(&bytes).unwrap(), nested());
+        assert!(SetManifest::decode(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn a_decoded_manifest_is_checked() {
+        let bad = SetManifest {
+            entries: vec![file("../x", 1, 1)],
+        };
+        assert!(SetManifest::decode(&bad.encode()).is_err());
+    }
+
+    #[test]
+    fn roots_round_trip_and_a_partial_root_is_refused() {
+        let roots = [[1u8; 32], [2u8; 32]];
+        assert_eq!(decode_roots(&encode_roots(&roots)).unwrap(), roots);
+        assert_eq!(decode_roots(&[]).unwrap(), Vec::<[u8; 32]>::new());
+        assert!(decode_roots(&[0u8; 33]).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_blob_head_and_the_artifact_requests_round_trip() {
+        let head = BlobHead {
+            root: [9; 32],
+            size: 1 << 40,
+        };
+        let run = || "r.1.j".to_owned();
+        let requests = [
+            ArtifactRequest::Offer {
+                run: run(),
+                transfer: 3,
+            },
+            ArtifactRequest::Blobs {
+                run: run(),
+                transfer: 3,
+            },
+            ArtifactRequest::Unavailable {
+                run: run(),
+                transfer: 3,
+                message: "gone".to_owned(),
+            },
+            ArtifactRequest::Manifest { run: run() },
+            ArtifactRequest::Fetch { run: run() },
+        ];
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &head).await.unwrap();
+        for request in &requests {
+            write_frame(&mut buf, request).await.unwrap();
+        }
+        let mut r: &[u8] = &buf;
+        assert_eq!(read_frame::<_, BlobHead>(&mut r).await.unwrap(), Some(head));
+        for request in requests {
+            assert_eq!(
+                read_frame::<_, ArtifactRequest>(&mut r).await.unwrap(),
+                Some(request)
             );
         }
     }

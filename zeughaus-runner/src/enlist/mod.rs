@@ -7,12 +7,13 @@
 //! under `<state-dir>/ci/`: the assignment of every started run
 //! (`assigned/<run>.json`), its artifacts, the mirrors and the workspaces.
 //!
-//! Artifacts are kept once, on the runner that produced them
-//! (`artifacts/<run>`, moved out of the run's directory), until the CI
-//! sends `DropArtifacts`; a consumer on another runner gets them relayed
-//! through the CI, which stores nothing. A consumer's copy of its inputs
-//! (`inputs/` in the run directory, the guest's copy on a VM) goes with its
-//! run.
+//! Artifacts are kept on the runner that produced them (`artifacts/<run>`,
+//! moved out of the run's directory) until the CI sends `DropArtifacts`; a
+//! consumer on another runner gets them through the CI, which keeps their
+//! files by content. Each runner keeps a cache of the files it fetched
+//! (`blobs/`, kept alive by the sets in `blob-sets/`), so a file it holds is
+//! never fetched again. A consumer's copy of its inputs (`inputs/` in the run
+//! directory, the guest's copy on a VM) goes with its run.
 //!
 //! The connection is the runner's to keep: it dials the CI, says who it is and
 //! which runs it still knows, and redials with a growing delay when it is
@@ -24,7 +25,7 @@
 //! * `run`: one assignment from staging to its end, the log delivery and
 //!   the restart of runs a previous process left.
 //! * `control`: the clock of this runner: machine status and the VM timeout.
-//! * `artifacts`: the artifact sets that cross to and from the CI, streamed.
+//! * `artifacts`: the artifact sets that cross to and from the CI, by content.
 //! * `prefetch`: the sets fetched before their job is assigned.
 //! * `launch`, `machine`, `git`, `cleanup`, `stage`: what a run is rendered
 //!   from and housekeeping.
@@ -82,6 +83,19 @@ fn assigned_dir(state_dir: &Path) -> PathBuf {
 pub fn artifacts_dir(state_dir: &Path) -> PathBuf {
     ci_dir(state_dir).join("artifacts")
 }
+
+/// The blob cache: every file this runner fetched, by its BLAKE3 root.
+pub fn blobs_dir(state_dir: &Path) -> PathBuf {
+    ci_dir(state_dir).join("blobs")
+}
+
+/// The sets whose files the blob cache keeps, one `<run>.set` each.
+fn blob_sets_dir(state_dir: &Path) -> PathBuf {
+    ci_dir(state_dir).join("blob-sets")
+}
+
+/// How long the blob cache keeps a set's files after it was last fetched.
+const BLOB_KEEP: std::time::Duration = std::time::Duration::from_secs(7 * 86400);
 
 fn mirror_dir(state_dir: &Path, repo: &str) -> PathBuf {
     ci_dir(state_dir)
@@ -176,6 +190,8 @@ pub struct Executor {
     mirrors: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// The sets fetched for jobs that are not assigned yet.
     prefetches: prefetch::Prefetches,
+    /// The raw blobs fetched sets are materialized from.
+    blobs: zeughaus_blobs::Store,
 }
 
 /// Starts enlisting: the executor's threads and the connection task. Called
@@ -219,6 +235,9 @@ pub fn start(
     let cpus = config.cpus.unwrap_or_else(|| {
         std::thread::available_parallelism().map_or(1, |n| u32::try_from(n.get()).unwrap_or(1))
     });
+    let blobs_at = blobs_dir(state_dir);
+    let blobs = zeughaus_blobs::Store::open(&blobs_at, false)
+        .map_err(|e| format!("enlist: cannot open {}: {e}", blobs_at.display()))?;
 
     let executor = Arc::new(Executor {
         host,
@@ -235,12 +254,14 @@ pub fn start(
         link: Mutex::new(Link::default()),
         mirrors: Mutex::new(HashMap::new()),
         prefetches: prefetch::Prefetches::default(),
+        blobs,
     });
     // An earlier process fetched sets early for jobs it knew of; a job
     // assigned now fetches its inputs itself.
     if let Err(e) = cleanup::remove_tree(&prefetch::prefetch_dir(state_dir)) {
         eprintln!("[enlist] cannot empty the early fetches: {e}");
     }
+    executor.sweep_blobs(std::time::Duration::ZERO);
     executor.recover();
     executor.sweep_inputs();
     control::spawn(&executor);
@@ -261,6 +282,25 @@ impl Executor {
 
     fn ctl(&self, run: &str) -> Option<Arc<RunCtl>> {
         lock(&self.runs).get(run).cloned()
+    }
+
+    /// Keeps the blob cache within [`BLOB_KEEP`] and `blob_cache_gb`, leaving
+    /// alone what is younger than `grace`.
+    fn sweep_blobs(&self, grace: std::time::Duration) {
+        let retention = zeughaus_blobs::Retention {
+            keep: BLOB_KEEP,
+            budget: self.config.blob_cache_gb << 30,
+            grace,
+        };
+        let swept = zeughaus_blobs::sweep(&self.blobs, &blob_sets_dir(&self.state_dir), &retention);
+        if swept.sets > 0 || swept.blobs > 0 {
+            eprintln!(
+                "[enlist] blob cache: removed {} sets, {} blobs, {} MB",
+                swept.sets,
+                swept.blobs,
+                swept.bytes >> 20
+            );
+        }
     }
 
     /// The runs this process started, for `Hello`. A run that has ended is

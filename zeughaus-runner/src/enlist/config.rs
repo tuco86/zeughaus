@@ -18,6 +18,10 @@ fn default_budget_gb() -> u64 {
     50
 }
 
+fn default_blob_cache_gb() -> u64 {
+    8
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnlistConfig {
@@ -31,6 +35,9 @@ pub struct EnlistConfig {
     /// Size limit of the host workspaces under `ci/work`.
     #[serde(default = "default_budget_gb")]
     pub budget_gb: u64,
+    /// Size limit of the blob cache under `ci/blobs`, in GiB.
+    #[serde(default = "default_blob_cache_gb")]
+    pub blob_cache_gb: u64,
     /// Present: this runner runs jobs in rootless podman containers.
     pub containers: Option<ContainerConfig>,
     /// The machines behind this runner, by the name a job's `machine` key
@@ -191,6 +198,7 @@ mod tests {
             EnlistConfig::parse(&format!("ci = \"{}\"\nname = \"sadala\"\n", url())).unwrap();
         assert_eq!(config.name, "sadala");
         assert_eq!(config.budget_gb, 50);
+        assert_eq!(config.blob_cache_gb, 8);
         assert!(config.containers.is_none());
         assert!(config.machines.is_empty());
         assert_eq!(
