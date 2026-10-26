@@ -2792,12 +2792,14 @@ mod tests {
                 )
                 .await
                 .expect_err("not in the CI");
+            // The refusal names the checkout as git spells its top level:
+            // `/private/var/...` on macOS, forward slashes on Windows.
+            let root = fx(&receiving, &["rev-parse", "--show-toplevel"]);
             assert_eq!(
                 err,
                 format!(
                     "git@example.invalid:o/other.git is no repository of the CI; write \
-                     PROPOSAL-<source>-<topic>.md into {} instead",
-                    receiving.display()
+                     PROPOSAL-<source>-<topic>.md into {root} instead"
                 )
             );
             let _ = std::fs::remove_dir_all(receiving.parent().unwrap());
