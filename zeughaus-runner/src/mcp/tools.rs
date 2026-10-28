@@ -495,13 +495,7 @@ impl Toolbox {
         }
     }
 
-    /// Looks at a pipeline, named by its number or by the sha of its commit,
-    /// until it has settled (or, with `job`, until that job has) or the wait
-    /// has passed, and answers as `ci_pipeline` does. Named by neither, it is
-    /// the pipeline of the commit the working directory's checkout is at. A
-    /// sha that matches no pipeline yet is waited for: the push may not have
-    /// reached the CI. Once it matches, the pipeline is followed by its
-    /// number, so a newer one of the same commit does not take its place.
+    /// `ci_wait`: [`Toolbox::wait`] for as long as the call may take.
     async fn ci_wait(&self, args: CiWaitArgs) -> Result<String, String> {
         let CiWaitArgs {
             repo,
@@ -510,6 +504,26 @@ impl Toolbox {
             job,
             wait_seconds,
         } = args;
+        self.wait(repo, number, sha, job, wait_for(wait_seconds))
+            .await
+            .map(|waited| waited.text)
+    }
+
+    /// Looks at a pipeline, named by its number or by the sha of its commit,
+    /// until it has settled (or, with `job`, until that job has) or `limit`
+    /// has passed, and answers as `ci_pipeline` does. Named by neither, it is
+    /// the pipeline of the commit the working directory's checkout is at. A
+    /// sha that matches no pipeline yet is waited for: the push may not have
+    /// reached the CI. Once it matches, the pipeline is followed by its
+    /// number, so a newer one of the same commit does not take its place.
+    pub(super) async fn wait(
+        &self,
+        repo: Option<String>,
+        number: Option<u64>,
+        sha: Option<String>,
+        job: Option<String>,
+        limit: Duration,
+    ) -> Result<Waited, String> {
         let started = Instant::now();
         let named = match (number, sha) {
             (Some(number), None) => Some(Wanted::Number(number)),
@@ -525,7 +539,7 @@ impl Toolbox {
             None => Wanted::Sha(self.head().await?),
         };
         let repo = self.repo_or_checkout(repo).await?;
-        let deadline = started + wait_for(wait_seconds);
+        let deadline = started + limit;
         let mut latest: Option<PipelineView> = None;
         // Every look sets it before the loop can end.
         let mut last_error: Option<String>;
@@ -556,7 +570,10 @@ impl Toolbox {
                             matches!(found.status.as_str(), "succeeded" | "failed" | "skipped");
                     }
                     if settled {
-                        return Ok(pipeline_text(&view));
+                        return Ok(Waited {
+                            settled: true,
+                            text: pipeline_text(&view),
+                        });
                     }
                     latest = Some(view);
                 }
@@ -584,17 +601,23 @@ impl Toolbox {
             tokio::time::sleep(self.poll.min(deadline - now)).await;
         }
         let seconds = started.elapsed().as_secs();
-        match (latest, &wanted, last_error) {
-            (Some(view), _, _) => Ok(waiting_text(&view, job.as_deref(), seconds)),
+        let text = match (latest, &wanted, last_error) {
+            (Some(view), _, _) => waiting_text(&view, job.as_deref(), seconds),
             (None, wanted, Some(e)) => {
-                Err(unreachable_text(&e, &wanted.describe(&repo), "ci_wait"))
+                return Err(unreachable_text(&e, &wanted.describe(&repo), "ci_wait"));
             }
-            (None, Wanted::Sha(sha), None) => Ok(format!(
+            (None, Wanted::Sha(sha), None) => format!(
                 "no pipeline of {sha} in {repo} after {seconds} s; the push may not have \
                  reached the CI yet; call ci_wait again\n"
-            )),
-            (None, Wanted::Number(number), None) => Err(format!("no pipeline {repo} #{number}")),
-        }
+            ),
+            (None, Wanted::Number(number), None) => {
+                return Err(format!("no pipeline {repo} #{number}"));
+            }
+        };
+        Ok(Waited {
+            settled: false,
+            text,
+        })
     }
 
     /// The commit the working directory's checkout is at.
@@ -847,6 +870,13 @@ enum Wanted {
     Sha(String),
 }
 
+/// What [`Toolbox::wait`] ended with: the text to show, and whether the
+/// pipeline (or the job waited for) has settled or the wait ran out.
+pub(super) struct Waited {
+    pub settled: bool,
+    pub text: String,
+}
+
 impl Wanted {
     fn describe(&self, repo: &str) -> String {
         match self {
@@ -1032,15 +1062,15 @@ pub(super) fn pipeline_text(pipeline: &PipelineView) -> String {
 /// A `ci_wait` that stopped before what it waited for happened: the
 /// pipeline as it stands, and how to wait on.
 fn waiting_text(pipeline: &PipelineView, job: Option<&str>, waited_seconds: u64) -> String {
+    let job_arg = job.map(|job| format!(" job={job}")).unwrap_or_default();
+    let job_operand = job.map(|job| format!(" {job}")).unwrap_or_default();
     let mut text = pipeline_text(pipeline);
     text.push_str(&format!(
-        "still running after {waited_seconds} s; call ci_wait again with repo={} number={}",
-        pipeline.repo, pipeline.number
+        "still running after {waited_seconds} s; call ci_wait again with repo={} number={}{job_arg}\n\
+         to keep working meanwhile, run `zeughaus-runner ci wait {} {}{job_operand}` as a \
+         background command; it answers once the pipeline has settled\n",
+        pipeline.repo, pipeline.number, pipeline.repo, pipeline.number
     ));
-    if let Some(job) = job {
-        text.push_str(&format!(" job={job}"));
-    }
-    text.push('\n');
     text
 }
 
@@ -1387,7 +1417,9 @@ fn definitions() -> Vec<Value> {
             "Wait until a pipeline, or one job of it, has settled, and answer with the pipeline \
              as ci_pipeline does. Name the pipeline by number, or by the sha of its commit right \
              after a push: a pipeline that does not exist yet is waited for. With neither, it \
-             waits for the pipeline of the working directory's HEAD.",
+             waits for the pipeline of the working directory's HEAD. For a wait longer than a \
+             few minutes, run `zeughaus-runner ci wait <repo> <number>` as a background command \
+             instead and keep working.",
             json!({
                 "repo": repo,
                 "number": number,
@@ -2548,7 +2580,9 @@ mod tests {
             );
             assert!(
                 text.ends_with(
-                    "still running after 1 s; call ci_wait again with repo=demo number=1\n"
+                    "still running after 1 s; call ci_wait again with repo=demo number=1\n\
+                     to keep working meanwhile, run `zeughaus-runner ci wait demo 1` as a \
+                     background command; it answers once the pipeline has settled\n"
                 ),
                 "{text}"
             );
@@ -2634,11 +2668,13 @@ mod tests {
                 .await
                 .expect("still running is not an error");
             assert!(
-            text.ends_with(
-                "still running after 0 s; call ci_wait again with repo=demo number=4 job=build\n"
-            ),
-            "{text}"
-        );
+                text.ends_with(
+                    "still running after 0 s; call ci_wait again with repo=demo number=4 \
+                     job=build\nto keep working meanwhile, run `zeughaus-runner ci wait demo 4 \
+                     build` as a background command; it answers once the pipeline has settled\n"
+                ),
+                "{text}"
+            );
 
             let err = tools
                 .call(
@@ -3170,11 +3206,32 @@ mod tests {
         }
 
         /// A `zeughaus-runner ci` client of the fake CI.
-        fn ci_client(ci: &FakeCi) -> Client {
-            Client::new(crate::mcp::client::Link::resolve(
+        fn ci_client(ci: &FakeCi) -> Arc<Client> {
+            Arc::new(Client::new(crate::mcp::client::Link::resolve(
                 Some(ci.url.clone()),
                 &ci.state,
-            ))
+            )))
+        }
+
+        /// `ci wait` answers once the pipeline has settled, with the text
+        /// `ci_wait` gives.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_cli_wait_answers_once_the_pipeline_has_settled() {
+            let ci = fake_ci("cli-wait", 1, None).await;
+            let client = ci_client(&ci);
+            let text = ci_answer(
+                &client,
+                CiCommand::Wait {
+                    repo: "demo".to_owned(),
+                    number: Some(1),
+                    sha: None,
+                    job: None,
+                },
+            )
+            .await
+            .expect("settled");
+            assert!(text.starts_with("demo/dev #1 succeeded"), "{text}");
+            client.shutdown().await;
         }
 
         /// An omitted `repo` is the repository the working directory's checkout
@@ -3504,7 +3561,7 @@ mod tests {
         #[tokio::test]
         async fn without_a_ci_a_command_exits_2_but_a_checkout_is_checked_first() {
             let reason = "no CI configured: add ci = [..] to /x/zeughaus.toml";
-            let client = Client::new(Err(reason.to_owned()));
+            let client = Arc::new(Client::new(Err(reason.to_owned())));
             let (dir, _) = committed_checkout("cli-noci");
             let in_dir = |path: &Path| CiCommand::Repo {
                 json: false,

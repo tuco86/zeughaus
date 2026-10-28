@@ -139,11 +139,15 @@ const EXIT_NOT_A_REPOSITORY: u8 = 3;
 ///   with `approve_failed` saying why an asked approval did not go through.
 /// - `ci planned <repo> <file>`: marks the proposals that the plan in
 ///   `file` names as planned, for a plan executed without being saved.
+/// - `ci wait <repo> <number|sha> [<job>]`: waits until the pipeline (or
+///   that job of it) has settled, up to [`CLI_WAIT_LIMIT`], and prints it
+///   as `ci_wait` does; an agent runs it as a background command.
 ///
-/// Exit 0: answered; an `--approve` that the CI refused still exits 0 and
-/// says so, because the plan is stored. 1: the arguments, the directory or
-/// the file were wrong. 2: no CI is configured, it could not be asked, or
-/// it refused (no such document, a state that cannot change). 3: `ci repo`
+/// Exit 0: answered (for `ci wait`: settled, whatever its status); an
+/// `--approve` that the CI refused still exits 0 and says so, because the
+/// plan is stored. 1: the arguments, the directory or the file were wrong.
+/// 2: no CI is configured, it could not be asked, it refused (no such
+/// document, a state that cannot change), or the wait ran out. 3: `ci repo`
 /// only, no repository of the CI has the checkout's origin.
 pub fn cli(args: &[String], state_dir: &Path) -> ExitCode {
     let command = match parse_ci(args) {
@@ -166,7 +170,7 @@ pub fn cli(args: &[String], state_dir: &Path) -> ExitCode {
     // A missing CI is the client's error on its first question, after the
     // checkout was found: a directory that is none is wrong whatever the CI
     // is doing.
-    let client = Client::new(Link::resolve(None, state_dir));
+    let client = Arc::new(Client::new(Link::resolve(None, state_dir)));
     let answered = runtime.block_on(async {
         let answered = ci_answer(&client, command).await;
         client.shutdown().await;
@@ -211,11 +215,21 @@ enum CiCommand {
         repo: String,
         file: PathBuf,
     },
+    Wait {
+        repo: String,
+        number: Option<u64>,
+        sha: Option<String>,
+        job: Option<String>,
+    },
 }
+
+/// How long `ci wait` waits: the longest a job may run by default. The
+/// caller's own timeout is the hang detector.
+const CLI_WAIT_LIMIT: Duration = Duration::from_secs(4 * 3600);
 
 /// The arguments that follow `ci`.
 fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
-    const SUBCOMMANDS: &str = "repo, find, doc, plan-save or planned";
+    const SUBCOMMANDS: &str = "repo, find, doc, plan-save, planned or wait";
     let Some((subcommand, rest)) = args.split_first() else {
         return Err(format!("ci needs a subcommand: {SUBCOMMANDS}"));
     };
@@ -224,7 +238,7 @@ fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
     let mut operands: Vec<&String> = Vec::new();
     for arg in rest {
         match arg.as_str() {
-            "--json" if subcommand != "planned" => json = true,
+            "--json" if subcommand != "planned" && subcommand != "wait" => json = true,
             "--approve" if subcommand == "plan-save" => approve = true,
             flag if flag.len() > 1 && flag.starts_with('-') => {
                 return Err(format!("unknown flag {flag:?} for ci {subcommand}"));
@@ -267,6 +281,36 @@ fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
             file: PathBuf::from(file),
         }),
         ("planned", _) => Err("ci planned takes a repository name and a file".to_owned()),
+        ("wait", [repo, target, rest @ ..]) if rest.len() <= 1 => {
+            // Up to 7 digits is a pipeline number; more digits are a sha
+            // prefix that happens to have no letter.
+            let digits = target.len() <= 7 && target.bytes().all(|b| b.is_ascii_digit());
+            let (number, sha) = match target.parse::<u64>() {
+                Ok(number) if digits && number >= 1 => (Some(number), None),
+                _ if is_sha_prefix(target) => (None, Some((*target).clone())),
+                _ => {
+                    return Err(format!(
+                        "{target:?} is neither a pipeline number nor 4 to 40 hex digits"
+                    ));
+                }
+            };
+            let job = match rest.first() {
+                Some(job) if !crate::names::valid_name(job) => {
+                    return Err(format!("{job:?} is not a job name"));
+                }
+                job => job.map(|job| (*job).clone()),
+            };
+            Ok(CiCommand::Wait {
+                repo: (*repo).clone(),
+                number,
+                sha,
+                job,
+            })
+        }
+        ("wait", _) => Err(
+            "ci wait takes a repository name, a pipeline number or sha, and optionally a job"
+                .to_owned(),
+        ),
         (other, _) => Err(format!("unknown ci subcommand {other:?}: {SUBCOMMANDS}")),
     }
 }
@@ -329,7 +373,7 @@ fn encoded<T: Serialize>(value: &T) -> Result<String, Failure> {
 }
 
 /// Runs one `ci` command. `Ok` is what goes to stdout, newline included.
-async fn ci_answer(client: &Client, command: CiCommand) -> Result<String, Failure> {
+async fn ci_answer(client: &Arc<Client>, command: CiCommand) -> Result<String, Failure> {
     match command {
         CiCommand::Repo { json, path } => {
             let dir = match path {
@@ -464,6 +508,22 @@ async fn ci_answer(client: &Client, command: CiCommand) -> Result<String, Failur
             let marked: Vec<String> = numbers.iter().map(|n| format!("#{n}")).collect();
             Ok(format!("marked {} planned\n", marked.join(", ")))
         }
+        CiCommand::Wait {
+            repo,
+            number,
+            sha,
+            job,
+        } => {
+            let waited = Toolbox::new(Arc::clone(client))
+                .wait(Some(repo), number, sha, job, CLI_WAIT_LIMIT)
+                .await
+                .map_err(Failure::no_answer)?;
+            if waited.settled {
+                Ok(waited.text)
+            } else {
+                Err(Failure::no_answer(waited.text))
+            }
+        }
     }
 }
 
@@ -557,6 +617,25 @@ mod tests {
                 file: PathBuf::from("/tmp/p.md")
             })
         );
+        let wait = |number: Option<u64>, sha: Option<&str>, job: Option<&str>| CiCommand::Wait {
+            repo: "demo".to_owned(),
+            number,
+            sha: sha.map(str::to_owned),
+            job: job.map(str::to_owned),
+        };
+        assert_eq!(
+            parse_ci(&args(&["wait", "demo", "12"])),
+            Ok(wait(Some(12), None, None))
+        );
+        assert_eq!(
+            parse_ci(&args(&["wait", "demo", "deadbeef", "build"])),
+            Ok(wait(None, Some("deadbeef"), Some("build")))
+        );
+        // Eight digits are more than a pipeline number has: a sha prefix.
+        assert_eq!(
+            parse_ci(&args(&["wait", "demo", "12345678"])),
+            Ok(wait(None, Some("12345678"), None))
+        );
     }
 
     #[test]
@@ -590,6 +669,20 @@ mod tests {
             (
                 &["find", "zeughaus", "abc"][..],
                 "is not 4 to 40 hex digits",
+            ),
+            (
+                &["wait", "demo", "xyz"][..],
+                "\"xyz\" is neither a pipeline number nor 4 to 40 hex digits",
+            ),
+            (&["wait", "demo", "12", "a", "b"][..], "ci wait takes"),
+            (&["wait", "demo"][..], "ci wait takes"),
+            (
+                &["wait", "demo", "12", "Bad"][..],
+                "\"Bad\" is not a job name",
+            ),
+            (
+                &["wait", "--json", "demo", "12"][..],
+                "unknown flag \"--json\" for ci wait",
             ),
         ] {
             let err = parse_ci(&args(given)).expect_err(&format!("{given:?}"));
