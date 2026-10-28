@@ -364,6 +364,7 @@ mod tests {
             kind: kind.to_owned(),
             status: status.to_owned(),
             jobs: Vec::new(),
+            build: 0,
         }
     }
 

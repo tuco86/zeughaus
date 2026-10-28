@@ -130,6 +130,7 @@ async fn exchange(
         major: ENLIST_MAJOR,
         name: exec.config.name.clone(),
         offer: exec.offer(),
+        build: zeughaus_update::manifest::own_build(),
         runs: exec.reports(),
         artifacts: exec.artifact_sets(),
     };

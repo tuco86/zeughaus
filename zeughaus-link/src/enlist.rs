@@ -21,7 +21,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The protocol major a runner and the CI must share.
-pub const ENLIST_MAJOR: u32 = 7;
+pub const ENLIST_MAJOR: u32 = 8;
 
 /// The most one frame body may carry.
 pub const MAX_ENLIST_FRAME_BYTES: usize = 1 << 20;
@@ -46,6 +46,9 @@ pub enum FromRunner {
         major: u32,
         name: String,
         offer: Offer,
+        /// The CI build (pipeline number) this runner runs; 0 for one built
+        /// elsewhere.
+        build: u64,
         runs: Vec<RunReport>,
         /// Run ids of the artifact sets under the runner's `ci/artifacts/`.
         artifacts: Vec<String>,

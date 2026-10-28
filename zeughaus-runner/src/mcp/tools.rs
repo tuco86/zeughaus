@@ -896,9 +896,13 @@ fn accepted(reply: CiReply) -> Result<String, String> {
 
 // What the tools print.
 
-/// `ci_status`: the CI at a glance.
+/// `ci_status`: the CI at a glance, led by the CI's own build when it has
+/// one.
 fn status_text(overview: &CiOverview, now: u64) -> String {
     let mut text = String::new();
+    if overview.build > 0 {
+        text.push_str(&format!("ci build {}\n", overview.build));
+    }
     section(
         &mut text,
         "channels",
@@ -912,6 +916,9 @@ fn status_text(overview: &CiOverview, now: u64) -> String {
         "machines",
         overview.machines.iter().map(|m| {
             let mut line = format!("{} {} {}", m.name, m.kind, m.status);
+            if m.build > 0 {
+                line.push_str(&format!(" build {}", m.build));
+            }
             if !m.jobs.is_empty() {
                 let jobs: Vec<String> = m
                     .jobs
@@ -1240,9 +1247,10 @@ fn definitions() -> Vec<Value> {
     vec![
         tool(
             "ci_status",
-            "The CI at a glance: every channel with its newest pipeline and status, every \
-             runner and machine with its state and the jobs on it, the events waiting in the \
-             queue, and the platforms (name -> runner or machine). Start here.",
+            "The CI at a glance: the CI's build, every channel with its newest pipeline and \
+             status, every runner and machine with its state, the build it runs and the jobs \
+             on it, the events waiting in the queue, and the platforms (name -> runner or \
+             machine). Start here; after a publish, the builds say which hosts updated.",
             json!({}),
             &[],
             true,
@@ -1720,12 +1728,14 @@ mod tests {
                         number: 9,
                         job: "build".to_owned(),
                     }],
+                    build: 116,
                 },
                 MachineView {
                     name: "win11".to_owned(),
                     kind: "windows-vm".to_owned(),
                     status: "off".to_owned(),
                     jobs: Vec::new(),
+                    build: 0,
                 },
             ],
             queued: vec![QueuedView {
@@ -1742,11 +1752,12 @@ mod tests {
                 ("windows-amd64".to_owned(), "wohnzimmer".to_owned()),
             ],
             repos: Vec::new(),
+            build: 116,
         };
         assert_eq!(
             status_text(&overview, 1_000),
-            "channels\n  zeughaus/dev #123 succeeded\n  zeughaus/nightly #9 running\n\
-             machines\n  tuco-pc runner free [zeughaus#9/build]\n  win11 windows-vm off\n\
+            "ci build 116\nchannels\n  zeughaus/dev #123 succeeded\n  zeughaus/nightly #9 running\n\
+             machines\n  tuco-pc runner free build 116 [zeughaus#9/build]\n  win11 windows-vm off\n\
              queued\n  zeughaus/dev push main abcdef0 (rerun of #6) 100 s ago\n\
              platforms\n  linux-amd64 -> tuco-pc\n  windows-amd64 -> wohnzimmer\n"
         );
@@ -1757,6 +1768,7 @@ mod tests {
             queued: Vec::new(),
             platforms: Vec::new(),
             repos: Vec::new(),
+            build: 0,
         };
         assert_eq!(
             status_text(&empty, 0),
@@ -2247,6 +2259,7 @@ mod tests {
                     kind: "runner".to_owned(),
                     status: "online".to_owned(),
                     jobs: Vec::new(),
+                    build: 0,
                 }],
                 platforms: vec![("linux-amd64".to_owned(), "agent".to_owned())],
                 docs: Vec::new(),

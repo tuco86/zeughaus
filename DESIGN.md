@@ -849,14 +849,16 @@ lists the channels, `plan` starts with the one an event selects, and
 `clean = true` on a channel marks the pipelines it gets `clean` (kept in the
 record): the first of their jobs at a place starts its workspace from nothing (**Workspaces**).
 
-**The enlist protocol** (`zeughaus-link/src/enlist.rs`, `ENLIST_MAJOR` 6) is
+**The enlist protocol** (`zeughaus-link/src/enlist.rs`, `ENLIST_MAJOR` 8) is
 one long exchange on `/enlist` (req/rep) per runner. Frames are a 4-byte
 little-endian length and a postcard body, at most `MAX_ENLIST_FRAME_BYTES`
 (1 MiB), refused before the body is allocated.
 
-- The runner opens with `Hello { major, name, offer, runs }`: its `Offer`
-  (`os`, `arch`, `cpus`, whether it has `containers`, its `machines`) and a
-  `RunReport` for each run in its `assigned/` directory. The CI checks the
+- The runner opens with `Hello { major, name, offer, build, runs, artifacts }`:
+  its `Offer` (`os`, `arch`, `cpus`, whether it has `containers`, its
+  `machines`), the CI build it runs (0 for one built elsewhere; `ci_status`
+  shows it), a `RunReport` for each run in its `assigned/` directory and the
+  artifact sets it holds. The CI checks the
   TLS principal against the `fingerprint` of the `[runners.*]` entry that
   `name` names, the major, and that the runner's `os` is the host
   `ci.toml` gives it (`windows` or not), and answers `Refused { message }` or

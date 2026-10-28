@@ -311,6 +311,9 @@ pub struct CiOverview {
     /// Every repository of `ci.toml` and its documents, in name order.
     #[serde(default)]
     pub repos: Vec<RepoDocsView>,
+    /// The CI's own build (pipeline number); 0 for one built elsewhere.
+    #[serde(default)]
+    pub build: u64,
 }
 
 /// What a plan or a proposal is.
@@ -652,6 +655,10 @@ pub struct MachineView {
     pub status: String,
     /// The jobs running on it.
     pub jobs: Vec<MachineJob>,
+    /// The build an enlisted runner runs; 0 when it is offline, for a
+    /// machine, or unknown.
+    #[serde(default)]
+    pub build: u64,
 }
 
 /// A job running on a machine, named so that an editor can open its
@@ -954,12 +961,14 @@ mod tests {
                                 number: 7,
                                 job: "build".to_owned(),
                             }],
+                            build: 116,
                         },
                         MachineView {
                             name: "win11".to_owned(),
                             kind: "windows-vm".to_owned(),
                             status: "off".to_owned(),
                             jobs: Vec::new(),
+                            build: 0,
                         },
                     ],
                     queued: vec![QueuedView {
@@ -981,6 +990,7 @@ mod tests {
                         running: Some(4),
                         proposals: 3,
                     }],
+                    build: 116,
                 },
             },
             CiReply::Pipelines {

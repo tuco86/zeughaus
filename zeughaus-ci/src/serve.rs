@@ -255,6 +255,7 @@ impl CiServer {
             queued: queued_views(&pipelines, &queued),
             platforms: self.platforms(),
             repos: docs::summary(&self.state_dir, &self.config),
+            build: zeughaus_update::manifest::own_build(),
         }
     }
 
@@ -292,6 +293,7 @@ impl CiServer {
                 kind: "runner".to_owned(),
                 status,
                 jobs,
+                build: connected.get(name).map_or(0, |view| view.build),
             });
             for (machine, status) in connected.get(name).iter().flat_map(|v| &v.machines) {
                 machines.push(MachineView {
@@ -306,6 +308,7 @@ impl CiServer {
                         })
                         .map(|a| a.job.clone())
                         .collect(),
+                    build: 0,
                 });
             }
         }
@@ -1729,6 +1732,7 @@ mod tests {
                         containers: false,
                         machines: Vec::new(),
                     },
+                    build: 0,
                     machines: BTreeMap::new(),
                     since: 1,
                 },

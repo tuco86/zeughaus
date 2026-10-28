@@ -554,6 +554,7 @@ mod tests {
                             queued: Vec::new(),
                             platforms: Vec::new(),
                             repos: Vec::new(),
+                            build: 0,
                         },
                     },
                     _ => CiReply::Error {

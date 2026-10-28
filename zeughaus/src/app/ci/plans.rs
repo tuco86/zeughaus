@@ -763,6 +763,7 @@ mod tests {
                     proposals: 0,
                 })
                 .collect(),
+            build: 0,
         }
     }
 

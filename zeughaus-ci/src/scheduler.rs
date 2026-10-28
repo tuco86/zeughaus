@@ -2799,6 +2799,7 @@ mod tests {
                     containers,
                     machines: Vec::new(),
                 },
+                build: 0,
                 machines: BTreeMap::new(),
                 since,
             },

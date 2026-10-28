@@ -108,6 +108,7 @@ impl EnlistService {
             major,
             name,
             offer,
+            build,
             runs,
             artifacts,
         } = hello
@@ -161,6 +162,7 @@ impl EnlistService {
             Connected {
                 tx,
                 offer,
+                build,
                 machines: Default::default(),
                 since: now_secs(),
             },

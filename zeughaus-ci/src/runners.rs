@@ -15,6 +15,9 @@ pub struct Connected {
     /// The `/enlist` exchange's writer; dropping it ends that exchange.
     pub tx: UnboundedSender<ToRunner>,
     pub offer: Offer,
+    /// The CI build the runner runs, as its hello said; 0 for one built
+    /// elsewhere.
+    pub build: u64,
     /// Machine name -> status, as the runner last reported them.
     pub machines: BTreeMap<String, String>,
     /// When it connected, seconds since the epoch.
@@ -25,6 +28,7 @@ pub struct Connected {
 #[derive(Debug, Clone)]
 pub struct RunnerView {
     pub offer: Offer,
+    pub build: u64,
     pub machines: BTreeMap<String, String>,
     pub since: u64,
 }
@@ -116,6 +120,7 @@ impl Runners {
 fn view(connected: &Connected) -> RunnerView {
     RunnerView {
         offer: connected.offer.clone(),
+        build: connected.build,
         machines: connected.machines.clone(),
         since: connected.since,
     }
