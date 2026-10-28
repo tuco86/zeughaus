@@ -275,6 +275,7 @@ fn retries(request: &CiRequest) -> bool {
         CiRequest::OpenTranscript { .. }
         | CiRequest::CloseTranscript { .. }
         | CiRequest::Rerun { .. }
+        | CiRequest::Queue { .. }
         | CiRequest::Cancel { .. }
         | CiRequest::DocCreate { .. }
         | CiRequest::DocState { .. }

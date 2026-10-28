@@ -120,6 +120,7 @@ impl CiServer {
             }
             CiRequest::Find { repo, sha } => self.find(&repo, &sha),
             CiRequest::Rerun { repo, number } => self.rerun(&repo, number),
+            CiRequest::Queue { repo, cron, actor } => self.queue(&repo, cron.as_deref(), &actor),
             CiRequest::Cancel { repo, number } => self.cancel(&repo, number),
             CiRequest::Log {
                 repo,
@@ -347,6 +348,47 @@ impl CiServer {
         event.actor = format!("rerun of #{number}");
         event.delivery = None;
         event.received = crate::now_secs();
+        match event::write_inbox(&self.state_dir, &event) {
+            Ok(_) => CiReply::Accepted,
+            Err(e) => error(&e),
+        }
+    }
+
+    /// Queues a push or cron event of `repo`'s default branch, the way a
+    /// push to it or its schedule would. No sha: the scheduler takes the
+    /// branch's head. Only the default branch and no tag, because a tag is
+    /// a release.
+    fn queue(&self, repo: &str, cron: Option<&str>, actor: &str) -> CiReply {
+        let Some(config) = self.config.repos.get(repo) else {
+            return error("no such repository");
+        };
+        let valid_actor = (1..=64).contains(&actor.len())
+            && actor
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._@-".contains(&b));
+        if !valid_actor {
+            return error("an actor is 1 to 64 letters, digits, '.', '_', '@' or '-'");
+        }
+        let (kind, cron) = match cron {
+            None => (EventKind::Push, None),
+            Some(expr) => match crate::pipeline::Pattern::parse(&format!("cron {expr}")) {
+                Ok(crate::pipeline::Pattern::Cron(normalized)) => {
+                    (EventKind::Cron, Some(normalized))
+                }
+                _ => return error(&format!("{expr:?} is not a cron expression")),
+            },
+        };
+        let event = event::CiEvent {
+            repo: repo.to_owned(),
+            kind,
+            git_ref: config.default_branch.clone(),
+            sha: None,
+            cron,
+            actor: actor.to_owned(),
+            delivery: None,
+            upload: None,
+            received: crate::now_secs(),
+        };
         match event::write_inbox(&self.state_dir, &event) {
             Ok(_) => CiReply::Accepted,
             Err(e) => error(&e),
@@ -2579,6 +2621,49 @@ mod tests {
             );
             event::drain_inbox(&state);
             assert!(event::queued(&state).is_empty());
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_queued_cron_is_an_event_of_the_default_branch_by_its_actor() {
+            let state = scratch("queue");
+            let server = server_with(&state, &repos());
+            let queue = |repo: &str, cron: Option<&str>, actor: &str| {
+                server.answer(CiRequest::Queue {
+                    repo: repo.to_owned(),
+                    cron: cron.map(str::to_owned),
+                    actor: actor.to_owned(),
+                })
+            };
+            assert_eq!(queue("nowhere", None, "a@b"), error("no such repository"));
+            assert_eq!(
+                queue("plain", None, "a b"),
+                error("an actor is 1 to 64 letters, digits, '.', '_', '@' or '-'")
+            );
+            assert_eq!(
+                queue("plain", None, ""),
+                error("an actor is 1 to 64 letters, digits, '.', '_', '@' or '-'")
+            );
+            assert_eq!(
+                queue("plain", Some("tomorrow"), "a@b"),
+                error("\"tomorrow\" is not a cron expression")
+            );
+            event::drain_inbox(&state);
+            assert!(event::queued(&state).is_empty());
+
+            assert_eq!(
+                queue("plain", Some("0  3 * * *"), "hannes@tuco-pc"),
+                CiReply::Accepted
+            );
+            event::drain_inbox(&state);
+            let queued = event::queued(&state);
+            assert_eq!(queued.len(), 1);
+            let event = &queued[0].1;
+            assert_eq!(event.kind, EventKind::Cron);
+            assert_eq!(event.git_ref, "trunk");
+            assert_eq!(event.cron.as_deref(), Some("0 3 * * *"));
+            assert_eq!(event.sha, None);
+            assert_eq!(event.actor, "hannes@tuco-pc");
             let _ = std::fs::remove_dir_all(&state);
         }
 

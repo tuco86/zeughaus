@@ -19,7 +19,7 @@
 //! script that is no MCP client; [`cli`] answers them on stdout.
 //!
 //! - [`rpc`]: the JSON-RPC framing and the calls running in parallel;
-//! - [`tools`]: the fourteen tools and the text they answer with;
+//! - [`tools`]: the fifteen tools and the text they answer with;
 //! - [`docs`]: plans and proposals as text, and what a plan file names;
 //! - [`client`]: the CI's `/ci` and `/manual` exchanges;
 //! - [`repo`]: a checkout, and the CI's view of the repository it belongs to;
@@ -605,7 +605,7 @@ mod tests {
         use serde_json::{Value, json};
         use tokio::io::{AsyncReadExt, BufReader};
 
-        /// What the agent sees of a runner that has no CI: fourteen tools, and
+        /// What the agent sees of a runner that has no CI: fifteen tools, and
         /// an error with the reason from every call.
         #[tokio::test]
         async fn a_session_without_a_ci_lists_the_tools_and_explains_every_call() {
@@ -642,7 +642,7 @@ mod tests {
             };
 
             assert_eq!(by_id(1)["result"]["serverInfo"]["name"], "zeughaus");
-            assert_eq!(by_id(2)["result"]["tools"].as_array().unwrap().len(), 14);
+            assert_eq!(by_id(2)["result"]["tools"].as_array().unwrap().len(), 15);
             let status = &by_id(3)["result"];
             assert_eq!(status["isError"], true);
             let text = status["content"][0]["text"].as_str().unwrap();

@@ -1,4 +1,4 @@
-//! The fourteen tools, the schemas an agent sees and the text they answer with.
+//! The fifteen tools, the schemas an agent sees and the text they answer with.
 //!
 //! The text is for a model, so it is short, one fact per line and in a shape
 //! that is the same every time. The functions that build it take the records
@@ -34,7 +34,8 @@ dependencies included, in the same warm workspace the pipeline uses at that job'
 build is incremental; it is the way to build, test or debug on another platform. ci_wait waits \
 for a pipeline or one job, also for the pipeline a push is about to start; ci_status, \
 ci_pipelines, ci_pipeline and ci_log show the CI's state and output; ci_timing says where the \
-time went. ci_repo says which repository of the CI the current checkout is, its jobs and where \
+time went; ci_run queues the default branch's push or cron pipeline now, ci_rerun a pipeline \
+again. ci_repo says which repository of the CI the current checkout is, its jobs and where \
 each runs, and whether HEAD and the default branch are green; in such a checkout `repo` can be \
 omitted. Plans and proposals of a repository live in the CI too: docs lists them, doc_read reads \
 one, proposal_write stores a proposal for another repository of the CI (instead of a \
@@ -58,11 +59,16 @@ const POLL: Duration = Duration::from_secs(2);
 /// How long a wait keeps looking at a CI that does not answer before it
 /// gives up on it: a restart or a dropped link is over by then.
 const ERROR_GRACE: Duration = Duration::from_secs(60);
+/// How long a rerun or a queued event is looked for in the pipeline list
+/// before the answer says it has no number yet: the scheduler numbers an
+/// event within a tick unless a pipeline of the same ref still runs.
+const NUMBERING_WAIT: Duration = Duration::from_secs(30);
 
 pub struct Toolbox {
     client: Arc<Client>,
     poll: Duration,
     error_grace: Duration,
+    numbering_wait: Duration,
     /// The directory a call that names no `path` works in. `None` is the
     /// working directory of this process, which is all a server ever uses; a
     /// test sets one, because the process's own cannot be changed under the
@@ -79,6 +85,7 @@ impl Toolbox {
             client,
             poll: POLL,
             error_grace: ERROR_GRACE,
+            numbering_wait: NUMBERING_WAIT,
             workdir: None,
             resolved: tokio::sync::Mutex::new(None),
         }
@@ -96,6 +103,13 @@ impl Toolbox {
     #[cfg(test)]
     fn tolerating_errors_for(mut self, grace: Duration) -> Toolbox {
         self.error_grace = grace;
+        self
+    }
+
+    /// How long a rerun or a queued event is looked for.
+    #[cfg(test)]
+    fn numbering_for(mut self, wait: Duration) -> Toolbox {
+        self.numbering_wait = wait;
         self
     }
 
@@ -221,11 +235,114 @@ impl Toolbox {
     }
 
     async fn rerun(&self, args: PipelineArgs) -> Result<String, String> {
+        let repo = self.repo_or_checkout(args.repo).await?;
+        let number = args.number;
+        let above = self.newest(&repo).await?;
         let request = CiRequest::Rerun {
-            repo: self.repo_or_checkout(args.repo).await?,
-            number: args.number,
+            repo: repo.clone(),
+            number,
         };
-        accepted(self.client.ci(request).await?)
+        accepted(self.client.ci(request).await?)?;
+        let actor = format!("rerun of #{number}");
+        Ok(
+            match self.numbered(&repo, above, |p| p.actor == actor).await? {
+                Some(view) => format!(
+                    "accepted: #{} reruns #{number}; ci_wait number={} waits for it\n",
+                    view.number, view.number
+                ),
+                None => format!(
+                    "accepted: the rerun of #{number} has no number yet: it waits behind a \
+                     running pipeline of the same ref; ci_pipelines lists it once it starts\n"
+                ),
+            },
+        )
+    }
+
+    /// `ci_run`: queues a push or cron event of the default branch.
+    async fn ci_run(&self, args: RunArgs) -> Result<String, String> {
+        let cron = match (args.event.as_str(), args.cron) {
+            ("push", None) => None,
+            ("push", Some(_)) => return Err("cron goes with event cron only".to_owned()),
+            ("cron", Some(cron)) => Some(cron),
+            ("cron", None) => {
+                return Err(
+                    "event cron needs the schedule in cron, for example 0 3 * * *".to_owned(),
+                );
+            }
+            _ => return Err("event is push or cron".to_owned()),
+        };
+        let repo = self.repo_or_checkout(args.repo).await?;
+        let above = self.newest(&repo).await?;
+        let actor = snapshot::actor();
+        let request = CiRequest::Queue {
+            repo: repo.clone(),
+            cron,
+            actor: actor.clone(),
+        };
+        accepted(self.client.ci(request).await?)?;
+        let event = args.event;
+        let wanted = |p: &PipelineView| p.actor == actor && p.event == event;
+        Ok(match self.numbered(&repo, above, wanted).await? {
+            Some(view) => format!(
+                "accepted: {}\nci_wait number={} waits for it\n",
+                pipeline_header(&view),
+                view.number
+            ),
+            None => format!(
+                "accepted: the {event} event has no number yet: it waits behind a running \
+                 pipeline of the same ref, or no job's on selects it; ci_status lists the queue\n"
+            ),
+        })
+    }
+
+    /// The number of `repo`'s newest pipeline of any channel, 0 without one.
+    async fn newest(&self, repo: &str) -> Result<u64, String> {
+        let request = CiRequest::Pipelines {
+            repo: repo.to_owned(),
+            channel: String::new(),
+            before: None,
+            limit: 1,
+        };
+        match self.client.ci(request).await? {
+            CiReply::Pipelines { pipelines } => Ok(pipelines.first().map_or(0, |p| p.number)),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// The first pipeline of `repo` numbered above `above` that is
+    /// `wanted`, looked for every poll until the numbering wait is over;
+    /// `None` then. An error of the CI ends the search at once.
+    async fn numbered(
+        &self,
+        repo: &str,
+        above: u64,
+        wanted: impl Fn(&PipelineView) -> bool,
+    ) -> Result<Option<PipelineView>, String> {
+        let deadline = Instant::now() + self.numbering_wait;
+        loop {
+            let request = CiRequest::Pipelines {
+                repo: repo.to_owned(),
+                channel: String::new(),
+                before: None,
+                limit: 10,
+            };
+            match self.client.ci(request).await? {
+                CiReply::Pipelines { pipelines } => {
+                    if let Some(view) = pipelines
+                        .into_iter()
+                        .filter(|p| p.number > above && wanted(p))
+                        .min_by_key(|p| p.number)
+                    {
+                        return Ok(Some(view));
+                    }
+                }
+                other => return Err(unexpected(&other)),
+            }
+            if Instant::now() + self.poll > deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(self.poll).await;
+        }
     }
 
     async fn cancel(&self, args: PipelineArgs) -> Result<String, String> {
@@ -619,6 +736,7 @@ impl Tools for Toolbox {
             "doc_read" => self.doc_read(arguments_of(arguments)?).await,
             "proposal_write" => self.proposal_write(arguments_of(arguments)?).await,
             "plan_done" => self.plan_done(arguments_of(arguments)?).await,
+            "ci_run" => self.ci_run(arguments_of(arguments)?).await,
             other => Err(format!(
                 "unknown tool {other:?}; the tools are {}",
                 definitions()
@@ -672,6 +790,14 @@ struct PipelinesArgs {
 struct PipelineArgs {
     repo: Option<String>,
     number: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunArgs {
+    repo: Option<String>,
+    event: String,
+    cron: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1275,8 +1401,9 @@ fn definitions() -> Vec<Value> {
         ),
         tool(
             "ci_rerun",
-            "Queue the pipeline's event again, pinned to the commit it ran for. Answers \
-             `accepted`. A manual run cannot be rerun: start a new one with run_jobs.",
+            "Queue the pipeline's event again, pinned to the commit it ran for. Answers with \
+             the new pipeline's number once the CI has numbered it. A manual run cannot be \
+             rerun: start a new one with run_jobs.",
             json!({ "repo": repo, "number": number }),
             &["number"],
             false,
@@ -1375,6 +1502,30 @@ fn definitions() -> Vec<Value> {
             &["number"],
             false,
         ),
+        tool(
+            "ci_run",
+            "Queue a pipeline for the repository's default branch at its current head, as a \
+             push to it or one of its cron schedules would start it: the way to run the \
+             nightly now, or the push pipeline again on the newest commit. Tags (releases) are \
+             not queued here. Answers with the new pipeline's number once the CI has numbered \
+             it.",
+            json!({
+                "repo": repo,
+                "event": {
+                    "type": "string",
+                    "enum": ["push", "cron"],
+                    "description": "push: as a push to the default branch; cron: as the \
+                                    schedule in cron.",
+                },
+                "cron": {
+                    "type": "string",
+                    "description": "With event cron: the schedule as ci_repo shows it in a \
+                                    job's `on`, for example `0 3 * * *`.",
+                },
+            }),
+            &["event"],
+            false,
+        ),
     ]
 }
 
@@ -1443,7 +1594,7 @@ mod tests {
     }
 
     #[test]
-    fn there_are_fourteen_tools_and_each_takes_an_object() {
+    fn there_are_fifteen_tools_and_each_takes_an_object() {
         let definitions = definitions();
         let names: Vec<&str> = definitions
             .iter()
@@ -1465,7 +1616,8 @@ mod tests {
                 "docs",
                 "doc_read",
                 "proposal_write",
-                "plan_done"
+                "plan_done",
+                "ci_run"
             ]
         );
         for tool in &definitions {
@@ -1520,6 +1672,7 @@ mod tests {
             "ci_wait",
             "ci_rerun",
             "ci_cancel",
+            "ci_run",
         ] {
             let shape = schema(&definitions, name);
             let required = shape["required"].as_array().cloned().unwrap_or_default();
@@ -1530,6 +1683,9 @@ mod tests {
                 "{name}: {description}"
             );
         }
+        let run = schema(&definitions, "ci_run");
+        assert_eq!(run["required"], json!(["event"]));
+        assert_eq!(run["properties"]["event"]["enum"], json!(["push", "cron"]));
         assert_eq!(schema(&definitions, "ci_wait").get("required"), None);
         let repo_tool = schema(&definitions, "ci_repo");
         assert_eq!(repo_tool["properties"]["path"]["type"], "string");
@@ -1835,6 +1991,7 @@ mod tests {
             ("ci_cancel", json!({ "number": 1 })),
             ("ci_wait", json!({ "number": 1 })),
             ("ci_wait", json!({})),
+            ("ci_run", json!({ "repo": "r", "event": "push" })),
             ("run_jobs", json!({ "jobs": ["build-x"] })),
         ] {
             let err = tools.call(name, arguments).await.expect_err(name);
@@ -1897,6 +2054,32 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.contains("unknown field `repo`"), "{err}");
+    }
+
+    /// A ci_run that cannot be meant is refused before the CI is asked.
+    #[tokio::test]
+    async fn a_run_names_push_or_cron_with_its_schedule() {
+        let tools = toolbox_without_a_ci();
+        for (arguments, refusal) in [
+            (
+                json!({ "event": "push", "cron": "0 3 * * *" }),
+                "cron goes with event cron only",
+            ),
+            (
+                json!({ "event": "cron" }),
+                "event cron needs the schedule in cron, for example 0 3 * * *",
+            ),
+            (json!({ "event": "tag" }), "event is push or cron"),
+        ] {
+            assert_eq!(
+                tools
+                    .call("ci_run", arguments.clone())
+                    .await
+                    .expect_err("refused"),
+                refusal,
+                "{arguments}"
+            );
+        }
     }
 
     #[test]
@@ -2079,109 +2262,132 @@ mod tests {
                     .expect("request");
                 let asked = CiRequest::decode(&body).expect("a CiRequest");
                 seen.asked.lock().unwrap().push(asked.clone());
-                let reply = match asked {
-                    CiRequest::Pipeline { number: 1, .. } => CiReply::Pipeline {
-                        pipeline: Some(Box::new(pipeline_one(&seen, running_looks))),
-                    },
-                    // Still running, one of its jobs already settled.
-                    CiRequest::Pipeline { number: 4, .. } => {
-                        let mut view = pipeline(
-                            "running",
-                            None,
-                            vec![
-                                job("build", "running", "agent", ""),
-                                job("publish", "skipped", "agent", ""),
-                            ],
-                        );
-                        view.number = 4;
-                        CiReply::Pipeline {
-                            pipeline: Some(Box::new(view)),
-                        }
-                    }
-                    // The push of `dead..` reaches the CI after two asks.
-                    CiRequest::Find { sha, .. } if sha.starts_with("dead") => {
-                        if seen.finds.fetch_add(1, Ordering::Relaxed) < 2 {
-                            CiReply::Pipeline { pipeline: None }
-                        } else {
+                let reply =
+                    match asked {
+                        CiRequest::Pipeline { number: 1, .. } => CiReply::Pipeline {
+                            pipeline: Some(Box::new(pipeline_one(&seen, running_looks))),
+                        },
+                        // Still running, one of its jobs already settled.
+                        CiRequest::Pipeline { number: 4, .. } => {
+                            let mut view = pipeline(
+                                "running",
+                                None,
+                                vec![
+                                    job("build", "running", "agent", ""),
+                                    job("publish", "skipped", "agent", ""),
+                                ],
+                            );
+                            view.number = 4;
                             CiReply::Pipeline {
-                                pipeline: Some(Box::new(pipeline_one(&seen, running_looks))),
+                                pipeline: Some(Box::new(view)),
                             }
                         }
-                    }
-                    CiRequest::Find { .. } => CiReply::Pipeline { pipeline: None },
-                    // What a CI says while it cannot read its records.
-                    CiRequest::Pipeline { number: 3, .. } => CiReply::Error {
-                        message: "the scheduler is restarting".to_owned(),
-                    },
-                    CiRequest::Pipeline { .. } => CiReply::Pipeline { pipeline: None },
-                    CiRequest::Log {
-                        job,
-                        tail,
-                        timestamps,
-                        lines,
-                        ..
-                    } => CiReply::Log {
-                        text: format!(
-                            "{}job {job}, {tail} lines, {} spans\ntest result: ok. 1 passed\n",
-                            if timestamps { "[+     0.0s] " } else { "" },
-                            lines.len()
-                        ),
-                        finished: true,
-                    },
-                    CiRequest::Timing { job, .. } if job == "nothing" => CiReply::Error {
-                        message: "no output for nothing of #1".to_owned(),
-                    },
-                    CiRequest::Timing { job, top, .. } => CiReply::Timing {
-                        timing: JobTiming {
-                            lines: 3,
-                            span_ms: 31_200,
-                            slowest: vec![TimedLine {
-                                line: 7,
-                                at_ms: 0,
-                                took_ms: 30_000,
-                                text: format!("{job}: asked for {top}"),
-                            }],
-                            finished: false,
-                            truncated: true,
+                        // The push of `dead..` reaches the CI after two asks.
+                        CiRequest::Find { sha, .. } if sha.starts_with("dead") => {
+                            if seen.finds.fetch_add(1, Ordering::Relaxed) < 2 {
+                                CiReply::Pipeline { pipeline: None }
+                            } else {
+                                CiReply::Pipeline {
+                                    pipeline: Some(Box::new(pipeline_one(&seen, running_looks))),
+                                }
+                            }
+                        }
+                        CiRequest::Find { .. } => CiReply::Pipeline { pipeline: None },
+                        // What a CI says while it cannot read its records.
+                        CiRequest::Pipeline { number: 3, .. } => CiReply::Error {
+                            message: "the scheduler is restarting".to_owned(),
                         },
-                    },
-                    CiRequest::Repo { origin, sha, jobs } if origin == DEMO_ORIGIN => {
-                        CiReply::Repo {
-                            repo: Some(Box::new(demo_repo(sha.as_deref(), jobs))),
+                        CiRequest::Pipeline { .. } => CiReply::Pipeline { pipeline: None },
+                        CiRequest::Log {
+                            job,
+                            tail,
+                            timestamps,
+                            lines,
+                            ..
+                        } => CiReply::Log {
+                            text: format!(
+                                "{}job {job}, {tail} lines, {} spans\ntest result: ok. 1 passed\n",
+                                if timestamps { "[+     0.0s] " } else { "" },
+                                lines.len()
+                            ),
+                            finished: true,
+                        },
+                        CiRequest::Timing { job, .. } if job == "nothing" => CiReply::Error {
+                            message: "no output for nothing of #1".to_owned(),
+                        },
+                        CiRequest::Timing { job, top, .. } => CiReply::Timing {
+                            timing: JobTiming {
+                                lines: 3,
+                                span_ms: 31_200,
+                                slowest: vec![TimedLine {
+                                    line: 7,
+                                    at_ms: 0,
+                                    took_ms: 30_000,
+                                    text: format!("{job}: asked for {top}"),
+                                }],
+                                finished: false,
+                                truncated: true,
+                            },
+                        },
+                        CiRequest::Repo { origin, sha, jobs } if origin == DEMO_ORIGIN => {
+                            CiReply::Repo {
+                                repo: Some(Box::new(demo_repo(sha.as_deref(), jobs))),
+                            }
                         }
-                    }
-                    // A remote that is none of the repositories of its ci.toml.
-                    CiRequest::Repo { .. } => CiReply::Repo { repo: None },
-                    CiRequest::Pipelines { repo, channel, .. } => {
-                        let mut view = pipeline("succeeded", Some(1_007), Vec::new());
-                        view.repo = repo;
-                        view.channel = channel;
-                        view.number = 1;
-                        CiReply::Pipelines {
-                            pipelines: vec![view],
+                        // A remote that is none of the repositories of its ci.toml.
+                        CiRequest::Repo { .. } => CiReply::Repo { repo: None },
+                        // Every channel: pipeline 1, and once #1 was rerun the
+                        // rerun as #2, newest first.
+                        CiRequest::Pipelines { repo, channel, .. } if channel.is_empty() => {
+                            let reran =
+                                seen.asked.lock().unwrap().iter().any(|asked| {
+                                    matches!(asked, CiRequest::Rerun { number: 1, .. })
+                                });
+                            let mut one = pipeline("succeeded", Some(1_007), Vec::new());
+                            one.repo = repo;
+                            one.number = 1;
+                            let mut pipelines = vec![one.clone()];
+                            if reran {
+                                let mut two = one;
+                                two.number = 2;
+                                two.actor = "rerun of #1".to_owned();
+                                pipelines.insert(0, two);
+                            }
+                            CiReply::Pipelines { pipelines }
                         }
-                    }
-                    CiRequest::Docs { .. } => CiReply::Docs {
-                        docs: vec![fake_doc(false)],
-                    },
-                    CiRequest::Doc { number: 2, .. } => CiReply::Doc {
-                        doc: Some(Box::new(fake_doc(true))),
-                    },
-                    CiRequest::Doc { .. } => CiReply::Doc { doc: None },
-                    CiRequest::DocCreate { .. } => CiReply::DocCreated { number: 7 },
-                    CiRequest::DocState { number: 2, .. } => CiReply::Accepted,
-                    CiRequest::DocState {
-                        number: 7,
-                        state: DocState::Approved,
-                        ..
-                    } => CiReply::Accepted,
-                    CiRequest::DocState { number, .. } => CiReply::Error {
-                        message: format!("no document #{number} in demo"),
-                    },
-                    _ => CiReply::Error {
-                        message: "not served by the fake".to_owned(),
-                    },
-                };
+                        CiRequest::Rerun { number: 1, .. } | CiRequest::Queue { .. } => {
+                            CiReply::Accepted
+                        }
+                        CiRequest::Pipelines { repo, channel, .. } => {
+                            let mut view = pipeline("succeeded", Some(1_007), Vec::new());
+                            view.repo = repo;
+                            view.channel = channel;
+                            view.number = 1;
+                            CiReply::Pipelines {
+                                pipelines: vec![view],
+                            }
+                        }
+                        CiRequest::Docs { .. } => CiReply::Docs {
+                            docs: vec![fake_doc(false)],
+                        },
+                        CiRequest::Doc { number: 2, .. } => CiReply::Doc {
+                            doc: Some(Box::new(fake_doc(true))),
+                        },
+                        CiRequest::Doc { .. } => CiReply::Doc { doc: None },
+                        CiRequest::DocCreate { .. } => CiReply::DocCreated { number: 7 },
+                        CiRequest::DocState { number: 2, .. } => CiReply::Accepted,
+                        CiRequest::DocState {
+                            number: 7,
+                            state: DocState::Approved,
+                            ..
+                        } => CiReply::Accepted,
+                        CiRequest::DocState { number, .. } => CiReply::Error {
+                            message: format!("no document #{number} in demo"),
+                        },
+                        _ => CiReply::Error {
+                            message: "not served by the fake".to_owned(),
+                        },
+                    };
                 let mut out = request.reply(TransferMeta::default()).await.expect("reply");
                 out.write_all(&reply.encode()).await.expect("write");
                 out.finish().expect("finish");
@@ -2729,11 +2935,42 @@ mod tests {
                 "job build, 5000 lines, 0 spans\ntest result: ok. 1 passed\n"
             );
 
-            let err = tools
+            let text = tools
                 .call("ci_rerun", json!({ "repo": "demo", "number": 1 }))
                 .await
-                .expect_err("the fake refuses");
-            assert_eq!(err, "not served by the fake");
+                .expect("accepted");
+            assert_eq!(
+                text,
+                "accepted: #2 reruns #1; ci_wait number=2 waits for it\n"
+            );
+        }
+
+        /// A queued event the CI does not number in time is accepted all
+        /// the same, and the answer says why it may have no number.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_queued_event_without_a_number_yet_is_accepted() {
+            let ci = fake_ci("queue", 0, None).await;
+            let tools = toolbox_for(&ci).numbering_for(Duration::from_millis(100));
+            let text = tools
+                .call(
+                    "ci_run",
+                    json!({ "repo": "demo", "event": "cron", "cron": "0 3 * * *" }),
+                )
+                .await
+                .expect("accepted");
+            assert!(
+                text.starts_with("accepted: the cron event has no number yet: "),
+                "{text}"
+            );
+            let asked = ci.seen.asked.lock().unwrap().clone();
+            assert!(
+                asked.iter().any(|request| matches!(
+                    request,
+                    CiRequest::Queue { repo, cron: Some(cron), actor }
+                        if repo == "demo" && cron == "0 3 * * *" && actor.contains('@')
+                )),
+                "{asked:?}"
+            );
         }
 
         /// Plan #2 of the fake: saved an hour after the epoch.

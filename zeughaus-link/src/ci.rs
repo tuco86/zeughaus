@@ -157,6 +157,16 @@ pub enum CiRequest {
     /// body; answers [`CiReply::Doc`], `None` when nothing is approved, an
     /// error while a plan is in progress.
     PlanClaim { repo: String },
+    /// Queues an event of `repo` on its default branch, as a push to it or
+    /// its cron would: `cron` is one of the repository's schedules
+    /// (`0 3 * * *`), `None` a push. The commit is the branch's head when
+    /// the scheduler takes the event; `actor` (`user@host`) is who asked.
+    /// Answers [`CiReply::Accepted`].
+    Queue {
+        repo: String,
+        cron: Option<String>,
+        actor: String,
+    },
 }
 
 /// Lines of a job's output, counted from 1 over the lines that have text.
@@ -824,6 +834,16 @@ mod tests {
             CiRequest::Rerun {
                 repo: "griasdi".to_owned(),
                 number: 7,
+            },
+            CiRequest::Queue {
+                repo: "griasdi".to_owned(),
+                cron: Some("0 3 * * *".to_owned()),
+                actor: "hannes@tuco-pc".to_owned(),
+            },
+            CiRequest::Queue {
+                repo: "griasdi".to_owned(),
+                cron: None,
+                actor: "hannes@tuco-pc".to_owned(),
             },
             CiRequest::Cancel {
                 repo: "griasdi".to_owned(),

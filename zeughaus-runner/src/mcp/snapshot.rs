@@ -348,7 +348,7 @@ fn summary(root: &Path) -> String {
 }
 
 /// `<user>@<host>`, with only the characters a name can hold.
-fn actor() -> String {
+pub(super) fn actor() -> String {
     let user = ["USER", "USERNAME", "LOGNAME"]
         .iter()
         .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
