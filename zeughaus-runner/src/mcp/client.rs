@@ -131,9 +131,30 @@ impl Client {
         self.link.as_ref().map(|_| ()).map_err(Clone::clone)
     }
 
-    /// Asks the CI one question. The CI's own refusal is the error.
+    /// Asks the CI one question. The CI's own refusal is the error. A
+    /// question that only reads is asked once more on a fresh connection when
+    /// the first exchange broke off, which is what a CI restart looks like
+    /// from here; one that changes state is not, because the CI may have
+    /// taken it.
     pub async fn ci(&self, request: CiRequest) -> Result<CiReply, String> {
-        let (requester, _) = self.requester(CI_PATH).await?;
+        let encoded = match self.ask_once(&request).await {
+            Err(Asked::Transport(_)) if retries(&request) => self.ask_once(&request).await,
+            first => first,
+        }
+        .map_err(|asked| match asked {
+            Asked::Unreachable(e) | Asked::Transport(e) | Asked::Timeout(e) => e,
+        })?;
+        match CiReply::decode(&encoded) {
+            Some(CiReply::Error { message }) => Err(message),
+            Some(reply) => Ok(reply),
+            None => Err("ci: malformed reply".to_owned()),
+        }
+    }
+
+    /// One exchange on `/ci`. A failed one drops the requester, so the next
+    /// call dials again.
+    async fn ask_once(&self, request: &CiRequest) -> Result<Vec<u8>, Asked> {
+        let (requester, _) = self.requester(CI_PATH).await.map_err(Asked::Unreachable)?;
         let exchange = async {
             let reply = requester
                 .request(&request.encode())
@@ -144,21 +165,19 @@ impl Client {
                 .await
                 .map_err(|e| format!("ci: {e}"))
         };
-        let encoded = match tokio::time::timeout(CI_TIMEOUT, exchange).await {
-            Ok(Ok(encoded)) => encoded,
+        match tokio::time::timeout(CI_TIMEOUT, exchange).await {
+            Ok(Ok(encoded)) => Ok(encoded),
             Ok(Err(e)) => {
                 self.forget(CI_PATH).await;
-                return Err(e);
+                Err(Asked::Transport(e))
             }
             Err(_) => {
                 self.forget(CI_PATH).await;
-                return Err(format!("ci: no answer within {} s", CI_TIMEOUT.as_secs()));
+                Err(Asked::Timeout(format!(
+                    "ci: no answer within {} s",
+                    CI_TIMEOUT.as_secs()
+                )))
             }
-        };
-        match CiReply::decode(&encoded) {
-            Some(CiReply::Error { message }) => Err(message),
-            Some(reply) => Ok(reply),
-            None => Err("ci: malformed reply".to_owned()),
         }
     }
 
@@ -225,6 +244,42 @@ impl Client {
 
     async fn forget(&self, path: &'static str) {
         self.state.lock().await.requesters.remove(path);
+    }
+}
+
+/// Why one exchange on `/ci` has no answer.
+enum Asked {
+    /// No connection could be made: a second dial right away fares no
+    /// better.
+    Unreachable(String),
+    /// An exchange on a connection broke off.
+    Transport(String),
+    /// The CI took longer than [`CI_TIMEOUT`]: asking again would double the
+    /// wait.
+    Timeout(String),
+}
+
+/// Whether `request` may be asked again after a broken exchange: only a
+/// question that changes nothing. No `_` arm, so a new request decides.
+fn retries(request: &CiRequest) -> bool {
+    match request {
+        CiRequest::Overview
+        | CiRequest::Pipelines { .. }
+        | CiRequest::Pipeline { .. }
+        | CiRequest::Find { .. }
+        | CiRequest::Log { .. }
+        | CiRequest::Timing { .. }
+        | CiRequest::Repo { .. }
+        | CiRequest::Docs { .. }
+        | CiRequest::Doc { .. } => true,
+        CiRequest::OpenTranscript { .. }
+        | CiRequest::CloseTranscript { .. }
+        | CiRequest::Rerun { .. }
+        | CiRequest::Cancel { .. }
+        | CiRequest::DocCreate { .. }
+        | CiRequest::DocState { .. }
+        | CiRequest::DocDelete { .. }
+        | CiRequest::PlanClaim { .. } => false,
     }
 }
 
@@ -432,6 +487,105 @@ mod tests {
             std::fs::write(dir.join("zeughaus.toml"), "ci = 3\n").unwrap();
             let err = Link::resolve(None, &dir).err().expect("bad toml");
             assert!(err.contains("zeughaus.toml"), "{err}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A fake CI under the identity in `state` that answers an overview
+        /// and refuses everything else. Built on a runtime of
+        /// its own, because a [`crate::transport::Transport`] keeps its port
+        /// until the process exits and a restart needs the same one.
+        struct FakeCi {
+            runtime: Runtime,
+            binding: weida::Binding,
+            served: tokio::task::JoinHandle<()>,
+            url: String,
+        }
+
+        impl FakeCi {
+            async fn start(bind: std::net::SocketAddr, state: &Path) -> FakeCi {
+                let identity = credentials::runner_identity(state).expect("identity");
+                let fingerprint = identity.fingerprint().expect("fingerprint");
+                credentials::client_identity(state).expect("client key");
+                let trust = credentials::client_trust(state).expect("trust");
+                let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+                let listener = runtime.listener();
+                let binding = listener
+                    .bind_quic(bind, weida::ServerTls::new(identity).require_client(trust))
+                    .await
+                    .expect("bind");
+                let url = EndpointAddr {
+                    host: "127.0.0.1".to_owned(),
+                    port: Some(binding.local_addr().port()),
+                    path: "/".to_owned(),
+                    peer: Some(fingerprint),
+                }
+                .to_string();
+                let replier = listener.replier(CI_PATH).expect("/ci");
+                let served = tokio::spawn(serve(replier));
+                FakeCi {
+                    runtime,
+                    binding,
+                    served,
+                    url,
+                }
+            }
+
+            /// Closes the port, so the next fake can bind it.
+            async fn stop(self) {
+                self.served.abort();
+                self.binding.close().await;
+                self.runtime.shutdown().await;
+            }
+        }
+
+        async fn serve(replier: weida::Replier) {
+            while let Ok(mut request) = replier.accept().await {
+                let body = request
+                    .take_body()
+                    .collect(zeughaus_link::MAX_CI_REQUEST_BYTES)
+                    .await
+                    .expect("request");
+                let reply = match CiRequest::decode(&body).expect("a CiRequest") {
+                    CiRequest::Overview => CiReply::Overview {
+                        overview: zeughaus_link::CiOverview {
+                            channels: Vec::new(),
+                            machines: Vec::new(),
+                            queued: Vec::new(),
+                            platforms: Vec::new(),
+                            repos: Vec::new(),
+                        },
+                    },
+                    _ => CiReply::Error {
+                        message: "not served".to_owned(),
+                    },
+                };
+                let mut out = request.reply(TransferMeta::default()).await.expect("reply");
+                out.write_all(&reply.encode()).await.expect("write");
+                out.finish().expect("finish");
+            }
+        }
+
+        /// A CI restart breaks the connection the client keeps; the next
+        /// question is answered all the same. A CI that is killed instead
+        /// sends no close, which a test in one process cannot do; the retry
+        /// of [`Client::ci`] covers that case.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_read_after_a_ci_restart_is_answered() {
+            let dir = state("restart");
+            let any = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+            let ci = FakeCi::start(any, &dir).await;
+            let bind = ci.binding.local_addr();
+            let client = Client::new(Link::resolve(Some(ci.url.clone()), &dir));
+            client.ci(CiRequest::Overview).await.expect("first answer");
+
+            ci.stop().await;
+            let ci = FakeCi::start(bind, &dir).await;
+            client
+                .ci(CiRequest::Overview)
+                .await
+                .expect("answered after the restart");
+            client.shutdown().await;
+            ci.stop().await;
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
