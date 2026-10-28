@@ -5,12 +5,12 @@ description: "Repo has .zeughaus-ci/: debug a job or platform with run_jobs, CI 
 
 # zeughaus-ci
 
-zeughaus-ci is the user's own CI. Its runners are the machines they own, one per platform. A repository's jobs are scripts in its `.zeughaus-ci/` folder. You reach the CI through the tools of the MCP server `zeughaus`: `ci_repo`, `ci_status`, `ci_pipelines`, `ci_pipeline`, `ci_log`, `ci_timing`, `ci_wait`, `ci_rerun`, `ci_cancel`, `run_jobs`, `docs`, `doc_read`, `proposal_write`, `plan_done`.
+zeughaus-ci is the user's own CI. Its runners are the machines they own, one per platform. A repository's jobs are scripts in its `.zeughaus-ci/` folder. You reach the CI through the tools of the MCP server `zeughaus`: `ci_repo`, `ci_status`, `ci_pipelines`, `ci_pipeline`, `ci_log`, `ci_timing`, `ci_wait`, `ci_rerun`, `ci_run`, `ci_cancel`, `run_jobs`, `docs`, `doc_read`, `proposal_write`, `plan_done`.
 
 ## 1. Orient
 
 - Read the `<zeughaus-ci>` block of the system prompt first. It is the state at session start: which repository of the CI this checkout is, every job with the runner and place it runs at, whether HEAD and the default branch were green. It does not change during the session.
-- Call `ci_repo` for the state now: the pipeline of HEAD, the channels, the jobs, the runners, the platforms. `ci_status` shows the whole CI: every channel, every runner online or offline, the queue.
+- Call `ci_repo` for the state now: the pipeline of HEAD, the channels, the jobs, the runners, the platforms. `ci_status` shows the whole CI: the CI's build, every channel, every runner online or offline with the build it runs, the queue. `ci_pipelines` without `channel` lists every channel's pipelines, each line starting with its channel.
 - In the checkout, leave `repo` out of the other `ci_*` tools. It defaults to the repository of the working directory's checkout.
 - Job names are the file stems of `.zeughaus-ci/`: `build-linux-amd64.sh` is the job `build-linux-amd64`. `run_jobs`, `ci_log` and `needs` use these names.
 - Read a job row as: name, runner, where on it (`host`, `image:<x>` or `machine:<vm>`), then `on <patterns>` or `needs <jobs>`, then `channels <names>`, `secrets <names> (none in run_jobs)` and `run_jobs cannot run it` when they apply. A job the CI cannot place says `cannot be placed: <why>` in place of the runner.
@@ -30,9 +30,10 @@ zeughaus-ci is the user's own CI. Its runners are the machines they own, one per
 
 - Run `run_jobs` with the platform's pair: `jobs=["build-<p>", "check-<p>"]`. The platforms are in the job table (zeughaus: `linux-amd64`, `linux-arm64`, `darwin-arm64`, `windows-amd64`).
 - `run_jobs` snapshots the checkout at `path` (default: the working directory) as it is on disk: HEAD's commit, uncommitted changes, untracked files that are not ignored, and the Cargo path dependencies beside it (`../<dir>`). It uploads that and runs the named jobs in the warm workspace of their place, the one the pipeline builds in. The second run is incremental.
-- The call answers once the run has settled, within `wait_seconds` (default 540, at most 600). A run still going answers with how to continue: `ci_wait` with the `repo` and `number` it names.
-- Read the answer. Every job has status, place and note. A failed job adds `cause:` (the first of `panicked at`, `error[`, `error:`, `FAILED` in its last 40 lines) and `excerpt:` (those lines).
-- Need more: `ci_log` with `number` and `job`. `tail` counts lines from the end (default 200, at most 5000). `ci_log` has no filter: read the lines for `panicked at`, `error[`, `error:`, `FAILED`. `timestamps` starts every line with the seconds since the job's first output.
+- The call answers once the run has settled, within `wait_seconds` (default 540; a larger value waits 600). A run still going answers with how to continue: `ci_wait` with the `repo` and `number` it names.
+- A wait longer than a few minutes: run `zeughaus-runner ci wait <repo> <number>` (optionally a job name after the number) as a background bash command (`async`), with a timeout of about twice the expected duration, and keep working. It prints the pipeline once it has settled and exits 0, whatever the pipeline's status; 2 when it could not ask or ran out.
+- Read the answer. Every job has status, place and note. A failed job adds `cause:` and `excerpt:`. The cause is the first of `panicked at`, `error[`, nextest's `FAIL [` (also `TIMEOUT [`, `SIGSEGV [`, `SIGABRT [`), `error:`, `FAILED`; the excerpt is the last 40 lines, led by the first panic and its message (then `...`) when the panic is further up, so the cause is the panic of a failed test run.
+- Need more: `ci_log` with `number` and `job`. To find something in the output, use `pattern` (a Rust regex, over the whole stored output or within `lines`) with `context` (lines around each match, at most 20); for a test run `panicked at|FAIL \[|error(\[|:)`. Never fetch `tail: 5000` to search it. `tail` counts lines from the end (default 200, at most 5000), `lines` names lines like read does, `timestamps` starts every line with the seconds since the job's first output.
 - A job that does not start says why in its note. The notes are listed in `skill://zeughaus-ci/reference/jobs.md`, "Job notes".
 - Fix the code, then run the same jobs again.
 - Runs for different platforms are independent: issue them as parallel `run_jobs` calls, one pair per platform. The jobs of a repository at one place share one workspace and run one after another, oldest first, so two runs for the same platform queue.
@@ -49,9 +50,11 @@ zeughaus-ci is the user's own CI. Its runners are the machines they own, one per
 
 - The zeughaus-ci extension watches the pipeline of the pushed commit. It reports the first failed job into the session as a message that starts your turn (job, place, cause, excerpt), and a success as a line with your next turn. Do not poll. `/zeughaus` shows the state in the TUI.
 - On a failure: `ci_log` for the job's output; `run_jobs` with that job reproduces it from the working tree.
-- Without the extension: `ci_wait`. Without `number` or `sha` it waits for the commit at HEAD, and for a pipeline that does not exist yet.
+- Without the extension: `ci_wait`, or `zeughaus-runner ci wait <repo> <number|sha>` as a background command for a long one. Without `number` or `sha`, `ci_wait` waits for the commit at HEAD, and for a pipeline that does not exist yet.
 - A push starts a pipeline only when some job's `on` matches the ref (zeughaus: pushes to `main`, tags `v*`, the 03:00 cron). A push to another branch starts nothing; that is not a failure.
-- Manual runs post no forge status and cannot be rerun. `ci_rerun` queues the event of a pipeline a push or a cron started, pinned to its commit.
+- Manual runs post no forge status and cannot be rerun. `ci_rerun` queues the event of a pipeline a push or a cron started, pinned to its commit, and answers with the new pipeline's number.
+- `ci_run` queues a pipeline of the default branch at its current head: `event: "push"` as a push would, `event: "cron"` with `cron` set to one of the repository's schedules (as `on` shows it, `0 3 * * *`) to run the nightly now. It answers with the new pipeline's number. Never ssh to the CI host to queue an event.
+- Whether the hosts installed a published build: `ci_status` shows each runner's build; do not run `update status` over ssh.
 
 ## 6. What manual runs do not have
 

@@ -112,7 +112,7 @@ Set by the CI:
 | `CI_SHA` | The commit id (a tag's commit). For `manual`, the snapshot commit of the uploaded working tree, not HEAD |
 | `CI_PIPELINE` | The pipeline number |
 | `CI_JOB` | The job's name |
-| `CI_ACTOR` | Who caused it: the forge user of a push or tag, `cron`, `rerun of #<n>`, `manual` for `zeughaus-ci run`, `<user>@<host>` of a manual run |
+| `CI_ACTOR` | Who caused it: the forge user of a push or tag, `cron`, `rerun of #<n>`, `manual` for `zeughaus-ci run`, `<user>@<host>` of a manual run or of an event `ci_run` queued |
 | `CI_PLATFORM` | The job's `platform`; set only when the header has one |
 | `CI_CRON` | The cron expression, whitespace normalized; set only for `cron` events |
 

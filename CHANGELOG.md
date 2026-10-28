@@ -113,6 +113,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ResourceFetch`/`Resource` exchange. The mux protocol major is 4: an
   editor and a runner or CI of different builds refuse to attach until both
   have updated. Kitty graphics stay off.
+- The MCP server for agents, from 11 days of their sessions: `ci_log`
+  searches a job's output by `pattern` (a regular expression) with
+  `context` lines, instead of an agent fetching 5000 lines to grep them;
+  `ci_pipelines` without `channel` lists every channel; `ci_rerun` and the
+  new `ci_run` (a push or cron event of the default branch, as `/ci`'s
+  `Queue`, so the nightly runs now without ssh to the CI host) answer with
+  the new pipeline's number; `ci_status` shows the CI's build and each
+  runner's (`zeughaus-runner update status` over ssh no longer needed after
+  a publish); `zeughaus-runner ci wait <repo> <number|sha> [<job>]` waits
+  up to 4 h for an agent's background command. A read is asked again on a
+  new connection after a CI restart, and the schemas carry no `maximum`,
+  which omp enforced by refusing the call; the tools clamp instead. The omp
+  plugin (0.3.3) teaches all of it.
+- CI: a failed job's cause names the test: nextest's `FAIL [`, `TIMEOUT [`,
+  `SIGSEGV [` and `SIGABRT [` lines come before its closing `error: test
+  run failed`, and the excerpt is led by the first panic and its message
+  when that is above the last 40 lines, so the cause is the panic.
 
 ### Changed
 
@@ -126,6 +143,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   once. `ci_timing` shows per input how many compressed bytes moved next
   to the set's size. The enlist protocol is major 7: CI and runners refuse
   each other until both run this build.
+- The enlist protocol is major 8: a runner's hello names the CI build it
+  runs, for `ci_status`. CI and runners refuse each other until both run
+  this build.
 - weida is a git dependency pinned to a commit of its public GitHub mirror
   instead of a path dependency on the sibling checkout `../weida`, so work in
   progress there no longer changes what zeughaus builds locally or in the

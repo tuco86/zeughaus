@@ -1335,11 +1335,16 @@ ends, the calls still running finish and answer, then the process exits 0.
 Logs go to stderr: stdout carries nothing but protocol.
 
 The tools (`tools.rs`) are `ci_status` (the overview and the `[platforms]`
-of `ci.toml`),
-`ci_pipelines`, `ci_pipeline` (a failed job adds its `cause` and
-`excerpt`), `ci_log` (`CiRequest::Log`: the last lines of a job's stored
-output, 5000 at most, and whether the job has finished; `timestamps` starts
-every line with the seconds since the job's first output), `ci_timing`
+of `ci.toml`, led by the CI's own build, and each enlisted runner with the
+build its hello named),
+`ci_pipelines` (one channel's, or without `channel` every channel's, each
+line then starting with its channel), `ci_pipeline` (a failed job adds its
+`cause` and `excerpt`), `ci_log` (`CiRequest::Log`: the last lines of a
+job's stored output, 5000 at most, and whether the job has finished;
+`timestamps` starts every line with the seconds since the job's first
+output; `pattern`, a regular expression of at most 1 KiB, keeps the lines
+that match it, within `lines` when given, with `context` lines around each,
+at most 20), `ci_timing`
 (without `job`, from the pipeline's record alone: when it was created and how
 long it took, and for each job when it was assigned, started and ended as
 seconds after the creation, how long it staged (assigned to started) and ran,
@@ -1350,11 +1355,19 @@ was there before the job was assigned; with `job`, `CiRequest::Timing`: the
 pipeline, named by number or by the sha of its commit, or one job of it,
 looked at every 2 s until it has settled; a sha that matches nothing yet is
 waited for, and then followed by its number; at the end of the wait it
-says `still running after <s> s; call ci_wait again with repo=.. number=..`),
-`ci_rerun`, `ci_cancel`, `ci_repo` and `run_jobs`; their answers are one
+says `still running after <s> s; call ci_wait again with repo=.. number=..`
+and names `zeughaus-runner ci wait <repo> <number>` for a background wait),
+`ci_rerun` and `ci_run` (`CiRequest::Queue`: a push or cron event of the
+default branch, with the asker's `<user>@<host>` as its actor; both look
+for the pipeline the CI numbers for it for up to 30 s and answer with its
+number), `ci_cancel`, `ci_repo` and `run_jobs`; their answers are one
 fact per line
 in a fixed shape, and a CI that answers with an error, or not at all within
-30 s, is the tool's error.
+30 s, is the tool's error. No schema carries a `maximum`, because omp
+refuses a call above it; the tools clamp instead and the descriptions name
+the limits. A question that only reads is asked once more on a new
+connection when the exchange broke off (a CI restart); one that changes
+state is not.
 
 `ci_repo` (`repo.rs`) reads the checkout at `path` (default: the working
 directory): its top level, its `origin` with credentials cut, and `HEAD`,
@@ -1373,6 +1386,9 @@ plugin): `--json` prints `{"repo": RepoView, "text": ..}` or the
 `PipelineView` (`null` when there is none); the exit code is 0 when
 answered, 3 when the origin is no repository of `ci.toml`, 2 when no CI is
 configured or the exchange failed, 1 for bad arguments or no checkout.
+`ci wait <repo> <number|sha> [<job>]` is `ci_wait` for up to 4 h, for an
+agent's background command: exit 0 once settled, 2 when it ran out or the
+CI could not be asked.
 
 `run_jobs` runs named jobs of the repository's pipeline from the working
 tree it is called in (`jobs`, one to 16 names: the files of

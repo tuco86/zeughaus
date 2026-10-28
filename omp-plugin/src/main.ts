@@ -294,7 +294,7 @@ function failedMessage(name: string, sha7: string, p: PipelineView, job: JobView
   const excerpt = (job.excerpt ?? "").trimEnd().split("\n").slice(-EXCERPT_LINES).join("\n");
   if (excerpt) lines.push(excerpt);
   lines.push(
-    `Next: ci_log number=${p.number} job=${job.name} for its output; run_jobs jobs=["${job.name}"] reproduces it from the working tree.`,
+    `Next: ci_log number=${p.number} job=${job.name} with a pattern (for a test run "panicked at|FAIL \\[") finds the failure in its output; run_jobs jobs=["${job.name}"] reproduces it from the working tree.`,
   );
   return lines.join("\n");
 }
