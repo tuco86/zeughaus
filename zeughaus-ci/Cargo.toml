@@ -45,3 +45,5 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # The CI follows a release channel like the runners: it replaces its own
 # binary and restarts into it.
 zeughaus-update.workspace = true
+# ci_log's pattern search over a job's output.
+regex = "1"

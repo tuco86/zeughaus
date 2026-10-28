@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use zeughaus_link::ci::{LineSpan, MAX_PIPELINES_PER_REQUEST, MAX_TIMING_LINES, TIMING_READ_BYTES};
+use zeughaus_link::ci::{
+    LineSpan, MAX_LOG_CONTEXT, MAX_PIPELINES_PER_REQUEST, MAX_TIMING_LINES, TIMING_READ_BYTES,
+};
 use zeughaus_link::manual::{MAX_MANUAL_JOBS, RunReply};
 use zeughaus_link::{
     CiOverview, CiReply, CiRequest, DocKind, DocState, DocView, JobTiming, JobView, PipelineView,
@@ -161,6 +163,12 @@ impl Toolbox {
             (Some(lines), None) => LineSpan::parse_list(lines)?,
             (None, _) => Vec::new(),
         };
+        if args.pattern.is_some() && args.tail.is_some() {
+            return Err("give pattern alone or with lines, not with tail".to_owned());
+        }
+        if args.context.is_some() && args.pattern.is_none() {
+            return Err("context goes with pattern".to_owned());
+        }
         let request = CiRequest::Log {
             repo: self.repo_or_checkout(args.repo).await?,
             number: args.number,
@@ -168,6 +176,8 @@ impl Toolbox {
             tail: args.tail.unwrap_or(DEFAULT_TAIL).clamp(1, MAX_TAIL),
             timestamps: args.timestamps.unwrap_or(false),
             lines,
+            pattern: args.pattern,
+            context: args.context.unwrap_or(0),
         };
         match self.client.ci(request).await? {
             CiReply::Log { text, finished } => Ok(log_text(&text, finished)),
@@ -662,6 +672,8 @@ struct LogArgs {
     tail: Option<u32>,
     timestamps: Option<bool>,
     lines: Option<String>,
+    pattern: Option<String>,
+    context: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -1148,9 +1160,9 @@ fn definitions() -> Vec<Value> {
         ),
         tool(
             "ci_log",
-            "One job's output in a pipeline, live while the job runs: its last lines, or the \
-             lines you name like read does. Every line starts with its number; numbers count \
-             the lines that have text.",
+            "One job's output in a pipeline, live while the job runs: its last lines, the \
+             lines you name like read does, or the lines that match a pattern. Every line \
+             starts with its number; numbers count the lines that have text.",
             json!({
                 "repo": repo,
                 "number": number,
@@ -1176,6 +1188,22 @@ fn definitions() -> Vec<Value> {
                     "default": false,
                     "description": "Prefix every line with the seconds since the job's first \
                                     output; ci_timing names the slowest lines by number.",
+                },
+                "pattern": {
+                    "type": "string",
+                    "description": "A regular expression (Rust regex syntax): only the lines \
+                                    that match it, searched over all of the job's stored \
+                                    output, or within `lines` when given. Not together with \
+                                    tail. For a failed test run: `panicked at|FAIL \\[|error(\\[|:)`.",
+                },
+                "context": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": format!(
+                        "With pattern: lines before and after each match, at most \
+                         {MAX_LOG_CONTEXT}."
+                    ),
                 },
             }),
             &["number", "job"],
@@ -2569,6 +2597,35 @@ mod tests {
                 .expect_err("tail and lines");
             assert_eq!(err, "give tail or lines, not both");
             assert_eq!(ci.seen.asked.lock().unwrap().len(), asked);
+
+            // A pattern and its context travel; with lines it searches them.
+            log(json!({ "pattern": "panicked at", "context": 3, "lines": "10-" }))
+                .await
+                .expect("search");
+            match ci.seen.asked.lock().unwrap().last() {
+                Some(CiRequest::Log {
+                    pattern,
+                    context,
+                    lines,
+                    ..
+                }) => {
+                    assert_eq!(pattern.as_deref(), Some("panicked at"));
+                    assert_eq!(*context, 3);
+                    assert_eq!(lines.len(), 1);
+                }
+                other => panic!("{other:?}"),
+            }
+            // A pattern with a tail, or context without a pattern: refused
+            // before the CI is asked.
+            let err = log(json!({ "pattern": "x", "tail": 5 }))
+                .await
+                .expect_err("pattern and tail");
+            assert_eq!(err, "give pattern alone or with lines, not with tail");
+            let err = log(json!({ "context": 2 }))
+                .await
+                .expect_err("context alone");
+            assert_eq!(err, "context goes with pattern");
+            assert_eq!(ci.seen.asked.lock().unwrap().len(), asked + 1);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

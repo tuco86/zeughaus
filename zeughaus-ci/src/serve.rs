@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use weida::{Replier, TransferMeta};
 use zeughaus_link::ci::{
-    LineSpan, MAX_ORIGIN_BYTES, MAX_PIPELINES_PER_REQUEST, MAX_TIMING_LINES, TIMING_READ_BYTES,
+    LineSpan, MAX_LOG_CONTEXT, MAX_LOG_PATTERN_BYTES, MAX_ORIGIN_BYTES, MAX_PIPELINES_PER_REQUEST,
+    MAX_TIMING_LINES, TIMING_READ_BYTES,
 };
 use zeughaus_link::enlist::Place;
 use zeughaus_link::{
@@ -127,7 +128,18 @@ impl CiServer {
                 tail,
                 timestamps,
                 lines,
-            } => self.log(&repo, number, &job, tail, timestamps, &lines),
+                pattern,
+                context,
+            } => self.log(
+                &repo,
+                number,
+                &job,
+                tail,
+                timestamps,
+                &lines,
+                pattern.as_deref(),
+                context,
+            ),
             CiRequest::Timing {
                 repo,
                 number,
@@ -498,7 +510,9 @@ impl CiServer {
     /// or the `lines` asked for, never more than a reply may carry. The
     /// transcript is read from its end, so a job that wrote for hours costs
     /// what its last [`TIMING_READ_BYTES`] do. With `timestamps` every line
-    /// also says when it began.
+    /// also says when it began. With `pattern` only the lines that match
+    /// it, among `lines` when given, with `context` lines around each.
+    #[allow(clippy::too_many_arguments)]
     fn log(
         &self,
         repo: &str,
@@ -507,10 +521,16 @@ impl CiServer {
         tail: u32,
         timestamps: bool,
         lines: &[LineSpan],
+        pattern: Option<&str>,
+        context: u32,
     ) -> CiReply {
         if !valid_name(repo) || !valid_name(job) {
             return error("no such job");
         }
+        let regex = match pattern.map(compile_pattern).transpose() {
+            Ok(regex) => regex,
+            Err(e) => return error(&e),
+        };
         let dir = transcript_dir(&self.state_dir, repo, number, job);
         if !dir.join("wal").exists() {
             return error(&format!("no output for {job} of #{number}"));
@@ -521,15 +541,32 @@ impl CiServer {
             Ok(output) => output,
             Err(e) => return error(&e),
         };
+        let finished = dir.join("exit").exists();
+        let total = output.lines.len();
+        if let (Some(regex), Some(pattern)) = (regex, pattern) {
+            let candidates = if lines.is_empty() {
+                (0..total).collect()
+            } else {
+                pick_lines(total, lines)
+            };
+            let context = context.min(MAX_LOG_CONTEXT) as usize;
+            let picked = matching_lines(&output.lines, &candidates, &regex, context);
+            let text = if picked.is_empty() {
+                format!("(no line matches {pattern:?}; the output has {total} lines)\n")
+            } else {
+                numbered(&output, &picked, timestamps, false, true)
+            };
+            return CiReply::Log { text, finished };
+        }
         let keep_end = lines.is_empty();
         let last = [LineSpan::Last {
             count: tail.min(MAX_LOG_LINES),
         }];
         let spans = if keep_end { &last[..] } else { lines };
-        let picked = pick_lines(output.lines.len(), spans);
+        let picked = pick_lines(total, spans);
         CiReply::Log {
-            text: numbered(&output, &picked, timestamps, keep_end),
-            finished: dir.join("exit").exists(),
+            text: numbered(&output, &picked, timestamps, keep_end, false),
+            finished,
         }
     }
 
@@ -717,14 +754,59 @@ fn pick_lines(total: usize, spans: &[LineSpan]) -> Vec<usize> {
     picked
 }
 
+/// A `Log` pattern as a regular expression, refused when it is too long or
+/// not valid. The compiled size is bounded too, so a pattern cannot make
+/// the CI build a huge automaton.
+fn compile_pattern(pattern: &str) -> Result<regex::Regex, String> {
+    if pattern.len() > MAX_LOG_PATTERN_BYTES {
+        return Err(format!(
+            "a pattern is at most {MAX_LOG_PATTERN_BYTES} bytes"
+        ));
+    }
+    regex::RegexBuilder::new(pattern)
+        .size_limit(1 << 20)
+        .build()
+        .map_err(|e| format!("pattern {pattern:?}: {e}"))
+}
+
+/// The `candidates` whose text `regex` matches, each widened by `context`
+/// lines on both sides within the output: ascending, each once. A context
+/// line may lie outside the candidates.
+fn matching_lines(
+    lines: &[(u64, String)],
+    candidates: &[usize],
+    regex: &regex::Regex,
+    context: usize,
+) -> Vec<usize> {
+    let mut picked = Vec::new();
+    for &index in candidates {
+        if index < lines.len() && regex.is_match(&lines[index].1) {
+            let last = (index + context).min(lines.len() - 1);
+            // Ascending candidates: only what is not picked yet is added.
+            let first = index
+                .saturating_sub(context)
+                .max(picked.last().map_or(0, |&p: &usize| p + 1));
+            picked.extend(first..=last);
+        }
+    }
+    picked
+}
+
 /// The lines of `tail` at `picked` (from [`pick_lines`]) as text, each as
 /// `<number>| <text>` with the numbers right-aligned to the widest one
 /// shown, with `timestamps` as `<number>| [+<seconds>s] <text>` (seconds
 /// since the job's first output), and `...` between lines that are not
 /// adjacent. At most [`MAX_LOG_LINES`] lines and [`MAX_LOG_TEXT_BYTES`]:
 /// `keep_end` (a tail) drops lines from the front, otherwise lines are
-/// dropped from the end and a note says where to continue.
-fn numbered(tail: &TimedTail, picked: &[usize], timestamps: bool, keep_end: bool) -> String {
+/// dropped from the end and a note says where to continue; `searched` (the
+/// lines of a pattern) says to keep the pattern there.
+fn numbered(
+    tail: &TimedTail,
+    picked: &[usize],
+    timestamps: bool,
+    keep_end: bool,
+    searched: bool,
+) -> String {
     let mut text = String::new();
     if tail.truncated {
         text.push_str(&format!(
@@ -797,9 +879,14 @@ fn numbered(tail: &TimedTail, picked: &[usize], timestamps: bool, keep_end: bool
     }
     if to < picked.len() {
         text.push_str(&format!(
-            "(cut at {} lines; continue with lines={}-)\n",
+            "(cut at {} lines; continue with lines={}-{})\n",
             kept.len(),
-            picked[to] + 1
+            picked[to] + 1,
+            if searched {
+                " and the same pattern"
+            } else {
+                ""
+            }
         ));
     }
     text
@@ -1453,25 +1540,25 @@ mod tests {
     fn numbered_lines_align_their_numbers_and_mark_gaps() {
         let letters = output(12, |i| ((b'a' + i as u8) as char).to_string(), false);
         assert_eq!(
-            numbered(&letters, &[0, 1, 4], false, false),
+            numbered(&letters, &[0, 1, 4], false, false, false),
             "1| a\n2| b\n...\n5| e\n"
         );
         // The width is that of the widest number shown.
         assert_eq!(
-            numbered(&letters, &[8, 9, 10, 11], false, true),
+            numbered(&letters, &[8, 9, 10, 11], false, true, false),
             " 9| i\n10| j\n11| k\n12| l\n"
         );
         assert_eq!(
-            numbered(&letters, &[1, 10], true, false),
+            numbered(&letters, &[1, 10], true, false, false),
             " 2| [+     0.5s] b\n...\n11| [+     5.0s] k\n"
         );
         assert_eq!(
-            numbered(&letters, &[], false, false),
+            numbered(&letters, &[], false, false, false),
             "(no such lines: the output has 12 lines)\n"
         );
         let cut = output(2, |_| "x".to_owned(), true);
         assert_eq!(
-            numbered(&cut, &[0, 1], false, true),
+            numbered(&cut, &[0, 1], false, true, false),
             "(only the last 64 MiB of output were read; line numbers count from there)\n\
              1| x\n2| x\n"
         );
@@ -1484,7 +1571,7 @@ mod tests {
         let all: Vec<usize> = (0..max + 3).collect();
 
         // Asked for lines: the first ones, and where to go on.
-        let head = numbered(&many, &all, false, false);
+        let head = numbered(&many, &all, false, false, false);
         let rows: Vec<&str> = head.lines().collect();
         assert_eq!(rows.len(), max + 1);
         assert_eq!(rows[0], "   1| x");
@@ -1492,7 +1579,7 @@ mod tests {
         assert_eq!(rows[max], "(cut at 5000 lines; continue with lines=5001-)");
 
         // A tail: the last ones, nothing said.
-        let tail = numbered(&many, &all, false, true);
+        let tail = numbered(&many, &all, false, true, false);
         let rows: Vec<&str> = tail.lines().collect();
         assert_eq!(rows.len(), max);
         assert_eq!(rows[0], "   4| x");
@@ -1501,14 +1588,58 @@ mod tests {
         // Long lines hit the byte limit before the line limit.
         let wide = output(4000, |_| "y".repeat(1000), false);
         let all: Vec<usize> = (0..4000).collect();
-        let tail = numbered(&wide, &all, false, true);
+        let tail = numbered(&wide, &all, false, true, false);
         assert!(tail.len() <= MAX_LOG_TEXT_BYTES, "{}", tail.len());
         assert!(tail.ends_with(&format!("4000| {}\n", "y".repeat(1000))));
         assert!(!tail.starts_with("   1|"));
-        let head = numbered(&wide, &all, false, false);
+        let head = numbered(&wide, &all, false, false, false);
         assert!(head.len() <= MAX_LOG_TEXT_BYTES + 100, "{}", head.len());
         assert!(head.starts_with("   1| y"));
         assert!(head.contains("; continue with lines="));
+    }
+
+    #[test]
+    fn matching_lines_widen_by_context_and_merge() {
+        let ten = output(
+            10,
+            |i| if i == 2 || i == 4 { "hit" } else { "-" }.to_owned(),
+            false,
+        );
+        let all: Vec<usize> = (0..10).collect();
+        let hit = regex::Regex::new("hit").unwrap();
+        assert_eq!(matching_lines(&ten.lines, &all, &hit, 1), [1, 2, 3, 4, 5]);
+        assert_eq!(matching_lines(&ten.lines, &all, &hit, 0), [2, 4]);
+        // Context reaches past the candidates, not past the output.
+        assert_eq!(
+            matching_lines(&ten.lines, &[4], &hit, 20),
+            (0..10).collect::<Vec<_>>()
+        );
+        let first = output(10, |i| if i == 0 { "hit" } else { "-" }.to_owned(), false);
+        assert_eq!(matching_lines(&first.lines, &all, &hit, 3), [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn a_pattern_cut_says_to_keep_the_pattern() {
+        let max = MAX_LOG_LINES as usize;
+        let many = output(max + 3, |_| "x".to_owned(), false);
+        let all: Vec<usize> = (0..max + 3).collect();
+        let text = numbered(&many, &all, false, false, true);
+        assert!(
+            text.ends_with("(cut at 5000 lines; continue with lines=5001- and the same pattern)\n"),
+            "{}",
+            &text[text.len() - 100..]
+        );
+    }
+
+    #[test]
+    fn a_pattern_that_is_too_long_or_not_valid_is_refused() {
+        let long = "a".repeat(MAX_LOG_PATTERN_BYTES + 1);
+        assert_eq!(
+            compile_pattern(&long).err().as_deref(),
+            Some("a pattern is at most 1024 bytes")
+        );
+        let open = compile_pattern("(").expect_err("unclosed group");
+        assert!(open.starts_with("pattern \"(\": "), "{open}");
     }
 
     /// Tests that touch the filesystem, network, processes or real time: the
@@ -2447,6 +2578,8 @@ mod tests {
                     tail,
                     timestamps: false,
                     lines,
+                    pattern: None,
+                    context: 0,
                 })
             };
             let log = |tail, lines| match ask("view", "build", tail, lines) {
@@ -2483,6 +2616,35 @@ mod tests {
             std::fs::write(dir.join("exit"), "code=0\n").expect("write the exit record");
             assert_eq!(log(1, Vec::new()), ("4| four\n".to_owned(), true));
 
+            // A pattern keeps the matching lines and their context, within
+            // the lines asked for when there are some.
+            let search = |pattern: &str, context, lines| match server.answer(CiRequest::Log {
+                repo: "view".to_owned(),
+                number: 3,
+                job: "build".to_owned(),
+                tail: 0,
+                timestamps: false,
+                lines,
+                pattern: Some(pattern.to_owned()),
+                context,
+            }) {
+                CiReply::Log { text, .. } => text,
+                other => panic!("unexpected reply {other:?}"),
+            };
+            assert_eq!(
+                search("^one$|four", 0, Vec::new()),
+                "1| one\n...\n4| four\n"
+            );
+            assert_eq!(search("four", 1, Vec::new()), "3| three\n4| four\n");
+            let late = vec![LineSpan::Range {
+                first: 3,
+                last: None,
+            }];
+            assert_eq!(
+                search("one", 0, late),
+                "(no line matches \"one\"; the output has 4 lines)\n"
+            );
+
             // Names that are no job read nothing.
             assert_eq!(
                 ask("../view", "build", 10, Vec::new()),
@@ -2508,6 +2670,8 @@ mod tests {
                 tail,
                 timestamps: true,
                 lines: Vec::new(),
+                pattern: None,
+                context: 0,
             }) {
                 CiReply::Log { text, finished } => (text, finished),
                 other => panic!("unexpected reply {other:?}"),

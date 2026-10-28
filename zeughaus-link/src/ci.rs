@@ -39,6 +39,13 @@ pub const TIMING_READ_BYTES: usize = 64 << 20;
 /// The most spans one [`CiRequest::Log`] may name.
 pub const MAX_LOG_SPANS: usize = 32;
 
+/// The longest pattern one [`CiRequest::Log`] may search for, in bytes.
+pub const MAX_LOG_PATTERN_BYTES: usize = 1024;
+
+/// The most lines of context a [`CiRequest::Log`] search shows around each
+/// match, on either side.
+pub const MAX_LOG_CONTEXT: u32 = 20;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CiRequest {
@@ -77,8 +84,11 @@ pub enum CiRequest {
     /// the last `tail` lines, or with `lines` those lines instead. Every
     /// line starts with its number ([`LineSpan`] counts them). With
     /// `timestamps` the number is followed by the seconds since the job's
-    /// first output (`[+     1.5s] text`). Answers [`CiReply::Log`], or an
-    /// error when the job has no output.
+    /// first output (`[+     1.5s] text`). With `pattern` only the lines
+    /// that match the regular expression, each with `context` lines (at
+    /// most [`MAX_LOG_CONTEXT`]) before and after it, searched within
+    /// `lines` when given; `tail` is unused then. Answers [`CiReply::Log`],
+    /// or an error when the job has no output.
     Log {
         repo: String,
         number: u64,
@@ -88,6 +98,10 @@ pub enum CiRequest {
         timestamps: bool,
         #[serde(default)]
         lines: Vec<LineSpan>,
+        #[serde(default)]
+        pattern: Option<String>,
+        #[serde(default)]
+        context: u32,
     },
     /// Where a job's time went: the `top` lines of its output (clamped to
     /// `1..=`[`MAX_TIMING_LINES`]) that the longest pauses follow, from the
@@ -824,6 +838,8 @@ mod tests {
                 tail: 200,
                 timestamps: false,
                 lines: Vec::new(),
+                pattern: None,
+                context: 0,
             },
             CiRequest::Log {
                 repo: "griasdi".to_owned(),
@@ -842,6 +858,8 @@ mod tests {
                     },
                     LineSpan::Last { count: 2 },
                 ],
+                pattern: Some("panicked at|FAIL \\[".to_owned()),
+                context: 2,
             },
             CiRequest::Timing {
                 repo: "griasdi".to_owned(),
@@ -1028,8 +1046,13 @@ mod tests {
                 tail,
                 timestamps,
                 lines,
+                pattern,
+                context,
                 ..
-            }) => assert_eq!((tail, timestamps, lines), (200, false, Vec::new())),
+            }) => assert_eq!(
+                (tail, timestamps, lines, pattern, context),
+                (200, false, Vec::new(), None, 0)
+            ),
             other => panic!("{other:?}"),
         }
     }
