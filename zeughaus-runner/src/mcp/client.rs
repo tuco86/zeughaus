@@ -19,8 +19,8 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use weida::{
-    ClientTls, EndpointAddr, OutgoingTransfer, ReplyStream, Requester, Runtime, RuntimeConfig,
-    TransferMeta, Trust,
+    ClientTls, EndpointAddr, Limits, OutgoingTransfer, ReplyStream, Requester, Runtime,
+    RuntimeConfig, TransferMeta, Trust,
 };
 use zeughaus_link::enlist::{read_frame, write_frame};
 use zeughaus_link::manual::{RunReply, RunUpload};
@@ -31,6 +31,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How long a question on `/ci` may take.
 const CI_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The QUIC idle timeout of this client's connections, and the keep-alive
+/// that holds a healthy one open. A CI that was killed sends no close, and
+/// the one started in its place cannot reset the old connection, so only
+/// the idle timeout notices; at weida's default of 30 s that raced
+/// [`CI_TIMEOUT`]. At 6 s a question on a dead connection fails soon and is
+/// asked again on a new one.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(6);
+const KEEP_ALIVE: Duration = Duration::from_secs(2);
 
 /// How long the CI may take to answer an upload once all of it was sent. It
 /// waits up to 30 s for its scheduler to number the pipeline.
@@ -220,8 +229,15 @@ impl Client {
         let runtime = match &state.runtime {
             Some(runtime) => runtime.clone(),
             None => {
-                let runtime =
-                    Runtime::new(RuntimeConfig::default()).map_err(|e| format!("weida: {e}"))?;
+                let config = RuntimeConfig {
+                    limits: Limits {
+                        keep_alive: KEEP_ALIVE,
+                        idle_timeout: IDLE_TIMEOUT,
+                        ..Limits::default()
+                    },
+                    ..RuntimeConfig::default()
+                };
+                let runtime = Runtime::new(config).map_err(|e| format!("weida: {e}"))?;
                 state.runtime = Some(runtime.clone());
                 runtime
             }
