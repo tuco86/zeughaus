@@ -933,9 +933,9 @@ fn job_timing(tail: &TimedTail, end: u64, finished: bool, top: u32) -> JobTiming
     }
 }
 
-/// A page of `channel`'s pipelines, newest first: those numbered below
-/// `before`, at most `limit` of them, clamped to `1..=`
-/// [`MAX_PIPELINES_PER_REQUEST`].
+/// A page of `channel`'s pipelines (every channel's when it is empty),
+/// newest first: those numbered below `before`, at most `limit` of them,
+/// clamped to `1..=`[`MAX_PIPELINES_PER_REQUEST`].
 fn page(
     records: Vec<Pipeline>,
     channel: &str,
@@ -944,7 +944,10 @@ fn page(
 ) -> Vec<PipelineView> {
     let mut records: Vec<Pipeline> = records
         .into_iter()
-        .filter(|p| before.is_none_or(|before| p.number < before) && p.channel() == channel)
+        .filter(|p| {
+            before.is_none_or(|before| p.number < before)
+                && (channel.is_empty() || p.channel() == channel)
+        })
         .collect();
     records.sort_by_key(|p| std::cmp::Reverse(p.number));
     records.truncate(limit.clamp(1, MAX_PIPELINES_PER_REQUEST) as usize);
@@ -1313,6 +1316,21 @@ mod tests {
             MAX_PIPELINES_PER_REQUEST as usize
         );
         assert!(page(records, "nightly", None, 10).is_empty());
+    }
+
+    #[test]
+    fn an_empty_channel_pages_every_channel() {
+        let records = vec![
+            pipeline("view", 1, "dev", PipelineStatus::Succeeded, Vec::new()),
+            pipeline("view", 2, "nightly", PipelineStatus::Failed, Vec::new()),
+            pipeline("view", 3, "dev", PipelineStatus::Succeeded, Vec::new()),
+        ];
+        let views = page(records, "", None, 10);
+        let seen: Vec<(u64, &str)> = views
+            .iter()
+            .map(|v| (v.number, v.channel.as_str()))
+            .collect();
+        assert_eq!(seen, [(3, "dev"), (2, "nightly"), (1, "dev")]);
     }
 
     #[test]

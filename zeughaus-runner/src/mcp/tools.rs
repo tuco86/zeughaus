@@ -127,25 +127,36 @@ impl Toolbox {
         }
     }
 
+    /// One channel's pipelines, or with no channel every channel's, each
+    /// line then starting with its channel.
     async fn pipelines(&self, args: PipelinesArgs) -> Result<String, String> {
         let repo = self.repo_or_checkout(args.repo).await?;
         let limit = args
             .limit
             .unwrap_or(DEFAULT_PIPELINES)
             .clamp(1, MAX_PIPELINES_PER_REQUEST);
+        let channel = args.channel.unwrap_or_default();
         let request = CiRequest::Pipelines {
             repo: repo.clone(),
-            channel: args.channel.clone(),
+            channel: channel.clone(),
             before: None,
             limit,
         };
         match self.client.ci(request).await? {
-            CiReply::Pipelines { pipelines } if pipelines.is_empty() => {
-                Ok(format!("no pipelines in {repo}/{}", args.channel))
-            }
+            CiReply::Pipelines { pipelines } if pipelines.is_empty() => Ok(if channel.is_empty() {
+                format!("no pipelines in {repo}")
+            } else {
+                format!("no pipelines in {repo}/{channel}")
+            }),
             CiReply::Pipelines { pipelines } => Ok(pipelines
                 .iter()
-                .map(|pipeline| pipeline_line(pipeline) + "\n")
+                .map(|pipeline| {
+                    if channel.is_empty() {
+                        format!("{} {}\n", pipeline.channel, pipeline_line(pipeline))
+                    } else {
+                        pipeline_line(pipeline) + "\n"
+                    }
+                })
                 .collect()),
             other => Err(unexpected(&other)),
         }
@@ -652,7 +663,7 @@ struct ProposalArgs {
 #[serde(deny_unknown_fields)]
 struct PipelinesArgs {
     repo: Option<String>,
-    channel: String,
+    channel: Option<String>,
     limit: Option<u32>,
 }
 
@@ -1128,14 +1139,15 @@ fn definitions() -> Vec<Value> {
         ),
         tool(
             "ci_pipelines",
-            "A channel's pipelines, newest first, one line each: #number status event ref \
-             sha subject (actor).",
+            "A repository's pipelines, newest first, of one channel or all, one line each: \
+             #number status event ref sha subject (actor).",
             json!({
                 "repo": repo,
                 "channel": {
                     "type": "string",
                     "description": "Channel name as ci_status lists it, for example dev, \
-                                    nightly or release.",
+                                    nightly or release; without it, every channel, each line \
+                                    starting with its channel.",
                 },
                 "limit": {
                     "type": "integer",
@@ -1146,7 +1158,7 @@ fn definitions() -> Vec<Value> {
                     ),
                 },
             }),
-            &["channel"],
+            &[],
             true,
         ),
         tool(

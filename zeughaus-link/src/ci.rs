@@ -51,10 +51,12 @@ pub const MAX_LOG_CONTEXT: u32 = 20;
 pub enum CiRequest {
     /// Every channel with its newest pipeline, and the machines.
     Overview,
-    /// A channel's pipelines, newest first. `before` keeps only numbers below
-    /// it; `limit` is clamped to `1..=`[`MAX_PIPELINES_PER_REQUEST`].
+    /// A channel's pipelines, newest first; an empty `channel` is every
+    /// channel. `before` keeps only numbers below it; `limit` is clamped to
+    /// `1..=`[`MAX_PIPELINES_PER_REQUEST`].
     Pipelines {
         repo: String,
+        #[serde(default)]
         channel: String,
         before: Option<u64>,
         limit: u32,
