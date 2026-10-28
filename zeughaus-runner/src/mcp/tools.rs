@@ -1076,13 +1076,16 @@ fn definitions() -> Vec<Value> {
         "minimum": 1,
         "description": "Number of the plan or proposal, as docs lists it.",
     });
+    // No `maximum` anywhere: omp refuses a call above a schema maximum, while
+    // the server clamps every limit and says so in the description.
     let wait = |what: &str| {
         json!({
             "type": "integer",
             "minimum": 0,
-            "maximum": MAX_WAIT_SECONDS,
             "default": DEFAULT_WAIT_SECONDS,
-            "description": what,
+            "description": format!(
+                "{what} At most {MAX_WAIT_SECONDS}; a larger value waits {MAX_WAIT_SECONDS}."
+            ),
         })
     };
     vec![
@@ -1125,9 +1128,10 @@ fn definitions() -> Vec<Value> {
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": MAX_PIPELINES_PER_REQUEST,
                     "default": DEFAULT_PIPELINES,
-                    "description": "How many pipelines to list.",
+                    "description": format!(
+                        "How many pipelines to list, at most {MAX_PIPELINES_PER_REQUEST}."
+                    ),
                 },
             }),
             &["channel"],
@@ -1157,9 +1161,8 @@ fn definitions() -> Vec<Value> {
                 "tail": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": MAX_TAIL,
                     "default": DEFAULT_TAIL,
-                    "description": "How many lines from the end.",
+                    "description": format!("How many lines from the end, at most {MAX_TAIL}."),
                 },
                 "lines": {
                     "type": "string",
@@ -1196,9 +1199,10 @@ fn definitions() -> Vec<Value> {
                 "top": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": MAX_TIMING_LINES,
                     "default": DEFAULT_TOP,
-                    "description": "With job: how many lines to name.",
+                    "description": format!(
+                        "With job: how many lines to name, at most {MAX_TIMING_LINES}."
+                    ),
                 },
             }),
             &["number"],
@@ -1436,6 +1440,15 @@ mod tests {
                 let key = required.as_str().unwrap();
                 assert!(tool["inputSchema"]["properties"][key].is_object(), "{tool}");
             }
+            // omp refuses a call above a schema maximum; the server clamps
+            // instead, so no property may carry one.
+            for (key, property) in tool["inputSchema"]["properties"]
+                .as_object()
+                .into_iter()
+                .flatten()
+            {
+                assert_eq!(property.get("maximum"), None, "{key} of {tool}");
+            }
         }
         fn schema<'a>(definitions: &'a [Value], name: &str) -> &'a Value {
             &definitions
@@ -1448,7 +1461,6 @@ mod tests {
         assert_eq!(run["properties"]["jobs"]["minItems"], 1);
         assert_eq!(run["properties"]["jobs"]["maxItems"], 16);
         assert_eq!(run["properties"]["wait_seconds"]["default"], 540);
-        assert_eq!(run["properties"]["wait_seconds"]["maximum"], 600);
         assert_eq!(definitions[9]["annotations"]["readOnlyHint"], false);
         assert_eq!(definitions[1]["annotations"]["readOnlyHint"], true);
         let log = schema(&definitions, "ci_log");
@@ -1459,7 +1471,6 @@ mod tests {
         let timing = schema(&definitions, "ci_timing");
         assert_eq!(timing["required"], json!(["number"]));
         assert_eq!(timing["properties"]["top"]["default"], 15);
-        assert_eq!(timing["properties"]["top"]["maximum"], 100);
         // Where a checkout names the repository, `repo` is optional.
         for name in [
             "ci_pipelines",
