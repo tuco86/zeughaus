@@ -3,21 +3,37 @@
 //!
 //! A run's output is the PTY's bytes as the terminal received them, colours,
 //! cursor movement and progress bars included. [`plain_text`] reduces that
-//! to the lines a reader would see; the excerpt is the last of them.
+//! to the lines a reader would see; the excerpt is the last of them, led by
+//! the first panic when that is further up.
 
 use std::path::Path;
 
 use zeughaus_terminal::wal::Record;
 
-/// Lines an excerpt keeps.
+/// Lines an excerpt keeps from the end of the log; a panic further up comes
+/// before them.
 pub const EXCERPT_LINES: usize = 40;
+/// Lines a panic above the last [`EXCERPT_LINES`] brings along, its own
+/// line included: the message follows it, up to a blank line.
+const PANIC_LINES: usize = 6;
 /// Bytes read from the end of a log for an excerpt: 40 lines of a build
 /// with long paths and colour codes fit many times over.
 const TAIL_BYTES: usize = 256 * 1024;
 /// What a cause line looks like, in order of preference: a panic or a
 /// compiler error says more than the `error: test failed` or
-/// `test result: FAILED` cargo prints after it.
-const CAUSES: [&str; 4] = ["panicked at", "error[", "error:", "FAILED"];
+/// `test result: FAILED` cargo prints after it. nextest's status lines name
+/// the test and come before `error:`, because its closing
+/// `error: test run failed` says nothing.
+const CAUSES: [&str; 8] = [
+    "panicked at",
+    "error[",
+    "FAIL [",
+    "TIMEOUT [",
+    "SIGSEGV [",
+    "SIGABRT [",
+    "error:",
+    "FAILED",
+];
 
 /// Terminal output as the lines a reader sees: escape sequences removed, a
 /// carriage return starting its line over, a backspace moving back one
@@ -113,6 +129,9 @@ fn skip_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
 }
 
 /// The last [`EXCERPT_LINES`] lines of `text`, trailing blank lines dropped.
+/// When none of them is a panic but an earlier line is, the first panic and
+/// its message (up to a blank line, [`PANIC_LINES`] in all) come first,
+/// then a line `...`: a test run reports its panic long before it ends.
 pub fn excerpt(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let mut body = lines.as_slice();
@@ -121,7 +140,21 @@ pub fn excerpt(text: &str) -> String {
     {
         body = rest;
     }
-    body[body.len().saturating_sub(EXCERPT_LINES)..].join("\n")
+    let start = body.len().saturating_sub(EXCERPT_LINES);
+    let tail = &body[start..];
+    let panic = |line: &&str| line.contains("panicked at");
+    if !tail.iter().any(panic)
+        && let Some(first) = body[..start].iter().position(panic)
+    {
+        let block: Vec<&str> = body[first..start]
+            .iter()
+            .take(PANIC_LINES)
+            .take_while(|line| !line.trim().is_empty())
+            .copied()
+            .collect();
+        return [block.as_slice(), &["..."], tail].concat().join("\n");
+    }
+    tail.join("\n")
 }
 
 /// The first line of `excerpt` that looks like a cause, by the order of
@@ -282,6 +315,44 @@ mod tests {
             Some("error[E0425]: cannot find value `x` in this scope")
         );
         assert_eq!(cause("all good\nexit 3"), None);
+    }
+
+    #[test]
+    fn a_panic_above_the_tail_leads_the_excerpt_and_is_the_cause() {
+        let mut text =
+            "thread 'it::boom' panicked at src/lib.rs:1:2:\nassertion failed: boom\n\n".to_owned();
+        for i in 1..=60 {
+            text.push_str(&format!(
+                "        PASS [   0.001s] ({i}/61) smoke it::ok_{i}\n"
+            ));
+        }
+        text.push_str("        FAIL [   0.002s] (61/61) smoke it::boom\nerror: test run failed\n");
+        let excerpt = excerpt(&text);
+        let lines: Vec<&str> = excerpt.lines().collect();
+        assert_eq!(
+            lines[..3],
+            [
+                "thread 'it::boom' panicked at src/lib.rs:1:2:",
+                "assertion failed: boom",
+                "..."
+            ]
+        );
+        assert_eq!(lines.len(), 3 + EXCERPT_LINES);
+        assert_eq!(lines.last(), Some(&"error: test run failed"));
+        assert_eq!(
+            cause(&excerpt).as_deref(),
+            Some("thread 'it::boom' panicked at src/lib.rs:1:2: assertion failed: boom")
+        );
+    }
+
+    #[test]
+    fn a_failed_test_line_is_the_cause_over_the_summary() {
+        let excerpt = "PASS ...\n        FAIL [   0.769s] (1958/2554) griasdi-screen::it \
+                       capture::a_new_resolution\nerror: test run failed";
+        assert_eq!(
+            cause(excerpt).as_deref(),
+            Some("FAIL [   0.769s] (1958/2554) griasdi-screen::it capture::a_new_resolution")
+        );
     }
 
     fn record(at_micros: u64, bytes: &[u8]) -> Record {
