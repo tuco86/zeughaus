@@ -115,8 +115,10 @@ fn parse_args(args: &[String]) -> Result<Option<String>, String> {
 const EXIT_BAD_INPUT: u8 = 1;
 const EXIT_NO_ANSWER: u8 = 2;
 const EXIT_NOT_A_REPOSITORY: u8 = 3;
+/// `ci wait` only: a running job reached a multiple of its expected time.
+const EXIT_LATE: u8 = 4;
 
-/// `zeughaus-runner ci repo|find|doc|plan-save|planned`: one question to
+/// `zeughaus-runner ci repo|find|doc|plan-save|planned|wait|overdue`: one question to
 /// the CI, answered on stdout, for a script that is no MCP client (an
 /// agent's extension asks them at session start, after a push and when a
 /// plan is saved). The CI is dialled as `mcp` does without `--ci`, and the
@@ -141,14 +143,20 @@ const EXIT_NOT_A_REPOSITORY: u8 = 3;
 ///   `file` names as planned, for a plan executed without being saved.
 /// - `ci wait <repo> <number|sha> [<job>]`: waits until the pipeline (or
 ///   that job of it) has settled, up to [`CLI_WAIT_LIMIT`], and prints it
-///   as `ci_wait` does; an agent runs it as a background command.
+///   as `ci_wait` does; an agent runs it as a background command. It ends
+///   early when a running job reaches a multiple of its expected time.
+/// - `ci overdue <repo> <number> <job>`: the late report of a running job
+///   (how far into its expected time, its machine's other jobs, its last
+///   lines), which the omp plugin's push watch sends at each multiple.
 ///
 /// Exit 0: answered (for `ci wait`: settled, whatever its status); an
 /// `--approve` that the CI refused still exits 0 and says so, because the
 /// plan is stored. 1: the arguments, the directory or the file were wrong.
 /// 2: no CI is configured, it could not be asked, it refused (no such
-/// document, a state that cannot change), or the wait ran out. 3: `ci repo`
-/// only, no repository of the CI has the checkout's origin.
+/// document, a state that cannot change, a job that is not running or has
+/// no expected time), or the wait ran out. 3: `ci repo` only, no
+/// repository of the CI has the checkout's origin. 4: `ci wait` only, a
+/// running job reached a multiple of its expected time; stdout says which.
 pub fn cli(args: &[String], state_dir: &Path) -> ExitCode {
     let command = match parse_ci(args) {
         Ok(command) => command,
@@ -180,6 +188,11 @@ pub fn cli(args: &[String], state_dir: &Path) -> ExitCode {
         Ok(text) => {
             print!("{text}");
             ExitCode::SUCCESS
+        }
+        // The whole report, for the agent to decide on.
+        Err(failure) if failure.code == EXIT_LATE => {
+            print!("{}", failure.message);
+            ExitCode::from(EXIT_LATE)
         }
         Err(failure) => {
             eprintln!("{}", one_line(&failure.message));
@@ -221,6 +234,11 @@ enum CiCommand {
         sha: Option<String>,
         job: Option<String>,
     },
+    Overdue {
+        repo: String,
+        number: u64,
+        job: String,
+    },
 }
 
 /// How long `ci wait` waits: the longest a job may run by default. The
@@ -229,7 +247,7 @@ const CLI_WAIT_LIMIT: Duration = Duration::from_secs(4 * 3600);
 
 /// The arguments that follow `ci`.
 fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
-    const SUBCOMMANDS: &str = "repo, find, doc, plan-save, planned or wait";
+    const SUBCOMMANDS: &str = "repo, find, doc, plan-save, planned, wait or overdue";
     let Some((subcommand, rest)) = args.split_first() else {
         return Err(format!("ci needs a subcommand: {SUBCOMMANDS}"));
     };
@@ -238,7 +256,9 @@ fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
     let mut operands: Vec<&String> = Vec::new();
     for arg in rest {
         match arg.as_str() {
-            "--json" if subcommand != "planned" && subcommand != "wait" => json = true,
+            "--json" if !matches!(subcommand.as_str(), "planned" | "wait" | "overdue") => {
+                json = true
+            }
             "--approve" if subcommand == "plan-save" => approve = true,
             flag if flag.len() > 1 && flag.starts_with('-') => {
                 return Err(format!("unknown flag {flag:?} for ci {subcommand}"));
@@ -311,6 +331,23 @@ fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
             "ci wait takes a repository name, a pipeline number or sha, and optionally a job"
                 .to_owned(),
         ),
+        ("overdue", [repo, number, job]) => {
+            let number = match number.parse::<u64>() {
+                Ok(number) if number >= 1 => number,
+                _ => return Err(format!("{number:?} is no pipeline number")),
+            };
+            if !crate::names::valid_name(job) {
+                return Err(format!("{job:?} is not a job name"));
+            }
+            Ok(CiCommand::Overdue {
+                repo: (*repo).clone(),
+                number,
+                job: (*job).clone(),
+            })
+        }
+        ("overdue", _) => {
+            Err("ci overdue takes a repository name, a pipeline number and a job".to_owned())
+        }
         (other, _) => Err(format!("unknown ci subcommand {other:?}: {SUBCOMMANDS}")),
     }
 }
@@ -515,15 +552,24 @@ async fn ci_answer(client: &Arc<Client>, command: CiCommand) -> Result<String, F
             job,
         } => {
             let waited = Toolbox::new(Arc::clone(client))
-                .wait(Some(repo), number, sha, job, CLI_WAIT_LIMIT)
+                .wait(Some(repo), number, sha, job, None, CLI_WAIT_LIMIT)
                 .await
                 .map_err(Failure::no_answer)?;
             if waited.settled {
                 Ok(waited.text)
+            } else if waited.late {
+                Err(Failure {
+                    code: EXIT_LATE,
+                    message: waited.text,
+                })
             } else {
                 Err(Failure::no_answer(waited.text))
             }
         }
+        CiCommand::Overdue { repo, number, job } => Toolbox::new(Arc::clone(client))
+            .late_report(&repo, number, &job)
+            .await
+            .map_err(Failure::no_answer),
     }
 }
 

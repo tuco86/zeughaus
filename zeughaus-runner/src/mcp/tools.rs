@@ -4,6 +4,7 @@
 //! that is the same every time. The functions that build it take the records
 //! and the clock as arguments and touch no network.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,8 +17,8 @@ use zeughaus_link::ci::{
 };
 use zeughaus_link::manual::{MAX_MANUAL_JOBS, RunReply};
 use zeughaus_link::{
-    CiOverview, CiReply, CiRequest, DocKind, DocState, DocView, JobTiming, JobView, PipelineView,
-    TransferView,
+    CiOverview, CiReply, CiRequest, DocKind, DocState, DocView, JobTiming, JobView, MachineView,
+    PipelineView, TransferView,
 };
 
 use super::client::Client;
@@ -63,6 +64,10 @@ const ERROR_GRACE: Duration = Duration::from_secs(60);
 /// before the answer says it has no number yet: the scheduler numbers an
 /// event within a tick unless a pipeline of the same ref still runs.
 const NUMBERING_WAIT: Duration = Duration::from_secs(30);
+/// Lines of a late job's output its report shows.
+const LATE_TAIL: u32 = 10;
+/// The longest `expected_minutes` a call may give: a day.
+const MAX_EXPECTED_MINUTES: u64 = 1440;
 
 pub struct Toolbox {
     client: Arc<Client>,
@@ -375,6 +380,7 @@ impl Toolbox {
                 return Err(format!("job {name} is named twice"));
             }
         }
+        let given = given_secs(args.expected_minutes)?;
         let wait = wait_for(args.wait_seconds);
         // The snapshot and its upload cost time and bytes: do not make them
         // for a CI that is not there.
@@ -400,6 +406,7 @@ impl Toolbox {
                     sha: None,
                     job: None,
                     wait_seconds: Some(left),
+                    expected_minutes: given.map(|secs| secs / 60),
                 })
                 .await
             }
@@ -503,8 +510,10 @@ impl Toolbox {
             sha,
             job,
             wait_seconds,
+            expected_minutes,
         } = args;
-        self.wait(repo, number, sha, job, wait_for(wait_seconds))
+        let given = given_secs(expected_minutes)?;
+        self.wait(repo, number, sha, job, given, wait_for(wait_seconds))
             .await
             .map(|waited| waited.text)
     }
@@ -516,12 +525,19 @@ impl Toolbox {
     /// sha that matches no pipeline yet is waited for: the push may not have
     /// reached the CI. Once it matches, the pipeline is followed by its
     /// number, so a newer one of the same commit does not take its place.
+    ///
+    /// It answers early, as late, when a running job reaches a multiple of
+    /// its expected time (`given` seconds, else the CI's measure) above the
+    /// one it was at on the first look: a job already past 1x when the call
+    /// starts is reported at its next multiple, so calling again right after
+    /// a late answer waits for the next one.
     pub(super) async fn wait(
         &self,
         repo: Option<String>,
         number: Option<u64>,
         sha: Option<String>,
         job: Option<String>,
+        given: Option<u64>,
         limit: Duration,
     ) -> Result<Waited, String> {
         let started = Instant::now();
@@ -541,6 +557,8 @@ impl Toolbox {
         let repo = self.repo_or_checkout(repo).await?;
         let deadline = started + limit;
         let mut latest: Option<PipelineView> = None;
+        // The multiple each running job was at on the first look.
+        let mut baseline: Option<HashMap<String, u64>> = None;
         // Every look sets it before the loop can end.
         let mut last_error: Option<String>;
         let mut failing_since: Option<Instant> = None;
@@ -572,8 +590,31 @@ impl Toolbox {
                     if settled {
                         return Ok(Waited {
                             settled: true,
+                            late: false,
                             text: pipeline_text(&view),
                         });
+                    }
+                    let late = lateness(&view, job.as_deref(), given, now());
+                    match &baseline {
+                        None => {
+                            baseline = Some(
+                                late.iter()
+                                    .map(|late| (late.job.clone(), late.multiple()))
+                                    .collect(),
+                            );
+                        }
+                        Some(baseline) => {
+                            let crossed = crossed(late, baseline);
+                            if !crossed.is_empty() {
+                                let text =
+                                    self.late_text(&view, &crossed, job.as_deref(), given).await;
+                                return Ok(Waited {
+                                    settled: false,
+                                    late: true,
+                                    text,
+                                });
+                            }
+                        }
                     }
                     latest = Some(view);
                 }
@@ -616,8 +657,101 @@ impl Toolbox {
         };
         Ok(Waited {
             settled: false,
+            late: false,
             text,
         })
+    }
+
+    /// The text of a wait that ends because jobs ran late: the pipeline,
+    /// a block for each late job, and what the agent can do. A failed
+    /// question to the CI changes only its own line.
+    async fn late_text(
+        &self,
+        view: &PipelineView,
+        crossed: &[Lateness],
+        job: Option<&str>,
+        given: Option<u64>,
+    ) -> String {
+        let machines = self.machines().await;
+        let mut text = pipeline_text(view);
+        for late in crossed {
+            let log = self.last_lines(&view.repo, view.number, &late.job).await;
+            text.push_str(&late_block(
+                view,
+                late,
+                machines.as_deref().map_err(String::as_str),
+                log.as_deref().map_err(String::as_str),
+            ));
+        }
+        text.push_str(&late_advice(view, job, given.map(|secs| secs / 60)));
+        text
+    }
+
+    /// The late report of one running job, measured against the CI's
+    /// expected time, for `zeughaus-runner ci overdue`.
+    pub(super) async fn late_report(
+        &self,
+        repo: &str,
+        number: u64,
+        job: &str,
+    ) -> Result<String, String> {
+        let view = self.view(repo, number).await?;
+        let found = view
+            .jobs
+            .iter()
+            .find(|j| j.name == job)
+            .ok_or_else(|| format!("no job {job} in {repo} #{number}"))?;
+        if found.status != "running" {
+            return Err(format!(
+                "{job} of {repo} #{number} is {}, not running",
+                found.status
+            ));
+        }
+        let late = lateness(&view, Some(job), None, now())
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                format!(
+                    "{job} of {repo} #{number} has no expected time: no succeeded run at its \
+                     place yet"
+                )
+            })?;
+        let machines = self.machines().await;
+        let log = self.last_lines(repo, number, job).await;
+        let mut text = late_block(
+            &view,
+            &late,
+            machines.as_deref().map_err(String::as_str),
+            log.as_deref().map_err(String::as_str),
+        );
+        text.push_str(&late_advice(&view, None, None));
+        Ok(text)
+    }
+
+    /// The machines of the CI and the jobs running on each.
+    async fn machines(&self) -> Result<Vec<MachineView>, String> {
+        match self.client.ci(CiRequest::Overview).await? {
+            CiReply::Overview { overview } => Ok(overview.machines),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// The last [`LATE_TAIL`] lines of a job's output.
+    async fn last_lines(&self, repo: &str, number: u64, job: &str) -> Result<String, String> {
+        let request = CiRequest::Log {
+            repo: repo.to_owned(),
+            number,
+            job: job.to_owned(),
+            tail: LATE_TAIL,
+            timestamps: false,
+            lines: Vec::new(),
+            pattern: None,
+            context: 0,
+        };
+        match self.client.ci(request).await? {
+            CiReply::Log { text, .. } => Ok(text),
+            other => Err(unexpected(&other)),
+        }
     }
 
     /// The commit the working directory's checkout is at.
@@ -851,6 +985,7 @@ struct RunJobsArgs {
     jobs: Vec<String>,
     path: Option<String>,
     wait_seconds: Option<u64>,
+    expected_minutes: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -861,6 +996,7 @@ struct CiWaitArgs {
     sha: Option<String>,
     job: Option<String>,
     wait_seconds: Option<u64>,
+    expected_minutes: Option<u64>,
 }
 
 /// What a `ci_wait` is waiting for: a pipeline by number, or the newest one
@@ -871,9 +1007,11 @@ enum Wanted {
 }
 
 /// What [`Toolbox::wait`] ended with: the text to show, and whether the
-/// pipeline (or the job waited for) has settled or the wait ran out.
+/// pipeline (or the job waited for) has settled, a running job reached a
+/// multiple of its expected time (`late`), or the wait ran out.
 pub(super) struct Waited {
     pub settled: bool,
+    pub late: bool,
     pub text: String,
 }
 
@@ -901,6 +1039,17 @@ fn wait_for(seconds: Option<u64>) -> Duration {
             .unwrap_or(DEFAULT_WAIT_SECONDS)
             .min(MAX_WAIT_SECONDS),
     )
+}
+
+/// A call's `expected_minutes` in seconds.
+fn given_secs(expected_minutes: Option<u64>) -> Result<Option<u64>, String> {
+    match expected_minutes {
+        None => Ok(None),
+        Some(minutes) if (1..=MAX_EXPECTED_MINUTES).contains(&minutes) => Ok(Some(minutes * 60)),
+        Some(_) => Err(format!(
+            "expected_minutes must be 1 to {MAX_EXPECTED_MINUTES}"
+        )),
+    }
 }
 
 fn now() -> u64 {
@@ -1072,6 +1221,135 @@ fn waiting_text(pipeline: &PipelineView, job: Option<&str>, waited_seconds: u64)
         pipeline.repo, pipeline.number, pipeline.repo, pipeline.number
     ));
     text
+}
+
+/// A running job and how far it is into its expected time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Lateness {
+    pub job: String,
+    pub place: String,
+    pub elapsed: u64,
+    pub expected: u64,
+    /// The expected time came from the call, not from the CI's measure.
+    pub given: bool,
+}
+
+impl Lateness {
+    fn multiple(&self) -> u64 {
+        self.elapsed / self.expected
+    }
+}
+
+/// Every job of `view` with status `running` and a start (with `job`, only
+/// that one) whose expected time is `given` (seconds, from the call) or else
+/// its `expected_secs`; jobs with neither, or 0, are left out.
+fn lateness(view: &PipelineView, job: Option<&str>, given: Option<u64>, now: u64) -> Vec<Lateness> {
+    view.jobs
+        .iter()
+        .filter(|j| j.status == "running" && job.is_none_or(|name| j.name == name))
+        .filter_map(|j| {
+            let started = j.started?;
+            let (expected, given) = match given {
+                Some(secs) => (secs, true),
+                None => (j.expected_secs?, false),
+            };
+            (expected > 0).then(|| Lateness {
+                job: j.name.clone(),
+                place: j.place.clone(),
+                elapsed: now.saturating_sub(started),
+                expected,
+                given,
+            })
+        })
+        .collect()
+}
+
+/// Those of `late` that reached a multiple of at least 1 above the one
+/// `baseline` holds for them (0 when absent).
+fn crossed(late: Vec<Lateness>, baseline: &HashMap<String, u64>) -> Vec<Lateness> {
+    late.into_iter()
+        .filter(|late| {
+            let multiple = late.multiple();
+            multiple >= 1 && multiple > baseline.get(&late.job).copied().unwrap_or(0)
+        })
+        .collect()
+}
+
+/// What one late job is doing: how long it runs against its expected time,
+/// what else its machine runs, and its last lines.
+fn late_block(
+    view: &PipelineView,
+    late: &Lateness,
+    machines: Result<&[MachineView], &str>,
+    log: Result<&str, &str>,
+) -> String {
+    let source = if late.given {
+        "given as expected_minutes"
+    } else {
+        "measured from its last successful runs"
+    };
+    let mut text = format!(
+        "late: {} on {}: running {} s, {}x its expected {} s ({source})\n",
+        late.job,
+        late.place,
+        late.elapsed,
+        late.multiple(),
+        late.expected
+    );
+    let is_this = |j: &zeughaus_link::MachineJob| {
+        j.repo == view.repo && j.number == view.number && j.job == late.job
+    };
+    match machines {
+        Err(e) => text.push_str(&format!("  machine: not known ({e})\n")),
+        Ok(machines) => match machines.iter().find(|m| m.jobs.iter().any(is_this)) {
+            None => text.push_str("  machine: not known (the CI lists no machine for it)\n"),
+            Some(machine) => {
+                let others: Vec<String> = machine
+                    .jobs
+                    .iter()
+                    .filter(|j| !is_this(j))
+                    .map(|j| format!("{}#{}/{}", j.repo, j.number, j.job))
+                    .collect();
+                if others.is_empty() {
+                    text.push_str(&format!("  {}: runs no other job\n", machine.name));
+                } else {
+                    text.push_str(&format!(
+                        "  {}: also runs {}\n",
+                        machine.name,
+                        others.join(", ")
+                    ));
+                }
+            }
+        },
+    }
+    match log {
+        Err(e) => text.push_str(&format!("  last lines: not available ({e})\n")),
+        Ok(log) => {
+            text.push_str("  last lines:\n");
+            for line in log.lines() {
+                text.push_str("    ");
+                text.push_str(line.trim_end());
+                text.push('\n');
+            }
+        }
+    }
+    text
+}
+
+/// What the agent can do about a late job: wait on, or stop it.
+fn late_advice(view: &PipelineView, job: Option<&str>, given_minutes: Option<u64>) -> String {
+    let (repo, number) = (&view.repo, view.number);
+    let job_arg = job.map(|job| format!(" job={job}")).unwrap_or_default();
+    let job_operand = job.map(|job| format!(" {job}")).unwrap_or_default();
+    let minutes = given_minutes
+        .map(|m| format!(" expected_minutes={m}"))
+        .unwrap_or_default();
+    format!(
+        "the CI stops it only at its timeout_minutes; to wait on call ci_wait repo={repo} \
+         number={number}{job_arg}{minutes} (it answers again at the next multiple) or run \
+         `zeughaus-runner ci wait {repo} {number}{job_operand}` in the background; to stop it \
+         call ci_cancel repo={repo} number={number}\n"
+    )
 }
 
 /// `  <name> <status> <place> <note>`
@@ -1263,7 +1541,8 @@ fn definitions() -> Vec<Value> {
         "description": "Number of the plan or proposal, as docs lists it.",
     });
     // No `maximum` anywhere: omp refuses a call above a schema maximum, while
-    // the server clamps every limit and says so in the description.
+    // the server clamps every limit and says so in the description, or
+    // refuses it with the range (`expected_minutes`).
     let wait = |what: &str| {
         json!({
             "type": "integer",
@@ -1274,6 +1553,14 @@ fn definitions() -> Vec<Value> {
             ),
         })
     };
+    let expected_minutes = json!({
+        "type": "integer",
+        "minimum": 1,
+        "description": "How long a job is expected to run, 1 to 1440. Default: the median of \
+                        its last 5 successful runs at its place (at least 1 minute). The answer \
+                        comes early when a running job reaches 1x, 2x, ... of it, so you can \
+                        decide to wait on or ci_cancel; nothing is stopped by it.",
+    });
     vec![
         tool(
             "ci_status",
@@ -1419,7 +1706,9 @@ fn definitions() -> Vec<Value> {
              after a push: a pipeline that does not exist yet is waited for. With neither, it \
              waits for the pipeline of the working directory's HEAD. For a wait longer than a \
              few minutes, run `zeughaus-runner ci wait <repo> <number>` as a background command \
-             instead and keep working.",
+             instead and keep working. When a running job reaches a multiple of its expected \
+             time it answers early, with the job's last lines and what else runs on its \
+             machine; the CI stops a job only at its timeout_minutes.",
             json!({
                 "repo": repo,
                 "number": number,
@@ -1435,6 +1724,7 @@ fn definitions() -> Vec<Value> {
                                     was skipped because a job it needs failed.",
                 },
                 "wait_seconds": wait("How long to wait for it to settle."),
+                "expected_minutes": expected_minutes,
             }),
             &[],
             true,
@@ -1464,7 +1754,10 @@ fn definitions() -> Vec<Value> {
              commit, the changes to it, untracked files that are not ignored) with the sibling \
              checkouts its Cargo path dependencies point to. Only the named jobs run; a need \
              on a job that is not named is dropped, and no secrets are given. Answers as \
-             ci_wait does once the run has settled, or says how to continue with ci_wait.",
+             ci_wait does once the run has settled, or says how to continue with ci_wait. \
+             When a running job reaches a multiple of its expected time it answers early, with \
+             the job's last lines and what else runs on its machine; the CI stops a job only at \
+             its timeout_minutes.",
             json!({
                 "jobs": {
                     "type": "array",
@@ -1483,6 +1776,7 @@ fn definitions() -> Vec<Value> {
                     "How long this call may take in all, snapshot and upload included. A \
                      run that has not settled by then is picked up with ci_wait."
                 ),
+                "expected_minutes": expected_minutes,
             }),
             &["jobs"],
             false,
@@ -2159,6 +2453,113 @@ mod tests {
             .await
             .expect_err("no CI");
         assert!(err.starts_with("no CI configured"), "{err}");
+    }
+
+    fn running(name: &str, started: u64, expected: Option<u64>) -> JobView {
+        JobView {
+            started: Some(started),
+            finished: None,
+            expected_secs: expected,
+            ..job(name, "running", "atik", "")
+        }
+    }
+
+    fn late(job: &str, elapsed: u64, expected: u64) -> Lateness {
+        Lateness {
+            job: job.to_owned(),
+            place: "atik".to_owned(),
+            elapsed,
+            expected,
+            given: false,
+        }
+    }
+
+    fn names(late: &[Lateness]) -> Vec<&str> {
+        late.iter().map(|late| late.job.as_str()).collect()
+    }
+
+    #[test]
+    fn a_job_is_late_at_each_multiple_above_the_one_the_wait_began_at() {
+        let baseline = HashMap::from([("a".to_owned(), 2)]);
+        let at = |a: u64| crossed(vec![late("a", a, 60), late("b", 61, 60)], &baseline);
+        assert_eq!(names(&at(125)), ["b"]);
+        assert_eq!(names(&at(185)), ["a", "b"]);
+        // Short of 1x nothing is late, with or without a baseline.
+        assert!(crossed(vec![late("c", 59, 60)], &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn a_given_expected_time_wins_over_the_measured_one_and_a_job_narrows_it() {
+        let view = pipeline(
+            "running",
+            None,
+            vec![
+                running("a", 1_000, Some(600)),
+                running("b", 1_000, Some(600)),
+                running("c", 1_000, None),
+                job("d", "succeeded", "atik", ""),
+            ],
+        );
+        let given = lateness(&view, None, Some(30), 1_090);
+        assert_eq!(names(&given), ["a", "b", "c"]);
+        assert!(
+            given
+                .iter()
+                .all(|late| late.expected == 30 && late.given && late.multiple() == 3)
+        );
+        // Without one, a job with no measure is left out.
+        let measured = lateness(&view, None, None, 1_090);
+        assert_eq!(names(&measured), ["a", "b"]);
+        assert!(
+            measured
+                .iter()
+                .all(|late| late.expected == 600 && !late.given)
+        );
+        assert_eq!(names(&lateness(&view, Some("b"), Some(30), 1_090)), ["b"]);
+    }
+
+    #[test]
+    fn a_late_block_names_what_else_its_machine_runs() {
+        let view = pipeline("running", None, vec![running("a", 1_000, Some(60))]);
+        let a = late("a", 125, 60);
+        let machine = |jobs: Vec<MachineJob>| MachineView {
+            name: "atik".to_owned(),
+            kind: "runner".to_owned(),
+            status: "online".to_owned(),
+            jobs,
+            build: 0,
+        };
+        let on = |repo: &str, number: u64, job: &str| MachineJob {
+            repo: repo.to_owned(),
+            channel: "dev".to_owned(),
+            number,
+            job: job.to_owned(),
+        };
+        let busy = [machine(vec![
+            on("demo", 7, "a"),
+            on("weida", 3, "check"),
+            on("demo", 6, "a"),
+        ])];
+        assert_eq!(
+            late_block(&view, &a, Ok(&busy), Ok("one\ntwo\n")),
+            "late: a on atik: running 125 s, 2x its expected 60 s (measured from its last \
+             successful runs)\n  atik: also runs weida#3/check, demo#6/a\n  last lines:\n    \
+             one\n    two\n"
+        );
+        let alone = [machine(vec![on("demo", 7, "a")])];
+        assert!(
+            late_block(&view, &a, Ok(&alone), Ok("")).contains("\n  atik: runs no other job\n")
+        );
+        let elsewhere = [machine(vec![on("demo", 6, "a")])];
+        let text = late_block(&view, &a, Ok(&elsewhere), Err("no answer"));
+        assert!(
+            text.contains("\n  machine: not known (the CI lists no machine for it)\n"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("\n  last lines: not available (no answer)\n"),
+            "{text}"
+        );
     }
 
     /// Tests that touch the filesystem, network, processes or real time: the
