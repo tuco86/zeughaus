@@ -63,8 +63,8 @@ zeughaus-link = { path = "zeughaus-link", version = "0.3.0-dev" }
 # zeughaus depends on instead.
 weida = { git = "https://github.com/tuco86/weida.git", rev = "3a6241e5d8f075c321fc79286853e5442f506aa6", version = "0.1.0-alpha.7" }
 zeughaus-runner = { path = "zeughaus-runner", version = "0.3.0-dev" }
-# The CI service: pipelines from webhooks and cron, scheduled onto the runners
-# that enlist into it.
+# The CI service: pipelines from webhooks and its nightly round, scheduled
+# onto the runners that enlist into it.
 zeughaus-ci = { path = "zeughaus-ci", version = "0.3.0-dev" }
 # Artifact files by content: manifests, the CI's store, the runners' caches.
 zeughaus-blobs = { path = "zeughaus-blobs", version = "0.3.0-dev" }

@@ -3,7 +3,7 @@
 //! deploy jobs all succeeded.
 //!
 //! Computed from the pipeline records, so `ci status` and the scheduler see
-//! the same thing and a restart forgets nothing. Push and cron pipelines of
+//! the same thing and a restart forgets nothing. Push and nightly pipelines of
 //! the branch count; a job that a pipeline skipped or did not select
 //! says nothing about it, so the streak looks past that pipeline. A
 //! cancelled pipeline says nothing about the commit either and is left out
@@ -34,12 +34,12 @@ pub struct Streak {
     pub last_deploy: Option<(u64, Vec<String>)>,
 }
 
-/// Whether `pipeline` ran for `branch` itself: a push to it or a cron
-/// schedule, which runs at its head. A manual run has the default branch as
-/// its ref and is neither: what it ran is a working tree no branch holds.
+/// Whether `pipeline` ran for `branch` itself: a push to it or a nightly,
+/// which runs at its head. A manual run has the default branch as its ref
+/// and is neither: what it ran is a working tree no branch holds.
 pub fn is_branch(pipeline: &Pipeline, branch: &str) -> bool {
     pipeline.event.git_ref == branch
-        && matches!(pipeline.event.kind, EventKind::Push | EventKind::Cron)
+        && matches!(pipeline.event.kind, EventKind::Push | EventKind::Nightly)
 }
 
 /// The streak of `branch` over `pipelines`, the records of one repository
@@ -186,6 +186,7 @@ mod tests {
             artifacts: false,
             excerpt: None,
             expected_secs: None,
+            shared_with: None,
         }
     }
 
@@ -208,7 +209,6 @@ mod tests {
                 kind: EventKind::Push,
                 git_ref: git_ref.to_owned(),
                 sha: None,
-                cron: None,
                 actor: "test".to_owned(),
                 delivery: None,
                 upload: None,

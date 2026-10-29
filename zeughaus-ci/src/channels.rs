@@ -78,7 +78,7 @@ impl Channels {
             let patterns = def
                 .on
                 .iter()
-                .map(|p| Pattern::parse_grant(p))
+                .map(|p| Pattern::parse(p))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| fail(format!("channel `{}`: {e}", def.name)))?;
             channels.push(Entry {
@@ -114,13 +114,13 @@ impl Channels {
     }
 }
 
-/// push `<branch>` -> `<branch>`, tag -> `tags`, cron -> `cron`, manual run
-/// -> its ref, which is the repository's default branch.
+/// push `<branch>` -> `<branch>`, tag -> `tags`, nightly -> `nightly`,
+/// manual run -> its ref, which is the repository's default branch.
 pub fn fallback(event: &CiEvent) -> String {
     match event.kind {
         EventKind::Push | EventKind::Manual => event.git_ref.clone(),
         EventKind::Tag => "tags".to_owned(),
-        EventKind::Cron => "cron".to_owned(),
+        EventKind::Nightly => "nightly".to_owned(),
     }
 }
 
@@ -128,13 +128,12 @@ pub fn fallback(event: &CiEvent) -> String {
 mod tests {
     use super::*;
 
-    fn event(kind: EventKind, git_ref: &str, cron: Option<&str>) -> CiEvent {
+    fn event(kind: EventKind, git_ref: &str) -> CiEvent {
         CiEvent {
             repo: "r".to_owned(),
             kind,
             git_ref: git_ref.to_owned(),
             sha: None,
-            cron: cron.map(str::to_owned),
             actor: "test".to_owned(),
             delivery: None,
             upload: None,
@@ -152,7 +151,7 @@ name = "release"
 on = ["tag v*"]
 [[channel]]
 name = "nightly"
-on = ["cron *"]
+on = ["nightly"]
 [[channel]]
 name = "dev"
 on = ["push *"]
@@ -161,12 +160,9 @@ on = ["push *"]
     #[test]
     fn first_match_wins_in_file_order() {
         let channels = load(FILE).unwrap();
-        assert_eq!(channels.of(&event(EventKind::Tag, "v1", None)), "release");
-        assert_eq!(channels.of(&event(EventKind::Push, "main", None)), "dev");
-        assert_eq!(
-            channels.of(&event(EventKind::Cron, "main", Some("0 3 * * *"))),
-            "nightly"
-        );
+        assert_eq!(channels.of(&event(EventKind::Tag, "v1")), "release");
+        assert_eq!(channels.of(&event(EventKind::Push, "main")), "dev");
+        assert_eq!(channels.of(&event(EventKind::Nightly, "main")), "nightly");
         // Two channels whose patterns both match: file order decides.
         let ordered = load(
             r#"
@@ -179,7 +175,7 @@ on = ["push main"]
 "#,
         )
         .unwrap();
-        assert_eq!(ordered.of(&event(EventKind::Push, "main", None)), "first");
+        assert_eq!(ordered.of(&event(EventKind::Push, "main")), "first");
     }
 
     #[test]
@@ -193,26 +189,20 @@ on = ["tag v*"]
         )
         .unwrap();
         assert_eq!(
-            channels.of(&event(EventKind::Push, "feature/x", None)),
+            channels.of(&event(EventKind::Push, "feature/x")),
             "feature/x"
         );
-        assert_eq!(
-            channels.of(&event(EventKind::Tag, "nightly-1", None)),
-            "tags"
-        );
-        assert_eq!(
-            channels.of(&event(EventKind::Cron, "main", Some("0 3 * * *"))),
-            "cron"
-        );
-        assert_eq!(channels.of(&event(EventKind::Manual, "main", None)), "main");
+        assert_eq!(channels.of(&event(EventKind::Tag, "nightly-1")), "tags");
+        assert_eq!(channels.of(&event(EventKind::Nightly, "main")), "nightly");
+        assert_eq!(channels.of(&event(EventKind::Manual, "main")), "main");
     }
 
     #[test]
     fn no_file_means_fallback_only() {
         let channels = Channels::from_files(&[("build.sh".to_owned(), String::new())]).unwrap();
         assert_eq!(channels.names().count(), 0);
-        assert_eq!(channels.of(&event(EventKind::Push, "main", None)), "main");
-        assert_eq!(channels.of(&event(EventKind::Tag, "v1", None)), "tags");
+        assert_eq!(channels.of(&event(EventKind::Push, "main")), "main");
+        assert_eq!(channels.of(&event(EventKind::Tag, "v1")), "tags");
     }
 
     #[test]
@@ -221,7 +211,7 @@ on = ["tag v*"]
             r#"
 [[channel]]
 name = "nightly"
-on = ["cron *"]
+on = ["nightly"]
 clean = true
 [[channel]]
 name = "dev"

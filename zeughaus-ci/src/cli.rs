@@ -6,9 +6,9 @@
 //! serve --listen <host:port> [--hook <host:port>]
 //! check [DIR]
 //! plan [DIR] <push|tag> <ref>
-//! plan [DIR] cron "<expr>"
+//! plan [DIR] nightly
 //! run <repo> <push|tag> <ref> [<sha>]
-//! run <repo> cron "<expr>"
+//! run <repo> nightly
 //! status [N]
 //! log <repo> <pipeline> <job> [--tail N]
 //! forge-check <repo>
@@ -44,8 +44,8 @@ use crate::secrets::{self, Secrets};
 use crate::streak;
 
 const USAGE: &str = "usage: zeughaus-ci [--state-dir DIR] serve --listen <host:port> \
-[--hook <host:port>] | check [DIR] | plan [DIR] <push|tag> <ref> | plan [DIR] cron \"<expr>\" | \
-run <repo> <push|tag> <ref> [<sha>] | run <repo> cron \"<expr>\" | status [N] | \
+[--hook <host:port>] | check [DIR] | plan [DIR] <push|tag> <ref> | plan [DIR] nightly | \
+run <repo> <push|tag> <ref> [<sha>] | run <repo> nightly | status [N] | \
 log <repo> <pipeline> <job> [--tail N] | forge-check <repo> | secrets-check | version | \
 update status|rollback | install ci [--channel C] [--from DIR] [--no-service]";
 
@@ -161,11 +161,11 @@ fn ignored_key_warnings(jobs: &[JobDef]) -> Vec<String> {
 /// fallback names an event without a listed channel gets.
 fn check_job_channels(jobs: &[JobDef], channels: &Channels) -> Result<(), String> {
     let known =
-        |c: &str| matches!(c, "tags" | "cron") || channels.names().any(|(name, ..)| name == c);
+        |c: &str| matches!(c, "tags" | "nightly") || channels.names().any(|(name, ..)| name == c);
     for job in jobs {
         if let Some(c) = job.channels.iter().find(|c| !known(c)) {
             return Err(format!(
-                "{CI_DIR}/{}: channel `{c}` is not in {CHANNELS_FILE} and is no fallback name (tags, cron)",
+                "{CI_DIR}/{}: channel `{c}` is not in {CHANNELS_FILE} and is no fallback name (tags, nightly)",
                 job.file
             ));
         }
@@ -234,25 +234,19 @@ fn check(state_dir: &Path, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Parses `<push|tag> <ref>` or `cron "<expr>"` into an event of `repo`.
+/// Parses `<push|tag> <ref>` or `nightly` into an event of `repo`.
 fn parse_event(
     repo: &str,
     kind: &str,
     rest: &[String],
     default_branch: &str,
 ) -> Result<CiEvent, String> {
-    let (kind, git_ref, sha, cron) = match (kind, rest) {
-        ("push", [git_ref]) => (EventKind::Push, git_ref.clone(), None, None),
-        ("push", [git_ref, sha]) => (EventKind::Push, git_ref.clone(), Some(sha.clone()), None),
-        ("tag", [git_ref]) => (EventKind::Tag, git_ref.clone(), None, None),
-        ("tag", [git_ref, sha]) => (EventKind::Tag, git_ref.clone(), Some(sha.clone()), None),
-        ("cron", [expr]) => {
-            let pattern = Pattern::parse(&format!("cron {expr}"))?;
-            let Pattern::Cron(expr) = pattern else {
-                return Err(format!("{expr:?} is not a cron expression"));
-            };
-            (EventKind::Cron, default_branch.to_owned(), None, Some(expr))
-        }
+    let (kind, git_ref, sha) = match (kind, rest) {
+        ("push", [git_ref]) => (EventKind::Push, git_ref.clone(), None),
+        ("push", [git_ref, sha]) => (EventKind::Push, git_ref.clone(), Some(sha.clone())),
+        ("tag", [git_ref]) => (EventKind::Tag, git_ref.clone(), None),
+        ("tag", [git_ref, sha]) => (EventKind::Tag, git_ref.clone(), Some(sha.clone())),
+        ("nightly", []) => (EventKind::Nightly, default_branch.to_owned(), None),
         ("manual", _) => return Err("manual events come from the /manual service".to_owned()),
         _ => return Err(USAGE.to_owned()),
     };
@@ -261,7 +255,6 @@ fn parse_event(
         kind,
         git_ref,
         sha,
-        cron,
         actor: "manual".to_owned(),
         delivery: None,
         upload: None,
@@ -270,7 +263,7 @@ fn parse_event(
 }
 
 fn plan(args: &[String]) -> Result<(), String> {
-    let starts_event = |arg: &String| matches!(arg.as_str(), "push" | "tag" | "cron");
+    let starts_event = |arg: &String| matches!(arg.as_str(), "push" | "tag" | "nightly");
     let (dir, rest) = match args.first() {
         Some(first) if !starts_event(first) => (first.as_str(), &args[1..]),
         _ => (CI_DIR, args),
@@ -278,7 +271,8 @@ fn plan(args: &[String]) -> Result<(), String> {
     let [kind, rest @ ..] = rest else {
         return Err(USAGE.to_owned());
     };
-    if rest.len() != 1 {
+    let operands = if kind == "nightly" { 0 } else { 1 };
+    if rest.len() != operands {
         return Err(USAGE.to_owned());
     }
     let event = parse_event("", kind, rest, "main")?;
@@ -475,10 +469,10 @@ mod tests {
     fn a_job_may_name_listed_channels_and_the_fallback_names_only() {
         let channels = Channels::from_files(&[(
             CHANNELS_FILE.to_owned(),
-            "[[channel]]\nname = \"nightly\"\non = [\"cron *\"]\n".to_owned(),
+            "[[channel]]\nname = \"dev\"\non = [\"push main\"]\n".to_owned(),
         )])
         .unwrap();
-        let ok = job_in("\"nightly\", \"tags\", \"cron\"");
+        let ok = job_in("\"dev\", \"tags\", \"nightly\"");
         assert!(check_job_channels(&[ok], &channels).is_ok());
         let err = check_job_channels(&[job_in("\"nightlyy\"")], &channels).unwrap_err();
         assert!(
@@ -486,6 +480,7 @@ mod tests {
             "{err}"
         );
         assert!(check_job_channels(&[job_in("\"manual\"")], &channels).is_err());
+        assert!(check_job_channels(&[job_in("\"cron\"")], &channels).is_err());
     }
 
     #[test]

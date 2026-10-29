@@ -3,7 +3,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::str::FromStr;
 
 use crate::CI_DIR;
 use crate::event::{CiEvent, EventKind};
@@ -13,15 +12,8 @@ use crate::header::{JobDef, parse_job};
 pub enum Pattern {
     Push(String),
     Tag(String),
-    /// A normalized five-field cron expression.
-    Cron(String),
-    /// `cron *`: any cron event. Only valid in grants.
-    AnyCron,
-}
-
-/// Whitespace collapsed to single spaces, so equal schedules compare equal.
-pub fn normalize_cron(expr: &str) -> String {
-    expr.split_whitespace().collect::<Vec<_>>().join(" ")
+    /// `nightly`: the repository's nightly, which the CI's nightly round queues.
+    Nightly,
 }
 
 /// `*` matches any sequence including empty and `/`; everything else is
@@ -52,17 +44,16 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 
 impl Pattern {
     pub fn parse(text: &str) -> Result<Pattern, String> {
-        match Self::parse_grant(text)? {
-            Pattern::AnyCron => Err("`cron *` is only valid in grants".into()),
-            other => Ok(other),
-        }
-    }
-
-    pub fn parse_grant(text: &str) -> Result<Pattern, String> {
         let text = text.trim();
+        if text == "nightly" {
+            return Ok(Pattern::Nightly);
+        }
         let (kind, rest) = text
             .split_once(char::is_whitespace)
             .ok_or_else(|| format!("pattern `{text}` needs a kind and an argument"))?;
+        if kind == "nightly" {
+            return Err("`nightly` takes no argument".into());
+        }
         let rest = rest.trim();
         if rest.is_empty() {
             return Err(format!("pattern `{text}` needs an argument"));
@@ -70,19 +61,8 @@ impl Pattern {
         match kind {
             "push" => Ok(Pattern::Push(single_glob(kind, rest)?)),
             "tag" => Ok(Pattern::Tag(single_glob(kind, rest)?)),
-            "cron" => {
-                if rest == "*" {
-                    return Ok(Pattern::AnyCron);
-                }
-                let expr = normalize_cron(rest);
-                if expr.split(' ').count() != 5 {
-                    return Err(format!("cron `{expr}` needs exactly 5 fields"));
-                }
-                croner::Cron::from_str(&expr).map_err(|e| format!("cron `{expr}`: {e}"))?;
-                Ok(Pattern::Cron(expr))
-            }
             other => Err(format!(
-                "unknown pattern kind `{other}` (push, tag or cron)"
+                "unknown pattern kind `{other}` (push, tag or nightly)"
             )),
         }
     }
@@ -93,11 +73,7 @@ impl Pattern {
                 event.kind == EventKind::Push && glob_match(glob, &event.git_ref)
             }
             Pattern::Tag(glob) => event.kind == EventKind::Tag && glob_match(glob, &event.git_ref),
-            Pattern::Cron(expr) => {
-                event.kind == EventKind::Cron
-                    && event.cron.as_deref().map(normalize_cron).as_deref() == Some(expr.as_str())
-            }
-            Pattern::AnyCron => event.kind == EventKind::Cron,
+            Pattern::Nightly => event.kind == EventKind::Nightly,
         }
     }
 }
@@ -107,8 +83,7 @@ impl fmt::Display for Pattern {
         match self {
             Pattern::Push(glob) => write!(f, "push {glob}"),
             Pattern::Tag(glob) => write!(f, "tag {glob}"),
-            Pattern::Cron(expr) => write!(f, "cron {expr}"),
-            Pattern::AnyCron => f.write_str("cron *"),
+            Pattern::Nightly => f.write_str("nightly"),
         }
     }
 }
@@ -271,30 +246,16 @@ pub fn select(jobs: &[JobDef], event: &CiEvent, channel: &str) -> Vec<String> {
         .collect()
 }
 
-/// Distinct normalized cron expressions of all `on` patterns, sorted.
-pub fn cron_schedules(jobs: &[JobDef]) -> Vec<String> {
-    let set: BTreeSet<String> = jobs
-        .iter()
-        .flat_map(|j| j.on.iter())
-        .filter_map(|p| match Pattern::parse(p) {
-            Ok(Pattern::Cron(expr)) => Some(expr),
-            _ => None,
-        })
-        .collect();
-    set.into_iter().collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn ev(kind: EventKind, git_ref: &str, cron: Option<&str>) -> CiEvent {
+    fn ev(kind: EventKind, git_ref: &str) -> CiEvent {
         CiEvent {
             repo: "r".into(),
             kind,
             git_ref: git_ref.into(),
             sha: None,
-            cron: cron.map(Into::into),
             actor: "t".into(),
             delivery: None,
             upload: None,
@@ -329,36 +290,30 @@ mod tests {
     #[test]
     fn push_and_tag_patterns() {
         let push = Pattern::parse("push main").unwrap();
-        assert!(push.matches(&ev(EventKind::Push, "main", None)));
-        assert!(!push.matches(&ev(EventKind::Push, "dev", None)));
-        assert!(!push.matches(&ev(EventKind::Tag, "main", None)));
+        assert!(push.matches(&ev(EventKind::Push, "main")));
+        assert!(!push.matches(&ev(EventKind::Push, "dev")));
+        assert!(!push.matches(&ev(EventKind::Tag, "main")));
         let tag = Pattern::parse("tag v*").unwrap();
-        assert!(tag.matches(&ev(EventKind::Tag, "v1.0", None)));
-        assert!(!tag.matches(&ev(EventKind::Push, "v1.0", None)));
-    }
-
-    #[test]
-    fn cron_patterns_normalize() {
-        let p = Pattern::parse("cron  0   4 * * *").unwrap();
-        assert_eq!(p, Pattern::Cron("0 4 * * *".into()));
-        assert!(p.matches(&ev(EventKind::Cron, "main", Some("0 4  * * *"))));
-        assert!(!p.matches(&ev(EventKind::Cron, "main", Some("0 5 * * *"))));
-        assert!(!p.matches(&ev(EventKind::Push, "main", None)));
-        assert!(Pattern::parse("cron 0 4 * *").is_err());
-        assert!(Pattern::parse("cron 99 4 * * *").is_err());
-        assert!(Pattern::parse("cron *").is_err());
+        assert!(tag.matches(&ev(EventKind::Tag, "v1.0")));
+        assert!(!tag.matches(&ev(EventKind::Push, "v1.0")));
         assert!(Pattern::parse("nonsense x").is_err());
         assert!(Pattern::parse("push").is_err());
     }
 
     #[test]
-    fn grant_patterns() {
-        let any = Pattern::parse_grant("cron *").unwrap();
-        assert_eq!(any, Pattern::AnyCron);
-        assert!(any.matches(&ev(EventKind::Cron, "main", Some("0 4 * * *"))));
-        assert!(!any.matches(&ev(EventKind::Push, "main", None)));
-        let tag = Pattern::parse_grant("tag v*").unwrap();
-        assert!(tag.matches(&ev(EventKind::Tag, "v2", None)));
+    fn the_nightly_pattern_takes_no_argument_and_cron_is_gone() {
+        let nightly = Pattern::parse(" nightly ").unwrap();
+        assert_eq!(nightly, Pattern::Nightly);
+        assert!(nightly.matches(&ev(EventKind::Nightly, "main")));
+        assert!(!nightly.matches(&ev(EventKind::Push, "main")));
+        assert_eq!(
+            Pattern::parse("nightly x").unwrap_err(),
+            "`nightly` takes no argument"
+        );
+        assert_eq!(
+            Pattern::parse("cron 0 3 * * *").unwrap_err(),
+            "unknown pattern kind `cron` (push, tag or nightly)"
+        );
     }
 
     #[test]
@@ -433,7 +388,7 @@ mod tests {
                 "no .zeughaus-ci/nope.Containerfile",
             ),
             (vec![file("a.sh", "on = [\"cron 1 2 3\"]")], "on:"),
-            (vec![file("a.sh", "on = [\"cron *\"]")], "on:"),
+            (vec![file("a.sh", "on = [\"nightly 0 3\"]")], "on:"),
             (
                 vec![
                     file("a.sh", on),
@@ -452,15 +407,18 @@ mod tests {
     #[test]
     fn a_needs_job_with_channels_runs_only_in_those() {
         let jobs = load(&[
-            file("box.sh", "on = [\"push main\", \"cron 0 4 * * *\"]"),
+            file("box.sh", "on = [\"push main\", \"nightly\"]"),
             file("after.sh", "needs = [\"box\"]\nchannels = [\"nightly\"]"),
             file("always.sh", "needs = [\"box\"]"),
         ])
         .unwrap();
-        let push = ev(EventKind::Push, "main", None);
-        let cron = ev(EventKind::Cron, "main", Some("0 4 * * *"));
+        let push = ev(EventKind::Push, "main");
+        let nightly = ev(EventKind::Nightly, "main");
         assert_eq!(select(&jobs, &push, "dev"), ["box", "always"]);
-        assert_eq!(select(&jobs, &cron, "nightly"), ["box", "after", "always"]);
+        assert_eq!(
+            select(&jobs, &nightly, "nightly"),
+            ["box", "after", "always"]
+        );
     }
 
     #[test]
@@ -483,7 +441,7 @@ mod tests {
             file("only-tag.sh", "on = [\"tag v*\"]"),
             file("after.sh", "needs = [\"hello\", \"box\"]"),
             file("pub.sh", "needs = [\"after\", \"only-tag\"]"),
-            file("nightly.sh", "on = [\"cron 0 4 * * *\"]"),
+            file("nightly.sh", "on = [\"nightly\"]"),
         ])
         .unwrap()
     }
@@ -492,11 +450,11 @@ mod tests {
     fn select_follows_needs() {
         let jobs = sample();
         assert_eq!(
-            select(&jobs, &ev(EventKind::Push, "main", None), "dev"),
+            select(&jobs, &ev(EventKind::Push, "main"), "dev"),
             ["box", "hello", "after"]
         );
         assert_eq!(
-            select(&jobs, &ev(EventKind::Tag, "v1", None), "tags"),
+            select(&jobs, &ev(EventKind::Tag, "v1"), "tags"),
             ["box", "only-tag"]
         );
     }
@@ -505,33 +463,20 @@ mod tests {
     fn job_is_excluded_when_one_need_is_not_selected() {
         let jobs = sample();
         // `after` needs hello, which a tag does not select.
-        let tag = select(&jobs, &ev(EventKind::Tag, "v1", None), "tags");
+        let tag = select(&jobs, &ev(EventKind::Tag, "v1"), "tags");
         assert!(tag.contains(&"box".to_string()));
         assert!(!tag.contains(&"hello".to_string()));
         assert!(!tag.contains(&"after".to_string()));
         assert!(!tag.contains(&"pub".to_string()));
-        assert!(select(&jobs, &ev(EventKind::Push, "dev", None), "dev").is_empty());
+        assert!(select(&jobs, &ev(EventKind::Push, "dev"), "dev").is_empty());
     }
 
     #[test]
-    fn select_cron_and_schedules() {
+    fn a_nightly_selects_the_nightly_jobs() {
         let jobs = sample();
         assert_eq!(
-            select(
-                &jobs,
-                &ev(EventKind::Cron, "main", Some("0  4 * * *")),
-                "cron"
-            ),
+            select(&jobs, &ev(EventKind::Nightly, "main"), "nightly"),
             ["nightly"]
         );
-        assert!(
-            select(
-                &jobs,
-                &ev(EventKind::Cron, "main", Some("0 5 * * *")),
-                "cron"
-            )
-            .is_empty()
-        );
-        assert_eq!(cron_schedules(&jobs), ["0 4 * * *"]);
     }
 }

@@ -35,7 +35,7 @@ dependencies included, in the same warm workspace the pipeline uses at that job'
 build is incremental; it is the way to build, test or debug on another platform. ci_wait waits \
 for a pipeline or one job, also for the pipeline a push is about to start; ci_status, \
 ci_pipelines, ci_pipeline and ci_log show the CI's state and output; ci_timing says where the \
-time went; ci_run queues the default branch's push or cron pipeline now, ci_rerun a pipeline \
+time went; ci_run queues the default branch's push or nightly pipeline now, ci_rerun a pipeline \
 again. ci_repo says which repository of the CI the current checkout is, its jobs and where \
 each runs, and whether HEAD and the default branch are green; in such a checkout `repo` can be \
 omitted. Plans and proposals of a repository live in the CI too: docs lists them, doc_read reads \
@@ -263,25 +263,19 @@ impl Toolbox {
         )
     }
 
-    /// `ci_run`: queues a push or cron event of the default branch.
+    /// `ci_run`: queues a push or nightly event of the default branch.
     async fn ci_run(&self, args: RunArgs) -> Result<String, String> {
-        let cron = match (args.event.as_str(), args.cron) {
-            ("push", None) => None,
-            ("push", Some(_)) => return Err("cron goes with event cron only".to_owned()),
-            ("cron", Some(cron)) => Some(cron),
-            ("cron", None) => {
-                return Err(
-                    "event cron needs the schedule in cron, for example 0 3 * * *".to_owned(),
-                );
-            }
-            _ => return Err("event is push or cron".to_owned()),
+        let nightly = match args.event.as_str() {
+            "push" => false,
+            "nightly" => true,
+            _ => return Err("event is push or nightly".to_owned()),
         };
         let repo = self.repo_or_checkout(args.repo).await?;
         let above = self.newest(&repo).await?;
         let actor = snapshot::actor();
         let request = CiRequest::Queue {
             repo: repo.clone(),
-            cron,
+            nightly,
             actor: actor.clone(),
         };
         accepted(self.client.ci(request).await?)?;
@@ -295,7 +289,8 @@ impl Toolbox {
             ),
             None => format!(
                 "accepted: the {event} event has no number yet: it waits behind a running \
-                 pipeline of the same ref, or no job's on selects it; ci_status lists the queue\n"
+                 pipeline of the same ref or a running nightly, or no job's on selects it; \
+                 ci_status lists the queue\n"
             ),
         })
     }
@@ -954,7 +949,6 @@ struct PipelineArgs {
 struct RunArgs {
     repo: Option<String>,
     event: String,
-    cron: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1085,10 +1079,13 @@ fn status_text(overview: &CiOverview, now: u64) -> String {
     section(
         &mut text,
         "channels",
-        overview
-            .channels
-            .iter()
-            .map(|c| format!("{}/{} #{} {}", c.repo, c.channel, c.latest, c.status)),
+        overview.channels.iter().map(|c| {
+            let mut line = format!("{}/{} #{} {}", c.repo, c.channel, c.latest, c.status);
+            if let Some(load) = &c.load {
+                line.push_str(&format!(": {load}"));
+            }
+            line
+        }),
     );
     section(
         &mut text,
@@ -1190,9 +1187,15 @@ pub(super) fn pipeline_text(pipeline: &PipelineView) -> String {
     if !pipeline.note.is_empty() {
         text.push_str(&format!("note: {}\n", one_line(&pipeline.note)));
     }
+    if let Some(load) = zeughaus_link::pipeline_load(pipeline) {
+        text.push_str(&format!("load: {load}\n"));
+    }
     for job in &pipeline.jobs {
         text.push_str(&job_line(job));
         text.push('\n');
+        if let Some(shared) = job.shared_with.as_ref().filter(|s| !s.is_empty()) {
+            text.push_str(&format!("    shared with: {}\n", shared.join(", ")));
+        }
         if let Some(cause) = &job.cause {
             text.push_str(&format!("    cause: {}\n", one_line(cause)));
         }
@@ -1352,11 +1355,11 @@ fn late_advice(view: &PipelineView, job: Option<&str>, given_minutes: Option<u64
     )
 }
 
-/// `  <name> <status> <place> <note>`
+/// `  <name> <status> <place> <note> (<load>)`
 fn job_line(job: &JobView) -> String {
     let note = one_line(&job.note);
     let parts = [job.name.as_str(), &job.status, &job.place, &note];
-    format!(
+    let mut line = format!(
         "  {}",
         parts
             .iter()
@@ -1364,7 +1367,11 @@ fn job_line(job: &JobView) -> String {
             .copied()
             .collect::<Vec<_>>()
             .join(" ")
-    )
+    );
+    if let Some(load) = job.load_text() {
+        line.push_str(&format!(" ({load})"));
+    }
+    line
 }
 
 /// `ci_log`: the lines, and a note when the job may still add to them.
@@ -1839,7 +1846,7 @@ fn definitions() -> Vec<Value> {
         tool(
             "ci_run",
             "Queue a pipeline for the repository's default branch at its current head, as a \
-             push to it or one of its cron schedules would start it: the way to run the \
+             push to it or the CI's nightly round would start it: the way to run the \
              nightly now, or the push pipeline again on the newest commit. Tags (releases) are \
              not queued here. Answers with the new pipeline's number once the CI has numbered \
              it.",
@@ -1847,14 +1854,10 @@ fn definitions() -> Vec<Value> {
                 "repo": repo,
                 "event": {
                     "type": "string",
-                    "enum": ["push", "cron"],
-                    "description": "push: as a push to the default branch; cron: as the \
-                                    schedule in cron.",
-                },
-                "cron": {
-                    "type": "string",
-                    "description": "With event cron: the schedule as ci_repo shows it in a \
-                                    job's `on`, for example `0 3 * * *`.",
+                    "enum": ["push", "nightly"],
+                    "description": "push: as a push to the default branch; nightly: the \
+                                    repository's nightly, which the CI runs one after another \
+                                    with the other repositories' nightlies.",
                 },
             }),
             &["event"],
@@ -1907,6 +1910,7 @@ mod tests {
             assigned: None,
             transfers: Vec::new(),
             expected_secs: None,
+            shared_with: None,
         }
     }
 
@@ -2020,7 +2024,10 @@ mod tests {
         }
         let run = schema(&definitions, "ci_run");
         assert_eq!(run["required"], json!(["event"]));
-        assert_eq!(run["properties"]["event"]["enum"], json!(["push", "cron"]));
+        assert_eq!(
+            run["properties"]["event"]["enum"],
+            json!(["push", "nightly"])
+        );
         assert_eq!(schema(&definitions, "ci_wait").get("required"), None);
         let repo_tool = schema(&definitions, "ci_repo");
         assert_eq!(repo_tool["properties"]["path"]["type"], "string");
@@ -2036,12 +2043,14 @@ mod tests {
                     channel: "dev".to_owned(),
                     latest: 123,
                     status: "succeeded".to_owned(),
+                    load: None,
                 },
                 ChannelView {
                     repo: "zeughaus".to_owned(),
                     channel: "nightly".to_owned(),
                     latest: 9,
-                    status: "running".to_owned(),
+                    status: "succeeded".to_owned(),
+                    load: Some("check 3.4x expected, runner not shared".to_owned()),
                 },
             ],
             machines: vec![
@@ -2083,7 +2092,8 @@ mod tests {
         };
         assert_eq!(
             status_text(&overview, 1_000),
-            "ci build 116\nchannels\n  zeughaus/dev #123 succeeded\n  zeughaus/nightly #9 running\n\
+            "ci build 116\nchannels\n  zeughaus/dev #123 succeeded\n  \
+             zeughaus/nightly #9 succeeded: check 3.4x expected, runner not shared\n\
              machines\n  tuco-pc runner free build 116 [zeughaus#9/build]\n  win11 windows-vm off\n\
              queued\n  zeughaus/dev push main abcdef0 (rerun of #6) 100 s ago\n\
              platforms\n  linux-amd64 -> tuco-pc\n  windows-amd64 -> wohnzimmer\n"
@@ -2395,32 +2405,6 @@ mod tests {
         assert!(err.contains("unknown field `repo`"), "{err}");
     }
 
-    /// A ci_run that cannot be meant is refused before the CI is asked.
-    #[tokio::test]
-    async fn a_run_names_push_or_cron_with_its_schedule() {
-        let tools = toolbox_without_a_ci();
-        for (arguments, refusal) in [
-            (
-                json!({ "event": "push", "cron": "0 3 * * *" }),
-                "cron goes with event cron only",
-            ),
-            (
-                json!({ "event": "cron" }),
-                "event cron needs the schedule in cron, for example 0 3 * * *",
-            ),
-            (json!({ "event": "tag" }), "event is push or cron"),
-        ] {
-            assert_eq!(
-                tools
-                    .call("ci_run", arguments.clone())
-                    .await
-                    .expect_err("refused"),
-                refusal,
-                "{arguments}"
-            );
-        }
-    }
-
     #[test]
     fn a_wait_is_bounded_by_what_the_clients_call_allows() {
         assert_eq!(wait_for(None), Duration::from_secs(540));
@@ -2683,6 +2667,7 @@ mod tests {
                     channel: "dev".to_owned(),
                     latest: 5,
                     status: "succeeded".to_owned(),
+                    load: None,
                 }],
                 head: sha.map(|_| Box::new(head)),
                 jobs_sha: sha.filter(|_| jobs).map(str::to_owned),
@@ -3403,22 +3388,19 @@ mod tests {
             let ci = fake_ci("queue", 0, None).await;
             let tools = toolbox_for(&ci).numbering_for(Duration::from_millis(100));
             let text = tools
-                .call(
-                    "ci_run",
-                    json!({ "repo": "demo", "event": "cron", "cron": "0 3 * * *" }),
-                )
+                .call("ci_run", json!({ "repo": "demo", "event": "nightly" }))
                 .await
                 .expect("accepted");
             assert!(
-                text.starts_with("accepted: the cron event has no number yet: "),
+                text.starts_with("accepted: the nightly event has no number yet: "),
                 "{text}"
             );
             let asked = ci.seen.asked.lock().unwrap().clone();
             assert!(
                 asked.iter().any(|request| matches!(
                     request,
-                    CiRequest::Queue { repo, cron: Some(cron), actor }
-                        if repo == "demo" && cron == "0 3 * * *" && actor.contains('@')
+                    CiRequest::Queue { repo, nightly: true, actor }
+                        if repo == "demo" && actor.contains('@')
                 )),
                 "{asked:?}"
             );

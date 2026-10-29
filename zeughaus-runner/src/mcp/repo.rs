@@ -338,6 +338,7 @@ mod tests {
             assigned: None,
             transfers: Vec::new(),
             expected_secs: None,
+            shared_with: None,
         }
     }
 
@@ -377,6 +378,7 @@ mod tests {
             channel: channel.to_owned(),
             latest,
             status: "succeeded".to_owned(),
+            load: None,
         };
         let mut publish = job_def(
             "publish",

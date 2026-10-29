@@ -120,7 +120,11 @@ impl CiServer {
             }
             CiRequest::Find { repo, sha } => self.find(&repo, &sha),
             CiRequest::Rerun { repo, number } => self.rerun(&repo, number),
-            CiRequest::Queue { repo, cron, actor } => self.queue(&repo, cron.as_deref(), &actor),
+            CiRequest::Queue {
+                repo,
+                nightly,
+                actor,
+            } => self.queue(&repo, nightly, &actor),
             CiRequest::Cancel { repo, number } => self.cancel(&repo, number),
             CiRequest::Log {
                 repo,
@@ -357,11 +361,11 @@ impl CiServer {
         }
     }
 
-    /// Queues a push or cron event of `repo`'s default branch, the way a
-    /// push to it or its schedule would. No sha: the scheduler takes the
-    /// branch's head. Only the default branch and no tag, because a tag is
-    /// a release.
-    fn queue(&self, repo: &str, cron: Option<&str>, actor: &str) -> CiReply {
+    /// Queues a push or nightly event of `repo`'s default branch, the way a
+    /// push to it or the nightly round would. No sha: the scheduler takes
+    /// the branch's head. Only the default branch and no tag, because a tag
+    /// is a release.
+    fn queue(&self, repo: &str, nightly: bool, actor: &str) -> CiReply {
         let Some(config) = self.config.repos.get(repo) else {
             return error("no such repository");
         };
@@ -372,21 +376,16 @@ impl CiServer {
         if !valid_actor {
             return error("an actor is 1 to 64 letters, digits, '.', '_', '@' or '-'");
         }
-        let (kind, cron) = match cron {
-            None => (EventKind::Push, None),
-            Some(expr) => match crate::pipeline::Pattern::parse(&format!("cron {expr}")) {
-                Ok(crate::pipeline::Pattern::Cron(normalized)) => {
-                    (EventKind::Cron, Some(normalized))
-                }
-                _ => return error(&format!("{expr:?} is not a cron expression")),
-            },
+        let kind = if nightly {
+            EventKind::Nightly
+        } else {
+            EventKind::Push
         };
         let event = event::CiEvent {
             repo: repo.to_owned(),
             kind,
             git_ref: config.default_branch.clone(),
             sha: None,
-            cron,
             actor: actor.to_owned(),
             delivery: None,
             upload: None,
@@ -1043,6 +1042,7 @@ fn job_view(job: &JobRecord) -> JobView {
             })
             .collect(),
         expected_secs: job.expected_secs,
+        shared_with: job.shared_with.clone(),
     }
 }
 
@@ -1076,12 +1076,13 @@ fn channel_views(pipelines: &[Pipeline]) -> Vec<ChannelView> {
             channel,
             latest: pipeline.number,
             status: pipeline.status.as_str().to_owned(),
+            load: zeughaus_link::pipeline_load(&pipeline_view(pipeline)),
         })
         .collect()
 }
 
 /// The queued events, each in the channel of the newest pipeline that had
-/// its queue key (the same repository, kind, ref and cron), else in the
+/// its queue key (the same repository, kind and ref), else in the
 /// channel its event names without a `channels.toml`.
 fn queued_views(pipelines: &[Pipeline], queued: &[event::CiEvent]) -> Vec<QueuedView> {
     queued
@@ -1268,6 +1269,7 @@ mod tests {
             artifacts: false,
             excerpt: None,
             expected_secs: None,
+            shared_with: None,
         }
     }
 
@@ -1287,7 +1289,6 @@ mod tests {
                 kind: EventKind::Push,
                 git_ref: "main".to_owned(),
                 sha: None,
-                cron: None,
                 actor: "test".to_owned(),
                 delivery: None,
                 upload: None,
@@ -1813,6 +1814,7 @@ mod tests {
                 channel: channel.to_owned(),
                 latest,
                 status: status.to_owned(),
+                load: None,
             };
             assert_eq!(
                 seen.platforms,
@@ -2142,6 +2144,7 @@ mod tests {
                 channel: channel.to_owned(),
                 latest,
                 status: "succeeded".to_owned(),
+                load: None,
             };
             assert_eq!(
                 view_of(&server, None, false).channels,
@@ -2567,8 +2570,8 @@ mod tests {
             assert_eq!(queued.actor, "rerun of #4");
             assert_eq!(queued.delivery, None);
             assert_eq!(
-                (queued.kind, queued.git_ref.as_str(), queued.cron.as_ref()),
-                (record.event.kind, "main", None)
+                (queued.kind, queued.git_ref.as_str()),
+                (record.event.kind, "main")
             );
 
             let unknown = |repo: &str, number| {
@@ -2631,43 +2634,35 @@ mod tests {
         }
 
         #[test]
-        fn a_queued_cron_is_an_event_of_the_default_branch_by_its_actor() {
+        fn a_queued_nightly_is_an_event_of_the_default_branch_by_its_actor() {
             let state = scratch("queue");
             let server = server_with(&state, &repos());
-            let queue = |repo: &str, cron: Option<&str>, actor: &str| {
+            let queue = |repo: &str, nightly: bool, actor: &str| {
                 server.answer(CiRequest::Queue {
                     repo: repo.to_owned(),
-                    cron: cron.map(str::to_owned),
+                    nightly,
                     actor: actor.to_owned(),
                 })
             };
-            assert_eq!(queue("nowhere", None, "a@b"), error("no such repository"));
+            assert_eq!(queue("nowhere", false, "a@b"), error("no such repository"));
             assert_eq!(
-                queue("plain", None, "a b"),
+                queue("plain", false, "a b"),
                 error("an actor is 1 to 64 letters, digits, '.', '_', '@' or '-'")
             );
             assert_eq!(
-                queue("plain", None, ""),
+                queue("plain", true, ""),
                 error("an actor is 1 to 64 letters, digits, '.', '_', '@' or '-'")
-            );
-            assert_eq!(
-                queue("plain", Some("tomorrow"), "a@b"),
-                error("\"tomorrow\" is not a cron expression")
             );
             event::drain_inbox(&state);
             assert!(event::queued(&state).is_empty());
 
-            assert_eq!(
-                queue("plain", Some("0  3 * * *"), "hannes@tuco-pc"),
-                CiReply::Accepted
-            );
+            assert_eq!(queue("plain", true, "hannes@tuco-pc"), CiReply::Accepted);
             event::drain_inbox(&state);
             let queued = event::queued(&state);
             assert_eq!(queued.len(), 1);
             let event = &queued[0].1;
-            assert_eq!(event.kind, EventKind::Cron);
+            assert_eq!(event.kind, EventKind::Nightly);
             assert_eq!(event.git_ref, "trunk");
-            assert_eq!(event.cron.as_deref(), Some("0 3 * * *"));
             assert_eq!(event.sha, None);
             assert_eq!(event.actor, "hannes@tuco-pc");
             let _ = std::fs::remove_dir_all(&state);

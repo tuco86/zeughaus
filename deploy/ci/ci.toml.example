@@ -3,6 +3,12 @@
 
 default_runner = "tuco-pc"         # runs every job that names no `machine`
 
+# The nightly round: at this local time the CI queues every repository's
+# nightly (jobs with `on = ["nightly"]`) and runs them one after the other,
+# in repository name order. Without it nothing runs nightly by itself.
+[nightly]
+at = "03:00"
+
 # Runners that may enlist: pinned by the fingerprint printed in their
 # `<state-dir>/endpoint` (weida://sha256:<fp>@host:port/). A runner that is not
 # listed here is refused.
@@ -55,7 +61,7 @@ status_token = "GRIASDI_GITHUB_TOKEN"
 webhook_secret = "GRIASDI_WEBHOOK_SECRET"
 
 [repos.griasdi.grants]             # secret -> event patterns it is released to
-GRIASDI_GITHUB_TOKEN = ["tag v*", "cron *"]
+GRIASDI_GITHUB_TOKEN = ["tag v*", "nightly"]
 
 # zeughaus itself, on Forgejo. The bot user `zeughaus-ci` is a collaborator
 # with write on zeughaus (fetch, statuses). weida comes from its public GitHub
@@ -72,8 +78,8 @@ status_token = "FORGEJO_TOKEN"
 webhook_secret = "ZEUGHAUS_WEBHOOK_SECRET"
 
 [repos.zeughaus.grants]
-ZEUGHAUS_UPDATE_KEY = ["push main", "cron *", "tag v*"]
-ZEUGHAUS_GITHUB_TOKEN = ["push main", "cron *", "tag v*"]
+ZEUGHAUS_UPDATE_KEY = ["push main", "nightly", "tag v*"]
+ZEUGHAUS_GITHUB_TOKEN = ["push main", "nightly", "tag v*"]
 
 [repos.smoke]
 url = "/var/lib/zeughaus-ci/smoke.git"

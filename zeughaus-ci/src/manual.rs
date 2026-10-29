@@ -384,7 +384,6 @@ impl ManualService {
             kind: EventKind::Manual,
             git_ref: default_branch,
             sha: upload.dirs.first().map(|dir| dir.sha.clone()),
-            cron: None,
             actor: upload.actor,
             delivery: None,
             upload: Some(id.clone()),

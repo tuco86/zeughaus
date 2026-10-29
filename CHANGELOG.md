@@ -44,7 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI: a job with `needs` may name the `channels` it runs in, so a publish
   step that depends on a build job runs for `nightly` or `release` pipelines
   only. `zeughaus-ci check` refuses a channel that is neither in
-  `channels.toml` nor one of the fallback names (`tags`, `cron`),
+  `channels.toml` nor one of the fallback names (`tags`, `nightly`),
   and `channels` on a job with `on` is refused.
 - CI tab: a cable between two jobs animates, as arrows in the colour of a
   running job, while the needed job's artifact set moves to the runner of
@@ -130,9 +130,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SIGSEGV [` and `SIGABRT [` lines come before its closing `error: test
   run failed`, and the excerpt is led by the first panic and its message
   when that is above the last 40 lines, so the cause is the panic.
+- CI: a finished pipeline says how loaded it ran. Every job records the
+  other jobs that shared its runner while it was active (`shared_with`,
+  `<repo>#<n>/<job>`), and its load is its run time against its expected
+  time and that count: `check-linux-arm64 3.4x expected, shared its runner
+  with 2 other jobs`. `ci_status` adds the load of the job a channel's
+  newest pipeline is judged by (its first failed, else its slowest),
+  `ci_pipeline` shows it as `load:`, per job and with a `shared with:`
+  line, and the CI tab under the pipeline's row. The omp plugin (0.3.5)
+  teaches it.
 
 ### Changed
 
+- CI: nightlies are one CI-wide round instead of per-repository cron
+  schedules, after every repository's 04:00 cron jobs started at once on
+  one runner and failed. `ci.toml` sets the time, `[nightly] at = "HH:MM"`
+  (the CI host's local time); then the CI queues a `nightly` event of every
+  repository's default branch and runs nightly pipelines one at a time
+  across the whole CI, in repository name order. A job selects it with
+  `on = ["nightly"]`, a grant or channel with `nightly`, and it sees
+  `CI_EVENT=nightly`. The `cron` event kind, cron expressions and `CI_CRON`
+  are gone: a `cron` pattern now fails a pipeline's setup with `unknown
+  pattern kind`. `ci_run` takes `event: "nightly"`, `zeughaus-ci run <repo>
+  nightly` and `plan [DIR] nightly` replace their cron forms, and stored
+  records and queued events of cron kind read as nightlies.
 - CI: artifact sets move by content instead of as one tar. A set is a
   manifest of its files by BLAKE3 root (new crate `zeughaus-blobs`); the CI
   keeps a store of zstd-compressed files (3 days, 2 GiB) and every runner a

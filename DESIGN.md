@@ -770,10 +770,10 @@ as `ci = ["<endpoint>"]` next to `remotes` in `zeughaus.toml`. In production:
 between `# /// ci` and `# ///` is a job named after its file. The header
 holds these keys:
 
-- `on`: `push <glob>`, `tag <glob>`, or `cron <5 fields>`;
+- `on`: `push <glob>`, `tag <glob>`, or `nightly`;
 - `needs`: exactly one of `on` and `needs` is set;
 - `channels`: only with `needs`; the channels the job is added in (names from
-  `channels.toml`, or `tags`, `cron`); without it a job with `needs`
+  `channels.toml`, or `tags`, `nightly`); without it a job with `needs`
   runs in every channel that selects what it needs;
 - `image` (a `.zeughaus-ci/<image>.Containerfile`), `machine` (a runner or
   a Windows VM of one, by name) or `platform` (a key of `ci.toml`
@@ -816,14 +816,25 @@ kind, fails the pipeline's setup like an invalid header.
 
 **Events are files.** A webhook (`serve --hook <addr>`, HMAC-checked, Caddy on
 sadala forwards `https://ci.doodleshnookie.net/hook/<repo>` to it),
-`zeughaus-ci run` and the cron schedules all write `ci/inbox/*.json`. The
+`zeughaus-ci run` and the nightly round all write `ci/inbox/*.json`. The
 scheduler moves each inbox file to
-`ci/queue/<repo>.<kind>.<hash(ref, cron)>.json`, overwriting what waits
+`ci/queue/<repo>.<kind>.<hash(ref)>.json`, overwriting what waits
 there. A newer push to a ref therefore replaces the one queued behind a
 running pipeline and never cancels the running one. Without `--hook` the
-service has no HTTP listener and pipelines come from `run`, cron and manual
-runs (**Manual runs**, whose events are keyed by upload: none replaces
-another).
+service has no HTTP listener and pipelines come from `run`, the nightly
+round and manual runs (**Manual runs**, whose events are keyed by upload:
+none replaces another).
+
+**The nightly round.** `ci.toml`'s `[nightly] at = "HH:MM"` (the CI host's
+local time; without it there is no round) is when the scheduler queues a
+`nightly` event of every repository's default branch, all with the same
+`received`, so the queue holds them in repository name order. Nightly
+pipelines run strictly one at a time across the whole CI: a queued nightly
+waits while any nightly runs, whether the round, `zeughaus-ci run <repo>
+nightly`, `ci_run` or a rerun queued it. A round missed while the CI was
+down does not run, and a repository without nightly jobs leaves no record.
+Records and queue files from before the round say `cron` and read as
+nightlies.
 
 **Pipelines** (`scheduler.rs`, one thread):
 
@@ -837,10 +848,10 @@ another).
 **Channels** group a repository's pipelines (`channels.rs`).
 `.zeughaus-ci/channels.toml` lists `[[channel]]` tables of `name` and `on`
 patterns; the first channel whose `on` matches the event gets the pipeline
-(`release` on `tag v*`, `nightly` on `cron *`, `dev` on `push main` in
+(`release` on `tag v*`, `nightly` on `nightly`, `dev` on `push main` in
 zeughaus's own file). Without
 a match, or without the file, a push lands in a channel named after its
-branch, a tag in `tags`, a cron in `cron`, a manual run in the channel of the
+branch, a tag in `tags`, a nightly in `nightly`, a manual run in the channel of the
 default branch, and records from before channels
 are grouped the same way. The channel is decided in setup and kept in the
 record; an invalid file fails the setup like an invalid job header. `check`
@@ -1047,7 +1058,7 @@ wrapper, like `run`, `forge-check` and `secrets-check`.
 with any runner's `--keep-runs`.
 
 **The default branch has an owner.** `streak.rs` derives from the records,
-per job of the default branch (push and cron pipelines), the first
+per job of the default branch (push and nightly pipelines), the first
 pipeline of its current run of failures, and the last pipeline in which
 every deploy job (one without `on`) succeeded. `zeughaus-ci status` leads with
 it (`griasdi main: windows red since #138 (79e9035, 17 h, 13 pipelines); last
@@ -1059,6 +1070,18 @@ every connected editor shows as a desktop notification. A push to the
 default branch whose commit has no `.zeughaus-ci/` is recorded as a
 `no-jobs` pipeline and posts an `error` on `zeughaus/pipeline`, naming a
 leftover `.ci/`; on other refs that stays silent.
+
+**Load.** When a job is handed to its runner, the scheduler records on it
+and on every other job active on that runner (a VM job counts as on its
+runner) the other's `<repo>#<n>/<job>` in `shared_with`; two runs overlap
+exactly when one is assigned while the other is active. A finished job's
+load (`JobView::load_text`) is its run time over its expected time, in
+tenths (`3.4x expected`), and how many other jobs shared its runner (or
+`runner not shared`). A finished pipeline is judged by its first failed
+job, else its slowest against the expected time (`pipeline_load`):
+`ci_status` adds it to the channel's line, `ci_pipeline` as `load:` and
+per job with a `shared with:` line, and the desktop under the pipeline's
+row.
 
 **Waiting, skipping, failing.** A job whose needs succeeded is `Waiting`
 while its runner is not connected (`waiting for runner <R>`), is `Skipped`
@@ -1277,8 +1300,9 @@ pipeline. A channel tab lists its pipelines in a scrollable, newest on top
 and separated by rules, one row each: a status glyph (codicons from the
 bundled Nerd Font, so status never rests on colour alone), `#<n>` and the
 commit's subject (the CI reads it from its mirror when the pipeline starts,
-and once at start for records without one), the branch, tag or cron, the
-commit and the actor, the cause line of each failed job, and the duration
+and once at start for records without one), the branch, tag or nightly, the
+commit and the actor, the cause line of each failed job, the load of a
+finished pipeline (**Load**), and the duration
 and age (the local time on hover). A closed row ends in one glyph per job.
 The newest pipeline and every running one are open unless the user closed
 them, and any other opens on a press of its row: an open pipeline adds
@@ -1339,7 +1363,7 @@ of `ci.toml`, led by the CI's own build, and each enlisted runner with the
 build its hello named),
 `ci_pipelines` (one channel's, or without `channel` every channel's, each
 line then starting with its channel), `ci_pipeline` (a failed job adds its
-`cause` and `excerpt`), `ci_log` (`CiRequest::Log`: the last lines of a
+`cause` and `excerpt`; a finished job its load, **Load**), `ci_log` (`CiRequest::Log`: the last lines of a
 job's stored output, 5000 at most, and whether the job has finished;
 `timestamps` starts every line with the seconds since the job's first
 output; `pattern`, a regular expression of at most 1 KiB, keeps the lines
@@ -1357,7 +1381,7 @@ looked at every 2 s until it has settled; a sha that matches nothing yet is
 waited for, and then followed by its number; at the end of the wait it
 says `still running after <s> s; call ci_wait again with repo=.. number=..`
 and names `zeughaus-runner ci wait <repo> <number>` for a background wait),
-`ci_rerun` and `ci_run` (`CiRequest::Queue`: a push or cron event of the
+`ci_rerun` and `ci_run` (`CiRequest::Queue`: a push or nightly event of the
 default branch, with the asker's `<user>@<host>` as its actor; both look
 for the pipeline the CI numbers for it for up to 30 s and answer with its
 number), `ci_cancel`, `ci_repo` and `run_jobs`; their answers are one

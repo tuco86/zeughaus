@@ -6,16 +6,15 @@
 //! themselves live on the runners, which report them again when they
 //! reconnect; that report settles every job that was active.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base64::Engine as _;
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, NaiveTime, TimeZone};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeughaus_link::enlist::{
@@ -34,8 +33,6 @@ use crate::streak::{self, Streak};
 use crate::{CI_DIR, cleanup, excerpt, expected, manual, pipeline};
 
 const TICK: Duration = Duration::from_secs(1);
-/// How often a repository's cron schedules are re-read without a push.
-const CRON_REFRESH: Duration = Duration::from_secs(3600);
 /// Seconds after a job's timeout that a run whose runner is gone is given up.
 const LOST_GRACE_SECS: u64 = 900;
 /// How long a job of the default branch stays red before every further red
@@ -154,6 +151,11 @@ pub struct JobRecord {
     /// runner ([`crate::expected`]); `None` without a succeeded run at its place.
     #[serde(default)]
     pub expected_secs: Option<u64>,
+    /// `<repo>#<n>/<job>` of every other job that was starting or running
+    /// on the same runner while this one was; `None` in records from before
+    /// it was kept. A VM job counts as on its runner.
+    #[serde(default)]
+    pub shared_with: Option<Vec<String>>,
 }
 
 /// One artifact set moving to the runner of a consuming job. Times are
@@ -435,11 +437,6 @@ struct Planned {
     place: Place,
 }
 
-struct CronCache {
-    schedules: Vec<String>,
-    refreshed: Option<Instant>,
-}
-
 struct Scheduler {
     state_dir: PathBuf,
     config: Arc<CiConfig>,
@@ -449,8 +446,9 @@ struct Scheduler {
     statuses: Sender<Status>,
     /// The only reader of OpenBao in this process; jobs never see its token.
     secrets: Arc<Secrets>,
-    crons: BTreeMap<String, CronCache>,
-    last_cron_check: DateTime<Local>,
+    /// The end of the span the last nightly check covered. Starts at the
+    /// process start, so a round missed while the CI was down does not run.
+    last_nightly_check: DateTime<Local>,
     /// When a job's needs were first all met while it had no runner to go
     /// to: its wait for the runner is counted from then. Not persisted; a
     /// restart starts the wait over.
@@ -535,19 +533,6 @@ impl Scheduler {
         alerts: Sender<Alert>,
         changes: Sender<CiChange>,
     ) -> Scheduler {
-        let crons = config
-            .repos
-            .keys()
-            .map(|name| {
-                (
-                    name.clone(),
-                    CronCache {
-                        schedules: Vec::new(),
-                        refreshed: None,
-                    },
-                )
-            })
-            .collect();
         Scheduler {
             statuses: forge::poster(state_dir.clone(), Arc::clone(&secrets)),
             secrets,
@@ -556,8 +541,7 @@ impl Scheduler {
             running: Vec::new(),
             rx,
             runners,
-            crons,
-            last_cron_check: Local::now(),
+            last_nightly_check: Local::now(),
             ready_since: HashMap::new(),
             alerts,
             changes,
@@ -600,10 +584,10 @@ impl Scheduler {
 
     fn tick(&mut self) {
         event::drain_inbox(&self.state_dir);
-        self.fire_crons();
+        self.fire_nightly();
         for (path, event) in event::queued(&self.state_dir) {
             let key = event::queue_key(&event);
-            if self.running.iter().any(|p| p.key == key) {
+            if !may_start(&event, &key, &self.running) {
                 continue;
             }
             self.start_pipeline(&path, event, key);
@@ -636,7 +620,7 @@ impl Scheduler {
         });
     }
 
-    // ------------------------------------------------------------ mirrors and cron
+    // ------------------------------------------------------------ mirrors
 
     /// Creates the mirror if needed and fetches every branch and tag.
     fn fetch(&self, name: &str, repo: &RepoConfig) -> Result<PathBuf, String> {
@@ -692,81 +676,35 @@ impl Scheduler {
         Ok(mirror)
     }
 
-    /// Re-reads the cron schedules at the head of the default branch.
-    fn refresh_crons(&mut self, name: &str, mirror: &Path) {
-        let Some(repo) = self.config.repos.get(name) else {
+    /// Queues every repository's nightly once the round's time has come:
+    /// all with the same `received`, so the queue holds them in repository
+    /// name order (`event::queued` breaks the tie by file name).
+    fn fire_nightly(&mut self) {
+        let now = Local::now();
+        let last = std::mem::replace(&mut self.last_nightly_check, now);
+        let Some(nightly) = &self.config.nightly else {
             return;
         };
-        let head = format!("refs/heads/{}", repo.default_branch);
-        let schedules = rev_parse(mirror, &format!("{head}^{{commit}}"))
-            .and_then(|sha| read_ci(mirror, &sha))
-            .and_then(|(files, containerfiles)| pipeline::load_jobs(&files, &containerfiles))
-            .map(|jobs| pipeline::cron_schedules(&jobs));
-        let cache = self.crons.entry(name.to_owned()).or_insert(CronCache {
-            schedules: Vec::new(),
-            refreshed: None,
-        });
-        cache.refreshed = Some(Instant::now());
-        match schedules {
-            Ok(schedules) => cache.schedules = schedules,
-            Err(e) => eprintln!("[ci] {name}: cron schedules not read: {e}"),
+        if !nightly_due(nightly.time, &last, &now) {
+            return;
         }
-    }
-
-    fn fire_crons(&mut self) {
-        let stale: Vec<String> = self
-            .crons
-            .iter()
-            .filter(|(_, c)| c.refreshed.is_none_or(|at| at.elapsed() >= CRON_REFRESH))
-            .map(|(name, _)| name.clone())
-            .collect();
-        for name in stale {
-            let Some(repo) = self.config.repos.get(&name).cloned() else {
-                continue;
+        let received = crate::now_secs();
+        for (name, repo) in &self.config.repos {
+            let event = CiEvent {
+                repo: name.clone(),
+                kind: EventKind::Nightly,
+                git_ref: repo.default_branch.clone(),
+                sha: None,
+                actor: "nightly".to_owned(),
+                delivery: None,
+                upload: None,
+                received,
             };
-            match self.fetch(&name, &repo) {
-                Ok(mirror) => self.refresh_crons(&name, &mirror),
-                Err(e) => {
-                    eprintln!("[ci] {name}: fetch: {e}");
-                    if let Some(cache) = self.crons.get_mut(&name) {
-                        cache.refreshed = Some(Instant::now());
-                    }
-                }
+            match event::write_inbox(&self.state_dir, &event) {
+                Ok(_) => eprintln!("[ci] {name}: nightly queued"),
+                Err(e) => eprintln!("[ci] {name}: nightly: {e}"),
             }
         }
-        let now = Local::now();
-        for (name, cache) in &self.crons {
-            let Some(repo) = self.config.repos.get(name) else {
-                continue;
-            };
-            for expr in &cache.schedules {
-                let Ok(cron) = croner::Cron::from_str(expr) else {
-                    continue;
-                };
-                let due = cron
-                    .find_next_occurrence(&self.last_cron_check, false)
-                    .is_ok_and(|next| next <= now);
-                if !due {
-                    continue;
-                }
-                let event = CiEvent {
-                    repo: name.clone(),
-                    kind: EventKind::Cron,
-                    git_ref: repo.default_branch.clone(),
-                    sha: None,
-                    cron: Some(expr.clone()),
-                    actor: "cron".to_owned(),
-                    delivery: None,
-                    upload: None,
-                    received: crate::now_secs(),
-                };
-                match event::write_inbox(&self.state_dir, &event) {
-                    Ok(_) => eprintln!("[ci] {name}: cron {expr} due"),
-                    Err(e) => eprintln!("[ci] {name}: cron {expr}: {e}"),
-                }
-            }
-        }
-        self.last_cron_check = now;
     }
 
     // ------------------------------------------------------------ pipelines
@@ -855,6 +793,7 @@ impl Scheduler {
                 artifacts: false,
                 excerpt: None,
                 expected_secs: None,
+                shared_with: None,
             })
             .collect();
         pipeline.save(&self.state_dir, &self.changes);
@@ -926,7 +865,6 @@ impl Scheduler {
         pipeline: &mut Pipeline,
     ) -> Result<Option<Vec<Planned>>, String> {
         let mirror = self.fetch(name, repo)?;
-        self.refresh_crons(name, &mirror);
         let sha = event_commit(&mirror, event)?;
         pipeline.sha = Some(sha.clone());
         // Only shown, so a commit git cannot describe leaves it empty.
@@ -1554,7 +1492,11 @@ impl Scheduler {
         record.assigned = Some(now);
         record.expected_secs = expected;
         record.note.clear();
+        let touched = share(&mut self.running, pi, ji, &runner);
         self.running[pi].save(&self.state_dir, &self.changes);
+        for qi in touched {
+            self.running[qi].save(&self.state_dir, &self.changes);
+        }
         let pipeline = self.running[pi].clone();
         self.post(
             &pipeline,
@@ -1638,9 +1580,6 @@ impl Scheduler {
         ];
         if let Some(platform) = &job.platform {
             env.push(("CI_PLATFORM".into(), platform.clone()));
-        }
-        if let Some(cron) = &pipeline.event.cron {
-            env.push(("CI_CRON".into(), cron.clone()));
         }
         env.extend(job.env.iter().map(|(k, v)| (k.clone(), v.clone())));
 
@@ -2144,8 +2083,77 @@ impl Scheduler {
         job.started = None;
         job.assigned = None;
         job.transfers.clear();
+        job.shared_with = None;
         self.running[pi].save(&self.state_dir, &self.changes);
     }
+}
+
+/// Whether a queued event may become a pipeline now: not while a pipeline
+/// of its key runs, and a nightly not while any nightly runs.
+fn may_start(event: &CiEvent, key: &str, running: &[Pipeline]) -> bool {
+    running.iter().all(|p| {
+        p.key != key && !(event.kind == EventKind::Nightly && p.event.kind == EventKind::Nightly)
+    })
+}
+
+/// Whether wall-clock time `at` of `now`'s zone occurred in (last, now].
+fn nightly_due<Tz: TimeZone>(at: NaiveTime, last: &DateTime<Tz>, now: &DateTime<Tz>) -> bool {
+    let zone = now.timezone();
+    let mut day = last.date_naive();
+    loop {
+        if let Some(when) = zone.from_local_datetime(&day.and_time(at)).earliest()
+            && *last < when
+            && when <= *now
+        {
+            return true;
+        }
+        if day >= now.date_naive() {
+            return false;
+        }
+        match day.succ_opt() {
+            Some(next) => day = next,
+            None => return false,
+        }
+    }
+}
+
+/// Records on both sides that job `ji` of `running[pi]`, just handed to
+/// `runner`, shares it with every other active job there. Returns the
+/// indices of the other pipelines it changed. Two runs overlap exactly when
+/// one is assigned while the other is active, so recording at assignment
+/// catches every overlap.
+fn share(running: &mut [Pipeline], pi: usize, ji: usize, runner: &str) -> Vec<usize> {
+    let id = |p: &Pipeline, k: usize| format!("{}#{}/{}", p.repo, p.number, p.jobs[k].def.name);
+    let this = id(&running[pi], ji);
+    let mut others = Vec::new();
+    for (qi, q) in running.iter().enumerate() {
+        for (ki, k) in q.jobs.iter().enumerate() {
+            if (qi, ki) != (pi, ji) && k.status.is_active() && k.runner.as_deref() == Some(runner) {
+                others.push((qi, ki, id(q, ki)));
+            }
+        }
+    }
+    let mine = running[pi].jobs[ji]
+        .shared_with
+        .get_or_insert_with(Vec::new);
+    for (_, _, other) in &others {
+        if !mine.contains(other) {
+            mine.push(other.clone());
+        }
+    }
+    let mut touched = Vec::new();
+    for (qi, ki, _) in others {
+        let theirs = running[qi].jobs[ki]
+            .shared_with
+            .get_or_insert_with(Vec::new);
+        if !theirs.contains(&this) {
+            theirs.push(this.clone());
+            if qi != pi && !touched.contains(&qi) {
+                touched.push(qi);
+            }
+        }
+    }
+    touched
 }
 
 /// The newest transfer of `need` that has not ended.
@@ -2409,7 +2417,7 @@ fn event_commit(mirror: &Path, event: &CiEvent) -> Result<String, String> {
         None => {
             let refname = match event.kind {
                 EventKind::Tag => format!("refs/tags/{}^{{commit}}", event.git_ref),
-                EventKind::Push | EventKind::Cron => {
+                EventKind::Push | EventKind::Nightly => {
                     format!("refs/heads/{}^{{commit}}", event.git_ref)
                 }
                 EventKind::Manual => return Err("a manual event carries its sha".to_owned()),
@@ -2476,7 +2484,6 @@ mod tests {
                 kind: EventKind::Push,
                 git_ref: "main".to_owned(),
                 sha: None,
-                cron: None,
                 actor: "test".to_owned(),
                 delivery: None,
                 upload: None,
@@ -2813,7 +2820,7 @@ mod tests {
                     machines: Vec::new(),
                 },
                 build: 0,
-                machines: BTreeMap::new(),
+                machines: std::collections::BTreeMap::new(),
                 since,
             },
         );
@@ -2841,6 +2848,7 @@ mod tests {
             artifacts: false,
             excerpt: None,
             expected_secs: None,
+            shared_with: None,
         }
     }
 
@@ -2933,6 +2941,77 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn the_nightly_is_due_once_its_wall_clock_time_has_passed() {
+        let zone = chrono::FixedOffset::east_opt(3600).unwrap();
+        let at = |day: u32, h: u32, m: u32, s: u32| {
+            zone.with_ymd_and_hms(2026, 10, day, h, m, s).unwrap()
+        };
+        let three = NaiveTime::from_hms_opt(3, 0, 0).unwrap();
+        let midnight = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+        assert!(nightly_due(three, &at(1, 2, 59, 59), &at(1, 3, 0, 0)));
+        assert!(!nightly_due(three, &at(1, 3, 0, 0), &at(1, 3, 0, 1)));
+        assert!(nightly_due(midnight, &at(1, 23, 59, 59), &at(2, 0, 0, 0)));
+        assert!(!nightly_due(three, &at(1, 3, 0, 1), &at(2, 2, 59, 59)));
+    }
+
+    #[test]
+    fn one_nightly_runs_at_a_time_across_repositories() {
+        let queued = |repo: &str, kind: EventKind| {
+            let mut p = pipeline("");
+            p.repo = repo.to_owned();
+            p.event.repo = repo.to_owned();
+            p.event.kind = kind;
+            p.key = event::queue_key(&p.event);
+            p
+        };
+        let nightly_a = queued("a", EventKind::Nightly);
+        let push_a = queued("a", EventKind::Push);
+        let nightly_b = queued("b", EventKind::Nightly);
+        let push_b = queued("b", EventKind::Push);
+        let start =
+            |event: &Pipeline, running: &[Pipeline]| may_start(&event.event, &event.key, running);
+        assert!(!start(&nightly_b, std::slice::from_ref(&nightly_a)));
+        assert!(start(&nightly_b, std::slice::from_ref(&push_a)));
+        assert!(start(&push_b, std::slice::from_ref(&nightly_a)));
+        assert!(!start(&push_a, std::slice::from_ref(&push_a)));
+        assert!(start(&nightly_a, &[]));
+    }
+
+    #[test]
+    fn sharing_a_runner_is_recorded_on_both_sides_once() {
+        let mut a = numbered(1, vec![record("x", &[], "r", JobStatus::Starting)]);
+        a.repo = "a".to_owned();
+        let mut b = numbered(2, vec![record("y", &[], "r", JobStatus::Running)]);
+        b.repo = "b".to_owned();
+        let mut c = numbered(3, vec![record("z", &[], "s", JobStatus::Running)]);
+        c.repo = "c".to_owned();
+        let mut running = vec![a, b, c];
+        assert_eq!(share(&mut running, 0, 0, "r"), [1]);
+        assert_eq!(
+            running[0].jobs[0].shared_with,
+            Some(vec!["b#2/y".to_owned()])
+        );
+        assert_eq!(
+            running[1].jobs[0].shared_with,
+            Some(vec!["a#1/x".to_owned()])
+        );
+        assert_eq!(running[2].jobs[0].shared_with, None);
+
+        assert!(share(&mut running, 0, 0, "r").is_empty());
+        assert_eq!(
+            running[0].jobs[0].shared_with,
+            Some(vec!["b#2/y".to_owned()])
+        );
+        assert_eq!(
+            running[1].jobs[0].shared_with,
+            Some(vec!["a#1/x".to_owned()])
+        );
+
+        assert!(share(&mut running, 2, 0, "s").is_empty());
+        assert_eq!(running[2].jobs[0].shared_with, Some(Vec::new()));
     }
 
     /// Tests that touch the filesystem, network, processes or real time: the
@@ -3229,13 +3308,13 @@ mod tests {
             for name in ["a", "b"] {
                 std::fs::write(
                     ci.join(format!("{name}.sh")),
-                    "# /// ci\n# on = [\"push *\", \"cron 0 3 * * *\"]\n# context = \"box\"\n# ///\necho\n",
+                    "# /// ci\n# on = [\"push *\", \"nightly\"]\n# context = \"box\"\n# ///\necho\n",
                 )
                 .unwrap();
             }
             std::fs::write(
                 ci.join("channels.toml"),
-                "[[channel]]\nname = \"nightly\"\non = [\"cron *\"]\nclean = true\n",
+                "[[channel]]\nname = \"nightly\"\non = [\"nightly\"]\nclean = true\n",
             )
             .unwrap();
             git(&origin, &["init", "-q", "-b", "main"], &author).unwrap();
@@ -3253,13 +3332,12 @@ mod tests {
             );
             let mut s = scheduler_over(&state, Arc::clone(&config));
             let repo = config.repos["view"].clone();
-            for (kind, cron, channel, clean) in [
-                (EventKind::Push, None, "main", false),
-                (EventKind::Cron, Some("0 3 * * *"), "nightly", true),
+            for (kind, channel, clean) in [
+                (EventKind::Push, "main", false),
+                (EventKind::Nightly, "nightly", true),
             ] {
                 let mut p = pipeline("");
                 p.event.kind = kind;
-                p.event.cron = cron.map(str::to_owned);
                 let event = p.event.clone();
                 let planned = s
                     .set_up("view", &repo, &event, &mut p)
@@ -3332,7 +3410,6 @@ mod tests {
                 kind: EventKind::Manual,
                 git_ref: "main".to_owned(),
                 sha: Some(sha.to_owned()),
-                cron: None,
                 actor: upload.actor,
                 delivery: None,
                 upload: Some(id),

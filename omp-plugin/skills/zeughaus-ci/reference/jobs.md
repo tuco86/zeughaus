@@ -27,13 +27,13 @@ A header with an `env` table:
 
 | key | value | rule |
 |---|---|---|
-| `on` | list of patterns | `push <glob>`, `tag <glob>` or `cron <expr>`. A glob is one word; `*` matches any run of characters, `/` and nothing included, everything else is literal (`main`, `v*`, `release/*`). A cron expression has exactly five fields; it runs against the default branch's head, in the CI host's local time. `cron *` is valid only in channels and grants. Empty when the job has `needs` |
+| `on` | list of patterns | `push <glob>`, `tag <glob>` or `nightly`. A glob is one word; `*` matches any run of characters, `/` and nothing included, everything else is literal (`main`, `v*`, `release/*`). `nightly` takes no argument: the CI's nightly round (ci.toml `[nightly] at`, the CI host's local time) runs it against the default branch's head, one repository after another in name order. Empty when the job has `needs` |
 | `needs` | list of job names | Each names another job of the folder; no cycles. The job is selected only when all its needs are selected, and is skipped when one of them fails or is skipped. A need that succeeded and left output is staged as `$CI_INPUTS/<need>` |
-| `channels` | list of channel names | Only with `needs` (a job with `on` is selected by its own patterns). The job joins a pipeline only in these channels; without the key, in every channel that selects what it needs. A name is a channel of `channels.toml`, or `tags` or `cron` (`zeughaus-ci check` refuses others) |
+| `channels` | list of channel names | Only with `needs` (a job with `on` is selected by its own patterns). The job joins a pipeline only in these channels; without the key, in every channel that selects what it needs. A name is a channel of `channels.toml`, or `tags` or `nightly` (`zeughaus-ci check` refuses others) |
 | `image` | name | `[a-z0-9][a-z0-9-]*` with a file `.zeughaus-ci/<image>.Containerfile`. The job runs in a container built from it (build context `.zeughaus-ci/`) on the platform's runner, else on the default runner. A unix runner only. Exclusive with `machine` |
 | `machine` | name | A runner of ci.toml (the job runs on its host) or a machine (Windows VM) a runner lists. Exclusive with `image` and `platform` |
 | `platform` | name | `[a-z0-9][a-z0-9-]*`, a key of ci.toml `[platforms]`, whose value is the runner or VM that builds it. Exclusive with `machine`. The job sees it as `CI_PLATFORM` |
-| `secrets` | list of names | Each `[A-Z_][A-Z0-9_]*`. A secret reaches the job as an environment variable of that name when the repository's `grants` in ci.toml release it to the event (`push main`, `tag v*`, `cron *`). Otherwise the job fails with `secret <name> is not granted for <event> <ref>`. A manual run gives none |
+| `secrets` | list of names | Each `[A-Z_][A-Z0-9_]*`. A secret reaches the job as an environment variable of that name when the repository's `grants` in ci.toml release it to the event (`push main`, `tag v*`, `nightly`). Otherwise the job fails with `secret <name> is not granted for <event> <ref>`. A manual run gives none |
 | `env` | table of strings | More variables for the job. Names `[A-Z_][A-Z0-9_]*`, none starting with `CI_` or `ZEUGHAUS_` |
 | `timeout_minutes` | integer | 1..=1440, default 240. At the deadline the job gets SIGTERM and, 60 s later, SIGKILL. Its note is `timed out after <n> min` |
 | `context`, `cache`, `when_busy` | any | Parsed and ignored: a repository's jobs at one place share one workspace, a checkout keeps ignored files, and no runner is ever busy. `zeughaus-ci check` warns; remove them |
@@ -48,7 +48,8 @@ Rules across keys:
 
 - First the jobs whose `on` matches the event; then, repeatedly, every job with `needs` whose needs are all selected and whose `channels` is empty or names the event's channel.
 - Nothing selected: no pipeline is made (the CI only logs `no jobs`). A push to a ref no job's `on` names starts nothing. A push to the default branch whose commit has no `.zeughaus-ci/` is recorded as `no-jobs` and posts an error on the forge.
-- A push or tag event runs the commit it names; a cron event runs the default branch's head; a manual run runs its uploaded working tree.
+- A push or tag event runs the commit it names; a nightly runs the default branch's head; a manual run runs its uploaded working tree.
+- Nightlies run one at a time across the whole CI: a queued nightly waits while any repository's nightly runs, whether the round, `ci_run` or a rerun queued it.
 
 ## Placement
 
@@ -83,18 +84,18 @@ on = ["push main"]
 
 [[channel]]
 name = "nightly"
-on = ["cron *"]
+on = ["nightly"]
 clean = true
 ```
 
 | key | rule |
 |---|---|
 | `name` | `[a-z0-9][a-z0-9-]*`, unique |
-| `on` | Non-empty list of patterns as in a job's `on`; `cron *` (any cron event) is allowed here |
+| `on` | Non-empty list of patterns as in a job's `on` |
 | `clean` | Boolean, default false. The first job of a pipeline of this channel at each place starts its workspace from nothing |
 
 - The first channel in file order whose `on` matches the event names the pipeline's channel. Unknown keys are an error.
-- No match, or no file: a push goes to a channel named after its branch, a tag to `tags`, a cron event to `cron`. A manual run goes to the channel a push to the default branch selects.
+- No match, or no file: a push goes to a channel named after its branch, a tag to `tags`, a nightly to `nightly`. A manual run goes to the channel a push to the default branch selects.
 - A channel sorts pipelines (`ci_pipelines` takes one; the CI keeps the 200 newest per channel) and sets `clean`. It starts nothing: a job's `on` does.
 
 ## Job environment
@@ -107,14 +108,13 @@ Set by the CI:
 | `ZEUGHAUS_CI` | `1` |
 | `CI_REPO` | The repository's name in ci.toml |
 | `CI_REPO_SLUG` | Its `slug`, `owner/name`; empty when ci.toml gives none |
-| `CI_EVENT` | `push`, `tag`, `cron` or `manual` |
-| `CI_REF` | Branch or tag name without `refs/`; the default branch for `cron` and `manual` |
+| `CI_EVENT` | `push`, `tag`, `nightly` or `manual` |
+| `CI_REF` | Branch or tag name without `refs/`; the default branch for `nightly` and `manual` |
 | `CI_SHA` | The commit id (a tag's commit). For `manual`, the snapshot commit of the uploaded working tree, not HEAD |
 | `CI_PIPELINE` | The pipeline number |
 | `CI_JOB` | The job's name |
-| `CI_ACTOR` | Who caused it: the forge user of a push or tag, `cron`, `rerun of #<n>`, `manual` for `zeughaus-ci run`, `<user>@<host>` of a manual run or of an event `ci_run` queued |
+| `CI_ACTOR` | Who caused it: the forge user of a push or tag, `nightly`, `rerun of #<n>`, `manual` for `zeughaus-ci run`, `<user>@<host>` of a manual run or of an event `ci_run` queued |
 | `CI_PLATFORM` | The job's `platform`; set only when the header has one |
-| `CI_CRON` | The cron expression, whitespace normalized; set only for `cron` events |
 
 Set by the runner:
 
@@ -176,4 +176,5 @@ It lives on the CI host, not in the repository; `ci_repo` and `ci_status` show t
 | `default_runner` | Runs the jobs that name no `machine` or `platform`, and the containers of jobs without a target |
 | `[runners.<name>]` | `fingerprint`, `os` (`unix`, the default, or `windows`), `machines` (the VMs it boots), `wait_minutes` (15) |
 | `[platforms]` | Platform name to a runner or a machine of one |
+| `[nightly]` | `at = "HH:MM"`, the CI host's local time: the round that queues every repository's `nightly` and runs them one after another in name order; without it nothing runs nightly by itself |
 | `[repos.<name>]` | `url` (the repository's identity: an upload's `origin` must be the same repository), `forge` (`github`, `forgejo` or `none`), `slug`, `api`, `default_branch` (`main`), tokens, `grants` (secret name to event patterns) |

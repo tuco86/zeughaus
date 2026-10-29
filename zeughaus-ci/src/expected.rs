@@ -15,7 +15,7 @@ const FLOOR_SECS: u64 = 60;
 
 /// The kind of pipeline a run's duration is comparable within. A manual run
 /// reproduces the push pipeline: `.zeughaus-ci/build.sh` picks the test tier
-/// by `CI_EVENT`, cron and tag against everything else.
+/// by `CI_EVENT`, nightly and tag against everything else.
 fn class(kind: EventKind) -> EventKind {
     match kind {
         EventKind::Manual => EventKind::Push,
@@ -90,7 +90,6 @@ mod tests {
                 kind,
                 git_ref: "main".to_owned(),
                 sha: None,
-                cron: None,
                 actor: "test".to_owned(),
                 delivery: None,
                 upload: None,
@@ -130,6 +129,7 @@ mod tests {
                 artifacts: false,
                 excerpt: None,
                 expected_secs: None,
+                shared_with: None,
             }],
             channel: "dev".to_owned(),
             cancelled: false,
@@ -152,8 +152,11 @@ mod tests {
     }
 
     #[test]
-    fn a_manual_run_counts_as_a_push_and_a_cron_run_does_not() {
-        let history = vec![ok(1, EventKind::Manual, 200), ok(2, EventKind::Cron, 900)];
+    fn a_manual_run_counts_as_a_push_and_a_nightly_does_not() {
+        let history = vec![
+            ok(1, EventKind::Manual, 200),
+            ok(2, EventKind::Nightly, 900),
+        ];
         assert_eq!(
             expected_secs(&history, EventKind::Push, "check", "x", &Place::Host),
             Some(200)
@@ -163,7 +166,7 @@ mod tests {
             Some(200)
         );
         assert_eq!(
-            expected_secs(&history, EventKind::Cron, "check", "x", &Place::Host),
+            expected_secs(&history, EventKind::Nightly, "check", "x", &Place::Host),
             Some(900)
         );
     }

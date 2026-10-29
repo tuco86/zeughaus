@@ -1902,6 +1902,19 @@ impl App {
         {
             lines = lines.push(self.cause_line(job, chars));
         }
+        if let Some(load) = zeughaus_link::pipeline_load(pipeline) {
+            lines = lines.push(
+                row![
+                    icon(glyph::WAITING, TEXT_SM, muted),
+                    text(fit(&load, chars))
+                        .size(TEXT_SM)
+                        .color(muted)
+                        .wrapping(Wrapping::None)
+                ]
+                .spacing(SP_1)
+                .align_y(Alignment::Center),
+            );
+        }
 
         let elapsed = match pipeline.finished {
             Some(finished) if finished >= pipeline.created => duration(finished - pipeline.created),
@@ -2016,7 +2029,7 @@ impl App {
         };
         let (glyph, what) = match event {
             "tag" => (glyph::TAG, git_ref.to_owned()),
-            "cron" => (glyph::CRON, format!("nightly on {git_ref}")),
+            "nightly" => (glyph::NIGHTLY, format!("nightly on {git_ref}")),
             _ => (glyph::BRANCH, git_ref.to_owned()),
         };
         let mut line = row![part(glyph, fit(&what, chars / 2))]
@@ -2025,7 +2038,7 @@ impl App {
         if let Some(sha) = sha {
             line = line.push(part(glyph::COMMIT, sha.get(..7).unwrap_or(sha).to_owned()));
         }
-        // A cron's actor is `cron`, which the trigger already says.
+        // A nightly's actor is `nightly`, which the trigger already says.
         if !actor.is_empty() && actor != event {
             line = line.push(part(glyph::PERSON, actor.to_owned()));
         }
@@ -2295,7 +2308,7 @@ mod glyph {
     pub const CANCELLED: char = '\u{eba5}';
     pub const BRANCH: char = '\u{ea68}';
     pub const TAG: char = '\u{ea66}';
-    pub const CRON: char = '\u{eab0}';
+    pub const NIGHTLY: char = '\u{eab0}';
     pub const COMMIT: char = '\u{eafc}';
     pub const PERSON: char = '\u{ea67}';
     pub const RERUN: char = '\u{ebc0}';
@@ -2785,6 +2798,7 @@ mod tests {
             assigned: None,
             transfers: Vec::new(),
             expected_secs: None,
+            shared_with: None,
         };
         assert_eq!(
             note(&job("skipped: gate failed (#4)")),
@@ -2813,6 +2827,7 @@ mod tests {
             assigned: None,
             transfers,
             expected_secs: None,
+            shared_with: None,
         }
     }
 
@@ -2947,6 +2962,7 @@ mod tests {
                     channel: channel.to_owned(),
                     latest: 1,
                     status: "succeeded".to_owned(),
+                    load: None,
                 })
                 .collect(),
             machines: Vec::new(),

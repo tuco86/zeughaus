@@ -746,6 +746,7 @@ mod tests {
                     channel: channel.to_owned(),
                     latest: 1,
                     status: "succeeded".to_owned(),
+                    load: None,
                 })
                 .collect(),
             machines: Vec::new(),

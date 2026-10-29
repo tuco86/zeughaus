@@ -157,14 +157,15 @@ pub enum CiRequest {
     /// body; answers [`CiReply::Doc`], `None` when nothing is approved, an
     /// error while a plan is in progress.
     PlanClaim { repo: String },
-    /// Queues an event of `repo` on its default branch, as a push to it or
-    /// its cron would: `cron` is one of the repository's schedules
-    /// (`0 3 * * *`), `None` a push. The commit is the branch's head when
-    /// the scheduler takes the event; `actor` (`user@host`) is who asked.
+    /// Queues an event of `repo` on its default branch: a push, or with
+    /// `nightly` the repository's nightly, which waits for any other
+    /// nightly that runs. The commit is the branch's head when the
+    /// scheduler takes the event; `actor` (`user@host`) is who asked.
     /// Answers [`CiReply::Accepted`].
     Queue {
         repo: String,
-        cron: Option<String>,
+        #[serde(default)]
+        nightly: bool,
         actor: String,
     },
 }
@@ -524,7 +525,7 @@ pub struct QueuedView {
     /// of the same ref, else the one the event names without a
     /// `channels.toml`. The pipeline's own channel is decided when it starts.
     pub channel: String,
-    /// `push`, `tag` or `cron`.
+    /// `push`, `tag`, `nightly` or `manual`.
     pub event: String,
     pub git_ref: String,
     /// Pinned by a rerun or a webhook; `None` builds the ref's head.
@@ -543,6 +544,9 @@ pub struct ChannelView {
     pub latest: u64,
     /// That pipeline's status.
     pub status: String,
+    /// [`pipeline_load`] of the newest pipeline.
+    #[serde(default)]
+    pub load: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -550,11 +554,11 @@ pub struct PipelineView {
     pub repo: String,
     pub number: u64,
     pub channel: String,
-    /// `push`, `tag` or `cron`.
+    /// `push`, `tag`, `nightly` or `manual`.
     pub event: String,
     pub git_ref: String,
     pub sha: Option<String>,
-    /// Who caused the pipeline: the pushing user, `cron`, or whoever queued
+    /// Who caused the pipeline: the pushing user, `nightly`, or whoever queued
     /// it by hand. Empty from a runner that does not report it.
     #[serde(default)]
     pub actor: String,
@@ -600,6 +604,70 @@ pub struct JobView {
     /// runs at its place; `None` without one.
     #[serde(default)]
     pub expected_secs: Option<u64>,
+    /// `<repo>#<n>/<job>` of every other job that was starting or running
+    /// on the same runner while this one was; `None` in records from before
+    /// it was kept. A VM job counts as on its runner.
+    #[serde(default)]
+    pub shared_with: Option<Vec<String>>,
+}
+
+impl JobView {
+    /// Run time (`finished - started`) over `expected_secs`, in tenths
+    /// rounded half up: 34 = 3.4x. `None` unless started, finished and
+    /// `expected_secs` > 0.
+    pub fn factor_tenths(&self) -> Option<u64> {
+        let expected = self.expected_secs.filter(|&e| e > 0)?;
+        let elapsed = self.finished?.saturating_sub(self.started?);
+        Some((elapsed * 10 + expected / 2) / expected)
+    }
+
+    /// `3.4x expected` when the factor is known, then `shared its runner
+    /// with N other jobs` (`1 other job`) or `runner not shared` when
+    /// `shared_with` is known, joined by `, `. `None` when the job has not
+    /// both started and finished, or neither part is known.
+    pub fn load_text(&self) -> Option<String> {
+        self.started?;
+        self.finished?;
+        let mut parts = Vec::new();
+        if let Some(tenths) = self.factor_tenths() {
+            parts.push(format!("{}.{}x expected", tenths / 10, tenths % 10));
+        }
+        match self.shared_with.as_ref().map(Vec::len) {
+            Some(0) => parts.push("runner not shared".to_owned()),
+            Some(1) => parts.push("shared its runner with 1 other job".to_owned()),
+            Some(n) => parts.push(format!("shared its runner with {n} other jobs")),
+            None => {}
+        }
+        (!parts.is_empty()).then(|| parts.join(", "))
+    }
+}
+
+/// `<job> <load_text>` of the job a finished pipeline is judged by: its
+/// first `failed` job with a load text, else the job with the highest
+/// factor (the first of equals; jobs without a factor rank last), else the
+/// first job with a load text. `None` while `finished` is `None` or no job
+/// has a load text.
+pub fn pipeline_load(view: &PipelineView) -> Option<String> {
+    view.finished?;
+    let loaded: Vec<(&JobView, String)> = view
+        .jobs
+        .iter()
+        .filter_map(|job| job.load_text().map(|text| (job, text)))
+        .collect();
+    let mut slowest: Option<(u64, &(&JobView, String))> = None;
+    for entry in &loaded {
+        if let Some(factor) = entry.0.factor_tenths()
+            && slowest.is_none_or(|(best, _)| factor > best)
+        {
+            slowest = Some((factor, entry));
+        }
+    }
+    let (job, text) = loaded
+        .iter()
+        .find(|(job, _)| job.status == "failed")
+        .or(slowest.map(|(_, entry)| entry))
+        .or(loaded.first())?;
+    Some(format!("{} {text}", job.name))
 }
 
 /// One artifact set moving to the runner of a consuming job. Seconds since
@@ -791,6 +859,7 @@ mod tests {
                     assigned: Some(1_700_000_000),
                     transfers: Vec::new(),
                     expected_secs: None,
+                    shared_with: None,
                 },
                 JobView {
                     name: "test".to_owned(),
@@ -813,6 +882,7 @@ mod tests {
                         error: None,
                     }],
                     expected_secs: None,
+                    shared_with: None,
                 },
             ],
         }
@@ -850,12 +920,12 @@ mod tests {
             },
             CiRequest::Queue {
                 repo: "griasdi".to_owned(),
-                cron: Some("0 3 * * *".to_owned()),
+                nightly: true,
                 actor: "hannes@tuco-pc".to_owned(),
             },
             CiRequest::Queue {
                 repo: "griasdi".to_owned(),
-                cron: None,
+                nightly: false,
                 actor: "hannes@tuco-pc".to_owned(),
             },
             CiRequest::Cancel {
@@ -955,6 +1025,7 @@ mod tests {
                         channel: "dev".to_owned(),
                         latest: 7,
                         status: "running".to_owned(),
+                        load: Some("build 3.4x expected, runner not shared".to_owned()),
                     }],
                     machines: vec![
                         MachineView {
@@ -1039,6 +1110,7 @@ mod tests {
                         channel: "dev".to_owned(),
                         latest: 64,
                         status: "succeeded".to_owned(),
+                        load: None,
                     }],
                     head: Some(Box::new(pipeline())),
                     jobs_sha: Some("3635dad0".to_owned()),
@@ -1284,5 +1356,98 @@ mod tests {
                 (DocGroup::History, vec![5, 1]),
             ]
         );
+    }
+
+    /// A finished job that ran `secs` against `expected`, beside `shared`
+    /// other jobs.
+    fn ran(
+        name: &str,
+        status: &str,
+        secs: u64,
+        expected: Option<u64>,
+        shared: Option<usize>,
+    ) -> JobView {
+        let mut job = pipeline().jobs[0].clone();
+        job.name = name.to_owned();
+        job.status = status.to_owned();
+        job.started = Some(1000);
+        job.finished = Some(1000 + secs);
+        job.expected_secs = expected;
+        job.shared_with = shared.map(|n| (0..n).map(|i| format!("r#{i}/j")).collect());
+        job
+    }
+
+    #[test]
+    fn a_jobs_factor_is_its_run_time_over_the_expected_in_tenths() {
+        assert_eq!(
+            ran("a", "succeeded", 204, Some(60), None).factor_tenths(),
+            Some(34)
+        );
+        assert_eq!(
+            ran("a", "succeeded", 29, Some(60), None).factor_tenths(),
+            Some(5)
+        );
+        assert_eq!(
+            ran("a", "succeeded", 29, Some(0), None).factor_tenths(),
+            None
+        );
+        let mut running = ran("a", "running", 29, Some(60), None);
+        running.finished = None;
+        assert_eq!(running.factor_tenths(), None);
+    }
+
+    #[test]
+    fn a_jobs_load_says_its_factor_and_who_shared_its_runner() {
+        assert_eq!(
+            ran("a", "succeeded", 204, Some(60), Some(2))
+                .load_text()
+                .as_deref(),
+            Some("3.4x expected, shared its runner with 2 other jobs")
+        );
+        assert_eq!(
+            ran("a", "succeeded", 60, Some(60), Some(0))
+                .load_text()
+                .as_deref(),
+            Some("1.0x expected, runner not shared")
+        );
+        assert_eq!(
+            ran("a", "succeeded", 9, None, Some(1))
+                .load_text()
+                .as_deref(),
+            Some("shared its runner with 1 other job")
+        );
+        assert_eq!(ran("a", "succeeded", 60, None, None).load_text(), None);
+        let mut running = ran("a", "running", 60, Some(60), Some(0));
+        running.finished = None;
+        assert_eq!(running.load_text(), None);
+    }
+
+    #[test]
+    fn a_pipeline_is_judged_by_its_failed_job_else_its_slowest() {
+        let mut view = pipeline();
+        view.finished = Some(2000);
+        view.jobs = vec![
+            ran("fast", "succeeded", 60, Some(60), Some(0)),
+            ran("slow", "succeeded", 300, Some(60), Some(1)),
+            ran("broke", "failed", 90, Some(60), Some(0)),
+        ];
+        assert_eq!(
+            pipeline_load(&view).as_deref(),
+            Some("broke 1.5x expected, runner not shared")
+        );
+        view.jobs.pop();
+        view.jobs
+            .push(ran("unknown", "succeeded", 9, None, Some(3)));
+        assert_eq!(
+            pipeline_load(&view).as_deref(),
+            Some("slow 5.0x expected, shared its runner with 1 other job")
+        );
+        view.jobs = vec![ran("unknown", "succeeded", 9, None, Some(3))];
+        assert_eq!(
+            pipeline_load(&view).as_deref(),
+            Some("unknown shared its runner with 3 other jobs")
+        );
+        view.finished = None;
+        assert_eq!(pipeline_load(&view), None);
     }
 }

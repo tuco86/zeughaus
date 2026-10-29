@@ -32,15 +32,14 @@ tokio = { version = "1", features = [
 serde.workspace = true
 serde_json = "1"
 # `ci.toml` and the `.zeughaus-ci` job headers, webhook signatures (hmac and
-# sha2 share one `digest` major), the hook's HTTP intake, cron schedules in
-# the local time zone, and the basic-auth header a mirror fetch presents.
+# sha2 share one `digest` major), the hook's HTTP intake, the nightly round's
+# local time, and the basic-auth header a mirror fetch presents.
 toml.workspace = true
 hmac = "0.13"
 sha2 = "0.11"
 hex = "0.4"
 base64 = "0.23"
 tiny_http = "0.12"
-croner = "4"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # The CI follows a release channel like the runners: it replaces its own
 # binary and restarts into it.

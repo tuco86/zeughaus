@@ -225,7 +225,6 @@ fn handle(
             kind,
             git_ref: short.to_owned(),
             sha: Some(after.to_owned()),
-            cron: None,
             actor: actor.to_owned(),
             delivery: delivery.map(str::to_owned),
             upload: None,

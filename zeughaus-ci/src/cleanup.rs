@@ -78,7 +78,6 @@ mod tests {
                 kind: EventKind::Push,
                 git_ref: "main".to_owned(),
                 sha: None,
-                cron: None,
                 actor: "test".to_owned(),
                 delivery: None,
                 upload: None,

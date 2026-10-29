@@ -21,7 +21,10 @@ use crate::files::{read_json, write_json};
 pub enum EventKind {
     Push,
     Tag,
-    Cron,
+    /// Started by the CI's nightly round or queued by hand. Records and
+    /// queue files written while nightlies were cron events say `cron`.
+    #[serde(alias = "cron")]
+    Nightly,
     /// A working-tree snapshot an editor's agent uploaded on `/manual`, to
     /// run named jobs of the repository's pipeline from.
     Manual,
@@ -32,7 +35,7 @@ impl fmt::Display for EventKind {
         f.write_str(match self {
             EventKind::Push => "push",
             EventKind::Tag => "tag",
-            EventKind::Cron => "cron",
+            EventKind::Nightly => "nightly",
             EventKind::Manual => "manual",
         })
     }
@@ -45,10 +48,10 @@ impl FromStr for EventKind {
         match s {
             "push" => Ok(EventKind::Push),
             "tag" => Ok(EventKind::Tag),
-            "cron" => Ok(EventKind::Cron),
+            "nightly" => Ok(EventKind::Nightly),
             "manual" => Ok(EventKind::Manual),
             other => Err(format!(
-                "unknown event kind `{other}` (push, tag, cron or manual)"
+                "unknown event kind `{other}` (push, tag, nightly or manual)"
             )),
         }
     }
@@ -62,8 +65,6 @@ pub struct CiEvent {
     /// default branch for a manual run.
     pub git_ref: String,
     pub sha: Option<String>,
-    /// The normalized cron expression of a cron event.
-    pub cron: Option<String>,
     pub actor: String,
     pub delivery: Option<String>,
     /// The id of the upload a manual run carries, the directory
@@ -93,7 +94,7 @@ pub fn write_inbox(state_dir: &Path, event: &CiEvent) -> Result<PathBuf, String>
     Ok(path)
 }
 
-/// `<repo>.<kind>.<first 12 hex of sha256(git_ref \n cron)>`, and for a manual
+/// `<repo>.<kind>.<first 12 hex of sha256(git_ref \n)>`, and for a manual
 /// run `<repo>.manual.<upload>`: every manual run runs, none replaces another.
 pub fn queue_key(event: &CiEvent) -> String {
     if let (EventKind::Manual, Some(upload)) = (event.kind, &event.upload) {
@@ -102,7 +103,6 @@ pub fn queue_key(event: &CiEvent) -> String {
     let mut hasher = Sha256::new();
     hasher.update(event.git_ref.as_bytes());
     hasher.update(b"\n");
-    hasher.update(event.cron.as_deref().unwrap_or_default().as_bytes());
     let digest = hex::encode(hasher.finalize());
     format!("{}.{}.{}", event.repo, event.kind, &digest[..12])
 }
@@ -215,7 +215,6 @@ mod tests {
             kind: EventKind::Push,
             git_ref: "main".into(),
             sha: Some(sha.into()),
-            cron: None,
             actor: "manual".into(),
             delivery: None,
             upload: None,
@@ -224,14 +223,14 @@ mod tests {
     }
 
     #[test]
-    fn key_distinguishes_ref_kind_and_cron() {
+    fn key_distinguishes_ref_and_kind() {
         let a = event("x", 0);
         let mut b = a.clone();
         b.git_ref = "dev".into();
         let mut c = a.clone();
         c.kind = EventKind::Tag;
         let mut d = a.clone();
-        d.cron = Some("0 4 * * *".into());
+        d.kind = EventKind::Nightly;
         let keys = [a.clone(), b, c, d].map(|e| queue_key(&e));
         for i in 0..keys.len() {
             for j in i + 1..keys.len() {
@@ -240,6 +239,18 @@ mod tests {
         }
         assert!(queue_key(&a).starts_with("smoke.push."));
         assert_eq!(queue_key(&a).len(), "smoke.push.".len() + 12);
+    }
+
+    /// Queue files and pipeline records from before the nightly round say
+    /// `cron` and carry a `cron` field; they still read, as nightlies.
+    #[test]
+    fn an_old_cron_event_reads_as_a_nightly() {
+        let old: CiEvent = serde_json::from_str(
+            r#"{"repo":"r","kind":"cron","git_ref":"main","sha":null,"cron":"0 3 * * *","actor":"cron","delivery":null,"received":0}"#,
+        )
+        .unwrap();
+        assert_eq!(old.kind, EventKind::Nightly);
+        assert_eq!(old.git_ref, "main");
     }
 
     /// Every manual run is its own key, so none replaces another still
@@ -265,7 +276,7 @@ mod tests {
         for kind in [
             EventKind::Push,
             EventKind::Tag,
-            EventKind::Cron,
+            EventKind::Nightly,
             EventKind::Manual,
         ] {
             assert_eq!(kind.to_string().parse::<EventKind>().unwrap(), kind);

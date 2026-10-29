@@ -29,6 +29,31 @@ pub struct CiConfig {
     pub repos: BTreeMap<String, RepoConfig>,
     /// Where the values of the secrets named below live.
     pub secrets: Option<SecretsConfig>,
+    /// When the CI runs every repository's nightly; no round without it.
+    #[serde(default)]
+    pub nightly: Option<NightlyConfig>,
+}
+
+/// `[nightly]`: the CI-wide time of the nightly round.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NightlyConfig {
+    /// `HH:MM` in the CI host's local time. A time inside a skipped DST
+    /// hour does not occur that day.
+    at: String,
+    /// `at`, parsed by `validate`.
+    #[serde(skip)]
+    pub time: chrono::NaiveTime,
+}
+
+/// `HH:MM`, both parts exactly two ASCII digits, 00:00 to 23:59.
+pub fn parse_clock(text: &str) -> Option<chrono::NaiveTime> {
+    let (hours, minutes) = text.split_once(':')?;
+    let two_digits = |s: &str| s.len() == 2 && s.bytes().all(|b| b.is_ascii_digit());
+    if !two_digits(hours) || !two_digits(minutes) {
+        return None;
+    }
+    chrono::NaiveTime::from_hms_opt(hours.parse().ok()?, minutes.parse().ok()?, 0)
 }
 
 fn default_mount() -> String {
@@ -139,7 +164,7 @@ impl RepoConfig {
         self.grants.get(secret).is_some_and(|patterns| {
             patterns
                 .iter()
-                .any(|p| Pattern::parse_grant(p).is_ok_and(|p| p.matches(event)))
+                .any(|p| Pattern::parse(p).is_ok_and(|p| p.matches(event)))
         })
     }
 
@@ -266,6 +291,14 @@ impl CiConfig {
                 ));
             }
         }
+        if let Some(nightly) = &mut self.nightly {
+            nightly.time = parse_clock(&nightly.at).ok_or_else(|| {
+                format!(
+                    "[nightly]: `at` must be HH:MM (00:00 to 23:59), not `{}`",
+                    nightly.at
+                )
+            })?;
+        }
         if let Some(secrets) = &mut self.secrets {
             secrets.addr = secrets.addr.trim_end_matches('/').to_string();
             for (field, value) in [
@@ -298,7 +331,7 @@ impl CiConfig {
             }
             for (secret, patterns) in &repo.grants {
                 for pattern in patterns {
-                    Pattern::parse_grant(pattern)
+                    Pattern::parse(pattern)
                         .map_err(|e| format!("repo `{name}`: grant for {secret}: {e}"))?;
                 }
             }
@@ -355,7 +388,7 @@ fetch_user = "x-access-token"
 status_token = "GITHUB_TOKEN"
 webhook_secret = "GRIASDI_WEBHOOK_SECRET"
 [repos.griasdi.grants]
-GITHUB_TOKEN = ["tag v*", "cron *"]
+GITHUB_TOKEN = ["tag v*", "nightly"]
 [secrets]
 addr = "http://10.8.0.1:8200/"
 path = "zeughaus/ci"
@@ -375,7 +408,6 @@ forge = "none"
             kind,
             git_ref: git_ref.into(),
             sha: None,
-            cron: None,
             actor: "t".into(),
             delivery: None,
             upload: None,
@@ -482,7 +514,7 @@ forge = "none"
         assert!(parse("[repos.Bad]\nurl = \"x\"").is_err());
         assert!(parse("[repos.a]\nurl = \"x\"\nfetch_token = \"lower\"").is_err());
         assert!(parse("[repos.a]\nurl = \"x\"\n[repos.a.grants]\nlower = []").is_err());
-        assert!(parse("[repos.a]\nurl = \"x\"\n[repos.a.grants]\nA = [\"cron 1 2\"]").is_err());
+        assert!(parse("[repos.a]\nurl = \"x\"\n[repos.a.grants]\nA = [\"cron *\"]").is_err());
         assert!(parse("[repos.a]\nurl = \"x\"\nforge = \"github\"").is_err());
     }
 
@@ -509,10 +541,28 @@ forge = "none"
         assert!(repo.grants("GITHUB_TOKEN", &event(EventKind::Tag, "v1.2")));
         assert!(!repo.grants("GITHUB_TOKEN", &event(EventKind::Tag, "x1")));
         assert!(!repo.grants("GITHUB_TOKEN", &event(EventKind::Push, "main")));
-        let mut cron = event(EventKind::Cron, "main");
-        cron.cron = Some("0 4 * * *".into());
-        assert!(repo.grants("GITHUB_TOKEN", &cron));
-        assert!(!repo.grants("OTHER", &cron));
+        let nightly = event(EventKind::Nightly, "main");
+        assert!(repo.grants("GITHUB_TOKEN", &nightly));
+        assert!(!repo.grants("OTHER", &nightly));
+    }
+
+    #[test]
+    fn the_nightly_round_is_at_a_clock_time() {
+        let parse = |extra: &str| CiConfig::parse(&format!("{}{extra}", with_runners("")));
+        assert!(parse("").unwrap().nightly.is_none());
+        let config = parse("[nightly]\nat = \"03:00\"").unwrap();
+        assert_eq!(
+            config.nightly.unwrap().time,
+            chrono::NaiveTime::from_hms_opt(3, 0, 0).unwrap()
+        );
+        for at in ["3:00", "24:00", "03:60", "0a:00", "+3:00"] {
+            let err = parse(&format!("[nightly]\nat = \"{at}\"")).unwrap_err();
+            assert_eq!(
+                err,
+                format!("[nightly]: `at` must be HH:MM (00:00 to 23:59), not `{at}`")
+            );
+        }
+        assert!(parse("[nightly]\nat = \"03:00\"\nevery = 1").is_err());
     }
 
     #[test]
