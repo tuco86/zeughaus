@@ -256,7 +256,7 @@ impl CiServer {
         CiOverview {
             channels: channel_views(&pipelines),
             machines: self.machine_views(&pipelines),
-            queued: queued_views(&pipelines, &queued),
+            queued: queued_views(&pipelines, &queued, &self.config),
             platforms: self.platforms(),
             repos: docs::summary(&self.state_dir, &self.config),
             build: zeughaus_update::manifest::own_build(),
@@ -1083,17 +1083,21 @@ fn channel_views(pipelines: &[Pipeline]) -> Vec<ChannelView> {
 
 /// The queued events, each in the channel of the newest pipeline that had
 /// its queue key (the same repository, kind and ref), else in the
-/// channel its event names without a `channels.toml`.
-fn queued_views(pipelines: &[Pipeline], queued: &[event::CiEvent]) -> Vec<QueuedView> {
+/// channel its event names without a `channels.toml`. A manual run is shown
+/// where a push to the default branch lands.
+fn queued_views(
+    pipelines: &[Pipeline],
+    queued: &[event::CiEvent],
+    config: &CiConfig,
+) -> Vec<QueuedView> {
     queued
         .iter()
         .map(|queued| {
-            let key = event::queue_key(queued);
-            let channel = pipelines
-                .iter()
-                .filter(|p| p.repo == queued.repo && p.key == key)
-                .max_by_key(|p| p.number)
-                .map_or_else(|| crate::channels::fallback(queued), Pipeline::channel);
+            let channel = config
+                .repos
+                .get(&queued.repo)
+                .and_then(|repo| scheduler::channel_before(pipelines, queued, &repo.default_branch))
+                .unwrap_or_else(|| crate::channels::fallback(queued));
             QueuedView {
                 repo: queued.repo.clone(),
                 channel,
@@ -1333,7 +1337,8 @@ mod tests {
         rerun.actor = "rerun of #4".to_owned();
         let mut feature = dev.event.clone();
         feature.git_ref = "feature/x".to_owned();
-        let shown = queued_views(&[dev], &[rerun, feature]);
+        let config = config("[repos.griasdi]\nurl = \"git@example.org:me/griasdi.git\"\n");
+        let shown = queued_views(&[dev], &[rerun, feature], &config);
         let channels: Vec<(&str, &str)> = shown
             .iter()
             .map(|q| (q.channel.as_str(), q.actor.as_str()))

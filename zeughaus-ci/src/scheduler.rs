@@ -391,6 +391,32 @@ pub fn load_pipeline(state_dir: &Path, repo: &str, number: u64) -> Result<Pipeli
     crate::files::read_json(&path).map_err(|e| format!("{repo} #{number}: {e}"))
 }
 
+/// The channel of the newest pipeline in `pipelines` that `event` shares a
+/// queue key with: the same repository, kind and ref. A manual run counts
+/// as a push to `default_branch`, where `set_up_manual` puts it. `None` when
+/// there is no such pipeline.
+pub fn channel_before(
+    pipelines: &[Pipeline],
+    event: &CiEvent,
+    default_branch: &str,
+) -> Option<String> {
+    let key = if event.kind == EventKind::Manual {
+        event::queue_key(&CiEvent {
+            kind: EventKind::Push,
+            git_ref: default_branch.to_owned(),
+            upload: None,
+            ..event.clone()
+        })
+    } else {
+        event::queue_key(event)
+    };
+    pipelines
+        .iter()
+        .filter(|p| p.repo == event.repo && p.key == key)
+        .max_by_key(|p| p.number)
+        .map(Pipeline::channel)
+}
+
 fn next_number(state_dir: &Path, repo: &str) -> u64 {
     std::fs::read_dir(pipelines_dir(state_dir, repo))
         .map(|entries| {
@@ -732,7 +758,7 @@ impl Scheduler {
             created: crate::now_secs(),
             finished: None,
             jobs: Vec::new(),
-            channel: channels::fallback(&event),
+            channel: String::new(),
             clean: false,
         };
         let setup = match (event.kind, &repo) {
@@ -755,6 +781,22 @@ impl Scheduler {
                 pipeline.status = PipelineStatus::Error;
                 pipeline.note = e.clone();
                 pipeline.finished = Some(crate::now_secs());
+                // A setup that failed before its channel was known (an
+                // unreadable channels.toml, a fetch that failed) stays with
+                // its ref's pipelines instead of opening a channel named
+                // after the ref.
+                if pipeline.channel.is_empty() {
+                    pipeline.channel = repo
+                        .as_ref()
+                        .and_then(|repo| {
+                            channel_before(
+                                &load_repo_pipelines(&self.state_dir, &name),
+                                &event,
+                                &repo.default_branch,
+                            )
+                        })
+                        .unwrap_or_else(|| channels::fallback(&event));
+                }
                 pipeline.save(&self.state_dir, &self.changes);
                 self.post(
                     &pipeline,
@@ -2503,6 +2545,49 @@ mod tests {
     }
 
     #[test]
+    fn an_event_belongs_to_the_channel_of_the_newest_pipeline_of_its_ref() {
+        let record = |number, channel: &str, edit: fn(&mut CiEvent)| {
+            let mut p = pipeline(channel);
+            p.number = number;
+            edit(&mut p.event);
+            p.key = event::queue_key(&p.event);
+            p
+        };
+        let records = [
+            record(1, "old", |_| {}),
+            record(3, "dev", |_| {}),
+            record(5, "manual-only", |e| {
+                e.kind = EventKind::Manual;
+                e.upload = Some("u1".to_owned());
+            }),
+        ];
+        let push = pipeline("").event;
+        assert_eq!(
+            channel_before(&records, &push, "main").as_deref(),
+            Some("dev")
+        );
+        let manual = CiEvent {
+            kind: EventKind::Manual,
+            upload: Some("u2".to_owned()),
+            ..push.clone()
+        };
+        assert_eq!(
+            channel_before(&records, &manual, "main").as_deref(),
+            Some("dev")
+        );
+        let feature = CiEvent {
+            git_ref: "feature/x".to_owned(),
+            ..push.clone()
+        };
+        assert_eq!(channel_before(&records, &feature, "main"), None);
+        let other = CiEvent {
+            repo: "other".to_owned(),
+            ..push
+        };
+        assert_eq!(channel_before(&records, &other, "main"), None);
+    }
+
+    #[test]
     fn a_record_from_before_enlisting_still_loads() {
         let old = r#"{"def":{"name":"a","file":"a.sh","on":[],"needs":[],"image":null,
             "machine":null,"cache":[],"secrets":[],"when_busy":"wait","env":{},
@@ -3350,6 +3435,71 @@ mod tests {
                     .collect();
                 assert_eq!(jobs, [("a", &["context"][..]), ("b", &["context"][..])]);
             }
+            let _ = std::fs::remove_dir_all(&origin);
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_setup_error_lands_in_the_channel_of_its_refs_pipelines() {
+            let origin = scratch("setup-error-origin");
+            let state = scratch("setup-error-state");
+            let author = [
+                ("GIT_AUTHOR_NAME".to_owned(), "t".to_owned()),
+                ("GIT_AUTHOR_EMAIL".to_owned(), "t@t".to_owned()),
+                ("GIT_COMMITTER_NAME".to_owned(), "t".to_owned()),
+                ("GIT_COMMITTER_EMAIL".to_owned(), "t@t".to_owned()),
+            ];
+            let ci = origin.join(CI_DIR);
+            std::fs::create_dir_all(&ci).unwrap();
+            std::fs::write(
+                ci.join("a.sh"),
+                "# /// ci\n# on = [\"push main\"]\n# ///\necho\n",
+            )
+            .unwrap();
+            std::fs::write(
+                ci.join("channels.toml"),
+                "[[channel]]\nname = \"nightly\"\non = [\"cron 0 3 * * *\"]\n",
+            )
+            .unwrap();
+            git(&origin, &["init", "-q", "-b", "main"], &author).unwrap();
+            git(&origin, &["add", "."], &author).unwrap();
+            git(&origin, &["commit", "-q", "-m", "ci"], &author).unwrap();
+            git(&origin, &["branch", "other"], &author).unwrap();
+
+            let config = Arc::new(
+                CiConfig::parse(&format!(
+                    "default_runner = \"x\"\n\
+                     [runners.x]\nfingerprint = \"{FP_1}\"\n\
+                     [repos.view]\nurl = '{}'\n",
+                    origin.display()
+                ))
+                .expect("a valid config"),
+            );
+            let mut s = scheduler_over(&state, config);
+            let mut dev = numbered(1, Vec::new());
+            dev.status = PipelineStatus::Succeeded;
+            dev.key = event::queue_key(&dev.event);
+            dev.save(&state, &s.changes);
+
+            let queue = Path::new("/nonexistent/queue.json");
+            let event = dev.event.clone();
+            s.start_pipeline(queue, event.clone(), event::queue_key(&event));
+            let failed = load_pipeline(&state, "view", 2).expect("record #2");
+            assert_eq!(failed.status, PipelineStatus::Error);
+            assert!(
+                failed.note.contains("unknown pattern kind `cron`"),
+                "{}",
+                failed.note
+            );
+            assert_eq!(failed.channel(), "dev");
+
+            let other = CiEvent {
+                git_ref: "other".to_owned(),
+                ..event
+            };
+            s.start_pipeline(queue, other.clone(), event::queue_key(&other));
+            let fresh = load_pipeline(&state, "view", 3).expect("record #3");
+            assert_eq!(fresh.channel(), "other");
             let _ = std::fs::remove_dir_all(&origin);
             let _ = std::fs::remove_dir_all(&state);
         }
