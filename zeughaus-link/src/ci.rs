@@ -596,6 +596,10 @@ pub struct JobView {
     /// The inputs that moved to the job's runner.
     #[serde(default)]
     pub transfers: Vec<TransferView>,
+    /// Expected run time in seconds, measured from the job's last succeeded
+    /// runs at its place; `None` without one.
+    #[serde(default)]
+    pub expected_secs: Option<u64>,
 }
 
 /// One artifact set moving to the runner of a consuming job. Seconds since
@@ -786,6 +790,7 @@ mod tests {
                     excerpt: None,
                     assigned: Some(1_700_000_000),
                     transfers: Vec::new(),
+                    expected_secs: None,
                 },
                 JobView {
                     name: "test".to_owned(),
@@ -807,6 +812,7 @@ mod tests {
                         moved: Some(2_000_000),
                         error: None,
                     }],
+                    expected_secs: None,
                 },
             ],
         }

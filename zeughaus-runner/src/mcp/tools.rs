@@ -1612,6 +1612,7 @@ mod tests {
             excerpt: None,
             assigned: None,
             transfers: Vec::new(),
+            expected_secs: None,
         }
     }
 

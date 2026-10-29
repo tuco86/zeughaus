@@ -2784,6 +2784,7 @@ mod tests {
             excerpt: None,
             assigned: None,
             transfers: Vec::new(),
+            expected_secs: None,
         };
         assert_eq!(
             note(&job("skipped: gate failed (#4)")),
@@ -2811,6 +2812,7 @@ mod tests {
             excerpt: None,
             assigned: None,
             transfers,
+            expected_secs: None,
         }
     }
 

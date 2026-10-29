@@ -31,7 +31,7 @@ use crate::header::JobDef;
 use crate::runners::Runners;
 use crate::secrets::Secrets;
 use crate::streak::{self, Streak};
-use crate::{CI_DIR, cleanup, excerpt, manual, pipeline};
+use crate::{CI_DIR, cleanup, excerpt, expected, manual, pipeline};
 
 const TICK: Duration = Duration::from_secs(1);
 /// How often a repository's cron schedules are re-read without a push.
@@ -150,6 +150,10 @@ pub struct JobRecord {
     /// The end of a failed run's log (see [`excerpt`]).
     #[serde(default)]
     pub excerpt: Option<String>,
+    /// Expected run time in seconds, measured when the job was handed to its
+    /// runner ([`crate::expected`]); `None` without a succeeded run at its place.
+    #[serde(default)]
+    pub expected_secs: Option<u64>,
 }
 
 /// One artifact set moving to the runner of a consuming job. Times are
@@ -850,6 +854,7 @@ impl Scheduler {
                 place: Some(planned.place),
                 artifacts: false,
                 excerpt: None,
+                expected_secs: None,
             })
             .collect();
         pipeline.save(&self.state_dir, &self.changes);
@@ -1536,10 +1541,18 @@ impl Scheduler {
             return;
         }
         self.ready_since.remove(&key);
+        let expected = expected::expected_secs(
+            &load_repo_pipelines(&self.state_dir, &pipeline.repo),
+            pipeline.event.kind,
+            &name,
+            &runner,
+            &place,
+        );
         let record = &mut self.running[pi].jobs[ji];
         record.status = JobStatus::Starting;
         record.started = Some(now);
         record.assigned = Some(now);
+        record.expected_secs = expected;
         record.note.clear();
         self.running[pi].save(&self.state_dir, &self.changes);
         let pipeline = self.running[pi].clone();
@@ -2827,6 +2840,7 @@ mod tests {
             place: Some(Place::Host),
             artifacts: false,
             excerpt: None,
+            expected_secs: None,
         }
     }
 

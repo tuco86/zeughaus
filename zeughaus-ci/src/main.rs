@@ -10,6 +10,7 @@ mod docs;
 mod enlist;
 mod event;
 mod excerpt;
+mod expected;
 mod files;
 mod forge;
 mod header;

@@ -1042,6 +1042,7 @@ fn job_view(job: &JobRecord) -> JobView {
                 error: t.error.clone(),
             })
             .collect(),
+        expected_secs: job.expected_secs,
     }
 }
 
@@ -1266,6 +1267,7 @@ mod tests {
             place,
             artifacts: false,
             excerpt: None,
+            expected_secs: None,
         }
     }
 

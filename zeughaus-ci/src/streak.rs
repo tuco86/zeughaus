@@ -185,6 +185,7 @@ mod tests {
             place: None,
             artifacts: false,
             excerpt: None,
+            expected_secs: None,
         }
     }
 
