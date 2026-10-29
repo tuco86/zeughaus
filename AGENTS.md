@@ -200,7 +200,8 @@ change is announced as `CiDocs` on `/events`. A CI section's repository
 group starts with its Plans tab, whose `Plan session` and `Master` buttons
 ask the editor's own runner on `/agent` (Unix) to open `zeughaus-runner
 plan <repo>` or `master <repo>` in a terminal of its `Triggered` group, in
-the checkout `~/work/<origin>` (`$ZEUGHAUS_WORK` overrides `~/work`):
+the checkout `~/work/<origin>` (`$ZEUGHAUS_WORK` overrides `~/work`; a
+missing one is cloned over ssh from the origin in that terminal first):
 `plan` brings the detached worktree `<checkout>-plan` to `origin/<default
 branch>` and execs omp in plan mode there; `master` claims approved plans
 one after another and runs `omp @<plan> <instruction>` with

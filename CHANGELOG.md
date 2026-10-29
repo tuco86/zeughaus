@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   review with `Save and approve`, `Save` (both store the plan in the CI and
   end the session) and `Refine`. `zeughaus-runner ci plan-save --approve`
   approves the plan as it is stored.
+- `Plan session` and `Master` no longer refuse a repository without a
+  checkout under the work root: the session clones it over ssh from the
+  origin (`git@<host>:<owner>/<repo>.git`) in its terminal and goes on.
 - A runner on Windows enlists into the CI. It runs `.ps1` jobs on its own
   host under its `timeout` subcommand, which a job object backs on
   Windows. `ci.toml` marks such a runner `os = "windows"`; the CI places
