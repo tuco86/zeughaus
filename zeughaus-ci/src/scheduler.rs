@@ -417,6 +417,31 @@ pub fn channel_before(
         .map(Pipeline::channel)
 }
 
+/// Deletes the record of finished pipeline `number` of `repo` and its
+/// transcripts (`<n>.runs/`). Refuses a running pipeline, whose record the
+/// scheduler writes again, and the repository's newest one, whose number
+/// `next_number` would hand out again.
+pub fn forget_pipeline(state_dir: &Path, repo: &str, number: u64) -> Result<(), String> {
+    let pipeline = load_pipeline(state_dir, repo, number)?;
+    if pipeline.status == PipelineStatus::Running {
+        return Err(format!("{repo} #{number} is running; cancel it first"));
+    }
+    if next_number(state_dir, repo) == number + 1 {
+        return Err(format!(
+            "{repo} #{number} is the newest pipeline of {repo}; forgetting it would hand its number out again"
+        ));
+    }
+    let dir = pipelines_dir(state_dir, repo);
+    std::fs::remove_file(dir.join(format!("{number}.json")))
+        .map_err(|e| format!("cannot remove {repo} #{number}: {e}"))?;
+    match std::fs::remove_dir_all(dir.join(format!("{number}.runs"))) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!(
+            "{repo} #{number}: record removed, transcripts not: {e}"
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn next_number(state_dir: &Path, repo: &str) -> u64 {
     std::fs::read_dir(pipelines_dir(state_dir, repo))
         .map(|entries| {
@@ -3501,6 +3526,35 @@ mod tests {
             let fresh = load_pipeline(&state, "view", 3).expect("record #3");
             assert_eq!(fresh.channel(), "other");
             let _ = std::fs::remove_dir_all(&origin);
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn forgetting_removes_a_finished_record_and_refuses_running_and_newest() {
+            let state = scratch("forget");
+            let (tx, _rx) = std::sync::mpsc::channel();
+            for (number, status) in [
+                (1, PipelineStatus::Error),
+                (2, PipelineStatus::Running),
+                (3, PipelineStatus::Succeeded),
+            ] {
+                let mut p = numbered(number, Vec::new());
+                p.status = status;
+                p.save(&state, &tx);
+            }
+            std::fs::create_dir_all(transcript_dir(&state, "view", 1, "build")).unwrap();
+            let dir = pipelines_dir(&state, "view");
+
+            forget_pipeline(&state, "view", 1).expect("#1 is forgotten");
+            assert!(!dir.join("1.json").exists());
+            assert!(!dir.join("1.runs").exists());
+            let running = forget_pipeline(&state, "view", 2).unwrap_err();
+            assert!(running.contains("is running"), "{running}");
+            let newest = forget_pipeline(&state, "view", 3).unwrap_err();
+            assert!(newest.contains("newest"), "{newest}");
+            assert!(forget_pipeline(&state, "view", 9).is_err());
+            assert!(dir.join("2.json").exists());
+            assert!(dir.join("3.json").exists());
             let _ = std::fs::remove_dir_all(&state);
         }
 

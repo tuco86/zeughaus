@@ -11,6 +11,7 @@
 //! run <repo> nightly
 //! status [N]
 //! log <repo> <pipeline> <job> [--tail N]
+//! forget <repo> <pipeline>
 //! forge-check <repo>
 //! secrets-check
 //! version
@@ -21,8 +22,8 @@
 //! `check` reads the folder, and the state directory's `ci.toml` when there
 //! is one, to place every job as a pipeline would; `plan` reads only the
 //! folder; the others read `ci.toml`. Only `serve` is the service: `run`
-//! drops an event into the inbox its scheduler drains, and `status` and
-//! `log` read its records.
+//! drops an event into the inbox its scheduler drains, `status` and `log`
+//! read its records, and `forget` deletes one.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -46,7 +47,8 @@ use crate::streak;
 const USAGE: &str = "usage: zeughaus-ci [--state-dir DIR] serve --listen <host:port> \
 [--hook <host:port>] | check [DIR] | plan [DIR] <push|tag> <ref> | plan [DIR] nightly | \
 run <repo> <push|tag> <ref> [<sha>] | run <repo> nightly | status [N] | \
-log <repo> <pipeline> <job> [--tail N] | forge-check <repo> | secrets-check | version | \
+log <repo> <pipeline> <job> [--tail N] | forget <repo> <pipeline> | forge-check <repo> | \
+secrets-check | version | \
 update status|rollback | install ci [--channel C] [--from DIR] [--no-service]";
 
 pub fn main() -> ExitCode {
@@ -82,6 +84,7 @@ fn run(args: &[String], state_dir: &Path) -> ExitCode {
         Some("run") => queue(state_dir, &args[1..]),
         Some("status") => status(state_dir, &args[1..]),
         Some("log") => log(state_dir, &args[1..]),
+        Some("forget") => forget(state_dir, &args[1..]),
         Some("forge-check") => forge_check(state_dir, &args[1..]),
         Some("secrets-check") => secrets_check(state_dir, &args[1..]),
         // What the updater runs a new binary with before it trusts it.
@@ -403,10 +406,7 @@ fn log(state_dir: &Path, args: &[String]) -> Result<(), String> {
         ),
         _ => return Err(USAGE.to_owned()),
     };
-    let number = number
-        .trim_start_matches('#')
-        .parse::<u64>()
-        .map_err(|_| format!("{number:?} is not a pipeline number"))?;
+    let number = pipeline_number(number)?;
     let pipeline = scheduler::load_pipeline(state_dir, repo, number)?;
     if !pipeline.jobs.iter().any(|j| j.def.name == *job) {
         return Err(format!("{repo} #{number} has no job {job}"));
@@ -422,6 +422,28 @@ fn log(state_dir: &Path, args: &[String]) -> Result<(), String> {
     out.push('\n');
     print_out(&out);
     Ok(())
+}
+
+/// Deletes one finished pipeline record and its transcripts: a stray
+/// channel goes away with its last record.
+fn forget(state_dir: &Path, args: &[String]) -> Result<(), String> {
+    let [repo, number] = args else {
+        return Err("usage: zeughaus-ci forget <repo> <pipeline>".to_owned());
+    };
+    if !crate::config::valid_name(repo) {
+        return Err(format!("{repo:?} is no repository name"));
+    }
+    let number = pipeline_number(number)?;
+    scheduler::forget_pipeline(state_dir, repo, number)?;
+    println!("forgot {repo} #{number}");
+    Ok(())
+}
+
+/// A pipeline number as `status` prints it, with or without its `#`.
+fn pipeline_number(arg: &str) -> Result<u64, String> {
+    arg.trim_start_matches('#')
+        .parse::<u64>()
+        .map_err(|_| format!("{arg:?} is not a pipeline number"))
 }
 
 /// Writes to stdout, quietly stopping when the reader went away (`| head`).
