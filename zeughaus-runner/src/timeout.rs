@@ -8,7 +8,10 @@
 //! exit status is 124 when the deadline ended the run, otherwise the child's
 //! code (`128 + signal` for a signal). A `SIGHUP`, `SIGINT` or `SIGTERM` sent
 //! to this process goes to the child's group too: the group is not the
-//! terminal's foreground group, so nothing else would deliver it.
+//! terminal's foreground group, so nothing else would deliver it. Once the
+//! child has exited, by any cause, whatever its group still holds is killed
+//! with `SIGKILL`: a job's processes end with it, as a Windows job object's
+//! do.
 //!
 //! On Windows the child runs in a job object, which has no gentle stop: the
 //! deadline terminates every process in it with 124. The job also ends with
@@ -86,6 +89,34 @@ mod signals {
     }
 }
 
+/// Whether `pid` (a child of this process) has exited, without reaping it:
+/// while its zombie holds the pid, the group id it named cannot be reused,
+/// so a signal to that group cannot reach an unrelated one.
+#[cfg(unix)]
+fn has_exited(pid: libc::pid_t) -> std::io::Result<bool> {
+    // SAFETY: plain data, zeroed so that "nothing exited" reads as si_pid 0.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` outlives the call.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc == -1 {
+        let e = std::io::Error::last_os_error();
+        return if e.kind() == std::io::ErrorKind::Interrupted {
+            Ok(false)
+        } else {
+            Err(e)
+        };
+    }
+    // SAFETY: filled by waitid or still zeroed.
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
 /// Runs the request to its end and returns the exit status to leave with.
 #[cfg(unix)]
 pub fn run(request: &Request) -> i32 {
@@ -108,17 +139,23 @@ pub fn run(request: &Request) -> i32 {
     let mut timed_out = false;
     let mut kill_at: Option<Instant> = None;
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                return if timed_out {
-                    124
-                } else {
-                    status
+        match has_exited(group) {
+            Ok(true) => {
+                // SAFETY: the unreaped child keeps the group id ours; ESRCH
+                // only means nothing is left in it.
+                unsafe { libc::killpg(group, libc::SIGKILL) };
+                return match child.wait() {
+                    Ok(_) if timed_out => 124,
+                    Ok(status) => status
                         .code()
-                        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+                        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
+                    Err(e) => {
+                        eprintln!("[timeout] cannot wait for {}: {e}", request.program);
+                        125
+                    }
                 };
             }
-            Ok(None) => {}
+            Ok(false) => {}
             Err(e) => {
                 eprintln!("[timeout] cannot wait for {}: {e}", request.program);
                 return 125;

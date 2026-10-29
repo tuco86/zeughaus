@@ -180,6 +180,9 @@ enum Io {
     Local {
         master: Mutex<Box<dyn MasterPty + Send>>,
         killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+        /// The child's pid, which is also its process group id; 0 if unknown.
+        #[cfg(unix)]
+        pid: u32,
     },
     #[cfg(unix)]
     Shim { sender: crate::shim::ShimSender },
@@ -342,6 +345,8 @@ impl Session {
         // From here on the child is alive but nothing is attached to it: a
         // failure now must take it with us rather than leave a shell running
         // in a PTY no one will ever read.
+        #[cfg(unix)]
+        let pid = child.process_id().unwrap_or(0);
         let mut killer = child.clone_killer();
         let writer = master
             .take_writer()
@@ -359,6 +364,8 @@ impl Session {
             Io::Local {
                 master: Mutex::new(master),
                 killer: Mutex::new(killer),
+                #[cfg(unix)]
+                pid,
             },
             wal,
             Arc::new(AtomicBool::new(false)),
@@ -826,11 +833,20 @@ impl Session {
 
     /// Kill the child. The exit is recorded as [`ExitState::Killed`] whatever
     /// signal or status it produced, because what a closing pane wants to
-    /// know is that this was deliberate. A shim is told to close, which also
-    /// ends the shim and removes its directory.
+    /// know is that this was deliberate. On unix the child's whole process
+    /// group is hung up. A shim is told to close, which does the same and
+    /// also ends the shim and removes its directory.
     pub fn kill(&self) {
         self.inner.killed.store(true, Ordering::SeqCst);
         match &self.inner.io {
+            #[cfg(unix)]
+            Io::Local { killer, pid, .. } => {
+                hang_up(
+                    *pid,
+                    killer.lock().unwrap_or_else(|e| e.into_inner()).as_mut(),
+                );
+            }
+            #[cfg(not(unix))]
             Io::Local { killer, .. } => {
                 let _ = killer.lock().unwrap_or_else(|e| e.into_inner()).kill();
             }
@@ -866,6 +882,26 @@ pub(crate) fn pty_size(size: Dimensions) -> PtySize {
         cols: size.cols,
         pixel_width: 0,
         pixel_height: 0,
+    }
+}
+
+/// Hangs up the process group `pid` leads: the PTY child is a session
+/// leader (portable-pty `setsid`s it), and a non-interactive shell keeps
+/// its children in its group, so a job's wrapper hears it too instead of
+/// only the shell, which defers its trap until its foreground command ends.
+/// Without a pid, the child alone is signalled.
+#[cfg(unix)]
+pub(crate) fn hang_up(pid: u32, killer: &mut dyn ChildKiller) {
+    match libc::pid_t::try_from(pid) {
+        // `kill(0, ..)` would signal our own group, hence the guard.
+        Ok(pid) if pid > 0 => {
+            // SAFETY: a plain signal to the group the child leads; ESRCH
+            // only means that group has already ended.
+            unsafe { libc::kill(-pid, libc::SIGHUP) };
+        }
+        _ => {
+            let _ = killer.kill();
+        }
     }
 }
 

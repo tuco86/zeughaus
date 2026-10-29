@@ -74,6 +74,89 @@ mod io {
         })
     }
 
+    /// Whether process `pid` is gone within `within`. One that is not is
+    /// killed, so a failing test leaves nothing behind.
+    fn ended_within(pid: &str, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", pid])
+                .status()
+                .expect("run kill")
+                .success();
+            if !alive {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", pid])
+                    .status();
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn closing_a_job_terminal_ends_the_jobs_whole_process_group() {
+        let host = host("group");
+        std::fs::create_dir_all(&host.root).expect("create the host root");
+        let job = host.root.join("job.sh");
+        std::fs::write(
+            &job,
+            "sleep 6013 >/dev/null 2>&1 &\n\
+             echo bg-$!\n\
+             (trap '' HUP; exec sleep 6014) >/dev/null 2>&1 &\n\
+             echo bg-$!\n\
+             wait\n",
+        )
+        .expect("write job.sh");
+        // What a host job's `launch.sh` and `inner.sh` amount to: a shell that
+        // traps HUP around the runner's `timeout` wrapping the job.
+        let launch = host.root.join("launch.sh");
+        std::fs::write(
+            &launch,
+            format!(
+                "trap 'exit 129' HUP\n'{}' timeout 600 -- /bin/sh '{}'\nexit $?\n",
+                env!("CARGO_BIN_EXE_zeughaus-runner"),
+                job.display()
+            ),
+        )
+        .expect("write launch.sh");
+        let launch = launch.to_string_lossy().into_owned();
+        let session = Session::spawn(
+            TerminalId(5),
+            &sh(&[&launch]),
+            SIZE,
+            Wal::Off,
+            &TerminalHost::Shim(host.clone()),
+        )
+        .expect("start the job in a shim");
+        let pids = wait_for(Duration::from_secs(10), || {
+            let text = text_of(&session.head(64));
+            let pids: Vec<String> = text
+                .match_indices("bg-")
+                .filter_map(|(at, m)| {
+                    let digits: String = text[at + m.len()..]
+                        .chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect();
+                    (!digits.is_empty()).then_some(digits)
+                })
+                .collect();
+            (pids.len() == 2).then_some(pids)
+        })
+        .unwrap_or_else(|| panic!("no pids: {:?}", text_of(&session.head(64))));
+
+        session.kill();
+        let survivors: Vec<&String> = pids
+            .iter()
+            .filter(|pid| !ended_within(pid, Duration::from_secs(5)))
+            .collect();
+        assert!(survivors.is_empty(), "{survivors:?} outlived the close");
+        let _ = std::fs::remove_dir_all(&host.root);
+    }
+
     #[test]
     fn a_shell_outlives_its_session_and_is_found_again() {
         let host = host("reattach");

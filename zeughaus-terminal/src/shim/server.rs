@@ -298,7 +298,7 @@ impl Shim {
             let mut shared = lock(&self.shared);
             shared.killed = true;
             if shared.exit.is_none() {
-                let _ = lock(&self.killer).kill();
+                crate::session::hang_up(self.child_pid, lock(&self.killer).as_mut());
             }
         }
         let _ = std::fs::remove_dir_all(&self.dir);

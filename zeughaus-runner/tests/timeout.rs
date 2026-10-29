@@ -80,4 +80,64 @@ mod io {
             .expect("run the runner");
         assert_eq!(status.code(), Some(127));
     }
+
+    /// Whether process `pid` is gone within `within`. One that is not is
+    /// killed, so a failing test leaves nothing behind.
+    #[cfg(unix)]
+    fn ended_within(pid: &str, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            let alive = Command::new("kill")
+                .args(["-0", pid])
+                .status()
+                .expect("run kill")
+                .success();
+            if !alive {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                let _ = Command::new("kill").args(["-9", pid]).status();
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_background_process_ends_with_the_program() {
+        let output = runner()
+            .args(["timeout", "5", "--", "sh", "-c"])
+            .arg("sleep 6011 >/dev/null 2>&1 & echo $!")
+            .output()
+            .expect("run the runner");
+        assert_eq!(output.status.code(), Some(0));
+        let pid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        assert!(
+            ended_within(&pid, Duration::from_secs(5)),
+            "the background sleep {pid} outlived the program"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_group_member_that_ignores_the_deadline_ends_too() {
+        let started = Instant::now();
+        let output = runner()
+            .args(["timeout", "1", "--", "sh", "-c"])
+            .arg("(trap '' TERM; exec sleep 6012) >/dev/null 2>&1 & echo $!; wait")
+            .output()
+            .expect("run the runner");
+        assert_eq!(output.status.code(), Some(124));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+        let pid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        assert!(
+            ended_within(&pid, Duration::from_secs(5)),
+            "the sleep {pid} that ignores TERM outlived the deadline"
+        );
+    }
 }
