@@ -10,7 +10,7 @@
 # ///
 # Collects the four platform archives into one signed release bundle and
 # publishes it: to the update channel the installed runners poll (Caddy
-# serves $UPDATES_DIR under /updates/), and for cron and tag events also as a
+# serves $UPDATES_DIR under /updates/), and for nightly and tag events also as a
 # GitHub release. Runs no cargo: the bundling tool is the zeughaus-runner of
 # the linux-arm64 archive, which is why this job needs sadala (aarch64).
 set -euo pipefail
@@ -20,7 +20,7 @@ version=$(version)
 
 case "$CI_EVENT" in
 push) channel=dev ;;
-cron) channel=nightly ;;
+nightly) channel=nightly ;;
 tag) channel=release ;;
 *)
     echo "unknown CI_EVENT '$CI_EVENT'"
@@ -125,7 +125,7 @@ delete_tag() {
     esac
 }
 
-if [ "$CI_EVENT" = cron ]; then
+if [ "$CI_EVENT" = nightly ]; then
     tag="nightly-$(date -u +%Y-%m-%d)"
     name="$tag"
     prerelease=true
@@ -150,7 +150,7 @@ code=$(gh_status "$api/releases/tags/$tag")
 case "$code" in
 200)
     old_id=$(jq -r .id "$work/response")
-    if [ "$CI_EVENT" = cron ]; then
+    if [ "$CI_EVENT" = nightly ]; then
         delete_release "$old_id" "$tag"
     else
         gh -X DELETE "$api/releases/$old_id" >/dev/null

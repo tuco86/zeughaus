@@ -1,6 +1,6 @@
 #!/bin/sh
 # /// ci
-# on = ["push main", "tag v*", "cron 0 3 * * *"]
+# on = ["push main", "tag v*", "nightly"]
 # platform = "darwin-arm64"
 # timeout_minutes = 120
 # ///

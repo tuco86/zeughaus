@@ -43,12 +43,12 @@ nextest_env() {
 
 # clippy, the tests (`.config/nextest.toml`) and the doctests, which nextest
 # does not run: what every platform checks. A push or manual run takes the
-# unit tier; the nightly cron and a release tag take both tiers.
+# unit tier; the nightly and a release tag take both tiers.
 check_platform() {
     step cargo clippy --locked --workspace --all-targets -- -D warnings
     nextest_env
     case "$CI_EVENT" in
-        cron | tag) tier=ci ;;
+        nightly | tag) tier=ci ;;
         *) tier=default ;;
     esac
     step cargo nextest run --locked --workspace --profile "$tier"

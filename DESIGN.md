@@ -626,7 +626,7 @@ results keyed by (pin, tier, sequence).
 - The gate before a push: `cargo fmt --check`, `cargo clippy --workspace
   --all-targets -- -D warnings` and the unit tier (`cargo nextest run -p
   <crate>`) of the crates the change touches. The pipelines run the rest: a
-  push the unit tier and the doctests on every platform, the nightly cron and
+  push the unit tier and the doctests on every platform, the nightly and
   a release tag both tiers (section 14).
 
 ## 13. Jobs: processes the runner owns
@@ -1488,7 +1488,7 @@ build 0. Per platform one check job, `check-<platform>`, `needs` the build
 job, so it runs in the workspace the build left, at the same place: it runs
 `cargo clippy --workspace --all-targets -- -D warnings`, the tests (`cargo
 nextest run --workspace`: the unit tier on a push or manual run, `--profile
-ci` with the integration tier on the nightly cron and a tag) and `cargo test
+ci` with the integration tier on the nightly and a tag) and `cargo test
 --workspace --doc` (`check_platform` in `build.sh`; `windows.ps1` for the
 Windows jobs), and on `linux-amd64` also `cargo fmt --check`. Every OS
 therefore passes the gate. The build is a release build
@@ -1517,7 +1517,7 @@ The Linux archives also hold `zeughaus-ci`, which the CI's updater installs.
 jobs and by `publish.sh`; `windows.ps1` is the Windows jobs' helper (the
 `Run` function, `CARGO_TARGET_DIR` under `<workspace>\.ci-cache` and
 `Install-Nextest`). Every build job runs on a push to `main`, a `v*`
-tag and the cron `0 3 * * *`; a check job has no `on`, so it runs with the
+tag and the nightly round; a check job has no `on`, so it runs with the
 build it needs. A push to any other branch starts nothing, and no channel is
 named after a branch.
 
@@ -1527,19 +1527,19 @@ four archives, then `release verify`. The directory it makes holds the
 archives, `manifest.json` (format 1: channel, build, version, commit, and
 per platform file, size and SHA-256), `manifest.sig` (the raw Ed25519
 signature of those exact bytes) and `SHA256SUMS`. Its channel follows the
-event (push `dev`, cron `nightly`, tag `release`; a tag must equal
+event (push `dev`, nightly `nightly`, tag `release`; a tag must equal
 `v<version>`). It is copied to `/var/www/zeughaus-updates/<channel>/<build>/`
 (through a temporary name and a rename), `latest` is rewritten with the
 build number, and all but the two newest builds of the channel go. A rerun of
 an older pipeline leaves `latest` where it is. Caddy on sadala serves the
 directory at `https://zeughaus.doodleshnookie.net/updates/` (`handle_path
 /updates/*` with `file_server`, `latest` sent with `Cache-Control:
-no-cache`). For cron and tag events the bundle is also attached to a GitHub
+no-cache`). For nightly and tag events the bundle is also attached to a GitHub
 release of `tuco86/zeughaus`: `nightly-<date>` as a prerelease (the seven
-newest stay) for the cron, `v<version>` with the version's CHANGELOG section
+newest stay) for the nightly, `v<version>` with the version's CHANGELOG section
 as its body for a tag, a prerelease when the version has a `-`. The two
 secrets this needs are in the OpenBao document next to the others and
-granted to `push main`, `cron *` and `tag v*`: `ZEUGHAUS_UPDATE_KEY` (64 hex
+granted to `push main`, `nightly` and `tag v*`: `ZEUGHAUS_UPDATE_KEY` (64 hex
 characters, the Ed25519 seed from `zeughaus-runner release keygen`) and
 `ZEUGHAUS_GITHUB_TOKEN`. `publish.sh` reaches GitHub through a header file,
 never through argv.

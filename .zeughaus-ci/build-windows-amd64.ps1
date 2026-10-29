@@ -1,5 +1,5 @@
 # /// ci
-# on = ["push main", "tag v*", "cron 0 3 * * *"]
+# on = ["push main", "tag v*", "nightly"]
 # machine = "wohnzimmer"
 # timeout_minutes = 180
 # ///

@@ -1,6 +1,6 @@
 #!/bin/sh
 # /// ci
-# on = ["push main", "tag v*", "cron 0 3 * * *"]
+# on = ["push main", "tag v*", "nightly"]
 # platform = "linux-amd64"
 # image = "trixie"
 # timeout_minutes = 120

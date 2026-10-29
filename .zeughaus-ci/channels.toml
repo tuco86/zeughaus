@@ -9,7 +9,7 @@ on = ["push main"]
 
 [[channel]]
 name = "nightly"
-on = ["cron *"]
+on = ["nightly"]
 clean = true
 
 [[channel]]

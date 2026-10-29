@@ -456,12 +456,13 @@ bundles the platform archives into a signed release directory
 `ZEUGHAUS_UPDATE_KEY`, never from an argument) and checks one.
 
 This repository is one of its repos: a push to `main`, a `v*` tag and the
-nightly cron (`0 3 * * *`) run a build job and a check job per platform,
-against the weida commit the root `Cargo.toml` pins, and post `zeughaus/<job>`
+CI's nightly round (`[nightly] at = "03:00"` in its `ci.toml`) run a build
+job and a check job per platform, against the weida commit the root
+`Cargo.toml` pins, and post `zeughaus/<job>`
 on the commit; pushes to other branches start nothing. `build-<platform>`
 packs `zeughaus-<version>-<platform>.tar.gz` (`.zip` on Windows) into its
 output, and `check-<platform>` runs clippy and the tests after it in the
-same warm workspace (the unit tier on a push, both tiers on the nightly cron
+same warm workspace (the unit tier on a push, both tiers on the nightly
 and a tag; `check-linux-amd64` also runs `fmt`): `linux-amd64` (tuco-pc,
 in the `.zeughaus-ci/trixie.Containerfile` image), `linux-arm64` (atik, the same
 image in an Apple `container`), `windows-amd64` (the `wohnzimmer` runner's
@@ -476,11 +477,11 @@ with `latest` naming the newest; the two newest builds of a channel stay.
 Caddy serves that directory as
 `https://zeughaus.doodleshnookie.net/updates/<channel>/{latest,<build>/}`
 (`handle_path /updates/*` in the site block, `latest` uncached). The channel
-follows the event: a push to `main` is `dev`, the cron `nightly`, a tag
+follows the event: a push to `main` is `dev`, the nightly `nightly`, a tag
 `release`; the last two also become a GitHub release (`nightly-<date>` as a
 prerelease, the seven newest kept; a tag `v<version>` with the CHANGELOG
 section as its body, and it must equal the workspace version). Two secrets
-in OpenBao `secret/zeughaus/ci` back it, granted to `push main`, `cron *`
+in OpenBao `secret/zeughaus/ci` back it, granted to `push main`, `nightly`
 and `tag v*`: `ZEUGHAUS_UPDATE_KEY` (the signing seed) and
 `ZEUGHAUS_GITHUB_TOKEN` (contents write on `tuco86/zeughaus`).
 Forgejo reaches the CI as the bot user `zeughaus-ci`
@@ -545,7 +546,7 @@ push only after the gate:
   tier, the only tests an agent runs locally
 
 The pipelines run the rest: a push runs the unit tier and the doctests on
-every platform, the nightly cron and a release tag also the integration
+every platform, the nightly and a release tag also the integration
 tier (`--profile ci`). Never run the whole suite, `--profile integration`
 or `--profile ci` locally before a push. An I/O test lives in a `mod io`
 inside its `#[cfg(test)] mod tests`; `.config/nextest.toml` holds the
