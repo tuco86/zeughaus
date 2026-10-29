@@ -3,7 +3,8 @@
 // - asks the CI at session start (`zeughaus-runner ci repo --json`) and puts the answer into the
 //   system prompt as a <zeughaus-ci> block and into the status line;
 // - after a `git push` of this checkout polls `zeughaus-runner ci find --json` and reports the
-//   first failed job of the pushed commit's pipeline into the session, or its success;
+//   first failed job of the pushed commit's pipeline into the session, each multiple of its
+//   expected time a running job reaches, or its success;
 // - answers /zeughaus with the current state, and /zeughaus save stores the session's plan in
 //   the CI (`zeughaus-runner ci plan-save`) and starts a fresh session;
 // - marks the proposals a plan names as planned when the plan is executed from its review;
@@ -104,6 +105,8 @@ interface JobView {
   code?: number | null;
   cause?: string | null;
   excerpt?: string | null;
+  started?: number | null;
+  expected_secs?: number | null;
 }
 interface PipelineView {
   number: number;
@@ -138,6 +141,8 @@ interface Watch {
   timer: unknown;
   busy: boolean;
   failures: number;
+  /** The multiple of its expected time each running job was last reported at. */
+  late: Map<string, number>;
 }
 
 const RUNNER = "zeughaus-runner";
@@ -667,6 +672,30 @@ export default function zeughausCi(pi: Pi): void {
     }
   };
 
+  /** Reports each running job of the pipeline that reached a new multiple of its expected time. */
+  const reportLate = async (w: Watch, p: PipelineView): Promise<void> => {
+    const sha7 = w.sha.slice(0, 7);
+    for (const job of p.jobs) {
+      const expected = job.expected_secs ?? 0;
+      if (job.status !== "running" || job.started == null || expected <= 0) continue;
+      const elapsed = Math.max(0, Math.floor(Date.now() / 1000 - job.started));
+      const multiple = Math.floor(elapsed / expected);
+      if (multiple < 1 || multiple <= (w.late.get(job.name) ?? 0)) continue;
+      w.late.set(job.name, multiple);
+      const args = ["ci", "overdue", w.name, String(p.number), job.name];
+      const r = await exec(pi, RUNNER, args, w.root, FIND_TIMEOUT_MS);
+      if (watch !== w) return;
+      const head = `zeughaus-ci: ${w.name} #${p.number} (${sha7}, ${p.channel}): ${job.name} runs ${multiple}x its expected time`;
+      // An installed runner from before `ci overdue` answers with usage; say it without it.
+      const body =
+        r.code === 0 && r.stdout.trim() !== ""
+          ? r.stdout.trimEnd()
+          : `${job.name} on ${job.place} runs ${elapsed} s, ${multiple}x its expected ${expected} s. ci_log number=${p.number} job=${job.name} tail=20 shows its last lines, ci_status what else runs there; ci_cancel number=${p.number} stops it, ci_wait number=${p.number} waits on.`;
+      send(`${head}\n${body}`, "aside", true);
+      w.ctx.ui.notify(head, "warning");
+    }
+  };
+
   const poll = async (w: Watch): Promise<void> => {
     if (w.busy || watch !== w) return;
     w.busy = true;
@@ -692,6 +721,7 @@ export default function zeughausCi(pi: Pi): void {
       w.failures = 0;
       if (p !== null) {
         report(w, p);
+        if (watch === w) await reportLate(w, p);
       } else if (Date.now() - w.started >= APPEAR_LIMIT_MS) {
         send(
           `zeughaus-ci: no pipeline started for ${sha7} in ${w.name} within 10 min: no job's \`on\` selects this ref, or the push did not reach the CI.`,
@@ -717,6 +747,7 @@ export default function zeughausCi(pi: Pi): void {
       timer: undefined,
       busy: false,
       failures: 0,
+      late: new Map(),
     };
     watch = w;
     progress = { sha7: sha.slice(0, 7) };
@@ -892,7 +923,7 @@ export default function zeughausCi(pi: Pi): void {
     if (sha === undefined) return undefined;
     startWatch(ctx, c.view.name, c.root, sha);
     return {
-      additionalContext: `zeughaus-ci watches the pipeline of ${sha.slice(0, 7)} in ${c.view.name} and reports its first failure, or its success, here: no need to poll.`,
+      additionalContext: `zeughaus-ci watches the pipeline of ${sha.slice(0, 7)} in ${c.view.name} and reports its first failure, a job running past a multiple of its expected time, or its success, here: no need to poll.`,
     };
   });
 
