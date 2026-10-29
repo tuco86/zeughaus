@@ -8,8 +8,9 @@
 //! ```
 //!
 //! A profile is three kinds of steps: the binaries, copied from the release
-//! by a rename; the files of the release's `share/`, written where the
-//! profile wants them with `@BINDIR@`, `@FEED_ADDR@` and `@LOGS@` filled in;
+//! by a rename; the files of the release's `share/`,
+//! written where the profile wants them with `@BINDIR@`, `@HOME@`,
+//! `@FEED_ADDR@` and `@LOGS@` filled in;
 //! and the service, started or reloaded. Every build the updater installs
 //! writes the files again from its own release ([`refresh`]); binaries and
 //! service are the updater's own business then.
@@ -198,6 +199,7 @@ fn file_steps(profile: Profile, dirs: &Dirs) -> Vec<FileStep> {
 fn values(dirs: &Dirs, feed_addr: Option<&str>) -> Vec<(&'static str, String)> {
     let mut values = vec![
         ("@BINDIR@", dirs.bin.display().to_string()),
+        ("@HOME@", dirs.env.home.display().to_string()),
         ("@LOGS@", dirs.logs().display().to_string()),
     ];
     if let Some(addr) = feed_addr {
