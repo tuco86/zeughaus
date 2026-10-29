@@ -155,7 +155,13 @@ and `ci_cancel` read and control the CI's channels, pipelines and job
 output (`ci_log` shows the last lines or the line ranges asked for, each
 with its number and, on request, the seconds since the job's first
 output); `ci_wait` waits until a pipeline (by number, or by the sha of
-the commit just pushed) or one job of it has settled; `ci_timing` says where
+the commit just pushed) or one job of it has settled, and answers early
+when a running job reaches a multiple (1x, 2x, ...) of its expected time
+(the median of its last 5 successful runs at that place for that kind of
+event, at least 60 s, or the call's `expected_minutes`) with its last
+lines and the other jobs on its machine; the agent decides to wait on or
+`ci_cancel`, and the CI stops a job only at its `timeout_minutes`;
+`ci_timing` says where
 a pipeline's time went (for each job when it was assigned, started and ended
 after the pipeline was created, its staging time and the inputs that moved
 to it) or, for one job, which lines of its output the longest pauses follow,
@@ -175,11 +181,14 @@ proposals (below). Nothing but
 protocol messages is written to its stdout.
 `zeughaus-runner [--state-dir <dir>] ci repo [--json] [<path>]`, `ci
 find [--json] <repo> <sha>`, `ci doc [--json] <repo> <n>`, `ci plan-save
-[--json] [--approve] <repo> <file>` and `ci planned <repo> <file>` answer
+[--json] [--approve] <repo> <file>`, `ci planned <repo> <file>` and `ci
+overdue <repo> <number> <job>` answer
 the same for a script (exit 3: the origin is no repository of `ci.toml`;
 2: no CI, no answer or a refusal); the
 `zeughaus-ci` omp plugin in `omp-plugin/` uses them for its session
-context, its push watch and `/zeughaus save`.
+context, its push watch and `/zeughaus save` (`ci overdue` prints the late
+report of one running job, which the push watch sends at each multiple of
+the job's expected time).
 
 Plans and proposals: the CI keeps them per repository in
 `<state-dir>/ci/docs/<repo>/<n>.json` (numbers shared by both kinds, never
@@ -540,7 +549,9 @@ every platform, the nightly cron and a release tag also the integration
 tier (`--profile ci`). Never run the whole suite, `--profile integration`
 or `--profile ci` locally before a push. An I/O test lives in a `mod io`
 inside its `#[cfg(test)] mod tests`; `.config/nextest.toml` holds the
-tiers and their time limits.
+tiers and each tier's expected time per test (the `slow-timeout` period,
+reported as SLOW); no profile kills a test, and a run past its budget is a
+finding to look at, not a failure.
 
 `cargo publish --workspace --dry-run` belongs to the release (`RELEASING.md`
 step 4), not to a change: it builds every crate again from its package and

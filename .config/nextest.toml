@@ -1,25 +1,26 @@
 # Test tiers (see AGENTS.md, Development Workflow). A test that touches the
 # filesystem, network, processes, a PTY, a GPU, the environment or real time
 # lives in a module named `io`; everything else is a unit test.
+#
+# No profile kills a test: a `slow-timeout` period is the expected time of one
+# test, nextest prints SLOW at each multiple and the test runs on. The CI
+# job's `timeout_minutes` is the only hard limit.
 nextest-version = { required = "0.9.115" }
 
 # Unit tier: `cargo nextest run`. No I/O, so a second per test is already slow.
 [profile.default]
 default-filter = 'not test(/(^|::)io::/)'
-slow-timeout = { period = "1s", terminate-after = 5 }
-global-timeout = "60s"
+slow-timeout = { period = "1s" }
 
 # I/O tier: `cargo nextest run --profile integration`.
 [profile.integration]
 default-filter = 'test(/(^|::)io::/)'
-slow-timeout = { period = "10s", terminate-after = 1 }
-global-timeout = "5m"
+slow-timeout = { period = "10s" }
 
 # Both tiers, as the nightly and release checks run them.
 [profile.ci]
 default-filter = 'all()'
-slow-timeout = { period = "10s", terminate-after = 1 }
-global-timeout = "6m"
+slow-timeout = { period = "10s" }
 
 # The NVIDIA Vulkan driver on Windows hangs when devices are created
 # concurrently; nextest runs each test in its own process, so the in-process
