@@ -210,9 +210,11 @@ checkout is dirty or a plan is in progress. An open proposal's `Plan`
 button opens `plan <repo> --proposal <n>` (tab `plan <repo> #<n>`), which
 attaches the proposal to omp's first prompt so planning starts at once.
 In every session `plan` starts (`ZEUGHAUS_PLAN_SESSION=<repo>`), the omp
-plugin answers the agent's proposal with its own menu instead of omp's
-review: `Save and approve` and `Save` store the plan (`ci plan-save
-[--approve]`) and end the session, `Refine` keeps planning.
+plugin answers the agent's proposal by ending its turn and opening omp's
+plan review view with its own choices instead of omp's: `Save and approve`
+and `Save` store the plan (`ci plan-save [--approve]`) and end the
+session, `Refine` sends the view's annotations, or what the user types,
+back as the next prompt.
 
 A runner also runs the tasks of `<state-dir>/maintain.toml` (`[[task]]` with
 `name`, `command` as an argv, `every_minutes` and `timeout_minutes`,
