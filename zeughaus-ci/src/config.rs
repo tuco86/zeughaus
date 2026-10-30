@@ -19,6 +19,9 @@ pub const CONFIG_FILE: &str = "ci.toml";
 pub struct CiConfig {
     /// The runner of jobs that name no `machine`.
     pub default_runner: String,
+    /// Compressed blobs the artifact store under `ci/blobs` may hold, in GiB.
+    #[serde(default = "default_artifact_store_gb")]
+    pub artifact_store_gb: u64,
     /// Runners that may enlist, by name.
     #[serde(default)]
     pub runners: BTreeMap<String, RunnerConfig>,
@@ -54,6 +57,10 @@ pub fn parse_clock(text: &str) -> Option<chrono::NaiveTime> {
         return None;
     }
     chrono::NaiveTime::from_hms_opt(hours.parse().ok()?, minutes.parse().ok()?, 0)
+}
+
+fn default_artifact_store_gb() -> u64 {
+    2
 }
 
 fn default_mount() -> String {
@@ -226,6 +233,9 @@ impl CiConfig {
     }
 
     fn validate(&mut self) -> Result<(), String> {
+        if self.artifact_store_gb == 0 {
+            return Err("ci.toml: `artifact_store_gb` must be at least 1".into());
+        }
         if self.runners.is_empty() {
             return Err("ci.toml: at least one [runners.<name>] is required".into());
         }
@@ -454,6 +464,21 @@ forge = "none"
         .unwrap_err();
         assert!(err.contains("default_runner"), "{err}");
         assert!(CiConfig::parse(&with_runners("")).is_ok());
+    }
+
+    #[test]
+    fn artifact_store_budget() {
+        assert_eq!(
+            CiConfig::parse(&with_runners(""))
+                .unwrap()
+                .artifact_store_gb,
+            2
+        );
+        let text = format!("artifact_store_gb = 100\n{}", with_runners(""));
+        assert_eq!(CiConfig::parse(&text).unwrap().artifact_store_gb, 100);
+        let text = format!("artifact_store_gb = 0\n{}", with_runners(""));
+        let err = CiConfig::parse(&text).unwrap_err();
+        assert_eq!(err, "ci.toml: `artifact_store_gb` must be at least 1");
     }
 
     #[test]

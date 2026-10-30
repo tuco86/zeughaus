@@ -51,6 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lost. A checkout a session holds and a `target/` cargo builds in are left
   alone; `--list` prints the repositories' origins. A maintenance task now
   sees the runner's `ZEUGHAUS_STATE_DIR`.
+- `artifact_store_gb` in `ci.toml` sets the size of the CI's artifact store
+  (2 GiB by default, as before). `deploy/setup-sadala.sh` mounts a Storage
+  Box sub-account for the CI and the sadala runner at `<home>/storage` and
+  links the CI's `ci/blobs` and `ci/sets` and the runner's `ci/blobs` and
+  `ci/blob-sets` into it; while a mount is down the store refuses to open
+  instead of filling the local disk.
 - A runner on Windows enlists into the CI. It runs `.ps1` jobs on its own
   host under its `timeout` subcommand, which a job object backs on
   Windows. `ci.toml` marks such a runner `os = "windows"`; the CI places

@@ -47,10 +47,6 @@ const UPLOAD_WAIT: Duration = Duration::from_secs(600);
 /// How long the store keeps a set.
 const SET_KEEP: Duration = Duration::from_secs(3 * 86400);
 
-/// Bytes of compressed blobs the store may hold. sadala's disk is small and
-/// holds a runner's cache too.
-const STORE_BUDGET: u64 = 2 << 30;
-
 /// A fill of one run's set, shared by every request for it.
 type Fill = Arc<OnceCell<Result<(), String>>>;
 
@@ -61,6 +57,8 @@ pub struct ArtifactService {
     next_transfer: AtomicU64,
     store: Arc<Store>,
     sets: PathBuf,
+    /// Bytes of compressed blobs the store may hold (`artifact_store_gb`).
+    budget: u64,
     /// The fill in flight for a run, so concurrent consumers ask its
     /// producer once.
     fills: Mutex<HashMap<String, Fill>>,
@@ -100,6 +98,7 @@ impl ArtifactService {
         let store = Store::open(&blobs, true)
             .map_err(|e| format!("cannot open {}: {e}", blobs.display()))?;
         Ok(ArtifactService {
+            budget: config.artifact_store_gb << 30,
             sets: state_dir.join("ci/sets"),
             state_dir,
             config,
@@ -111,12 +110,12 @@ impl ArtifactService {
         })
     }
 
-    /// Keeps the store within [`SET_KEEP`] and [`STORE_BUDGET`], leaving
+    /// Keeps the store within [`SET_KEEP`] and `artifact_store_gb`, leaving
     /// alone what is younger than `grace`.
     pub fn sweep(&self, grace: Duration) {
         let retention = Retention {
             keep: SET_KEEP,
-            budget: STORE_BUDGET,
+            budget: self.budget,
             grace,
         };
         let swept = zeughaus_blobs::sweep(&self.store, &self.sets, &retention);

@@ -981,7 +981,8 @@ and moves the set by content (`zeughaus-blobs`): a set is a `SetManifest`
 (every directory, and every file by path, size, BLAKE3 root and executable
 bit; symlinks followed), and its files travel as blobs named by their root.
 The CI keeps a store of zstd-compressed blobs under `ci/blobs` and each
-manifest it holds under `ci/sets/<run>.set` (3 days and 2 GiB, swept at
+manifest it holds under `ci/sets/<run>.set` (3 days and `artifact_store_gb`
+of `ci.toml`, default 2 GiB, swept at
 start and hourly); every runner keeps a cache of raw blobs under `ci/blobs`
 with its sets under `ci/blob-sets` (7 days and `blob_cache_gb` of
 `enlist.toml`, default 8 GiB, swept the same way). A sweep removes the

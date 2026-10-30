@@ -3,6 +3,11 @@
 
 default_runner = "tuco-pc"         # runs every job that names no `machine`
 
+# Size limit of the artifact store under <state-dir>/ci/blobs (compressed
+# files of the artifact sets between jobs, kept 3 days). On sadala ci/blobs
+# and ci/sets are links into the Storage Box (deploy/setup-sadala.sh).
+artifact_store_gb = 100
+
 # The nightly round: at this local time the CI queues every repository's
 # nightly (jobs with `on = ["nightly"]`) and runs them one after the other,
 # in repository name order. Without it nothing runs nightly by itself.

@@ -18,10 +18,13 @@
 #   1. with --ci-toml: users, linger, state directories, trust for this
 #      workstation's editor certificate, ci.toml, and the CI's OpenBao
 #      credential;
-#   2. each user's bin directory (and lib, /var/www/zeughaus-updates); a
-#      binary an older install left in /usr/local/lib/zeughaus moves to its
-#      owner's bin, and the old path becomes a symlink to it, so a process
-#      still running from there finds an executable;
+#   2. each user's bin directory (and lib, /var/www/zeughaus-updates), each
+#      user's Storage Box sub-account at <home>/storage (storagebox-mount-setup,
+#      sadala's own helper in /usr/local/sbin) and the links of the CI's
+#      artifact store and the runner's blob cache into it; a binary an older
+#      install left in /usr/local/lib/zeughaus moves to its owner's bin, and
+#      the old path becomes a symlink to it, so a process still running from
+#      there finds an executable;
 #   3. the CI: bootstrap `ci`, then the wrapper /usr/local/bin/zeughaus-ci;
 #   4. the runner: enlist.toml when --ci-toml and none exists, then bootstrap
 #      `service`;
@@ -112,7 +115,7 @@ else
     say "1/5 users, OpenBao credential: kept"
 fi
 
-say "2/5 directories, old binaries"
+say "2/5 directories, storage, old binaries"
 remote 'sudo -n sh -s' <<EOF
 set -eu
 install -d -o zeughaus-ci -g zeughaus-ci -m755 $ci_home/bin
@@ -128,6 +131,32 @@ for entry in "zeughaus-ci zeughaus-ci $ci_home" "zeughaus-runner zeughaus $run_h
         mv -f "\$old.new" "\$old"
     fi
 done
+# The artifact store and the runner's blob cache live on each user's
+# Storage Box sub-account (the root disk is 38 GB): <home>/state/ci/<name>
+# is a link to <home>/storage/<name>. What a real directory held there is a
+# cache and goes. While a mount is down its links dangle and the store
+# refuses to open instead of filling the local disk.
+command -v storagebox-mount-setup >/dev/null || {
+    echo "storagebox-mount-setup is missing on sadala" >&2
+    exit 1
+}
+storagebox-mount-setup zeughaus-ci zeughaus-ci $ci_home/storage
+storagebox-mount-setup zeughaus zeughaus $run_home/storage
+link_store() {
+    user=\$1 home=\$2
+    shift 2
+    sudo -u \$user mountpoint -q \$home/storage
+    sudo -u \$user mkdir -p \$home/state/ci
+    for name in "\$@"; do
+        sudo -u \$user mkdir -p \$home/storage/\$name
+        if ! test -L \$home/state/ci/\$name; then
+            rm -rf \$home/state/ci/\$name
+            sudo -u \$user ln -s \$home/storage/\$name \$home/state/ci/\$name
+        fi
+    done
+}
+link_store zeughaus-ci $ci_home blobs sets
+link_store zeughaus $run_home blobs blob-sets
 EOF
 
 say "3/5 CI"
@@ -153,7 +182,7 @@ if [ -n "$ci_toml" ]; then
 set -eu
 if ! test -e $run_home/state/enlist.toml; then
     enlist=\$(mktemp)
-    printf 'ci = "%s"\nname = "sadala"\n' "\$(cat $ci_home/state/endpoint)" >"\$enlist"
+    printf 'ci = "%s"\nname = "sadala"\nblob_cache_gb = 50\n' "\$(cat $ci_home/state/endpoint)" >"\$enlist"
     install -o zeughaus -g zeughaus -m600 "\$enlist" $run_home/state/enlist.toml
     rm -f "\$enlist"
 fi
