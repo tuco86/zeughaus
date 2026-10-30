@@ -37,6 +37,8 @@ use zeughaus_link::credentials;
 pub static QUIC: LazyLock<Option<Runtime>> = LazyLock::new(|| {
     let config = RuntimeConfig {
         reconnect: policy(),
+        #[cfg(test)]
+        network: weida::Network::sim(&SIM),
         ..RuntimeConfig::default()
     };
     match Runtime::new(config) {
@@ -48,6 +50,11 @@ pub static QUIC: LazyLock<Option<Runtime>> = LazyLock::new(|| {
         }
     }
 });
+
+/// The network every test of this process dials over. The client runtime
+/// is process-wide, so its network is too.
+#[cfg(test)]
+pub static SIM: LazyLock<weida::SimNet> = LazyLock::new(weida::SimNet::new);
 
 /// Closes every connection this process holds, so the runner sees it leave
 /// rather than time out. Bounded by weida's shutdown budget; a runtime that

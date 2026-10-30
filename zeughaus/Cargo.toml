@@ -127,6 +127,9 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # `#[tokio::test]` for the first-dial schedule, with a paused clock.
 tokio = { version = "1", features = ["rt", "macros", "test-util"] }
+# Endpoint tests run on weida's simulated network (`weida::SimNet`), so
+# no test opens a UDP socket.
+weida = { workspace = true, features = ["test-util"] }
 
 # wasm: iced without the tokio executor (iced uses the wasm-bindgen executor).
 # iced_nodegraph is WebGPU-only, so the browser editor needs a WebGPU context.

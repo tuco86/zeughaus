@@ -657,8 +657,11 @@ mod tests {
 
         impl FakeRuntime {
             async fn bind(port: u16, identity: weida::Identity, seq: u64) -> FakeRuntime {
-                let runtime =
-                    weida::Runtime::new(weida::RuntimeConfig::default()).expect("runtime");
+                let runtime = weida::Runtime::new(weida::RuntimeConfig {
+                    network: weida::Network::sim(&crate::transport::SIM),
+                    ..weida::RuntimeConfig::default()
+                })
+                .expect("runtime");
                 let listener = runtime.listener();
                 let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
                 let binding = listener.bind_quic(addr, identity).await.expect("bind");
@@ -734,10 +737,10 @@ mod tests {
         /// back under the same identity on the same port is redialled by weida,
         /// and this side's only work is to say `Lost`, fetch the snapshot the
         /// gap needs, and reopen the feed exchange. No second dial happens here
-        /// -- there is no loop left that could make one. Loopback QUIC, so it
-        /// needs a reactor; the process-wide client runtime binds to this test's
-        /// reactor, which is why it is the one network test in this module.
-        #[tokio::test]
+        /// -- there is no loop left that could make one. It runs on the
+        /// process's `SimNet` under a paused clock, and the process-wide client
+        /// runtime binds to this test's reactor.
+        #[tokio::test(start_paused = true)]
         async fn a_restarted_runtime_is_redialled_by_weida_not_by_us() {
             use iced::futures::StreamExt;
             use weida::EndpointAddr;
