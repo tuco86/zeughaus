@@ -25,14 +25,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an executed plan names as planned, and ends a master's session once its
   plan is done.
 - An open proposal in the Plans tab has a `Plan` button: it opens
-  `zeughaus-runner plan <repo> --proposal <n>`, omp in plan mode with the
-  proposal attached, which starts planning it at once. In every session
-  `zeughaus-runner plan` starts, the omp plugin (0.3.6) ends the agent's
-  turn when it proposes and opens omp's full-screen plan review view with
+  `zeughaus-runner plan <repo> --proposal <n>`, omp with the proposal
+  attached, which starts planning it at once. In every session
+  `zeughaus-runner plan` starts, the omp plugin (0.4.0) brings its own plan
+  mode instead of omp's: a plan-session prompt, a read-only working tree,
+  a reminder when a turn ends without `ask` or `propose_plan`, and the
+  `propose_plan` tool, which opens omp's full-screen plan review view with
   `Save and approve`, `Save` (both store the plan in the CI and end the
-  session) and `Refine` (the view's annotations, or what the user types,
-  become the next prompt). `zeughaus-runner ci plan-save --approve`
-  approves the plan as it is stored.
+  session) and `Refine` (the view's annotations return as the tool's
+  result), plus Copy and `$VISUAL`/`$EDITOR` editing.
+  `zeughaus-runner plan` starts omp on the `plan` model role.
+  `zeughaus-runner ci plan-save --approve` approves the plan as it is
+  stored.
 - `Plan session` and `Master` no longer refuse a repository without a
   checkout under the work root: the session clones it over ssh from the
   origin (`git@<host>:<owner>/<repo>.git`) in its terminal and goes on.

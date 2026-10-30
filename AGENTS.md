@@ -203,18 +203,23 @@ plan <repo>` or `master <repo>` in a terminal of its `Triggered` group, in
 the checkout `~/work/<origin>` (`$ZEUGHAUS_WORK` overrides `~/work`; a
 missing one is cloned over ssh from the origin in that terminal first):
 `plan` brings the detached worktree `<checkout>-plan` to `origin/<default
-branch>` and execs omp in plan mode there; `master` claims approved plans
+branch>` and execs omp there on the `plan` model role (`--model @plan`);
+`master` claims approved plans
 one after another and runs `omp @<plan> <instruction>` with
 `ZEUGHAUS_PLAN=<repo>#<n>` in the main checkout, waiting while the
 checkout is dirty or a plan is in progress. An open proposal's `Plan`
 button opens `plan <repo> --proposal <n>` (tab `plan <repo> #<n>`), which
 attaches the proposal to omp's first prompt so planning starts at once.
 In every session `plan` starts (`ZEUGHAUS_PLAN_SESSION=<repo>`), the omp
-plugin answers the agent's proposal by ending its turn and opening omp's
-plan review view with its own choices instead of omp's: `Save and approve`
-and `Save` store the plan (`ci plan-save [--approve]`) and end the
-session, `Refine` sends the view's annotations, or what the user types,
-back as the next prompt.
+plugin supplies the plan mode instead of omp's: a plan-session system
+prompt, a read-only working tree for every agent (`write`/`edit` only to
+`local://` and the internal devices, no `ast_edit`), a reminder when a
+turn ends without `ask` or `propose_plan`, and the `propose_plan` tool.
+That tool opens omp's plan review view with `Save and approve` and `Save`
+(store the plan with `ci plan-save [--approve]` and end the session) and
+`Refine` (the view's annotations return to the agent as the tool's
+result); the view also offers Copy and the external editor (`$VISUAL` or
+`$EDITOR`), and keeps a plan's annotations until they are sent.
 
 A runner also runs the tasks of `<state-dir>/maintain.toml` (`[[task]]` with
 `name`, `command` as an argv, `every_minutes` and `timeout_minutes`,

@@ -10,21 +10,25 @@
 // - marks the proposals a plan names as planned when the plan is executed from its review;
 // - in a session a master started on a plan (`ZEUGHAUS_PLAN=<repo>#<n>`), ends the session once
 //   that plan is done and the agent is idle, so the master goes on with the next one;
-// - in a session `zeughaus-runner plan` started (`ZEUGHAUS_PLAN_SESSION=<repo>`), ends the
-//   agent's turn when it proposes and then opens omp's plan review view with zeughaus's choices:
-//   Save and approve, Save (both store the plan in the CI and end the session) or Refine (the
-//   view's annotations, or what the user types, go back as the next prompt).
+// - in a session `zeughaus-runner plan` started (`ZEUGHAUS_PLAN_SESSION=<repo>`), supplies the
+//   plan mode: its prompt, a read-only working tree and a turn-end reminder; the `propose_plan`
+//   tool opens omp's plan review view with Save and approve, Save (both store the plan in the CI
+//   and end the session) or Refine (the view's annotations go back to the agent as the tool's
+//   result).
 //
 // The factory only registers: `omp plugin install` runs it against a throwaway API, so it must
-// do no work at load. Every handler skips subagents, which have prompts of their own. Nothing
-// here may reject out of a detached promise or a timer: omp ends the whole session on it.
+// do no work at load. Every handler skips subagents, which have prompts of their own, except the
+// read-only guard of a plan session. Nothing here may reject out of a detached promise or a
+// timer: omp ends the whole session on it.
 
-import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { basename, join, resolve } from "node:path";
 // omp resolves `@oh-my-pi/*` in an extension to its own bundled modules; only a static import
 // is rewritten that way, a dynamic `import()` of it fails to resolve.
 import { PlanReviewOverlay } from "@oh-my-pi/pi-tui/overlays/plan-review-overlay";
+import { copyToClipboard } from "@oh-my-pi/pi-coding-agent/utils/clipboard";
+import { planModePrompt } from "./plan-mode.ts";
 
 // The parts of omp's extension API this plugin uses; omp ships no type package to import.
 interface Exec {
@@ -42,10 +46,9 @@ interface Ctx {
     notify(message: string, level: "info" | "warning" | "error"): void;
     setStatus(key: string, text: string | undefined): void;
     select(title: string, options: string[]): Promise<string | number | undefined>;
-    editor(title: string, prefill?: string): Promise<string | undefined>;
     custom?<T>(
-      factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result: T) => void) => unknown,
-      options?: { overlay?: boolean; overlayOptions?: Record<string, unknown> },
+      factory: (tui: Tui, theme: unknown, keybindings: Keybindings, done: (result: T) => void) => unknown,
+      options?: { overlay?: boolean; overlayOptions?: Record<string, unknown>; signal?: AbortSignal },
     ): Promise<T | undefined>;
   };
   sessionManager: { getArtifactsDir(): string | undefined | null };
@@ -55,6 +58,16 @@ interface Ctx {
   isIdle(): boolean;
   abort(): void;
   shutdown(): void | Promise<void>;
+}
+/** The TUI a custom dialog's factory gets; what handing the terminal to an editor needs. */
+interface Tui {
+  stop(): void;
+  start(): void;
+  requestRender(force?: boolean): void;
+}
+/** The keybindings a custom dialog's factory gets (omp's defaults). */
+interface Keybindings {
+  getKeys(id: string): string[];
 }
 /** A command handler's context has what changes the session too. */
 interface CommandCtx extends Ctx {
@@ -70,6 +83,11 @@ interface ToolResultEvent {
 interface Events {
   session_start: (event: unknown, ctx: Ctx) => void;
   session_switch: (event: unknown, ctx: Ctx) => void;
+  agent_start: (event: unknown, ctx: Ctx) => void;
+  session_stop: (
+    event: { stop_hook_active?: boolean },
+    ctx: Ctx,
+  ) => { decision: "block"; reason: string } | undefined;
   before_agent_start: (
     event: { systemPrompt: string[] },
     ctx: Ctx,
@@ -103,12 +121,31 @@ interface Pi {
     name: string,
     command: { description: string; handler: (args: string, ctx: CommandCtx) => Promise<void> },
   ): void;
-  sendUserMessage(content: string): void;
+  registerTool(tool: ToolDefinition): void;
+  zod: { object(shape: Record<string, unknown>): unknown; string(): { describe(text: string): unknown } };
+}
+interface ToolDefinition {
+  name: string;
+  label: string;
+  description: string;
+  parameters: unknown;
+  approval: "read";
+  loadMode: "essential";
+  execute(
+    id: string,
+    params: { slug?: unknown },
+    signal: AbortSignal | undefined,
+    onUpdate: unknown,
+    ctx: Ctx,
+  ): Promise<{ content: Array<{ type: "text"; text: string }> }>;
 }
 /** The constructor of omp's plan review view (`PlanReviewOverlay`); only what is passed. */
 interface PlanReviewOverlayOptions {
   promptTitle: string;
   options: string[];
+  helpText?: string;
+  externalEditorName?: string;
+  externalEditorLabel?: string;
   annotationState?: unknown;
 }
 interface PlanReviewOverlayCallbacks {
@@ -116,13 +153,20 @@ interface PlanReviewOverlayCallbacks {
   onCancel(): void;
   onPlanEdited(text: string): void;
   onFeedbackChange(text: string): void;
-  onAnnotationStateChange(state: unknown): void;
+  onAnnotationStateChange(state: { annotations?: unknown[] } | undefined): void;
+  onCopyPlan?(text: string): void;
+  onExternalEditor?(): void;
+  onAnnotationExternalEditor?(text: string, apply: (text: string) => void): void;
+}
+/** The view itself; what is called on it after it was made. */
+interface PlanReviewView {
+  setPlanContent(text: string): void;
 }
 type PlanReviewOverlayClass = new (
   plan: string,
   options: PlanReviewOverlayOptions,
   callbacks: PlanReviewOverlayCallbacks,
-) => unknown;
+) => PlanReviewView;
 
 // What `zeughaus-runner ci` prints (zeughaus-link/src/ci.rs); only the fields used here.
 interface JobView {
@@ -189,7 +233,12 @@ const CLOSE = "</zeughaus-ci>";
 const PLAN_CHOICES = ["Save and approve", "Save", "Refine"];
 // How omp shows its own plan review.
 const FULLSCREEN = { anchor: "bottom-center", width: "100%", maxHeight: "100%", margin: 0, fullscreen: true };
-const IDLE_POLL_MS = 100;
+const READ_ONLY =
+  "Plan session: the working tree is read-only. Write the plan to local://<slug>-plan.md; every other change waits for the plan's execution.";
+const PLAN_TURN_REMINDER =
+  "Plan session: this turn ended without ask or propose_plan. End it with exactly one of them: ask for a decision only the user can make, or propose_plan with the plan's slug once the plan is complete. Do not answer in plain text alone.";
+// The annotations of each plan file's review: they survive a Refine and the next propose.
+const annotationsByPlan = new Map<string, unknown>();
 
 /** Runs a program; one that cannot start (not installed) answers like a shell, with 127. */
 async function exec(
@@ -620,49 +669,128 @@ function proposalsNamed(body: string): number[] {
   return line ? [...line.matchAll(/#(\d+)/g)].map((m) => Number(m[1])) : [];
 }
 
-/** What the plan view collected across reopenings: its annotations and the feedback they make. */
-interface Review {
-  annotations: unknown;
-  feedback: string;
+/** Whether a tool call of a plan session would change the working tree. */
+function writesTree(tool: string, input: Record<string, unknown>): boolean {
+  if (tool === "ast_edit") return true;
+  if (tool === "write") {
+    const path = String(input.path ?? "");
+    return path === "xd://ast_edit" || !/^(local|xd|agent|out|proc):\/\//.test(path);
+  }
+  if (tool === "edit") {
+    const headers = [...String(input.input ?? "").matchAll(/^\[(.+)#[0-9A-Fa-f]{4}\]$/gm)];
+    return headers.length === 0 || headers.some((m) => !(m[1] ?? "").startsWith("local://"));
+  }
+  return false;
+}
+
+/** `$VISUAL`, else `$EDITOR`; `undefined` when neither is set. */
+function editorCommand(): string | undefined {
+  return process.env.VISUAL?.trim() || process.env.EDITOR?.trim() || undefined;
+}
+
+/** `$VISUAL` or `$EDITOR` on `file` with the terminal handed over, as omp's review does; true on exit 0. */
+async function editInTerminal(tui: Tui, file: string): Promise<boolean> {
+  const editor = editorCommand();
+  if (!editor) throw new Error("set $VISUAL or $EDITOR to edit in an external editor");
+  tui.stop();
+  try {
+    const proc = Bun.spawn(["sh", "-c", `${editor} "$1"`, "sh", file], {
+      stdin: "inherit",
+      stdout: "inherit",
+      stderr: "inherit",
+    });
+    return (await proc.exited) === 0;
+  } finally {
+    tui.start();
+    tui.requestRender(true);
+  }
 }
 
 /**
  * The plan in omp's own plan review view with zeughaus's choices, as the index into
- * PLAN_CHOICES (-1: closed without a choice). Outside the TUI, the bare menu.
+ * PLAN_CHOICES (-1: closed without a choice). Outside the TUI, the bare menu. `review.feedback`
+ * gets what the view's annotations make; an aborted `signal` closes the view.
  */
-async function reviewPlan(ctx: Ctx, path: string, note: string, review: Review): Promise<number> {
+async function reviewPlan(
+  ctx: Ctx,
+  path: string,
+  note: string,
+  review: { feedback: string },
+  signal: AbortSignal | undefined,
+): Promise<number> {
   const body = readFileSync(path, "utf8");
-  const prompt = `${note}Plan "${planTitleOf(body)}"`;
   const custom = ctx.ui.custom;
   if (ctx.mode !== "tui" || !custom) {
-    const picked = await ctx.ui.select(prompt, PLAN_CHOICES);
+    const picked = await ctx.ui.select(`${note}Plan "${planTitleOf(body)}"`, PLAN_CHOICES);
     return typeof picked === "number" ? picked : picked === undefined ? -1 : PLAN_CHOICES.indexOf(picked);
   }
   const View: PlanReviewOverlayClass = PlanReviewOverlay;
+  const editor = editorCommand();
   // The callbacks run in the TUI's input path, so none of them may throw.
+  const run = (work: () => Promise<void>): void => {
+    void work().catch((e) => ctx.ui.notify(`zeughaus-ci: ${String(e)}`, "error"));
+  };
   const picked = await custom.call(
     ctx.ui,
-    (_tui: unknown, _theme: unknown, _keys: unknown, done: (label: string | undefined) => void) =>
-      new View(body, { promptTitle: prompt, options: PLAN_CHOICES, annotationState: review.annotations }, {
-        onPick: (label) => done(label),
-        onCancel: () => done(undefined),
-        // Edits made in the view go back into the file, as omp's review does: what is saved is
-        // what the user saw, and a reopened view shows them.
-        onPlanEdited: (text) => {
-          try {
-            writeFileSync(path, text);
-          } catch (e) {
-            ctx.ui.notify(`zeughaus-ci: cannot write the edited plan: ${String(e)}`, "error");
-          }
+    (tui: Tui, _theme: unknown, keys: Keybindings, done: (label: string | undefined) => void) => {
+      // The key the view answers with the editor; its hint line shows it only when it is named.
+      const editorKey = keys.getKeys("app.editor.external")[0];
+      const view: PlanReviewView = new View(
+        body,
+        {
+          promptTitle: `${note}Plan mode - next step`,
+          options: PLAN_CHOICES,
+          helpText: "esc cancel",
+          externalEditorName: editor ? basename(editor.split(/\s+/)[0] ?? editor) : undefined,
+          externalEditorLabel: editorKey,
+          annotationState: annotationsByPlan.get(path),
         },
-        onFeedbackChange: (text) => {
-          review.feedback = text;
+        {
+          onPick: (label) => done(label),
+          onCancel: () => done(undefined),
+          // Edits made in the view go back into the file, as omp's review does: what is saved is
+          // what the user saw, and a reopened view shows them.
+          onPlanEdited: (text) => {
+            try {
+              writeFileSync(path, text);
+            } catch (e) {
+              ctx.ui.notify(`zeughaus-ci: cannot write the edited plan: ${String(e)}`, "error");
+            }
+          },
+          onFeedbackChange: (text) => {
+            review.feedback = text;
+          },
+          onAnnotationStateChange: (state) => {
+            if ((state?.annotations?.length ?? 0) > 0) {
+              annotationsByPlan.set(path, state);
+            } else {
+              annotationsByPlan.delete(path);
+            }
+          },
+          onCopyPlan: (text) =>
+            run(async () => {
+              await copyToClipboard(text);
+              ctx.ui.notify("Copied plan to clipboard", "info");
+            }),
+          onExternalEditor: () =>
+            run(async () => {
+              if (await editInTerminal(tui, path)) view.setPlanContent(readFileSync(path, "utf8"));
+            }),
+          onAnnotationExternalEditor: (text, apply) =>
+            run(async () => {
+              const file = join(tmpdir(), `zeughaus-annotation-${process.pid}.md`);
+              try {
+                writeFileSync(file, text);
+                if (await editInTerminal(tui, file)) apply(readFileSync(file, "utf8"));
+              } finally {
+                rmSync(file, { force: true });
+              }
+            }),
         },
-        onAnnotationStateChange: (state) => {
-          review.annotations = state;
-        },
-      }),
-    { overlay: true, overlayOptions: FULLSCREEN },
+      );
+      return view;
+    },
+    { overlay: true, overlayOptions: FULLSCREEN, signal },
   );
   return picked === undefined ? -1 : PLAN_CHOICES.indexOf(picked);
 }
@@ -692,11 +820,11 @@ export default function zeughausCi(pi: Pi): void {
   let planFile: string | undefined;
   // The master's plan, once it is being watched for `done`.
   let master: { timer: unknown; busy: boolean } | undefined;
-  // From a propose that opens the plan view until that review has ended.
+  // From a propose_plan call that opens the plan view until that review has ended.
   let reviewing = false;
-  // The main session's context. The plan view opens through it: dialogs opened through a
-  // `tool_call` context close when that call is cancelled, and the propose call's turn is aborted.
-  let sessionCtx: Ctx | undefined;
+  // Whether the main agent's current run called ask or propose_plan, which may end a plan
+  // session's turn.
+  let decided = false;
 
   const isMain = (ctx: Ctx): boolean => !ctx.agent || ctx.agent.kind === "main";
 
@@ -866,60 +994,10 @@ export default function zeughausCi(pi: Pi): void {
     }, POLL_MS);
   };
 
-  /** The plan view and what follows from its choice; runs with the agent idle. */
-  const runReview = async (ctx: Ctx, repo: string, path: string): Promise<void> => {
-    const review: Review = { annotations: undefined, feedback: "" };
-    let note = "";
-    try {
-      for (;;) {
-        const index = await reviewPlan(ctx, path, note, review);
-        if (index === 0 || index === 1) {
-          const args = ["ci", "plan-save", "--json", ...(index === 0 ? ["--approve"] : [])];
-          const r = await exec(pi, RUNNER, [...args, repo, path], ctx.cwd, CONTEXT_TIMEOUT_MS);
-          const number = r.code === 0 ? jsonField(r.stdout, "number") : undefined;
-          if (typeof number !== "number") {
-            note = `Saving failed: ${r.code === 0 ? "unreadable answer" : failure(r, "ci plan-save")}. `;
-            continue;
-          }
-          const approveFailed = jsonField(r.stdout, "approve_failed");
-          let message = `saved plan #${number}`;
-          let level: "info" | "warning" = "info";
-          if (jsonField(r.stdout, "approved") === true) {
-            message = `saved and approved plan #${number}`;
-          } else if (typeof approveFailed === "string") {
-            message = `saved plan #${number}; approving it failed: ${approveFailed}; approve it in the Plans tab`;
-            level = "warning";
-          }
-          ctx.ui.notify(message, level);
-          planFile = undefined;
-          await ctx.shutdown();
-          return;
-        }
-        // Refine without annotations or typed text, and Esc: the user goes on in the conversation.
-        if (index === 2) {
-          const feedback =
-            review.feedback.trim() || (await ctx.ui.editor("What should change in the plan?"))?.trim();
-          if (feedback) pi.sendUserMessage(`${feedback}\n\nRevise the plan file, then propose it again.`);
-        }
-        return;
-      }
-    } finally {
-      reviewing = false;
-    }
-  };
-
-  /** Runs `review` once the agent's turn has ended; a timer callback must not reject. */
-  const whenIdle = (ctx: Ctx, review: () => Promise<void>): void => {
-    const timer = ctx.setInterval(() => {
-      if (!ctx.isIdle()) return;
-      ctx.clearTimer(timer);
-      void review().catch((e) => ctx.ui.notify(`zeughaus-ci: ${String(e)}`, "error"));
-    }, IDLE_POLL_MS);
-  };
-
   pi.on("session_start", (_event, ctx) => {
     if (!isMain(ctx)) return;
-    sessionCtx = ctx;
+    const session = planSession();
+    if (session && ctx.hasUI) ctx.ui.setStatus("zeughaus-plan", `plan ${session.repo}`);
     // Not awaited: a slow CI must not hold up the session; before_agent_start waits for it.
     void prime(ctx).catch(() => undefined);
     const plan = masterPlan();
@@ -947,53 +1025,30 @@ export default function zeughausCi(pi: Pi): void {
     })().catch(() => undefined);
   });
 
-  // In a session `zeughaus-runner plan` started, proposing a plan ends the agent's turn and opens
-  // omp's plan review view with zeughaus's choices: the propose write is blocked, so omp's own
-  // review (whose approval executes the plan) never opens.
+  // A plan session's working tree is read-only for every agent, subagents included; only the
+  // session's artifacts (the plan file) and the internal devices are written.
   pi.on("tool_call", async (event, ctx) => {
-    const session = planSession();
-    if (!session || !isMain(ctx) || !ctx.hasUI) return undefined;
-    if (event.toolName !== "write" || event.input.path !== "xd://propose") return undefined;
-    try {
-      const slug = String(event.input.content ?? "").trim();
-      const named = slug ? resolvePlan(`local://${slug}-plan.md`, ctx) : undefined;
-      const path = named && existsSync(named) ? named : newestPlan(ctx);
-      // No plan: omp's own propose handler says what is missing.
-      if (!path) return undefined;
-      const body = readFileSync(path, "utf8");
-      if (body.trim() === "") return undefined;
-      const n = session.proposal;
-      if (n !== undefined && !proposalsNamed(body).includes(n)) {
-        return {
-          block: true,
-          reason: `Put the line \`Proposals: #${n}\` directly under the plan's title, then propose again.`,
-        };
-      }
-      if (reviewing) {
-        return { block: true, reason: "The plan view is already open. End your turn now; do nothing more." };
-      }
-      reviewing = true;
-      // omp stops its working spinner only when the turn ends, so the view opens after the turn:
-      // this call is blocked, the turn aborted right after the handler returned, and the view
-      // opens once the agent is idle.
-      ctx.setTimeout(() => ctx.abort(), 0);
-      const ui = sessionCtx ?? ctx;
-      whenIdle(ui, () => runReview(ui, session.repo, path));
-      return {
-        block: true,
-        reason: "The user is reviewing the plan in zeughaus's plan view. Your turn ends here; do nothing more.",
-      };
-    } catch (e) {
-      ctx.ui.notify(`zeughaus-ci: ${String(e)}`, "error");
-      return undefined;
-    }
+    if (!planSession()) return undefined;
+    if (writesTree(event.toolName, event.input)) return { block: true, reason: READ_ONLY };
+    if (isMain(ctx) && (event.toolName === "ask" || event.toolName === "propose_plan")) decided = true;
+    return undefined;
+  });
+
+  pi.on("agent_start", (_event, ctx) => {
+    if (isMain(ctx)) decided = false;
+  });
+
+  // A plan session's turn ends with ask or propose_plan; the second stop is let through, so the
+  // reminder never loops.
+  pi.on("session_stop", (event, ctx) => {
+    if (!planSession() || !isMain(ctx) || decided || event.stop_hook_active) return undefined;
+    return { decision: "block", reason: PLAN_TURN_REMINDER };
   });
 
   // A new or resumed session in this process: its prompt block and status are its own, and the
   // watch of the previous one must not report into it.
   pi.on("session_switch", (_event, ctx) => {
     if (!isMain(ctx)) return;
-    sessionCtx = ctx;
     if (watch) endWatch(watch, false);
     loaded = undefined;
     latest = { kind: "none" };
@@ -1004,11 +1059,102 @@ export default function zeughausCi(pi: Pi): void {
 
   pi.on("before_agent_start", async (event, ctx) => {
     if (!isMain(ctx) || !Array.isArray(event.systemPrompt)) return undefined;
+    const added: string[] = [];
     const text = block(await contextFor(ctx.cwd));
     // Exact match: AGENTS.md and the skill mention the tag, so a substring test would skip the block.
-    if (text === undefined || event.systemPrompt.includes(text)) return undefined;
-    return { systemPrompt: [...event.systemPrompt, text] };
+    if (text !== undefined && !event.systemPrompt.includes(text)) added.push(text);
+    const session = planSession();
+    if (session) {
+      const prompt = planModePrompt(session.repo, session.proposal);
+      if (!event.systemPrompt.includes(prompt)) added.push(prompt);
+    }
+    return added.length === 0 ? undefined : { systemPrompt: [...event.systemPrompt, ...added] };
   });
+
+  // Registered only in a plan session; registering does no work at load.
+  const planned = planSession();
+  if (planned) {
+    pi.registerTool({
+      name: "propose_plan",
+      label: "Propose plan",
+      description:
+        "Submit the finished plan local://<slug>-plan.md for the user's review. Returns when the user has chosen: Save and approve or Save end the session; Refine returns the user's feedback (revise the plan file, then call propose_plan again); a closed review means end your turn and wait for the user.",
+      parameters: pi.zod.object({
+        slug: pi.zod.string().describe("The plan's slug: the file is local://<slug>-plan.md"),
+      }),
+      approval: "read",
+      loadMode: "essential",
+      execute: async (_id, params, signal, _onUpdate, ctx) => {
+        const say = (text: string) => ({ content: [{ type: "text" as const, text }] });
+        if (!isMain(ctx)) throw new Error("Only the main agent proposes the plan.");
+        const slug = String(params.slug ?? "")
+          .trim()
+          .replace(/^local:\/\//, "")
+          .replace(/-plan\.md$/, "");
+        const name = `local://${slug}-plan.md`;
+        const path = resolvePlan(name, ctx);
+        if (!path || !existsSync(path)) {
+          throw new Error(`No plan at ${name}: write it there, then call propose_plan again.`);
+        }
+        const body = readFileSync(path, "utf8");
+        if (body.trim() === "") throw new Error(`${name} is empty.`);
+        const n = planned.proposal;
+        if (n !== undefined && !proposalsNamed(body).includes(n)) {
+          throw new Error(
+            `Put the line \`Proposals: #${n}\` directly under the plan's title, then call propose_plan again.`,
+          );
+        }
+        if (reviewing) throw new Error("The plan review is already open.");
+        reviewing = true;
+        planFile = path;
+        try {
+          let note = "";
+          for (;;) {
+            const review = { feedback: "" };
+            const index = await reviewPlan(ctx, path, note, review, signal);
+            if (index === 0 || index === 1) {
+              const args = ["ci", "plan-save", "--json", ...(index === 0 ? ["--approve"] : [])];
+              const r = await exec(pi, RUNNER, [...args, planned.repo, path], ctx.cwd, CONTEXT_TIMEOUT_MS);
+              const number = r.code === 0 ? jsonField(r.stdout, "number") : undefined;
+              if (typeof number !== "number") {
+                note = `Saving failed: ${r.code === 0 ? "unreadable answer" : failure(r, "ci plan-save")}. `;
+                continue;
+              }
+              const approved = jsonField(r.stdout, "approved") === true;
+              const approveFailed = jsonField(r.stdout, "approve_failed");
+              let message = `saved plan #${number}`;
+              let level: "info" | "warning" = "info";
+              if (approved) {
+                message = `saved and approved plan #${number}`;
+              } else if (typeof approveFailed === "string") {
+                message = `saved plan #${number}; approving it failed: ${approveFailed}; approve it in the Plans tab`;
+                level = "warning";
+              }
+              ctx.ui.notify(message, level);
+              annotationsByPlan.delete(path);
+              planFile = undefined;
+              // After the result is in: the session ends once this call has returned.
+              ctx.setTimeout(() => {
+                ctx.abort();
+                void Promise.resolve(ctx.shutdown()).catch(() => undefined);
+              }, 0);
+              return say(`Saved as plan #${number}${approved ? " and approved" : ""}. The session ends now.`);
+            }
+            if (index === 2 && review.feedback.trim() !== "") {
+              annotationsByPlan.delete(path);
+              return say(`${review.feedback.trim()}\n\nRevise the plan file, then call propose_plan again.`);
+            }
+            if (index === 2) ctx.ui.notify("Refine: type what should change", "info");
+            return say(
+              "The user closed the review to answer in the conversation. End your turn now without another tool call; the user's next message says how to go on.",
+            );
+          }
+        } finally {
+          reviewing = false;
+        }
+      },
+    });
+  }
 
   pi.on("tool_result", async (event, ctx) => {
     if (!isMain(ctx) || event.toolName !== "bash" || event.isError) return undefined;

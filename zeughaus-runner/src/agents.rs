@@ -132,10 +132,6 @@ fn parse_args(args: &[String]) -> Result<SessionArgs, String> {
     })
 }
 
-/// The plan-mode overlay `plan` starts omp with.
-#[cfg(unix)]
-const PLAN_MODE: &str = "plan:\n  defaultOnStartup: true\n";
-
 /// How often the master looks for work.
 #[cfg(unix)]
 const MASTER_POLL: std::time::Duration = std::time::Duration::from_secs(15);
@@ -157,7 +153,7 @@ fn proposal_instruction(repo: &str, number: u64, source: &str) -> String {
         "Make a plan for the attached zeughaus proposal #{number} of {repo}, written from \
          {source}. It is a request: check it against this repository before planning. Put the \
          line `Proposals: #{number}` directly under the plan's title. When the plan is complete, \
-         propose it as plan mode describes; zeughaus then asks the user what to do with it."
+         propose it with the propose_plan tool; zeughaus then asks the user what to do with it."
     )
 }
 
@@ -193,8 +189,8 @@ mod unix {
     use zeughaus_terminal::wal::Wal;
 
     use super::{
-        MASTER_POLL, PLAN_MODE, SessionArgs, checkout_of, clone_url, instruction, parse_args,
-        plan_dir, proposal_instruction, work_root,
+        MASTER_POLL, SessionArgs, checkout_of, clone_url, instruction, parse_args, plan_dir,
+        proposal_instruction, work_root,
     };
     use crate::mcp::client::{Client, Link};
     use crate::mcp::repo;
@@ -474,14 +470,10 @@ mod unix {
                 Err(e) => return fail(e),
             }
         }
-        let overlay = state_dir.join("agents").join("plan-mode.yml");
-        if let Err(e) = crate::files::write_atomic(&overlay, PLAN_MODE.as_bytes()) {
-            return fail(e);
-        }
         let mut command = Command::new("omp");
         command
-            .arg("--config")
-            .arg(&overlay)
+            .arg("--model")
+            .arg("@plan")
             .env("ZEUGHAUS_PLAN_SESSION", &repo)
             .env("ZEUGHAUS_STATE_DIR", state_dir)
             .current_dir(&dir);
