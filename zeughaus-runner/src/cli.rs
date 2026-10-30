@@ -1,5 +1,6 @@
 //! The runner binary's subcommands: `trigger` and `hold` as a client of a
 //! running runner, `maintain` as a reader of its maintenance records,
+//! `tidy` as the keeper of the CI repositories' checkouts on this host,
 //! `timeout` as the deadline a host CI job runs under, `release` as the tool
 //! that makes and checks signed release bundles, `mcp` as the server that
 //! gives an agent the CI's pipelines and try runs as tools, `ci` as the
@@ -25,9 +26,10 @@
 //! zeughaus-runner ci planned <repo> <file>
 //! zeughaus-runner ci wait <repo> <number|sha> [<job>]
 //! zeughaus-runner ci overdue <repo> <number> <job>
-//! zeughaus-runner plan <repo> --branch <branch> [--proposal <n>]
-//! zeughaus-runner master <repo> [--branch <branch>]
+//! zeughaus-runner plan <repo> --branch <branch> --origin <origin> [--proposal <n>]
+//! zeughaus-runner master <repo> --branch <branch> --origin <origin>
 //! zeughaus-runner maintain
+//! zeughaus-runner tidy [--dry-run] [--list]
 //! zeughaus-runner timeout <seconds> -- <program> [args..]
 //! zeughaus-runner release keygen <file>
 //! zeughaus-runner release bundle --channel <c> --build <n> --sha <sha> --version <v> --out <dir> <file>...
@@ -61,9 +63,10 @@ usage: zeughaus-runner [--state-dir <dir>] [--feed-addr <host:port>] [--keep-run
        zeughaus-runner ci planned <repo> <file>
        zeughaus-runner ci wait <repo> <number|sha> [<job>]
        zeughaus-runner ci overdue <repo> <number> <job>
-       zeughaus-runner plan <repo> --branch <branch> [--proposal <n>]
-       zeughaus-runner master <repo> [--branch <branch>]
+       zeughaus-runner plan <repo> --branch <branch> --origin <origin> [--proposal <n>]
+       zeughaus-runner master <repo> --branch <branch> --origin <origin>
        zeughaus-runner maintain
+       zeughaus-runner tidy [--dry-run] [--list]
        zeughaus-runner timeout <seconds> -- <program> [args..]
        zeughaus-runner release keygen <file>
        zeughaus-runner release bundle --channel <c> --build <n> --sha <sha> --version <v> --out <dir> <file>...
@@ -145,6 +148,13 @@ pub fn run(args: &[String], state_dir: &Path) -> Option<ExitCode> {
         Some("trigger") => parse_trigger(&positional[1..]),
         Some("hold") => parse_hold(&positional[1..]),
         Some("maintain") => return Some(maintain(&positional[1..], state_dir)),
+        #[cfg(unix)]
+        Some("tidy") => return Some(crate::tidy::run(&positional[1..], state_dir)),
+        #[cfg(not(unix))]
+        Some("tidy") => {
+            eprintln!("[tidy] not supported on this platform");
+            return Some(ExitCode::FAILURE);
+        }
         // What the updater runs a new binary with before it trusts it: the
         // answer must not depend on anything but the binary.
         Some("version") if positional.len() == 1 => {

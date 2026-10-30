@@ -18,9 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documents by state, the selected one as Markdown, Approve, Reject,
   Requeue, Mark done, Dismiss and Delete, and the buttons `Plan session`
   and `Master`, which open `zeughaus-runner plan` (omp in plan mode in a
-  clean `<checkout>-plan` worktree of the default branch) or
+  clean plan clone of the default branch) or
   `zeughaus-runner master` (claims the approved plans one after another and
-  runs omp on each in the main checkout) in the own runner's `Triggered`
+  runs omp on each in the master clone) in the own runner's `Triggered`
   group. The omp plugin (0.2.0) adds `/zeughaus save`, marks the proposals
   an executed plan names as planned, and ends a master's session once its
   plan is done.
@@ -37,9 +37,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `zeughaus-runner plan` starts omp on the `plan` model role.
   `zeughaus-runner ci plan-save --approve` approves the plan as it is
   stored.
-- `Plan session` and `Master` no longer refuse a repository without a
-  checkout under the work root: the session clones it over ssh from the
-  origin (`git@<host>:<owner>/<repo>.git`) in its terminal and goes on.
+- The agent sessions work in clones of their own in the runner's state
+  directory, `<state-dir>/agent-work/{master,plan}/<host>/<owner>/<repo>`,
+  never in the user's checkouts under `~/work`: a missing one is cloned over
+  ssh from the origin (`git@<host>:<owner>/<repo>.git`) in the session's
+  terminal, and the plan clone borrows the master clone's objects. The
+  master fast-forwards its clone to the default branch before each claim
+  and waits while it has uncommitted or unpushed work.
+- `zeughaus-runner tidy [--dry-run] [--list]` keeps the checkouts of the
+  CI's repositories on a host: it fetches them, fast-forwards the default
+  branch of a clean work checkout, removes a cargo `target/` idle for 24 h
+  and a checkout or agent clone idle for 72 h once nothing in it would be
+  lost. A checkout a session holds and a `target/` cargo builds in are left
+  alone; `--list` prints the repositories' origins. A maintenance task now
+  sees the runner's `ZEUGHAUS_STATE_DIR`.
 - A runner on Windows enlists into the CI. It runs `.ps1` jobs on its own
   host under its `timeout` subcommand, which a job object backs on
   Windows. `ci.toml` marks such a runner `os = "windows"`; the CI places

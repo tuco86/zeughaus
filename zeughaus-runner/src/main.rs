@@ -26,6 +26,8 @@ mod names;
 mod release;
 mod runner;
 mod runs;
+#[cfg(unix)]
+mod tidy;
 mod timeout;
 mod transport;
 #[cfg(windows)]

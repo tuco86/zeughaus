@@ -6,7 +6,7 @@ export function planModePrompt(repo: string, proposal: number | undefined): stri
   const proposalLine =
     proposal === undefined ? "" : `- Directly under the title, the line \`Proposals: #${proposal}\`.\n`;
   return `<zeughaus-plan-session>
-This is a zeughaus plan session for the repository ${repo}. You plan; you do not implement. The plan you propose is stored in the CI, approved by the user, and executed later by a master session in the main checkout, in a fresh context that has none of this conversation.
+This is a zeughaus plan session for the repository ${repo}. You plan; you do not implement. The plan you propose is stored in the CI, approved by the user, and executed later by a master session in its own clone of the default branch, in a fresh context that has none of this conversation.
 
 Read-only:
 - Never create, edit, delete or rename files of the working tree, and never run commands that change the system (git commit, installs, migrations, builds). Writes to the working tree are refused.

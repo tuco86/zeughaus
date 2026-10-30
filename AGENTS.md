@@ -200,14 +200,18 @@ change is announced as `CiDocs` on `/events`. A CI section's repository
 group starts with its Plans tab, whose `Plan session` and `Master` buttons
 ask the editor's own runner on `/agent` (Unix) to open `zeughaus-runner
 plan <repo>` or `master <repo>` in a terminal of its `Triggered` group, in
-the checkout `~/work/<origin>` (`$ZEUGHAUS_WORK` overrides `~/work`; a
-missing one is cloned over ssh from the origin in that terminal first):
-`plan` brings the detached worktree `<checkout>-plan` to `origin/<default
-branch>` and execs omp there on the `plan` model role (`--model @plan`);
-`master` claims approved plans
+the session's own clone under `<state-dir>/agent-work/`, never in the
+user's checkouts (a missing one is cloned over ssh from the origin in that
+terminal first): `plan` brings the plan clone
+`agent-work/plan/<origin>`, which borrows the objects of the master clone,
+detached to `origin/<default branch>` and runs omp there on the `plan`
+model role (`--model @plan`); `master` claims approved plans
 one after another and runs `omp @<plan> <instruction>` with
-`ZEUGHAUS_PLAN=<repo>#<n>` in the main checkout, waiting while the
-checkout is dirty or a plan is in progress. An open proposal's `Plan`
+`ZEUGHAUS_PLAN=<repo>#<n>` in the master clone `agent-work/master/<origin>`,
+which it fast-forwards to the default branch before each claim, waiting
+while the clone is dirty or has unpushed commits or a plan is in progress.
+While it runs, a session holds a shared lock on the clone's
+`.git/zeughaus-session.lock`. An open proposal's `Plan`
 button opens `plan <repo> --proposal <n>` (tab `plan <repo> #<n>`), which
 attaches the proposal to omp's first prompt so planning starts at once.
 In every session `plan` starts (`ZEUGHAUS_PLAN_SESSION=<repo>`), the omp
@@ -233,6 +237,19 @@ editor; its log is `<state-dir>/runs/<id>/wal`.
 result and age from `<state-dir>/maintain/<name>.json`. The wohnzimmer
 runner's file is `deploy/windows/maintain.toml`, which the release's `share/`
 carries and `install windows` and every update write to its state directory.
+A runner's maintenance task sees `ZEUGHAUS_STATE_DIR`, so a task
+`zeughaus-runner tidy` works on that runner's state directory. `tidy
+[--dry-run] [--list]` asks the CI for its repositories and keeps their
+checkouts on the host: the work checkout `~/work/<origin>` with its linked
+worktrees and the agent clones. It fetches them, fast-forwards the default
+branch of a clean work checkout, removes a cargo `target/` idle for 24 h,
+and removes a checkout idle for 72 h (its reflog without tidy's own
+`zeughaus-tidy` entries, and its last build) only when nothing would be
+lost: no changed, untracked or ignored file, stash, unpushed branch, tag or
+HEAD, linked worktree, and for a master clone no plan clone. A clone a
+session holds and a `target/` cargo builds in are left alone. `--dry-run`
+prints `would ...` and changes nothing; `--list` prints the origins, one
+per line (exit 2 without an answer from the CI).
 
 Every terminal lives in a shim process (`zeughaus-runner shim <dir>`, one
 per terminal under `<state-dir>/terminals/`), so shells and job runs

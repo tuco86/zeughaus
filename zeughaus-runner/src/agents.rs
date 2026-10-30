@@ -1,19 +1,22 @@
 //! Agent sessions an editor opens on its own runner, each in a terminal of
 //! the runner's locked `Triggered` group (closing the tab ends it):
 //!
-//! - `plan <repo> [--proposal <n>]`: omp in plan mode in `<checkout>-plan`,
-//!   a detached worktree of the repository's default branch that this keeps
-//!   clean and current, so planning never touches the main checkout or its
-//!   `target/`. With a proposal, omp starts planning that open proposal of
-//!   the CI at once.
+//! - `plan <repo> [--proposal <n>]`: omp in plan mode in the plan clone, a
+//!   checkout detached at the repository's default branch that this keeps
+//!   clean and current. It borrows the master clone's objects and never
+//!   builds. With a proposal, omp starts planning that open proposal of the
+//!   CI at once.
 //! - `master <repo>`: the loop that claims the repository's approved plans
-//!   from the CI one after another and executes each with omp in the main
-//!   checkout. One session works in a checkout at a time: the CI refuses a
-//!   claim while a plan is in progress, and a dirty checkout is waited for.
+//!   from the CI one after another and executes each with omp in the master
+//!   clone, which it fast-forwards to the default branch before each claim.
+//!   One session works in a clone at a time: the CI refuses a claim while a
+//!   plan is in progress, and a dirty or unpushed clone is waited for.
 //!
-//! A checkout is found by the repository's origin under the work root,
-//! `~/work/<host>/<owner>/<repo>`. A missing one is cloned over ssh from the
-//! origin in the session's terminal before the session starts.
+//! Both clones live in the runner's state directory, never among the user's
+//! own checkouts: `<state-dir>/agent-work/{master,plan}/<host>/<owner>/<repo>`.
+//! A missing one is cloned over ssh from the origin in the session's terminal
+//! before the session starts. While a session runs it holds a shared lock on
+//! the clone's `.git/zeughaus-session.lock`, so `tidy` leaves the clone alone.
 
 use std::path::Path;
 #[cfg(unix)]
@@ -71,16 +74,29 @@ fn clone_url(origin: &str) -> String {
     }
 }
 
-/// The worktree plans are made in: `<checkout>-plan` beside the checkout.
+/// The directory the agent sessions' clones live under.
 #[cfg(unix)]
-pub fn plan_dir(checkout: &Path) -> PathBuf {
-    let mut name = checkout
-        .file_name()
-        .map(|name| name.to_os_string())
-        .unwrap_or_default();
-    name.push("-plan");
-    checkout.with_file_name(name)
+pub fn agent_root(state_dir: &Path) -> PathBuf {
+    state_dir.join("agent-work")
 }
+
+/// The clone the master session executes the plans of `origin` in.
+#[cfg(unix)]
+pub fn master_dir(state_dir: &Path, origin: &str) -> Result<PathBuf, String> {
+    checkout_of(&agent_root(state_dir).join("master"), origin)
+}
+
+/// The clone plans of `origin` are made in; it borrows the master clone's
+/// objects.
+#[cfg(unix)]
+pub fn plan_clone_dir(state_dir: &Path, origin: &str) -> Result<PathBuf, String> {
+    checkout_of(&agent_root(state_dir).join("plan"), origin)
+}
+
+/// The file in a clone's git directory a session holds a shared lock on
+/// while it runs, and `tidy` an exclusive one while it works on the clone.
+#[cfg(unix)]
+pub const SESSION_LOCK: &str = "zeughaus-session.lock";
 
 /// What both sessions are started with.
 #[cfg(unix)]
@@ -174,7 +190,6 @@ pub use self::unix::{Agents, master, plan, serve};
 
 #[cfg(unix)]
 mod unix {
-    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, ExitCode, Stdio};
     use std::sync::Arc;
@@ -189,8 +204,8 @@ mod unix {
     use zeughaus_terminal::wal::Wal;
 
     use super::{
-        MASTER_POLL, SessionArgs, checkout_of, clone_url, instruction, parse_args, plan_dir,
-        proposal_instruction, work_root,
+        MASTER_POLL, SESSION_LOCK, SessionArgs, agent_root, clone_url, instruction, master_dir,
+        parse_args, plan_clone_dir, proposal_instruction,
     };
     use crate::mcp::client::{Client, Link};
     use crate::mcp::repo;
@@ -217,15 +232,21 @@ mod unix {
             if !crate::names::valid_name(&request.repo) {
                 return refused(format!("{:?} is no repository name", request.repo));
             }
-            let Some(root) = work_root() else {
-                return refused("no work root: neither ZEUGHAUS_WORK nor HOME is set".to_owned());
-            };
-            let checkout = match checkout_of(&root, &request.origin) {
-                Ok(checkout) => checkout,
+            let master = match master_dir(&self.state_dir, &request.origin) {
+                Ok(dir) => dir,
                 Err(e) => return refused(e),
             };
-            if checkout.exists() && !checkout.is_dir() {
-                return refused(format!("{} exists and is no checkout", checkout.display()));
+            let dir = match request.session {
+                AgentSession::Master => master.clone(),
+                AgentSession::Plan => match plan_clone_dir(&self.state_dir, &request.origin) {
+                    Ok(dir) => dir,
+                    Err(e) => return refused(e),
+                },
+            };
+            for clone in [&master, &dir] {
+                if clone.exists() && !clone.is_dir() {
+                    return refused(format!("{} exists and is no checkout", clone.display()));
+                }
             }
             let (word, label) = match (request.session, request.proposal) {
                 (AgentSession::Plan, Some(n)) => ("plan", format!("plan {} #{n}", request.repo)),
@@ -241,11 +262,12 @@ mod unix {
                     existing: true,
                 };
             }
-            // A missing checkout is cloned by the session itself, in the
-            // terminal, so the terminal starts in the work root.
-            let cwd = if checkout.is_dir() {
-                checkout
+            // A missing clone is made by the session itself, in the
+            // terminal, so the terminal starts in the agent root.
+            let cwd = if dir.is_dir() {
+                dir
             } else {
+                let root = agent_root(&self.state_dir);
                 if let Err(e) = std::fs::create_dir_all(&root) {
                     return refused(format!("cannot create {}: {e}", root.display()));
                 }
@@ -345,11 +367,13 @@ mod unix {
         }
     }
 
-    /// Runs git in `dir`; `Err` is its last line of stderr.
+    /// Runs git in `dir`; `Err` is its last line of stderr. It never asks
+    /// for credentials: nobody would answer.
     fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
         let output = Command::new("git")
             .current_dir(dir)
             .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
             .stdin(Stdio::null())
             .output()
             .map_err(|e| format!("cannot run git: {e}"))?;
@@ -366,57 +390,73 @@ mod unix {
             .to_owned())
     }
 
-    /// Makes the session's working directory its checkout: the one of
-    /// `origin` under the work root, cloned first when it is missing, or
-    /// the current directory when no origin is named (a session run by
-    /// hand in a checkout).
-    fn enter_checkout(
+    /// Clones `origin` into `dir` when it is missing and checks `branch`
+    /// out: the branch itself in the master clone (no `reference`), or
+    /// `origin/<branch>` detached in the plan clone, which borrows the
+    /// objects of the `reference` clone.
+    fn ensure_clone(
         word: &str,
-        origin: Option<&str>,
-        branch: Option<&str>,
-    ) -> Result<PathBuf, String> {
-        let Some(origin) = origin else {
-            return std::env::current_dir()
-                .map_err(|e| format!("cannot read the working directory: {e}"));
+        dir: &Path,
+        origin: &str,
+        branch: &str,
+        reference: Option<&Path>,
+    ) -> Result<(), String> {
+        if dir.exists() {
+            if !dir.is_dir() {
+                return Err(format!("{} exists and is no checkout", dir.display()));
+            }
+            return Ok(());
+        }
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+        let url = clone_url(origin);
+        println!("[{word}] cloning {url} into {}", dir.display());
+        // Inherited stdio: the progress and an ssh prompt belong in the
+        // session's terminal.
+        let mut command = Command::new("git");
+        command.arg("clone");
+        if let Some(reference) = reference {
+            command.arg("--reference").arg(reference);
+        }
+        let status = command
+            .arg("--no-checkout")
+            .arg(&url)
+            .arg(dir)
+            .status()
+            .map_err(|e| format!("cannot run git: {e}"))?;
+        if !status.success() {
+            return Err(format!("git clone {url} failed ({status})"));
+        }
+        let tracking = format!("origin/{branch}");
+        match reference {
+            None => git(dir, &["checkout", "-q", branch])?,
+            Some(_) => git(dir, &["checkout", "-q", "--detach", &tracking])?,
         };
-        let root = work_root()
-            .ok_or_else(|| "no work root: neither ZEUGHAUS_WORK nor HOME is set".to_owned())?;
-        let checkout = checkout_of(&root, origin)?;
-        if !checkout.exists() {
-            if let Some(parent) = checkout.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-            }
-            let url = clone_url(origin);
-            println!("[{word}] cloning {url} into {}", checkout.display());
-            // Inherited stdio: the progress and an ssh prompt belong in the
-            // session's terminal.
-            let mut command = Command::new("git");
-            command.arg("clone");
-            if let Some(branch) = branch {
-                command.args(["--branch", branch]);
-            }
-            let status = command
-                .arg(&url)
-                .arg(&checkout)
-                .status()
-                .map_err(|e| format!("cannot run git: {e}"))?;
-            if !status.success() {
-                return Err(format!("git clone {url} failed ({status})"));
-            }
-        }
-        if !checkout.is_dir() {
-            return Err(format!("{} exists and is no checkout", checkout.display()));
-        }
-        std::env::set_current_dir(&checkout)
-            .map_err(|e| format!("cannot enter {}: {e}", checkout.display()))?;
-        Ok(checkout)
+        Ok(())
     }
 
-    /// `zeughaus-runner plan <repo> --branch <b> [--proposal <n>] [--origin
-    /// <o>]`: brings `<checkout>-plan` to the default branch and replaces
-    /// itself with omp in plan mode there, planning proposal `n` of the CI
-    /// when one is named.
+    /// A shared lock on the clone's session lock file, held as long as the
+    /// returned file lives. It only waits while `tidy` holds the file.
+    fn session_lock(dir: &Path) -> Result<std::fs::File, String> {
+        let path = dir.join(".git").join(SESSION_LOCK);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
+        file.lock_shared()
+            .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
+        Ok(file)
+    }
+
+    /// `zeughaus-runner plan <repo> --branch <b> --origin <o> [--proposal
+    /// <n>]`: brings the plan clone to the default branch and runs omp in
+    /// plan mode there, planning proposal `n` of the CI when one is named.
+    /// It holds the clone's session lock until omp ends and exits with
+    /// omp's code.
     pub fn plan(args: &[String], state_dir: &Path) -> ExitCode {
         let fail = |message: String| {
             eprintln!("[plan] {message}");
@@ -427,9 +467,10 @@ mod unix {
                 repo,
                 branch: Some(branch),
                 proposal,
-                origin,
+                origin: Some(origin),
             }) => (repo, branch, proposal, origin),
             Ok(SessionArgs { branch: None, .. }) => return fail("--branch is needed".to_owned()),
+            Ok(SessionArgs { origin: None, .. }) => return fail("--origin is needed".to_owned()),
             Err(e) => return fail(e),
         };
         let proposal = match proposal {
@@ -439,37 +480,62 @@ mod unix {
             },
             None => None,
         };
-        let checkout = match enter_checkout("plan", origin.as_deref(), Some(&branch)) {
-            Ok(dir) => dir,
-            Err(e) => return fail(e),
+        let (master, dir) = match (
+            master_dir(state_dir, &origin),
+            plan_clone_dir(state_dir, &origin),
+        ) {
+            (Ok(master), Ok(dir)) => (master, dir),
+            (Err(e), _) | (_, Err(e)) => return fail(e),
         };
+        if let Err(e) = ensure_clone("plan", &master, &origin, &branch, None) {
+            return fail(e);
+        }
         let tracking = format!("origin/{branch}");
-        match git(&checkout, &["fetch", "-q", "origin", &branch]) {
+        match git(&master, &["fetch", "-q", "origin", &branch]) {
             Ok(_) => println!("[plan] fetched {tracking}"),
             Err(e) => println!("[plan] fetch failed: {e}; using the last fetched {tracking}"),
         }
-        let dir = plan_dir(&checkout);
-        let dir_arg = dir.to_string_lossy().into_owned();
-        if !dir.exists() {
-            if let Err(e) = git(
-                &checkout,
-                &["worktree", "add", "--detach", &dir_arg, &tracking],
-            ) {
+        let mut cloned_again = false;
+        loop {
+            if let Err(e) = ensure_clone("plan", &dir, &origin, &branch, Some(&master)) {
                 return fail(e);
             }
-            println!("[plan] made {dir_arg} at {tracking}");
-        } else {
             match git(&dir, &["status", "--porcelain"]) {
-                Ok(status) if status.trim().is_empty() => {
-                    if let Err(e) = git(&dir, &["checkout", "-q", "--detach", &tracking]) {
-                        return fail(e);
-                    }
-                    println!("[plan] {dir_arg} at {tracking}");
+                Ok(status) if status.trim().is_empty() => {}
+                Ok(_) => {
+                    println!(
+                        "[plan] {} has changes; planning on it as it is",
+                        dir.display()
+                    );
+                    break;
                 }
-                Ok(_) => println!("[plan] {dir_arg} has changes; planning on it as it is"),
+                Err(e) => return fail(e),
+            }
+            let brought = git(&dir, &["fetch", "-q", "origin", &branch])
+                .and_then(|_| git(&dir, &["checkout", "-q", "--detach", &tracking]));
+            match brought {
+                Ok(_) => {
+                    println!("[plan] {} at {tracking}", dir.display());
+                    break;
+                }
+                // A clean clone holds nothing of value: make it anew once.
+                Err(e) if !cloned_again => {
+                    println!(
+                        "[plan] {} was unusable ({e}); cloning it again",
+                        dir.display()
+                    );
+                    if let Err(e) = std::fs::remove_dir_all(&dir) {
+                        return fail(format!("cannot remove {}: {e}", dir.display()));
+                    }
+                    cloned_again = true;
+                }
                 Err(e) => return fail(e),
             }
         }
+        let _lock = match session_lock(&dir) {
+            Ok(lock) => lock,
+            Err(e) => return fail(e),
+        };
         let mut command = Command::new("omp");
         command
             .arg("--model")
@@ -490,11 +556,14 @@ mod unix {
                 .arg(proposal_instruction(&repo, doc.number, &doc.source))
                 .env("ZEUGHAUS_PROPOSAL", doc.number.to_string());
         }
-        let error = command.exec();
-        if error.kind() == std::io::ErrorKind::NotFound {
-            fail("omp not found on PATH".to_owned())
-        } else {
-            fail(format!("cannot start omp: {error}"))
+        match command.status() {
+            Ok(status) => status
+                .code()
+                .map_or(ExitCode::FAILURE, |code| ExitCode::from(code as u8)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                fail("omp not found on PATH".to_owned())
+            }
+            Err(e) => fail(format!("cannot start omp: {e}")),
         }
     }
 
@@ -546,9 +615,9 @@ mod unix {
         }
     }
 
-    /// `zeughaus-runner master <repo> [--branch <b>] [--origin <o>]` in the
-    /// main checkout: claims the approved plans of `repo` one after another
-    /// and runs omp on each.
+    /// `zeughaus-runner master <repo> --branch <b> --origin <o>` in the
+    /// master clone: claims the approved plans of `repo` one after another
+    /// and runs omp on each, holding the clone's session lock throughout.
     pub fn master(args: &[String], state_dir: &Path) -> ExitCode {
         let fail = |message: String| {
             eprintln!("[master] {message}");
@@ -558,16 +627,28 @@ mod unix {
             Ok(SessionArgs {
                 proposal: Some(_), ..
             }) => return fail("--proposal is for plan only".to_owned()),
+            Ok(SessionArgs { branch: None, .. }) => return fail("--branch is needed".to_owned()),
+            Ok(SessionArgs { origin: None, .. }) => return fail("--origin is needed".to_owned()),
             Ok(SessionArgs {
                 repo,
-                branch,
-                origin,
+                branch: Some(branch),
+                origin: Some(origin),
                 ..
             }) => (repo, branch, origin),
             Err(e) => return fail(e),
         };
-        let cwd = match enter_checkout("master", origin.as_deref(), branch.as_deref()) {
+        let cwd = match master_dir(state_dir, &origin) {
             Ok(dir) => dir,
+            Err(e) => return fail(e),
+        };
+        if let Err(e) = ensure_clone("master", &cwd, &origin, &branch, None) {
+            return fail(e);
+        }
+        if let Err(e) = std::env::set_current_dir(&cwd) {
+            return fail(format!("cannot enter {}: {e}", cwd.display()));
+        }
+        let _lock = match session_lock(&cwd) {
+            Ok(lock) => lock,
             Err(e) => return fail(e),
         };
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -579,7 +660,7 @@ mod unix {
         };
         let client = Client::new(Link::resolve(None, state_dir));
         let ended = runtime.block_on(async {
-            let ended = serve_plans(&client, &repo, &cwd, state_dir).await;
+            let ended = serve_plans(&client, &repo, &branch, &cwd, state_dir).await;
             client.shutdown().await;
             ended
         });
@@ -593,6 +674,7 @@ mod unix {
     async fn serve_plans(
         client: &Client,
         repo: &str,
+        branch: &str,
         cwd: &Path,
         state_dir: &Path,
     ) -> Result<(), String> {
@@ -616,18 +698,14 @@ mod unix {
         println!("[master] {repo} in {}", checkout.root.display());
         let mut waiting = Waiting { last: None };
         loop {
-            match git(&checkout.root, &["status", "--porcelain"]) {
-                Ok(status) if status.trim().is_empty() => {}
-                Ok(_) => {
-                    waiting.say("checkout has uncommitted changes".to_owned());
-                    tokio::time::sleep(MASTER_POLL).await;
-                    continue;
-                }
-                Err(e) => {
-                    waiting.say(format!("git status failed: {e}"));
-                    tokio::time::sleep(MASTER_POLL).await;
-                    continue;
-                }
+            let (root, wanted) = (checkout.root.clone(), branch.to_owned());
+            let ready = tokio::task::spawn_blocking(move || bring_up_to_date(&root, &wanted))
+                .await
+                .unwrap_or_else(|e| Err(format!("the checkout could not be updated: {e}")));
+            if let Err(reason) = ready {
+                waiting.say(reason);
+                tokio::time::sleep(MASTER_POLL).await;
+                continue;
             }
             let claimed = client
                 .ci(CiRequest::PlanClaim {
@@ -656,6 +734,44 @@ mod unix {
             run_plan(&plan, &checkout.root, state_dir).await?;
             settle(client, repo, plan.number, &mut waiting).await;
         }
+    }
+
+    /// Puts the master clone on `branch` at `origin/<branch>`, so a claimed
+    /// plan starts on the current default branch. `Err` is why it cannot,
+    /// which the master waits out.
+    fn bring_up_to_date(root: &Path, branch: &str) -> Result<(), String> {
+        let status =
+            git(root, &["status", "--porcelain"]).map_err(|e| format!("git status failed: {e}"))?;
+        if !status.trim().is_empty() {
+            return Err(format!("{} has uncommitted changes", root.display()));
+        }
+        git(root, &["fetch", "-q", "--prune", "origin", branch])
+            .map_err(|e| format!("fetch failed: {e}"))?;
+        let head = git(root, &["symbolic-ref", "-q", "HEAD"]).unwrap_or_default();
+        if head.trim() != format!("refs/heads/{branch}") {
+            git(root, &["checkout", "-q", branch])?;
+        }
+        let tracking = format!("origin/{branch}");
+        let count = |range: String| -> Result<u64, String> {
+            let counted = git(root, &["rev-list", "--count", &range])?;
+            counted
+                .trim()
+                .parse()
+                .map_err(|_| format!("git rev-list --count {range} answered {counted:?}"))
+        };
+        let ahead = count(format!("{tracking}..HEAD"))?;
+        if ahead > 0 {
+            return Err(format!(
+                "{} has {ahead} unpushed commits on {branch}; push or reset them",
+                root.display()
+            ));
+        }
+        let behind = count(format!("HEAD..{tracking}"))?;
+        if behind > 0 {
+            git(root, &["merge", "--ff-only", "-q", &tracking])?;
+            println!("[master] fast-forwarded {behind} commits");
+        }
+        Ok(())
     }
 
     /// Runs omp on `plan` in the checkout, with the terminal's stdio.
@@ -754,11 +870,18 @@ mod tests {
     }
 
     #[test]
-    fn plans_are_made_beside_the_checkout() {
+    fn agent_clones_live_in_the_state_directory() {
+        let state = Path::new("/s");
         assert_eq!(
-            plan_dir(Path::new("/w/h/o/zeughaus")),
-            PathBuf::from("/w/h/o/zeughaus-plan")
+            master_dir(state, "h/o/r"),
+            Ok(PathBuf::from("/s/agent-work/master/h/o/r"))
         );
+        assert_eq!(
+            plan_clone_dir(state, "h/o/r"),
+            Ok(PathBuf::from("/s/agent-work/plan/h/o/r"))
+        );
+        assert!(master_dir(state, "host/../x/y").is_err());
+        assert!(plan_clone_dir(state, "host/../x/y").is_err());
     }
 
     #[test]

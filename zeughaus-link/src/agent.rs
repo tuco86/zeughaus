@@ -1,7 +1,8 @@
-//! Agent sessions an editor opens on its own runner: a planning session in a
-//! repository's `-plan` worktree, optionally planning one open proposal, or
+//! Agent sessions an editor opens on its own runner: a planning session in
+//! the repository's plan clone, optionally planning one open proposal, or
 //! the master session that executes the approved plans of a repository one
-//! after another in its main checkout.
+//! after another in its master clone. Both clones live in the runner's state
+//! directory.
 //!
 //! One req/rep exchange on [`AGENT_PATH`](crate::AGENT_PATH): an
 //! [`AgentRequest`] in, an [`AgentReply`] out, both JSON. The session runs in
@@ -16,7 +17,7 @@ pub const MAX_AGENT_BYTES: usize = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentSession {
-    /// omp in plan mode in the repository's `<checkout>-plan` worktree.
+    /// omp in plan mode in the repository's plan clone.
     Plan,
     /// The loop that executes the repository's approved plans.
     Master,
@@ -24,7 +25,7 @@ pub enum AgentSession {
 
 /// Opens a session for one repository of the CI. `origin` is the
 /// repository's url as `normalize_origin` gives it; the runner finds the
-/// checkout under its work root by it.
+/// session's clone in its state directory by it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRequest {
     pub session: AgentSession,

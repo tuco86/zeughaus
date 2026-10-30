@@ -23,6 +23,10 @@
 //! it is what makes a task due again, and what `zeughaus-runner maintain`
 //! prints. A failed task sends an [`Alert`], which the runner publishes to
 //! every editor.
+//!
+//! A task sees `ZEUGHAUS_MAINTAIN` (its name) and `ZEUGHAUS_STATE_DIR` (this
+//! runner's state directory), so a `zeughaus-runner tidy` task works on the
+//! runner's own state.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -304,7 +308,7 @@ fn run_task(host: &JobHost, state_dir: &Path, exe: &Path, task: &Task, alerts: &
         run: None,
     };
     host.set_maintaining(true);
-    let outcome = match start_run(host, exe, task, &mut state, &path) {
+    let outcome = match start_run(host, state_dir, exe, task, &mut state, &path) {
         Ok(handle) => {
             let exit = handle.wait();
             state.code = exit.code;
@@ -345,6 +349,7 @@ fn run_task(host: &JobHost, state_dir: &Path, exe: &Path, task: &Task, alerts: &
 /// record is written, so a runner that dies mid-task leaves the log's place.
 fn start_run(
     host: &JobHost,
+    state_dir: &Path,
     exe: &Path,
     task: &Task,
     state: &mut State,
@@ -363,7 +368,13 @@ fn start_run(
         label: format!("maintain {}", task.name),
         program: exe.to_string_lossy().into_owned(),
         args,
-        env: vec![("ZEUGHAUS_MAINTAIN".to_owned(), task.name.clone())],
+        env: vec![
+            ("ZEUGHAUS_MAINTAIN".to_owned(), task.name.clone()),
+            (
+                "ZEUGHAUS_STATE_DIR".to_owned(),
+                state_dir.to_string_lossy().into_owned(),
+            ),
+        ],
         cwd: home(),
         run_dir,
         started: state.started,
@@ -389,7 +400,7 @@ fn hostname() -> String {
         .unwrap_or_else(|| "unknown host".to_owned())
 }
 
-fn age(seconds: u64) -> String {
+pub(crate) fn age(seconds: u64) -> String {
     match seconds {
         s if s < 60 => format!("{s} s"),
         s if s < 3_600 => format!("{} min", s / 60),
