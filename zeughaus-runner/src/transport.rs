@@ -22,8 +22,8 @@ use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
 use weida::{
-    Binding, EndpointAddr, Fingerprint, IncomingMeta, Listener, PeerIdentity, Puller, Replier,
-    Runtime, RuntimeConfig, ServerTls, TransferMeta, Trust,
+    Binding, EndpointAddr, Fingerprint, Identity, IncomingMeta, Listener, PeerIdentity, Puller,
+    Replier, Runtime, RuntimeConfig, ServerTls, TransferMeta, Trust,
 };
 use zeughaus_link::{MAX_TRIGGER_BYTES, Snapshot, TriggerRequest, credentials};
 
@@ -53,20 +53,30 @@ impl Transport {
     /// pointed at a runtime that is not yet serving would fail its first
     /// request and have no reason to try again.
     pub async fn start(bind: SocketAddr, state_dir: &Path) -> Result<Transport, String> {
-        let host = announced_host(bind);
         let identity = credentials::runner_identity(state_dir)?;
+        credentials::client_identity(state_dir)?;
+        let trust = credentials::client_trust(state_dir)?;
+        Transport::start_with(bind, RuntimeConfig::default(), identity, trust).await
+    }
+
+    /// Binds `bind` under `identity`, admitting the clients `trust` pins, on a
+    /// runtime made from `config`.
+    pub async fn start_with(
+        bind: SocketAddr,
+        config: RuntimeConfig,
+        identity: Identity,
+        trust: Trust,
+    ) -> Result<Transport, String> {
+        let host = announced_host(bind);
         // Before the identity moves into the binding: the fingerprint is what
         // the URL pins, and it is read off the certificate.
         let fingerprint = identity
             .fingerprint()
             .map_err(|e| format!("cannot fingerprint the runner identity: {e}"))?;
-        credentials::client_identity(state_dir)?;
-        let trust = credentials::client_trust(state_dir)?;
         refuse_anonymous_exposure(bind, &trust)?;
         let trusted_clients = trust.pins.clone();
 
-        let runtime =
-            Runtime::new(RuntimeConfig::default()).map_err(|e| format!("weida runtime: {e}"))?;
+        let runtime = Runtime::new(config).map_err(|e| format!("weida runtime: {e}"))?;
         let listener = runtime.listener();
         let binding = listener
             .bind_quic(bind, ServerTls::new(identity).require_client(trust))
@@ -108,6 +118,42 @@ impl Transport {
     /// were on the list.
     pub fn trusted_clients(&self) -> &[Fingerprint] {
         &self.trusted_clients
+    }
+}
+
+/// Runtimes and transports on a `weida::SimNet`, for the tests of every
+/// module that stands up an endpoint.
+#[cfg(test)]
+pub(crate) mod sim {
+    use std::net::SocketAddr;
+
+    use weida::{Identity, Network, RuntimeConfig, SimNet, Trust};
+
+    use super::Transport;
+
+    /// A runtime configuration on `net`, the network of one test.
+    pub(crate) fn config(net: &SimNet) -> RuntimeConfig {
+        RuntimeConfig {
+            network: Network::sim(net),
+            ..RuntimeConfig::default()
+        }
+    }
+
+    /// A runner transport on `net` at 127.0.0.1 under a fresh key, and the
+    /// one fresh client key it admits.
+    pub(crate) async fn transport(net: &SimNet) -> (Transport, Identity) {
+        let server = Identity::generate_for(["127.0.0.1"]).expect("server identity");
+        let client = Identity::generate_for(["client"]).expect("client identity");
+        let trust = Trust::by_address().and_pin(client.fingerprint().expect("client fingerprint"));
+        let transport = Transport::start_with(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            config(net),
+            server,
+            trust,
+        )
+        .await
+        .expect("a transport on the SimNet");
+        (transport, client)
     }
 }
 
@@ -254,7 +300,8 @@ pub async fn serve_snapshots(replier: Replier, snapshot: Arc<Mutex<Snapshot>>) {
 mod tests {
     use super::*;
 
-    use weida::Trust;
+    use weida::{ClientTls, Trust};
+    use zeughaus_link::SNAPSHOT_PATH;
 
     #[test]
     fn an_unspecified_bind_address_is_announced_as_loopback() {
@@ -319,6 +366,34 @@ mod tests {
         assert_eq!(offer(&tx, press(1)), Intake::Gone);
     }
 
+    /// Authorization is the handshake: this listener carries terminal
+    /// endpoints, so a client whose key was never pinned must not reach an
+    /// endpoint at all -- and the key the runner trusts must.
+    #[tokio::test]
+    async fn only_a_trusted_client_gets_a_connection() {
+        let net = weida::SimNet::new();
+        let (transport, client_identity) = sim::transport(&net).await;
+        let _replier = transport
+            .listener()
+            .replier(SNAPSHOT_PATH)
+            .expect("snapshot endpoint");
+        let mut addr = EndpointAddr::parse(transport.url()).expect("announced url");
+        addr.path = SNAPSHOT_PATH.to_owned();
+        let url = addr.to_string();
+
+        let client = Runtime::new(sim::config(&net)).expect("client runtime");
+        let anonymous = client.requester(ClientTls::new(Trust::by_address()));
+        let refused =
+            tokio::time::timeout(std::time::Duration::from_secs(10), anonymous.connect(&url))
+                .await
+                .expect("the handshake must fail rather than hang");
+        assert!(refused.is_err(), "an anonymous editor must be refused");
+
+        let trusted =
+            client.requester(ClientTls::new(Trust::by_address()).with_identity(client_identity));
+        trusted.connect(&url).await.expect("the pinned client");
+    }
+
     /// Tests that touch the filesystem, network, processes or real time: the
     /// integration tier (`.config/nextest.toml`).
     mod io {
@@ -326,9 +401,6 @@ mod tests {
 
         use std::path::PathBuf;
         use std::sync::atomic::{AtomicU64, Ordering};
-
-        use weida::ClientTls;
-        use zeughaus_link::SNAPSHOT_PATH;
 
         static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -380,36 +452,6 @@ mod tests {
                 .await
                 .expect("restart");
             assert_eq!(before, pinned(second.url()));
-        }
-
-        /// Authorization is the handshake: this listener carries terminal
-        /// endpoints, so a client whose key was never pinned must not reach an
-        /// endpoint at all -- and the key the runner bootstrapped must.
-        #[tokio::test]
-        async fn only_a_trusted_client_gets_a_connection() {
-            let state = TempState::new("mtls");
-            let transport = Transport::start(loopback(), &state.0).await.expect("start");
-            let _replier = transport
-                .listener()
-                .replier(SNAPSHOT_PATH)
-                .expect("snapshot endpoint");
-            let mut addr = EndpointAddr::parse(transport.url()).expect("announced url");
-            addr.path = SNAPSHOT_PATH.to_owned();
-            let url = addr.to_string();
-
-            let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
-            let anonymous = client.requester(ClientTls::new(Trust::by_address()));
-            let refused =
-                tokio::time::timeout(std::time::Duration::from_secs(10), anonymous.connect(&url))
-                    .await
-                    .expect("the handshake must fail rather than hang");
-            assert!(refused.is_err(), "an anonymous editor must be refused");
-
-            let identity =
-                credentials::load_client_identity(&state.0).expect("bootstrapped client");
-            let trusted =
-                client.requester(ClientTls::new(Trust::by_address()).with_identity(identity));
-            trusted.connect(&url).await.expect("the pinned client");
         }
     }
 }

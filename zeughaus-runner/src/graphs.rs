@@ -966,10 +966,8 @@ mod tests {
 
         use std::sync::atomic::{AtomicU64, Ordering};
 
-        use weida::{ClientTls, EndpointAddr, Runtime, RuntimeConfig, Trust};
-        use zeughaus_link::{GRAPH_PATH, credentials};
-
-        use crate::transport::Transport;
+        use weida::{ClientTls, EndpointAddr, Runtime, Trust};
+        use zeughaus_link::GRAPH_PATH;
 
         static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -1043,10 +1041,6 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&broken).expect("kept"), "not json");
         }
 
-        fn loopback() -> std::net::SocketAddr {
-            std::net::SocketAddr::from(([127, 0, 0, 1], 0))
-        }
-
         struct Editor {
             request: OutgoingTransfer,
             reply: weida::IncomingTransfer,
@@ -1080,7 +1074,8 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn editors_see_each_others_changes_and_only_the_sender_a_refusal() {
             let dir = TempDir::new("protocol");
-            let transport = Transport::start(loopback(), &dir.0).await.expect("start");
+            let net = weida::SimNet::new();
+            let (transport, identity) = crate::transport::sim::transport(&net).await;
             let (graphs, _changes, _initial) = GraphService::load(&dir.0);
             let replier = transport
                 .listener()
@@ -1091,8 +1086,8 @@ mod tests {
             let mut addr = EndpointAddr::parse(transport.url()).expect("announced url");
             addr.path = GRAPH_PATH.to_owned();
             let url = addr.to_string();
-            let identity = credentials::load_client_identity(&dir.0).expect("client identity");
-            let runtime = Runtime::new(RuntimeConfig::default()).expect("client runtime");
+            let runtime =
+                Runtime::new(crate::transport::sim::config(&net)).expect("client runtime");
             let mut editors = Vec::new();
             for _ in 0..2 {
                 let requester = runtime

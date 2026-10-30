@@ -337,7 +337,7 @@ pub(crate) fn url_of(endpoint: &str, path: &str) -> Result<String, String> {
 }
 
 impl Command {
-    /// What is printed on success.
+    /// Dials with the client identity of `state_dir`.
     async fn send(self, state_dir: &Path) -> Result<String, String> {
         let identity = credentials::load_client_identity(state_dir).ok_or_else(|| {
             format!(
@@ -348,7 +348,12 @@ impl Command {
             )
         })?;
         let tls = ClientTls::new(Trust::by_address()).with_identity(identity);
-        let runtime = Runtime::new(RuntimeConfig::default()).map_err(|e| format!("weida: {e}"))?;
+        self.deliver(tls, RuntimeConfig::default()).await
+    }
+
+    /// What is printed on success.
+    async fn deliver(self, tls: ClientTls, config: RuntimeConfig) -> Result<String, String> {
+        let runtime = Runtime::new(config).map_err(|e| format!("weida: {e}"))?;
         let result = match self {
             Command::Trigger { endpoint, request } => {
                 let url = url_of(&endpoint, TRIGGERS_PATH)?;
@@ -487,57 +492,49 @@ mod tests {
         assert!(check_serve_args(&args(&["--keep-runs"])).is_err());
     }
 
-    /// Tests that touch the filesystem, network, processes or real time: the
-    /// integration tier (`.config/nextest.toml`).
-    mod io {
-        use super::*;
+    /// The push must be in the runner's hands when `send` returns: the
+    /// process exits right after, and the first version of this command lost
+    /// every trigger by closing the connection with the bytes still in
+    /// flight. QUIC over a SimNet with the runner's own listener.
+    #[tokio::test]
+    async fn a_trigger_is_delivered_before_send_returns() {
+        let net = weida::SimNet::new();
+        let (transport, client) = crate::transport::sim::transport(&net).await;
+        let puller = transport
+            .listener()
+            .puller(TRIGGERS_PATH)
+            .expect("trigger endpoint");
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        tokio::spawn(crate::transport::accept_triggers(puller, tx));
 
-        /// The push must be in the runner's hands when `send` returns: the
-        /// process exits right after, and the first version of this command lost
-        /// every trigger by closing the connection with the bytes still in
-        /// flight. Real loopback QUIC with the runner's own listener.
-        #[tokio::test]
-        async fn a_trigger_is_delivered_before_send_returns() {
-            let state = std::env::temp_dir().join(format!("zeughaus-cli-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&state);
-            let transport = crate::transport::Transport::start(
-                std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-                &state,
+        let command = parse_trigger(&[
+            transport.url().to_string(),
+            "42".to_string(),
+            "payload".to_string(),
+        ])
+        .expect("parsed");
+        let line = command
+            .deliver(
+                ClientTls::new(Trust::by_address()).with_identity(client),
+                crate::transport::sim::config(&net),
             )
             .await
-            .expect("listener");
-            let puller = transport
-                .listener()
-                .puller(TRIGGERS_PATH)
-                .expect("trigger endpoint");
-            let (tx, rx) = std::sync::mpsc::sync_channel(4);
-            tokio::spawn(crate::transport::accept_triggers(puller, tx));
+            .expect("sent");
+        assert_eq!(line, "triggered node 42");
 
-            let command = parse_trigger(&[
-                transport.url().to_string(),
-                "42".to_string(),
-                "payload".to_string(),
-            ])
-            .expect("parsed");
-            let line = command.send(&state).await.expect("sent");
-            assert_eq!(line, "triggered node 42");
-
-            // Already queued, or the send returned before delivery.
-            let received = tokio::task::spawn_blocking(move || {
-                rx.recv_timeout(std::time::Duration::from_secs(5))
-            })
-            .await
-            .expect("join")
-            .expect("the press reached the runner");
-            assert_eq!(
-                received,
-                TriggerRequest {
-                    node_id: 42,
-                    payload: Some("payload".to_string()),
-                    external: true,
-                }
-            );
-            let _ = std::fs::remove_dir_all(&state);
-        }
+        // Already queued, or the send returned before delivery.
+        let received =
+            tokio::task::spawn_blocking(move || rx.recv_timeout(std::time::Duration::from_secs(5)))
+                .await
+                .expect("join")
+                .expect("the press reached the runner");
+        assert_eq!(
+            received,
+            TriggerRequest {
+                node_id: 42,
+                payload: Some("payload".to_string()),
+                external: true,
+            }
+        );
     }
 }

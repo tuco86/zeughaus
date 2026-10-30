@@ -19,8 +19,8 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use weida::{
-    ClientTls, EndpointAddr, Limits, OutgoingTransfer, ReplyStream, Requester, Runtime,
-    RuntimeConfig, TransferMeta, Trust,
+    ClientTls, EndpointAddr, Identity, Limits, Network, OutgoingTransfer, ReplyStream, Requester,
+    Runtime, RuntimeConfig, TransferMeta, Trust,
 };
 use zeughaus_link::enlist::{read_frame, write_frame};
 use zeughaus_link::manual::{RunReply, RunUpload};
@@ -91,10 +91,15 @@ impl Link {
                 state_dir.join("client.pem").display()
             )
         })?;
-        Ok(Link {
+        Ok(Link::new(url, identity))
+    }
+
+    /// The CI at `url`, dialled under `identity`.
+    pub(crate) fn new(url: String, identity: Identity) -> Link {
+        Link {
             url,
             tls: ClientTls::new(Trust::by_address()).with_identity(identity),
-        })
+        }
     }
 
     pub fn url(&self) -> &str {
@@ -121,6 +126,7 @@ struct State {
 
 pub struct Client {
     link: Result<Link, String>,
+    network: Network,
     state: Mutex<State>,
 }
 
@@ -128,8 +134,14 @@ impl Client {
     /// A client that dials nothing until a call is made. An `Err` link is why
     /// no call can be: every call returns it.
     pub fn new(link: Result<Link, String>) -> Client {
+        Client::with_network(link, Network::default())
+    }
+
+    /// [`Client::new`] with its connections on `network`.
+    pub fn with_network(link: Result<Link, String>, network: Network) -> Client {
         Client {
             link,
+            network,
             state: Mutex::new(State::default()),
         }
     }
@@ -235,6 +247,7 @@ impl Client {
                         idle_timeout: IDLE_TIMEOUT,
                         ..Limits::default()
                     },
+                    network: self.network.clone(),
                     ..RuntimeConfig::default()
                 };
                 let runtime = Runtime::new(config).map_err(|e| format!("weida: {e}"))?;
@@ -507,8 +520,8 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        /// A fake CI under the identity in `state` that answers an overview
-        /// and refuses everything else. Built on a runtime of
+        /// A fake CI under `server`, admitting `client`, that answers an
+        /// overview and refuses everything else. Built on a runtime of
         /// its own, because a [`crate::transport::Transport`] keeps its port
         /// until the process exits and a restart needs the same one.
         struct FakeCi {
@@ -519,15 +532,19 @@ mod tests {
         }
 
         impl FakeCi {
-            async fn start(bind: std::net::SocketAddr, state: &Path) -> FakeCi {
-                let identity = credentials::runner_identity(state).expect("identity");
-                let fingerprint = identity.fingerprint().expect("fingerprint");
-                credentials::client_identity(state).expect("client key");
-                let trust = credentials::client_trust(state).expect("trust");
-                let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+            async fn start(
+                net: &weida::SimNet,
+                bind: std::net::SocketAddr,
+                server: Identity,
+                client: &Identity,
+            ) -> FakeCi {
+                let fingerprint = server.fingerprint().expect("fingerprint");
+                let trust =
+                    Trust::by_address().and_pin(client.fingerprint().expect("client fingerprint"));
+                let runtime = Runtime::new(crate::transport::sim::config(net)).expect("runtime");
                 let listener = runtime.listener();
                 let binding = listener
-                    .bind_quic(bind, weida::ServerTls::new(identity).require_client(trust))
+                    .bind_quic(bind, weida::ServerTls::new(server).require_client(trust))
                     .await
                     .expect("bind");
                 let url = EndpointAddr {
@@ -589,22 +606,26 @@ mod tests {
         /// of [`Client::ci`] covers that case.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_read_after_a_ci_restart_is_answered() {
-            let dir = state("restart");
+            let net = weida::SimNet::new();
+            let server = Identity::generate_for(["127.0.0.1"]).expect("server identity");
+            let client_identity = Identity::generate_for(["client"]).expect("client identity");
             let any = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
-            let ci = FakeCi::start(any, &dir).await;
+            let ci = FakeCi::start(&net, any, server.clone(), &client_identity).await;
             let bind = ci.binding.local_addr();
-            let client = Client::new(Link::resolve(Some(ci.url.clone()), &dir));
+            let client = Client::with_network(
+                Ok(Link::new(ci.url.clone(), client_identity.clone())),
+                Network::sim(&net),
+            );
             client.ci(CiRequest::Overview).await.expect("first answer");
 
             ci.stop().await;
-            let ci = FakeCi::start(bind, &dir).await;
+            let ci = FakeCi::start(&net, bind, server, &client_identity).await;
             client
                 .ci(CiRequest::Overview)
                 .await
                 .expect("answered after the restart");
             client.shutdown().await;
             ci.stop().await;
-            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

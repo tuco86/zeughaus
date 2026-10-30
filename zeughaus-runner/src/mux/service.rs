@@ -1153,7 +1153,7 @@ mod tests {
         use std::time::Duration;
 
         use tokio::io::AsyncReadExt;
-        use weida::{ClientTls, EndpointAddr, Identity, Runtime, RuntimeConfig, ServerTls, Trust};
+        use weida::{ClientTls, EndpointAddr, Identity, Runtime, ServerTls, SimNet, Trust};
         use zeughaus_mux::input::Key;
         use zeughaus_mux::{
             AttachTarget, Axis, KeyInput, KeyKind, Modifiers, NamedKey, SurfaceRef,
@@ -1201,10 +1201,18 @@ mod tests {
             Exchange { request, reply }
         }
 
-        async fn setup() -> (MuxService, weida::Runtime, weida::Binding, String, Identity) {
+        async fn setup() -> (
+            MuxService,
+            weida::Runtime,
+            weida::Binding,
+            String,
+            Identity,
+            SimNet,
+        ) {
             let server_identity = Identity::generate_for(["127.0.0.1"]).expect("identity");
             let client_identity = Identity::generate_for(["client"]).expect("identity");
-            let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+            let net = SimNet::new();
+            let runtime = Runtime::new(crate::transport::sim::config(&net)).expect("runtime");
             let listener = runtime.listener();
             let tls = ServerTls::new(server_identity.clone()).require_client(
                 Trust::by_address().and_pin(client_identity.fingerprint().unwrap()),
@@ -1235,7 +1243,7 @@ mod tests {
                 peer: Some(server_identity.fingerprint().unwrap()),
             }
             .to_string();
-            (service, runtime, binding, url, client_identity)
+            (service, runtime, binding, url, client_identity, net)
         }
 
         async fn client(runtime: &Runtime, url: &str, identity: &Identity, seed: u8) -> Client {
@@ -1290,7 +1298,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_shell_is_created_driven_shared_and_survives_its_viewers() {
-            let (service, runtime, _binding, url, identity) = setup().await;
+            let (service, runtime, _binding, url, identity, _net) = setup().await;
             let alice = client(&runtime, &url, &identity, 1).await;
 
             // Attach: the default workspace, no terminals.
@@ -1737,7 +1745,7 @@ mod tests {
                 (p50, p95)
             }
 
-            let (_service, runtime, _binding, url, identity) = setup().await;
+            let (_service, runtime, _binding, url, identity, net) = setup().await;
 
             // Fresh dial: a new requester each time, so the pool cannot reuse.
             let mut fresh = Vec::new();
@@ -1745,7 +1753,8 @@ mod tests {
                 // A runtime of its own per dial: the pool keys on the trust
                 // configuration, and an equal one would hand back the warm
                 // connection.
-                let fresh_runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+                let fresh_runtime =
+                    Runtime::new(crate::transport::sim::config(&net)).expect("runtime");
                 let started = Instant::now();
                 let client = client(&fresh_runtime, &url, &identity, 10 + i).await;
                 let mut control = open(&client, hello(&client)).await;
@@ -1862,7 +1871,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_terminal_the_runner_owns_is_listed_attached_and_only_closed_on_demand() {
-            let (service, runtime, _binding, url, identity) = setup().await;
+            let (service, runtime, _binding, url, identity, _net) = setup().await;
             let job = service
                 .spawn_owned(
                     Profile {
@@ -1935,7 +1944,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_title_the_child_sets_renames_its_tab_without_a_terminal_stream() {
-            let (service, runtime, _binding, url, identity) = setup().await;
+            let (service, runtime, _binding, url, identity, _net) = setup().await;
             let alice = client(&runtime, &url, &identity, 1).await;
             let mut control = open(&alice, hello(&alice)).await;
             let Message::ControlAttached(_) = control.next().await else {
