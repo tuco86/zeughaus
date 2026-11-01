@@ -50,6 +50,10 @@ const SET_KEEP: Duration = Duration::from_secs(3 * 86400);
 /// A fill of one run's set, shared by every request for it.
 type Fill = Arc<OnceCell<Result<(), String>>>;
 
+/// A state offer waiting for its blobs: the offered manifest and the blobs
+/// the state store lacks.
+type Offered = (SetManifest, Vec<(Root, u64)>);
+
 pub struct ArtifactService {
     state_dir: PathBuf,
     config: Arc<CiConfig>,
@@ -68,9 +72,8 @@ pub struct ArtifactService {
     fills: Mutex<HashMap<String, Fill>>,
     /// Fills waiting for their producer, by transfer number.
     waiting: Mutex<HashMap<u64, Waiting>>,
-    /// State offers waiting for their blobs, by `<run>/<name>`: the offered
-    /// manifest and the blobs the state store lacks.
-    saving: Mutex<HashMap<String, (SetManifest, Vec<(Root, u64)>)>>,
+    /// State offers waiting for their blobs, by `<run>/<name>`.
+    saving: Mutex<HashMap<String, Offered>>,
 }
 
 /// A fill that asked a producing runner for a set.
