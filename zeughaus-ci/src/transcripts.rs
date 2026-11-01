@@ -1,8 +1,9 @@
 //! Job transcripts as read-only terminals, served on `/mux`.
 //!
-//! A transcript is a [`Session::fed`] screen that a follower thread feeds
-//! from the stored copy of the run's WAL (`<n>.runs/<job>/wal`, appended by
-//! `/enlist`). The CI has no workspace and no shells: its mux answers the
+//! A transcript is a [`Session::fed`] screen that holds the stored copy of
+//! the run's WAL (`<n>.runs/<job>/wal`, appended by `/enlist`) parsed when
+//! it opens, and that a follower thread keeps feeding while the run goes on.
+//! The CI has no workspace and no shells: its mux answers the
 //! control exchange with an empty topology, streams the screens it holds,
 //! and ignores input except a resize, which rewraps the screen to the pane
 //! that asked last (one screen is shared by every editor that shows it). At
@@ -64,6 +65,17 @@ struct State {
     next: u64,
 }
 
+impl State {
+    /// The id of `key`'s open screen, now the one used last.
+    fn reuse(&mut self, key: &JobKey) -> Option<TerminalId> {
+        let at = self.open.iter().position(|o| &o.key == key)?;
+        let entry = self.open.remove(at);
+        let id = entry.id;
+        self.open.push(entry);
+        Some(id)
+    }
+}
+
 /// The transcript screens this process holds.
 pub struct Transcripts {
     state_dir: PathBuf,
@@ -88,30 +100,46 @@ impl Transcripts {
     /// already. The names must be valid: they are joined into a path.
     pub fn open(&self, repo: &str, number: u64, job: &str) -> TerminalId {
         let key = (repo.to_owned(), number, job.to_owned());
-        let mut state = self.lock();
-        if let Some(at) = state.open.iter().position(|o| o.key == key) {
-            let entry = state.open.remove(at);
-            let id = entry.id;
-            state.open.push(entry);
-            return id;
-        }
-        if state.open.len() >= MAX_TRANSCRIPTS {
-            state.open.remove(0);
-        }
-        state.next += 1;
-        let id = TerminalId(state.next);
+        let id = {
+            let mut state = self.lock();
+            if let Some(id) = state.reuse(&key) {
+                return id;
+            }
+            state.next += 1;
+            TerminalId(state.next)
+        };
+        let dir = transcript_dir(&self.state_dir, repo, number, job);
         let session = Session::fed(
             id,
             Dimensions { cols: 80, rows: 24 },
             SCROLLBACK_ROWS,
             &format!("{repo} #{number} {job}"),
         );
+        // The stored output is parsed before the id is handed out, so the
+        // first head an editor attaches to is the screen the run left, not an
+        // empty one the follower fills delta by delta. Outside the lock: a
+        // long log takes a moment and the mux's lookups must not wait for it.
+        // The exit is read before the drain, as in `follow`.
+        let exit = read_exit(&dir);
+        let wal = dir.join("wal");
+        let mut follower = None;
+        let drained = drain(&wal, &mut follower, &session);
+
+        let mut state = self.lock();
+        // Another editor opened the same job meanwhile; this screen is
+        // dropped, no thread was started for it.
+        if let Some(id) = state.reuse(&key) {
+            return id;
+        }
+        if state.open.len() >= MAX_TRANSCRIPTS {
+            state.open.remove(0);
+        }
         let stop = Arc::new(AtomicBool::new(false));
-        follow(
-            transcript_dir(&self.state_dir, repo, number, job),
-            session.clone(),
-            Arc::clone(&stop),
-        );
+        match (drained, exit) {
+            (Err(e), _) => eprintln!("[ci] cannot follow {}: {e}", wal.display()),
+            (Ok(_), Some(exit)) => session.finish(exit),
+            (Ok(_), None) => follow(dir, follower, session.clone(), Arc::clone(&stop)),
+        }
         state.open.push(Open {
             key,
             id,
@@ -169,40 +197,48 @@ fn read_exit(dir: &Path) -> Option<ExitState> {
     })
 }
 
-/// Feeds `session` from the run's WAL until the run's exit is recorded and
-/// the WAL is drained, or `stop` is set.
+/// Feeds `session` the records the run's WAL holds past `follower`'s
+/// offset. The follower is opened once the WAL exists; a WAL that does not
+/// exist yet is no error, the run has written nothing so far. Whether
+/// anything was fed.
+fn drain(wal: &Path, follower: &mut Option<Follower>, session: &Session) -> std::io::Result<bool> {
+    if follower.is_none() {
+        *follower = Follower::open(wal).ok();
+    }
+    let Some(follower) = follower else {
+        return Ok(false);
+    };
+    let records = follower.next_records()?;
+    for record in &records {
+        session.feed(&record.bytes);
+    }
+    Ok(!records.is_empty())
+}
+
+/// Feeds `session` from the run's WAL, continuing where `open` stopped,
+/// until the run's exit is recorded and the WAL is drained, or `stop` is
+/// set.
 ///
 /// The exit is read before the drain: output is stored before the exit is
 /// written, so a drain that finds nothing after an exit was seen is the end.
-fn follow(dir: PathBuf, session: Session, stop: Arc<AtomicBool>) {
+fn follow(dir: PathBuf, follower: Option<Follower>, session: Session, stop: Arc<AtomicBool>) {
     let spawned = std::thread::Builder::new()
         .name("zeughaus-ci-transcript".to_owned())
         .spawn(move || {
             let wal = dir.join("wal");
-            let mut follower: Option<Follower> = None;
+            let mut follower = follower;
             loop {
                 if stop.load(Ordering::SeqCst) {
                     return;
                 }
                 let exit = read_exit(&dir);
-                if follower.is_none() {
-                    follower = Follower::open(&wal).ok();
-                }
-                let mut fed = false;
-                if let Some(follower) = &mut follower {
-                    match follower.next_records() {
-                        Ok(records) => {
-                            for record in records {
-                                session.feed(&record.bytes);
-                                fed = true;
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[ci] cannot follow {}: {e}", wal.display());
-                            return;
-                        }
+                let fed = match drain(&wal, &mut follower, &session) {
+                    Ok(fed) => fed,
+                    Err(e) => {
+                        eprintln!("[ci] cannot follow {}: {e}", wal.display());
+                        return;
                     }
-                }
+                };
                 if !fed && let Some(exit) = exit {
                     session.finish(exit);
                     return;
@@ -520,6 +556,29 @@ mod tests {
             assert!(
                 text.contains("first") && text.contains("second"),
                 "output written before the exit is shown: {text:?}"
+            );
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_finished_run_opens_with_its_whole_output_and_exit() {
+            let state = scratch("done");
+            let transcripts = Transcripts::new(state.clone());
+            let dir = transcript_dir(&state, "view", 1, "done");
+            std::fs::create_dir_all(&dir).expect("create the transcript directory");
+            let mut wal = WalWriter::open(&dir.join("wal"), None).expect("open the WAL");
+            wal.append(1, b"first\r\n").expect("append");
+            wal.append(2, b"second").expect("append");
+            std::fs::write(dir.join("exit"), "code=3\n").expect("write the exit");
+
+            // No waiting: the screen is complete when `open` returns.
+            let id = transcripts.open("view", 1, "done");
+            let session = transcripts.session(id).expect("the screen is open");
+            assert_eq!(session.exit(), Some(ExitState::Exited { code: 3 }));
+            let text = text_of(&session);
+            assert!(
+                text.contains("first") && text.contains("second"),
+                "the stored output is on the first screen: {text:?}"
             );
             let _ = std::fs::remove_dir_all(&state);
         }
