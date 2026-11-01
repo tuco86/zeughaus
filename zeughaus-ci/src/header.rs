@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use zeughaus_link::enlist::{MAX_STATES, StateSave};
 
 use crate::config::{valid_env_name, valid_name};
 
@@ -35,6 +36,13 @@ pub struct JobDef {
     pub timeout_minutes: u32,
     /// `sh` or `bash` for `.sh` jobs, `powershell` for `.ps1` jobs.
     pub interpreter: String,
+    /// Stores the job restores before it starts and may save at its end, as
+    /// `$CI_STATE/<name>/`.
+    #[serde(default)]
+    pub state: Vec<String>,
+    /// When the end of a run saves `state`.
+    #[serde(default)]
+    pub state_save: StateSave,
     /// Header keys that parse and do nothing, for `zeughaus-ci check` to
     /// name. Never stored.
     #[serde(skip)]
@@ -68,6 +76,9 @@ struct JobHeader {
     #[serde(default)]
     env: BTreeMap<String, String>,
     timeout_minutes: Option<u32>,
+    #[serde(default)]
+    state: Vec<String>,
+    state_save: Option<String>,
 }
 
 const START: &str = "# /// ci";
@@ -166,6 +177,33 @@ pub fn parse_job(file_name: &str, text: &str) -> Result<Option<JobDef>, String> 
             "timeout_minutes {timeout_minutes} is outside 1..=1440"
         )));
     }
+    for (i, store) in header.state.iter().enumerate() {
+        if !valid_name(store) {
+            return Err(fail(format!(
+                "state name `{store}` must match [a-z0-9][a-z0-9-]*"
+            )));
+        }
+        if header.state[..i].contains(store) {
+            return Err(fail(format!("state {store} is named twice")));
+        }
+    }
+    if header.state.len() > MAX_STATES {
+        return Err(fail(format!(
+            "state names at most {MAX_STATES} stores, not {}",
+            header.state.len()
+        )));
+    }
+    let state_save = match header.state_save.as_deref() {
+        None => StateSave::Success,
+        Some(_) if header.state.is_empty() => {
+            return Err(fail("state_save needs state".into()));
+        }
+        Some("success") => StateSave::Success,
+        Some("always") => StateSave::Always,
+        Some(_) => {
+            return Err(fail(r#"state_save must be "success" or "always""#.into()));
+        }
+    };
     let interpreter = interpreter(ext, text).map_err(fail)?;
     let ignored_keys = [
         ("context", header.context.is_some()),
@@ -189,6 +227,8 @@ pub fn parse_job(file_name: &str, text: &str) -> Result<Option<JobDef>, String> 
         env: header.env,
         timeout_minutes,
         interpreter,
+        state: header.state,
+        state_save,
         ignored_keys,
     }))
 }
@@ -301,6 +341,45 @@ mod tests {
         assert_eq!(job.ignored_keys, ["context", "cache", "when_busy"]);
         let plain = parse_job("x.sh", &wrap("")).unwrap().unwrap();
         assert!(plain.ignored_keys.is_empty());
+    }
+
+    #[test]
+    fn state_names_the_stores_and_when_they_are_saved() {
+        let wrap = |body: &str| format!("# /// ci\n# on = [\"nightly\"]\n# {body}\n# ///\n");
+        let job = parse_job(
+            "x.sh",
+            &wrap("state = [\"fuzz-corpus\", \"seen\"]\n# state_save = \"always\""),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(job.state, ["fuzz-corpus", "seen"]);
+        assert_eq!(job.state_save, StateSave::Always);
+        let plain = parse_job("x.sh", &wrap("state = [\"corpus\"]"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plain.state_save, StateSave::Success);
+
+        let err = |body: &str| parse_job("x.sh", &wrap(body)).unwrap_err();
+        assert!(
+            err("state = [\"Corpus\"]").contains("state name `Corpus` must match"),
+            "{}",
+            err("state = [\"Corpus\"]")
+        );
+        let nine = (0..9).map(|i| format!("\"s{i}\"")).collect::<Vec<_>>();
+        let many = err(&format!("state = [{}]", nine.join(", ")));
+        assert!(
+            many.contains("state names at most 8 stores, not 9"),
+            "{many}"
+        );
+        let twice = err("state = [\"a\", \"a\"]");
+        assert!(twice.contains("state a is named twice"), "{twice}");
+        let bad = err("state = [\"a\"]\n# state_save = \"never\"");
+        assert!(
+            bad.contains(r#"state_save must be "success" or "always""#),
+            "{bad}"
+        );
+        let alone = err("state_save = \"always\"");
+        assert!(alone.contains("state_save needs state"), "{alone}");
     }
 
     #[test]

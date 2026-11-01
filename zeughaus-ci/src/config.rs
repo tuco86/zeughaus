@@ -22,6 +22,10 @@ pub struct CiConfig {
     /// Compressed blobs the artifact store under `ci/blobs` may hold, in GiB.
     #[serde(default = "default_artifact_store_gb")]
     pub artifact_store_gb: u64,
+    /// The largest version of one job state store (`state = [..]` in a job
+    /// header), as the sum of its file sizes, in MiB.
+    #[serde(default = "default_state_max_mb")]
+    pub state_max_mb: u64,
     /// Runners that may enlist, by name.
     #[serde(default)]
     pub runners: BTreeMap<String, RunnerConfig>,
@@ -61,6 +65,10 @@ pub fn parse_clock(text: &str) -> Option<chrono::NaiveTime> {
 
 fn default_artifact_store_gb() -> u64 {
     2
+}
+
+fn default_state_max_mb() -> u64 {
+    1024
 }
 
 fn default_mount() -> String {
@@ -235,6 +243,10 @@ impl CiConfig {
     fn validate(&mut self) -> Result<(), String> {
         if self.artifact_store_gb == 0 {
             return Err("ci.toml: `artifact_store_gb` must be at least 1".into());
+        }
+        // The upper bound is the most one artifact transfer carries.
+        if !(1..=4096).contains(&self.state_max_mb) {
+            return Err("ci.toml: `state_max_mb` must be 1 to 4096".into());
         }
         if self.runners.is_empty() {
             return Err("ci.toml: at least one [runners.<name>] is required".into());
@@ -479,6 +491,21 @@ forge = "none"
         let text = format!("artifact_store_gb = 0\n{}", with_runners(""));
         let err = CiConfig::parse(&text).unwrap_err();
         assert_eq!(err, "ci.toml: `artifact_store_gb` must be at least 1");
+    }
+
+    #[test]
+    fn state_size_limit() {
+        assert_eq!(
+            CiConfig::parse(&with_runners("")).unwrap().state_max_mb,
+            1024
+        );
+        for bad in [0, 4097] {
+            let text = format!("state_max_mb = {bad}\n{}", with_runners(""));
+            let err = CiConfig::parse(&text).unwrap_err();
+            assert_eq!(err, "ci.toml: `state_max_mb` must be 1 to 4096");
+        }
+        let text = format!("state_max_mb = 4096\n{}", with_runners(""));
+        assert_eq!(CiConfig::parse(&text).unwrap().state_max_mb, 4096);
     }
 
     #[test]

@@ -8,6 +8,10 @@ default_runner = "tuco-pc"         # runs every job that names no `machine`
 # and ci/sets are links into the Storage Box (deploy/setup-sadala.sh).
 artifact_store_gb = 100
 
+# The largest version of one job state store (`state = [..]` in a job
+# header), in MiB; a bigger save fails the job. 1 to 4096.
+# state_max_mb = 1024
+
 # The nightly round: at this local time the CI queues every repository's
 # nightly (jobs with `on = ["nightly"]`) and runs them one after the other,
 # in repository name order. Without it nothing runs nightly by itself.

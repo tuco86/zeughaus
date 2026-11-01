@@ -116,6 +116,8 @@ mod tests {
                     env: Default::default(),
                     timeout_minutes: 60,
                     interpreter: "sh".to_owned(),
+                    state: Vec::new(),
+                    state_save: zeughaus_link::enlist::StateSave::Success,
                 },
                 status,
                 note: String::new(),

@@ -2347,6 +2347,11 @@ pub fn place_job(
         Target::Default => (config.default_runner.as_str(), Place::Host),
         Target::Runner(runner) => (runner, Place::Host),
         Target::Machine { name, runner } => {
+            if !job.state.is_empty() {
+                return Err(fail(format!(
+                    "{what} is a Windows VM; state is kept only on a runner's host or in a container"
+                )));
+            }
             if !is_ps1 {
                 return Err(fail(format!(
                     "{what} is a Windows VM; it runs only .ps1 jobs"
@@ -2675,6 +2680,8 @@ mod tests {
             env: Default::default(),
             timeout_minutes: 60,
             interpreter: "sh".to_owned(),
+            state: Vec::new(),
+            state_save: zeughaus_link::enlist::StateSave::Success,
         }
     }
 
@@ -2771,6 +2778,19 @@ mod tests {
             let err = place_job(&config(), "r", &def, containerfile).unwrap_err();
             assert!(err.contains(expected), "{err}");
         }
+    }
+
+    #[test]
+    fn a_job_on_a_windows_vm_keeps_no_state() {
+        let mut def = job("w.ps1", None, Some("win11"), None);
+        def.state = vec!["corpus".to_owned()];
+        let err = place_job(&config(), "r", &def, containerfile).unwrap_err();
+        assert!(
+            err.contains(
+                "machine win11 is a Windows VM; state is kept only on a runner's host or in a container"
+            ),
+            "{err}"
+        );
     }
 
     #[test]

@@ -222,11 +222,18 @@ fn check(state_dir: &Path, args: &[String]) -> Result<(), String> {
         }
     }
     for job in jobs {
-        let triggers = if job.on.is_empty() {
+        let mut triggers = if job.on.is_empty() {
             format!("needs: {}", job.needs.join(", "))
         } else {
             format!("on: {}", job.on.join(", "))
         };
+        if !job.state.is_empty() {
+            triggers.push_str(&format!(
+                "  state: {} (save {})",
+                job.state.join(", "),
+                job.state_save.as_str()
+            ));
+        }
         println!("{:<20} {:<20} {}", job.name, place_name(&job), triggers);
     }
     for (name, patterns, clean) in channels.names() {

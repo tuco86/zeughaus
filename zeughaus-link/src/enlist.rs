@@ -208,6 +208,32 @@ pub enum Checkout {
     Wipe,
 }
 
+/// The most stores one job keeps.
+pub const MAX_STATES: usize = 8;
+
+/// When the end of a run saves a store (`state_save` of the job header).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StateSave {
+    /// Never saved: a manual run's stores. No header names it.
+    Never,
+    /// Saved when the job exits with code 0.
+    #[default]
+    Success,
+    /// Saved after any end but a kill.
+    Always,
+}
+
+impl StateSave {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StateSave::Never => "never",
+            StateSave::Success => "success",
+            StateSave::Always => "always",
+        }
+    }
+}
+
 /// The working trees a manual run executes in, in place of a checkout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Upload {
