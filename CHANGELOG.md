@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Job state: a job header's `state = ["fuzz-corpus"]` names stores the CI
+  keeps for that job from one pipeline to the next, independent of
+  workspaces, `clean` channels and runner budgets. The runner fills
+  `$CI_STATE/<name>/` with the store's newest version before the job starts
+  and saves the directory as the pipeline's version when it ends: on
+  success, or after any end but a kill with `state_save = "always"`. A
+  failed save fails the job; a manual run reads the stores and never saves.
+  The CI keeps the 3 newest versions of each store under `ci/state/`, each
+  at most `state_max_mb` of `ci.toml` (1024 by default), and a job on a
+  Windows VM keeps none. The MCP server gains `ci_state`, `ci_state_get` and
+  `ci_state_delete`; `ci_repo` and `zeughaus-ci check` show a job's stores.
+  The enlist protocol is major 9: a CI and a runner refuse each other until
+  both run it.
 - Plans and proposals live in the CI, numbered per repository
   (`<state-dir>/ci/docs/<repo>/`). The MCP server gains `docs`, `doc_read`,
   `proposal_write` (a proposal for another repository of the CI instead of

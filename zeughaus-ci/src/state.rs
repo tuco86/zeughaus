@@ -10,13 +10,21 @@
 //! removes a version: only [`record`] (beyond [`STATE_VERSIONS`]) and
 //! [`delete`] do, and the sweep then takes the blobs no version names.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use zeughaus_blobs::{read_set, record_set};
-use zeughaus_link::enlist::{SetEntry, SetManifest, parse_run_id, run_id};
+use weida::{IncomingRequest, Replier, TransferMeta};
+use zeughaus_blobs::{Store, read_set, record_set};
+use zeughaus_link::ci::StateDownload;
+use zeughaus_link::enlist::{
+    ARTIFACT_CHUNK, ArtifactReply, BlobHead, SetEntry, SetManifest, parse_run_id, read_frame,
+    run_id, write_chunk, write_end, write_frame,
+};
 use zeughaus_link::{StateVersionView, StateView};
 
-use crate::config::valid_name;
+use crate::config::{CiConfig, valid_name};
+use crate::transport::editor_principal;
 
 /// The versions the CI keeps of each store.
 pub const STATE_VERSIONS: usize = 3;
@@ -198,6 +206,131 @@ pub fn delete(
         }
     }
     Ok(())
+}
+
+/// Answers `/state` downloads until the replier goes away, which for this
+/// process means never; each exchange has a task of its own.
+pub async fn serve(replier: Replier, state_dir: PathBuf, config: Arc<CiConfig>) {
+    let blobs = blobs_dir(&state_dir);
+    let store = match Store::open(&blobs, true) {
+        Ok(store) => Arc::new(store),
+        Err(e) => {
+            eprintln!(
+                "[ci] no state service: cannot open {}: {e}",
+                blobs.display()
+            );
+            return;
+        }
+    };
+    let service = Arc::new(StateService {
+        state_dir,
+        config,
+        store,
+    });
+    loop {
+        match replier.accept().await {
+            Ok(request) => {
+                let service = Arc::clone(&service);
+                tokio::spawn(async move { service.exchange(request).await });
+            }
+            Err(e) => {
+                eprintln!("[ci] stopped accepting state downloads: {e}");
+                return;
+            }
+        }
+    }
+}
+
+struct StateService {
+    state_dir: PathBuf,
+    config: Arc<CiConfig>,
+    store: Arc<Store>,
+}
+
+impl StateService {
+    async fn exchange(&self, mut request: IncomingRequest) {
+        if let Err(why) = editor_principal(&self.config, request.meta()) {
+            eprintln!("[ci] refused a state download from a peer that {why}");
+            request.refuse(weida::ErrorCode::Rejected).await;
+            return;
+        }
+        let mut body = request.take_body();
+        let asked = match read_frame::<_, StateDownload>(&mut body).await {
+            Ok(Some(asked)) => asked,
+            Ok(None) => return,
+            Err(e) => {
+                eprintln!("[ci] unreadable state download: {e}");
+                request.refuse(weida::ErrorCode::Rejected).await;
+                return;
+            }
+        };
+        let mut reply = match request.reply(TransferMeta::default()).await {
+            Ok(reply) => reply,
+            Err(e) => {
+                eprintln!("[ci] cannot open the reply half of a state download: {e}");
+                return;
+            }
+        };
+        let sent = match self.version(&asked) {
+            Ok(manifest) => self.send(&manifest, &mut reply).await,
+            Err(message) => write_frame(&mut reply, &ArtifactReply::Error { message }).await,
+        };
+        if let Err(e) = sent {
+            eprintln!(
+                "[ci] state {} #{} of {}: download failed: {e}",
+                asked.name, asked.version, asked.repo
+            );
+        }
+        let _ = reply.finish();
+    }
+
+    /// The manifest the download names, of a repository of `ci.toml`.
+    fn version(&self, asked: &StateDownload) -> Result<SetManifest, String> {
+        let StateDownload {
+            repo,
+            name,
+            version,
+        } = asked;
+        if !self.config.repos.contains_key(repo) {
+            return Err(format!("no repository {repo}"));
+        }
+        read(&self.state_dir, repo, name, *version)?
+            .ok_or_else(|| format!("no version #{version} of state {name} in {repo}"))
+    }
+
+    /// `Sending`, the manifest as chunks and an end marker, then every
+    /// distinct file's blob in manifest order.
+    async fn send(
+        &self,
+        manifest: &SetManifest,
+        reply: &mut weida::OutgoingTransfer,
+    ) -> Result<(), String> {
+        write_frame(reply, &ArtifactReply::Sending).await?;
+        for chunk in manifest.encode().chunks(ARTIFACT_CHUNK) {
+            write_chunk(reply, chunk).await?;
+        }
+        write_end(reply).await?;
+        crate::artifacts::stream_blobs(&self.store, blob_heads(manifest), reply).await
+    }
+}
+
+/// The blob of every distinct file of `manifest` that has bytes, in
+/// manifest order: an empty file needs none.
+pub fn blob_heads(manifest: &SetManifest) -> Vec<BlobHead> {
+    let mut seen = HashSet::new();
+    manifest
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            SetEntry::File { root, size, .. } if *size > 0 && seen.insert(*root) => {
+                Some(BlobHead {
+                    root: *root,
+                    size: *size,
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]

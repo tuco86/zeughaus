@@ -208,6 +208,25 @@ impl CiServer {
                     Err(e) => error(&e),
                 }
             }
+            CiRequest::States { repo } => {
+                if !self.config.repos.contains_key(&repo) {
+                    return error(&format!("no repository {repo}"));
+                }
+                match crate::state::list(&self.state_dir, &repo) {
+                    Ok(states) => CiReply::States { states },
+                    Err(e) => error(&e),
+                }
+            }
+            CiRequest::StateDelete {
+                repo,
+                name,
+                version,
+            } => {
+                if !self.config.repos.contains_key(&repo) {
+                    return error(&format!("no repository {repo}"));
+                }
+                accepted(crate::state::delete(&self.state_dir, &repo, &name, version))
+            }
         }
     }
 
@@ -732,6 +751,7 @@ fn job_def_view(
         at,
         placement,
         secrets: def.secrets.clone(),
+        state: def.state.clone(),
         manual,
     }
 }

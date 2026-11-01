@@ -1,4 +1,4 @@
-//! The fifteen tools, the schemas an agent sees and the text they answer with.
+//! The eighteen tools, the schemas an agent sees and the text they answer with.
 //!
 //! The text is for a model, so it is short, one fact per line and in a shape
 //! that is the same every time. The functions that build it take the records
@@ -18,7 +18,7 @@ use zeughaus_link::ci::{
 use zeughaus_link::manual::{MAX_MANUAL_JOBS, RunReply};
 use zeughaus_link::{
     CiOverview, CiReply, CiRequest, DocKind, DocState, DocView, JobTiming, JobView, MachineView,
-    PipelineView, TransferView,
+    PipelineView, StateView, TransferView,
 };
 
 use super::client::Client;
@@ -41,7 +41,9 @@ each runs, and whether HEAD and the default branch are green; in such a checkout
 omitted. Plans and proposals of a repository live in the CI too: docs lists them, doc_read reads \
 one, proposal_write stores a proposal for another repository of the CI (instead of a \
 PROPOSAL-*.md in its root), and a session executing a plan from zeughaus calls plan_done once its \
-work is committed and pushed.";
+work is committed and pushed. A job that names `state = [..]` in its header keeps data from one \
+pipeline to the next: ci_state lists those stores and their versions, ci_state_get downloads one \
+version into a directory and ci_state_delete removes a version or a whole store.";
 
 /// Pipelines listed when the call gives no limit.
 const DEFAULT_PIPELINES: u32 = 10;
@@ -430,6 +432,68 @@ impl Toolbox {
         let repo = self.repo_or_checkout(args.repo).await?;
         let doc = read_doc(&self.client, &repo, args.number).await?;
         Ok(docs::doc_text(&doc, now()))
+    }
+
+    /// `ci_state`: a repository's job state stores, or one store's versions.
+    async fn state(&self, args: StateArgs) -> Result<String, String> {
+        let repo = self.repo_or_checkout(args.repo).await?;
+        let states = self.states(&repo).await?;
+        states_text(&repo, &states, args.name.as_deref(), now())
+    }
+
+    async fn states(&self, repo: &str) -> Result<Vec<StateView>, String> {
+        let request = CiRequest::States {
+            repo: repo.to_owned(),
+        };
+        match self.client.ci(request).await? {
+            CiReply::States { states } => Ok(states),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// `ci_state_get`: one version of a store, the newest unless named, into
+    /// a directory.
+    async fn state_get(&self, args: StateGetArgs) -> Result<String, String> {
+        let repo = self.repo_or_checkout(args.repo).await?;
+        let name = args.name;
+        let version = match args.version {
+            Some(version) => version,
+            None => self
+                .states(&repo)
+                .await?
+                .iter()
+                .find(|state| state.name == name)
+                .and_then(|state| state.versions.first())
+                .map(|version| version.number)
+                .ok_or_else(|| format!("no state {name} in {repo}"))?,
+        };
+        let dir = self.checkout_path(Some(&args.dir))?;
+        let request = zeughaus_link::ci::StateDownload {
+            repo: repo.clone(),
+            name: name.clone(),
+            version,
+        };
+        let (files, bytes) = self.client.state_download(&request, &dir).await?;
+        Ok(format!(
+            "state {name} #{version} of {repo}: {files} files, {:.1} MB in {}",
+            bytes as f64 / 1e6,
+            dir.display()
+        ))
+    }
+
+    /// `ci_state_delete`: one version of a store, or all of it.
+    async fn state_delete(&self, args: StateDeleteArgs) -> Result<String, String> {
+        let repo = self.repo_or_checkout(args.repo).await?;
+        let request = CiRequest::StateDelete {
+            repo: repo.clone(),
+            name: args.name.clone(),
+            version: args.version,
+        };
+        accepted(self.client.ci(request).await?)?;
+        Ok(match args.version {
+            Some(v) => format!("deleted version #{v} of state {} of {repo}", args.name),
+            None => format!("deleted state {} of {repo}", args.name),
+        })
     }
 
     /// `proposal_write`: stores a proposal for another repository of the
@@ -889,6 +953,9 @@ impl Tools for Toolbox {
             "proposal_write" => self.proposal_write(arguments_of(arguments)?).await,
             "plan_done" => self.plan_done(arguments_of(arguments)?).await,
             "ci_run" => self.ci_run(arguments_of(arguments)?).await,
+            "ci_state" => self.state(arguments_of(arguments)?).await,
+            "ci_state_get" => self.state_get(arguments_of(arguments)?).await,
+            "ci_state_delete" => self.state_delete(arguments_of(arguments)?).await,
             other => Err(format!(
                 "unknown tool {other:?}; the tools are {}",
                 definitions()
@@ -918,6 +985,30 @@ struct RepoArgs {
 #[serde(deny_unknown_fields)]
 struct RepoOnlyArgs {
     repo: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateArgs {
+    repo: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateGetArgs {
+    repo: Option<String>,
+    name: String,
+    version: Option<u64>,
+    dir: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateDeleteArgs {
+    repo: Option<String>,
+    name: String,
+    version: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1529,6 +1620,57 @@ fn age(seconds: u64) -> String {
     }
 }
 
+/// `ci_state`'s text: one line per store of `repo` with its newest version,
+/// or with `name` one line per version of that store.
+fn states_text(
+    repo: &str,
+    states: &[StateView],
+    name: Option<&str>,
+    now: u64,
+) -> Result<String, String> {
+    let line = |name: &str, v: &zeughaus_link::StateVersionView| {
+        format!(
+            "{name}  #{} {:.1} MB {} files, saved {} ago",
+            v.number,
+            v.bytes as f64 / 1e6,
+            v.files,
+            age(now.saturating_sub(v.saved))
+        )
+    };
+    match name {
+        Some(name) => {
+            let state = states
+                .iter()
+                .find(|state| state.name == name && !state.versions.is_empty())
+                .ok_or_else(|| format!("no state {name} in {repo}"))?;
+            Ok(state
+                .versions
+                .iter()
+                .map(|v| line(name, v))
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+        None => {
+            let lines: Vec<String> = states
+                .iter()
+                .filter_map(|state| {
+                    let newest = state.versions.first()?;
+                    Some(format!(
+                        "{} ({} versions)",
+                        line(&state.name, newest),
+                        state.versions.len()
+                    ))
+                })
+                .collect();
+            if lines.is_empty() {
+                Ok(format!("no state in {repo}"))
+            } else {
+                Ok(lines.join("\n"))
+            }
+        }
+    }
+}
+
 // What the agent is told about the tools.
 
 fn definitions() -> Vec<Value> {
@@ -1546,6 +1688,16 @@ fn definitions() -> Vec<Value> {
         "type": "integer",
         "minimum": 1,
         "description": "Number of the plan or proposal, as docs lists it.",
+    });
+    let state_name = json!({
+        "type": "string",
+        "description": "Name of the state store, as ci_state lists it.",
+    });
+    let state_version = json!({
+        "type": "integer",
+        "minimum": 1,
+        "description": "Version: the number of the pipeline that saved it, as ci_state lists \
+                        it.",
     });
     // No `maximum` anywhere: omp refuses a call above a schema maximum, while
     // the server clamps every limit and says so in the description, or
@@ -1863,6 +2015,40 @@ fn definitions() -> Vec<Value> {
             &["event"],
             false,
         ),
+        tool(
+            "ci_state",
+            "The job state stores of a repository (a job keeps one with `state = [..]` in its \
+             header): one line per store with its newest version, its size, files, age and \
+             how many versions the CI keeps; with name, one line per version of that store.",
+            json!({ "repo": repo, "name": state_name }),
+            &[],
+            true,
+        ),
+        tool(
+            "ci_state_get",
+            "Download one version of a job state store into a directory, the newest unless \
+             version names one. The directory must be empty or missing.",
+            json!({
+                "repo": repo,
+                "name": state_name,
+                "version": state_version,
+                "dir": {
+                    "type": "string",
+                    "description": "Directory to put the files in, relative to the working \
+                                    directory unless absolute; must be empty or missing.",
+                },
+            }),
+            &["name", "dir"],
+            false,
+        ),
+        tool(
+            "ci_state_delete",
+            "Delete one version of a job state store, or the whole store without version. The \
+             next run of its job starts from the newest version that is left, or empty.",
+            json!({ "repo": repo, "name": state_name, "version": state_version }),
+            &["name"],
+            false,
+        ),
     ]
 }
 
@@ -1946,7 +2132,7 @@ mod tests {
     }
 
     #[test]
-    fn there_are_fifteen_tools_and_each_takes_an_object() {
+    fn there_are_eighteen_tools_and_each_takes_an_object() {
         let definitions = definitions();
         let names: Vec<&str> = definitions
             .iter()
@@ -1969,7 +2155,10 @@ mod tests {
                 "doc_read",
                 "proposal_write",
                 "plan_done",
-                "ci_run"
+                "ci_run",
+                "ci_state",
+                "ci_state_get",
+                "ci_state_delete"
             ]
         );
         for tool in &definitions {
@@ -2007,6 +2196,25 @@ mod tests {
         assert_eq!(run["properties"]["wait_seconds"]["default"], 540);
         assert_eq!(definitions[9]["annotations"]["readOnlyHint"], false);
         assert_eq!(definitions[1]["annotations"]["readOnlyHint"], true);
+        for (name, read_only) in [
+            ("ci_state", true),
+            ("ci_state_get", false),
+            ("ci_state_delete", false),
+        ] {
+            let tool = definitions
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            assert_eq!(tool["annotations"]["readOnlyHint"], read_only, "{name}");
+        }
+        assert_eq!(
+            schema(&definitions, "ci_state_get")["required"],
+            json!(["name", "dir"])
+        );
+        assert_eq!(
+            schema(&definitions, "ci_state_delete")["required"],
+            json!(["name"])
+        );
         let log = schema(&definitions, "ci_log");
         assert_eq!(log["required"], json!(["number", "job"]));
         assert_eq!(log["properties"]["timestamps"]["type"], "boolean");
@@ -2025,6 +2233,9 @@ mod tests {
             "ci_rerun",
             "ci_cancel",
             "ci_run",
+            "ci_state",
+            "ci_state_get",
+            "ci_state_delete",
         ] {
             let shape = schema(&definitions, name);
             let required = shape["required"].as_array().cloned().unwrap_or_default();
@@ -2045,6 +2256,49 @@ mod tests {
         let repo_tool = schema(&definitions, "ci_repo");
         assert_eq!(repo_tool["properties"]["path"]["type"], "string");
         assert_eq!(repo_tool.get("required"), None);
+    }
+
+    #[test]
+    fn the_state_text_lists_stores_or_one_stores_versions() {
+        use zeughaus_link::StateVersionView;
+        let now = 100_000;
+        let version = |number, saved_ago: u64, bytes, files| StateVersionView {
+            number,
+            saved: now - saved_ago,
+            bytes,
+            files,
+        };
+        assert_eq!(
+            states_text("demo", &[], None, now),
+            Ok("no state in demo".to_owned())
+        );
+        let states = [
+            StateView {
+                name: "corpus".to_owned(),
+                versions: vec![
+                    version(12, 30, 2_500_000, 40),
+                    version(11, 7300, 2_000_000, 38),
+                ],
+            },
+            StateView {
+                name: "seen".to_owned(),
+                versions: vec![version(12, 600, 1000, 1)],
+            },
+        ];
+        assert_eq!(
+            states_text("demo", &states, None, now).unwrap(),
+            "corpus  #12 2.5 MB 40 files, saved 30 s ago (2 versions)\n\
+             seen  #12 0.0 MB 1 files, saved 10 min ago (1 versions)"
+        );
+        assert_eq!(
+            states_text("demo", &states, Some("corpus"), now).unwrap(),
+            "corpus  #12 2.5 MB 40 files, saved 30 s ago\n\
+             corpus  #11 2.0 MB 38 files, saved 2 h ago"
+        );
+        assert_eq!(
+            states_text("demo", &states, Some("other"), now),
+            Err("no state other in demo".to_owned())
+        );
     }
 
     #[test]
@@ -2354,6 +2608,21 @@ mod tests {
             ("ci_wait", json!({ "number": 1 })),
             ("ci_wait", json!({})),
             ("ci_run", json!({ "repo": "r", "event": "push" })),
+            ("ci_state", json!({ "repo": "r" })),
+            ("ci_state", json!({ "repo": "r", "name": "corpus" })),
+            (
+                "ci_state_get",
+                json!({ "repo": "r", "name": "corpus", "dir": "/nonexistent/zh-state" }),
+            ),
+            (
+                "ci_state_get",
+                json!({ "repo": "r", "name": "corpus", "version": 3, "dir": "/nonexistent/zh-state" }),
+            ),
+            ("ci_state_delete", json!({ "repo": "r", "name": "corpus" })),
+            (
+                "ci_state_delete",
+                json!({ "repo": "r", "name": "corpus", "version": 3 }),
+            ),
             ("run_jobs", json!({ "jobs": ["build-x"] })),
         ] {
             let err = tools.call(name, arguments).await.expect_err(name);
@@ -2640,6 +2909,7 @@ mod tests {
             at: "host".to_owned(),
             placement: String::new(),
             secrets: Vec::new(),
+            state: Vec::new(),
             manual: true,
         };
         RepoView {
@@ -3249,6 +3519,106 @@ mod tests {
                 assert!(status.success());
             }
             dir
+        }
+
+        /// Serves version 4 of `demo`'s store `corpus` on `/state` as the CI
+        /// does: the manifest of the files under `src`, then their blobs.
+        async fn serve_state(replier: weida::Replier, src: PathBuf) {
+            use zeughaus_link::ci::StateDownload;
+            use zeughaus_link::enlist::{ArtifactReply, BlobHead, write_chunk, write_end};
+            while let Ok(mut request) = replier.accept().await {
+                let mut body = request.take_body();
+                let asked: StateDownload = read_frame(&mut body).await.unwrap().unwrap();
+                let mut out = request.reply(TransferMeta::default()).await.unwrap();
+                if (asked.repo.as_str(), asked.name.as_str(), asked.version)
+                    != ("demo", "corpus", 4)
+                {
+                    let message = format!("no version #{} of state {}", asked.version, asked.name);
+                    write_frame(&mut out, &ArtifactReply::Error { message })
+                        .await
+                        .unwrap();
+                    out.finish().unwrap();
+                    continue;
+                }
+                let (manifest, sources) = zeughaus_blobs::manifest_of(&src).unwrap();
+                write_frame(&mut out, &ArtifactReply::Sending)
+                    .await
+                    .unwrap();
+                write_chunk(&mut out, &manifest.encode()).await.unwrap();
+                write_end(&mut out).await.unwrap();
+                let empty =
+                    zeughaus_blobs::Store::open(&src.join("..").join("none"), false).unwrap();
+                for (root, size) in zeughaus_blobs::missing(&manifest, &empty) {
+                    let mut packed = Vec::new();
+                    zeughaus_blobs::compress_file(&sources[&root], 3, &mut packed).unwrap();
+                    write_frame(&mut out, &BlobHead { root, size })
+                        .await
+                        .unwrap();
+                    write_chunk(&mut out, &packed).await.unwrap();
+                    write_end(&mut out).await.unwrap();
+                }
+                out.finish().unwrap();
+            }
+        }
+
+        /// `ci_state_get` lays the files of the version out in the named
+        /// directory, and refuses one that holds something already.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn ci_state_get_puts_a_versions_files_into_a_directory() {
+            let ci = fake_ci(0, None).await;
+            let root =
+                std::env::temp_dir().join(format!("zeughaus-mcp-state-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let src = root.join("src");
+            std::fs::create_dir_all(src.join("seeds")).unwrap();
+            std::fs::write(src.join("seeds/a"), b"first seed").unwrap();
+            std::fs::write(src.join("log"), b"pipeline 1\npipeline 2\n").unwrap();
+            let replier = ci
+                ._transport
+                .listener()
+                .replier(zeughaus_link::STATE_PATH)
+                .expect("/state");
+            tokio::spawn(serve_state(replier, src));
+            let tools = toolbox_for(&ci).working_in(root.clone());
+
+            let text = tools
+                .call(
+                    "ci_state_get",
+                    json!({ "repo": "demo", "name": "corpus", "version": 4, "dir": "got" }),
+                )
+                .await
+                .expect("the download");
+            let got = root.join("got");
+            assert_eq!(
+                text,
+                format!(
+                    "state corpus #4 of demo: 2 files, 0.0 MB in {}",
+                    got.display()
+                )
+            );
+            assert_eq!(std::fs::read(got.join("seeds/a")).unwrap(), b"first seed");
+            assert_eq!(
+                std::fs::read(got.join("log")).unwrap(),
+                b"pipeline 1\npipeline 2\n"
+            );
+
+            let err = tools
+                .call(
+                    "ci_state_get",
+                    json!({ "repo": "demo", "name": "corpus", "version": 4, "dir": "got" }),
+                )
+                .await
+                .expect_err("occupied");
+            assert_eq!(err, format!("{} is not empty", got.display()));
+            let err = tools
+                .call(
+                    "ci_state_get",
+                    json!({ "repo": "demo", "name": "corpus", "version": 5, "dir": "other" }),
+                )
+                .await
+                .expect_err("no such version");
+            assert!(err.ends_with("no version #5 of state corpus"), "{err}");
+            let _ = std::fs::remove_dir_all(&root);
         }
 
         /// The whole of a manual run against a CI that is not the real one: the

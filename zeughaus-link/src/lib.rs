@@ -24,6 +24,7 @@
 //! | [`ENLIST_PATH`] | one long exchange per runner | [`enlist`]: a runner takes assignments from the CI and streams output |
 //! | [`ARTIFACTS_PATH`] | one exchange per transfer | [`enlist::ArtifactRequest`]: a run's artifact set, streamed as chunks |
 //! | [`MANUAL_PATH`] | one exchange per manual run | [`manual`]: a working-tree snapshot and its bundles |
+//! | [`STATE_PATH`] | one exchange per download | [`ci::StateDownload`]: one version of a job state store |
 //! | [`MUX_PATH`] | req/rep exchanges | the terminal mux (`zeughaus-mux`) |
 //! | [`GRAPH_PATH`] | one long exchange per editor | [`graph`]: the document, edits and changes |
 //!
@@ -119,3 +120,8 @@ pub const ARTIFACTS_PATH: &str = "/artifacts";
 /// bundles in, a [`manual::RunReply`] out. Served by the CI to editors'
 /// client keys, not to runners.
 pub const MANUAL_PATH: &str = "/manual";
+
+/// The exchange an agent downloads one version of a job state store on: a
+/// [`ci::StateDownload`] frame in, the version's manifest and blobs out.
+/// Served by the CI to editors' client keys, not to runners.
+pub const STATE_PATH: &str = "/state";

@@ -781,7 +781,10 @@ holds these keys:
   default runner;
 - `cache`, `context`, `when_busy`: ignored, with a warning from
   `zeughaus-ci check` (**Workspaces**; no runner is ever busy);
-- `secrets`, `env`, `timeout_minutes`.
+- `secrets`, `env`, `timeout_minutes`;
+- `state` (at most 8 store names) and `state_save` (`success`, the
+  default, or `always`; only with `state`): data the job keeps from one
+  pipeline to the next (**Job state**).
 
 Files without a header are helpers. `zeughaus-ci check` validates a folder and
 `zeughaus-ci plan` shows what an event selects, both without a service
@@ -889,13 +892,40 @@ little-endian length and a postcard body, at most `MAX_ENLIST_FRAME_BYTES`
   the workspace (`Checkout`); the runner derives the workspace's name from
   the place (`Place::workspace`). The runner adds
   the paths and the CPU count (`CI_WORKSPACE`, `CI_OUTPUT`, `CI_INPUTS`,
-  `CI_CPUS`, `CARGO_BUILD_JOBS`, and `CI_SIBLINGS` for a manual run).
+  `CI_CPUS`, `CARGO_BUILD_JOBS`, `CI_SIBLINGS` for a manual run and
+  `CI_STATE` for a job with `state`).
 - Output is the run's `wal` byte for byte. The CI appends a chunk when its
   offset is the stored length, appends only the part beyond the length when
   the offset is below it (a resend after a reconnect), and ends the exchange
   when it is above: the runner reconnects and resumes from the new
   `Welcome`. Output of a run the CI did not assign to that runner is
   refused.
+
+**Job state.** A job's `state = ["fuzz-corpus"]` names stores the CI keeps
+for it, apart from workspaces, `clean` and runner budgets (`state.rs`).
+A version of a store is a `SetManifest` under
+`ci/state/sets/<repo>.<number>.<name>.set` (`number` is the pipeline that
+saved it, the file's mtime when) whose files are zstd blobs in the store
+`ci/state/blobs`; neither the artifact store's expiry nor
+`artifact_store_gb` touches it, and the hourly sweep removes only blobs no
+kept version names. The CI keeps the 3 highest numbers of each store; a
+lower number saved later is kept but never becomes the newest. `Assign`
+carries a `StateMount` per store: the newest version (`None` while there is
+none) and whether the end saves it (`StateSave::Never` for a manual run,
+else the header's `state_save`). The runner fills `<run>/state/<name>/`
+before the job starts (`StateManifest`, `StateFetch` on `/artifacts`; the
+blob cache keeps the version, so the next night moves only new files) and
+points `CI_STATE` at `<run>/state` (`/ci/run/state` in a container). When
+the run ends it saves each store unless it is a manual run, the run was
+killed, or `success` and the job failed (`StateOffer`, `StateBlobs`, against
+`state_max_mb` of `ci.toml`, 1024 by default), and reports a `StateResult`
+per store in `RunEnd`. The CI only serves and accepts a store to the
+runner assigned the run of a job that names it, and never accepts one from
+a manual run. A failed save fails a job that passed; the note says what
+became of each store (`state corpus saved 2.5 MB (started from #12)`). A
+job on a Windows VM keeps no state. `ci_state`, `ci_state_get` (on
+`/state`, editors' keys only) and `ci_state_delete` list, download and
+delete versions.
 
 The runner keeps the connection (`link.rs`): it redials after 1 s, doubling
 to 30 s, starting over after a connection that lasted 60 s. It presents its
@@ -1385,7 +1415,8 @@ and names `zeughaus-runner ci wait <repo> <number>` for a background wait),
 `ci_rerun` and `ci_run` (`CiRequest::Queue`: a push or nightly event of the
 default branch, with the asker's `<user>@<host>` as its actor; both look
 for the pipeline the CI numbers for it for up to 30 s and answer with its
-number), `ci_cancel`, `ci_repo` and `run_jobs`; their answers are one
+number), `ci_cancel`, `ci_repo`, `run_jobs` and the job state tools
+`ci_state`, `ci_state_get` and `ci_state_delete`; their answers are one
 fact per line
 in a fixed shape, and a CI that answers with an error, or not at all within
 30 s, is the tool's error. No schema carries a `maximum`, because omp

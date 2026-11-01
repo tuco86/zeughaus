@@ -168,6 +168,30 @@ pub enum CiRequest {
         nightly: bool,
         actor: String,
     },
+    /// Every job state store of a repository with its versions. Answers
+    /// [`CiReply::States`].
+    States { repo: String },
+    /// Deletes version `version` of a store, or every version without one.
+    /// Answers [`CiReply::Accepted`].
+    StateDelete {
+        repo: String,
+        name: String,
+        #[serde(default)]
+        version: Option<u64>,
+    },
+}
+
+/// The one frame of a download on [`crate::STATE_PATH`]: version `version`
+/// of the store `name` of `repo`. Sent as an enlist frame (postcard). The
+/// reply is an [`crate::enlist::ArtifactReply`] frame; after `Sending`, the
+/// encoded manifest as chunks and an end marker, then each distinct file's
+/// blob in manifest order as a [`crate::enlist::BlobHead`] frame, its zstd
+/// bytes as chunks and an end marker, and then the end of the reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateDownload {
+    pub repo: String,
+    pub name: String,
+    pub version: u64,
 }
 
 /// Lines of a job's output, counted from 1 over the lines that have text.
@@ -291,6 +315,9 @@ pub enum CiReply {
     },
     DocCreated {
         number: u64,
+    },
+    States {
+        states: Vec<StateView>,
     },
     Error {
         message: String,
@@ -793,6 +820,9 @@ pub struct JobDefView {
     /// Why the job cannot be placed; empty when it can.
     pub placement: String,
     pub secrets: Vec<String>,
+    /// The job state stores it keeps (`state = [..]`).
+    #[serde(default)]
+    pub state: Vec<String>,
     /// Whether a manual run (`run_jobs`) can run it: placed, and not on a
     /// machine.
     pub manual: bool,
@@ -1146,6 +1176,7 @@ mod tests {
                         at: "host".to_owned(),
                         placement: String::new(),
                         secrets: vec!["ZEUGHAUS_UPDATE_KEY".to_owned()],
+                        state: vec!["corpus".to_owned()],
                         manual: true,
                     }],
                     jobs_note: String::new(),

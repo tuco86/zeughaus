@@ -175,7 +175,12 @@ continue with `ci_wait`. `ci_repo` says which repository of the CI the
 checkout is (by its origin), whether its default branch and `HEAD` are
 green, and every job of its `.zeughaus-ci/` with the runner and place it
 runs at; in such a checkout `repo` can be omitted from every other tool,
-and `ci_wait` without a number or sha waits for `HEAD`. `docs`, `doc_read`,
+and `ci_wait` without a number or sha waits for `HEAD`. `ci_state` lists
+the job state stores of a repository (`state = [..]` in a job header: data
+the CI keeps for a job from one pipeline to the next, the 3 newest versions
+each, under `<state-dir>/ci/state/`), `ci_state_get` downloads one version
+into a directory and `ci_state_delete` removes a version or a store.
+`docs`, `doc_read`,
 `proposal_write` and `plan_done` read and write the repository's plans and
 proposals (below). Nothing but
 protocol messages is written to its stdout.

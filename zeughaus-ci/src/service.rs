@@ -20,7 +20,7 @@ use weida::{
 };
 use zeughaus_link::{
     ARTIFACTS_PATH, CI_PATH, ENLIST_PATH, EVENTS_PATH, MANUAL_PATH, MUX_PATH, RuntimeEvent,
-    SNAPSHOT_PATH, TOPIC_CI, credentials,
+    SNAPSHOT_PATH, STATE_PATH, TOPIC_CI, credentials,
 };
 
 use crate::artifacts::ArtifactService;
@@ -321,6 +321,16 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
             ));
         }
         Err(e) => eprintln!("[ci] no manual service: {e}"),
+    }
+    match listener.replier(STATE_PATH) {
+        Ok(replier) => {
+            rt.spawn(crate::state::serve(
+                replier,
+                state_dir.to_path_buf(),
+                Arc::clone(&config),
+            ));
+        }
+        Err(e) => eprintln!("[ci] no state service: {e}"),
     }
     let publisher = match listener.publisher(EVENTS_PATH) {
         Ok(publisher) => Some(publisher),

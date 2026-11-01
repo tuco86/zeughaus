@@ -1,5 +1,5 @@
-//! The two exchanges the tools have with the CI: a JSON question on `/ci`
-//! and a manual run's upload on `/manual`.
+//! The exchanges the tools have with the CI: a JSON question on `/ci`, a
+//! manual run's upload on `/manual` and a state download on `/state`.
 //!
 //! The CI is reached the way an editor reaches it: the pinned URL names its
 //! fingerprint, and this machine's client key is what the CI admits. One
@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -22,9 +23,15 @@ use weida::{
     ClientTls, EndpointAddr, Identity, Limits, Network, OutgoingTransfer, ReplyStream, Requester,
     Runtime, RuntimeConfig, TransferMeta, Trust,
 };
-use zeughaus_link::enlist::{read_frame, write_frame};
+use zeughaus_link::ci::StateDownload;
+use zeughaus_link::enlist::{
+    ArtifactReply, BlobHead, MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES, SetEntry, SetManifest,
+    read_frame, write_frame,
+};
 use zeughaus_link::manual::{RunReply, RunUpload};
-use zeughaus_link::{CI_PATH, CiReply, CiRequest, MANUAL_PATH, MAX_CI_REPLY_BYTES, credentials};
+use zeughaus_link::{
+    CI_PATH, CiReply, CiRequest, MANUAL_PATH, MAX_CI_REPLY_BYTES, STATE_PATH, credentials,
+};
 
 /// How long a first dial may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -219,6 +226,27 @@ impl Client {
         reply
     }
 
+    /// Downloads a version of a job state store into `dest`, which must not
+    /// hold anything yet. Answers its files and bytes.
+    pub async fn state_download(
+        &self,
+        request: &StateDownload,
+        dest: &Path,
+    ) -> Result<(u64, u64), String> {
+        let occupied = std::fs::read_dir(dest).is_ok_and(|mut dir| dir.next().is_some());
+        if occupied {
+            return Err(format!("{} is not empty", dest.display()));
+        }
+        let (requester, url) = self.requester(STATE_PATH).await?;
+        let got = download(&requester, request, dest)
+            .await
+            .map_err(|e| format!("download from {url}: {e}"));
+        if got.is_err() {
+            self.forget(STATE_PATH).await;
+        }
+        got
+    }
+
     /// Closes the connections this client opened, so the CI sees it leave.
     pub async fn shutdown(&self) {
         let mut state = self.state.lock().await;
@@ -300,7 +328,8 @@ fn retries(request: &CiRequest) -> bool {
         | CiRequest::Timing { .. }
         | CiRequest::Repo { .. }
         | CiRequest::Docs { .. }
-        | CiRequest::Doc { .. } => true,
+        | CiRequest::Doc { .. }
+        | CiRequest::States { .. } => true,
         CiRequest::OpenTranscript { .. }
         | CiRequest::CloseTranscript { .. }
         | CiRequest::Rerun { .. }
@@ -309,7 +338,8 @@ fn retries(request: &CiRequest) -> bool {
         | CiRequest::DocCreate { .. }
         | CiRequest::DocState { .. }
         | CiRequest::DocDelete { .. }
-        | CiRequest::PlanClaim { .. } => false,
+        | CiRequest::PlanClaim { .. }
+        | CiRequest::StateDelete { .. } => false,
     }
 }
 
@@ -343,6 +373,113 @@ async fn exchange(
                 MANUAL_REPLY_TIMEOUT.as_secs()
             )
         })?
+}
+
+/// Names the temporary blob stores of downloads.
+static DOWNLOADS: AtomicU64 = AtomicU64::new(0);
+
+/// One `/state` exchange: the version's manifest and blobs into a temporary
+/// store, then its files into `dest`. The store goes whatever happened.
+async fn download(
+    requester: &Requester,
+    request: &StateDownload,
+    dest: &Path,
+) -> Result<(u64, u64), String> {
+    let (mut out, reply) =
+        tokio::time::timeout(CONNECT_TIMEOUT, requester.open(TransferMeta::default()))
+            .await
+            .map_err(|_| format!("open: no connection within {} s", CONNECT_TIMEOUT.as_secs()))?
+            .map_err(|e| format!("open: {e}"))?;
+    write_frame(&mut out, request).await?;
+    out.finish().map_err(|e| format!("finish: {e}"))?;
+    let mut body = reply.recv().await.map_err(|e| format!("reply: {e}"))?;
+    match read_frame::<_, ArtifactReply>(&mut body).await? {
+        Some(ArtifactReply::Sending) => {}
+        Some(ArtifactReply::Error { message }) => return Err(message),
+        Some(ArtifactReply::Done) | None => {
+            return Err("the CI did not answer the download".to_owned());
+        }
+    }
+    let mut chunk = Vec::new();
+    let mut encoded = Vec::new();
+    while zeughaus_link::enlist::read_chunk(&mut body, &mut chunk).await? {
+        if encoded.len() + chunk.len() > MAX_MANIFEST_BYTES {
+            return Err(format!(
+                "a manifest of more than {MAX_MANIFEST_BYTES} bytes"
+            ));
+        }
+        encoded.extend_from_slice(&chunk);
+    }
+    let manifest = SetManifest::decode(&encoded)?;
+
+    let dir = std::env::temp_dir().join(format!(
+        "zeughaus-state-{}-{}",
+        std::process::id(),
+        DOWNLOADS.fetch_add(1, Ordering::Relaxed)
+    ));
+    let got = receive(&mut body, &manifest, &dir, dest).await;
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    got
+}
+
+/// Receives every blob of `manifest` from `body` into a raw store at `dir`,
+/// then materializes the set into `dest`.
+async fn receive(
+    body: &mut (impl tokio::io::AsyncRead + Unpin),
+    manifest: &SetManifest,
+    dir: &Path,
+    dest: &Path,
+) -> Result<(u64, u64), String> {
+    let joined = |e: tokio::task::JoinError| format!("the store failed: {e}");
+    let store = zeughaus_blobs::Store::open(dir, false)
+        .map_err(|e| format!("cannot open {}: {e}", dir.display()))?;
+    let store = Arc::new(store);
+    // A fresh store lacks every blob: these are the ones the CI sends.
+    let expected = zeughaus_blobs::missing(manifest, &store);
+    let mut chunk = Vec::new();
+    let mut total = 0u64;
+    for (i, &(root, size)) in expected.iter().enumerate() {
+        let head = read_frame::<_, BlobHead>(body)
+            .await?
+            .ok_or_else(|| format!("the download ended after {i} blobs"))?;
+        if head != (BlobHead { root, size }) {
+            return Err(format!("blob {i} is not the one asked for"));
+        }
+        let into = Arc::clone(&store);
+        let mut receiving = tokio::task::spawn_blocking(move || into.receive(root, size))
+            .await
+            .map_err(joined)?
+            .map_err(|e| format!("blob {}: {e}", hex::encode(root)))?;
+        while zeughaus_link::enlist::read_chunk(body, &mut chunk).await? {
+            total += chunk.len() as u64;
+            if total > MAX_ARTIFACT_BYTES {
+                return Err(format!("more than {MAX_ARTIFACT_BYTES} bytes"));
+            }
+            let bytes = std::mem::take(&mut chunk);
+            (receiving, chunk) = tokio::task::spawn_blocking(move || {
+                receiving.write(&bytes).map(|()| (receiving, bytes))
+            })
+            .await
+            .map_err(joined)??;
+        }
+        tokio::task::spawn_blocking(move || receiving.finish())
+            .await
+            .map_err(joined)??;
+    }
+    if read_frame::<_, BlobHead>(body).await?.is_some() {
+        return Err("the CI sent more blobs than the set holds".to_owned());
+    }
+    let files = manifest
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry, SetEntry::File { .. }))
+        .count() as u64;
+    let (manifest, dest) = (manifest.clone(), dest.to_owned());
+    let bytes =
+        tokio::task::spawn_blocking(move || zeughaus_blobs::materialize(&manifest, &store, &dest))
+            .await
+            .map_err(joined)??;
+    Ok((files, bytes))
 }
 
 /// The frame, then each bundle as raw bytes, exactly as many as `sizes` said.

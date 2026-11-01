@@ -248,8 +248,8 @@ fn place_of(job: &JobDefView) -> String {
     }
 }
 
-/// What starts the job, what it is given and what keeps `run_jobs` from
-/// running it, separated by semicolons.
+/// What starts the job, the stores it keeps, what it is given and what keeps
+/// `run_jobs` from running it, separated by semicolons.
 fn notes_of(job: &JobDefView) -> String {
     let mut parts = Vec::new();
     if !job.on.is_empty() {
@@ -260,6 +260,9 @@ fn notes_of(job: &JobDefView) -> String {
     }
     if !job.channels.is_empty() {
         parts.push(format!("channels {}", job.channels.join(", ")));
+    }
+    if !job.state.is_empty() {
+        parts.push(format!("state {}", job.state.join(", ")));
     }
     if !job.secrets.is_empty() {
         parts.push(format!(
@@ -319,6 +322,7 @@ mod tests {
             at: at.to_owned(),
             placement: String::new(),
             secrets: Vec::new(),
+            state: Vec::new(),
             manual: !at.starts_with("machine:"),
         }
     }
@@ -623,10 +627,12 @@ mod tests {
         lost.placement = "machine nowhere is no runner or machine of ci.toml".to_owned();
         lost.manual = false;
         lost.secrets = vec!["TOKEN".to_owned()];
+        let mut keeping = job_def("bb", &[], &["a"], "sadala", "image:x");
+        keeping.state = vec!["corpus".to_owned(), "seen".to_owned()];
         view.jobs = vec![
             job_def("a", &["push main"], &[], "tuco-pc", "host"),
             lost,
-            job_def("bb", &[], &["a"], "sadala", "image:x"),
+            keeping,
         ];
         view.jobs_sha = Some("abcdef0123".to_owned());
         let text = describe(&view, Some(HEAD));
@@ -637,7 +643,7 @@ mod tests {
                 "jobs at abcdef0 (run_jobs takes these names):",
                 "  a     tuco-pc host    on push main",
                 "  lost  cannot be placed: machine nowhere is no runner or machine of ci.toml  on push main; secrets TOKEN (none in run_jobs)",
-                "  bb    sadala image:x  needs a",
+                "  bb    sadala image:x  needs a; state corpus, seen",
             ]
         );
     }

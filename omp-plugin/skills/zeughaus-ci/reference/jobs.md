@@ -36,6 +36,8 @@ A header with an `env` table:
 | `secrets` | list of names | Each `[A-Z_][A-Z0-9_]*`. A secret reaches the job as an environment variable of that name when the repository's `grants` in ci.toml release it to the event (`push main`, `tag v*`, `nightly`). Otherwise the job fails with `secret <name> is not granted for <event> <ref>`. A manual run gives none |
 | `env` | table of strings | More variables for the job. Names `[A-Z_][A-Z0-9_]*`, none starting with `CI_` or `ZEUGHAUS_` |
 | `timeout_minutes` | integer | 1..=1440, default 240. At the deadline the job gets SIGTERM and, 60 s later, SIGKILL. Its note is `timed out after <n> min` |
+| `state` | list of names | At most 8, each `[a-z0-9][a-z0-9-]*`, none twice. Stores the CI keeps for this job from one pipeline to the next, independent of workspaces, `clean` and runner budgets (a fuzz corpus, a cache that must survive a clean nightly). Before the job starts, `$CI_STATE/<name>/` holds the store's newest version (empty while it has none); when the job ends, that directory becomes the pipeline's version. The CI keeps the 3 newest versions, each at most `state_max_mb` of ci.toml (1024 MB by default). Not on a Windows VM. Manual runs read the stores and never save |
+| `state_save` | `success` or `always` | Only with `state`; default `success`: save when the job exits 0. `always` saves after any end but a kill (a timeout too). A failed save fails the job; its note says what became of each store |
 | `context`, `cache`, `when_busy` | any | Parsed and ignored: a repository's jobs at one place share one workspace, a checkout keeps ignored files, and no runner is ever busy. `zeughaus-ci check` warns; remove them |
 
 Rules across keys:
@@ -125,6 +127,7 @@ Set by the runner:
 | `CI_INPUTS` | One directory `<need>/` for each job of `needs` that succeeded and left output. Container: `/ci/inputs` |
 | `CI_CPUS`, `CARGO_BUILD_JOBS` | The CPU count of the place: the runner's, the container's or the VM's |
 | `CI_SIBLINGS` | Manual runs only: the directory of the sibling checkouts, `<workspace>/.zci-siblings` (`/work/.zci-siblings` in a container). `$CI_SIBLINGS/<dir>` is the path dependency `<dir>` |
+| `CI_STATE` | Jobs with `state` only: the directory with one directory per store, `<run>/state` on the host, `/ci/run/state` in a container. `$CI_STATE/<name>` is the store `<name>`; `ci_state`, `ci_state_get` and `ci_state_delete` list, download and delete its versions |
 
 Besides these: the header's `env`, and the granted `secrets` by name. A `.ps1` job reads all of them as `$env:NAME`.
 
