@@ -21,7 +21,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The protocol major a runner and the CI must share.
-pub const ENLIST_MAJOR: u32 = 8;
+pub const ENLIST_MAJOR: u32 = 9;
 
 /// The most one frame body may carry.
 pub const MAX_ENLIST_FRAME_BYTES: usize = 1 << 20;
@@ -120,6 +120,9 @@ pub struct RunEnd {
     /// The run left an artifact set, which the runner holds until the CI
     /// drops it.
     pub artifacts: bool,
+    /// What became of each store of the assignment's `state`.
+    #[serde(default)]
+    pub state: Vec<StateResult>,
 }
 
 /// What the CI says to a runner.
@@ -194,6 +197,9 @@ pub struct Assignment {
     /// A snapshot of working trees in place of a commit of the repository.
     #[serde(default)]
     pub upload: Option<Upload>,
+    /// The job state stores the run starts from and may save.
+    #[serde(default)]
+    pub state: Vec<StateMount>,
 }
 
 /// What the launcher does to the workspace before the job runs.
@@ -232,6 +238,34 @@ impl StateSave {
             StateSave::Always => "always",
         }
     }
+}
+
+/// A store the run starts from (`version`, `None` while the store has none)
+/// and may save when it ends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateMount {
+    pub name: String,
+    pub version: Option<u64>,
+    pub save: StateSave,
+}
+
+/// What became of one store at the end of a run; `from` is the version it
+/// started from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateResult {
+    pub name: String,
+    pub from: Option<u64>,
+    pub outcome: StateOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StateOutcome {
+    /// Saved as the pipeline's version; `bytes` is the sum of its files.
+    Saved { bytes: u64 },
+    /// Not saved, and that is no failure: `why` says why.
+    NotSaved { why: String },
+    /// The save failed, which fails the job.
+    Failed { message: String },
 }
 
 /// The working trees a manual run executes in, in place of a checkout.
@@ -320,6 +354,28 @@ pub enum ArtifactRequest {
     /// A runner fetches bundle `index` of the manual run `run` it was
     /// assigned.
     ManualBundle { run: String, index: u32 },
+    /// A runner restoring store `name` of the run `run` it was assigned:
+    /// version `version`'s encoded [`SetManifest`]. Reply as to `Manifest`.
+    StateManifest {
+        run: String,
+        name: String,
+        version: u64,
+    },
+    /// The concatenated roots of that version it wants follow as chunks and
+    /// an end marker. Reply as to `Fetch`.
+    StateFetch {
+        run: String,
+        name: String,
+        version: u64,
+    },
+    /// A runner saving store `name` of the run `run` it was assigned: the
+    /// encoded [`SetManifest`] follows as chunks and an end marker. Reply:
+    /// `Sending`, then the roots the CI lacks as chunks and an end marker
+    /// (none: the version is recorded); or `Error`.
+    StateOffer { run: String, name: String },
+    /// After a `StateOffer` that named roots: the blobs, framed as for
+    /// `Blobs`. Reply: `Done` once the version is recorded, or `Error`.
+    StateBlobs { run: String, name: String },
 }
 
 /// The most entries one [`SetManifest`] holds.
@@ -666,6 +722,11 @@ fn sample_assignment() -> Assignment {
                 sha: "ab".repeat(20),
             }],
         }),
+        state: vec![StateMount {
+            name: "corpus".to_owned(),
+            version: Some(4),
+            save: StateSave::Always,
+        }],
     }
 }
 

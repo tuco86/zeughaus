@@ -25,7 +25,7 @@
 //! The bundles of a manual run come from the CI itself, which stored them
 //! (`ManualBundle`), straight into the run's own directory: they go with it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -36,9 +36,10 @@ use weida::{OutgoingTransfer, ReplyStream, TransferMeta};
 use zeughaus_blobs::{Root, compress_file, manifest_of, materialize, missing, record_set};
 use zeughaus_link::ARTIFACTS_PATH;
 use zeughaus_link::enlist::{
-    ARTIFACT_CHUNK, ArtifactReply, ArtifactRequest, BlobHead, FromRunner, MAX_ARTIFACT_BYTES,
-    MAX_MANIFEST_BYTES, MAX_SET_ENTRIES, SetEntry, SetManifest, TransferEvent, decode_roots,
-    encode_roots, read_chunk, read_frame, write_chunk, write_end, write_frame,
+    ARTIFACT_CHUNK, ArtifactReply, ArtifactRequest, Assignment, BlobHead, FromRunner,
+    MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES, MAX_SET_ENTRIES, SetEntry, SetManifest, StateMount,
+    TransferEvent, decode_roots, encode_roots, read_chunk, read_frame, run_id, write_chunk,
+    write_end, write_frame,
 };
 
 use super::cleanup::remove_tree;
@@ -154,37 +155,73 @@ impl Executor {
                 return Err(e);
             }
         };
+        let offer = ArtifactRequest::Offer {
+            run: run.to_owned(),
+            transfer,
+        };
         let wanted = self
             .handle
-            .block_on(self.offer_set(run, transfer, &manifest))?;
+            .block_on(self.offer_manifest(offer, &manifest))?;
         if wanted.is_empty() {
             return Ok(());
         }
-        let sizes = sizes_of(&manifest);
-        let blobs: Result<Vec<(BlobHead, PathBuf)>, String> = wanted
-            .iter()
-            .map(|root| match (sizes.get(root), sources.get(root)) {
-                (Some(&size), Some(path)) => Ok((BlobHead { root: *root, size }, path.clone())),
-                _ => Err(format!(
-                    "the CI asked for {}, which is no file of {run}",
-                    hex::encode(root)
-                )),
-            })
-            .collect();
-        let blobs = match blobs {
+        let blobs = match blobs_for(&wanted, &manifest, &sources, run) {
             Ok(blobs) => blobs,
             Err(e) => {
                 self.report_unavailable(run, transfer, &e);
                 return Err(e);
             }
         };
+        let request = ArtifactRequest::Blobs {
+            run: run.to_owned(),
+            transfer,
+        };
+        self.compress_and_send(request, &blobs, run)
+    }
+
+    /// Saves the directory `dir` as the store `name` of the run `run`: hashes
+    /// it, offers its manifest and sends the files the CI lacks. Answers the
+    /// sum of its file sizes. Called on the thread that finishes a run.
+    pub(super) fn send_state(
+        self: &Arc<Self>,
+        run: &str,
+        name: &str,
+        dir: &Path,
+    ) -> Result<u64, String> {
+        let (manifest, sources) = manifest_of(dir)?;
+        let offer = ArtifactRequest::StateOffer {
+            run: run.to_owned(),
+            name: name.to_owned(),
+        };
+        let wanted = self
+            .handle
+            .block_on(self.offer_manifest(offer, &manifest))?;
+        if !wanted.is_empty() {
+            let what = format!("state {name}");
+            let blobs = blobs_for(&wanted, &manifest, &sources, &what)?;
+            let request = ArtifactRequest::StateBlobs {
+                run: run.to_owned(),
+                name: name.to_owned(),
+            };
+            self.compress_and_send(request, &blobs, &what)?;
+        }
+        Ok(manifest.files())
+    }
+
+    /// Compresses `blobs` on this thread while a task sends them as
+    /// `request`, then waits for the CI's verdict.
+    fn compress_and_send(
+        self: &Arc<Self>,
+        request: ArtifactRequest,
+        blobs: &[(BlobHead, PathBuf)],
+        what: &str,
+    ) -> Result<(), String> {
         let (tx, rx) = mpsc::channel(QUEUE);
         let exec = Arc::clone(self);
-        let name = run.to_owned();
         let sender = self
             .handle
-            .spawn(async move { exec.send_stream(&name, transfer, rx).await });
-        let packed = compress_blobs(&blobs, tx);
+            .spawn(async move { exec.send_stream(request, rx).await });
+        let packed = compress_blobs(blobs, tx);
         let sent = self
             .handle
             .block_on(sender)
@@ -194,9 +231,9 @@ impl Executor {
             // The writer fails like this only when the sender stopped first,
             // and the sender's error says why.
             Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
-                sent.and(Err(format!("cannot compress {run}: {e}")))
+                sent.and(Err(format!("cannot compress {what}: {e}")))
             }
-            Err(e) => Err(format!("cannot compress {run}: {e}")),
+            Err(e) => Err(format!("cannot compress {what}: {e}")),
         }
     }
 
@@ -211,19 +248,14 @@ impl Executor {
         }
     }
 
-    /// Offers the manifest of `run` as `transfer`; the CI answers with the
-    /// roots it lacks.
-    async fn offer_set(
+    /// Offers `manifest` as `request` (`Offer` or `StateOffer`); the CI
+    /// answers with the roots it lacks.
+    async fn offer_manifest(
         &self,
-        run: &str,
-        transfer: u64,
+        request: ArtifactRequest,
         manifest: &SetManifest,
     ) -> Result<Vec<Root>, String> {
         let (mut out, reply) = self.open_exchange().await?;
-        let request = ArtifactRequest::Offer {
-            run: run.to_owned(),
-            transfer,
-        };
         write_frame(&mut out, &request).await?;
         for chunk in manifest.encode().chunks(ARTIFACT_CHUNK) {
             write_chunk(&mut out, chunk).await?;
@@ -293,19 +325,14 @@ impl Executor {
         verdict(reply, "report").await
     }
 
-    /// Opens the `Blobs` exchange for `transfer` and sends what `pieces`
-    /// yields, up to the last blob.
+    /// Opens the exchange `request` (`Blobs` or `StateBlobs`) and sends what
+    /// `pieces` yields, up to the last blob.
     async fn send_stream(
         &self,
-        run: &str,
-        transfer: u64,
+        request: ArtifactRequest,
         mut pieces: mpsc::Receiver<Piece>,
     ) -> Result<(), String> {
         let (mut out, reply) = self.open_exchange().await?;
-        let request = ArtifactRequest::Blobs {
-            run: run.to_owned(),
-            transfer,
-        };
         write_frame(&mut out, &request).await?;
         let mut ended = false;
         while let Some(piece) = pieces.recv().await {
@@ -364,10 +391,50 @@ impl Executor {
     /// blobs the cache lacks, and copies the set out of the cache into
     /// `dest`. Called on the thread that prepares a job.
     fn download(self: &Arc<Self>, run: &str, dest: &Path) -> Result<Fetched, String> {
-        let request = ArtifactRequest::Manifest {
+        let manifest = ArtifactRequest::Manifest {
             run: run.to_owned(),
         };
-        let (rx, task) = self.receive(request, None, Body::Chunks);
+        let fetch = ArtifactRequest::Fetch {
+            run: run.to_owned(),
+        };
+        self.download_set(manifest, fetch, run, dest)
+    }
+
+    /// Restores version `version` of the store `mount` of the run `a` into
+    /// `dest`. The blob cache keeps the version under a run id of its own,
+    /// so the next run of the job moves only what changed since.
+    pub(super) fn restore_state(
+        self: &Arc<Self>,
+        a: &Assignment,
+        mount: &StateMount,
+        version: u64,
+        dest: &Path,
+    ) -> Result<Fetched, String> {
+        let manifest = ArtifactRequest::StateManifest {
+            run: a.run.clone(),
+            name: mount.name.clone(),
+            version,
+        };
+        let fetch = ArtifactRequest::StateFetch {
+            run: a.run.clone(),
+            name: mount.name.clone(),
+            version,
+        };
+        let cache_id = run_id(&a.repo, version, &format!("state-{}", mount.name));
+        self.download_set(manifest, fetch, &cache_id, dest)
+    }
+
+    /// Reads a set's manifest with `manifest`, fetches the blobs the cache
+    /// lacks with `fetch`, copies the set out of the cache into `dest` and
+    /// records it in the cache as `cache_id`.
+    fn download_set(
+        self: &Arc<Self>,
+        manifest: ArtifactRequest,
+        fetch: ArtifactRequest,
+        cache_id: &str,
+        dest: &Path,
+    ) -> Result<Fetched, String> {
+        let (rx, task) = self.receive(manifest, None, Body::Chunks);
         let mut reader = ChunkReader::new(rx);
         let read = read_to_limit(&mut reader, MAX_MANIFEST_BYTES);
         drop(reader);
@@ -378,17 +445,14 @@ impl Executor {
         let mut moved = 0;
         if !wanted.is_empty() {
             let roots: Vec<Root> = wanted.iter().map(|(root, _)| *root).collect();
-            let request = ArtifactRequest::Fetch {
-                run: run.to_owned(),
-            };
-            let (rx, task) = self.receive(request, Some(encode_roots(&roots)), Body::Blobs);
+            let (rx, task) = self.receive(fetch, Some(encode_roots(&roots)), Body::Blobs);
             let stored = store_blobs(&self.blobs, &wanted, rx);
             self.finish_receiving(task);
             moved = stored?;
         }
         let bytes = materialize(&manifest, &self.blobs, dest)?;
-        if let Err(e) = record_set(&blob_sets_dir(&self.state_dir), run, &manifest) {
-            eprintln!("[enlist] {run}: the blob cache does not keep the set: {e}");
+        if let Err(e) = record_set(&blob_sets_dir(&self.state_dir), cache_id, &manifest) {
+            eprintln!("[enlist] {cache_id}: the blob cache does not keep the set: {e}");
         }
         Ok(Fetched { bytes, moved })
     }
@@ -533,14 +597,30 @@ async fn verdict(reply: ReplyStream, what: &str) -> Result<(), String> {
     }
 }
 
-/// The size of every root of `manifest`.
-fn sizes_of(manifest: &SetManifest) -> HashMap<Root, u64> {
-    manifest
+/// The blob of each of `wanted` with the file it is read from, each a file
+/// of `manifest` (the set `what`).
+fn blobs_for(
+    wanted: &[Root],
+    manifest: &SetManifest,
+    sources: &BTreeMap<Root, PathBuf>,
+    what: &str,
+) -> Result<Vec<(BlobHead, PathBuf)>, String> {
+    let sizes: HashMap<Root, u64> = manifest
         .entries
         .iter()
         .filter_map(|entry| match entry {
             SetEntry::File { root, size, .. } => Some((*root, *size)),
             SetEntry::Dir { .. } => None,
+        })
+        .collect();
+    wanted
+        .iter()
+        .map(|root| match (sizes.get(root), sources.get(root)) {
+            (Some(&size), Some(path)) => Ok((BlobHead { root: *root, size }, path.clone())),
+            _ => Err(format!(
+                "the CI asked for {}, which is no file of {what}",
+                hex::encode(root)
+            )),
         })
         .collect()
 }

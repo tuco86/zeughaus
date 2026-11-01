@@ -586,6 +586,7 @@ mod tests {
             inputs: Vec::new(),
             checkout: Checkout::Clean,
             upload: None,
+            state: Vec::new(),
         }
     }
 

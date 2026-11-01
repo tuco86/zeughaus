@@ -23,8 +23,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use zeughaus_job::{JobSpec, ProcessHost, RunExit, RunHandle, record_run_end};
 use zeughaus_link::enlist::{
-    Assignment, FromRunner, Input, InputSource, MAX_OUTPUT_CHUNK, Place, RunEnd, Upload,
-    parse_run_id, run_id,
+    Assignment, FromRunner, Input, InputSource, MAX_OUTPUT_CHUNK, MAX_STATES, Place, RunEnd,
+    StateOutcome, StateResult, StateSave, Upload, parse_run_id, run_id,
 };
 use zeughaus_link::manual::{MAX_MANUAL_DIRS, valid_dir_name};
 
@@ -118,6 +118,17 @@ fn validate(a: &Assignment) -> Result<(), String> {
     if let Some(upload) = &a.upload {
         validate_upload(a, upload)?;
     }
+    if a.state.len() > MAX_STATES {
+        return Err(format!("more than {MAX_STATES} states"));
+    }
+    for mount in &a.state {
+        if !valid_name(&mount.name) {
+            return Err(format!("{:?} is not a state name", mount.name));
+        }
+    }
+    if !a.state.is_empty() && matches!(a.place, Place::Machine { .. }) {
+        return Err("state is kept on a runner's host or in a container".to_owned());
+    }
     Ok(())
 }
 
@@ -159,6 +170,16 @@ fn siblings_var(place: &Place, workspace: &Path) -> String {
     }
 }
 
+/// What `CI_STATE` names: the directory that holds a directory per store, at
+/// the path the job sees it. The run directory is mounted at `/ci/run` in a
+/// container; `validate` refuses state on a machine.
+fn state_var(place: &Place, run_dir: &Path) -> String {
+    match place {
+        Place::Container { .. } => "/ci/run/state".to_owned(),
+        Place::Host | Place::Machine { .. } => run_dir.join("state").to_string_lossy().into_owned(),
+    }
+}
+
 /// The run id as one path component of `<state>/ci/`.
 pub(super) fn safe_run(run: &str) -> bool {
     !run.contains('/') && parse_run_id(run).is_some()
@@ -168,6 +189,13 @@ pub(super) fn safe_run(run: &str) -> bool {
 fn remove_inputs(inputs: &Path) {
     if let Err(e) = cleanup::remove_tree(inputs) {
         eprintln!("[enlist] cannot remove {}: {e}", inputs.display());
+    }
+}
+
+/// Removes a run's `state/`, saved or not.
+fn remove_state(state: &Path) {
+    if let Err(e) = cleanup::remove_tree(state) {
+        eprintln!("[enlist] cannot remove {}: {e}", state.display());
     }
 }
 
@@ -349,6 +377,7 @@ impl Executor {
         std::fs::create_dir_all(&inputs).map_err(|e| format!("cannot create inputs: {e}"))?;
         self.stage_inputs(&a.run, &inputs, &a.inputs)?;
         check_abort(ctl)?;
+        self.stage_state(ctl, run_dir)?;
 
         let place_dir = a.place.workspace();
         let workspace = work_dir(&self.state_dir, &a.repo, &place_dir);
@@ -395,6 +424,9 @@ impl Executor {
         // The other checkouts of a manual run, for a job that links to them.
         if a.upload.is_some() {
             env.push(("CI_SIBLINGS".to_owned(), siblings_var(&a.place, &workspace)));
+        }
+        if !a.state.is_empty() {
+            env.push(("CI_STATE".to_owned(), state_var(&a.place, run_dir)));
         }
 
         let write = |path: &Path, text: &str| write_atomic(path, text.as_bytes());
@@ -556,6 +588,69 @@ impl Executor {
             .ok_or_else(|| format!("runner {} offers no machine {name}", self.config.name))
     }
 
+    /// Puts each store the run keeps under `state/<name>`: the version the
+    /// CI named, or an empty directory for a store without one.
+    fn stage_state(self: &Arc<Self>, ctl: &RunCtl, run_dir: &Path) -> Result<(), Prep> {
+        let a = &ctl.assignment;
+        for mount in &a.state {
+            let dest = run_dir.join("state").join(&mount.name);
+            match mount.version {
+                None => std::fs::create_dir_all(&dest)
+                    .map_err(|e| format!("cannot create {}: {e}", dest.display()))?,
+                Some(v) => {
+                    let restored = self.restore_state(a, mount, v, &dest).map_err(|e| {
+                        Prep::Failed(format!("cannot restore state {} #{v}: {e}", mount.name))
+                    })?;
+                    eprintln!(
+                        "[enlist] {}: state {} #{v} restored ({} bytes, {} moved)",
+                        a.run, mount.name, restored.bytes, restored.moved
+                    );
+                }
+            }
+            check_abort(ctl)?;
+        }
+        Ok(())
+    }
+
+    /// Saves each store of the run as its pipeline's version, as the mount
+    /// says and the run ended, and says what became of each.
+    fn save_state(
+        self: &Arc<Self>,
+        a: &Assignment,
+        run_dir: &Path,
+        exit: RunExit,
+    ) -> Vec<StateResult> {
+        a.state
+            .iter()
+            .map(|mount| {
+                let dir = run_dir.join("state").join(&mount.name);
+                let not_saved = |why: &str| StateOutcome::NotSaved {
+                    why: why.to_owned(),
+                };
+                let outcome = if mount.save == StateSave::Never {
+                    not_saved("manual run")
+                } else if exit.killed {
+                    not_saved("killed")
+                } else if mount.save == StateSave::Success && exit.code != Some(0) {
+                    not_saved("the job failed")
+                } else if !dir.is_dir() {
+                    not_saved("no directory")
+                } else {
+                    match self.send_state(&a.run, &mount.name, &dir) {
+                        Ok(bytes) => StateOutcome::Saved { bytes },
+                        Err(message) => StateOutcome::Failed { message },
+                    }
+                };
+                eprintln!("[enlist] {}: state {}: {outcome:?}", a.run, mount.name);
+                StateResult {
+                    name: mount.name.clone(),
+                    from: mount.version,
+                    outcome,
+                }
+            })
+            .collect()
+    }
+
     /// Stages every input at once. Each is a transfer of its own, bound by a
     /// link or a disk and not by this thread, so they overlap. The first
     /// error, in the order of the inputs, is the run's.
@@ -656,11 +751,13 @@ impl Executor {
         let artifacts = exit.code == Some(0)
             && stage::has_entries(&source)
             && self.keep_artifacts(&a.run, &source);
+        let state = self.save_state(a, run_dir, exit);
         let end = RunEnd {
             code: exit.code,
             killed: exit.killed,
             timed_out,
             artifacts,
+            state,
         };
         if let Place::Machine { name } = &a.place
             && let Some(vm) = self.machines.get(name)
@@ -690,6 +787,7 @@ impl Executor {
         );
         self.housekeeping(a);
         remove_inputs(&run_dir.join("inputs"));
+        remove_state(&run_dir.join("state"));
     }
 
     /// Moves the artifacts of `run` out of its run directory to
@@ -720,14 +818,22 @@ impl Executor {
         }
     }
 
-    /// Removes the inputs of every run that has ended and still has them: a
-    /// process that stopped between a run's exit record and the removal left
-    /// them there. A run without an exit record is still going, and its end
-    /// removes them.
+    /// Removes the inputs and stores of every run that has ended and still
+    /// has them: a process that stopped between a run's exit record and the
+    /// removal left them there. A run without an exit record is still going,
+    /// and its end removes them; a recovered run without an end still saves
+    /// its stores, and its end removes them too.
     pub(super) fn sweep_inputs(&self) {
+        let saving: HashSet<PathBuf> = lock(&self.runs)
+            .values()
+            .filter_map(|ctl| ctl.running_in())
+            .collect();
         for run_dir in self.host.run_dirs() {
             if run_dir.join("exit").exists() {
                 remove_inputs(&run_dir.join("inputs"));
+                if !saving.contains(&run_dir) {
+                    remove_state(&run_dir.join("state"));
+                }
             }
         }
     }
@@ -1004,6 +1110,7 @@ mod tests {
             inputs: Vec::new(),
             checkout: Checkout::Clean,
             upload: None,
+            state: Vec::new(),
         }
     }
 
@@ -1123,6 +1230,51 @@ mod tests {
         assert_eq!(
             siblings_var(&container("trixie"), &workspace),
             "/work/.zci-siblings"
+        );
+    }
+
+    /// `CI_STATE` is the run's `state/` where the job sees the run directory.
+    #[test]
+    fn the_stores_are_a_directory_of_the_run() {
+        let run_dir = Path::new("runs").join("7");
+        assert_eq!(
+            Path::new(&state_var(&Place::Host, &run_dir)),
+            run_dir.join("state")
+        );
+        assert_eq!(state_var(&container("trixie"), &run_dir), "/ci/run/state");
+    }
+
+    #[test]
+    fn the_names_of_the_stores_are_checked_before_they_become_paths() {
+        use zeughaus_link::enlist::StateMount;
+        let mount = |name: &str| StateMount {
+            name: name.to_owned(),
+            version: Some(3),
+            save: StateSave::Success,
+        };
+        let with = |state: Vec<StateMount>| Assignment {
+            state,
+            ..assignment()
+        };
+        assert!(validate(&with(vec![mount("corpus"), mount("seen")])).is_ok());
+        assert_eq!(
+            validate(&with(vec![mount("../x")])),
+            Err("\"../x\" is not a state name".to_owned())
+        );
+        let nine = (0..9).map(|i| mount(&format!("s{i}"))).collect();
+        assert_eq!(validate(&with(nine)), Err("more than 8 states".to_owned()));
+        let on_machine = Assignment {
+            place: Place::Machine {
+                name: "win11".to_owned(),
+            },
+            interpreter: "powershell".to_owned(),
+            file: "build.ps1".to_owned(),
+            ..with(vec![mount("corpus")])
+        };
+        let refused = validate(&on_machine).unwrap_err();
+        assert!(
+            cfg!(windows) || refused == "state is kept on a runner's host or in a container",
+            "{refused}"
         );
     }
 

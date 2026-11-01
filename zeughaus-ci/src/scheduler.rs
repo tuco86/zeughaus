@@ -18,8 +18,8 @@ use chrono::{DateTime, Local, NaiveTime, TimeZone};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeughaus_link::enlist::{
-    Assignment, Checkout, FromRunner, Input, InputSource, Place, RunEnd, RunReport, ToRunner,
-    TransferEvent, Upload, parse_run_id, run_id,
+    Assignment, Checkout, FromRunner, Input, InputSource, Place, RunEnd, RunReport, StateMount,
+    StateOutcome, StateSave, ToRunner, TransferEvent, Upload, parse_run_id, run_id,
 };
 
 use crate::channels::{self, Channels};
@@ -1649,6 +1649,21 @@ impl Scheduler {
             env.push(("CI_PLATFORM".into(), platform.clone()));
         }
         env.extend(job.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let mut state = Vec::with_capacity(job.state.len());
+        for name in &job.state {
+            let version = crate::state::latest(&self.state_dir, &pipeline.repo, name)
+                .map_err(|e| format!("cannot read state {name}: {e}"))?;
+            state.push(StateMount {
+                name: name.clone(),
+                version,
+                // A manual run reads the stores and never saves.
+                save: if upload.is_some() {
+                    StateSave::Never
+                } else {
+                    job.state_save
+                },
+            });
+        }
 
         Ok(Assignment {
             run: run_id(&pipeline.repo, pipeline.number, &job.name),
@@ -1668,6 +1683,7 @@ impl Scheduler {
             inputs,
             checkout: checkout_of(pipeline, ji),
             upload,
+            state,
         })
     }
 
@@ -1914,7 +1930,12 @@ impl Scheduler {
         let timeout_minutes = record.def.timeout_minutes;
         let record_runner = record.runner.clone();
         let dir = transcript_dir(&self.state_dir, &repo, number, &job);
-        let succeeded = end.code == Some(0);
+        let state_failed = end
+            .state
+            .iter()
+            .any(|r| matches!(r.outcome, StateOutcome::Failed { .. }));
+        let succeeded = end.code == Some(0) && !state_failed;
+        let state_note = state_note(&end);
 
         let exit = format!(
             "code={}\n",
@@ -1924,7 +1945,7 @@ impl Scheduler {
         if let Err(e) = crate::files::write_atomic(&dir.join("exit"), exit.as_bytes()) {
             eprintln!("[ci] {repo} #{number} {job}: {e}");
         }
-        let (state, note, excerpt) = if succeeded {
+        let (state, mut note, excerpt) = if succeeded {
             (
                 State::Success,
                 format!("passed in {}m{}s", elapsed / 60, elapsed % 60),
@@ -1932,6 +1953,10 @@ impl Scheduler {
             )
         } else if self.running[pi].cancelled {
             (State::Error, CANCELLED.to_owned(), None)
+        } else if end.code == Some(0) {
+            // The job passed and a store could not be saved: the fragments
+            // say why.
+            (State::Failure, String::new(), excerpt::extract(&dir))
         } else {
             (
                 State::Failure,
@@ -1939,6 +1964,12 @@ impl Scheduler {
                 excerpt::extract(&dir),
             )
         };
+        if !state_note.is_empty() {
+            if !note.is_empty() {
+                note.push_str("; ");
+            }
+            note.push_str(&state_note);
+        }
 
         let cancelled = !succeeded && self.running[pi].cancelled;
         let record = &mut self.running[pi].jobs[ji];
@@ -1960,6 +1991,15 @@ impl Scheduler {
             && self.running[pi].jobs[ji].artifacts
         {
             self.prefetch_for_consumers(pi, ji, runner);
+        }
+        // The set of a run whose save failed is no input of anything now.
+        if let Some(runner) = &record_runner
+            && end.artifacts
+            && !succeeded
+            && end.code == Some(0)
+        {
+            self.runners
+                .send(runner, ToRunner::DropArtifacts { run: run.clone() });
         }
         let pipeline = self.running[pi].clone();
         let description = if succeeded || cancelled {
@@ -2239,6 +2279,30 @@ fn shareable_cause(job: &JobRecord) -> Option<String> {
         return None;
     }
     job.cause()
+}
+
+/// What became of the run's stores, one fragment each, joined by `; `.
+fn state_note(end: &RunEnd) -> String {
+    end.state
+        .iter()
+        .map(|r| {
+            let name = &r.name;
+            match &r.outcome {
+                StateOutcome::Saved { bytes } => {
+                    let from = match r.from {
+                        Some(v) => format!("started from #{v}"),
+                        None => "started empty".to_owned(),
+                    };
+                    format!("state {name} saved {:.1} MB ({from})", *bytes as f64 / 1e6)
+                }
+                StateOutcome::NotSaved { why } => format!("state {name} not saved ({why})"),
+                StateOutcome::Failed { message } => {
+                    format!("state {name} not saved: {message}")
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn failure_note(end: &RunEnd, timeout_minutes: u32) -> String {
@@ -2900,6 +2964,7 @@ mod tests {
             killed,
             timed_out,
             artifacts: false,
+            state: Vec::new(),
         };
         assert_eq!(
             failure_note(&end(Some(124), false, true), 30),
@@ -3068,6 +3133,7 @@ mod tests {
                     killed: false,
                     timed_out: false,
                     artifacts,
+                    state: Vec::new(),
                 },
             },
         }
@@ -3964,6 +4030,7 @@ mod tests {
                     killed: false,
                     timed_out: false,
                     artifacts: false,
+                    state: Vec::new(),
                 },
             }));
             s.finish_pipelines();
@@ -3983,6 +4050,115 @@ mod tests {
             );
             s.advance();
             assert_eq!(assigned(&mut x).run, "view.2.a");
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        fn keeping(mut job: JobRecord, save: StateSave) -> JobRecord {
+            job.def.state = vec!["corpus".to_owned()];
+            job.def.state_save = save;
+            job
+        }
+
+        #[test]
+        fn a_job_starts_from_the_newest_state_and_a_manual_run_never_saves() {
+            use JobStatus::{Pending, Succeeded};
+            use zeughaus_link::enlist::{SetEntry, SetManifest};
+            let state = scratch("state-mounts");
+            let mut s = scheduler(&state);
+            let mut x = connect(&s.runners, "x", 0);
+            let manifest = SetManifest {
+                entries: vec![SetEntry::Dir {
+                    path: "d".to_owned(),
+                }],
+            };
+            crate::state::record(&state, "view", "corpus", 3, &manifest).unwrap();
+            crate::state::record(&state, "view", "corpus", 4, &manifest).unwrap();
+            let job = || keeping(record("a", &[], "x", Pending), StateSave::Always);
+
+            s.running.push(numbered(5, vec![job()]));
+            s.assign(0, 0);
+            assert_eq!(
+                assigned(&mut x).state,
+                [StateMount {
+                    name: "corpus".to_owned(),
+                    version: Some(4),
+                    save: StateSave::Always,
+                }]
+            );
+            s.running[0].jobs[0].status = Succeeded;
+
+            let mut manual = numbered(6, vec![job()]);
+            manual.event = stored_manual(&state, "view", &["a"], "abc");
+            s.running.push(manual);
+            s.assign(1, 0);
+            assert_eq!(
+                assigned(&mut x).state,
+                [StateMount {
+                    name: "corpus".to_owned(),
+                    version: Some(4),
+                    save: StateSave::Never,
+                }]
+            );
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_failed_save_fails_a_job_that_passed() {
+            use zeughaus_link::enlist::StateResult;
+            let state = scratch("state-saved");
+            let mut s = scheduler(&state);
+            let _x = connect(&s.runners, "x", 0);
+            let end = |outcome| RunEnd {
+                code: Some(0),
+                killed: false,
+                timed_out: false,
+                artifacts: false,
+                state: vec![StateResult {
+                    name: "corpus".to_owned(),
+                    from: Some(2),
+                    outcome,
+                }],
+            };
+            let running = || {
+                keeping(
+                    record("a", &[], "x", JobStatus::Running),
+                    StateSave::Success,
+                )
+            };
+            s.running.push(numbered(3, vec![running()]));
+            s.running.push(numbered(4, vec![running()]));
+            for (run, outcome) in [
+                (
+                    "view.3.a",
+                    StateOutcome::Failed {
+                        message: "the CI is gone".to_owned(),
+                    },
+                ),
+                ("view.4.a", StateOutcome::Saved { bytes: 2_500_000 }),
+            ] {
+                s.runners.assign(run, "x");
+                s.handle(Msg::FromRunner {
+                    name: "x".to_owned(),
+                    message: FromRunner::Finished {
+                        run: run.to_owned(),
+                        end: end(outcome),
+                    },
+                });
+            }
+            let failed = &s.running[0].jobs[0];
+            assert_eq!(
+                (failed.status, failed.note.as_str()),
+                (JobStatus::Failed, "state corpus not saved: the CI is gone")
+            );
+            let saved = &s.running[1].jobs[0];
+            assert_eq!(saved.status, JobStatus::Succeeded);
+            assert!(
+                saved
+                    .note
+                    .ends_with("; state corpus saved 2.5 MB (started from #2)"),
+                "{}",
+                saved.note
+            );
             let _ = std::fs::remove_dir_all(&state);
         }
 
@@ -4512,6 +4688,7 @@ mod tests {
                         killed: false,
                         timed_out: false,
                         artifacts: true,
+                        state: Vec::new(),
                     },
                 },
             });
@@ -4638,6 +4815,7 @@ mod tests {
                         killed: true,
                         timed_out: false,
                         artifacts: false,
+                        state: Vec::new(),
                     },
                 },
             });
