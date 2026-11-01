@@ -57,6 +57,10 @@ pub struct ArtifactService {
     next_transfer: AtomicU64,
     store: Arc<Store>,
     sets: PathBuf,
+    /// The job state store (`crate::state`): kept versions only, no expiry
+    /// and no budget.
+    state_store: Arc<Store>,
+    state_sets: PathBuf,
     /// Bytes of compressed blobs the store may hold (`artifact_store_gb`).
     budget: u64,
     /// The fill in flight for a run, so concurrent consumers ask its
@@ -97,8 +101,13 @@ impl ArtifactService {
         let blobs = state_dir.join("ci/blobs");
         let store = Store::open(&blobs, true)
             .map_err(|e| format!("cannot open {}: {e}", blobs.display()))?;
+        let state_blobs = crate::state::blobs_dir(&state_dir);
+        let state_store = Store::open(&state_blobs, true)
+            .map_err(|e| format!("cannot open {}: {e}", state_blobs.display()))?;
         Ok(ArtifactService {
             budget: config.artifact_store_gb << 30,
+            state_store: Arc::new(state_store),
+            state_sets: crate::state::sets_dir(&state_dir),
             sets: state_dir.join("ci/sets"),
             state_dir,
             config,
@@ -122,6 +131,22 @@ impl ArtifactService {
         if swept.sets > 0 || swept.blobs > 0 {
             eprintln!(
                 "[ci] artifact store: removed {} sets, {} blobs, {} MB",
+                swept.sets,
+                swept.blobs,
+                swept.bytes >> 20
+            );
+        }
+        // Versions go only by count (`state::record`) and by hand, so this
+        // takes the blobs no kept version names and stale temp files.
+        let state = Retention {
+            keep: Duration::MAX,
+            budget: u64::MAX,
+            grace,
+        };
+        let swept = zeughaus_blobs::sweep(&self.state_store, &self.state_sets, &state);
+        if swept.sets > 0 || swept.blobs > 0 {
+            eprintln!(
+                "[ci] state store: removed {} sets, {} blobs, {} MB",
                 swept.sets,
                 swept.blobs,
                 swept.bytes >> 20

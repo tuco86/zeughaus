@@ -798,6 +798,27 @@ pub struct JobDefView {
     pub manual: bool,
 }
 
+/// One job state store of a repository with its versions, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateView {
+    pub name: String,
+    #[serde(default)]
+    pub versions: Vec<StateVersionView>,
+}
+
+/// One version of a [`StateView`]: the pipeline that saved it, when (UNIX
+/// seconds), and the sum and count of its files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateVersionView {
+    pub number: u64,
+    #[serde(default)]
+    pub saved: u64,
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub files: u64,
+}
+
 impl CiRequest {
     pub fn encode(&self) -> Vec<u8> {
         serde_json::to_vec(self).unwrap_or_else(|_| b"{}".to_vec())

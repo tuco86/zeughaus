@@ -23,6 +23,7 @@ mod scheduler;
 mod secrets;
 mod serve;
 mod service;
+mod state;
 mod streak;
 mod transcripts;
 mod transport;
