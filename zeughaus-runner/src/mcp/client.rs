@@ -418,7 +418,7 @@ async fn download(
         DOWNLOADS.fetch_add(1, Ordering::Relaxed)
     ));
     let got = receive(&mut body, &manifest, &dir, dest).await;
-    let _ = tokio::fs::remove_dir_all(&dir).await;
+    let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir)).await;
     got
 }
 
