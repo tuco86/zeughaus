@@ -1145,7 +1145,7 @@ mod tests {
         /// an error with the reason from every call.
         #[tokio::test]
         async fn a_session_without_a_ci_lists_the_tools_and_explains_every_call() {
-            let link = Link::resolve(None, Path::new("/nonexistent/zeughaus-state"));
+            let link = Link::resolve_given(None, Path::new("/nonexistent/zeughaus-state"));
             let client = Arc::new(Client::new(link));
             let toolbox = Arc::new(Toolbox::new(client));
             let script = concat!(

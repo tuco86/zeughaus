@@ -79,11 +79,17 @@ impl Link {
     /// the `ci` of its `enlist.toml`; the identity is the state directory's
     /// `client.pem`.
     pub fn resolve(ci: Option<String>, state_dir: &Path) -> Result<Link, String> {
-        let config = state_dir.join("zeughaus.toml");
         let from_env = std::env::var("ZEUGHAUS_CI")
             .ok()
             .filter(|url| !url.is_empty());
-        let url = match ci.or(from_env) {
+        Link::resolve_given(ci.or(from_env), state_dir)
+    }
+
+    /// [`Link::resolve`] without the environment: a CI job's own
+    /// `ZEUGHAUS_CI` must not reach a test.
+    pub(crate) fn resolve_given(ci: Option<String>, state_dir: &Path) -> Result<Link, String> {
+        let config = state_dir.join("zeughaus.toml");
+        let url = match ci {
             Some(url) => url,
             None => match first_ci(&config)? {
                 Some(url) => url,
@@ -605,7 +611,7 @@ mod tests {
         #[test]
         fn no_ci_is_named_with_the_file_to_add_it_to() {
             let dir = state("none");
-            let err = Link::resolve(None, &dir).err().expect("no CI");
+            let err = Link::resolve_given(None, &dir).err().expect("no CI");
             assert_eq!(
                 err,
                 format!(
@@ -616,7 +622,7 @@ mod tests {
             // An empty list is the same as no file.
             std::fs::write(dir.join("zeughaus.toml"), "remotes = []\nci = []\n").unwrap();
             assert!(
-                Link::resolve(None, &dir)
+                Link::resolve_given(None, &dir)
                     .err()
                     .expect("empty")
                     .starts_with("no CI configured")
@@ -627,7 +633,7 @@ mod tests {
         #[test]
         fn a_missing_client_key_is_named_with_its_path() {
             let dir = state("nokey");
-            let err = Link::resolve(Some(CI.to_owned()), &dir)
+            let err = Link::resolve_given(Some(CI.to_owned()), &dir)
                 .err()
                 .expect("no identity");
             assert_eq!(
@@ -646,10 +652,13 @@ mod tests {
             format!("remotes = [\"weida://elsewhere/\"]\ntheme = \"x\"\nci = [\"{CI}\", \"weida://other/\"]\n"),
         )
         .unwrap();
-            assert_eq!(Link::resolve(None, &dir).expect("from file").url(), CI);
+            assert_eq!(
+                Link::resolve_given(None, &dir).expect("from file").url(),
+                CI
+            );
             let other = CI.replace("10.8.0.1", "10.8.0.2");
             assert_eq!(
-                Link::resolve(Some(other.clone()), &dir)
+                Link::resolve_given(Some(other.clone()), &dir)
                     .expect("flag")
                     .url(),
                 other
@@ -661,16 +670,16 @@ mod tests {
         fn a_ci_that_is_not_pinned_or_not_a_url_is_refused() {
             let dir = state("pin");
             credentials::client_identity(&dir).expect("client key");
-            let err = Link::resolve(Some("weida://10.8.0.1:7444/".to_owned()), &dir)
+            let err = Link::resolve_given(Some("weida://10.8.0.1:7444/".to_owned()), &dir)
                 .err()
                 .expect("unpinned");
             assert!(err.contains("names no fingerprint"), "{err}");
-            let err = Link::resolve(Some("not a url".to_owned()), &dir)
+            let err = Link::resolve_given(Some("not a url".to_owned()), &dir)
                 .err()
                 .expect("garbage");
             assert!(err.contains("is not valid"), "{err}");
             std::fs::write(dir.join("zeughaus.toml"), "ci = 3\n").unwrap();
-            let err = Link::resolve(None, &dir).err().expect("bad toml");
+            let err = Link::resolve_given(None, &dir).err().expect("bad toml");
             assert!(err.contains("zeughaus.toml"), "{err}");
             let _ = std::fs::remove_dir_all(&dir);
         }
