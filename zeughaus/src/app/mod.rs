@@ -2127,6 +2127,9 @@ impl App {
                                     .contains(&CollapseKey::Group(key.clone(), group.id)),
                                 tabs: group.tabs.iter().map(tab).collect(),
                                 editor,
+                                host: None,
+                                badges: Vec::new(),
+                                closable: false,
                             })
                         }
                     })
@@ -2134,6 +2137,7 @@ impl App {
                 iced_tabs::Section {
                     id: key.clone(),
                     label: Cow::Borrowed(section.label.as_str()),
+                    header: true,
                     collapsed: self
                         .workspace
                         .collapsed
@@ -2171,6 +2175,9 @@ impl App {
             on_dissolve_group: Box::new(|key, group| {
                 Message::Workspace(W::DissolveGroup(key, group))
             }),
+            // No group of the runner sections has badges or a close button.
+            on_group_badge: Box::new(|key, group, _| Message::Workspace(W::PressGroup(key, group))),
+            on_close_group: Box::new(|key, group| Message::Workspace(W::DissolveGroup(key, group))),
         };
         let renaming = self.workspace.renaming_tab.as_ref().map(|(tab, draft)| {
             let field: Element<'_, Message, Theme> = iced::widget::text_input("Tab name", draft)

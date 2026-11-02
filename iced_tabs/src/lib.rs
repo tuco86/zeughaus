@@ -72,6 +72,8 @@ pub struct Tab<'a, Id> {
     pub accent: Option<Color>,
     /// A glyph in the tree's glyph font, in its colour, before the label.
     pub badge: Option<(char, Color)>,
+    /// See [`Tab::host`].
+    pub host: Option<(char, Cow<'a, str>)>,
     pub closable: bool,
 }
 
@@ -82,6 +84,7 @@ impl<'a, Id> Tab<'a, Id> {
             label: label.into(),
             accent: None,
             badge: None,
+            host: None,
             closable: true,
         }
     }
@@ -96,6 +99,13 @@ impl<'a, Id> Tab<'a, Id> {
     /// label: a status of what it shows.
     pub fn badge(mut self, glyph: char, color: Color) -> Self {
         self.badge = Some((glyph, color));
+        self
+    }
+
+    /// The machine the tab runs on: a glyph in the tab's muted text colour
+    /// after the accent dot, and what its tooltip says.
+    pub fn host(mut self, glyph: char, tooltip: impl Into<Cow<'a, str>>) -> Self {
+        self.host = Some((glyph, tooltip.into()));
         self
     }
 
@@ -118,6 +128,34 @@ pub struct Group<'a, Id, G, Message, Theme> {
     /// Replaces the label while the app renames the group (a `text_input`
     /// it owns).
     pub editor: Option<Element<'a, Message, Theme>>,
+    /// The machine the group's tabs run on: a glyph before the label and
+    /// what its tooltip says.
+    pub host: Option<(char, Cow<'a, str>)>,
+    /// Glyphs after the label, each a button.
+    pub badges: Vec<Badge<'a>>,
+    /// A locked group with a close button ([`Handlers::on_close_group`])
+    /// instead of its lock glyph.
+    pub closable: bool,
+}
+
+/// A glyph button in a group header: a status of what the group is about.
+#[derive(Debug, Clone)]
+pub struct Badge<'a> {
+    pub glyph: char,
+    pub color: Color,
+    pub tooltip: Cow<'a, str>,
+}
+
+/// What [`Builder::group_header`] draws, besides the group's ids.
+struct GroupHeader<'a, Message, Theme> {
+    label: Cow<'a, str>,
+    color: Color,
+    locked: bool,
+    collapsed: bool,
+    editor: Option<Element<'a, Message, Theme>>,
+    host: Option<(char, Cow<'a, str>)>,
+    badges: Vec<Badge<'a>>,
+    closable: bool,
 }
 
 /// One entry of a section: a loose tab or a group of tabs.
@@ -166,6 +204,10 @@ impl<'a> Control<'a> {
 pub struct Section<'a, Id, G, S, Message, Theme> {
     pub id: S,
     pub label: Cow<'a, str>,
+    /// Whether the section draws its header row (chevron, label and
+    /// controls). Without one its items sit in the bar as they are and it
+    /// cannot be collapsed; its drop zones stay.
+    pub header: bool,
     /// A collapsed section shows only its header.
     pub collapsed: bool,
     /// Buttons in the header.
@@ -218,6 +260,10 @@ pub struct Handlers<'a, Id, G, S, Message> {
     pub on_cycle_color: Box<dyn Fn(S, G) -> Message + 'a>,
     /// The close button of an unlocked group.
     pub on_dissolve_group: Box<dyn Fn(S, G) -> Message + 'a>,
+    /// A badge of a group header, by its index in [`Group::badges`].
+    pub on_group_badge: Box<dyn Fn(S, G, usize) -> Message + 'a>,
+    /// The close button of a [`Group::closable`] locked group.
+    pub on_close_group: Box<dyn Fn(S, G) -> Message + 'a>,
 }
 
 /// The state of a tab when it is styled.
@@ -936,17 +982,20 @@ where
         let Section {
             id,
             label,
+            header,
             collapsed,
             controls,
             items,
         } = section;
-        let header = self.section_header(&id, label, collapsed, controls);
-        if collapsed {
-            return header;
-        }
-
+        // A section without a header cannot be collapsed: nothing would be
+        // left to expand it with.
+        let header = header.then(|| self.section_header(&id, label, collapsed, controls));
         let mut children = Vec::with_capacity(2 * items.len() + 2);
-        children.push(header);
+        match header {
+            Some(header) if collapsed => return header,
+            Some(header) => children.push(header),
+            None => {}
+        }
         for (index, item) in items.into_iter().enumerate() {
             let before = Target::Before {
                 section: id.clone(),
@@ -1067,14 +1116,7 @@ where
         let Some(tip) = tip else {
             return button.into();
         };
-        let position = match self.placement {
-            Placement::Top => tooltip::Position::Bottom,
-            Placement::Left => tooltip::Position::Right,
-        };
-        let bubble = container(text(tip).size(12))
-            .padding([3, 6])
-            .style(|theme: &Theme| container_style(Catalog::tooltip(theme)));
-        tooltip(button, bubble, position).gap(4).into()
+        self.with_tip(button, tip)
     }
 
     /// Header and, unless collapsed, the tabs and the end zone, all on the
@@ -1092,11 +1134,27 @@ where
             collapsed,
             tabs,
             editor,
+            host,
+            badges,
+            closable,
         } = group;
         let placement = self.placement;
 
         let mut children = Vec::with_capacity(2 * tabs.len() + 2);
-        children.push(self.group_header(section, &id, label, color, locked, collapsed, editor));
+        children.push(self.group_header(
+            section,
+            &id,
+            GroupHeader {
+                label,
+                color,
+                locked,
+                collapsed,
+                editor,
+                host,
+                badges,
+                closable,
+            },
+        ));
         if !collapsed {
             for (index, tab) in tabs.into_iter().enumerate() {
                 children.push(self.slot(marks_slot(
@@ -1144,19 +1202,25 @@ where
         }
     }
 
-    /// Chevron, colour dot, name (or the app's editor), `locked` and the
-    /// dissolve button. The whole header is a press and hover target.
-    #[allow(clippy::too_many_arguments)]
+    /// Chevron, colour dot, host glyph, name (or the app's editor), the
+    /// badges, and `locked`, the close button of a closable locked group or
+    /// the dissolve button. The whole header is a press and hover target.
     fn group_header(
         &self,
         section: &S,
         id: &G,
-        label: Cow<'a, str>,
-        color: Color,
-        locked: bool,
-        collapsed: bool,
-        editor: Option<Element<'a, Message, Theme>>,
+        header: GroupHeader<'a, Message, Theme>,
     ) -> Element<'a, Message, Theme> {
+        let GroupHeader {
+            label,
+            color,
+            locked,
+            collapsed,
+            editor,
+            host,
+            badges,
+            closable,
+        } = header;
         let handlers = self.handlers;
         let placement = self.placement;
         let marked = marks_group(self.marker.as_ref(), section, id);
@@ -1187,6 +1251,9 @@ where
                 .on_press((handlers.on_cycle_color)(section.clone(), id.clone())),
             );
         }
+        if let Some(host) = host {
+            content = content.push(self.host(host, text_color));
+        }
         content = content.push(match editor {
             Some(editor) => container(editor).width(self.fill_left()).into(),
             None => Element::from(
@@ -1203,7 +1270,30 @@ where
                 .on_double_click((handlers.on_rename_group)(section.clone(), id.clone())),
             ),
         });
-        if locked {
+        let mut badges_row = Row::new().spacing(2).align_y(Alignment::Center);
+        for (index, badge) in badges.into_iter().enumerate() {
+            let Badge {
+                glyph,
+                color: badge_color,
+                tooltip: tip,
+            } = badge;
+            let button = flat_button(self.glyph(glyph, 12.0), move |_: &Theme| badge_color)
+                .padding([1, 2])
+                .on_press((handlers.on_group_badge)(
+                    section.clone(),
+                    id.clone(),
+                    index,
+                ));
+            badges_row = badges_row.push(self.with_tip(button, tip));
+        }
+        content = content.push(badges_row);
+        if locked && closable {
+            content = content.push(
+                flat_button(self.glyph(self.glyphs.close, 14.0), text_color)
+                    .padding([1, 4])
+                    .on_press((handlers.on_close_group)(section.clone(), id.clone())),
+            );
+        } else if locked {
             if let Some(lock) = self.glyphs.locked {
                 content = content.push(container(self.glyph(lock, 12.0)).style(
                     move |theme: &Theme| container::Style {
@@ -1256,6 +1346,22 @@ where
                     ..container::Style::default()
                 },
             ));
+        }
+        if let Some(host) = tab.host {
+            let host_class: <Theme as Catalog>::Class<'a> = <Theme as Catalog>::default();
+            content = content.push(self.host(host, move |theme: &Theme| {
+                Catalog::style(
+                    theme,
+                    &host_class,
+                    Status {
+                        selected,
+                        hovered: false,
+                        pressed: false,
+                        placement,
+                    },
+                )
+                .text
+            }));
         }
         if let Some((glyph, color)) = tab.badge {
             // The text inherits the container's colour, which needs no text
@@ -1397,6 +1503,41 @@ where
         )
         .on_enter((self.handlers.on_hover)(target))
         .into()
+    }
+
+    /// `content` with `tip` beside it on hover, in the tree's tooltip box:
+    /// below the bar on top, to the right of it at the left.
+    fn with_tip(
+        &self,
+        content: impl Into<Element<'a, Message, Theme>>,
+        tip: Cow<'a, str>,
+    ) -> Element<'a, Message, Theme> {
+        let position = match self.placement {
+            Placement::Top => tooltip::Position::Bottom,
+            Placement::Left => tooltip::Position::Right,
+        };
+        let bubble = container(text(tip).size(12))
+            .padding([3, 6])
+            .style(|theme: &Theme| container_style(Catalog::tooltip(theme)));
+        tooltip(content, bubble, position).gap(4).into()
+    }
+
+    /// A host glyph: which machine something runs on, dimmed to `color`'s
+    /// muted form, named by its tooltip.
+    fn host(
+        &self,
+        (glyph, tip): (char, Cow<'a, str>),
+        color: impl Fn(&Theme) -> Color + 'a,
+    ) -> Element<'a, Message, Theme> {
+        let glyph =
+            container(self.glyph(glyph, 12.0)).style(move |theme: &Theme| container::Style {
+                text_color: Some(Color {
+                    a: 0.6,
+                    ..color(theme)
+                }),
+                ..container::Style::default()
+            });
+        self.with_tip(glyph, tip)
     }
 
     /// The frame of a section or group header: as tall as the bar on top,
