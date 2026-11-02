@@ -1,8 +1,8 @@
 //! Disk housekeeping after a run: the workspace budget, container images
-//! nothing uses any more, and the removal of trees a container job may have
-//! left files in.
+//! superseded or unused for two weeks, and the removal of trees a container
+//! job may have left files in.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
@@ -115,13 +115,61 @@ pub fn remove_tree(ws: &Path) -> Result<(), String> {
     }
 }
 
-/// Removes this repository's CI image tags other than `used`, then the
-/// layers nothing references any more. A missing container engine means
-/// there is nothing to prune.
-pub fn prune_images(repo: &str, used: &HashSet<String>) {
+/// The name prefix of every image the CI's container jobs build
+/// (`localhost/zci-<repo>-<image>:<digest>`, set in zeughaus-ci's scheduler).
+const IMAGE_PREFIX: &str = "localhost/zci-";
+
+/// How long an image whose name no live run uses is kept after its last use.
+const IMAGE_IDLE_SECS: u64 = 14 * 24 * 60 * 60;
+
+/// The image name of a tag: everything before its last `:`.
+fn image_name(tag: &str) -> &str {
+    tag.rsplit_once(':').map_or(tag, |(name, _)| name)
+}
+
+/// Which of the CI images in `listed` (the engine's image list, one
+/// `name:tag` per line) to remove, given the tags of the live runs in
+/// `used`: a tag superseded by a used tag of the same name, and a tag
+/// whose name no run uses and that was last used `IMAGE_IDLE_SECS` or
+/// more before `now`. Updates `last_used` (tag -> unix seconds): used
+/// tags are stamped `now`, a listed tag it has no entry for gets `now`,
+/// and entries of tags that are no longer listed are dropped.
+fn stale_images(
+    listed: &str,
+    used: &HashSet<String>,
+    last_used: &mut BTreeMap<String, u64>,
+    now: u64,
+) -> Vec<String> {
+    let ours: Vec<&str> = listed
+        .lines()
+        .map(str::trim)
+        .filter(|tag| tag.starts_with(IMAGE_PREFIX))
+        .collect();
+    for tag in used {
+        last_used.insert(tag.clone(), now);
+    }
+    last_used.retain(|tag, _| used.contains(tag) || ours.contains(&tag.as_str()));
+    let used_names: HashSet<&str> = used.iter().map(|tag| image_name(tag)).collect();
+    ours.into_iter()
+        .filter(|tag| !used.contains(*tag))
+        .filter(|tag| {
+            if used_names.contains(image_name(tag)) {
+                return true;
+            }
+            let seen = *last_used.entry((*tag).to_owned()).or_insert(now);
+            now.saturating_sub(seen) >= IMAGE_IDLE_SECS
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Removes the CI image tags `stale_images` picks against `used` (the tags
+/// of every live run of this runner), keeping each tag's last use in
+/// `record`, then the layers nothing references any more. A missing
+/// container engine means there is nothing to prune.
+pub fn prune_images(used: &HashSet<String>, record: &Path) {
     let engine = Engine::host();
     let program = engine.program();
-    let prefix = format!("localhost/zci-{repo}-");
     let list: &[&str] = match engine {
         Engine::Podman => &["images", "--format", "{{.Repository}}:{{.Tag}}"],
         Engine::Apple => &["image", "list", "--quiet"],
@@ -136,11 +184,14 @@ pub fn prune_images(repo: &str, used: &HashSet<String>) {
     if !output.status.success() {
         return;
     }
-    let stale: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|tag| tag.starts_with(&prefix) && !used.contains(*tag))
-        .map(str::to_owned)
-        .collect();
+    // A missing or unreadable record is an empty one.
+    let mut last_used: BTreeMap<String, u64> = crate::files::read_json(record).unwrap_or_default();
+    let stale = stale_images(
+        &String::from_utf8_lossy(&output.stdout),
+        used,
+        &mut last_used,
+        super::now_secs(),
+    );
     for tag in &stale {
         let remove: Vec<&str> = match engine {
             Engine::Podman => vec!["rmi", tag],
@@ -154,6 +205,9 @@ pub fn prune_images(repo: &str, used: &HashSet<String>) {
         if removed.is_ok_and(|s| s.success()) {
             eprintln!("[enlist] removed image {tag}");
         }
+    }
+    if let Err(e) = crate::files::write_json(record, &last_used) {
+        eprintln!("[enlist] images: {e}");
     }
     let prune: &[&str] = match engine {
         Engine::Podman => &["image", "prune", "-f"],
@@ -169,6 +223,68 @@ pub fn prune_images(repo: &str, used: &HashSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const NOW: u64 = 1_000_000_000;
+
+    fn tags(list: &[&str]) -> HashSet<String> {
+        list.iter().map(|t| (*t).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_tag_is_removed_once_a_newer_tag_of_its_image_is_used() {
+        let listed = "localhost/zci-weida-trixie:old\nlocalhost/zci-weida-trixie:new\n";
+        let used = tags(&["localhost/zci-weida-trixie:new"]);
+        let mut record = BTreeMap::new();
+        assert_eq!(
+            stale_images(listed, &used, &mut record, NOW),
+            ["localhost/zci-weida-trixie:old"]
+        );
+    }
+
+    #[test]
+    fn an_image_of_another_containerfile_is_kept_while_recently_used() {
+        let listed = "localhost/zci-weida-trixie:new\n\
+                      localhost/zci-weida-python:x\n\
+                      localhost/zci-griasdi-ubuntu24:a\n";
+        let used = tags(&["localhost/zci-weida-trixie:new"]);
+        let mut record = BTreeMap::new();
+        assert!(stale_images(listed, &used, &mut record, NOW).is_empty());
+        let expected: BTreeMap<String, u64> = [
+            "localhost/zci-weida-trixie:new",
+            "localhost/zci-weida-python:x",
+            "localhost/zci-griasdi-ubuntu24:a",
+        ]
+        .into_iter()
+        .map(|t| (t.to_owned(), NOW))
+        .collect();
+        assert_eq!(record, expected);
+    }
+
+    #[test]
+    fn an_image_unused_for_the_idle_time_is_removed() {
+        let listed = "localhost/zci-weida-python:x\n";
+        let used = HashSet::new();
+        let tag = "localhost/zci-weida-python:x".to_owned();
+
+        let mut record = BTreeMap::from([(tag.clone(), NOW - IMAGE_IDLE_SECS)]);
+        assert_eq!(
+            stale_images(listed, &used, &mut record, NOW),
+            [tag.as_str()]
+        );
+
+        let recent = NOW - IMAGE_IDLE_SECS + 1;
+        let mut record = BTreeMap::from([(tag.clone(), recent)]);
+        assert!(stale_images(listed, &used, &mut record, NOW).is_empty());
+        assert_eq!(record.get(&tag), Some(&recent));
+    }
+
+    #[test]
+    fn the_record_forgets_images_that_are_gone() {
+        let listed = "docker.io/library/debian:trixie\n<none>:<none>\n";
+        let mut record = BTreeMap::from([("localhost/zci-weida-js:gone".to_owned(), NOW - 10)]);
+        assert!(stale_images(listed, &HashSet::new(), &mut record, NOW).is_empty());
+        assert!(record.is_empty());
+    }
 
     /// Tests that touch the filesystem, network, processes or real time: the
     /// integration tier (`.config/nextest.toml`).

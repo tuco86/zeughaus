@@ -841,7 +841,7 @@ impl Executor {
     }
 
     /// Disk housekeeping after a run: workspaces over budget and container
-    /// images nothing uses any more.
+    /// images superseded or unused for two weeks.
     fn housekeeping(&self, finished: &Assignment) {
         let live: Vec<Arc<RunCtl>> = lock(&self.runs).values().cloned().collect();
         let active: Vec<&Arc<RunCtl>> = live
@@ -862,7 +862,6 @@ impl Executor {
         if self.containers && matches!(finished.place, Place::Container { .. }) {
             let used: HashSet<String> = live
                 .iter()
-                .filter(|ctl| ctl.assignment.repo == finished.repo)
                 .filter_map(|ctl| match &ctl.assignment.place {
                     Place::Container { tag, .. } => Some(tag.clone()),
                     _ => None,
@@ -872,7 +871,8 @@ impl Executor {
                     _ => None,
                 })
                 .collect();
-            cleanup::prune_images(&finished.repo, &used);
+            let _held = lock(&self.images_lock);
+            cleanup::prune_images(&used, &super::ci_dir(&self.state_dir).join("images.json"));
         }
     }
 

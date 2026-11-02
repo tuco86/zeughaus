@@ -199,6 +199,8 @@ pub struct Executor {
     agents: Option<Arc<dyn SessionHost>>,
     /// Serializes the changes of `<state-dir>/sessions.json`.
     sessions_lock: Mutex<()>,
+    /// Serializes image housekeeping and `<state-dir>/ci/images.json`.
+    images_lock: Mutex<()>,
 }
 
 /// Starts enlisting: the executor's threads and the connection task. Called
@@ -265,6 +267,7 @@ pub fn start(
         blobs,
         agents,
         sessions_lock: Mutex::new(()),
+        images_lock: Mutex::new(()),
     });
     // An earlier process fetched sets early for jobs it knew of; a job
     // assigned now fetches its inputs itself.
