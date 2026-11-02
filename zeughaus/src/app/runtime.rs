@@ -20,6 +20,8 @@ use zeughaus_core::{NodeId, Value};
 
 use super::App;
 #[cfg(not(target_arch = "wasm32"))]
+use super::ci::DirectoryRunner;
+#[cfg(not(target_arch = "wasm32"))]
 use super::node_view::{DISPLAY_SIZE, is_display};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::feed::{self, FeedKey, FeedSpec, FrameOrder};
@@ -523,7 +525,7 @@ impl App {
     /// Stopping is by removal: every task handle aborts on drop.
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn reconcile_runtime(&mut self) -> Task<Message> {
-        let announced = announced_peers(&self.runner_urls, &self.ci_urls);
+        let announced = announced_peers(&self.runner_urls, &self.ci_urls, &self.directory);
         let mut tasks = Vec::new();
         // A runner that left takes its values, its terminals and its section
         // with it; its graphs show as not running.
@@ -882,8 +884,16 @@ struct Announced {
 /// be told apart from another peer and is skipped; two URLs with one
 /// fingerprint are one peer, the first. A CI whose fingerprint is also a
 /// runner's is kept as the runner: one fingerprint is one section key.
+///
+/// Then the runners the CIs announce that no URL names, dialled by name
+/// through [`crate::directory`]. A runner the directory knows is labelled by
+/// its name wherever it was found.
 #[cfg(not(target_arch = "wasm32"))]
-fn announced_peers(runner_urls: &[String], ci_urls: &[String]) -> Vec<Announced> {
+fn announced_peers(
+    runner_urls: &[String],
+    ci_urls: &[String],
+    directory: &[DirectoryRunner],
+) -> Vec<Announced> {
     let mut out: Vec<(Announced, weida::EndpointAddr)> = Vec::new();
     for (urls, kind) in [(runner_urls, LinkKind::Runner), (ci_urls, LinkKind::Ci)] {
         for url in urls {
@@ -910,12 +920,22 @@ fn announced_peers(runner_urls: &[String], ci_urls: &[String]) -> Vec<Announced>
             ));
         }
     }
+    let named = |key: &RunnerKey| {
+        directory
+            .iter()
+            .find(|runner| runner.fingerprint == key.as_str())
+    };
     // The host names a peer; two peers of one kind on one host are told
     // apart by their port, and without one by the first eight hex digits of
     // the key. A CI's section says `CI` already.
     let labels: Vec<String> = out
         .iter()
         .map(|(announced, addr)| {
+            if announced.kind == LinkKind::Runner
+                && let Some(runner) = named(&announced.key)
+            {
+                return runner.name.clone();
+            }
             let shared = out
                 .iter()
                 .filter(|(other_announced, other)| {
@@ -933,8 +953,90 @@ fn announced_peers(runner_urls: &[String], ci_urls: &[String]) -> Vec<Announced>
             }
         })
         .collect();
-    out.into_iter()
+    let mut peers: Vec<Announced> = out
+        .into_iter()
         .zip(labels)
         .map(|((announced, _), label)| Announced { label, ..announced })
-        .collect()
+        .collect();
+    for runner in directory {
+        let Some(first) = runner.addresses.first() else {
+            continue;
+        };
+        if peers.iter().any(|p| p.key.as_str() == runner.fingerprint) {
+            continue;
+        }
+        peers.push(Announced {
+            key: RunnerKey::new(&runner.fingerprint),
+            endpoint: Endpoint(format!(
+                "weida://{}@{}.{}:{}/",
+                runner.fingerprint,
+                runner.name,
+                crate::directory::RUNNER_DOMAIN,
+                first.port()
+            )),
+            label: runner.name.clone(),
+            kind: LinkKind::Runner,
+        });
+    }
+    peers
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    const FP_A: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
+    const FP_B: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000002";
+
+    fn runner(name: &str, fingerprint: &str, addresses: &[&str]) -> DirectoryRunner {
+        DirectoryRunner {
+            name: name.to_owned(),
+            fingerprint: fingerprint.to_owned(),
+            addresses: addresses.iter().map(|a| a.parse().unwrap()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_runner_named_by_url_and_directory_is_one_peer_labelled_by_name() {
+        let url = format!("weida://{FP_A}@10.8.0.7:7443/");
+        let peers = announced_peers(
+            std::slice::from_ref(&url),
+            &[],
+            &[runner("atik", FP_A, &["10.8.0.7:7443"])],
+        );
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].label, "atik");
+        assert_eq!(peers[0].endpoint, Endpoint(url));
+    }
+
+    #[test]
+    fn a_runner_only_the_directory_knows_is_dialled_by_name() {
+        let peers = announced_peers(&[], &[], &[runner("atik", FP_A, &["10.8.0.7:7443"])]);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].kind, LinkKind::Runner);
+        assert_eq!(peers[0].label, "atik");
+        assert_eq!(
+            peers[0].endpoint,
+            Endpoint(format!("weida://{FP_A}@atik.runner.zeughaus:7443/"))
+        );
+    }
+
+    #[test]
+    fn a_directory_runner_without_addresses_is_not_dialled() {
+        assert!(announced_peers(&[], &[], &[runner("atik", FP_A, &[])]).is_empty());
+    }
+
+    #[test]
+    fn a_ci_keeps_its_place_against_the_directory() {
+        let ci = format!("weida://{FP_B}@10.8.0.1:7444/");
+        let peers = announced_peers(
+            &[],
+            std::slice::from_ref(&ci),
+            &[runner("sadala", FP_B, &["10.8.0.1:7443"])],
+        );
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].kind, LinkKind::Ci);
+        assert_eq!(peers[0].endpoint, Endpoint(ci));
+        assert_eq!(peers[0].label, "10.8.0.1");
+    }
 }

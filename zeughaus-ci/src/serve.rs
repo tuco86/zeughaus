@@ -311,12 +311,18 @@ impl CiServer {
                 "offline"
             }
             .to_owned();
+            let view = connected.get(name);
+            let configured = &self.config.runners[name];
             runners.push(MachineView {
                 name: name.clone(),
                 kind: "runner".to_owned(),
                 status,
                 jobs,
-                build: connected.get(name).map_or(0, |view| view.build),
+                build: view.map_or(0, |view| view.build),
+                fingerprint: configured.fingerprint.clone(),
+                labels: self.config.labels_of(name, view.map(|v| &v.offer)),
+                addresses: view.map(|v| v.addresses.clone()).unwrap_or_default(),
+                sessions: configured.sessions,
             });
             for (machine, status) in connected.get(name).iter().flat_map(|v| &v.machines) {
                 machines.push(MachineView {
@@ -332,6 +338,7 @@ impl CiServer {
                         .map(|a| a.job.clone())
                         .collect(),
                     build: 0,
+                    ..MachineView::default()
                 });
             }
         }
@@ -1767,6 +1774,7 @@ mod tests {
                     build: 0,
                     machines: BTreeMap::new(),
                     since: 1,
+                    addresses: vec!["10.8.0.10:7444".to_owned()],
                 },
             );
         }

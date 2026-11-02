@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::Deserialize;
+use zeughaus_link::enlist::Offer;
+use zeughaus_link::selector::valid_label;
 
 use crate::event::CiEvent;
 use crate::pipeline::Pattern;
@@ -122,6 +124,16 @@ pub struct RunnerConfig {
     /// How long a job waits for this runner to connect before it is skipped.
     #[serde(default = "default_wait_minutes")]
     pub wait_minutes: u32,
+    /// Free labels of this runner (`gpu`, `cuda=12`); `os`, `arch` and
+    /// `runner` are the CI's own.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// The runner may host agent sessions.
+    #[serde(default)]
+    pub sessions: bool,
+    /// The ssh destination a session uses to reach this machine.
+    #[serde(default)]
+    pub ssh: Option<String>,
 }
 
 /// A runner's host: unix runs `.sh` jobs and offers containers and VMs, a
@@ -222,6 +234,28 @@ impl CiConfig {
             .map(|(name, _)| name.as_str())
     }
 
+    /// Runner `name`'s labels: the configured ones, `runner=<name>`, and
+    /// `os=` and `arch=` once its offer is known. Sorted.
+    pub fn labels_of(&self, name: &str, offer: Option<&Offer>) -> Vec<String> {
+        let mut labels: Vec<String> = self
+            .runners
+            .get(name)
+            .map(|r| r.labels.clone())
+            .unwrap_or_default();
+        labels.push(format!("runner={name}"));
+        if let Some(offer) = offer {
+            labels.push(format!("os={}", offer.os));
+            let arch = match offer.arch.as_str() {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                other => other,
+            };
+            labels.push(format!("arch={arch}"));
+        }
+        labels.sort();
+        labels
+    }
+
     pub fn parse(text: &str) -> Result<CiConfig, String> {
         let mut config: CiConfig =
             toml::from_str(text).map_err(|e| format!("{CONFIG_FILE}: {e}"))?;
@@ -279,6 +313,26 @@ impl CiConfig {
             if runner.os == RunnerOs::Windows && !runner.machines.is_empty() {
                 return Err(format!(
                     "runner `{name}`: a Windows runner boots no machines"
+                ));
+            }
+            for label in &runner.labels {
+                if !valid_label(label) {
+                    return Err(format!(
+                        "runner {name}: label {label} is not key or key=value"
+                    ));
+                }
+                let key = label.split_once('=').map_or(label.as_str(), |(k, _)| k);
+                if matches!(key, "os" | "arch" | "runner") {
+                    return Err(format!(
+                        "runner {name}: label {label}: os, arch and runner are set by the CI"
+                    ));
+                }
+            }
+            if let Some(ssh) = &runner.ssh
+                && (ssh.is_empty() || ssh.chars().any(char::is_whitespace))
+            {
+                return Err(format!(
+                    "runner {name}: `ssh` must be a destination without whitespace"
                 ));
             }
         }
@@ -557,6 +611,61 @@ forge = "none"
         let bad_name = format!("default_runner = \"A\"\n[runners.A]\nfingerprint = \"{FP_A}\"");
         assert!(CiConfig::parse(&bad_name).is_err());
         assert!(CiConfig::parse(&with_runners("machines = [\"W\"]")).is_err());
+    }
+
+    #[test]
+    fn runner_labels_are_checked_and_the_ci_adds_its_own() {
+        let config = CiConfig::parse(&with_runners(
+            "labels = [\"gpu\", \"cuda=12.4\"]\nsessions = true\nssh = \"me@10.0.0.1\"\n",
+        ))
+        .unwrap();
+        assert!(config.runners["a"].sessions);
+        assert_eq!(config.runners["a"].ssh.as_deref(), Some("me@10.0.0.1"));
+        let offer = Offer {
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            cpus: 1,
+            containers: false,
+            machines: Vec::new(),
+        };
+        assert_eq!(
+            config.labels_of("a", Some(&offer)),
+            ["arch=amd64", "cuda=12.4", "gpu", "os=linux", "runner=a"]
+        );
+        assert_eq!(
+            config.labels_of("a", None),
+            ["cuda=12.4", "gpu", "runner=a"]
+        );
+        let arm = Offer {
+            arch: "aarch64".to_owned(),
+            os: "macos".to_owned(),
+            ..offer.clone()
+        };
+        assert!(
+            config
+                .labels_of("a", Some(&arm))
+                .contains(&"arch=arm64".to_owned())
+        );
+        let riscv = Offer {
+            arch: "riscv64".to_owned(),
+            ..offer
+        };
+        assert!(
+            config
+                .labels_of("a", Some(&riscv))
+                .contains(&"arch=riscv64".to_owned())
+        );
+
+        let err = CiConfig::parse(&with_runners("labels = [\"Gpu\"]\n")).unwrap_err();
+        assert_eq!(err, "runner a: label Gpu is not key or key=value");
+        let err = CiConfig::parse(&with_runners("labels = [\"os=linux\"]\n")).unwrap_err();
+        assert_eq!(
+            err,
+            "runner a: label os=linux: os, arch and runner are set by the CI"
+        );
+        assert!(CiConfig::parse(&with_runners("labels = [\"runner\"]\n")).is_err());
+        assert!(CiConfig::parse(&with_runners("ssh = \"\"\n")).is_err());
+        assert!(CiConfig::parse(&with_runners("ssh = \"a b\"\n")).is_err());
     }
 
     #[test]

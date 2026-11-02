@@ -15,8 +15,8 @@ use std::time::Duration;
 use tokio::sync::mpsc::unbounded_channel;
 use weida::{IncomingRequest, Replier, TransferMeta};
 use zeughaus_link::enlist::{
-    ENLIST_MAJOR, FromRunner, MAX_OUTPUT_CHUNK, RunReport, ToRunner, parse_run_id, read_frame,
-    write_frame,
+    ENLIST_MAJOR, FromRunner, MAX_ADDRESSES, MAX_OUTPUT_CHUNK, RunReport, ToRunner, parse_run_id,
+    read_frame, write_frame,
 };
 
 use crate::config::{CiConfig, RunnerOs, valid_name};
@@ -111,11 +111,18 @@ impl EnlistService {
             build,
             runs,
             artifacts,
+            endpoint: _,
+            addresses,
         } = hello
         else {
             refuse(reply, "the first frame must be a hello").await;
             return;
         };
+        let addresses: Vec<String> = addresses
+            .into_iter()
+            .filter(|a| a.parse::<std::net::SocketAddr>().is_ok())
+            .take(MAX_ADDRESSES)
+            .collect();
         let known = principal
             .as_deref()
             .and_then(|principal| self.config.runner_of_fingerprint(principal));
@@ -163,6 +170,7 @@ impl EnlistService {
                 tx,
                 offer,
                 build,
+                addresses,
                 machines: Default::default(),
                 since: now_secs(),
             },

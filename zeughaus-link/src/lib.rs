@@ -41,6 +41,7 @@ pub mod feed;
 pub mod graph;
 pub mod manual;
 pub mod runs;
+pub mod selector;
 
 pub use agent::{AgentReply, AgentRequest, AgentSession, MAX_AGENT_BYTES};
 pub use ci::{

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Runners by name: a runner's `enlist.toml` may list `addresses` (the
+  `ip:port` pairs its listener answers at, best first; by default the
+  endpoint URL's address when it is a reachable IP), and its `Hello` carries
+  them with its endpoint. `ci.toml` gives a runner `labels`, `sessions`
+  (it may host agent sessions) and `ssh` (how a session reaches it). The
+  CI's overview lists each runner's fingerprint, labels (`runner=`, `os=`,
+  `arch=` plus the configured ones), addresses and `sessions`. The editor
+  labels a runner's section by that name, and dials a runner only a CI
+  announces as `<name>.runner.zeughaus`, which its own resolver answers
+  from the announced addresses. The enlist protocol is major 10.
 - Upstream pipelines: a job header's `on = ["push main of weida"]` follows
   another repository of `ci.toml`. When a push to weida's `main` is set up
   and is still the branch's head, the CI queues an `upstream` event for

@@ -7300,6 +7300,7 @@ dependencies = [
  "tokio",
  "toml",
  "weida",
+ "weida-runtime",
  "zeughaus-capture",
  "zeughaus-core",
  "zeughaus-db",

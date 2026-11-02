@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use zeughaus_link::enlist::MAX_ADDRESSES;
 
 use crate::names::valid_name;
 
@@ -44,6 +45,10 @@ pub struct EnlistConfig {
     /// uses.
     #[serde(default)]
     pub machines: BTreeMap<String, MachineConfig>,
+    /// The `ip:port` pairs where this runner's listener answers, best
+    /// first; the CI announces them to editors under the runner's name.
+    #[serde(default)]
+    pub addresses: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -160,6 +165,16 @@ impl EnlistConfig {
                 ));
             }
         }
+        if self.addresses.len() > MAX_ADDRESSES {
+            return Err(format!("{CONFIG_FILE}: addresses: at most {MAX_ADDRESSES}"));
+        }
+        for entry in &self.addresses {
+            if entry.parse::<std::net::SocketAddr>().is_err() {
+                return Err(format!(
+                    "{CONFIG_FILE}: addresses: {entry} is not an ip:port"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -213,6 +228,7 @@ mod tests {
     fn a_full_file_reads_every_section() {
         let text = format!(
             "ci = \"{}\"\nname = \"tuco-pc\"\ncpus = 16\n\
+             addresses = [\"10.8.0.10:7444\", \"[fd00::1]:7444\"]\n\
              [containers]\ncpus = 12\nmemory = \"24g\"\n\
              [machines.win11]\nkind = \"windows-vm\"\nscript = \"/s/vm.sh\"\n\
              dir = \"/d\"\nssh_host = \"win11-ci\"\ncpus = 8\n",
@@ -220,6 +236,7 @@ mod tests {
         );
         let config = EnlistConfig::parse(&text).unwrap();
         assert_eq!(config.cpus, Some(16));
+        assert_eq!(config.addresses, ["10.8.0.10:7444", "[fd00::1]:7444"]);
         assert_eq!(config.containers.unwrap().cpus, 12);
         let MachineConfig::WindowsVm(vm) = &config.machines["win11"];
         assert_eq!((vm.ssh_host.as_str(), vm.idle_minutes), ("win11-ci", 20));
@@ -247,5 +264,17 @@ mod tests {
             ))
             .is_err()
         );
+        let bad = EnlistConfig::parse(&format!(
+            "{base}name = \"x\"\naddresses = [\"tuco-pc:7444\"]\n"
+        ))
+        .unwrap_err();
+        assert!(bad.contains("tuco-pc:7444 is not an ip:port"), "{bad}");
+        let many = (0..9)
+            .map(|i| format!("\"10.0.0.{i}:1\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let bad = EnlistConfig::parse(&format!("{base}name = \"x\"\naddresses = [{many}]\n"))
+            .unwrap_err();
+        assert!(bad.contains("at most 8"), "{bad}");
     }
 }

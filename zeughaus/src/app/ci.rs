@@ -120,6 +120,65 @@ const RADIUS: f32 = 6.0;
 const MACHINE_WIDTH: f32 = 160.0;
 const STATE_WIDTH: f32 = 150.0;
 
+/// A runner a CI announces with its key and its addresses, which the editor
+/// dials and labels by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DirectoryRunner {
+    pub name: String,
+    /// As `weida::Fingerprint` writes it, the spelling a [`RunnerKey`] holds.
+    pub fingerprint: String,
+    pub addresses: Vec<std::net::SocketAddr>,
+}
+
+impl App {
+    /// Every runner the connected CIs list, with a fingerprint that is one
+    /// and the addresses that parse; the first CI wins a name both list.
+    pub(super) fn directory_runners(&self) -> Vec<DirectoryRunner> {
+        let mut out: Vec<DirectoryRunner> = Vec::new();
+        let machines = self
+            .ci
+            .values()
+            .filter_map(|client| client.overview.as_ref())
+            .flat_map(|overview| &overview.machines)
+            .filter(|machine| machine.kind == "runner");
+        for machine in machines {
+            let Ok(fingerprint) = machine.fingerprint.parse::<weida::Fingerprint>() else {
+                continue;
+            };
+            if out.iter().any(|r| r.name == machine.name) {
+                continue;
+            }
+            out.push(DirectoryRunner {
+                name: machine.name.clone(),
+                fingerprint: fingerprint.to_string(),
+                addresses: machine
+                    .addresses
+                    .iter()
+                    .filter_map(|a| a.parse().ok())
+                    .collect(),
+            });
+        }
+        out
+    }
+
+    /// Publishes the runners the CIs announce when they changed, and dials
+    /// the ones that are new.
+    fn refresh_directory(&mut self) -> Task<Message> {
+        let runners = self.directory_runners();
+        if runners == self.directory {
+            return Task::none();
+        }
+        crate::directory::publish(
+            runners
+                .iter()
+                .map(|r| (r.name.clone(), r.addresses.clone()))
+                .collect(),
+        );
+        self.directory = runners;
+        self.reconcile_runtime()
+    }
+}
+
 /// This editor's view of one runner's CI.
 pub(super) struct CiClient {
     /// Where the runner serves. A different one is a different runner process,
@@ -1136,7 +1195,10 @@ impl App {
             return Task::none();
         };
         match message {
-            CiMsg::Overview(result) => client.overview_arrived(&key, result),
+            CiMsg::Overview(result) => {
+                let asked = client.overview_arrived(&key, result);
+                Task::batch([asked, self.refresh_directory()])
+            }
             CiMsg::Pipelines {
                 view,
                 older,

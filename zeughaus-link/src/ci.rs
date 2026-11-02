@@ -745,7 +745,7 @@ pub struct TimedLine {
     pub text: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MachineView {
     pub name: String,
     /// `runner` (an enlisted runner, or one that is configured and offline)
@@ -758,6 +758,21 @@ pub struct MachineView {
     /// machine, or unknown.
     #[serde(default)]
     pub build: u64,
+    /// A runner's pinned fingerprint as `ci.toml` names it; empty for a
+    /// machine.
+    #[serde(default)]
+    pub fingerprint: String,
+    /// A runner's labels (`os=`, `arch=`, `runner=` and the configured
+    /// ones), sorted.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// The `ip:port` pairs an online runner's listener answers at, best
+    /// first.
+    #[serde(default)]
+    pub addresses: Vec<String>,
+    /// The runner may host agent sessions.
+    #[serde(default)]
+    pub sessions: bool,
 }
 
 /// A job running on a machine, named so that an editor can open its
@@ -1090,6 +1105,7 @@ mod tests {
                                 job: "build".to_owned(),
                             }],
                             build: 116,
+                            ..MachineView::default()
                         },
                         MachineView {
                             name: "win11".to_owned(),
@@ -1097,6 +1113,7 @@ mod tests {
                             status: "off".to_owned(),
                             jobs: Vec::new(),
                             build: 0,
+                            ..MachineView::default()
                         },
                     ],
                     queued: vec![QueuedView {

@@ -32,6 +32,9 @@ mod restart;
 // The weida client under the feed: the runtime, the trust, the first dial.
 #[cfg(not(target_arch = "wasm32"))]
 mod transport;
+// Runners by the names the CIs announce, and the resolver that dials them.
+#[cfg(not(target_arch = "wasm32"))]
+mod directory;
 mod workspace;
 
 use app::App;

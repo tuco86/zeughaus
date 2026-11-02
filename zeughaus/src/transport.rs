@@ -37,6 +37,7 @@ use zeughaus_link::credentials;
 pub static QUIC: LazyLock<Option<Runtime>> = LazyLock::new(|| {
     let config = RuntimeConfig {
         reconnect: policy(),
+        resolver: weida::SharedResolver::new(crate::directory::DirectoryResolver),
         #[cfg(test)]
         network: weida::Network::sim(&SIM),
         ..RuntimeConfig::default()

@@ -3088,6 +3088,7 @@ mod tests {
                 build: 0,
                 machines: std::collections::BTreeMap::new(),
                 since,
+                addresses: Vec::new(),
             },
         );
         rx

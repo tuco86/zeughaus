@@ -260,6 +260,10 @@ pub struct App {
     /// key (its fingerprint). Runner links have none.
     #[cfg(not(target_arch = "wasm32"))]
     ci: BTreeMap<RunnerKey, ci::CiClient>,
+    /// The runners the CIs announced last, as published to
+    /// [`crate::directory`].
+    #[cfg(not(target_arch = "wasm32"))]
+    directory: Vec<ci::DirectoryRunner>,
     /// A terminal a runner just opened for this editor (an agent session),
     /// whose tab comes to the front once that runner's workspace shows it.
     #[cfg(not(target_arch = "wasm32"))]
@@ -405,6 +409,8 @@ impl App {
             mux: BTreeMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             ci: BTreeMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            directory: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             reveal: None,
             #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]

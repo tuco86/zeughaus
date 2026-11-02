@@ -371,6 +371,7 @@ mod tests {
             status: status.to_owned(),
             jobs: Vec::new(),
             build: 0,
+            ..MachineView::default()
         }
     }
 

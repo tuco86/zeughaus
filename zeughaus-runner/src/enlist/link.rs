@@ -126,6 +126,7 @@ async fn exchange(
         Ok(halves) => halves,
         Err(e) => return Ended::lost(format!("open: {e}")),
     };
+    let endpoint = zeughaus_link::credentials::read_endpoint(&exec.state_dir).unwrap_or_default();
     let hello = FromRunner::Hello {
         major: ENLIST_MAJOR,
         name: exec.config.name.clone(),
@@ -133,6 +134,8 @@ async fn exchange(
         build: zeughaus_update::manifest::own_build(),
         runs: exec.reports(),
         artifacts: exec.artifact_sets(),
+        addresses: hello_addresses(&exec.config.addresses, &endpoint),
+        endpoint,
     };
     if let Err(e) = write_frame(&mut request, &hello).await {
         return Ended::lost(format!("hello: {e}"));
@@ -240,6 +243,25 @@ fn dispatch(exec: &Arc<Executor>, command: ToRunner) {
     }
 }
 
+/// The addresses `Hello` announces: `enlist.toml`'s when it names any, else
+/// the endpoint URL's `ip:port` when its host is an IP another machine can
+/// reach, else none.
+fn hello_addresses(config: &[String], endpoint: &str) -> Vec<String> {
+    if !config.is_empty() {
+        return config.to_vec();
+    }
+    let Ok(addr) = weida::EndpointAddr::parse(endpoint) else {
+        return Vec::new();
+    };
+    let (Ok(ip), Some(port)) = (addr.host.parse::<std::net::IpAddr>(), addr.port) else {
+        return Vec::new();
+    };
+    if ip.is_loopback() || ip.is_unspecified() {
+        return Vec::new();
+    }
+    vec![std::net::SocketAddr::new(ip, port).to_string()]
+}
+
 /// Why weida stopped redialling, in a log line's words.
 fn explain(why: &GiveUp) -> String {
     match why {
@@ -268,5 +290,28 @@ mod tests {
     fn a_minute_of_uptime_starts_the_delays_over() {
         assert_eq!(next_attempt(5, Duration::from_secs(59)), 6);
         assert_eq!(next_attempt(5, Duration::from_secs(60)), 1);
+    }
+
+    #[test]
+    fn hello_announces_the_configured_addresses_else_a_reachable_endpoint() {
+        let fp = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let at = |host: &str| format!("weida://{fp}@{host}/");
+        let configured = ["10.0.0.1:1".to_owned()];
+        assert_eq!(
+            hello_addresses(&configured, &at("10.8.0.10:7443")),
+            configured
+        );
+        assert_eq!(
+            hello_addresses(&[], &at("10.8.0.10:7443")),
+            ["10.8.0.10:7443"]
+        );
+        assert_eq!(
+            hello_addresses(&[], &at("[fd00::1]:7443")),
+            ["[fd00::1]:7443"]
+        );
+        assert!(hello_addresses(&[], &at("127.0.0.1:7443")).is_empty());
+        assert!(hello_addresses(&[], &at("0.0.0.0:7443")).is_empty());
+        assert!(hello_addresses(&[], &at("tuco-pc:7443")).is_empty());
+        assert!(hello_addresses(&[], "").is_empty());
     }
 }

@@ -21,7 +21,10 @@
 use serde::{Deserialize, Serialize};
 
 /// The protocol major a runner and the CI must share.
-pub const ENLIST_MAJOR: u32 = 9;
+pub const ENLIST_MAJOR: u32 = 10;
+
+/// The most addresses a runner's `Hello` announces.
+pub const MAX_ADDRESSES: usize = 8;
 
 /// The most one frame body may carry.
 pub const MAX_ENLIST_FRAME_BYTES: usize = 1 << 20;
@@ -52,6 +55,12 @@ pub enum FromRunner {
         runs: Vec<RunReport>,
         /// Run ids of the artifact sets under the runner's `ci/artifacts/`.
         artifacts: Vec<String>,
+        /// The runner's own pinned URL (its `<state-dir>/endpoint`); empty
+        /// when it could not be read.
+        endpoint: String,
+        /// The `ip:port` pairs where the runner's listener answers, best
+        /// first; editors dial it there under its name.
+        addresses: Vec<String>,
     },
     /// A machine behind the runner (a VM) changed status.
     Machine { name: String, status: String },

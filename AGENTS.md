@@ -295,7 +295,8 @@ token and every secret `ci.toml` names. `zeughaus-ci check [DIR]` and `plan
 Five runners enlist, each with an `<state-dir>/enlist.toml`
 (`deploy/runner/enlist.toml.example`: `ci` (the CI's pinned URL, the line in
 its `endpoint` file), `name`, `cpus`, `budget_gb`, `blob_cache_gb` (the
-artifact file cache, 8 by default), and the optional tables
+artifact file cache, 8 by default), `addresses` (the `ip:port` pairs the
+CI announces to editors under the runner's name), and the optional tables
 `[containers]` (podman; Apple `container` on macOS, see below) and
 `[machines.<name>]` (a Windows VM)). The CI pins each one by the fingerprint
 in its own `endpoint` file:
@@ -311,8 +312,13 @@ in its own `endpoint` file:
 In `ci.toml`, `default_runner` names the runner of every job without a
 `machine` or `platform`; `[runners.<name>]` has its `fingerprint`, its
 `os` (`unix` by default, or `windows`), its
-`machines` (VMs it boots) and `wait_minutes` (15: a job whose runner is
-offline is skipped after that, not failed). `[platforms]` maps a platform
+`machines` (VMs it boots), `wait_minutes` (15: a job whose runner is
+offline is skipped after that, not failed), `labels` (free `key` or
+`key=value` labels; the CI adds `runner=`, `os=` and `arch=`), `sessions`
+(it may host agent sessions) and `ssh` (the destination a session uses to
+reach it). The overview lists each runner with its fingerprint, labels and
+announced addresses, and editors label and dial runners by that name
+(`<name>.runner.zeughaus`). `[platforms]` maps a platform
 name (`linux-amd64`, `darwin-arm64`, ...) to the runner or VM that builds
 it. A job header places a job: `machine = "<runner>"` runs on that runner's
 host (`.sh`, `.ps1` on a Windows runner), `machine = "<vm>"` on the VM of

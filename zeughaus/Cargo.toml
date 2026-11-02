@@ -62,6 +62,8 @@ iced = { version = "0.14", features = ["advanced", "wgpu", "tokio", "image", "ca
 # which every feed task already runs on.
 zeughaus-link.workspace = true
 weida.workspace = true
+# The `Exec` the editor's `weida::Resolver` (runner names) is handed.
+weida-runtime.workspace = true
 # The terminal surface: draws a `TerminalView` with one wgpu primitive per
 # pane and bundles the font the grid is measured from.
 iced_terminal.workspace = true

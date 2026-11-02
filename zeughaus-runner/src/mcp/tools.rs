@@ -2332,6 +2332,7 @@ mod tests {
                         job: "build".to_owned(),
                     }],
                     build: 116,
+                    ..MachineView::default()
                 },
                 MachineView {
                     name: "win11".to_owned(),
@@ -2339,6 +2340,7 @@ mod tests {
                     status: "off".to_owned(),
                     jobs: Vec::new(),
                     build: 0,
+                    ..MachineView::default()
                 },
             ],
             queued: vec![QueuedView {
@@ -2794,6 +2796,7 @@ mod tests {
             status: "online".to_owned(),
             jobs,
             build: 0,
+            ..MachineView::default()
         };
         let on = |repo: &str, number: u64, job: &str| MachineJob {
             repo: repo.to_owned(),
@@ -2934,6 +2937,7 @@ mod tests {
                 status: "online".to_owned(),
                 jobs: Vec::new(),
                 build: 0,
+                ..MachineView::default()
             }],
             platforms: vec![("linux-amd64".to_owned(), "agent".to_owned())],
             docs: Vec::new(),

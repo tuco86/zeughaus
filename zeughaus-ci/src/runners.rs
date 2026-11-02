@@ -22,6 +22,8 @@ pub struct Connected {
     pub machines: BTreeMap<String, String>,
     /// When it connected, seconds since the epoch.
     pub since: u64,
+    /// The `ip:port` pairs the runner's listener answers at, best first.
+    pub addresses: Vec<String>,
 }
 
 /// What `/ci` and the scheduler read about a connected runner.
@@ -31,6 +33,7 @@ pub struct RunnerView {
     pub build: u64,
     pub machines: BTreeMap<String, String>,
     pub since: u64,
+    pub addresses: Vec<String>,
 }
 
 struct Entry {
@@ -123,6 +126,7 @@ fn view(connected: &Connected) -> RunnerView {
         build: connected.build,
         machines: connected.machines.clone(),
         since: connected.since,
+        addresses: connected.addresses.clone(),
     }
 }
 
