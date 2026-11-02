@@ -39,7 +39,7 @@ use crate::workspace::{
 /// Protocol version. A major mismatch refuses the attach; a minor is the
 /// lower of the two sides'.
 pub const MAJOR: u8 = 4;
-pub const MINOR: u8 = 0;
+pub const MINOR: u8 = 1;
 
 const MAGIC: [u8; 2] = *b"ZM";
 
@@ -663,7 +663,7 @@ mod tests {
         assert_eq!(
             bytes,
             [
-                b'Z', b'M', 4, 0, 0x12, 0x00, 0, 0, 0x04, 0x03, 0x02, 0x00, 0x88, 0x77, 0x66, 0x55,
+                b'Z', b'M', 4, 1, 0x12, 0x00, 0, 0, 0x04, 0x03, 0x02, 0x00, 0x88, 0x77, 0x66, 0x55,
                 0x44, 0x33, 0x22, 0x11
             ]
         );
@@ -920,6 +920,7 @@ mod tests {
                     side: Side::Right,
                 },
             },
+            TopologyCommand::ReplayRun { run: 12 },
         ] {
             round_trip(Message::Command(Command {
                 request: RequestId(13),

@@ -53,6 +53,8 @@ pub(super) struct MuxState {
     /// held by another instance under the same principal -- this user's
     /// previous editor -- is one this editor may type through.
     principal: Option<String>,
+    /// The protocol minor both ends speak: the lower of the two.
+    pub minor: u8,
     /// Whether the last thing the control task said was an attach. Drives
     /// the status bar and decides whether a structural command may be sent.
     pub attached: bool,
@@ -129,6 +131,7 @@ impl App {
                 commands: None,
                 incarnation: None,
                 principal: None,
+                minor: 0,
                 attached: false,
                 workspace: None,
                 terminals: HashMap::new(),
@@ -187,6 +190,7 @@ impl App {
                     mux.terminals.clear();
                 }
                 mux.incarnation = Some(hello.incarnation);
+                mux.minor = hello.minor;
                 mux.principal = Some(hello.principal);
                 mux.attached = true;
                 for head in heads {

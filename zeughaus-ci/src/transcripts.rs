@@ -188,12 +188,11 @@ fn incarnation() -> RunnerIncarnation {
 
 /// The exit a transcript's `exit` file records: `code=<n>` or `code=none`.
 fn read_exit(dir: &Path) -> Option<ExitState> {
-    let text = std::fs::read_to_string(dir.join("exit")).ok()?;
-    let code = text.trim().strip_prefix("code=")?;
-    Some(match code.parse::<u32>() {
-        Ok(code) => ExitState::Exited { code },
+    let end = zeughaus_job::read_run_end(dir)?;
+    Some(match end.code.and_then(|code| u32::try_from(code).ok()) {
+        Some(code) => ExitState::Exited { code },
         // No code: the run was killed or never reported one.
-        Err(_) => ExitState::Killed,
+        None => ExitState::Killed,
     })
 }
 
@@ -348,7 +347,7 @@ async fn control(
     let attached = ControlAttached {
         hello: ServerHello {
             major: MAJOR,
-            minor: MINOR,
+            minor: attach.hello.minor.min(MINOR),
             incarnation,
             capabilities: Vec::<Capability>::new(),
             principal: principal.to_owned(),

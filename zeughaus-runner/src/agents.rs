@@ -300,6 +300,7 @@ mod unix {
                 Dimensions { cols: 80, rows: 24 },
                 None,
                 OwnedPlacement::Triggered,
+                zeughaus_link::ActivityKind::Session,
             ) {
                 Ok(TerminalId(terminal)) => AgentReply::Opened {
                     terminal,

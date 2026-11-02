@@ -14,9 +14,131 @@
 
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde::{Deserialize, Serialize};
 use weida::{Replier, TransferMeta};
-use zeughaus_link::{MAX_RUN_REQUEST_BYTES, RunFileReply, RunFileRequest};
+use zeughaus_link::{ActivityKind, MAX_RUN_REQUEST_BYTES, RunFileReply, RunFileRequest};
+
+/// What `activity.json` of a run directory says about the terminal whose
+/// output it holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunActivity {
+    pub kind: ActivityKind,
+    pub label: String,
+    pub terminal: u64,
+    /// The grid width the output was written at, which a replay uses.
+    pub cols: u16,
+}
+
+pub const ACTIVITY_FILE: &str = "activity.json";
+
+pub fn write_activity(run_dir: &Path, activity: &RunActivity) -> Result<(), String> {
+    crate::files::write_json(&run_dir.join(ACTIVITY_FILE), activity)
+}
+
+pub fn read_activity(run_dir: &Path) -> Option<RunActivity> {
+    let text = std::fs::read(run_dir.join(ACTIVITY_FILE)).ok()?;
+    serde_json::from_slice(&text).ok()
+}
+
+/// The run directories under `<state-dir>/runs/`: one per job run, CI job,
+/// maintenance task and closed shell or session, numbered past every
+/// directory that already exists, so a restarted runner cannot hand out an
+/// id whose directory holds someone else's output.
+pub struct RunDirs {
+    root: PathBuf,
+    next: AtomicU64,
+    /// Prunable runs kept beyond which older ones go when a run is added.
+    keep: usize,
+}
+
+impl RunDirs {
+    pub fn new(state_dir: &Path, keep: usize) -> RunDirs {
+        let root = state_dir.join("runs");
+        let next = run_ids(&root).first().copied().unwrap_or(0) + 1;
+        RunDirs {
+            root,
+            next: AtomicU64::new(next),
+            keep,
+        }
+    }
+
+    /// A fresh run directory and its id. Housekeeping rides on it rather
+    /// than on a timer: the directory only grows when a run is added.
+    pub fn create(&self) -> Result<(u64, PathBuf), String> {
+        let id = self.next.fetch_add(1, Ordering::SeqCst);
+        let dir = self.root.join(id.to_string());
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        prune_runs(&self.root, self.keep);
+        Ok((id, dir))
+    }
+
+    /// The id of `dir` when it is one of these run directories.
+    pub fn id_of(&self, dir: &Path) -> Option<u64> {
+        if dir.parent() != Some(self.root.as_path()) {
+            return None;
+        }
+        dir.file_name()?.to_str()?.parse().ok()
+    }
+
+    /// Every run id, newest first.
+    pub fn ids(&self) -> Vec<u64> {
+        run_ids(&self.root)
+    }
+
+    pub fn dir(&self, id: u64) -> PathBuf {
+        self.root.join(id.to_string())
+    }
+}
+
+/// The numeric run directories under `runs`, newest id first. A name that is
+/// not a number is not a run of this process and is ignored; an unreadable
+/// directory means no runs are known, which is the same situation as a first
+/// start.
+fn run_ids(runs: &Path) -> Vec<u64> {
+    let Ok(entries) = std::fs::read_dir(runs) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<u64> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u64>().ok())
+        .collect();
+    ids.sort_unstable_by(|a, b| b.cmp(a));
+    ids
+}
+
+/// Whether the run in `dir` may go once newer ones replace it: a run that
+/// exited cleanly, and the output of a closed shell or session whatever its
+/// end. A failed run, one without a record yet and an unreadable one stay.
+fn prunable(dir: &Path) -> bool {
+    let clean = std::fs::read_to_string(dir.join("exit"))
+        .is_ok_and(|record| record.starts_with("code=0\n"));
+    clean
+        || read_activity(dir)
+            .is_some_and(|a| matches!(a.kind, ActivityKind::Shell | ActivityKind::Session))
+}
+
+/// Deletes prunable runs beyond the `keep` newest. Failures to delete are
+/// logged and otherwise ignored: retention is housekeeping, and a run that
+/// cannot be removed today is tried again on the next run.
+fn prune_runs(runs: &Path, keep: usize) {
+    let mut kept = 0usize;
+    for id in run_ids(runs) {
+        let dir = runs.join(id.to_string());
+        if !prunable(&dir) {
+            continue;
+        }
+        if kept < keep {
+            kept += 1;
+            continue;
+        }
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            eprintln!("[runner] cannot prune run {}: {e}", dir.display());
+        }
+    }
+}
 
 /// Answers run-file requests until the replier goes away, which for this
 /// process means never: it owns the replier for the life of the program.
@@ -173,6 +295,49 @@ mod tests {
             );
             assert_eq!(read_range(&dir.join("exit"), 0, 16), None, "no such file");
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Oldest to newest: green, red, green, no record (cut short), a
+        /// failed shell's output, green, green. The two newest prunable runs
+        /// stay; the older green ones and the shell beyond them go, and the
+        /// failed run, the recordless one and the new one are untouched.
+        #[test]
+        fn only_prunable_runs_beyond_the_newest_are_pruned() {
+            let state_dir = temp_dir("prune");
+            let runs = state_dir.join("runs");
+            let record = |id: u64, exit: Option<&str>, kind: Option<ActivityKind>| {
+                let dir = runs.join(id.to_string());
+                std::fs::create_dir_all(&dir).unwrap();
+                if let Some(exit) = exit {
+                    std::fs::write(dir.join("exit"), exit).unwrap();
+                }
+                if let Some(kind) = kind {
+                    let activity = RunActivity {
+                        kind,
+                        label: "bash".to_owned(),
+                        terminal: id,
+                        cols: 80,
+                    };
+                    write_activity(&dir, &activity).unwrap();
+                }
+            };
+            record(1, Some("code=0\nkilled=false\n"), None);
+            record(2, Some("code=3\nkilled=false\n"), None);
+            record(3, Some("code=0\nkilled=false\n"), None);
+            record(4, None, None);
+            record(5, Some("code=1\nkilled=false\n"), Some(ActivityKind::Shell));
+            record(6, Some("code=0\nkilled=false\n"), None);
+            record(7, Some("code=0\nkilled=false\n"), Some(ActivityKind::Job));
+
+            let dirs = RunDirs::new(&state_dir, 2);
+            let (id, fresh) = dirs.create().unwrap();
+            assert_eq!((id, fresh.clone()), (8, runs.join("8")));
+            assert_eq!(dirs.id_of(&fresh), Some(8));
+            assert_eq!(dirs.id_of(&state_dir.join("8")), None);
+            assert_eq!(dirs.ids(), vec![8, 7, 6, 4, 2]);
+            // A restarted runner continues the numbering past what is on disk.
+            assert_eq!(RunDirs::new(&state_dir, 2).create().unwrap().0, 9);
+            let _ = std::fs::remove_dir_all(&state_dir);
         }
     }
 }

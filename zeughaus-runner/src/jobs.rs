@@ -8,23 +8,24 @@
 //! with the program, whatever its exit code: what the run said is read from
 //! its WAL.
 //!
-//! Run ids come from the state directory rather than from a counter that
-//! starts at zero, so a restarted runner cannot hand out an id whose directory
+//! Run ids come from [`RunDirs`], numbered past what the state directory
+//! holds, so a restarted runner cannot hand out an id whose directory
 //! already holds someone else's output.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use weida::{Replier, TransferMeta};
-use zeughaus_job::{JobSpec, ProcessHost, RunExit, RunHandle, record_run_end};
-use zeughaus_link::{HoldReply, HoldRequest, MAX_HOLD_BYTES};
+use zeughaus_job::{JobSpec, ProcessHost, RunExit, RunHandle, RunKind, record_run_end};
+use zeughaus_link::{ActivityKind, HoldReply, HoldRequest, MAX_HOLD_BYTES};
 use zeughaus_mux::{Dimensions, ExitState, TerminalId};
 use zeughaus_terminal::Profile;
 use zeughaus_terminal::wal::{Wal, WalWriter};
 
 use crate::mux::{MuxService, OwnedPlacement, SavedRun};
+use crate::runs::{RunActivity, RunDirs, write_activity};
 
 /// How often a waiting run looks at its terminal. A job is measured in
 /// seconds at best, so this is latency nobody can perceive and a thread that
@@ -45,19 +46,17 @@ pub(crate) const RUN_DIMENSIONS: Dimensions = Dimensions {
     rows: 24,
 };
 
-/// Successful runs kept on disk beyond which older ones are deleted when a
-/// new run starts. Failed runs, and runs that never wrote an exit record
-/// (still live, or cut short with the runner), are never pruned: those are
-/// the ones someone comes back to.
+/// Prunable runs (successful ones, and closed shells' and sessions'
+/// output) kept on disk beyond which older ones are deleted when a new run
+/// starts. Failed runs, and runs that never wrote an exit record (still
+/// live, or cut short with the runner), are never pruned: those are the
+/// ones someone comes back to.
 pub const DEFAULT_KEEP_RUNS: usize = 50;
 
 /// The runner's side of the job plugin's host trait.
 pub struct JobHost {
     mux: MuxService,
-    state_dir: PathBuf,
-    /// The next run id. Seeded past every run directory that already exists.
-    next_run: AtomicU64,
-    keep_runs: usize,
+    runs: Arc<RunDirs>,
     /// Held: start nothing new, let the live runs finish.
     held: AtomicBool,
     /// A maintenance task runs: counts as held, so no CI job or graph job
@@ -72,13 +71,10 @@ pub struct JobHost {
 }
 
 impl JobHost {
-    pub fn new(mux: MuxService, state_dir: PathBuf, keep_runs: usize) -> JobHost {
-        let next = highest_run(&state_dir.join("runs")) + 1;
+    pub fn new(mux: MuxService, runs: Arc<RunDirs>) -> JobHost {
         JobHost {
             mux,
-            state_dir,
-            next_run: AtomicU64::new(next),
-            keep_runs,
+            runs,
             held: AtomicBool::new(false),
             maintaining: AtomicBool::new(false),
             live: Arc::new(AtomicU32::new(0)),
@@ -153,57 +149,21 @@ impl JobHost {
 
     /// Every numeric directory under `<state-dir>/runs`.
     pub fn run_dirs(&self) -> Vec<PathBuf> {
-        let runs = self.state_dir.join("runs");
-        run_ids(&runs)
+        self.runs
+            .ids()
             .into_iter()
-            .map(|id| runs.join(id.to_string()))
+            .map(|id| self.runs.dir(id))
             .collect()
     }
 }
 
-/// The numeric run directories under `runs`, newest id first. A name that is
-/// not a number is not a run of this process and is ignored; an unreadable
-/// directory means no runs are known, which is the same situation as a first
-/// start.
-fn run_ids(runs: &Path) -> Vec<u64> {
-    let Ok(entries) = std::fs::read_dir(runs) else {
-        return Vec::new();
-    };
-    let mut ids: Vec<u64> = entries
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_str()?.parse::<u64>().ok())
-        .collect();
-    ids.sort_unstable_by(|a, b| b.cmp(a));
-    ids
-}
-
-fn highest_run(runs: &Path) -> u64 {
-    run_ids(runs).first().copied().unwrap_or(0)
-}
-
-/// Whether the run in `dir` recorded a clean exit. Anything else -- a
-/// failure, no record yet, an unreadable one -- is kept.
-fn exited_clean(dir: &Path) -> bool {
-    std::fs::read_to_string(dir.join("exit")).is_ok_and(|record| record.starts_with("code=0\n"))
-}
-
-/// Deletes successful runs beyond the `keep` newest. Failures to delete are
-/// logged and otherwise ignored: retention is housekeeping, and a run that
-/// cannot be removed today is tried again on the next run.
-fn prune_runs(runs: &Path, keep: usize) {
-    let mut kept = 0usize;
-    for id in run_ids(runs) {
-        let dir = runs.join(id.to_string());
-        if !exited_clean(&dir) {
-            continue;
-        }
-        if kept < keep {
-            kept += 1;
-            continue;
-        }
-        if let Err(e) = std::fs::remove_dir_all(&dir) {
-            eprintln!("[runner] cannot prune run {}: {e}", dir.display());
-        }
+/// What a run's kind is as activity.
+fn activity_kind(kind: RunKind) -> ActivityKind {
+    match kind {
+        RunKind::Job => ActivityKind::Job,
+        RunKind::Trigger => ActivityKind::Trigger,
+        RunKind::CiJob => ActivityKind::CiJob,
+        RunKind::Maintenance => ActivityKind::Maintenance,
     }
 }
 
@@ -213,15 +173,7 @@ impl ProcessHost for JobHost {
     }
 
     fn new_run_dir(&self) -> Result<PathBuf, String> {
-        let id = self.next_run.fetch_add(1, Ordering::SeqCst);
-        let runs = self.state_dir.join("runs");
-        let dir = runs.join(id.to_string());
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-        // Housekeeping rides on the start of a run rather than on a timer:
-        // the directory only grows when a run is added.
-        prune_runs(&runs, self.keep_runs);
-        Ok(dir)
+        self.runs.create().map(|(_, dir)| dir)
     }
 
     fn spawn(&self, spec: JobSpec) -> Result<Box<dyn RunHandle>, String> {
@@ -232,6 +184,7 @@ impl ProcessHost for JobHost {
         let wal_path = spec.run_dir.join("wal");
         WalWriter::open(&wal_path, None)
             .map_err(|e| format!("cannot create {}: {e}", wal_path.display()))?;
+        let run_dir = spec.run_dir.clone();
         let run = SavedRun {
             run_dir: spec.run_dir.clone(),
             started: spec.started,
@@ -240,11 +193,10 @@ impl ProcessHost for JobHost {
         };
         // A run nobody in an editor started would otherwise sit unseen among
         // the detached terminals; one an editor pressed is attached from
-        // there by whoever wants to look.
-        let placement = if spec.external {
-            OwnedPlacement::Triggered
-        } else {
-            OwnedPlacement::Detached
+        // there by whoever wants to look, and maintenance runs unseen.
+        let placement = match spec.kind {
+            RunKind::Trigger | RunKind::CiJob => OwnedPlacement::Triggered,
+            RunKind::Job | RunKind::Maintenance => OwnedPlacement::Detached,
         };
 
         let mut env = spec.env;
@@ -260,13 +212,25 @@ impl ProcessHost for JobHost {
             env,
             scrollback_rows: RUN_SCROLLBACK_ROWS,
         };
+        let kind = activity_kind(spec.kind);
+        let label = profile.label.clone();
         let terminal = self.mux.spawn_owned(
             profile,
             Wal::At(wal_path),
             RUN_DIMENSIONS,
             Some(run),
             placement,
+            kind,
         )?;
+        let activity = RunActivity {
+            kind,
+            label,
+            terminal: terminal.0,
+            cols: RUN_DIMENSIONS.cols,
+        };
+        if let Err(e) = write_activity(&run_dir, &activity) {
+            eprintln!("[runner] {e}");
+        }
         self.live.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(Run {
             mux: self.mux.clone(),
@@ -472,19 +436,22 @@ mod tests {
             }
         }
 
-        #[test]
-        fn a_failed_run_records_its_code_and_closes_its_terminal() {
-            let state_dir = fresh_state_dir("e2e");
+        /// A host whose mux keeps terminals in this process, on `state_dir`.
+        fn host_on(state_dir: &Path) -> (MuxService, Arc<JobHost>) {
+            let runs = Arc::new(RunDirs::new(state_dir, DEFAULT_KEEP_RUNS));
             let mux = MuxService::new(
                 crate::mux::incarnation(),
                 Vec::new(),
                 zeughaus_terminal::TerminalHost::Local,
+                Arc::clone(&runs),
             );
-            let host = Arc::new(JobHost::new(
-                mux.clone(),
-                state_dir.clone(),
-                DEFAULT_KEEP_RUNS,
-            ));
+            (mux.clone(), Arc::new(JobHost::new(mux, runs)))
+        }
+
+        #[test]
+        fn a_failed_run_records_its_code_and_closes_its_terminal() {
+            let state_dir = fresh_state_dir("e2e");
+            let (mux, host) = host_on(&state_dir);
             let plugin = JobPlugin::new(Arc::clone(&host) as Arc<dyn ProcessHost>);
 
             // First run: fails with 3. The run is over with its program, so its
@@ -528,8 +495,12 @@ mod tests {
             assert!(!run_dir.join("code").exists());
             assert!(mux.session(TerminalId(2)).is_none());
 
+            // The run says what it was beside its output.
+            let activity = crate::runs::read_activity(&run_dir).expect("activity.json");
+            assert_eq!((activity.kind, activity.cols), (ActivityKind::Job, 500));
+
             // A restarted host continues the numbering past what is on disk.
-            let restarted = JobHost::new(mux, state_dir.clone(), DEFAULT_KEEP_RUNS);
+            let (_, restarted) = host_on(&state_dir);
             assert_eq!(
                 restarted.new_run_dir().unwrap(),
                 state_dir.join("runs").join("3")
@@ -541,12 +512,7 @@ mod tests {
         #[test]
         fn a_held_host_starts_nothing() {
             let state_dir = fresh_state_dir("held");
-            let mux = MuxService::new(
-                crate::mux::incarnation(),
-                Vec::new(),
-                zeughaus_terminal::TerminalHost::Local,
-            );
-            let host = Arc::new(JobHost::new(mux, state_dir.clone(), DEFAULT_KEEP_RUNS));
+            let (_, host) = host_on(&state_dir);
             host.hold(true);
             let plugin = JobPlugin::new(Arc::clone(&host) as Arc<dyn ProcessHost>);
             let mut node = plugin.create_node("job.run").unwrap();
@@ -559,43 +525,6 @@ mod tests {
             assert!(err.to_string().contains("held"), "was: {err}");
             assert!(ctx.take_deferred().is_none());
             assert!(!state_dir.join("runs").exists());
-        }
-
-        #[test]
-        fn only_successful_runs_beyond_the_newest_are_pruned() {
-            let state_dir = fresh_state_dir("prune");
-            let runs = state_dir.join("runs");
-            let record = |id: u64, exit: Option<&str>| {
-                let dir = runs.join(id.to_string());
-                std::fs::create_dir_all(&dir).unwrap();
-                if let Some(exit) = exit {
-                    std::fs::write(dir.join("exit"), exit).unwrap();
-                }
-            };
-            // Oldest to newest: green, red, green, no record (cut short), green,
-            // green.
-            record(1, Some("code=0\nkilled=false\n"));
-            record(2, Some("code=3\nkilled=false\n"));
-            record(3, Some("code=0\nkilled=false\n"));
-            record(4, None);
-            record(5, Some("code=0\nkilled=false\n"));
-            record(6, Some("code=0\nkilled=false\n"));
-
-            let mux = MuxService::new(
-                crate::mux::incarnation(),
-                Vec::new(),
-                zeughaus_terminal::TerminalHost::Local,
-            );
-            let host = JobHost::new(mux, state_dir.clone(), 2);
-            let fresh = host.new_run_dir().unwrap();
-            assert_eq!(fresh, runs.join("7"));
-
-            let left = run_ids(&runs);
-            // The two newest green runs stay, the older green ones go, and the
-            // failed one, the recordless one and the new one are untouched.
-            assert_eq!(left, vec![7, 6, 5, 4, 2]);
-
-            let _ = std::fs::remove_dir_all(&state_dir);
         }
     }
 }

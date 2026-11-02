@@ -34,7 +34,7 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use zeughaus_job::{JobSpec, ProcessHost, RunHandle};
+use zeughaus_job::{JobSpec, ProcessHost, RunHandle, RunKind};
 
 use crate::files;
 use crate::jobs::JobHost;
@@ -379,7 +379,7 @@ fn start_run(
         run_dir,
         started: state.started,
         artifacts: Vec::new(),
-        external: true,
+        kind: RunKind::Maintenance,
     })
 }
 

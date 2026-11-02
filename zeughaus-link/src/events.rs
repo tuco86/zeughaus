@@ -89,6 +89,12 @@ pub enum RuntimeEvent {
     /// deleted. Carries only the repository; an editor asks `/ci` for the
     /// documents. Only the CI sends it, on [`TOPIC_CI`].
     CiDocs { seq: u64, repo: String },
+    /// One of the runner's terminals started, exited or closed. Only a
+    /// runner sends it, on [`TOPIC_ACTIVITY`].
+    Activity {
+        seq: u64,
+        entry: crate::activity::ActivityEntry,
+    },
 }
 
 impl RuntimeEvent {
@@ -209,6 +215,9 @@ pub const TOPIC_MACHINE: &str = "machine";
 /// (a runner's alerts go out on [`TOPIC_MACHINE`]).
 pub const TOPIC_CI: &str = "ci";
 
+/// Topic of [`RuntimeEvent::Activity`].
+pub const TOPIC_ACTIVITY: &str = "activity";
+
 /// Largest event payload a subscriber reads. An event is a few identifiers and
 /// a scalar rendered as text; the cap is what stops a peer from making a viewer
 /// allocate on its behalf.
@@ -279,6 +288,20 @@ mod tests {
             RuntimeEvent::CiDocs {
                 seq: 17,
                 repo: "griasdi".to_owned(),
+            },
+            RuntimeEvent::Activity {
+                seq: 18,
+                entry: crate::activity::ActivityEntry {
+                    terminal: 3,
+                    run: None,
+                    kind: crate::activity::ActivityKind::Shell,
+                    label: "bash".to_owned(),
+                    state: crate::activity::ActivityState::Running,
+                    started: 1,
+                    ended: None,
+                    code: None,
+                    killed: false,
+                },
             },
         ];
         for event in events {

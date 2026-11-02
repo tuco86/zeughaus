@@ -138,12 +138,17 @@ terminal someone else drives, `Ctrl+Shift+C`/`V` copy and paste,
 `command` line when its `run` pin fires or it is pressed; its terminal lives
 as long as the program (the run ends with the program's exit code), every run
 keeps a timestamped WAL in `<state-dir>/runs/<id>/wal`, and every shell one
-in its shim directory.
+in its shim directory. A shell or agent session whose child exits closes by
+itself (`close_on_exit` in `<state-dir>/zeughaus.toml`: `always`, the
+default, `success` or `never`); a closed one's output is archived as a run
+of its own under `runs/`, and "Terminal / Reopen <runner> / <label>" in the
+palette opens it read-only in a tab. Every terminal the runner owns is
+reported on `/activity` and as `activity` events.
 `zeughaus-runner trigger <endpoint> <node-id> [payload]` and
 `zeughaus-runner hold <endpoint> on|off` do the same from a script, against
-the endpoint URL a runner prints at start; a triggered run's terminal lands
-in that runner's locked `Triggered` group, which exists only while it holds
-a tab.
+the endpoint URL a runner prints at start; a triggered run's terminal (and a
+CI job's) lands in that runner's locked `Triggered` group, which exists only
+while it holds a tab.
 
 `zeughaus-runner [--state-dir <dir>] mcp [--ci <url>]` is an MCP server on
 stdio, for an agent that starts it as a tool server. It dials the CI that
@@ -233,7 +238,7 @@ result); the view also offers Copy and the external editor (`$VISUAL` or
 A runner also runs the tasks of `<state-dir>/maintain.toml` (`[[task]]` with
 `name`, `command` as an argv, `every_minutes` and `timeout_minutes`,
 default 30) by itself, one at a time and only while it is idle: each is a
-run in the locked `Triggered` group, and while it runs the runner counts as
+run without a tab (reopen it from the palette), and while it runs the runner counts as
 held, so a toolchain update never swaps files under a build. The file is read
 every minute, a symlink is fine, and without it nothing runs. A task that
 does not end with code 0 raises a desktop notification in every connected

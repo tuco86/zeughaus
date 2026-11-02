@@ -64,6 +64,13 @@ pub struct SavedTerminal {
     /// Set for a job's terminal: what the runner that adopts it needs to
     /// finish the run's record when it ends.
     pub run: Option<SavedRun>,
+    /// What the terminal is; `None` in a file written before it was
+    /// recorded: a shell without a run, a job with one.
+    #[serde(default)]
+    pub kind: Option<zeughaus_link::ActivityKind>,
+    /// Unix seconds; 0 when unknown.
+    #[serde(default)]
+    pub started: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

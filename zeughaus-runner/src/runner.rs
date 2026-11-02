@@ -20,8 +20,8 @@ use zeughaus_core::{
     TypeConverters, Value, encode_scalar, occupancy_winner,
 };
 use zeughaus_link::{
-    ErrorRow, GraphChange, OutputRow, RejectionRow, RuntimeEvent, Snapshot, TOPIC_EDGE,
-    TOPIC_ERROR, TOPIC_MACHINE, TOPIC_OUTPUT,
+    ErrorRow, GraphChange, OutputRow, RejectionRow, RuntimeEvent, Snapshot, TOPIC_ACTIVITY,
+    TOPIC_EDGE, TOPIC_ERROR, TOPIC_MACHINE, TOPIC_OUTPUT,
 };
 use zeughaus_runtime::{DeferredWork, GraphExecutor};
 
@@ -305,6 +305,13 @@ impl Runner {
     pub fn report_alert(&mut self, title: String, body: String) {
         let seq = self.next_seq();
         self.emit(TOPIC_MACHINE, RuntimeEvent::Alert { seq, title, body });
+    }
+
+    /// Tells connected editors that one of this runner's terminals started,
+    /// exited or closed.
+    pub fn report_activity(&mut self, entry: zeughaus_link::ActivityEntry) {
+        let seq = self.next_seq();
+        self.emit(TOPIC_ACTIVITY, RuntimeEvent::Activity { seq, entry });
     }
 
     /// Publishes one event on `topic`. A failure is reported once per distinct

@@ -9,7 +9,7 @@
 //! and pure pixel math, no I/O, so the runtime's server and the editor's
 //! client cannot disagree about the protocol.
 //!
-//! One listener, thirteen paths, each a different weida pattern:
+//! One listener, fourteen paths, each a different weida pattern:
 //!
 //! | path | pattern | carries |
 //! |---|---|---|
@@ -19,6 +19,7 @@
 //! | [`TRIGGERS_PATH`] | push/pull | [`events::TriggerRequest`] from an editor |
 //! | [`RUNS_PATH`] | req/rep | [`runs`]: a range of one file of one run |
 //! | [`HOLD_PATH`] | req/rep | [`runs::HoldRequest`]: start no new runs |
+//! | [`ACTIVITY_PATH`] | req/rep | [`activity`]: the runner's terminals, live and archived |
 //! | [`AGENT_PATH`] | req/rep | [`agent`]: open a plan or master agent session in a terminal |
 //! | [`CI_PATH`] | req/rep | [`ci`]: channels, pipelines, machines, job transcripts |
 //! | [`ENLIST_PATH`] | one long exchange per runner | [`enlist`]: a runner takes assignments from the CI and streams output |
@@ -32,6 +33,7 @@
 //! files that hold the runner's identity and the client keys it trusts, and
 //! the endpoint file through which a local editor finds its runner.
 
+pub mod activity;
 pub mod agent;
 pub mod ci;
 pub mod credentials;
@@ -43,6 +45,10 @@ pub mod manual;
 pub mod runs;
 pub mod selector;
 
+pub use activity::{
+    ACTIVITY_PATH, ActivityEntry, ActivityKind, ActivityReply, ActivityRequest, ActivityState,
+    MAX_ACTIVITY_ENTRIES,
+};
 pub use agent::{AgentReply, AgentRequest, AgentSession, MAX_AGENT_BYTES};
 pub use ci::{
     ChannelView, CiOverview, CiReply, CiRequest, DocGroup, DocKind, DocState, DocView, JobDefView,
@@ -53,8 +59,8 @@ pub use ci::{
 };
 pub use events::{
     ErrorRow, MAX_EVENT_BYTES, MAX_SNAPSHOT_BYTES, MAX_TRIGGER_BYTES, OutputRow, RejectionRow,
-    RuntimeEvent, Snapshot, TOPIC_CI, TOPIC_EDGE, TOPIC_ERROR, TOPIC_MACHINE, TOPIC_OUTPUT,
-    TriggerRequest,
+    RuntimeEvent, Snapshot, TOPIC_ACTIVITY, TOPIC_CI, TOPIC_EDGE, TOPIC_ERROR, TOPIC_MACHINE,
+    TOPIC_OUTPUT, TriggerRequest,
 };
 pub use feed::{
     FeedRequest, FrameHeader, MAX_DIMENSION, MAX_SAMPLES_PER_AXIS, ladder, scale_to_fit,

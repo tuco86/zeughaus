@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use zeughaus_core::*;
 
-use crate::{JobSpec, ProcessHost, RunExit, RunHandle};
+use crate::{JobSpec, ProcessHost, RunExit, RunHandle, RunKind};
 
 /// One process with a beginning and an end.
 ///
@@ -141,7 +141,11 @@ impl ExecutableNode for JobNode {
                 run_dir: run_dir.clone(),
                 started,
                 artifacts: self.artifacts.clone(),
-                external,
+                kind: if external {
+                    RunKind::Trigger
+                } else {
+                    RunKind::Job
+                },
             })
             .map_err(ZeughausError::ExecutionFailed)?;
 
@@ -329,6 +333,26 @@ pub fn record_run_end(
     copy_artifacts(run_dir, cwd, artifacts)
 }
 
+/// The end a run's exit record (`record_run_end`'s `exit` file) holds:
+/// `None` while there is none, or when it names no `code=`.
+pub fn read_run_end(run_dir: &Path) -> Option<RunExit> {
+    let text = std::fs::read_to_string(run_dir.join("exit")).ok()?;
+    let mut exit = RunExit {
+        code: None,
+        killed: false,
+    };
+    let mut seen = false;
+    for line in text.lines() {
+        if let Some(code) = line.strip_prefix("code=") {
+            exit.code = code.parse().ok();
+            seen = true;
+        } else if let Some(killed) = line.strip_prefix("killed=") {
+            exit.killed = killed == "true";
+        }
+    }
+    seen.then_some(exit)
+}
+
 /// Copies every file a declared glob matches into `<run_dir>/artifacts/`,
 /// keeping its path relative to the directory the run worked in.
 ///
@@ -415,6 +439,7 @@ mod tests {
         use super::*;
         use crate::RunExit;
         use std::sync::Mutex;
+
         use std::sync::atomic::AtomicU64;
 
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -424,6 +449,29 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("zeughaus-job-{}-{n}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("scratch");
             dir
+        }
+
+        #[test]
+        fn the_exit_record_is_read_back() {
+            let dir = scratch();
+            assert_eq!(read_run_end(&dir), None);
+            std::fs::write(dir.join("exit"), "code=3\nkilled=false\nstarted=1\n").unwrap();
+            assert_eq!(
+                read_run_end(&dir),
+                Some(RunExit {
+                    code: Some(3),
+                    killed: false
+                })
+            );
+            std::fs::write(dir.join("exit"), "code=none\nkilled=true\n").unwrap();
+            assert_eq!(
+                read_run_end(&dir),
+                Some(RunExit {
+                    code: None,
+                    killed: true
+                })
+            );
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         struct FakeRun {
@@ -600,7 +648,7 @@ mod tests {
         }
 
         #[test]
-        fn only_an_external_press_starts_an_external_run() {
+        fn only_an_external_press_starts_a_triggered_run() {
             let host = FakeHost::new(ok_exit());
             let mut node = job(&host);
             node.set_parameter(
@@ -613,7 +661,7 @@ mod tests {
             .expect("fire");
             let mut ctx = NodeContext::new(NodeId(1));
             node.execute(&InputSet::new(), &mut ctx).expect("run");
-            assert!(host.spec().external);
+            assert_eq!(host.spec().kind, RunKind::Trigger);
             ctx.take_deferred().expect("deferred").run().expect("wait");
 
             // The flag is spent with the press: the `run` pin starts a run of
@@ -627,8 +675,8 @@ mod tests {
             assert!(fire(&mut node).expect("run").is_some());
             let specs = host.specs.lock().expect("specs");
             assert_eq!(
-                specs.iter().map(|spec| spec.external).collect::<Vec<_>>(),
-                [true, false, false]
+                specs.iter().map(|spec| spec.kind).collect::<Vec<_>>(),
+                [RunKind::Trigger, RunKind::Job, RunKind::Job]
             );
         }
 

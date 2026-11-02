@@ -26,11 +26,13 @@ use iced::futures::{SinkExt, Stream};
 use tokio::io::AsyncReadExt;
 use weida::{PeerEvent, PeerEvents, Requester, TransferMeta};
 use zeughaus_core::Image;
+use zeughaus_link::activity::MAX_ACTIVITY_REPLY_BYTES;
 use zeughaus_link::{
-    AGENT_PATH, AgentReply, AgentRequest, CI_PATH, CiReply, CiRequest, EVENTS_PATH, FEED_PATH,
-    FeedRequest, FrameHeader, HOLD_PATH, HoldReply, HoldRequest, MAX_AGENT_BYTES,
-    MAX_CI_REPLY_BYTES, MAX_EVENT_BYTES, MAX_HOLD_BYTES, MAX_SNAPSHOT_BYTES, RuntimeEvent,
-    SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, TriggerRequest, ladder,
+    ACTIVITY_PATH, AGENT_PATH, ActivityEntry, ActivityReply, ActivityRequest, AgentReply,
+    AgentRequest, CI_PATH, CiReply, CiRequest, EVENTS_PATH, FEED_PATH, FeedRequest, FrameHeader,
+    HOLD_PATH, HoldReply, HoldRequest, MAX_AGENT_BYTES, MAX_CI_REPLY_BYTES, MAX_EVENT_BYTES,
+    MAX_HOLD_BYTES, MAX_SNAPSHOT_BYTES, RuntimeEvent, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH,
+    TriggerRequest, ladder,
 };
 
 use crate::transport::{Endpoint, QUIC, client_tls, explain, first_dial, gave_up, policy};
@@ -392,6 +394,25 @@ pub async fn hold(endpoint: Endpoint, held: bool) -> Result<HoldReply, String> {
         .await
         .map_err(|e| format!("hold: {e}"))?;
     HoldReply::decode(&encoded).ok_or_else(|| "hold: malformed".to_owned())
+}
+
+/// The newest `limit` of a runner's terminals, live and archived.
+pub async fn activity(endpoint: Endpoint, limit: u32) -> Result<Vec<ActivityEntry>, String> {
+    let quic = QUIC.as_ref().ok_or("no QUIC runtime")?;
+    let url = endpoint.path(ACTIVITY_PATH)?;
+    let requester = quic.requester(client_tls());
+    first_dial(&url, || requester.connect(&url)).await?;
+    let reply = requester
+        .request(&ActivityRequest { limit }.encode())
+        .await
+        .map_err(|e| format!("activity: {e}"))?;
+    let encoded = reply
+        .collect(MAX_ACTIVITY_REPLY_BYTES)
+        .await
+        .map_err(|e| format!("activity: {e}"))?;
+    ActivityReply::decode(&encoded)
+        .map(|reply| reply.entries)
+        .ok_or_else(|| "activity: malformed".to_owned())
 }
 
 /// Opens a plan or master agent session on a runner, and reports the

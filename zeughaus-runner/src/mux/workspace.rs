@@ -141,6 +141,22 @@ impl Workspace {
         self.revision += 1;
     }
 
+    /// Whether the runner started `terminal` for itself.
+    pub fn owns(&self, terminal: TerminalId) -> bool {
+        self.owned.contains(&terminal)
+    }
+
+    /// A tab of its own at the end of the top level, showing `terminal`
+    /// under `title`: a closed terminal's output opened for reading.
+    pub fn add_tab(&mut self, terminal: TerminalId, title: String) -> Result<(), String> {
+        self.room_for(1, 1)?;
+        let mut tab = self.new_tab(SurfaceRef::Terminal(terminal));
+        tab.title = Some(title);
+        self.items.push(Item::Tab(tab));
+        self.revision += 1;
+        Ok(())
+    }
+
     /// The runner's locked group, created at the end of the top level the
     /// first time a run needs it.
     fn locked_group(&mut self) -> &mut Group {
@@ -511,7 +527,9 @@ impl Workspace {
                 self.tab_at_mut(pos).accent = *accent_rgba;
                 Applied::default()
             }
-            TopologyCommand::TakeControl { .. } | TopologyCommand::ReleaseControl { .. } => {
+            TopologyCommand::TakeControl { .. }
+            | TopologyCommand::ReleaseControl { .. }
+            | TopologyCommand::ReplayRun { .. } => {
                 return Err("not a structural command".to_owned());
             }
             TopologyCommand::AttachTerminal { terminal, target } => {
@@ -830,7 +848,7 @@ impl Workspace {
     }
 
     /// The pane showing `terminal`, if one does.
-    fn pane_of(&self, terminal: TerminalId) -> Option<PaneId> {
+    pub fn pane_of(&self, terminal: TerminalId) -> Option<PaneId> {
         self.tabs().find_map(|tab| {
             tab.root
                 .leaves()

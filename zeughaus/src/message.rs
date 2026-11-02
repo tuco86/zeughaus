@@ -298,6 +298,16 @@ pub enum Message {
     // still alive.
     #[cfg(not(target_arch = "wasm32"))]
     HoldReplied(Result<zeughaus_link::HoldReply, String>),
+    // Open a runner's archived run (a closed terminal's output) read-only in
+    // a tab of its own.
+    #[cfg(not(target_arch = "wasm32"))]
+    ReplayRun(crate::workspace::RunnerKey, u64),
+    // What a runner's terminals are doing, as `/activity` answered.
+    #[cfg(not(target_arch = "wasm32"))]
+    Activity(
+        crate::workspace::RunnerKey,
+        Result<Vec<zeughaus_link::ActivityEntry>, String>,
+    ),
     // What a runner's CI answered one of this editor's CI views, or what the
     // user did in one. The key is the runner, not its CI section. Native
     // only: the browser editor reaches no runner.

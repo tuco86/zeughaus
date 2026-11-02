@@ -335,6 +335,11 @@ pub enum TopologyCommand {
         pane: PaneId,
         to: PaneTarget,
     },
+    /// Open the output of a closed terminal the runner archived as run
+    /// `run` in a tab of its own, read-only. Needs minor 1.
+    ReplayRun {
+        run: u64,
+    },
 }
 
 /// A position in the tab bar: `index` into the top level (`group: None`) or

@@ -637,6 +637,20 @@ impl App {
                 label: link.label.as_str(),
                 detached: self.workspace.detached(key),
                 reachable: true,
+                // A replay needs mux minor 1 on both ends.
+                closed: if self.mux.get(key).is_some_and(|mux| mux.minor >= 1) {
+                    self.runtime
+                        .activity
+                        .get(key)
+                        .into_iter()
+                        .flatten()
+                        .filter(|e| e.state == zeughaus_link::ActivityState::Closed)
+                        .filter_map(|e| Some((e.label.as_str(), e.run?)))
+                        .take(palette::REOPEN_LISTED)
+                        .collect()
+                } else {
+                    Vec::new()
+                },
             })
             .collect();
         let pane_commands = self
@@ -1619,6 +1633,19 @@ impl App {
                     Err(e) => e,
                 };
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::ReplayRun(key, run) => {
+                self.workspace.expect_new_tab(&key);
+                self.send_topology(&key, zeughaus_mux::TopologyCommand::ReplayRun { run });
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::Activity(key, result) => match result {
+                Ok(entries) => {
+                    self.runtime.activity.insert(key, entries);
+                    self.rebuild_palette();
+                }
+                Err(e) => eprintln!("[activity] {e}"),
+            },
             // File dialogs are native-only (rfd). On wasm these are no-ops;
             // the runners hold the graphs instead.
             Message::SaveGraph => {

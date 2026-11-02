@@ -19,6 +19,8 @@ zeughaus-blobs.workspace = true
 # sessions that render the stored output.
 zeughaus-mux.workspace = true
 zeughaus-terminal.workspace = true
+# The parser of a run's `exit` record, which the CI's transcripts share.
+zeughaus-job.workspace = true
 tokio = { version = "1", features = [
     "rt",
     "rt-multi-thread",

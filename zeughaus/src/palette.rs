@@ -25,6 +25,11 @@ const THEME_COMMAND_ID: &str = "editor.theme";
 /// Which runner is runtime data too.
 const HOLD_COMMAND_ID: &str = "runner.hold";
 const RELEASE_COMMAND_ID: &str = "runner.release";
+#[cfg(not(target_arch = "wasm32"))]
+const REOPEN_COMMAND_ID: &str = "terminal.reopen";
+
+/// The closed terminals per runner the palette offers to reopen.
+pub const REOPEN_LISTED: usize = 20;
 
 /// What the palette offers about the runners this editor is connected to.
 ///
@@ -51,6 +56,9 @@ pub struct RunnerPalette<'a> {
     pub detached: &'a [DetachedTerminal],
     /// Whether its endpoint is known, so it can be held.
     pub reachable: bool,
+    /// Its closed terminals whose output it keeps, newest first: the label
+    /// and the run that holds the output.
+    pub closed: Vec<(&'a str, u64)>,
 }
 
 /// Build the list of palette commands: the editor's own, what the runner
@@ -154,6 +162,17 @@ fn runner_commands(state: &RunnerState<'_>) -> Vec<Command<Message>> {
                     runner.key.clone(),
                     detached.terminal,
                 )),
+            );
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        for (label, run) in &runner.closed {
+            commands.push(
+                command(
+                    REOPEN_COMMAND_ID,
+                    format!("Terminal / Reopen {} / {label}", runner.label),
+                )
+                .description("Open the closed terminal's output read-only")
+                .action(Message::ReplayRun(runner.key.clone(), *run)),
             );
         }
         if runner.reachable {

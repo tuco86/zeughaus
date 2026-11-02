@@ -5,6 +5,7 @@
 //! with a socket or a child process in it. The frame reader and writer are
 //! `zeughaus_terminal::frames`.
 
+mod close;
 mod persist;
 mod service;
 mod workspace;

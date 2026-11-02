@@ -40,6 +40,20 @@ use crate::workspace::RunnerKey;
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) const PARTICLE_SPEED: f32 = 240.0;
 
+/// Activity entries kept per runner.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) const ACTIVITY_KEPT: usize = 200;
+
+/// How far a terminal's life has come.
+#[cfg(not(target_arch = "wasm32"))]
+fn activity_rank(state: zeughaus_link::ActivityState) -> u8 {
+    match state {
+        zeughaus_link::ActivityState::Running => 0,
+        zeughaus_link::ActivityState::Exited => 1,
+        zeughaus_link::ActivityState::Closed => 2,
+    }
+}
+
 /// Shortest gap between two particles on one edge: at most ten per second. A
 /// 30 Hz source would otherwise smear into a solid line, which says less than
 /// countable dots do.
@@ -172,6 +186,10 @@ pub(super) struct RuntimeView {
     /// Which runner last reported a delivery on an edge, for the same reason.
     #[cfg(not(target_arch = "wasm32"))]
     pub edge_reported_by: HashMap<EdgeId, RunnerKey>,
+    /// Each runner's terminals as `/activity` and its events said, newest
+    /// first, at most [`ACTIVITY_KEPT`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub activity: BTreeMap<RunnerKey, Vec<zeughaus_link::ActivityEntry>>,
 }
 
 impl App {
@@ -245,8 +263,19 @@ impl App {
                 }
                 self.update_display_values();
                 // Events missed during a gap are not replayed, so the CI views
-                // ask for what they show again.
-                return self.resync_ci(&key);
+                // and the activity ask for what they show again.
+                let activity = match self.runtime.links.get(&key) {
+                    Some(link) if link.kind == LinkKind::Runner => {
+                        let endpoint = link.endpoint.clone();
+                        let runner = key.clone();
+                        Task::perform(
+                            feed::activity(endpoint, ACTIVITY_KEPT as u32),
+                            move |result| Message::Activity(runner.clone(), result),
+                        )
+                    }
+                    _ => Task::none(),
+                };
+                return Task::batch([activity, self.resync_ci(&key)]);
             }
             Traffic::Event(RuntimeEvent::Output {
                 seq,
@@ -364,6 +393,21 @@ impl App {
             // for the documents again.
             Traffic::Event(RuntimeEvent::CiDocs { repo, .. }) => {
                 return self.apply_ci_docs_event(&key, repo);
+            }
+            // Events travel on streams of their own and may arrive out of
+            // order; a terminal only ever moves from running to exited to
+            // closed, so an older state never replaces a newer one.
+            Traffic::Event(RuntimeEvent::Activity { entry, .. }) => {
+                let entries = self.runtime.activity.entry(key).or_default();
+                if let Some(held) = entries.iter().find(|e| e.terminal == entry.terminal)
+                    && activity_rank(held.state) > activity_rank(entry.state)
+                {
+                    return Task::none();
+                }
+                entries.retain(|e| e.terminal != entry.terminal);
+                entries.insert(0, entry);
+                entries.truncate(ACTIVITY_KEPT);
+                self.rebuild_palette();
             }
             Traffic::Lost => {
                 if let Some(link) = self.runtime.links.get_mut(&key) {
@@ -538,6 +582,7 @@ impl App {
             .collect();
         for key in &gone {
             self.runtime.links.remove(key);
+            self.runtime.activity.remove(key);
             self.forget_runner_values(key, false);
             self.forget_runner_graphs(key);
             self.mux.remove(key);

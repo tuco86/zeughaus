@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   labels a runner's section by that name, and dials a runner only a CI
   announces as `<name>.runner.zeughaus`, which its own resolver answers
   from the announced addresses. The enlist protocol is major 10.
+- Runner activity: every terminal a runner owns (shells, agent sessions, job
+  runs, CI jobs, maintenance) is reported on the new `/activity` path and as
+  `activity` events when it starts, exits and closes. A shell or session
+  whose child exits closes by itself (`close_on_exit` in `zeughaus.toml`:
+  `always` by default, `success` or `never`), and a closed one's output is
+  archived under `runs/` with an `activity.json`; the palette's "Terminal /
+  Reopen" opens it read-only (`ReplayRun`, mux protocol minor 1).
+  Maintenance runs no longer open a tab.
 - Upstream pipelines: a job header's `on = ["push main of weida"]` follows
   another repository of `ci.toml`. When a push to weida's `main` is set up
   and is still the branch's head, the CI queues an `upstream` event for

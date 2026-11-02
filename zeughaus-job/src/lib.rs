@@ -17,7 +17,7 @@
 
 mod node;
 
-pub use node::{JobNode, record_run_end};
+pub use node::{JobNode, read_run_end, record_run_end};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -45,10 +45,21 @@ pub struct JobSpec {
     /// The artifact globs, relative to `cwd`, copied when the run ends.
     /// Carried so a host that outlives the node's wait can finish the run.
     pub artifacts: Vec<String>,
-    /// Whether the press that started this run came from outside an editor.
-    /// The host shows such a run where nobody has to go looking for it; a
-    /// run started by the `run` pin never is one.
-    pub external: bool,
+    /// What started this run, which decides where the host shows it.
+    pub kind: RunKind,
+}
+
+/// What started a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunKind {
+    /// The node's `run` pin or a press in an editor.
+    Job,
+    /// A press from outside any editor (`zeughaus-runner trigger`).
+    Trigger,
+    /// A job the CI assigned.
+    CiJob,
+    /// A task of `maintain.toml`.
+    Maintenance,
 }
 
 /// How a run ended.

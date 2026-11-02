@@ -21,7 +21,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use zeughaus_job::{JobSpec, ProcessHost, RunExit, RunHandle, record_run_end};
+use zeughaus_job::{
+    JobSpec, ProcessHost, RunExit, RunHandle, RunKind, read_run_end, record_run_end,
+};
 use zeughaus_link::enlist::{
     Assignment, FromRunner, Input, InputSource, MAX_OUTPUT_CHUNK, MAX_STATES, Place, RunEnd,
     StateOutcome, StateResult, StateSave, Upload, parse_run_id, run_id,
@@ -534,7 +536,7 @@ impl Executor {
             run_dir: run_dir.to_path_buf(),
             started,
             artifacts: Vec::new(),
-            external: true,
+            kind: RunKind::CiJob,
         };
         let handle = match self.host.spawn(spec) {
             Ok(handle) => handle,
@@ -921,7 +923,7 @@ impl Executor {
             {
                 vm.adopt();
             }
-            if read_exit_record(&run_dir).is_none() && !self.host.has_run(&run_dir) {
+            if read_run_end(&run_dir).is_none() && !self.host.has_run(&run_dir) {
                 let exit = RunExit {
                     code: None,
                     killed: true,
@@ -935,7 +937,7 @@ impl Executor {
                 .name("zeughaus-enlist-watch".into())
                 .spawn(move || {
                     let exit = loop {
-                        if let Some(exit) = read_exit_record(&run_dir) {
+                        if let Some(exit) = read_run_end(&run_dir) {
                             break exit;
                         }
                         std::thread::sleep(RECOVERY_POLL);
@@ -1057,25 +1059,6 @@ fn pump(
         *sent += n as u64;
         total += n as u64;
     }
-}
-
-/// Reads `code=` and `killed=` from a run's exit record.
-fn read_exit_record(run_dir: &Path) -> Option<RunExit> {
-    let text = std::fs::read_to_string(run_dir.join("exit")).ok()?;
-    let mut exit = RunExit {
-        code: None,
-        killed: false,
-    };
-    let mut seen = false;
-    for line in text.lines() {
-        if let Some(code) = line.strip_prefix("code=") {
-            exit.code = code.parse().ok();
-            seen = true;
-        } else if let Some(killed) = line.strip_prefix("killed=") {
-            exit.killed = killed == "true";
-        }
-    }
-    seen.then_some(exit)
 }
 
 #[cfg(test)]
@@ -1288,29 +1271,6 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             dir
-        }
-
-        #[test]
-        fn the_exit_record_is_read_back() {
-            let dir = scratch("exit");
-            assert_eq!(read_exit_record(&dir), None);
-            std::fs::write(dir.join("exit"), "code=3\nkilled=false\nstarted=1\n").unwrap();
-            assert_eq!(
-                read_exit_record(&dir),
-                Some(RunExit {
-                    code: Some(3),
-                    killed: false
-                })
-            );
-            std::fs::write(dir.join("exit"), "code=none\nkilled=true\n").unwrap();
-            assert_eq!(
-                read_exit_record(&dir),
-                Some(RunExit {
-                    code: None,
-                    killed: true
-                })
-            );
-            let _ = std::fs::remove_dir_all(&dir);
         }
 
         /// The log goes out from the offset it is asked to start at, in pieces

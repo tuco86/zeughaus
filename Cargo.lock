@@ -7356,6 +7356,7 @@ dependencies = [
  "toml",
  "weida",
  "zeughaus-blobs",
+ "zeughaus-job",
  "zeughaus-link",
  "zeughaus-mux",
  "zeughaus-terminal",

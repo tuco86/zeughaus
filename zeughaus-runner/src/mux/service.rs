@@ -16,29 +16,38 @@
 //! larger deltas, never a queue of them.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use weida::{IncomingRequest, Replier, TransferMeta};
+use zeughaus_job::{RunExit, read_run_end, record_run_end};
+use zeughaus_link::{ActivityEntry, ActivityKind, ActivityState};
 use zeughaus_mux::message::{Capability, Command, ErrorCode};
 use zeughaus_mux::workspace::ProfileId;
 use zeughaus_mux::{
     ClientHello, ClientInstanceId, CommandOutcome, CommandReply, ControlAttach, Controller,
-    Dimensions, MAJOR, MINOR, Message, RequestId, ResourceFetch, RowFetch, RunnerIncarnation,
-    ServerHello, TerminalAttach, TerminalCommand, TerminalId, TopologyCommand, WireError,
-    WorkspaceSnapshot,
+    Dimensions, ExitState, MAJOR, MINOR, Message, RequestId, ResourceFetch, RowFetch,
+    RunnerIncarnation, ServerHello, TerminalAttach, TerminalCommand, TerminalId, TopologyCommand,
+    WireError, WorkspaceSnapshot,
 };
 use zeughaus_terminal::frames::{ReadError, read_frame, write_frame};
 use zeughaus_terminal::serve::{fetch_resource, fetch_rows, stream_terminal};
-use zeughaus_terminal::wal::Wal;
+use zeughaus_terminal::wal::{self, Wal, WalWriter};
 use zeughaus_terminal::{Profile, Session, TerminalHost};
 
+use super::close;
 use super::persist::{self, SavedRun, SavedTerminal};
 use super::workspace::Workspace;
 use super::{GraphSync, OwnedPlacement};
+use crate::runs::{RunActivity, RunDirs, read_activity, write_activity};
 use crate::transport::principal_of;
+
+/// How often the reaper looks for terminals whose child exited.
+const REAP_EVERY: Duration = Duration::from_millis(250);
 
 /// How long after a client vanishes its leases are held for it, so a network
 /// blink does not make its terminals read-only.
@@ -88,6 +97,12 @@ struct TerminalMeta {
     label: String,
     scrollback_rows: usize,
     run: Option<SavedRun>,
+    kind: ActivityKind,
+    /// Unix seconds.
+    started: u64,
+    /// A closed terminal's output opened for reading: never saved, never
+    /// archived, never reported as activity.
+    replay: bool,
 }
 
 /// The document's graphs as far as the panes that show them care.
@@ -118,6 +133,10 @@ struct Inner {
     next_terminal: AtomicU64,
     /// The workspace revision, for control exchanges to wake on.
     revision: watch::Sender<u64>,
+    /// Where closed shells and sessions are archived.
+    run_dirs: Arc<RunDirs>,
+    /// Where activity goes; set when the reaper starts.
+    activity: OnceLock<Sender<ActivityEntry>>,
 }
 
 impl Inner {
@@ -149,6 +168,7 @@ impl MuxService {
         incarnation: RunnerIncarnation,
         profiles: Vec<Profile>,
         host: TerminalHost,
+        run_dirs: Arc<RunDirs>,
     ) -> MuxService {
         let profiles = if profiles.is_empty() {
             vec![Profile::default_shell()]
@@ -169,6 +189,8 @@ impl MuxService {
                 clients: Mutex::new(HashMap::new()),
                 next_terminal: AtomicU64::new(1),
                 revision,
+                run_dirs,
+                activity: OnceLock::new(),
             }),
         };
         #[cfg(unix)]
@@ -210,6 +232,13 @@ impl MuxService {
                             label: terminal.label.clone(),
                             scrollback_rows: terminal.scrollback_rows,
                             run: terminal.run.clone(),
+                            kind: terminal.kind.unwrap_or(if terminal.run.is_some() {
+                                ActivityKind::Job
+                            } else {
+                                ActivityKind::Shell
+                            }),
+                            started: terminal.started,
+                            replay: false,
                         },
                     );
                 }
@@ -296,13 +325,15 @@ impl MuxService {
             let mut terminals: Vec<SavedTerminal> = sessions
                 .iter()
                 .filter_map(|(id, session)| {
-                    let meta = meta.get(id)?;
+                    let meta = meta.get(id).filter(|meta| !meta.replay)?;
                     Some(SavedTerminal {
                         id: *id,
                         label: meta.label.clone(),
                         scrollback_rows: meta.scrollback_rows,
                         size: session.size(),
                         run: meta.run.clone(),
+                        kind: Some(meta.kind),
+                        started: meta.started,
                     })
                 })
                 .collect();
@@ -375,11 +406,21 @@ impl MuxService {
         size: Dimensions,
         run: Option<SavedRun>,
         placement: OwnedPlacement,
+        kind: ActivityKind,
     ) -> Result<TerminalId, String> {
         let id = TerminalId(self.inner.next_terminal.fetch_add(1, Ordering::Relaxed));
         let session = Session::spawn(id, &profile, size, wal, &self.inner.host)
             .map_err(|e| format!("cannot start {}: {e}", profile.label))?;
         self.follow_title(&session);
+        let meta = TerminalMeta {
+            label: profile.label,
+            scrollback_rows: profile.scrollback_rows,
+            run,
+            kind,
+            started: now_secs(),
+            replay: false,
+        };
+        let running = self.entry(id, &meta, ActivityState::Running, None);
         let revision = {
             // The lock order is the one `snapshot` takes: sessions, then
             // the workspace.
@@ -399,12 +440,283 @@ impl MuxService {
                 .meta
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
+                .insert(id, meta);
+            workspace.revision()
+        };
+        self.inner.publish_revision(revision);
+        self.persist();
+        self.emit(running);
+        Ok(id)
+    }
+
+    /// Starts the thread that notices exited children: it reports each
+    /// exit on `activity` (where every other activity goes from now on
+    /// too) and closes a shell or session whose exit `close_on_exit` in
+    /// `<state-dir>/zeughaus.toml` says to close. Its first sweep handles
+    /// the terminals that exited while no runner watched.
+    pub fn start_reaper(&self, state_dir: PathBuf, activity: Sender<ActivityEntry>) {
+        let _ = self.inner.activity.set(activity);
+        let service = self.clone();
+        let started = std::thread::Builder::new()
+            .name("zeughaus-reaper".to_owned())
+            .spawn(move || {
+                let mut seen: HashSet<TerminalId> = HashSet::new();
+                loop {
+                    service.reap(&state_dir, &mut seen);
+                    std::thread::sleep(REAP_EVERY);
+                }
+            });
+        if let Err(e) = started {
+            eprintln!("[mux] cannot start the reaper: {e}");
+        }
+    }
+
+    /// One sweep of the reaper. `seen` holds the terminals whose exit was
+    /// handled already.
+    fn reap(&self, state_dir: &Path, seen: &mut HashSet<TerminalId>) {
+        let exited: Vec<(TerminalId, ExitState)> = {
+            let sessions = self
+                .inner
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            seen.retain(|id| sessions.contains_key(id));
+            sessions
+                .iter()
+                .filter(|(id, _)| !seen.contains(id))
+                .filter_map(|(id, session)| Some((*id, session.exit()?)))
+                .collect()
+        };
+        if exited.is_empty() {
+            return;
+        }
+        let policy = close::policy(state_dir);
+        for (id, exit) in exited {
+            seen.insert(id);
+            let found = {
+                let metas = self.inner.meta.lock().unwrap_or_else(|e| e.into_inner());
+                metas.get(&id).map(|meta| {
+                    (
+                        self.entry(id, meta, ActivityState::Exited, Some(&exit)),
+                        meta.run.is_some(),
+                        meta.replay,
+                    )
+                })
+            };
+            let Some((entry, has_run, replay)) = found else {
+                continue;
+            };
+            if !replay {
+                self.emit(entry);
+            }
+            if close::closes(policy, &exit, has_run, replay)
+                && let Err(e) = self.close_terminal(id)
+            {
+                eprintln!("[mux] cannot close exited {id}: {e}");
+            }
+        }
+    }
+
+    /// Sends `entry` to the activity channel, once there is one.
+    fn emit(&self, entry: ActivityEntry) {
+        if let Some(tx) = self.inner.activity.get() {
+            let _ = tx.send(entry);
+        }
+    }
+
+    /// The run directory id of a job's terminal.
+    fn run_of(&self, meta: &TerminalMeta) -> Option<u64> {
+        meta.run
+            .as_ref()
+            .and_then(|run| self.inner.run_dirs.id_of(&run.run_dir))
+    }
+
+    /// What activity says about terminal `id` in `state`. A terminal closed
+    /// without an exit code counts as killed.
+    fn entry(
+        &self,
+        id: TerminalId,
+        meta: &TerminalMeta,
+        state: ActivityState,
+        exit: Option<&ExitState>,
+    ) -> ActivityEntry {
+        let code = match exit {
+            Some(ExitState::Exited { code }) => i32::try_from(*code).ok(),
+            _ => None,
+        };
+        let killed = match state {
+            ActivityState::Closed => !matches!(exit, Some(ExitState::Exited { .. })),
+            _ => matches!(exit, Some(ExitState::Killed)),
+        };
+        ActivityEntry {
+            terminal: id.0,
+            run: self.run_of(meta),
+            kind: meta.kind,
+            label: meta.label.clone(),
+            state,
+            started: meta.started,
+            ended: (state != ActivityState::Running).then(now_secs),
+            code,
+            killed,
+        }
+    }
+
+    /// Every live terminal but the replays, newest first.
+    pub fn activity(&self) -> Vec<ActivityEntry> {
+        let sessions = self
+            .inner
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let metas = self.inner.meta.lock().unwrap_or_else(|e| e.into_inner());
+        let mut entries: Vec<ActivityEntry> = sessions
+            .iter()
+            .filter_map(|(id, session)| {
+                let meta = metas.get(id).filter(|meta| !meta.replay)?;
+                let exit = session.exit();
+                let state = if exit.is_some() {
+                    ActivityState::Exited
+                } else {
+                    ActivityState::Running
+                };
+                Some(self.entry(*id, meta, state, exit.as_ref()))
+            })
+            .collect();
+        entries.sort_by_key(|e| std::cmp::Reverse((e.started, e.terminal)));
+        entries
+    }
+
+    /// The shim directory of terminal `id`; `None` when terminals have no
+    /// directory (they die with this process).
+    fn shim_dir(&self, id: TerminalId) -> Option<PathBuf> {
+        match &self.inner.host {
+            TerminalHost::Local => {
+                let _ = id;
+                None
+            }
+            #[cfg(unix)]
+            TerminalHost::Shim(shim) => Some(shim.dir(id)),
+        }
+    }
+
+    /// Keeps a closing shell's or session's output as a run of its own:
+    /// its WAL, its exit and what it was. Called before the session is
+    /// killed, because the shim removes its directory with it. `None` when
+    /// there is nothing to keep it from.
+    fn archive(
+        &self,
+        id: TerminalId,
+        meta: &TerminalMeta,
+        exit: Option<&ExitState>,
+        cols: u16,
+    ) -> Option<u64> {
+        let shim = self.shim_dir(id)?;
+        let (run, dir) = match self.inner.run_dirs.create() {
+            Ok(created) => created,
+            Err(e) => {
+                eprintln!("[mux] {id}: cannot archive: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = copy_wal(&shim, &dir.join("wal")) {
+            eprintln!("[mux] {id}: cannot archive its output: {e}");
+        }
+        let end = match exit {
+            Some(ExitState::Exited { code }) => RunExit {
+                code: Some(i32::try_from(*code).unwrap_or(-1)),
+                killed: false,
+            },
+            _ => RunExit {
+                code: None,
+                killed: true,
+            },
+        };
+        if let Err(e) = record_run_end(&dir, end, meta.started, None, &[]) {
+            eprintln!("[mux] {id}: {e}");
+        }
+        let activity = RunActivity {
+            kind: meta.kind,
+            label: meta.label.clone(),
+            terminal: id.0,
+            cols,
+        };
+        if let Err(e) = write_activity(&dir, &activity) {
+            eprintln!("[mux] {id}: {e}");
+        }
+        Some(run)
+    }
+
+    /// Opens archived run `run` read-only in a tab of its own.
+    fn replay(&self, run: u64) -> CommandOutcome {
+        let refused = |reason: String| CommandOutcome::Refused { reason };
+        let dir = self.inner.run_dirs.dir(run);
+        let records = match wal::read(&dir.join("wal")) {
+            Ok(records) => records,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return refused(format!("run {run} has no output"));
+            }
+            Err(e) => return refused(format!("run {run}: {e}")),
+        };
+        let activity = read_activity(&dir);
+        let cols = activity.as_ref().map_or(80, |a| a.cols);
+        let label = activity
+            .as_ref()
+            .map_or_else(|| format!("run {run}"), |a| a.label.clone());
+        let title = format!("{label} (closed)");
+        let id = TerminalId(self.inner.next_terminal.fetch_add(1, Ordering::Relaxed));
+        let session = Session::fed(
+            id,
+            Dimensions { cols, rows: 24 },
+            crate::jobs::RUN_SCROLLBACK_ROWS,
+            &title,
+        );
+        for record in &records {
+            session.feed(&record.bytes);
+        }
+        session.finish(match read_run_end(&dir) {
+            Some(RunExit {
+                code: Some(code), ..
+            }) if code >= 0 => ExitState::Exited { code: code as u32 },
+            _ => ExitState::Killed,
+        });
+        match self.insert_fed(session, title) {
+            Ok(_) => CommandOutcome::Applied {
+                revision: *self.inner.revision.borrow(),
+            },
+            Err(reason) => refused(reason),
+        }
+    }
+
+    /// Shows `session`, a fed one, in a tab at the end of the top level.
+    /// Closing the tab ends it and keeps nothing.
+    pub fn insert_fed(&self, session: Session, title: String) -> Result<TerminalId, String> {
+        let id = session.id();
+        let revision = {
+            let mut sessions = self
+                .inner
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut workspace = self
+                .inner
+                .workspace
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            workspace.add_tab(id, title.clone())?;
+            sessions.insert(id, session);
+            self.inner
+                .meta
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(
                     id,
                     TerminalMeta {
-                        label: profile.label,
-                        scrollback_rows: profile.scrollback_rows,
-                        run,
+                        label: title,
+                        scrollback_rows: crate::jobs::RUN_SCROLLBACK_ROWS,
+                        run: None,
+                        kind: ActivityKind::Shell,
+                        started: now_secs(),
+                        replay: true,
                     },
                 );
             workspace.revision()
@@ -437,10 +749,22 @@ impl MuxService {
         }
     }
 
-    /// Ends a terminal the runner owns and forgets it, whether a pane shows
-    /// it or not. The same path a client's `CloseTerminal` takes.
+    /// Ends a terminal and forgets it, whether a pane shows it or not: a
+    /// terminal the runner owns the way a client's `CloseTerminal` does, a
+    /// pane's shell by closing its pane.
     pub fn close_terminal(&self, terminal: TerminalId) -> Result<(), String> {
-        match self.structural(&TopologyCommand::CloseTerminal { terminal }) {
+        let command = {
+            let workspace = self
+                .inner
+                .workspace
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match workspace.pane_of(terminal) {
+                Some(pane) if !workspace.owns(terminal) => TopologyCommand::ClosePane { pane },
+                _ => TopologyCommand::CloseTerminal { terminal },
+            }
+        };
+        match self.structural(&command) {
             CommandOutcome::Applied { .. } => Ok(()),
             CommandOutcome::Refused { reason } => Err(reason),
         }
@@ -807,13 +1131,11 @@ impl MuxService {
             .terminals()
             .filter_map(|t| sessions.get(&t).map(|s| s.head(0)))
             .collect();
-        let _ = hello;
         zeughaus_mux::message::ControlAttached {
             hello: ServerHello {
                 major: MAJOR,
-                // The lower of the two minors; with this side at zero that
-                // is always zero, and a real negotiation comes with MINOR 1.
-                minor: MINOR,
+                // The lower of the two minors.
+                minor: hello.minor.min(MINOR),
                 incarnation: self.inner.incarnation,
                 capabilities: Vec::<Capability>::new(),
                 principal: principal.to_owned(),
@@ -1001,6 +1323,9 @@ impl MuxService {
     }
 
     fn structural(&self, command: &TopologyCommand) -> CommandOutcome {
+        if let TopologyCommand::ReplayRun { run } = command {
+            return self.replay(*run);
+        }
         let mut spawned: Vec<(TerminalId, Session, TerminalMeta)> = Vec::new();
         let mut spawn = |profile: ProfileId| -> Result<TerminalId, String> {
             let profile = self
@@ -1021,6 +1346,9 @@ impl MuxService {
                 label: profile.label.clone(),
                 scrollback_rows: profile.scrollback_rows,
                 run: None,
+                kind: ActivityKind::Shell,
+                started: now_secs(),
+                replay: false,
             };
             spawned.push((id, session, meta));
             Ok(id)
@@ -1039,6 +1367,8 @@ impl MuxService {
         };
         match result {
             Ok((revision, applied)) => {
+                let mut running = Vec::new();
+                let mut forgotten = Vec::new();
                 {
                     let mut sessions = self
                         .inner
@@ -1048,20 +1378,24 @@ impl MuxService {
                     let mut metas = self.inner.meta.lock().unwrap_or_else(|e| e.into_inner());
                     for (id, session, meta) in spawned {
                         self.follow_title(&session);
+                        running.push(self.entry(id, &meta, ActivityState::Running, None));
                         sessions.insert(id, session);
                         metas.insert(id, meta);
                     }
                     let mut leases = self.inner.leases.lock().unwrap_or_else(|e| e.into_inner());
                     for id in &applied.killed {
                         leases.remove(id);
-                        metas.remove(id);
-                        if let Some(session) = sessions.remove(id) {
-                            session.kill();
-                        }
+                        forgotten.push((*id, sessions.remove(id), metas.remove(id)));
                     }
                 }
                 self.inner.publish_revision(revision);
                 self.persist();
+                for entry in running {
+                    self.emit(entry);
+                }
+                for (id, session, meta) in forgotten {
+                    self.forgotten(id, session, meta);
+                }
                 CommandOutcome::Applied { revision }
             }
             Err(reason) => {
@@ -1072,6 +1406,24 @@ impl MuxService {
                 }
                 CommandOutcome::Refused { reason }
             }
+        }
+    }
+
+    /// Ends a terminal the workspace let go of: a shell's or session's
+    /// output is archived first, and every one but a replay is reported
+    /// closed.
+    fn forgotten(&self, id: TerminalId, session: Option<Session>, meta: Option<TerminalMeta>) {
+        if let Some(meta) = meta.filter(|meta| !meta.replay) {
+            let exit = session.as_ref().and_then(Session::exit);
+            let mut entry = self.entry(id, &meta, ActivityState::Closed, exit.as_ref());
+            if meta.run.is_none() {
+                let cols = session.as_ref().map_or(80, |s| s.size().cols);
+                entry.run = self.archive(id, &meta, exit.as_ref(), cols);
+            }
+            self.emit(entry);
+        }
+        if let Some(session) = session {
+            session.kill();
         }
     }
 
@@ -1097,6 +1449,30 @@ impl MuxService {
     }
 }
 
+/// Unix seconds now.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Copies the records of a shim's capped WAL (`wal.1`, then `wal`) into a
+/// fresh WAL at `to`. A missing file is skipped.
+fn copy_wal(shim_dir: &Path, to: &Path) -> std::io::Result<()> {
+    let mut writer = WalWriter::open(to, None)?;
+    for name in ["wal.1", "wal"] {
+        let records = match wal::read(&shim_dir.join(name)) {
+            Ok(records) => records,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        for record in records {
+            writer.append(record.at_micros, &record.bytes)?;
+        }
+    }
+    Ok(())
+}
+
 fn gone(e: &str) -> WireError {
     WireError {
         code: ErrorCode::Protocol,
@@ -1112,12 +1488,19 @@ fn gone(e: &str) -> WireError {
 mod tests {
     use super::*;
 
+    /// Run directories nothing is archived into: terminals in this process
+    /// have no WAL of their own to keep.
+    fn no_runs() -> Arc<RunDirs> {
+        Arc::new(RunDirs::new(Path::new("/nonexistent-zeughaus-state"), 1))
+    }
+
     #[test]
     fn a_graph_tab_is_named_after_its_node_and_only_a_known_graph_opens() {
         let service = MuxService::new(
             RunnerIncarnation::from_bytes([7; 16]),
             Vec::new(),
             TerminalHost::Local,
+            no_runs(),
         );
         // Before the first sync nothing is known, so nothing is refused.
         assert!(matches!(
@@ -1234,6 +1617,7 @@ mod tests {
                 RunnerIncarnation::from_bytes([7; 16]),
                 vec![shell],
                 TerminalHost::Local,
+                no_runs(),
             );
             tokio::spawn(service.clone().accept(replier));
             let url = EndpointAddr {
@@ -1886,6 +2270,7 @@ mod tests {
                     Dimensions { cols: 80, rows: 24 },
                     None,
                     OwnedPlacement::Detached,
+                    ActivityKind::Job,
                 )
                 .expect("start the job's process");
 

@@ -11,6 +11,7 @@
 //! This runner executes every graph of its own document. An editor attached
 //! to several runners shows several documents side by side.
 
+mod activity;
 mod agents;
 mod cli;
 mod enlist;
@@ -44,8 +45,8 @@ use std::time::Duration;
 
 use zeughaus_core::{NodeId, Value, ZeughausError};
 use zeughaus_link::{
-    EVENTS_PATH, FEED_PATH, GRAPH_PATH, GraphChange, HOLD_PATH, MUX_PATH, RUNS_PATH, SNAPSHOT_PATH,
-    Snapshot, TRIGGERS_PATH, TriggerRequest, credentials,
+    ACTIVITY_PATH, ActivityEntry, EVENTS_PATH, FEED_PATH, GRAPH_PATH, GraphChange, HOLD_PATH,
+    MUX_PATH, RUNS_PATH, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, TriggerRequest, credentials,
 };
 use zeughaus_runtime::DeferredWork;
 
@@ -277,6 +278,8 @@ fn main() -> ExitCode {
     let mut job_host: Option<Arc<JobHost>> = None;
     // What a failed maintenance task asks the loop below to publish.
     let (alert_tx, alert_rx) = std::sync::mpsc::channel::<maintain::Alert>();
+    // What the mux's terminals do, for the loop below to publish.
+    let (activity_tx, activity_rx) = std::sync::mpsc::channel::<ActivityEntry>();
     // Kept for the restart, which saves the workspace before it `exec`s.
     let mut mux_service: Option<MuxService> = None;
     let (graphs, graph_rx, initial) = GraphService::load(&state_dir);
@@ -309,16 +312,25 @@ fn main() -> ExitCode {
         // that a restarted runner's terminals are not the ones it cached.
         match listener.replier(MUX_PATH) {
             Ok(replier) => {
+                let runs = Arc::new(runs::RunDirs::new(&state_dir, keep_runs));
                 let service = MuxService::new(
                     mux::incarnation(),
                     Vec::new(),
                     terminal_host(exe.as_ref().ok(), &state_dir),
+                    Arc::clone(&runs),
                 );
                 rt.spawn(service.clone().accept(replier));
                 // A run is a terminal this process owns, so the job host is
-                // the mux service plus the state directory its logs go in.
-                let host = Arc::new(JobHost::new(service.clone(), state_dir.clone(), keep_runs));
+                // the mux service plus the run directories its logs go in.
+                let host = Arc::new(JobHost::new(service.clone(), Arc::clone(&runs)));
                 host.adopt_runs();
+                service.start_reaper(state_dir.clone(), activity_tx);
+                match listener.replier(ACTIVITY_PATH) {
+                    Ok(replier) => {
+                        rt.spawn(activity::serve(replier, service.clone(), runs));
+                    }
+                    Err(e) => eprintln!("[runner] no activity service: {e}"),
+                }
                 job_host = Some(host);
                 mux_service = Some(service);
             }
@@ -544,6 +556,9 @@ fn main() -> ExitCode {
 
         while let Ok(alert) = alert_rx.try_recv() {
             runner.report_alert(alert.title, alert.body);
+        }
+        while let Ok(entry) = activity_rx.try_recv() {
+            runner.report_activity(entry);
         }
 
         if had_changes || ticked || fired {
