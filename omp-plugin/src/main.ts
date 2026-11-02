@@ -15,6 +15,8 @@
 //   tool opens omp's plan review view with Save and approve, Save (both store the plan in the CI
 //   and end the session) or Refine (the view's annotations go back to the agent as the tool's
 //   result).
+// - in a zeughaus terminal (`ZEUGHAUS_TERMINAL`), reports the main agent's state (idle, working,
+//   waiting, asking, review, failed) to the runner, which shows it on the tab (agent-status.ts).
 //
 // The factory only registers: `omp plugin install` runs it against a throwaway API, so it must
 // do no work at load. Every handler skips subagents, which have prompts of their own, except the
@@ -28,7 +30,9 @@ import { basename, join, resolve } from "node:path";
 // is rewritten that way, a dynamic `import()` of it fails to resolve.
 import { PlanReviewOverlay } from "@oh-my-pi/pi-tui/overlays/plan-review-overlay";
 import { copyToClipboard } from "@oh-my-pi/pi-coding-agent/utils/clipboard";
+import { agentReporter } from "./agent-status.ts";
 import { planModePrompt } from "./plan-mode.ts";
+import { masterPlan, planSession, sessionId } from "./session-env.ts";
 
 // The parts of omp's extension API this plugin uses; omp ships no type package to import.
 interface Exec {
@@ -84,6 +88,14 @@ interface Events {
   session_start: (event: unknown, ctx: Ctx) => void;
   session_switch: (event: unknown, ctx: Ctx) => void;
   agent_start: (event: unknown, ctx: Ctx) => void;
+  agent_end: (
+    event: {
+      messages: Array<{ role?: string; stopReason?: string; errorMessage?: string }>;
+      isTerminal?: boolean;
+    },
+    ctx: Ctx,
+  ) => void;
+  session_shutdown: (event: unknown, ctx: Ctx) => void;
   session_stop: (
     event: { stop_hook_active?: boolean },
     ctx: Ctx,
@@ -640,26 +652,6 @@ function newestPlan(ctx: Ctx): string | undefined {
   return newest?.path;
 }
 
-/** `ZEUGHAUS_PLAN=<repo>#<n>`: the plan a master started this session on. */
-function masterPlan(): { repo: string; number: number } | undefined {
-  const m = /^([a-z0-9][a-z0-9-]*)#([1-9][0-9]*)$/.exec(process.env.ZEUGHAUS_PLAN ?? "");
-  return m ? { repo: m[1] as string, number: Number(m[2]) } : undefined;
-}
-
-/** `ZEUGHAUS_PLAN_SESSION=<repo>`, `ZEUGHAUS_PROPOSAL=<n>`: a planning session `zeughaus-runner plan` started. */
-function planSession(): { repo: string; proposal?: number } | undefined {
-  const repo = process.env.ZEUGHAUS_PLAN_SESSION ?? "";
-  if (!/^[a-z0-9][a-z0-9-]*$/.test(repo)) return undefined;
-  const proposal = process.env.ZEUGHAUS_PROPOSAL ?? "";
-  return /^[1-9][0-9]*$/.test(proposal) ? { repo, proposal: Number(proposal) } : { repo };
-}
-
-/** `ZEUGHAUS_SESSION=<id>`: a session the CI opened on a runner. */
-function sessionId(): number | undefined {
-  const id = process.env.ZEUGHAUS_SESSION ?? "";
-  return /^[1-9][0-9]*$/.test(id) ? Number(id) : undefined;
-}
-
 // The <zeughaus-session> block, asked for once per session.
 let sessionBlock: Promise<string> | undefined;
 
@@ -841,6 +833,8 @@ export default function zeughausCi(pi: Pi): void {
   // Whether the main agent's current run called ask or propose_plan, which may end a plan
   // session's turn.
   let decided = false;
+  // What the main agent does, reported to the zeughaus terminal it runs in.
+  const agent = agentReporter();
 
   const isMain = (ctx: Ctx): boolean => !ctx.agent || ctx.agent.kind === "main";
 
@@ -1018,16 +1012,27 @@ export default function zeughausCi(pi: Pi): void {
     void prime(ctx).catch(() => undefined);
     const plan = masterPlan();
     if (plan) watchMaster(ctx, plan);
+    const doc = plan?.number ?? session?.proposal ?? null;
+    agent.setRepo(plan?.repo ?? session?.repo ?? basename(ctx.cwd), doc);
+    agent.report(ctx, "idle");
+    void contextFor(ctx.cwd)
+      .then((c) => {
+        if (c.kind === "repo") agent.setRepo(c.view.name, doc);
+      })
+      .catch(() => undefined);
   });
 
   pi.on("plan_review_requested", (event, ctx) => {
-    if (!isMain(ctx) || typeof event.planFilePath !== "string") return;
+    if (!isMain(ctx)) return;
+    agent.report(ctx, "review", typeof event.title === "string" ? event.title : "");
+    if (typeof event.planFilePath !== "string") return;
     planFile = resolvePlan(event.planFilePath, ctx);
   });
 
   // A plan executed straight from its review takes up the proposals it names, as a saved one
   // does when it is stored.
   pi.on("plan_review_resolved", (event, ctx) => {
+    if (isMain(ctx)) agent.report(ctx, "working");
     if (!isMain(ctx) || !["execute", "compact", "keep"].includes(event.choice ?? "")) return;
     const path = planFile ?? newestPlan(ctx);
     if (!path) return;
@@ -1044,6 +1049,11 @@ export default function zeughausCi(pi: Pi): void {
   // A plan session's working tree is read-only for every agent, subagents included; only the
   // session's artifacts (the plan file) and the internal devices are written.
   pi.on("tool_call", async (event, ctx) => {
+    if (isMain(ctx) && event.toolName === "ask") {
+      const questions = event.input.questions;
+      const first = Array.isArray(questions) ? (questions[0] as { question?: unknown } | undefined) : undefined;
+      agent.report(ctx, "asking", typeof first?.question === "string" ? first.question : "");
+    }
     if (!planSession()) return undefined;
     if (writesTree(event.toolName, event.input)) return { block: true, reason: READ_ONLY };
     if (isMain(ctx) && (event.toolName === "ask" || event.toolName === "propose_plan")) decided = true;
@@ -1051,7 +1061,27 @@ export default function zeughausCi(pi: Pi): void {
   });
 
   pi.on("agent_start", (_event, ctx) => {
-    if (isMain(ctx)) decided = false;
+    if (!isMain(ctx)) return;
+    decided = false;
+    agent.report(ctx, "working");
+  });
+
+  // The end of the main agent's run: it waits for its user, or its turn failed. A plan session
+  // that has not decided gets the reminder below and another turn, so it still works.
+  pi.on("agent_end", (event, ctx) => {
+    if (!isMain(ctx) || event.isTerminal === false) return;
+    if (planSession() && !decided) return;
+    const messages = Array.isArray(event.messages) ? event.messages : [];
+    const last = messages.findLast((m) => m.role === "assistant");
+    if (last?.stopReason === "error") {
+      agent.report(ctx, "failed", last.errorMessage || "the turn ended with an error");
+    } else {
+      agent.report(ctx, "waiting");
+    }
+  });
+
+  pi.on("session_shutdown", (_event, ctx) => {
+    if (isMain(ctx)) agent.report(ctx, "ended");
   });
 
   // A plan session's turn ends with ask or propose_plan; the second stop is let through, so the
@@ -1065,6 +1095,7 @@ export default function zeughausCi(pi: Pi): void {
   // watch of the previous one must not report into it.
   pi.on("session_switch", (_event, ctx) => {
     if (!isMain(ctx)) return;
+    agent.report(ctx, "idle");
     if (watch) endWatch(watch, false);
     loaded = undefined;
     latest = { kind: "none" };
@@ -1129,6 +1160,7 @@ export default function zeughausCi(pi: Pi): void {
         if (reviewing) throw new Error("The plan review is already open.");
         reviewing = true;
         planFile = path;
+        agent.report(ctx, "review", planTitleOf(body));
         try {
           let note = "";
           for (;;) {
@@ -1173,12 +1205,14 @@ export default function zeughausCi(pi: Pi): void {
           }
         } finally {
           reviewing = false;
+          agent.report(ctx, "working");
         }
       },
     });
   }
 
   pi.on("tool_result", async (event, ctx) => {
+    if (isMain(ctx) && event.toolName === "ask") agent.report(ctx, "working");
     if (!isMain(ctx) || event.toolName !== "bash" || event.isError) return undefined;
     const command = event.input.command;
     if (typeof command !== "string") return undefined;
