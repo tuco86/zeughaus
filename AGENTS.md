@@ -135,9 +135,11 @@ sessions; a row's terminal docks read-only beside the list and Enter or a
 click brings its tab to the front), the projects with a search and
 `Refresh`, and each CI's runners (a runner's activity with `Reopen` for
 closed runs). A project's Board shows its channels as a rail of pipeline
-dots over five columns PROPOSALS, PLANS, QUEUE, RUNNING and DONE: `h`/`l`
+dots over the columns PROPOSALS, PLANS, QUEUE, RUNNING and DONE, with the
+lanes PLANNING and STARTING between them while a proposal is planned or a
+master starts: `h`/`l`
 and `j`/`k` (or the arrows) move between cards, Enter opens a document's
-detail (or a running card's agent tab), `a`, `r` and `p` approve, reject
+detail (or the agent tab of a card in a lane or RUNNING), `a`, `r` and `p` approve, reject
 and plan, Escape closes the detail; a project no CI builds offers
 `Onboard`. A channel lists its pipelines one
 row each, newest on top and open with its jobs, a cable animating while its
@@ -239,7 +241,9 @@ protocol messages is written to its stdout.
 `zeughaus-runner [--state-dir <dir>] ci repo [--json] [<path>]`, `ci
 find [--json] <repo> <sha>`, `ci doc [--json] <repo> <n>`, `ci plan-save
 [--json] [--approve] <repo> <file>`, `ci planned <repo> <file>`, `ci
-overdue <repo> <number> <job>` and `ci session [--json] <id>` answer
+overdue <repo> <number> <job>`, `ci session [--json] <id>`, `ci claim
+[--json] <repo> proposal|pipeline <n>`, `ci renew`, `ci release [<repo>
+proposal|pipeline <n>]` and `ci responsible [--json] <repo> <n>` answer
 the same for a script (exit 3: the origin is no repository of `ci.toml`;
 2: no CI, no answer or a refusal); the
 `zeughaus-ci` omp plugin in `omp-plugin/` uses them for its session
@@ -247,10 +251,32 @@ context, its push watch and `/zeughaus save` (`ci overdue` prints the late
 report of one running job, which the push watch sends at each multiple of
 the job's expected time).
 
+Claims: the CI keeps who is responsible for a proposal or a pipeline as
+leased claims in `<state-dir>/ci/sessions.json` (`Book.claims`). A claim
+is held by an agent's terminal, `ZEUGHAUS_RUNNER` (the runner's enlist
+name, set in every terminal of an enlisted runner) and `ZEUGHAUS_TERMINAL`;
+its holder's CI session names it. It lives while it is renewed within 300
+s (`ci renew`, the plugin's heartbeat every minute), and goes with its
+session's end, `ci release`, a later succeeded pipeline of its channel (a
+pipeline claim) or its proposal leaving `open` and `planned`. `ci claim`
+takes one or says who has it; the MCP tools claim every pipeline they
+start or wait on, and `ci_pipeline`, a failed `ci_wait` and `ci
+responsible` name who is responsible for a failure: the holder of the
+earliest earlier pipeline of the channel that failed one of the same jobs,
+else the holder of the pipeline itself. It only informs; the CI refuses
+only a plan session for a proposal someone holds. The omp plugin claims a
+plan session's proposal, the proposals of a plan executed from its review
+and the pipeline its push watch follows, and releases them when its
+session ends. The editor shows claims on the Board (a held proposal in the
+PLANNING lane, a ring on a held pipeline's dot) and on a failed pipeline's
+row; a click brings the holder's tab to the front.
+
 Plans and proposals: the CI keeps them per repository in
 `<state-dir>/ci/docs/<repo>/<n>.json` (numbers shared by both kinds, never
 reused). A proposal is `open`, then `planned` (a plan names it in a
-`Proposals: #3, #5` line under its title) or `dismissed`; a plan is
+`Proposals: #3, #5` line under its title) or `dismissed`; a planned
+proposal follows its plan, back to `open` when the plan is rejected and to
+`done` when it is done. A plan is
 `saved`, `approved` in the editor, `in_progress` once the CI starts a
 master session for it, then `done` (`plan_done`) or `rejected`. A plan or
 proposal names the machines its work needs in a `Runs on: <selector>[;

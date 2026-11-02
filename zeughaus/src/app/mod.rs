@@ -300,6 +300,10 @@ pub struct App {
     /// id), whose terminal becomes [`App::reveal`] once its runner runs it.
     #[cfg(not(target_arch = "wasm32"))]
     reveal_session: Option<(RunnerKey, u64)>,
+    /// A plan session this editor asked a CI for, which has no session yet:
+    /// the CI's key, the repository and the proposal it plans.
+    #[cfg(not(target_arch = "wasm32"))]
+    opening_session: Option<(RunnerKey, String, Option<u64>)>,
     /// Running without a window (`zeughaus --headless`): nobody sits in front
     /// of a file dialog, and rfd would open one on the desktop of whoever
     /// started the process.
@@ -457,6 +461,8 @@ impl App {
             reveal: None,
             #[cfg(not(target_arch = "wasm32"))]
             reveal_session: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            opening_session: None,
             #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
             headless: false,
             #[cfg(not(target_arch = "wasm32"))]
@@ -3172,6 +3178,13 @@ impl App {
         #[cfg(not(target_arch = "wasm32"))]
         if self.board_animating() {
             subs.push(iced::window::frames().map(|_| Message::Tick));
+        }
+        // What runs or waits on the page pulses.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.page_pulsing() {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(50)).map(|_| Message::Tick),
+            );
         }
         #[cfg(not(target_arch = "wasm32"))]
         if !self.failing_nodes().is_empty() {

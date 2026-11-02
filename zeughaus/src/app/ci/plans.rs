@@ -13,8 +13,8 @@ use iced::widget::{
 };
 use iced::{Alignment, Element, Length, Task};
 use zeughaus_link::{
-    CiReply, CiRequest, DocKind, DocState, DocView, MachineView, SessionKind, SessionState,
-    SessionView,
+    CiReply, CiRequest, ClaimSubject, DocKind, DocState, DocView, MachineView, SessionKind,
+    SessionState, SessionView,
 };
 use zeughaus_mux::TerminalId;
 use zeughaus_theme::Theme;
@@ -61,6 +61,9 @@ pub(super) struct PlansState {
     shown_error: Option<String>,
     /// An approval, rejection or deletion on its way: the buttons wait.
     acting: bool,
+    /// The document an action is on and what it does (`approving`), from
+    /// the request until the list shows its result: its card pulses.
+    pub(super) acting_on: Option<(u64, &'static str)>,
     /// What the last action or session request came to.
     notice: Option<Notice>,
     /// The `Runs on` being edited: the document and the text so far.
@@ -80,6 +83,7 @@ impl PlansState {
             shown: None,
             shown_error: None,
             acting: false,
+            acting_on: None,
             notice: None,
             runs_on_input: None,
         }
@@ -156,6 +160,9 @@ impl CiClient {
                 state.docs = docs;
                 state.loaded = true;
                 state.error = None;
+                if !state.acting {
+                    state.acting_on = None;
+                }
                 // A deleted document leaves nothing to show.
                 if let Some(selected) = state.selected
                     && !state.docs.iter().any(|doc| doc.number == selected)
@@ -234,6 +241,7 @@ impl CiClient {
             return Task::none();
         }
         state.acting = true;
+        state.acting_on = acting_on(&request);
         state.notice = None;
         let key = key.clone();
         Task::perform(act(self.endpoint.clone(), request), move |result| {
@@ -252,6 +260,7 @@ impl CiClient {
         };
         state.acting = false;
         if let Err(e) = result {
+            state.acting_on = None;
             state.notice = Some(Notice {
                 text: e,
                 failed: true,
@@ -265,6 +274,26 @@ impl CiClient {
             self.ask_overview(key)
         };
         Task::batch([self.ask_docs(key, view), overview])
+    }
+}
+
+/// The document a request acts on and the word for what it does.
+fn acting_on(request: &CiRequest) -> Option<(u64, &'static str)> {
+    match request {
+        CiRequest::DocState { number, state, .. } => {
+            let verb = match state {
+                DocState::Approved => "approving",
+                DocState::Rejected => "rejecting",
+                DocState::Done => "finishing",
+                DocState::Dismissed => "dismissing",
+                DocState::Planned => "planning",
+                _ => return None,
+            };
+            Some((*number, verb))
+        }
+        CiRequest::DocDelete { number, .. } => Some((*number, "deleting")),
+        CiRequest::DocRunsOn { number, .. } => Some((*number, "saving")),
+        _ => None,
     }
 }
 
@@ -494,6 +523,7 @@ impl App {
             runner,
         };
         let endpoint = client.endpoint.clone();
+        self.opening_session = Some((key.clone(), state.repo.clone(), proposal));
         if let Some(state) = self.ci.get_mut(key).and_then(|c| c.plans.get_mut(&view)) {
             state.notice = None;
         }
@@ -510,6 +540,7 @@ impl App {
         key: &RunnerKey,
         result: Result<SessionView, String>,
     ) -> Task<Message> {
+        self.opening_session = None;
         match result {
             Ok(session) => {
                 self.reveal_session = Some((key.clone(), session.id));
@@ -801,22 +832,35 @@ impl App {
         };
         if doc.kind == DocKind::Proposal && doc.state == DocState::Open {
             let number = doc.number;
-            let mut pressed = pill("Plan this proposal", true);
-            let what = if client.sessions_possible() {
-                pressed = pressed.on_press_with(move || {
-                    Message::Ci(
-                        runner.clone(),
-                        CiMsg::OpenSession {
-                            view,
-                            proposal: Some(number),
-                        },
-                    )
-                });
-                "omp plans it in plan mode on a session runner (p)"
+            let held = client.claim_on(&ClaimSubject::Proposal {
+                repo: doc.repo.clone(),
+                number,
+            });
+            if let Some(claim) = held {
+                let mut pressed = pill("Open session", true);
+                if let Some((key, terminal)) = client.holder_target(claim) {
+                    pressed = pressed
+                        .on_press_with(move || Message::RevealTerminal(key.clone(), terminal));
+                }
+                bar = bar.push(tip(pressed, claim.holder_text()));
             } else {
-                "no connected runner hosts sessions (sessions = true in ci.toml)"
-            };
-            bar = bar.push(tip(pressed, what.to_owned()));
+                let mut pressed = pill("Plan this proposal", true);
+                let what = if client.sessions_possible() {
+                    pressed = pressed.on_press_with(move || {
+                        Message::Ci(
+                            runner.clone(),
+                            CiMsg::OpenSession {
+                                view,
+                                proposal: Some(number),
+                            },
+                        )
+                    });
+                    "omp plans it in plan mode on a session runner (p)"
+                } else {
+                    "no connected runner hosts sessions (sessions = true in ci.toml)"
+                };
+                bar = bar.push(tip(pressed, what.to_owned()));
+            }
             primary_taken = true;
         }
         if let Some(session) = client.master_of(&doc.repo, doc.number) {
@@ -880,7 +924,26 @@ impl App {
             };
             bar = bar.push(tip(pressed, format!("{what}{key}")));
         }
-        container(bar).padding([SP_2, SP_4]).into()
+        let bar = container(bar).padding([SP_2, SP_4]);
+        if doc.kind != DocKind::Plan || doc.proposals.is_empty() {
+            return bar.into();
+        }
+        let named: Vec<String> = doc.proposals.iter().map(|n| format!("#{n}")).collect();
+        column![
+            bar,
+            container(
+                text(format!("From {}", named.join(", ")))
+                    .size(TEXT_SM)
+                    .color(self.theme.muted())
+            )
+            .padding([0.0, SP_4])
+        ]
+        .spacing(SP_1)
+        .padding(iced::Padding {
+            bottom: SP_2,
+            ..iced::Padding::ZERO
+        })
+        .into()
     }
 
     /// The `Runs on` of a document: a field while it can change (an open
@@ -1030,6 +1093,7 @@ mod tests {
                     latest: 1,
                     status: "succeeded".to_owned(),
                     load: None,
+                    responsible: None,
                 })
                 .collect(),
             machines: Vec::new(),
@@ -1051,6 +1115,7 @@ mod tests {
                 .collect(),
             build: 0,
             sessions: Vec::new(),
+            claims: Vec::new(),
         }
     }
 

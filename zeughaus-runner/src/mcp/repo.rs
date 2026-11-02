@@ -142,10 +142,21 @@ pub fn describe(view: &RepoView, head: Option<&str>) -> String {
         head_line(view, head),
         format!(
             "channels: {}",
-            listed(view.channels.iter().map(|channel| format!(
-                "{} #{} {}",
-                channel.channel, channel.latest, channel.status
-            )))
+            listed(
+                view.channels
+                    .iter()
+                    .map(|channel| match &channel.responsible {
+                        Some(claim) => format!(
+                            "{} #{} {} (responsible: {})",
+                            channel.channel,
+                            channel.latest,
+                            channel.status,
+                            claim.holder_text()
+                        ),
+                        None =>
+                            format!("{} #{} {}", channel.channel, channel.latest, channel.status),
+                    })
+            )
         ),
     ];
     lines.extend(job_lines(view));
@@ -425,6 +436,7 @@ mod tests {
             latest,
             status: "succeeded".to_owned(),
             load: None,
+            responsible: None,
         };
         let mut publish = job_def(
             "publish",
@@ -506,6 +518,7 @@ mod tests {
             ],
             docs: Vec::new(),
             setup: Vec::new(),
+            claims: Vec::new(),
         }
     }
 

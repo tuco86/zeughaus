@@ -3,6 +3,7 @@
 
 mod artifacts;
 mod channels;
+mod claims;
 mod cleanup;
 mod cli;
 mod config;

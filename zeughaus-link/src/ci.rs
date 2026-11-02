@@ -287,6 +287,25 @@ pub enum CiRequest {
         #[serde(default)]
         version: Option<u64>,
     },
+    /// Takes `subject` for `holder`, or renews the holder's own claim on it.
+    /// Answers [`CiReply::Claim`]; `ours` is false when someone else holds
+    /// it, and the claim is theirs.
+    Claim {
+        subject: ClaimSubject,
+        holder: ClaimHolder,
+    },
+    /// Renews every claim of `holder`. Answers [`CiReply::Accepted`].
+    ClaimRenew { holder: ClaimHolder },
+    /// Releases `subject`, or every claim of `holder` without one. Answers
+    /// [`CiReply::Accepted`].
+    ClaimRelease {
+        holder: ClaimHolder,
+        #[serde(default)]
+        subject: Option<ClaimSubject>,
+    },
+    /// Who is responsible for pipeline `number` of `repo` (see
+    /// [`responsible`]). Answers [`CiReply::Responsible`].
+    Responsible { repo: String, number: u64 },
 }
 
 /// The one frame of a download on [`crate::STATE_PATH`]: version `version`
@@ -434,6 +453,13 @@ pub enum CiReply {
     Session {
         session: SessionView,
     },
+    Claim {
+        claim: ClaimView,
+        ours: bool,
+    },
+    Responsible {
+        claim: Option<ClaimView>,
+    },
     Error {
         message: String,
     },
@@ -459,6 +485,9 @@ pub struct CiOverview {
     /// The live agent sessions, then the newest ended ones.
     #[serde(default)]
     pub sessions: Vec<SessionView>,
+    /// Every live claim.
+    #[serde(default)]
+    pub claims: Vec<ClaimView>,
 }
 
 /// What an agent session does.
@@ -546,6 +575,138 @@ pub struct SessionView {
     pub message: String,
 }
 
+/// How long a claim lives without a renewal, in seconds.
+pub const CLAIM_LEASE_SECS: u64 = 300;
+
+/// What a claim is about: a proposal a session plans, or a pipeline a
+/// session started or waits on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "on", rename_all = "snake_case")]
+pub enum ClaimSubject {
+    Proposal { repo: String, number: u64 },
+    Pipeline { repo: String, number: u64 },
+}
+
+impl ClaimSubject {
+    pub fn repo(&self) -> &str {
+        match self {
+            ClaimSubject::Proposal { repo, .. } | ClaimSubject::Pipeline { repo, .. } => repo,
+        }
+    }
+
+    pub fn number(&self) -> u64 {
+        match self {
+            ClaimSubject::Proposal { number, .. } | ClaimSubject::Pipeline { number, .. } => {
+                *number
+            }
+        }
+    }
+
+    /// `proposal #3 of zeughaus`, `pipeline #12 of zeughaus`.
+    pub fn text(&self) -> String {
+        let kind = match self {
+            ClaimSubject::Proposal { .. } => "proposal",
+            ClaimSubject::Pipeline { .. } => "pipeline",
+        };
+        format!("{kind} #{} of {}", self.number(), self.repo())
+    }
+}
+
+/// Who holds a claim: an agent's terminal on a runner, and the CI session
+/// running in it, if any.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimHolder {
+    /// The runner's enlist name.
+    pub runner: String,
+    pub terminal: u64,
+    #[serde(default)]
+    pub session: Option<u64>,
+}
+
+impl ClaimHolder {
+    /// The same terminal; the session is what the CI knows of it, not who
+    /// it is.
+    pub fn same(&self, other: &ClaimHolder) -> bool {
+        self.runner == other.runner && self.terminal == other.terminal
+    }
+}
+
+/// One claim the CI keeps: a holder is responsible for its subject until it
+/// releases it, its session ends, or it is not renewed for
+/// [`CLAIM_LEASE_SECS`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimView {
+    pub subject: ClaimSubject,
+    pub holder: ClaimHolder,
+    /// The holder's CI session as the editor names it (`master zeughaus
+    /// #38`), or empty.
+    #[serde(default)]
+    pub label: String,
+    /// A pipeline's channel; empty for a proposal.
+    #[serde(default)]
+    pub channel: String,
+    /// Unix seconds.
+    pub since: u64,
+    pub renewed: u64,
+}
+
+impl ClaimView {
+    /// `master zeughaus #38 on atik, terminal 7`, or `a session on atik,
+    /// terminal 7` without a label.
+    pub fn holder_text(&self) -> String {
+        let who = if self.label.is_empty() {
+            "a session"
+        } else {
+            &self.label
+        };
+        format!(
+            "{who} on {}, terminal {}",
+            self.holder.runner, self.holder.terminal
+        )
+    }
+}
+
+/// Who is responsible for pipeline `number` of `repo` in `channel`, whose
+/// jobs `failed` failed: the holder of the earliest earlier pipeline of the
+/// channel that failed one of the same jobs (`failed_of` names an earlier
+/// pipeline's failed jobs, none when it is unknown), else the holder of
+/// `number` itself.
+pub fn responsible<'a>(
+    claims: &'a [ClaimView],
+    repo: &str,
+    number: u64,
+    channel: &str,
+    failed: &[String],
+    failed_of: impl Fn(u64) -> Vec<String>,
+) -> Option<&'a ClaimView> {
+    let own = || {
+        claims.iter().find(|claim| {
+            matches!(&claim.subject, ClaimSubject::Pipeline { repo: r, number: n }
+                if r == repo && *n == number)
+        })
+    };
+    if failed.is_empty() {
+        return own();
+    }
+    let mut earlier: Vec<&ClaimView> = claims
+        .iter()
+        .filter(|claim| {
+            matches!(&claim.subject, ClaimSubject::Pipeline { repo: r, number: n }
+                if r == repo && *n < number)
+                && claim.channel == channel
+        })
+        .collect();
+    earlier.sort_by_key(|claim| claim.subject.number());
+    earlier
+        .into_iter()
+        .find(|claim| {
+            failed_of(claim.subject.number())
+                .iter()
+                .any(|job| failed.contains(job))
+        })
+        .or_else(own)
+}
+
 /// What a plan or a proposal is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -559,9 +720,11 @@ pub enum DocKind {
 }
 
 /// Where a document stands. A proposal is `open`, then `planned` or
-/// `dismissed`; a plan is `saved`, `approved`, `in_progress`, then `done`,
-/// or `rejected`. An onboarding request is `open`, then `approved`, then
-/// `done` or back to `open` with a note, or `rejected`.
+/// `dismissed`; a `planned` proposal follows its plan, back to `open` when
+/// the plan is rejected and to `done` when it is done. A plan is `saved`,
+/// `approved`, `in_progress`, then `done`, or `rejected`. An onboarding
+/// request is `open`, then `approved`, then `done` or back to `open` with a
+/// note, or `rejected`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DocState {
@@ -857,6 +1020,10 @@ pub struct ChannelView {
     /// [`pipeline_load`] of the newest pipeline.
     #[serde(default)]
     pub load: Option<String>,
+    /// For a channel whose newest pipeline failed: who is responsible for
+    /// it (see [`responsible`]). Only [`RepoView`] fills it.
+    #[serde(default)]
+    pub responsible: Option<ClaimView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1100,6 +1267,9 @@ pub struct RepoView {
     /// With `setup`: one line per check of the repository's setup.
     #[serde(default)]
     pub setup: Vec<String>,
+    /// This repository's live claims.
+    #[serde(default)]
+    pub claims: Vec<ClaimView>,
 }
 
 /// One job of a repository's `.zeughaus-ci/` and where it would run.
@@ -1448,6 +1618,32 @@ mod tests {
             },
             CiRequest::Session { id: 4 },
             CiRequest::CloseSession { id: 4 },
+            CiRequest::Claim {
+                subject: ClaimSubject::Proposal {
+                    repo: "griasdi".to_owned(),
+                    number: 3,
+                },
+                holder: ClaimHolder {
+                    runner: "atik".to_owned(),
+                    terminal: 7,
+                    session: Some(4),
+                },
+            },
+            CiRequest::ClaimRenew {
+                holder: pipeline_claim("griasdi", "dev", 1, 7).holder,
+            },
+            CiRequest::ClaimRelease {
+                holder: pipeline_claim("griasdi", "dev", 1, 7).holder,
+                subject: Some(pipeline_claim("griasdi", "dev", 9, 7).subject),
+            },
+            CiRequest::ClaimRelease {
+                holder: pipeline_claim("griasdi", "dev", 1, 7).holder,
+                subject: None,
+            },
+            CiRequest::Responsible {
+                repo: "griasdi".to_owned(),
+                number: 9,
+            },
         ];
         for request in requests {
             assert_eq!(CiRequest::decode(&request.encode()), Some(request));
@@ -1465,6 +1661,7 @@ mod tests {
                         latest: 7,
                         status: "running".to_owned(),
                         load: Some("build 3.4x expected, runner not shared".to_owned()),
+                        responsible: None,
                     }],
                     machines: vec![
                         MachineView {
@@ -1512,6 +1709,7 @@ mod tests {
                     }],
                     build: 116,
                     sessions: vec![session()],
+                    claims: vec![pipeline_claim("griasdi", "dev", 7, 2)],
                 },
             },
             CiReply::Pipelines {
@@ -1567,6 +1765,7 @@ mod tests {
                         latest: 64,
                         status: "succeeded".to_owned(),
                         load: None,
+                        responsible: Some(pipeline_claim("zeughaus", "dev", 64, 2)),
                     }],
                     head: Some(Box::new(pipeline())),
                     jobs_sha: Some("3635dad0".to_owned()),
@@ -1589,6 +1788,7 @@ mod tests {
                     platforms: vec![("linux-amd64".to_owned(), "tuco-pc".to_owned())],
                     docs: vec![doc()],
                     setup: vec!["bot: push access to tuco86/zeughaus".to_owned()],
+                    claims: vec![pipeline_claim("zeughaus", "dev", 64, 2)],
                 })),
                 pending: None,
             },
@@ -1599,6 +1799,11 @@ mod tests {
             CiReply::Doc { doc: None },
             CiReply::DocCreated { number: 5 },
             CiReply::Session { session: session() },
+            CiReply::Claim {
+                claim: pipeline_claim("griasdi", "dev", 7, 2),
+                ours: false,
+            },
+            CiReply::Responsible { claim: None },
             CiReply::Error {
                 message: "no such job".to_owned(),
             },
@@ -1982,5 +2187,99 @@ mod tests {
         );
         view.finished = None;
         assert_eq!(pipeline_load(&view), None);
+    }
+
+    fn pipeline_claim(repo: &str, channel: &str, number: u64, terminal: u64) -> ClaimView {
+        ClaimView {
+            subject: ClaimSubject::Pipeline {
+                repo: repo.into(),
+                number,
+            },
+            holder: ClaimHolder {
+                runner: "atik".into(),
+                terminal,
+                session: None,
+            },
+            label: String::new(),
+            channel: channel.into(),
+            since: 0,
+            renewed: 0,
+        }
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    #[test]
+    fn the_earliest_holder_of_the_same_failure_is_responsible() {
+        let claims = vec![
+            pipeline_claim("zeughaus", "dev", 12, 3),
+            pipeline_claim("zeughaus", "dev", 10, 1),
+            pipeline_claim("zeughaus", "dev", 11, 2),
+            pipeline_claim("zeughaus", "dev", 14, 4),
+        ];
+        // #10 failed something else, #11 and #12 failed `check`.
+        let failed_of = |number| match number {
+            10 => names(&["build"]),
+            11 | 12 => names(&["check", "lint"]),
+            _ => Vec::new(),
+        };
+        let found = responsible(
+            &claims,
+            "zeughaus",
+            14,
+            "dev",
+            &names(&["check"]),
+            failed_of,
+        );
+        assert_eq!(found.map(|claim| claim.subject.number()), Some(11));
+        // Nothing shared: the pipeline's own holder.
+        let found = responsible(&claims, "zeughaus", 14, "dev", &names(&["fmt"]), failed_of);
+        assert_eq!(found.map(|claim| claim.holder.terminal), Some(4));
+        // Nothing failed: only the own claim counts.
+        let found = responsible(&claims, "zeughaus", 14, "dev", &[], |_| names(&["check"]));
+        assert_eq!(found.map(|claim| claim.holder.terminal), Some(4));
+        // A pipeline nobody holds, without an earlier match.
+        assert_eq!(
+            responsible(&claims, "zeughaus", 15, "dev", &names(&["fmt"]), failed_of),
+            None
+        );
+    }
+
+    #[test]
+    fn responsibility_stays_within_its_repository_and_channel() {
+        let claims = vec![
+            pipeline_claim("zeughaus", "nightly", 10, 1),
+            pipeline_claim("weida", "dev", 11, 2),
+        ];
+        let found = responsible(&claims, "zeughaus", 14, "dev", &names(&["check"]), |_| {
+            names(&["check"])
+        });
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn a_holder_is_its_terminal_whatever_session_the_ci_knows() {
+        let holder = ClaimHolder {
+            runner: "atik".into(),
+            terminal: 7,
+            session: Some(38),
+        };
+        let bare = ClaimHolder {
+            session: None,
+            ..holder.clone()
+        };
+        assert!(holder.same(&bare));
+        let other = ClaimHolder {
+            terminal: 8,
+            ..holder.clone()
+        };
+        assert!(!holder.same(&other));
+        let elsewhere = ClaimHolder {
+            runner: "sadala".into(),
+            ..holder.clone()
+        };
+        assert!(!holder.same(&elsewhere));
     }
 }

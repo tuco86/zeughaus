@@ -340,6 +340,7 @@ fn retries(request: &CiRequest) -> bool {
         | CiRequest::Docs { .. }
         | CiRequest::Doc { .. }
         | CiRequest::Session { .. }
+        | CiRequest::Responsible { .. }
         | CiRequest::States { .. } => true,
         CiRequest::OpenTranscript { .. }
         | CiRequest::CloseTranscript { .. }
@@ -353,6 +354,9 @@ fn retries(request: &CiRequest) -> bool {
         | CiRequest::QueuePaused { .. }
         | CiRequest::OpenSession { .. }
         | CiRequest::CloseSession { .. }
+        | CiRequest::Claim { .. }
+        | CiRequest::ClaimRenew { .. }
+        | CiRequest::ClaimRelease { .. }
         | CiRequest::StateDelete { .. } => false,
     }
 }
@@ -740,6 +744,7 @@ mod tests {
                             repos: Vec::new(),
                             build: 0,
                             sessions: Vec::new(),
+                            claims: Vec::new(),
                         },
                     },
                     _ => CiReply::Error {

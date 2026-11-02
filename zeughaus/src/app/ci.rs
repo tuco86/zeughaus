@@ -566,6 +566,31 @@ impl CiClient {
         self.overview.iter().flat_map(|overview| &overview.sessions)
     }
 
+    /// The CI's live claims.
+    pub(super) fn claims(&self) -> impl Iterator<Item = &zeughaus_link::ClaimView> {
+        self.overview.iter().flat_map(|overview| &overview.claims)
+    }
+
+    /// The live claim on `subject`.
+    pub(super) fn claim_on(
+        &self,
+        subject: &zeughaus_link::ClaimSubject,
+    ) -> Option<&zeughaus_link::ClaimView> {
+        self.claims().find(|claim| claim.subject == *subject)
+    }
+
+    /// The runner and terminal that hold `claim`, when this editor knows
+    /// the runner.
+    pub(super) fn holder_target(
+        &self,
+        claim: &zeughaus_link::ClaimView,
+    ) -> Option<(RunnerKey, TerminalId)> {
+        Some((
+            self.runner_key(&claim.holder.runner)?,
+            TerminalId(claim.holder.terminal),
+        ))
+    }
+
     /// Every repository of the CI's `ci.toml` (and pending onboarding).
     pub(super) fn repo_docs(&self) -> impl Iterator<Item = &zeughaus_link::RepoDocsView> {
         self.overview.iter().flat_map(|overview| &overview.repos)
@@ -1832,8 +1857,38 @@ impl App {
         let number = pipeline.number;
         let cursor = state.cursor == Some(number);
         let t = crate::style::Tokens::of(&self.theme);
+        // Who fixes a failed pipeline: the holder of an earlier pipeline of
+        // the channel that failed the same job, else its own.
+        let responsible = self
+            .ci
+            .get(runner)
+            .filter(|_| pipeline.status == "failed")
+            .and_then(|client| {
+                let claims = client
+                    .overview
+                    .as_ref()
+                    .map(|overview| overview.claims.as_slice())
+                    .unwrap_or_default();
+                let failed_of = |earlier: u64| {
+                    state
+                        .pipelines
+                        .iter()
+                        .find(|shown| shown.pipeline.number == earlier)
+                        .map(|shown| failed_jobs(&shown.pipeline))
+                        .unwrap_or_default()
+                };
+                let claim = zeughaus_link::responsible(
+                    claims,
+                    &pipeline.repo,
+                    number,
+                    &pipeline.channel,
+                    &failed_jobs(pipeline),
+                    failed_of,
+                )?;
+                Some((client, claim))
+            });
         let row = container(
-            button(self.pipeline_row(pipeline, open, size, now))
+            button(self.pipeline_row(pipeline, open, size, now, responsible))
                 .width(Length::Fill)
                 .padding([SP_3, SP_4])
                 .style(crate::style::row_entry_button(&t, true))
@@ -1863,6 +1918,7 @@ impl App {
         open: bool,
         size: Size,
         now: u64,
+        responsible: Option<(&'a CiClient, &'a zeughaus_link::ClaimView)>,
     ) -> Element<'a, Message, Theme> {
         let theme = &self.theme;
         let muted = theme.muted();
@@ -1913,6 +1969,9 @@ impl App {
         {
             lines = lines.push(self.cause_line(job, chars));
         }
+        if let Some((client, claim)) = responsible {
+            lines = lines.push(self.responsible_line(client, claim, pipeline.number, chars));
+        }
         if let Some(load) = zeughaus_link::pipeline_load(pipeline) {
             lines = lines.push(
                 row![
@@ -1948,9 +2007,14 @@ impl App {
         .spacing(SP_1)
         .align_x(Alignment::End)
         .width(TIME_COLUMN);
+        // A running pipeline breathes.
+        let mut status = tone.color(theme);
+        if pipeline.status == "running" {
+            status = page::faded(status, 0.35 + 0.65 * page::pulse(page::phase()));
+        }
         row![
             container(tip(
-                icon(status_glyph(&pipeline.status), ICON_SIZE, tone.color(theme)),
+                icon(status_glyph(&pipeline.status), ICON_SIZE, status),
                 pipeline.status.clone(),
             ))
             .width(ICON_COLUMN)
@@ -1964,6 +2028,59 @@ impl App {
         .spacing(SP_3)
         .align_y(Alignment::Start)
         .into()
+    }
+
+    /// Who is responsible for a failed pipeline: the holder's role glyph in
+    /// its agent's colour and `responsible: <holder>`, ` (holds #m)` when it
+    /// holds an earlier one. A press brings the holder's tab to the front.
+    fn responsible_line<'a>(
+        &'a self,
+        client: &'a CiClient,
+        claim: &'a zeughaus_link::ClaimView,
+        number: u64,
+        chars: usize,
+    ) -> Element<'a, Message, Theme> {
+        let target = client.holder_target(claim);
+        let agent = target
+            .as_ref()
+            .and_then(|(runner, terminal)| self.agent_at(runner, *terminal));
+        let role = agent.map(|agent| agent.role).or_else(|| {
+            let id = claim.holder.session?;
+            let session = client.sessions().find(|s| s.id == id)?;
+            Some(match session.kind {
+                zeughaus_link::SessionKind::Plan => zeughaus_link::AgentRole::Plan,
+                zeughaus_link::SessionKind::Master => zeughaus_link::AgentRole::Master,
+            })
+        });
+        let color = agent.map_or(self.theme.accent(), |agent| {
+            super::agents::agent_color(agent.state, &self.theme)
+        });
+        let mut words = format!("responsible: {}", claim.holder_text());
+        let held = claim.subject.number();
+        if held != number {
+            words.push_str(&format!(" (holds #{held})"));
+        }
+        let line = row![
+            icon(
+                super::agents::role_glyph(role.unwrap_or_default()),
+                TEXT_SM,
+                color
+            ),
+            text(fit(&words, chars))
+                .size(TEXT_SM)
+                .color(color)
+                .wrapping(Wrapping::None),
+        ]
+        .spacing(SP_1)
+        .align_y(Alignment::Center);
+        let pressed = button(line).padding(0).style(link_style);
+        match target {
+            Some((runner, terminal)) => tip(
+                pressed.on_press(Message::RevealTerminal(runner, terminal)),
+                "Bring the holder's tab to the front".to_owned(),
+            ),
+            None => pressed.into(),
+        }
     }
 
     /// An event waiting for its pipeline: a clock, `Queued`, what it will
@@ -2356,6 +2473,16 @@ fn status_glyph(status: &str) -> char {
         "cancelled" => glyph::CANCELLED,
         _ => glyph::PENDING,
     }
+}
+
+/// The names of a pipeline's failed jobs.
+fn failed_jobs(pipeline: &PipelineView) -> Vec<String> {
+    pipeline
+        .jobs
+        .iter()
+        .filter(|job| job.status == "failed")
+        .map(|job| job.name.clone())
+        .collect()
 }
 
 /// One small status glyph per job: a collapsed pipeline's jobs at a glance.
@@ -2948,6 +3075,7 @@ mod tests {
                     latest: 1,
                     status: "succeeded".to_owned(),
                     load: None,
+                    responsible: None,
                 })
                 .collect(),
             machines: Vec::new(),
@@ -2956,6 +3084,7 @@ mod tests {
             repos: Vec::new(),
             build: 0,
             sessions: Vec::new(),
+            claims: Vec::new(),
         };
         let key = RunnerKey::new("sha256:ci");
         let mut client = CiClient::new(Endpoint("weida://ci/".to_owned()), "ci".to_owned());

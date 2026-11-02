@@ -21,9 +21,9 @@ use zeughaus_link::ci::{
 };
 use zeughaus_link::enlist::Place;
 use zeughaus_link::{
-    ChannelView, CiOverview, CiReply, CiRequest, DocState, JobDefView, JobTiming, JobView,
-    MAX_CI_REPLY_BYTES, MAX_CI_REQUEST_BYTES, MachineJob, MachineView, PipelineView, QueuedView,
-    RepoView, TimedLine, TransferView,
+    ChannelView, CiOverview, CiReply, CiRequest, ClaimView, DocState, JobDefView, JobTiming,
+    JobView, MAX_CI_REPLY_BYTES, MAX_CI_REQUEST_BYTES, MachineJob, MachineView, PipelineView,
+    QueuedView, RepoView, TimedLine, TransferView,
 };
 use zeughaus_mux::TerminalId;
 use zeughaus_terminal::wal;
@@ -262,6 +262,29 @@ impl CiServer {
                 }
                 accepted(crate::state::delete(&self.state_dir, &repo, &name, version))
             }
+            CiRequest::Claim { subject, holder } => {
+                match self.sessions.claim(subject, holder, crate::now_secs()) {
+                    Ok((claim, ours)) => CiReply::Claim { claim, ours },
+                    Err(e) => error(&e),
+                }
+            }
+            CiRequest::ClaimRenew { holder } => {
+                self.sessions.renew_claims(&holder, crate::now_secs());
+                accepted(Ok(()))
+            }
+            CiRequest::ClaimRelease { holder, subject } => {
+                self.sessions.release_claims(&holder, subject.as_ref());
+                accepted(Ok(()))
+            }
+            CiRequest::Responsible { repo, number } => {
+                if !valid_name(&repo) {
+                    return error(&format!("no repository {repo}"));
+                }
+                match self.sessions.responsible(&repo, number) {
+                    Ok(claim) => CiReply::Responsible { claim },
+                    Err(e) => error(&e),
+                }
+            }
         }
     }
 
@@ -316,6 +339,7 @@ impl CiServer {
             repos: docs::summary(&self.state_dir, &config),
             build: zeughaus_update::manifest::own_build(),
             sessions: self.sessions.listed(),
+            claims: self.sessions.claims(),
         }
     }
 
@@ -560,6 +584,31 @@ impl CiServer {
         } else {
             Vec::new()
         };
+        let claims: Vec<ClaimView> = self
+            .sessions
+            .claims()
+            .into_iter()
+            .filter(|claim| claim.subject.repo() == name)
+            .collect();
+        let mut channels = channel_views(&pipelines);
+        for channel in channels.iter_mut().filter(|c| c.status == "failed") {
+            let failed = |number: u64| {
+                pipelines
+                    .iter()
+                    .find(|p| p.number == number)
+                    .map(crate::sessions::failed_jobs)
+                    .unwrap_or_default()
+            };
+            channel.responsible = zeughaus_link::responsible(
+                &claims,
+                name,
+                channel.latest,
+                &channel.channel,
+                &failed(channel.latest),
+                failed,
+            )
+            .cloned();
+        }
         CiReply::Repo {
             repo: Some(Box::new(RepoView {
                 name: name.to_owned(),
@@ -567,7 +616,7 @@ impl CiServer {
                 default_branch: repo.default_branch.clone(),
                 branch: crate::streak::of_branch(&pipelines, &repo.default_branch)
                     .describe(crate::now_secs()),
-                channels: channel_views(&pipelines),
+                channels,
                 head: sha
                     .and_then(|sha| newest_of_sha(&pipelines, &sha))
                     .map(|head| Box::new(pipeline_view(head))),
@@ -589,6 +638,7 @@ impl CiServer {
                     })
                     .collect(),
                 setup,
+                claims,
             })),
             pending: None,
         }
@@ -1249,6 +1299,7 @@ fn channel_views(pipelines: &[Pipeline]) -> Vec<ChannelView> {
             latest: pipeline.number,
             status: pipeline.status.as_str().to_owned(),
             load: zeughaus_link::pipeline_load(&pipeline_view(pipeline)),
+            responsible: None,
         })
         .collect()
 }
@@ -2019,6 +2070,7 @@ mod tests {
                 latest,
                 status: status.to_owned(),
                 load: None,
+                responsible: None,
             };
             assert_eq!(
                 seen.platforms,
@@ -2354,6 +2406,7 @@ mod tests {
                 latest,
                 status: "succeeded".to_owned(),
                 load: None,
+                responsible: None,
             };
             assert_eq!(
                 view_of(&server, None, false).channels,

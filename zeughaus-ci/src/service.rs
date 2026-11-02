@@ -338,7 +338,7 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
                 Arc::clone(&transcripts),
                 docs_lock,
                 docs_tx,
-                sessions,
+                Arc::clone(&sessions),
             );
             rt.spawn(serve::serve(replier, Arc::new(server)));
         }
@@ -402,9 +402,11 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
             events.alert(alert);
         }
         while let Ok(change) = changes.try_recv() {
+            sessions.pipeline_changed(&change.repo, &change.channel, change.number);
             events.change(change);
         }
         while let Ok(repo) = docs_rx.try_recv() {
+            sessions.docs_changed(&repo);
             events.docs(repo);
         }
         while sessions_rx.try_recv().is_ok() {

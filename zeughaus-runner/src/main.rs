@@ -323,6 +323,9 @@ fn main() -> ExitCode {
                     terminal_host(exe.as_ref().ok(), &state_dir),
                     Arc::clone(&runs),
                 );
+                if let Some(config) = enlist_config.as_ref() {
+                    service.set_runner_name(config.name.clone());
+                }
                 rt.spawn(service.clone().accept(replier));
                 // A run is a terminal this process owns, so the job host is
                 // the mux service plus the run directories its logs go in.

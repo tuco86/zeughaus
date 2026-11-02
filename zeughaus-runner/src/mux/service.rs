@@ -158,6 +158,9 @@ struct Inner {
     /// Builds the profile of a work shell for an origin and branch; unset
     /// on a runner that opens no projects.
     project_profile: OnceLock<ProjectProfile>,
+    /// The runner's enlist name, given to every terminal as
+    /// `ZEUGHAUS_RUNNER`; unset on a runner that enlists nowhere.
+    runner_name: OnceLock<String>,
 }
 
 /// The profile of a shell in the work checkout of `origin`, checked out at
@@ -220,6 +223,7 @@ impl MuxService {
                 closed: Mutex::new(VecDeque::new()),
                 gone_agents: Mutex::new(HashSet::new()),
                 project_profile: OnceLock::new(),
+                runner_name: OnceLock::new(),
             }),
         };
         #[cfg(unix)]
@@ -244,6 +248,23 @@ impl MuxService {
     #[cfg(unix)]
     pub fn set_project_profile(&self, f: ProjectProfile) {
         let _ = self.inner.project_profile.set(f);
+    }
+
+    /// The name the CI knows this runner by. A second call is ignored.
+    pub fn set_runner_name(&self, name: String) {
+        let _ = self.inner.runner_name.set(name);
+    }
+
+    /// The variables every terminal of this runner starts with.
+    fn terminal_env(&self, profile: &mut Profile, id: TerminalId) {
+        profile
+            .env
+            .push(("ZEUGHAUS_TERMINAL".to_owned(), id.0.to_string()));
+        if let Some(name) = self.inner.runner_name.get() {
+            profile
+                .env
+                .push(("ZEUGHAUS_RUNNER".to_owned(), name.clone()));
+        }
     }
 
     #[cfg(unix)]
@@ -441,9 +462,7 @@ impl MuxService {
         kind: ActivityKind,
     ) -> Result<TerminalId, String> {
         let id = TerminalId(self.inner.next_terminal.fetch_add(1, Ordering::Relaxed));
-        profile
-            .env
-            .push(("ZEUGHAUS_TERMINAL".to_owned(), id.0.to_string()));
+        self.terminal_env(&mut profile, id);
         let session = Session::spawn(id, &profile, size, wal, &self.inner.host)
             .map_err(|e| format!("cannot start {}: {e}", profile.label))?;
         self.follow_title(&session);
@@ -1498,9 +1517,7 @@ impl MuxService {
                 .ok_or_else(|| format!("no profile {}", profile.0))?;
             let id = TerminalId(self.inner.next_terminal.fetch_add(1, Ordering::Relaxed));
             let mut profile = profile.clone();
-            profile
-                .env
-                .push(("ZEUGHAUS_TERMINAL".to_owned(), id.0.to_string()));
+            self.terminal_env(&mut profile, id);
             let session = Session::spawn(
                 id,
                 &profile,

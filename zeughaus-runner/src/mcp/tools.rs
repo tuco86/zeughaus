@@ -17,8 +17,8 @@ use zeughaus_link::ci::{
 };
 use zeughaus_link::manual::{MAX_MANUAL_JOBS, RunReply};
 use zeughaus_link::{
-    CiOverview, CiReply, CiRequest, DocKind, DocState, DocView, JobTiming, JobView, MachineView,
-    OnboardSpec, PipelineView, StateView, TransferView,
+    CiOverview, CiReply, CiRequest, ClaimHolder, ClaimSubject, DocKind, DocState, DocView,
+    JobTiming, JobView, MachineView, OnboardSpec, PipelineView, StateView, TransferView,
 };
 
 use super::client::Client;
@@ -44,7 +44,10 @@ PROPOSAL-*.md in its root), onboard_request asks for a project the CI does not b
 join it, and a session executing a plan from zeughaus calls plan_done once its \
 work is committed and pushed. A job that names `state = [..]` in its header keeps data from one \
 pipeline to the next: ci_state lists those stores and their versions, ci_state_get downloads one \
-version into a directory and ci_state_delete removes a version or a whole store.";
+version into a directory and ci_state_delete removes a version or a whole store. The session \
+that starts or waits on a pipeline holds it: its failures, and a later pipeline's failure of the \
+same job, are that session's to fix; ci_pipeline and ci_wait name who is responsible, and \
+another session leaves that fix to it.";
 
 /// Pipelines listed when the call gives no limit.
 const DEFAULT_PIPELINES: u32 = 10;
@@ -85,6 +88,9 @@ pub struct Toolbox {
     /// The checkout an omitted `repo` was last resolved for, and the
     /// repository the CI named it.
     resolved: tokio::sync::Mutex<Option<(PathBuf, String)>>,
+    /// The terminal this process runs in, which takes the pipelines it
+    /// starts or waits on; `None` outside a zeughaus terminal.
+    holder: Option<ClaimHolder>,
 }
 
 impl Toolbox {
@@ -96,6 +102,7 @@ impl Toolbox {
             numbering_wait: NUMBERING_WAIT,
             workdir: None,
             resolved: tokio::sync::Mutex::new(None),
+            holder: super::env_holder(),
         }
     }
 
@@ -125,6 +132,14 @@ impl Toolbox {
     #[cfg(test)]
     fn working_in(mut self, dir: PathBuf) -> Toolbox {
         self.workdir = Some(dir);
+        self
+    }
+
+    /// The terminal that holds claims, for a test that must not depend on
+    /// the terminal it runs in.
+    #[cfg(test)]
+    fn holding(mut self, holder: Option<ClaimHolder>) -> Toolbox {
+        self.holder = holder;
         self
     }
 
@@ -190,7 +205,46 @@ impl Toolbox {
     async fn pipeline(&self, args: PipelineArgs) -> Result<String, String> {
         let repo = self.repo_or_checkout(args.repo).await?;
         let view = self.view(&repo, args.number).await?;
-        Ok(pipeline_text(&view))
+        let mut text = pipeline_text(&view);
+        text.push_str(&self.responsibility_line(&repo, view.number).await);
+        Ok(text)
+    }
+
+    /// Takes pipeline `number` of `repo` for the terminal this process runs
+    /// in. It only informs, so nothing is said when it fails or someone
+    /// else holds it.
+    async fn claim_pipeline(&self, repo: &str, number: u64) {
+        let Some(holder) = self.holder.clone() else {
+            return;
+        };
+        let request = CiRequest::Claim {
+            subject: ClaimSubject::Pipeline {
+                repo: repo.to_owned(),
+                number,
+            },
+            holder,
+        };
+        let _ = self.client.ci(request).await;
+    }
+
+    /// `responsible: <holder> (holds #m)\n` for pipeline `number` of
+    /// `repo`; empty when nobody holds it or the CI cannot say.
+    async fn responsibility_line(&self, repo: &str, number: u64) -> String {
+        let request = CiRequest::Responsible {
+            repo: repo.to_owned(),
+            number,
+        };
+        match self.client.ci(request).await {
+            Ok(CiReply::Responsible { claim: Some(claim) }) => {
+                let held = claim.subject.number();
+                if held == number {
+                    format!("responsible: {}\n", claim.holder_text())
+                } else {
+                    format!("responsible: {} (holds #{held})\n", claim.holder_text())
+                }
+            }
+            _ => String::new(),
+        }
     }
 
     async fn log(&self, args: LogArgs) -> Result<String, String> {
@@ -257,10 +311,13 @@ impl Toolbox {
         let actor = format!("rerun of #{number}");
         Ok(
             match self.numbered(&repo, above, |p| p.actor == actor).await? {
-                Some(view) => format!(
-                    "accepted: #{} reruns #{number}; ci_wait number={} waits for it\n",
-                    view.number, view.number
-                ),
+                Some(view) => {
+                    self.claim_pipeline(&repo, view.number).await;
+                    format!(
+                        "accepted: #{} reruns #{number}; ci_wait number={} waits for it\n",
+                        view.number, view.number
+                    )
+                }
                 None => format!(
                     "accepted: the rerun of #{number} has no number yet: it waits behind a \
                      running pipeline of the same ref; ci_pipelines lists it once it starts\n"
@@ -288,11 +345,14 @@ impl Toolbox {
         let event = args.event;
         let wanted = |p: &PipelineView| p.actor == actor && p.event == event;
         Ok(match self.numbered(&repo, above, wanted).await? {
-            Some(view) => format!(
-                "accepted: {}\nci_wait number={} waits for it\n",
-                pipeline_header(&view),
-                view.number
-            ),
+            Some(view) => {
+                self.claim_pipeline(&repo, view.number).await;
+                format!(
+                    "accepted: {}\nci_wait number={} waits for it\n",
+                    pipeline_header(&view),
+                    view.number
+                )
+            }
             None => format!(
                 "accepted: the {event} event has no number yet: it waits behind a running \
                  pipeline of the same ref or a running nightly, or no job's on selects it; \
@@ -400,6 +460,7 @@ impl Toolbox {
         drop(snapshot);
         match reply {
             RunReply::Accepted { repo, number } => {
+                self.claim_pipeline(&repo, number).await;
                 let left = wait.saturating_sub(started.elapsed()).as_secs().max(1);
                 self.ci_wait(CiWaitArgs {
                     repo: Some(repo),
@@ -687,6 +748,8 @@ impl Toolbox {
         // Every look sets it before the loop can end.
         let mut last_error: Option<String>;
         let mut failing_since: Option<Instant> = None;
+        // The first look takes the pipeline for this terminal.
+        let mut claimed = false;
         loop {
             let looked = match &wanted {
                 Wanted::Number(number) => self.look(&repo, *number).await,
@@ -694,6 +757,10 @@ impl Toolbox {
             };
             match looked {
                 Ok(Some(view)) => {
+                    if !claimed {
+                        claimed = true;
+                        self.claim_pipeline(&repo, view.number).await;
+                    }
                     wanted = Wanted::Number(view.number);
                     last_error = None;
                     failing_since = None;
@@ -713,10 +780,14 @@ impl Toolbox {
                             matches!(found.status.as_str(), "succeeded" | "failed" | "skipped");
                     }
                     if settled {
+                        let mut text = pipeline_text(&view);
+                        if view.status == "failed" {
+                            text.push_str(&self.responsibility_line(&repo, view.number).await);
+                        }
                         return Ok(Waited {
                             settled: true,
                             late: false,
-                            text: pipeline_text(&view),
+                            text,
                         });
                     }
                     let late = lateness(&view, job.as_deref(), given, now());
@@ -2478,6 +2549,7 @@ mod tests {
                     latest: 123,
                     status: "succeeded".to_owned(),
                     load: None,
+                    responsible: None,
                 },
                 ChannelView {
                     repo: "zeughaus".to_owned(),
@@ -2485,6 +2557,7 @@ mod tests {
                     latest: 9,
                     status: "succeeded".to_owned(),
                     load: Some("check 3.4x expected, runner not shared".to_owned()),
+                    responsible: None,
                 },
             ],
             machines: vec![
@@ -2526,6 +2599,7 @@ mod tests {
             repos: Vec::new(),
             build: 116,
             sessions: Vec::new(),
+            claims: Vec::new(),
         };
         assert_eq!(
             status_text(&overview, 1_000),
@@ -2544,6 +2618,7 @@ mod tests {
             repos: Vec::new(),
             build: 0,
             sessions: Vec::new(),
+            claims: Vec::new(),
         };
         assert_eq!(
             status_text(&empty, 0),
@@ -3095,6 +3170,7 @@ mod tests {
                 latest: 5,
                 status: "succeeded".to_owned(),
                 load: None,
+                responsible: None,
             }],
             head: sha.map(|_| Box::new(head)),
             jobs_sha: sha.filter(|_| jobs).map(str::to_owned),
@@ -3111,6 +3187,7 @@ mod tests {
             platforms: vec![("linux-amd64".to_owned(), "agent".to_owned())],
             docs: Vec::new(),
             setup: Vec::new(),
+            claims: Vec::new(),
         }
     }
 
@@ -3138,6 +3215,18 @@ mod tests {
                         ],
                     );
                     view.number = 4;
+                    CiReply::Pipeline {
+                        pipeline: Some(Box::new(view)),
+                    }
+                }
+                // Failed, its holder an earlier pipeline's.
+                CiRequest::Pipeline { number: 5, .. } => {
+                    let mut view = pipeline(
+                        "failed",
+                        Some(1_007),
+                        vec![job("build", "failed", "agent", "")],
+                    );
+                    view.number = 5;
                     CiReply::Pipeline {
                         pipeline: Some(Box::new(view)),
                     }
@@ -3248,6 +3337,34 @@ mod tests {
                 CiRequest::DocState { number, .. } => CiReply::Error {
                     message: format!("no document #{number} in demo"),
                 },
+                CiRequest::Claim { subject, holder } => CiReply::Claim {
+                    claim: zeughaus_link::ClaimView {
+                        subject,
+                        holder,
+                        label: String::new(),
+                        channel: "dev".to_owned(),
+                        since: 0,
+                        renewed: 0,
+                    },
+                    ours: true,
+                },
+                // #1 is held by a master; #5 inherits #1's holder.
+                CiRequest::Responsible { repo, number } if number == 1 || number == 5 => {
+                    CiReply::Responsible {
+                        claim: Some(zeughaus_link::ClaimView {
+                            subject: ClaimSubject::Pipeline { repo, number: 1 },
+                            holder: ClaimHolder {
+                                runner: "atik".to_owned(),
+                                terminal: 7,
+                                session: Some(3),
+                            },
+                            label: "master demo #38".to_owned(),
+                            channel: "dev".to_owned(),
+                            since: 0,
+                            renewed: 0,
+                        }),
+                    }
+                }
                 _ => CiReply::Error {
                     message: "not served by the fake".to_owned(),
                 },
@@ -3303,7 +3420,9 @@ mod tests {
 
     /// A tools box that talks to `ci`.
     fn toolbox_for(ci: &FakeCi) -> Toolbox {
-        Toolbox::new(Arc::new(client_for(ci))).polling_every(Duration::from_millis(20))
+        Toolbox::new(Arc::new(client_for(ci)))
+            .polling_every(Duration::from_millis(20))
+            .holding(None)
     }
 
     /// Plan #2 of the fake: saved an hour after the epoch.
@@ -3916,6 +4035,45 @@ mod tests {
             );
         }
 
+        /// A wait in a zeughaus terminal takes the pipeline, and a failed one
+        /// says who is responsible for it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn ci_wait_takes_the_pipeline_and_names_who_fixes_its_failure() {
+            let ci = fake_ci(0, None).await;
+            let holder = ClaimHolder {
+                runner: "agent".to_owned(),
+                terminal: 9,
+                session: None,
+            };
+            let tools = toolbox_for(&ci).holding(Some(holder.clone()));
+            let text = tools
+                .call(
+                    "ci_wait",
+                    json!({ "repo": "demo", "number": 5, "wait_seconds": 30 }),
+                )
+                .await
+                .expect("the pipeline has failed");
+            assert!(
+                text.ends_with("\nresponsible: master demo #38 on atik, terminal 7 (holds #1)\n"),
+                "{text}"
+            );
+            let asked = ci.seen.asked.lock().unwrap().clone();
+            let claims: Vec<&CiRequest> = asked
+                .iter()
+                .filter(|asked| matches!(asked, CiRequest::Claim { .. }))
+                .collect();
+            assert_eq!(
+                claims,
+                [&CiRequest::Claim {
+                    subject: ClaimSubject::Pipeline {
+                        repo: "demo".to_owned(),
+                        number: 5
+                    },
+                    holder,
+                }]
+            );
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn ci_wait_returns_once_the_pipeline_has_finished() {
             let ci = fake_ci(2, None).await;
@@ -4325,14 +4483,25 @@ mod tests {
                 text.starts_with("demo/dev #1 succeeded manual main 0123456"),
                 "{text}"
             );
+            // Who is responsible follows the pipeline.
+            assert!(
+                text.ends_with("\nresponsible: master demo #38 on atik, terminal 7\n"),
+                "{text}"
+            );
             let asked = ci.seen.asked.lock().unwrap().clone();
-            assert_eq!(asked.len(), 3, "{asked:?}");
+            assert_eq!(asked.len(), 4, "{asked:?}");
             assert_eq!(
-                asked[2],
-                CiRequest::Pipeline {
-                    repo: "demo".to_owned(),
-                    number: 1
-                }
+                asked[2..],
+                [
+                    CiRequest::Pipeline {
+                        repo: "demo".to_owned(),
+                        number: 1
+                    },
+                    CiRequest::Responsible {
+                        repo: "demo".to_owned(),
+                        number: 1
+                    }
+                ]
             );
 
             // A repo that is named is used as it is, whatever the checkout is.
@@ -4341,9 +4510,9 @@ mod tests {
                 .await
                 .expect("the pipeline");
             let asked = ci.seen.asked.lock().unwrap().clone();
-            assert_eq!(asked.len(), 4, "{asked:?}");
+            assert_eq!(asked.len(), 6, "{asked:?}");
             assert_eq!(
-                asked[3],
+                asked[4],
                 CiRequest::Pipeline {
                     repo: "named".to_owned(),
                     number: 1

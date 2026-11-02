@@ -40,7 +40,10 @@ use std::time::Duration;
 use serde::Serialize;
 use tokio::io::BufReader;
 use zeughaus_link::ci::{plan_title, proposals_named, runs_on_named};
-use zeughaus_link::{CiReply, CiRequest, DocKind, DocState, MachineView, RepoView, SessionView};
+use zeughaus_link::{
+    CiReply, CiRequest, ClaimHolder, ClaimSubject, ClaimView, DocKind, DocState, MachineView,
+    RepoView, SessionView,
+};
 
 use self::client::{Client, Link};
 pub(crate) use self::tools::unexpected;
@@ -119,7 +122,7 @@ const EXIT_NOT_A_REPOSITORY: u8 = 3;
 /// `ci wait` only: a running job reached a multiple of its expected time.
 const EXIT_LATE: u8 = 4;
 
-/// `zeughaus-runner ci repo|find|doc|plan-save|planned|wait|overdue`: one question to
+/// `zeughaus-runner ci <subcommand>`: one question to
 /// the CI, answered on stdout, for a script that is no MCP client (an
 /// agent's extension asks them at session start, after a push and when a
 /// plan is saved). The CI is dialled as `mcp` does without `--ci`, and the
@@ -149,6 +152,16 @@ const EXIT_LATE: u8 = 4;
 /// - `ci overdue <repo> <number> <job>`: the late report of a running job
 ///   (how far into its expected time, its machine's other jobs, its last
 ///   lines), which the omp plugin's push watch sends at each multiple.
+/// - `ci claim [--json] <repo> proposal|pipeline <n>`: takes the proposal
+///   or pipeline for this terminal (`ZEUGHAUS_RUNNER`, `ZEUGHAUS_TERMINAL`),
+///   or says who holds it. `--json` prints `{"ours": .., "claim": ..,
+///   "text": ..}`.
+/// - `ci renew`: renews every claim of this terminal.
+/// - `ci release [<repo> proposal|pipeline <n>]`: releases one claim of
+///   this terminal, or all of them.
+/// - `ci responsible [--json] <repo> <n>`: who is responsible for a
+///   pipeline's failure. `--json` prints `{"ours": .., "claim": ..|null,
+///   "text": ..}`, `ours` when this terminal holds it.
 ///
 /// Exit 0: answered (for `ci wait`: settled, whatever its status); an
 /// `--approve` that the CI refused still exits 0 and says so, because the
@@ -244,6 +257,60 @@ enum CiCommand {
         json: bool,
         id: u64,
     },
+    Claim {
+        json: bool,
+        subject: ClaimSubject,
+    },
+    Renew,
+    Release {
+        subject: Option<ClaimSubject>,
+    },
+    Responsible {
+        json: bool,
+        repo: String,
+        number: u64,
+    },
+}
+
+/// The holder a terminal names: a valid runner name and a terminal id, and
+/// the CI session in it when there is one.
+pub(crate) fn holder_of(
+    runner: Option<&str>,
+    terminal: Option<&str>,
+    session: Option<&str>,
+) -> Option<ClaimHolder> {
+    let runner = runner.filter(|name| crate::names::valid_name(name))?;
+    let terminal = terminal?.parse::<u64>().ok()?;
+    Some(ClaimHolder {
+        runner: runner.to_owned(),
+        terminal,
+        session: session.and_then(|id| id.parse::<u64>().ok()),
+    })
+}
+
+/// The holder of the zeughaus terminal this process runs in, if it runs in
+/// one.
+pub(crate) fn env_holder() -> Option<ClaimHolder> {
+    let var = |name: &str| std::env::var(name).ok();
+    holder_of(
+        var("ZEUGHAUS_RUNNER").as_deref(),
+        var("ZEUGHAUS_TERMINAL").as_deref(),
+        var("ZEUGHAUS_SESSION").as_deref(),
+    )
+}
+
+/// What a claim is on, from `<repo> proposal|pipeline <n>`.
+fn subject_of(repo: &str, kind: &str, number: &str) -> Result<ClaimSubject, String> {
+    let n = match number.parse::<u64>() {
+        Ok(n) if n >= 1 => n,
+        _ => return Err(format!("{number:?} is no number")),
+    };
+    let repo = repo.to_owned();
+    match kind {
+        "proposal" => Ok(ClaimSubject::Proposal { repo, number: n }),
+        "pipeline" => Ok(ClaimSubject::Pipeline { repo, number: n }),
+        _ => Err(format!("{kind:?} is neither proposal nor pipeline")),
+    }
 }
 
 /// How long `ci wait` waits: the longest a job may run by default. The
@@ -252,7 +319,8 @@ const CLI_WAIT_LIMIT: Duration = Duration::from_secs(4 * 3600);
 
 /// The arguments that follow `ci`.
 fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
-    const SUBCOMMANDS: &str = "repo, find, doc, plan-save, planned, wait, overdue or session";
+    const SUBCOMMANDS: &str = "repo, find, doc, plan-save, planned, wait, overdue, session, \
+                               claim, renew, release or responsible";
     let Some((subcommand, rest)) = args.split_first() else {
         return Err(format!("ci needs a subcommand: {SUBCOMMANDS}"));
     };
@@ -261,7 +329,12 @@ fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
     let mut operands: Vec<&String> = Vec::new();
     for arg in rest {
         match arg.as_str() {
-            "--json" if !matches!(subcommand.as_str(), "planned" | "wait" | "overdue") => {
+            "--json"
+                if !matches!(
+                    subcommand.as_str(),
+                    "planned" | "wait" | "overdue" | "renew" | "release"
+                ) =>
+            {
                 json = true
             }
             "--approve" if subcommand == "plan-save" => approve = true,
@@ -358,6 +431,34 @@ fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
             _ => Err(format!("{id:?} is no session number")),
         },
         ("session", _) => Err("ci session takes a session number".to_owned()),
+        ("claim", [repo, kind, number]) => Ok(CiCommand::Claim {
+            json,
+            subject: subject_of(repo, kind, number)?,
+        }),
+        ("claim", _) => {
+            Err("ci claim takes a repository name, proposal or pipeline, and a number".to_owned())
+        }
+        ("renew", []) => Ok(CiCommand::Renew),
+        ("renew", _) => Err("ci renew takes nothing".to_owned()),
+        ("release", []) => Ok(CiCommand::Release { subject: None }),
+        ("release", [repo, kind, number]) => Ok(CiCommand::Release {
+            subject: Some(subject_of(repo, kind, number)?),
+        }),
+        ("release", _) => Err(
+            "ci release takes nothing, or a repository name, proposal or pipeline, and a number"
+                .to_owned(),
+        ),
+        ("responsible", [repo, number]) => match number.parse::<u64>() {
+            Ok(n) if n >= 1 => Ok(CiCommand::Responsible {
+                json,
+                repo: (*repo).clone(),
+                number: n,
+            }),
+            _ => Err(format!("{number:?} is no number")),
+        },
+        ("responsible", _) => {
+            Err("ci responsible takes a repository name and a pipeline number".to_owned())
+        }
         (other, _) => Err(format!("unknown ci subcommand {other:?}: {SUBCOMMANDS}")),
     }
 }
@@ -409,6 +510,33 @@ struct SessionAnswer<'a> {
     session: &'a SessionView,
     runners: &'a [MachineView],
     others: &'a [SessionView],
+}
+
+/// The line `ci claim --json` and `ci responsible --json` print.
+#[derive(Serialize)]
+struct ClaimAnswer<'a> {
+    ours: bool,
+    claim: Option<&'a ClaimView>,
+    text: &'a str,
+}
+
+const NOT_IN_A_TERMINAL: &str =
+    "not in a zeughaus terminal: ZEUGHAUS_RUNNER and ZEUGHAUS_TERMINAL are unset";
+
+/// Who is responsible for pipeline `number` of `repo`, as `ci responsible`
+/// says it.
+fn responsible_text(repo: &str, number: u64, claim: Option<&ClaimView>) -> String {
+    match claim {
+        Some(claim) if claim.subject.number() == number => {
+            format!("responsible for {repo} #{number}: {}", claim.holder_text())
+        }
+        Some(claim) => format!(
+            "responsible for {repo} #{number}: {} (holds #{})",
+            claim.holder_text(),
+            claim.subject.number()
+        ),
+        None => format!("nobody holds {repo} #{number} or an earlier failure of its jobs"),
+    }
 }
 
 /// What an agent session is told about itself and the runners around it.
@@ -689,6 +817,79 @@ async fn ci_answer(client: &Arc<Client>, command: CiCommand) -> Result<String, F
                 Ok(session_text(&session, &runners, &others))
             }
         }
+        CiCommand::Claim { json, subject } => {
+            let holder =
+                env_holder().ok_or_else(|| Failure::bad_input(NOT_IN_A_TERMINAL.to_owned()))?;
+            let request = CiRequest::Claim {
+                subject: subject.clone(),
+                holder,
+            };
+            let (claim, ours) = match client.ci(request).await.map_err(Failure::no_answer)? {
+                CiReply::Claim { claim, ours } => (claim, ours),
+                other => return Err(Failure::no_answer(unexpected(&other))),
+            };
+            let text = if ours {
+                format!("claimed {}", subject.text())
+            } else {
+                format!("{} is held by {}", subject.text(), claim.holder_text())
+            };
+            if json {
+                encoded(&ClaimAnswer {
+                    ours,
+                    claim: Some(&claim),
+                    text: &text,
+                })
+            } else {
+                Ok(format!("{text}\n"))
+            }
+        }
+        CiCommand::Renew => {
+            let holder =
+                env_holder().ok_or_else(|| Failure::bad_input(NOT_IN_A_TERMINAL.to_owned()))?;
+            match client
+                .ci(CiRequest::ClaimRenew { holder })
+                .await
+                .map_err(Failure::no_answer)?
+            {
+                CiReply::Accepted => Ok("renewed\n".to_owned()),
+                other => Err(Failure::no_answer(unexpected(&other))),
+            }
+        }
+        CiCommand::Release { subject } => {
+            let holder =
+                env_holder().ok_or_else(|| Failure::bad_input(NOT_IN_A_TERMINAL.to_owned()))?;
+            match client
+                .ci(CiRequest::ClaimRelease { holder, subject })
+                .await
+                .map_err(Failure::no_answer)?
+            {
+                CiReply::Accepted => Ok("released\n".to_owned()),
+                other => Err(Failure::no_answer(unexpected(&other))),
+            }
+        }
+        CiCommand::Responsible { json, repo, number } => {
+            let request = CiRequest::Responsible {
+                repo: repo.clone(),
+                number,
+            };
+            let claim = match client.ci(request).await.map_err(Failure::no_answer)? {
+                CiReply::Responsible { claim } => claim,
+                other => return Err(Failure::no_answer(unexpected(&other))),
+            };
+            let text = responsible_text(&repo, number, claim.as_ref());
+            if json {
+                let ours = env_holder()
+                    .zip(claim.as_ref())
+                    .is_some_and(|(holder, claim)| claim.holder.same(&holder));
+                encoded(&ClaimAnswer {
+                    ours,
+                    claim: claim.as_ref(),
+                    text: &text,
+                })
+            } else {
+                Ok(format!("{text}\n"))
+            }
+        }
     }
 }
 
@@ -849,10 +1050,87 @@ mod tests {
                 &["wait", "--json", "demo", "12"][..],
                 "unknown flag \"--json\" for ci wait",
             ),
+            (
+                &["claim", "demo", "plan", "3"][..],
+                "\"plan\" is neither proposal nor pipeline",
+            ),
+            (
+                &["claim", "demo", "pipeline", "0"][..],
+                "\"0\" is no number",
+            ),
+            (&["claim", "demo", "3"][..], "ci claim takes"),
+            (&["renew", "x"][..], "ci renew takes nothing"),
+            (
+                &["renew", "--json"][..],
+                "unknown flag \"--json\" for ci renew",
+            ),
+            (
+                &["release", "--json"][..],
+                "unknown flag \"--json\" for ci release",
+            ),
+            (&["release", "demo"][..], "ci release takes"),
+            (&["responsible", "demo", "x"][..], "\"x\" is no number"),
+            (&["responsible", "demo"][..], "ci responsible takes"),
         ] {
             let err = parse_ci(&args(given)).expect_err(&format!("{given:?}"));
             assert!(err.contains(reason), "{given:?}: {err}");
         }
+    }
+
+    #[test]
+    fn ci_claims_a_proposal_or_pipeline_and_asks_who_is_responsible() {
+        assert_eq!(
+            parse_ci(&args(&["claim", "--json", "demo", "proposal", "3"])),
+            Ok(CiCommand::Claim {
+                json: true,
+                subject: ClaimSubject::Proposal {
+                    repo: "demo".to_owned(),
+                    number: 3
+                }
+            })
+        );
+        assert_eq!(parse_ci(&args(&["renew"])), Ok(CiCommand::Renew));
+        assert_eq!(
+            parse_ci(&args(&["release"])),
+            Ok(CiCommand::Release { subject: None })
+        );
+        assert_eq!(
+            parse_ci(&args(&["release", "demo", "pipeline", "12"])),
+            Ok(CiCommand::Release {
+                subject: Some(ClaimSubject::Pipeline {
+                    repo: "demo".to_owned(),
+                    number: 12
+                })
+            })
+        );
+        assert_eq!(
+            parse_ci(&args(&["responsible", "demo", "12", "--json"])),
+            Ok(CiCommand::Responsible {
+                json: true,
+                repo: "demo".to_owned(),
+                number: 12
+            })
+        );
+    }
+
+    #[test]
+    fn a_holder_needs_a_valid_runner_and_a_numeric_terminal() {
+        assert_eq!(
+            holder_of(Some("atik"), Some("7"), Some("38")),
+            Some(ClaimHolder {
+                runner: "atik".to_owned(),
+                terminal: 7,
+                session: Some(38)
+            })
+        );
+        assert_eq!(
+            holder_of(Some("atik"), Some("7"), None).map(|h| h.session),
+            Some(None)
+        );
+        assert_eq!(holder_of(Some("atik"), None, None), None);
+        assert_eq!(holder_of(Some("atik"), Some("seven"), None), None);
+        assert_eq!(holder_of(Some("Atik PC"), Some("7"), None), None);
+        assert_eq!(holder_of(None, Some("7"), None), None);
     }
 
     /// Tests that touch the filesystem, network, processes or real time: the

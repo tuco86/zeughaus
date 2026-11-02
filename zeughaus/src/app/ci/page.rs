@@ -5,20 +5,25 @@
 //!
 //! The Board is a project's lifecycle on one screen, read left to right:
 //! proposals become plans, plans queue, run and finish, with the channels'
-//! health above. A card the CI moves to another column arrives with an
-//! accent ring that fades over [`MOVED_FOR`].
+//! health above. Two lanes appear between the columns while something
+//! passes through them: a proposal a session plans, a master that starts.
+//! What runs or waits pulses; a card the CI moves to another slot arrives
+//! with an accent ring that fades over [`MOVED_FOR`].
 
 use std::collections::HashMap;
+use std::f32::consts::TAU;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Space, button, column, container, mouse_area, row, rule, scrollable, text, text_input,
+    Space, button, column, container, mouse_area, row, rule, scrollable, stack, text, text_input,
 };
 use iced::{Alignment, Border, Color, Element, Length, Task};
 use zeughaus_link::{
-    ActivityKind, ActivityState, AgentRole, AgentState, CiRequest, DocGroup, DocKind, DocView,
-    OnboardSpec, RepoDocsView, SessionKind, SessionState, SessionView, doc_groups,
+    ActivityKind, ActivityState, AgentRole, AgentState, CiRequest, ClaimSubject, ClaimView,
+    DocGroup, DocKind, DocState, DocView, OnboardSpec, RepoDocsView, SessionKind, SessionState,
+    SessionView, doc_groups,
 };
 use zeughaus_mux::TerminalId;
 use zeughaus_theme::Theme;
@@ -47,11 +52,12 @@ const FAILED_SESSION_RECENT: Duration = Duration::from_secs(24 * 3600);
 const RAIL_ROW: f32 = 28.0;
 const RAIL_PIPELINES: usize = 12;
 const PIPELINE_DOT: f32 = 8.0;
-/// The finished documents the DONE column shows.
+/// The finished documents the DONE slot shows.
 const DONE_SHOWN: usize = 12;
 /// How long a card the CI moved carries its ring.
 const MOVED_FOR: Duration = Duration::from_secs(2);
-/// The narrowest a Board column gets before the board scrolls sideways.
+/// The narrowest a Board column gets before the board scrolls sideways;
+/// a lane is always this wide.
 const COLUMN_MIN: f32 = 168.0;
 
 /// The glyphs of a project's channels: dev, nightly, release, and any
@@ -117,11 +123,11 @@ pub(in crate::app) struct Board {
     row: usize,
     /// Whether the selected document's detail is open beside the board.
     detail: bool,
-    /// The column each document was last seen in, by repository and number.
+    /// The slot each document was last seen in, by repository and number.
     columns: HashMap<(String, u64), usize>,
-    /// When the CI moved a document to another column.
+    /// When the CI moved a document to another slot.
     moved: HashMap<(String, u64), Instant>,
-    /// The card the cursor is on: the cursor follows it to another column
+    /// The card the cursor is on: the cursor follows it to another slot
     /// when the CI moves it.
     card: Option<Card>,
 }
@@ -129,7 +135,7 @@ pub(in crate::app) struct Board {
 impl Board {
     /// Where the cursor is: on its card wherever that is now, else at its
     /// last place.
-    fn at(&self, cards: &[Vec<Card>; 5]) -> (usize, usize) {
+    fn at(&self, cards: &Slots) -> (usize, usize) {
         if let Some(card) = self.card {
             for (column, list) in cards.iter().enumerate() {
                 if let Some(row) = list.iter().position(|c| *c == card) {
@@ -147,51 +153,152 @@ enum Card {
     Doc(u64),
     /// A live plan session, by its id.
     Session(u64),
+    /// A plan session this editor asked for, which has no session yet.
+    Opening,
 }
 
-/// The columns of the Board, left to right.
-const COLUMNS: [&str; 5] = ["Proposals", "Plans", "Queue", "Running", "Done"];
+/// The slots of the Board, left to right: a title, and whether it is a
+/// lane, drawn narrow and only while a card passes through it.
+const SLOTS: [(&str, bool); 7] = [
+    ("Proposals", false),
+    ("Planning", true),
+    ("Plans", false),
+    ("Queue", false),
+    ("Starting", true),
+    ("Running", false),
+    ("Done", false),
+];
+const PROPOSALS: usize = 0;
+const PLANNING: usize = 1;
+const PLANS: usize = 2;
+const QUEUE: usize = 3;
+const STARTING: usize = 4;
+const RUNNING: usize = 5;
+const DONE: usize = 6;
 
-/// The column of a document.
-fn column_of(group: DocGroup) -> usize {
-    match group {
-        DocGroup::Proposals => 0,
-        DocGroup::Awaiting => 1,
-        DocGroup::Queue => 2,
-        DocGroup::InProgress => 3,
-        DocGroup::History => 4,
+/// A repository's cards in their slots.
+type Slots = [Vec<Card>; 7];
+
+/// Whether a card in slot `at` is work a session does: it opens that
+/// session's tab.
+fn active(at: usize) -> bool {
+    matches!(at, PLANNING | STARTING | RUNNING)
+}
+
+/// Seconds since the first frame that asked: the clock every pulse and
+/// flow of the page runs on.
+pub(super) fn phase() -> f32 {
+    static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+    EPOCH.elapsed().as_secs_f32()
+}
+
+/// 0 to 1 and back over 1.6 s: what waits breathes.
+pub(super) fn pulse(phase: f32) -> f32 {
+    0.5 + 0.5 * (phase * TAU / 1.6).sin()
+}
+
+/// 0 to 1 over 1.4 s, then again: what moves flows.
+fn flow(phase: f32) -> f32 {
+    (phase / 1.4).fract()
+}
+
+/// `color` at alpha `a`.
+pub(super) fn faded(color: Color, a: f32) -> Color {
+    Color { a, ..color }
+}
+
+/// A repository's cards in their slots: its documents, its live plan
+/// sessions and a session asked for (`opening`: `Some` with the proposal it
+/// plans). A proposal a session plans (it holds the claim, its session
+/// runs, or this editor asked for one) is in the PLANNING lane; a plan
+/// whose master starts is in the STARTING lane. A planned proposal whose
+/// plan is still open is left out: the plan's card names it. `sessions`
+/// and `claims` are the repository's.
+fn board_columns(
+    docs: &[DocView],
+    sessions: &[&SessionView],
+    claims: &[&ClaimView],
+    opening: Option<Option<u64>>,
+) -> Slots {
+    let mut slots: Slots = Default::default();
+    let claimed = |number: u64| {
+        claims.iter().any(
+            |claim| matches!(claim.subject, ClaimSubject::Proposal { number: n, .. } if n == number),
+        )
+    };
+    let live = |kind: SessionKind, number: u64| {
+        sessions
+            .iter()
+            .find(|s| s.kind == kind && s.doc == Some(number) && s.state.is_live())
+    };
+    let open_plan = |plan: u64| {
+        docs.iter().any(|doc| {
+            doc.number == plan
+                && doc.kind == DocKind::Plan
+                && matches!(
+                    doc.state,
+                    DocState::Saved | DocState::Approved | DocState::InProgress
+                )
+        })
+    };
+    let mut done = 0;
+    for (group, members) in doc_groups(docs) {
+        for doc in members {
+            let number = doc.number;
+            let slot = match group {
+                DocGroup::Proposals => {
+                    if claimed(number)
+                        || live(SessionKind::Plan, number).is_some()
+                        || opening == Some(Some(number))
+                    {
+                        PLANNING
+                    } else {
+                        PROPOSALS
+                    }
+                }
+                DocGroup::Awaiting => PLANS,
+                DocGroup::Queue => QUEUE,
+                DocGroup::InProgress => match live(SessionKind::Master, number) {
+                    Some(master) if master.state == SessionState::Starting => STARTING,
+                    _ => RUNNING,
+                },
+                DocGroup::History
+                    if doc.kind == DocKind::Proposal && doc.state == DocState::Planned =>
+                {
+                    match doc.plan {
+                        Some(plan) if open_plan(plan) => continue,
+                        None if claimed(number) => RUNNING,
+                        _ => DONE,
+                    }
+                }
+                DocGroup::History => DONE,
+            };
+            if slot == DONE {
+                if done == DONE_SHOWN {
+                    continue;
+                }
+                done += 1;
+            }
+            slots[slot].push(Card::Doc(number));
+        }
     }
-}
-
-/// What a card says.
-#[derive(Default)]
-struct CardFace<'a> {
-    head: String,
-    changed: Option<u64>,
-    runs_on: &'a [String],
-    /// The document's repository and number, for its ring.
-    key: Option<(String, u64)>,
-}
-
-/// A repository's cards in their columns: its documents and its live plan
-/// sessions.
-fn board_columns(docs: &[DocView], sessions: &[&SessionView]) -> [Vec<Card>; 5] {
-    let mut columns: [Vec<Card>; 5] = Default::default();
-    for (group, docs) in doc_groups(docs) {
-        let column = &mut columns[column_of(group)];
-        let shown = if group == DocGroup::History {
-            DONE_SHOWN
-        } else {
-            usize::MAX
-        };
-        column.extend(
-            docs.into_iter()
-                .take(shown)
-                .map(|doc| Card::Doc(doc.number)),
-        );
+    // A plan session whose proposal has no card in the lane has one of its
+    // own there.
+    for session in sessions
+        .iter()
+        .filter(|s| s.kind == SessionKind::Plan && s.state.is_live())
+    {
+        if !session
+            .doc
+            .is_some_and(|n| slots[PLANNING].contains(&Card::Doc(n)))
+        {
+            slots[PLANNING].push(Card::Session(session.id));
+        }
     }
-    columns[3].extend(sessions.iter().map(|s| Card::Session(s.id)));
-    columns
+    if opening == Some(None) {
+        slots[PLANNING].push(Card::Opening);
+    }
+    slots
 }
 
 /// One row of the Overview.
@@ -689,25 +796,42 @@ impl App {
         }
     }
 
-    /// The cards of `origin`'s Board and where they come from.
-    fn board_cards(&self, origin: &str) -> Option<(RunnerKey, u64, [Vec<Card>; 5])> {
+    /// The cards of `origin`'s Board and where they come from: the CI, the
+    /// Plans view and the repository.
+    fn board_cards(&self, origin: &str) -> Option<(RunnerKey, u64, String, Slots)> {
         let (ci, client, repo) = self.ci_of(origin)?;
         let view = client.plans_view_of(&repo.repo)?;
         let state = client.plans.get(&view)?;
-        let sessions: Vec<&SessionView> = client
-            .sessions()
-            .filter(|s| s.repo == repo.repo && s.kind == SessionKind::Plan && s.state.is_live())
+        let slots = self.repo_slots(ci, client, &repo.repo, state.docs());
+        Some((ci.clone(), view, repo.repo.clone(), slots))
+    }
+
+    /// `repo`'s cards of CI `ci` in their slots.
+    fn repo_slots(&self, ci: &RunnerKey, client: &CiClient, repo: &str, docs: &[DocView]) -> Slots {
+        let sessions: Vec<&SessionView> = client.sessions().filter(|s| s.repo == repo).collect();
+        let claims: Vec<&ClaimView> = client
+            .claims()
+            .filter(|claim| claim.subject.repo() == repo)
             .collect();
-        Some((ci.clone(), view, board_columns(state.docs(), &sessions)))
+        board_columns(docs, &sessions, &claims, self.opening_on(ci, repo))
+    }
+
+    /// The plan session this editor asked CI `ci` for in `repo`, while it
+    /// has none: `Some` with the proposal it plans.
+    fn opening_on(&self, ci: &RunnerKey, repo: &str) -> Option<Option<u64>> {
+        self.opening_session
+            .as_ref()
+            .filter(|(key, asked, _)| key == ci && asked == repo)
+            .map(|(_, _, proposal)| *proposal)
     }
 
     /// The document under the Board's cursor, with its CI and Plans view.
     fn board_doc(&self, origin: &str) -> Option<(RunnerKey, u64, u64)> {
-        let (ci, view, columns) = self.board_cards(origin)?;
-        let (column, row) = self.page.board.at(&columns);
-        match columns[column].get(row)? {
+        let (ci, view, _, slots) = self.board_cards(origin)?;
+        let (column, row) = self.page.board.at(&slots);
+        match slots[column].get(row)? {
             Card::Doc(number) => Some((ci, view, *number)),
-            Card::Session(_) => None,
+            Card::Session(_) | Card::Opening => None,
         }
     }
 
@@ -725,17 +849,18 @@ impl App {
     /// Moves the Board's cursor by columns and rows, staying on a card; the
     /// detail, while open, follows it.
     fn board_move(&mut self, origin: &str, columns: isize, rows: isize) -> Task<Message> {
-        let Some((ci, view, cards)) = self.board_cards(origin) else {
+        let Some((ci, view, _, cards)) = self.board_cards(origin) else {
             return Task::none();
         };
         let board = &mut self.page.board;
         (board.column, board.row) = board.at(&cards);
         if columns != 0 {
-            // Past an empty column to the next one with cards.
+            // Past an empty slot (an empty lane is not drawn) to the next
+            // one with cards.
             let mut column = board.column as isize;
             loop {
                 column += columns;
-                if !(0..COLUMNS.len() as isize).contains(&column) {
+                if !(0..SLOTS.len() as isize).contains(&column) {
                     break;
                 }
                 if !cards[column as usize].is_empty() {
@@ -765,10 +890,11 @@ impl App {
         Task::batch([selected, self.redock()])
     }
 
-    /// Enter on the Board, and a press on a card: a running card brings its
-    /// agent's tab to the front; any other opens the document's detail.
+    /// Enter on the Board, and a press on a card: a card of work a session
+    /// does brings that session's tab to the front; any other opens the
+    /// document's detail.
     fn board_enter(&mut self, origin: &str) -> Task<Message> {
-        let Some((ci, view, cards)) = self.board_cards(origin) else {
+        let Some((ci, view, repo, cards)) = self.board_cards(origin) else {
             return Task::none();
         };
         let (column, row) = self.page.board.at(&cards);
@@ -776,8 +902,8 @@ impl App {
             return Task::none();
         };
         self.page.board.card = Some(card);
-        if column == 3
-            && let Some((runner, terminal)) = self.card_terminal(&ci, card)
+        if active(column)
+            && let Some((runner, terminal)) = self.card_holder(&ci, &repo, card)
         {
             return self.apply_page(Message::PageOpen(AttentionTarget::Terminal(
                 runner, terminal,
@@ -791,50 +917,71 @@ impl App {
         Task::batch([selected, self.redock()])
     }
 
-    /// The live session of a running card: a plan's master, a plan
-    /// session itself.
-    fn card_session(&self, ci: &RunnerKey, card: Card) -> Option<&SessionView> {
+    /// The live session of a card: a plan's master, a proposal's plan
+    /// session (numbers are shared by both kinds), a plan session itself.
+    fn card_session(&self, ci: &RunnerKey, repo: &str, card: Card) -> Option<&SessionView> {
         let client = self.ci.get(ci)?;
         match card {
-            Card::Doc(number) => client.sessions().find(|s| {
-                s.kind == SessionKind::Master && s.doc == Some(number) && s.state.is_live()
-            }),
+            Card::Doc(number) => client
+                .sessions()
+                .find(|s| s.repo == repo && s.doc == Some(number) && s.state.is_live()),
             Card::Session(id) => client.sessions().find(|s| s.id == id),
+            Card::Opening => None,
         }
     }
 
-    /// The runner and terminal of a running card's session.
-    fn card_terminal(&self, ci: &RunnerKey, card: Card) -> Option<(RunnerKey, TerminalId)> {
-        let session = self.card_session(ci, card)?;
-        Some((
-            self.ci.get(ci)?.runner_key(&session.runner)?,
-            TerminalId(session.terminal?),
-        ))
+    /// The runner and terminal responsible for a card: its session's, else
+    /// the holder of the claim on its proposal.
+    fn card_holder(
+        &self,
+        ci: &RunnerKey,
+        repo: &str,
+        card: Card,
+    ) -> Option<(RunnerKey, TerminalId)> {
+        let client = self.ci.get(ci)?;
+        if let Some(session) = self.card_session(ci, repo, card)
+            && let (Some(runner), Some(terminal)) =
+                (client.runner_key(&session.runner), session.terminal)
+        {
+            return Some((runner, TerminalId(terminal)));
+        }
+        let Card::Doc(number) = card else {
+            return None;
+        };
+        client.holder_target(client.claim_on(&ClaimSubject::Proposal {
+            repo: repo.to_owned(),
+            number,
+        })?)
     }
 
-    /// Notices the documents the CI moved to another column since the last
+    /// Notices the documents the CI moved to another slot since the last
     /// look, for their ring.
     pub(in crate::app) fn track_board_moves(&mut self) {
         let now = Instant::now();
+        let mut seen = Vec::new();
+        for (ci, client) in &self.ci {
+            for state in client.plans.values() {
+                let slots = self.repo_slots(ci, client, &state.repo, state.docs());
+                for (slot, cards) in slots.iter().enumerate() {
+                    for card in cards {
+                        if let Card::Doc(number) = card {
+                            seen.push(((state.repo.clone(), *number), slot));
+                        }
+                    }
+                }
+            }
+        }
         let board = &mut self.page.board;
         board
             .moved
             .retain(|_, at| now.duration_since(*at) < MOVED_FOR);
-        for client in self.ci.values() {
-            for state in client.plans.values() {
-                for (group, docs) in doc_groups(state.docs()) {
-                    let column = column_of(group);
-                    for doc in docs {
-                        let key = (doc.repo.clone(), doc.number);
-                        if board
-                            .columns
-                            .insert(key.clone(), column)
-                            .is_some_and(|was| was != column)
-                        {
-                            board.moved.insert(key, now);
-                        }
-                    }
-                }
+        for (key, slot) in seen {
+            if board
+                .columns
+                .insert(key.clone(), slot)
+                .is_some_and(|was| was != slot)
+            {
+                board.moved.insert(key, now);
             }
         }
     }
@@ -849,6 +996,52 @@ impl App {
                 .moved
                 .values()
                 .any(|at| at.elapsed() < MOVED_FOR)
+    }
+
+    /// Whether the page shows something that runs or waits, which pulses: a
+    /// card in a lane, an action or a session on its way, a running or
+    /// queued pipeline.
+    pub(in crate::app) fn page_pulsing(&self) -> bool {
+        if !self.page.open {
+            return false;
+        }
+        match &self.page.view {
+            PageView::Overview => false,
+            PageView::Board(origin) => {
+                let Some((ci, client, repo)) = self.ci_of(origin) else {
+                    return false;
+                };
+                let Some(state) = client
+                    .plans_view_of(&repo.repo)
+                    .and_then(|view| client.plans.get(&view))
+                else {
+                    return false;
+                };
+                let slots = self.repo_slots(ci, client, &repo.repo, state.docs());
+                !slots[PLANNING].is_empty()
+                    || !slots[STARTING].is_empty()
+                    || state.acting_on.is_some()
+                    || client
+                        .channels_of(&repo.repo)
+                        .iter()
+                        .any(|channel| channel.status == "running")
+                    || client
+                        .overview
+                        .iter()
+                        .flat_map(|overview| &overview.queued)
+                        .any(|queued| queued.repo == repo.repo)
+            }
+            PageView::Channel(ci, view) => self
+                .ci
+                .get(ci)
+                .and_then(|client| client.views.get(view))
+                .is_some_and(|state| {
+                    state
+                        .pipelines
+                        .iter()
+                        .any(|shown| shown.pipeline.status == "running")
+                }),
+        }
     }
 
     /// The page: the view it shows.
@@ -1176,8 +1369,9 @@ impl App {
         }
     }
 
-    /// A project's Board: the toolbar, the channel rail, the five columns,
-    /// and the selected document's detail beside them.
+    /// A project's Board: the toolbar, the channel rail, the columns with
+    /// the lanes between them, and the selected document's detail beside
+    /// them.
     fn board_view<'a>(&'a self, t: &Tokens, origin: &'a str) -> Element<'a, Message, Theme> {
         let muted = self.theme.muted();
         let Some((ci, client, repo)) = self.ci_of(origin) else {
@@ -1189,120 +1383,76 @@ impl App {
         else {
             return unavailable("Board", "The CI has not listed this repository yet.");
         };
-        let mut rail = column![].spacing(0).padding([4, 16]);
-        let channels = client.channels_of(&repo.repo);
-        if channels.is_empty() {
-            let line = match repo.onboarding {
-                Some(n) => format!("Onboarding requested (#{n}): the CI builds it once approved."),
-                None => "No channels yet: the first push starts one.".to_owned(),
-            };
-            rail = rail.push(
-                container(text(line).size(CAPTION_TEXT).color(muted))
-                    .height(RAIL_ROW)
-                    .align_y(Alignment::Center),
-            );
-        }
-        for channel in channels {
-            let tone = Tone::of(&channel.status);
-            let mut line = row![
-                container(
-                    super::glyph_text(channel_glyph(&channel.channel), 14.0)
-                        .color(tone.color(&self.theme))
-                )
-                .width(GLYPH_CELL),
-                text(channel.channel.clone()).size(ROW_TEXT).width(96),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center)
-            .height(RAIL_ROW);
-            let view = client.channel_view(&repo.repo, &channel.channel);
-            let pipelines = view
-                .and_then(|view| client.views.get(&view))
-                .map(|state| state.pipelines.as_slice())
-                .unwrap_or_default();
-            if pipelines.is_empty() {
-                line = line.push(text("No pipelines yet").size(CAPTION_TEXT).color(muted));
-            }
-            let mut dots = row![].spacing(6).align_y(Alignment::Center);
-            for shown in pipelines.iter().take(RAIL_PIPELINES) {
-                let color = Tone::of(&shown.pipeline.status).color(&self.theme);
-                let dot = container(Space::new())
-                    .width(PIPELINE_DOT)
-                    .height(PIPELINE_DOT)
-                    .style(move |_: &Theme| container::Style {
-                        background: Some(color.into()),
-                        border: iced::border::rounded(PIPELINE_DOT / 2.0),
-                        ..container::Style::default()
-                    });
-                let number = shown.pipeline.number;
-                let tip = format!("#{number} {}", shown.pipeline.status);
-                let dot = match view {
-                    Some(view) => Element::from(
-                        mouse_area(dot)
-                            .interaction(iced::mouse::Interaction::Pointer)
-                            .on_press(Message::PagePipeline(ci.clone(), view, number)),
-                    ),
-                    None => dot.into(),
-                };
-                dots = dots.push(super::tip(dot, tip));
-            }
-            line = line.push(dots);
-            rail = rail.push(line);
-        }
-
-        let cards = board_columns(
-            state.docs(),
-            &client
-                .sessions()
-                .filter(|s| s.repo == repo.repo && s.kind == SessionKind::Plan && s.state.is_live())
-                .collect::<Vec<_>>(),
-        );
+        let p = phase();
+        let rail = self.board_rail(ci, client, repo, p);
+        let cards = self.repo_slots(ci, client, &repo.repo, state.docs());
         let cursor = self.page.board.at(&cards);
-        // Five equal columns, each at least `COLUMN_MIN` wide: below that
-        // the columns keep their width and the board scrolls sideways.
+        // Every column, and a lane while a card passes through it.
+        let shown: Vec<usize> = (0..SLOTS.len())
+            .filter(|&at| !SLOTS[at].1 || !cards[at].is_empty())
+            .collect();
+        let accent = self.theme.accent();
+        // Equal columns, each at least `COLUMN_MIN` wide: below that the
+        // columns keep their width and the board scrolls sideways. A lane
+        // is always that narrow.
         let t = *t;
         let columns = iced::widget::responsive(move |size| {
-            let narrow = size.width < COLUMNS.len() as f32 * (COLUMN_MIN + 12.0) + 32.0;
-            let width = if narrow {
-                Length::Fixed(COLUMN_MIN)
-            } else {
-                Length::FillPortion(1)
-            };
+            let narrow = size.width < shown.len() as f32 * (COLUMN_MIN + 12.0) + 32.0;
             let mut columns = row![].spacing(12).padding([8, 16]).height(Length::Fill);
-            for (at, (title, cards)) in COLUMNS.iter().zip(cards.iter()).enumerate() {
-                let count = container(text(cards.len().to_string()).size(11))
+            for &at in &shown {
+                let (title, lane) = SLOTS[at];
+                let slot = &cards[at];
+                let width = if lane || narrow {
+                    Length::Fixed(COLUMN_MIN)
+                } else {
+                    Length::FillPortion(1)
+                };
+                let count = container(text(slot.len().to_string()).size(11))
                     .padding([0, 6])
                     .style(style::badge(&t, false));
+                let mut head = row![].spacing(6).align_y(Alignment::Center);
+                if lane {
+                    head = head.push(super::glyph_text(glyph::CHEVRON_RIGHT, 12.0).color(accent));
+                }
+                head = head
+                    .push(text(title.to_uppercase()).size(CAPTION_TEXT).color(muted))
+                    .push(count);
                 let mut list = column![].spacing(6);
-                if cards.is_empty() {
+                if slot.is_empty() {
                     list = list.push(text("Nothing here").size(CAPTION_TEXT).color(muted));
                 }
-                for (row_at, card) in cards.iter().enumerate() {
-                    let selected = cursor == (at, row_at);
+                for (row_at, card) in slot.iter().enumerate() {
                     list = list.push(self.board_card(
                         &t,
                         ci,
                         client,
-                        state.docs(),
+                        repo,
+                        state,
                         *card,
-                        at,
-                        row_at,
-                        selected,
+                        (at, row_at),
+                        cursor == (at, row_at),
+                        p,
                     ));
                 }
-                columns = columns.push(
-                    column![
-                        row![
-                            text(title.to_uppercase()).size(CAPTION_TEXT).color(muted),
-                            count
-                        ]
-                        .spacing(6)
-                        .align_y(Alignment::Center),
-                        scrollable(list).height(Length::Fill),
+                let list = scrollable(list).height(Length::Fill);
+                let body: Element<'_, Message, Theme> = if lane {
+                    // A guide down the lane's middle, breathing.
+                    let guide = faded(accent, 0.25 + 0.35 * pulse(p));
+                    let line = container(Space::new()).width(2).height(Length::Fill).style(
+                        move |_: &Theme| container::Style {
+                            background: Some(guide.into()),
+                            ..container::Style::default()
+                        },
+                    );
+                    stack![
+                        container(line).center_x(Length::Fill).height(Length::Fill),
+                        list,
                     ]
-                    .spacing(8)
-                    .width(width),
-                );
+                    .into()
+                } else {
+                    list.into()
+                };
+                columns = columns.push(column![head, body].spacing(8).width(width));
             }
             if narrow {
                 scrollable(columns)
@@ -1338,89 +1488,292 @@ impl App {
         }
     }
 
-    /// One card: number and title, age and `Runs on` chips; a running one
-    /// also where it runs and what its agent does.
+    /// The rail over a Board: each channel with its newest pipelines, led
+    /// by the events that wait for one as hollow dots. A running pipeline
+    /// pulses; a held one wears a ring in its holder's colour.
+    fn board_rail<'a>(
+        &'a self,
+        ci: &'a RunnerKey,
+        client: &'a CiClient,
+        repo: &'a RepoDocsView,
+        p: f32,
+    ) -> Element<'a, Message, Theme> {
+        let muted = self.theme.muted();
+        let mut rail = column![].spacing(0).padding([4, 16]);
+        let channels = client.channels_of(&repo.repo);
+        if channels.is_empty() {
+            let line = match repo.onboarding {
+                Some(n) => format!("Onboarding requested (#{n}): the CI builds it once approved."),
+                None => "No channels yet: the first push starts one.".to_owned(),
+            };
+            rail = rail.push(
+                container(text(line).size(CAPTION_TEXT).color(muted))
+                    .height(RAIL_ROW)
+                    .align_y(Alignment::Center),
+            );
+        }
+        for channel in channels {
+            let tone = Tone::of(&channel.status);
+            let mut line = row![
+                container(
+                    super::glyph_text(channel_glyph(&channel.channel), 14.0)
+                        .color(tone.color(&self.theme))
+                )
+                .width(GLYPH_CELL),
+                text(channel.channel.clone()).size(ROW_TEXT).width(96),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .height(RAIL_ROW);
+            let view = client.channel_view(&repo.repo, &channel.channel);
+            let pipelines = view
+                .and_then(|view| client.views.get(&view))
+                .map(|state| state.pipelines.as_slice())
+                .unwrap_or_default();
+            let mut dots = row![].spacing(6).align_y(Alignment::Center);
+            let mut queued = 0;
+            for waiting in client
+                .overview
+                .iter()
+                .flat_map(|overview| &overview.queued)
+                .filter(|q| q.repo == repo.repo && q.channel == channel.channel)
+            {
+                queued += 1;
+                let color = faded(self.theme.accent(), 0.3 + 0.7 * pulse(p));
+                let dot = container(Space::new())
+                    .width(PIPELINE_DOT)
+                    .height(PIPELINE_DOT)
+                    .style(move |_: &Theme| container::Style {
+                        border: Border {
+                            color,
+                            width: 1.5,
+                            radius: (PIPELINE_DOT / 2.0).into(),
+                        },
+                        ..container::Style::default()
+                    });
+                dots = dots.push(super::tip(
+                    dot,
+                    format!("queued {} {}", waiting.event, waiting.git_ref),
+                ));
+            }
+            if pipelines.is_empty() && queued == 0 {
+                line = line.push(text("No pipelines yet").size(CAPTION_TEXT).color(muted));
+            }
+            for shown in pipelines.iter().take(RAIL_PIPELINES) {
+                let mut color = Tone::of(&shown.pipeline.status).color(&self.theme);
+                if shown.pipeline.status == "running" {
+                    color = faded(color, 0.35 + 0.65 * pulse(p));
+                }
+                let number = shown.pipeline.number;
+                let mut tip = format!("#{number} {}", shown.pipeline.status);
+                let held = client.claim_on(&ClaimSubject::Pipeline {
+                    repo: repo.repo.clone(),
+                    number,
+                });
+                let ring = held.map(|claim| {
+                    tip.push_str(&format!("\nheld by {}", claim.holder_text()));
+                    self.holder_color(client, claim)
+                });
+                // A ring around the dot, not over it.
+                let size = PIPELINE_DOT + if ring.is_some() { 4.0 } else { 0.0 };
+                let dot =
+                    container(Space::new())
+                        .width(size)
+                        .height(size)
+                        .style(move |_: &Theme| container::Style {
+                            background: Some(color.into()),
+                            border: Border {
+                                color: ring.unwrap_or(Color::TRANSPARENT),
+                                width: if ring.is_some() { 2.0 } else { 0.0 },
+                                radius: (size / 2.0).into(),
+                            },
+                            ..container::Style::default()
+                        });
+                let dot = match view {
+                    Some(view) => Element::from(
+                        mouse_area(dot)
+                            .interaction(iced::mouse::Interaction::Pointer)
+                            .on_press(Message::PagePipeline(ci.clone(), view, number)),
+                    ),
+                    None => dot.into(),
+                };
+                dots = dots.push(super::tip(dot, tip));
+            }
+            line = line.push(dots);
+            rail = rail.push(line);
+        }
+        rail.into()
+    }
+
+    /// What the agent in `runner`'s terminal reports, once it reports.
+    pub(super) fn agent_at(
+        &self,
+        runner: &RunnerKey,
+        terminal: TerminalId,
+    ) -> Option<&zeughaus_link::AgentStatus> {
+        self.runtime
+            .activity
+            .get(runner)?
+            .iter()
+            .find(|entry| entry.terminal == terminal.0)?
+            .agent
+            .as_ref()
+    }
+
+    /// The colour of a claim's holder: its agent's state, else the accent.
+    pub(super) fn holder_color(&self, client: &CiClient, claim: &ClaimView) -> Color {
+        client
+            .holder_target(claim)
+            .and_then(|(runner, terminal)| self.agent_at(&runner, terminal))
+            .map_or(self.theme.accent(), |agent| {
+                agent_color(agent.state, &self.theme)
+            })
+    }
+
+    /// One card: number and title, age, `Runs on` and proposal chips; in a
+    /// lane or RUNNING also who works on it, what is being done to it, what
+    /// its master waits on. A card in a lane carries a flow bar.
     #[allow(clippy::too_many_arguments)]
     fn board_card<'a>(
         &'a self,
         t: &Tokens,
         ci: &RunnerKey,
         client: &'a CiClient,
-        docs: &'a [DocView],
+        repo: &'a RepoDocsView,
+        state: &'a super::plans::PlansState,
         card: Card,
-        column: usize,
-        row_at: usize,
+        (column, row_at): (usize, usize),
         selected: bool,
+        p: f32,
     ) -> Element<'a, Message, Theme> {
         let muted = self.theme.muted();
-        let face = match card {
-            Card::Doc(number) => match docs.iter().find(|d| d.number == number) {
-                Some(doc) => CardFace {
-                    head: doc.title.clone(),
-                    changed: Some(doc.changed),
-                    runs_on: &doc.runs_on,
-                    key: Some((doc.repo.clone(), number)),
-                },
-                None => CardFace::default(),
-            },
-            Card::Session(id) => {
-                let session = client.sessions().find(|s| s.id == id);
-                CardFace {
-                    head: match session.and_then(|s| s.doc) {
-                        Some(n) => format!("plan session #{n}"),
-                        None => "plan session".to_owned(),
-                    },
-                    changed: session.map(|s| s.started),
-                    ..CardFace::default()
-                }
-            }
+        let accent = self.theme.accent();
+        let doc = match card {
+            Card::Doc(number) => state.docs().iter().find(|d| d.number == number),
+            Card::Session(_) | Card::Opening => None,
         };
-        let CardFace {
-            head,
-            changed,
-            runs_on,
-            key,
-        } = face;
-        let number = match card {
-            Card::Doc(number) => format!("#{number}"),
-            Card::Session(_) => String::new(),
+        let session = self.card_session(ci, &repo.repo, card);
+        let head = match card {
+            Card::Doc(_) => doc.map(|d| d.title.clone()).unwrap_or_default(),
+            Card::Session(_) => match session.and_then(|s| s.doc) {
+                Some(n) => format!("plan session #{n}"),
+                None => "plan session".to_owned(),
+            },
+            Card::Opening => "plan session".to_owned(),
+        };
+        let changed = match card {
+            Card::Doc(_) => doc.map(|d| d.changed),
+            Card::Session(_) => session.map(|s| s.started),
+            Card::Opening => None,
         };
         let mut first = row![].spacing(6).align_y(Alignment::Start);
-        if !number.is_empty() {
-            first = first.push(text(number).size(CAPTION_TEXT).color(muted));
+        if let Card::Doc(number) = card {
+            first = first.push(text(format!("#{number}")).size(CAPTION_TEXT).color(muted));
         }
         first = first.push(text(head).size(ROW_TEXT).width(Length::Fill));
         let mut second = row![].spacing(6).align_y(Alignment::Center);
-        // A running card counts from its session's start, the rest from
-        // their last change.
-        let since = match self.card_session(ci, card) {
-            Some(session) if column == 3 => Some(session.started),
+        // Work a session does counts from the session's start, the rest
+        // from their last change.
+        let since = match session {
+            Some(session) if active(column) => Some(session.started),
             _ => changed,
         };
         if let Some(since) = since {
             second = second.push(text(age_of(since)).size(CAPTION_TEXT).color(muted));
         }
-        for selector in runs_on {
-            second = second.push(
-                container(text(selector.as_str()).size(11))
-                    .padding([0, 6])
-                    .style(style::badge(t, false)),
+        let chip = |words: String| {
+            container(text(words).size(11))
+                .padding([0, 6])
+                .style(style::badge(t, false))
+        };
+        if let Some(doc) = doc {
+            for selector in &doc.runs_on {
+                second = second.push(chip(selector.clone()));
+            }
+            if doc.kind == DocKind::Plan {
+                for number in &doc.proposals {
+                    second = second.push(chip(format!("#{number}")));
+                }
+            }
+        }
+        let mut lines = column![first, second].spacing(4);
+        if active(column) {
+            let opening = match card {
+                Card::Opening => true,
+                Card::Doc(number) => self.opening_on(ci, &repo.repo) == Some(Some(number)),
+                Card::Session(_) => false,
+            };
+            lines = lines.push(match self.card_holder(ci, &repo.repo, card) {
+                Some((runner, terminal)) => self.running_line(runner, terminal),
+                None => text(if opening {
+                    "requesting session"
+                } else {
+                    "no session"
+                })
+                .size(CAPTION_TEXT)
+                .color(muted)
+                .into(),
+            });
+        }
+        let acting = match (state.acting_on, card) {
+            (Some((number, verb)), Card::Doc(on)) if number == on => Some(verb),
+            _ => None,
+        };
+        if let Some(verb) = acting {
+            lines = lines.push(
+                text(format!("{verb}\u{2026}"))
+                    .size(CAPTION_TEXT)
+                    .color(accent),
             );
         }
-        if column == 3 {
-            second = second.push(self.running_line(ci, card));
+        if column == QUEUE && repo.paused {
+            lines = lines.push(text("queue paused").size(CAPTION_TEXT).color(muted));
+        }
+        if column == RUNNING
+            && let Some(master) = session.filter(|s| s.kind == SessionKind::Master)
+        {
+            for claim in client.claims().filter(|claim| {
+                claim.holder.session == Some(master.id)
+                    && matches!(claim.subject, ClaimSubject::Pipeline { .. })
+            }) {
+                lines = lines.push(self.wait_line(client, claim, p));
+            }
+        }
+        let lane = SLOTS[column].1;
+        if lane {
+            // A bar that flows along the card: the work moves on.
+            let at = (flow(p) * 80.0).round() as u16;
+            lines = lines.push(
+                row![
+                    Space::new().width(Length::FillPortion(1 + at)),
+                    container(Space::new())
+                        .width(Length::FillPortion(20))
+                        .height(3)
+                        .style(move |_: &Theme| container::Style {
+                            background: Some(accent.into()),
+                            border: iced::border::rounded(1.5),
+                            ..container::Style::default()
+                        }),
+                    Space::new().width(Length::FillPortion(1 + 80 - at)),
+                ]
+                .height(3),
+            );
         }
         // The ring of a card the CI just moved eases out around it, outside
         // the border that marks the selection.
-        let ring = key
-            .and_then(|key| self.page.board.moved.get(&key))
+        let ring = doc
+            .and_then(|doc| self.page.board.moved.get(&(doc.repo.clone(), doc.number)))
             .map(|at| (1.0 - at.elapsed().as_secs_f32() / MOVED_FOR.as_secs_f32()).max(0.0))
             .map(|left| left * left)
             .filter(|alpha| *alpha > 0.0);
-        let accent = self.theme.accent();
         let surface = t.surface;
-        let border = Color { a: 0.3, ..muted };
-        let body = container(column![first, second].spacing(4))
+        // What runs or waits breathes in its border.
+        let border = if lane || acting.is_some() {
+            faded(accent, 0.4 + 0.6 * pulse(p))
+        } else {
+            faded(muted, 0.3)
+        };
+        let body = container(lines)
             .width(Length::Fill)
             .padding(8)
             .style(move |_: &Theme| {
@@ -1443,10 +1796,7 @@ impl App {
             .padding(3)
             .style(move |_: &Theme| container::Style {
                 border: Border {
-                    color: Color {
-                        a: ring.unwrap_or(0.0),
-                        ..accent
-                    },
+                    color: faded(accent, ring.unwrap_or(0.0)),
                     width: 2.0,
                     radius: 9.0.into(),
                 },
@@ -1458,30 +1808,77 @@ impl App {
             .into()
     }
 
-    /// Where a running card runs and what its agent does: the host glyph,
-    /// the role glyph and the state word, `running` without a report.
-    fn running_line<'a>(&'a self, ci: &RunnerKey, card: Card) -> Element<'a, Message, Theme> {
+    /// What a master's pipeline claim stands for: `waits on dev #12` with a
+    /// pulsing dot while it runs, `fixing dev #12` once it failed, else
+    /// `holds dev #12`.
+    fn wait_line<'a>(
+        &'a self,
+        client: &CiClient,
+        claim: &ClaimView,
+        p: f32,
+    ) -> Element<'a, Message, Theme> {
+        let muted = self.theme.muted();
+        let number = claim.subject.number();
+        let status = client
+            .channel_view(claim.subject.repo(), &claim.channel)
+            .and_then(|view| client.views.get(&view))
+            .and_then(|state| {
+                state
+                    .pipelines
+                    .iter()
+                    .find(|shown| shown.pipeline.number == number)
+            })
+            .map(|shown| shown.pipeline.status.clone());
+        let what = format!("{} #{number}", claim.channel);
+        match status.as_deref() {
+            Some("running") => {
+                let color = faded(self.theme.accent(), 0.3 + 0.7 * pulse(p));
+                let dot = container(Space::new())
+                    .width(6)
+                    .height(6)
+                    .style(move |_: &Theme| container::Style {
+                        background: Some(color.into()),
+                        border: iced::border::rounded(3.0),
+                        ..container::Style::default()
+                    });
+                row![
+                    dot,
+                    text(format!("waits on {what}"))
+                        .size(CAPTION_TEXT)
+                        .color(muted)
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center)
+                .into()
+            }
+            Some("failed") => text(format!("fixing {what}"))
+                .size(CAPTION_TEXT)
+                .color(self.theme.error())
+                .into(),
+            _ => text(format!("holds {what}"))
+                .size(CAPTION_TEXT)
+                .color(muted)
+                .into(),
+        }
+    }
+
+    /// Where a session's terminal runs and what its agent does: the host
+    /// glyph, the role glyph and the state word, `running` without a
+    /// report.
+    fn running_line<'a>(
+        &'a self,
+        runner: RunnerKey,
+        terminal: TerminalId,
+    ) -> Element<'a, Message, Theme> {
         let muted = self.theme.muted();
         let mut line = row![].spacing(4).align_y(Alignment::Center);
-        let Some((runner, terminal)) = self.card_terminal(ci, card) else {
-            // In progress, but no session works on it now.
-            return line
-                .push(text("no session").size(CAPTION_TEXT).color(muted))
-                .into();
-        };
         if let Some((glyph, name)) = self.host_of(&runner) {
             line = line.push(super::tip(
                 super::glyph_text(glyph, 12.0).color(muted),
                 name,
             ));
         }
-        let agent = self
-            .runtime
-            .activity
-            .get(&runner)
-            .and_then(|entries| entries.iter().find(|e| e.terminal == terminal.0))
-            .and_then(|e| e.agent.clone());
-        match agent {
+        match self.agent_at(&runner, terminal) {
             Some(agent) => {
                 let color = agent_color(agent.state, &self.theme);
                 line = line
@@ -1691,7 +2088,7 @@ fn session_target(client: &CiClient, session: &SessionView) -> AttentionTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeughaus_link::DocState;
+    use zeughaus_link::ClaimHolder;
 
     fn doc(number: u64, kind: DocKind, state: DocState, changed: u64) -> DocView {
         DocView {
@@ -1714,8 +2111,25 @@ mod tests {
         }
     }
 
+    fn session(id: u64, kind: SessionKind, doc: Option<u64>, state: SessionState) -> SessionView {
+        SessionView {
+            id,
+            repo: "r".to_owned(),
+            kind,
+            doc,
+            runner: "a".to_owned(),
+            machines: Vec::new(),
+            state,
+            terminal: Some(3),
+            started: 0,
+            ended: None,
+            code: None,
+            message: String::new(),
+        }
+    }
+
     #[test]
-    fn documents_fall_into_the_lifecycle_columns_and_done_keeps_the_newest() {
+    fn documents_fall_into_the_lifecycle_slots_and_done_keeps_the_newest() {
         let mut docs = vec![
             doc(1, DocKind::Proposal, DocState::Open, 1),
             doc(2, DocKind::Plan, DocState::Saved, 1),
@@ -1723,26 +2137,65 @@ mod tests {
             doc(4, DocKind::Plan, DocState::InProgress, 1),
         ];
         docs.extend((10..30).map(|n| doc(n, DocKind::Plan, DocState::Done, n)));
-        let session = SessionView {
-            id: 7,
-            repo: "r".to_owned(),
-            kind: SessionKind::Plan,
-            doc: None,
-            runner: "a".to_owned(),
-            machines: Vec::new(),
-            state: SessionState::Running,
-            terminal: Some(3),
-            started: 0,
-            ended: None,
-            code: None,
-            message: String::new(),
+        let planning = session(7, SessionKind::Plan, None, SessionState::Running);
+        let master = session(8, SessionKind::Master, Some(4), SessionState::Running);
+        let slots = board_columns(&docs, &[&planning, &master], &[], None);
+        assert_eq!(slots[PROPOSALS], [Card::Doc(1)]);
+        assert_eq!(slots[PLANNING], [Card::Session(7)]);
+        assert_eq!(slots[PLANS], [Card::Doc(2)]);
+        assert_eq!(slots[QUEUE], [Card::Doc(3)]);
+        assert!(slots[STARTING].is_empty());
+        assert_eq!(slots[RUNNING], [Card::Doc(4)]);
+        assert_eq!(slots[DONE].len(), DONE_SHOWN);
+        assert_eq!(slots[DONE][0], Card::Doc(29));
+    }
+
+    #[test]
+    fn work_in_passage_takes_the_lanes_and_a_planned_proposal_follows_its_plan() {
+        let claim = ClaimView {
+            subject: ClaimSubject::Proposal {
+                repo: "r".to_owned(),
+                number: 1,
+            },
+            holder: ClaimHolder {
+                runner: "a".to_owned(),
+                terminal: 3,
+                session: None,
+            },
+            label: String::new(),
+            channel: String::new(),
+            since: 0,
+            renewed: 0,
         };
-        let columns = board_columns(&docs, &[&session]);
-        assert_eq!(columns[0], [Card::Doc(1)]);
-        assert_eq!(columns[1], [Card::Doc(2)]);
-        assert_eq!(columns[2], [Card::Doc(3)]);
-        assert_eq!(columns[3], [Card::Doc(4), Card::Session(7)]);
-        assert_eq!(columns[4].len(), DONE_SHOWN);
-        assert_eq!(columns[4][0], Card::Doc(29));
+        let open = |n| doc(n, DocKind::Proposal, DocState::Open, 1);
+        // Claimed, planned by a live session, asked for: each in PLANNING.
+        let docs = vec![open(1), open(2), open(3), open(4)];
+        let planning = session(7, SessionKind::Plan, Some(2), SessionState::Running);
+        let slots = board_columns(&docs, &[&planning], &[&claim], Some(Some(3)));
+        assert_eq!(slots[PROPOSALS], [Card::Doc(4)]);
+        assert_eq!(slots[PLANNING], [Card::Doc(1), Card::Doc(2), Card::Doc(3)]);
+        // A session asked for without a proposal has a card of its own.
+        let slots = board_columns(&docs, &[], &[], Some(None));
+        assert_eq!(slots[PLANNING], [Card::Opening]);
+
+        // A planned proposal is left to its saved plan's card.
+        let mut planned = doc(1, DocKind::Proposal, DocState::Planned, 2);
+        planned.plan = Some(5);
+        let mut plan = doc(5, DocKind::Plan, DocState::Saved, 2);
+        plan.proposals = vec![1];
+        let slots = board_columns(&[planned, plan.clone()], &[], &[], None);
+        assert_eq!(slots[PLANS], [Card::Doc(5)]);
+        assert!(slots.iter().all(|slot| !slot.contains(&Card::Doc(1))));
+        // The plan rejected, the proposal is open again.
+        plan.state = DocState::Rejected;
+        let slots = board_columns(&[open(1), plan], &[], &[], None);
+        assert_eq!(slots[PROPOSALS], [Card::Doc(1)]);
+
+        // A master that has not started yet puts its plan in STARTING.
+        let docs = vec![doc(6, DocKind::Plan, DocState::InProgress, 3)];
+        let starting = session(9, SessionKind::Master, Some(6), SessionState::Starting);
+        let slots = board_columns(&docs, &[&starting], &[], None);
+        assert_eq!(slots[STARTING], [Card::Doc(6)]);
+        assert!(slots[RUNNING].is_empty());
     }
 }

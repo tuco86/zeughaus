@@ -384,7 +384,8 @@ pub fn file_request(
 
 /// Moves document `number` to `to`, where [`allowed`] lets it. Approving a
 /// plan stamps `approved`, which orders the queue; a requeued plan keeps
-/// its stamp and with it its place.
+/// its stamp and with it its place. The proposals a plan took up follow it:
+/// back to `open` when it is rejected, `done` when it is done.
 pub fn set_state(
     state_dir: &Path,
     config: &CiConfig,
@@ -411,7 +412,30 @@ pub fn set_state(
     }
     doc.state = to;
     doc.changed = now;
-    write_json(&path, &doc)
+    write_json(&path, &doc)?;
+    if doc.kind == DocKind::Plan && matches!(to, DocState::Rejected | DocState::Done) {
+        for proposal in &doc.proposals {
+            let path = path_of(&dir, *proposal);
+            let Ok(mut taken) = read_json::<DocView>(&path) else {
+                continue;
+            };
+            if taken.kind != DocKind::Proposal
+                || taken.state != DocState::Planned
+                || taken.plan != Some(number)
+            {
+                continue;
+            }
+            if to == DocState::Rejected {
+                taken.state = DocState::Open;
+                taken.plan = None;
+            } else {
+                taken.state = DocState::Done;
+            }
+            taken.changed = now;
+            write_json(&path, &taken)?;
+        }
+    }
+    Ok(())
 }
 
 /// Deletes a document that is finished with: `planned`, `dismissed`,
@@ -725,6 +749,47 @@ mod tests {
             let proposal = load(&state, &config, "demo", 1).unwrap();
             assert_eq!((proposal.state, proposal.plan), (Planned, Some(3)));
             assert_eq!(load(&state, &config, "demo", 3).unwrap().proposals, vec![1]);
+        }
+
+        #[test]
+        fn proposals_follow_their_plan_and_only_their_own() {
+            let state = scratch("follow");
+            let config = config();
+            for title in ["p1", "p2", "p3"] {
+                create(
+                    &state,
+                    &config,
+                    "demo",
+                    new(DocKind::Proposal, title, &[]),
+                    1,
+                )
+                .unwrap();
+            }
+            let rejected = create(&state, &config, "demo", new(DocKind::Plan, "a", &[1, 2]), 2);
+            assert_eq!(rejected, Ok(4));
+            set_state(&state, &config, "demo", 4, Rejected, 3).unwrap();
+            for number in [1, 2] {
+                let proposal = load(&state, &config, "demo", number).unwrap();
+                assert_eq!(
+                    (proposal.state, proposal.plan, proposal.changed),
+                    (Open, None, 3)
+                );
+            }
+
+            let done = create(&state, &config, "demo", new(DocKind::Plan, "b", &[1]), 4).unwrap();
+            let other = create(&state, &config, "demo", new(DocKind::Plan, "c", &[2]), 4).unwrap();
+            // `done` also names #2, which `other` took up.
+            let path = path_of(&dir(&state, &config, "demo").unwrap(), done);
+            let mut plan: DocView = read_json(&path).unwrap();
+            plan.proposals = vec![1, 2];
+            write_json(&path, &plan).unwrap();
+            set_state(&state, &config, "demo", done, Approved, 5).unwrap();
+            start(&state, &config, "demo", done, vec!["x".to_owned()], 6).unwrap();
+            set_state(&state, &config, "demo", done, Done, 7).unwrap();
+            assert_eq!(state_of(&state, &config, 1), Done);
+            let kept = load(&state, &config, "demo", 2).unwrap();
+            assert_eq!((kept.state, kept.plan), (Planned, Some(other)));
+            assert_eq!(state_of(&state, &config, 3), Open);
         }
 
         #[test]

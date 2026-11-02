@@ -268,9 +268,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ci_pipeline` shows it as `load:`, per job and with a `shared with:`
   line, and the CI tab under the pipeline's row. The omp plugin (0.3.5)
   teaches it.
+- CI: responsibility claims. The CI keeps leased claims (300 s, renewed
+  every minute) that an agent's terminal holds on a proposal or a
+  pipeline (`ZEUGHAUS_RUNNER` and `ZEUGHAUS_TERMINAL`, which every runner
+  terminal now carries). `zeughaus-runner ci claim|renew|release|responsible`
+  take, keep, drop and ask about them; the MCP tools claim every pipeline
+  they start or wait on, and `ci_pipeline` and a failed `ci_wait` name who
+  is responsible: the holder of the earliest earlier pipeline of the
+  channel that failed the same job, else the pipeline's own. A plan
+  session for a proposal someone holds is refused. The omp plugin (0.8.0)
+  claims a plan session's proposal, a reviewed plan's proposals and the
+  pipeline its push watch follows, and tells a session whose failure
+  another one holds to leave the fix to it.
+- The Board shows what runs and waits: PLANNING and STARTING lanes appear
+  between the columns while a proposal is planned or a master starts,
+  with a flow bar on their cards; a pending approval, a requested session,
+  a running or queued pipeline and a held pipeline (a ring in its
+  holder's colour) pulse; a running plan says which pipelines its master
+  waits on or fixes; a claimed proposal opens its holder's tab. A failed
+  pipeline in a channel names who is responsible, and a click brings that
+  tab to the front.
 
 ### Changed
 
+- CI: a planned proposal follows its plan: back to `open` when the plan is
+  rejected, `done` when the plan is done.
 - CI: nightlies are one CI-wide round instead of per-repository cron
   schedules, after every repository's 04:00 cron jobs started at once on
   one runner and failed. `ci.toml` sets the time, `[nightly] at = "HH:MM"`

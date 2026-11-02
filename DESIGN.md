@@ -1416,12 +1416,24 @@ that open their transcripts; under them the chosen runner's `/activity`,
 `Reopen` for an archived run). A project's Board and its channel views are
 tabs of its group in the bar. The Board is the project's lifecycle on one
 screen: the channel rail (glyph in the tone of the newest pipeline, name,
-the newest 12 pipelines as dots that open the channel at that pipeline),
-then five columns PROPOSALS, PLANS, QUEUE, RUNNING and DONE (the newest 12)
-of cards (number, title, age, `Runs on` chips; a running card adds its
-host's glyph and its agent's role and state). `h`/`l` and Left/Right change
-the column, `j`/`k` and Up/Down the card, Enter on a running card brings
-its agent's tab to the front and on any other opens the document's detail
+the queued events as hollow pulsing dots, then the newest 12 pipelines as
+dots that open the channel at that pipeline; a running one pulses, a held
+one wears a ring in its holder's agent colour), then the columns
+PROPOSALS, PLANS, QUEUE, RUNNING and DONE (the newest 12) with two lanes
+between them that are drawn only while a card passes through: PLANNING (a
+proposal that is claimed, planned by a live plan session or asked a
+session for, and plan sessions of their own) and STARTING (a plan whose
+master has not started yet). A planned proposal whose plan is still open
+is left out; the plan's card names it. Cards show number, title, age,
+`Runs on` and proposal chips; a card in a lane or RUNNING adds its holder's
+host glyph and its agent's role and state, a running plan the pipelines its
+master holds (`waits on`, `fixing`, `holds`), a queued one `queue paused`,
+and an action on its way its verb. A lane card has a flowing bar and a
+breathing border, as has a card an action is on; the page ticks every
+50 ms while anything pulses. `h`/`l` and Left/Right change
+the column, `j`/`k` and Up/Down the card, Enter on a card of the lanes or
+RUNNING brings its session's (else its claim holder's) tab to the front
+and on any other opens the document's detail
 (text, actions, the master docked) beside the columns, `a`, `r` and `p`
 approve, reject and plan where the document offers it, and Escape closes
 the detail. A card the CI moved to another column carries an accent ring
@@ -1431,7 +1443,10 @@ and separated by rules, one row each: a status glyph (codicons from the
 bundled Nerd Font, so status never rests on colour alone), `#<n>` and the
 commit's subject (the CI reads it from its mirror when the pipeline starts,
 and once at start for records without one), the branch, tag or nightly, the
-commit and the actor, the cause line of each failed job, the load of a
+commit and the actor, the cause line of each failed job, for a failed
+pipeline who is responsible (the holder's role glyph and `responsible:
+<holder>`, `(holds #m)` when inherited; a press brings the holder's tab to
+the front), the load of a
 finished pipeline (**Load**), and the duration
 and age (the local time on hover). A closed row ends in one glyph per job.
 The newest pipeline and every running one are open unless the user closed

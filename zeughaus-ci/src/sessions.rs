@@ -23,13 +23,16 @@ use serde::{Deserialize, Serialize};
 use zeughaus_link::enlist::{FromRunner, SessionReport, SessionSpec, ToRunner};
 use zeughaus_link::selector::{Selector, parse_runs_on};
 use zeughaus_link::{
-    DocKind, DocState, SessionKind, SessionMachine, SessionState, SessionView, normalize_origin,
+    ClaimHolder, ClaimSubject, ClaimView, DocKind, DocState, SessionKind, SessionMachine,
+    SessionState, SessionView, normalize_origin,
 };
 
+use crate::claims;
 use crate::config::Shared;
 use crate::docs;
 use crate::files::{read_json, write_json};
 use crate::runners::{RunnerView, Runners};
+use crate::scheduler::{JobStatus, PipelineStatus};
 
 /// Ended sessions the registry keeps.
 const KEPT_ENDED: usize = 100;
@@ -44,6 +47,9 @@ const COOLDOWN_SECS: u64 = 300;
 struct Book {
     next: u64,
     list: Vec<SessionView>,
+    /// The live claims; renewals write them without an announcement.
+    #[serde(default)]
+    claims: Vec<ClaimView>,
 }
 
 pub struct Sessions {
@@ -128,10 +134,16 @@ impl Sessions {
         ended.sort_unstable_by(|a, b| b.cmp(a));
         let dropped: BTreeSet<u64> = ended.into_iter().skip(KEPT_ENDED).collect();
         book.list.retain(|s| !dropped.contains(&s.id));
-        if let Err(e) = write_json(&book_path(&self.state_dir), &*book) {
+        self.write(book);
+        let _ = self.events_tx.send(());
+    }
+
+    /// Writes the book without announcing it: for a renewal, which changes
+    /// nothing an editor shows.
+    fn write(&self, book: &Book) {
+        if let Err(e) = write_json(&book_path(&self.state_dir), book) {
             eprintln!("[ci] sessions: {e}");
         }
-        let _ = self.events_tx.send(());
     }
 
     /// The live sessions, then the newest ended ones.
@@ -218,6 +230,12 @@ impl Sessions {
     /// queue order. A plan that finds none stays queued; a later one may
     /// still find its own.
     pub fn dispatch(&self, now: u64) {
+        {
+            let mut book = lock(&self.book);
+            if claims::expire(&mut book.claims, now) {
+                self.changed(&mut book);
+            }
+        }
         let config = self.config.get();
         let queue = docs::queue(&self.state_dir, &config);
         if queue.is_empty() {
@@ -319,6 +337,7 @@ impl Sessions {
         session.state = SessionState::Failed;
         session.message = message.to_owned();
         session.ended = Some(now);
+        claims::release_session(&mut book.claims, id, &session.runner, session.terminal);
         if session.kind == SessionKind::Master {
             lock(&self.cooldown).insert(session.runner.clone(), now + COOLDOWN_SECS);
             if let Some(number) = session.doc {
@@ -368,8 +387,15 @@ impl Sessions {
                 self.fail(&mut book, id, &message, now);
             }
             FromRunner::SessionEnded { code, killed, .. } => {
+                let book = &mut *book;
                 if let Some(session) = book.list.iter_mut().find(|s| s.id == id) {
                     end(session, code, killed, now);
+                    claims::release_session(
+                        &mut book.claims,
+                        id,
+                        &session.runner,
+                        session.terminal,
+                    );
                 }
             }
             _ => {}
@@ -380,8 +406,10 @@ impl Sessions {
     /// Runner `name` enlisted again and holds `reports`: a live session it
     /// does not report ended with it, and a reported end applies.
     pub fn resync(&self, name: &str, reports: &[SessionReport], now: u64) {
-        let mut book = lock(&self.book);
+        let mut guard = lock(&self.book);
+        let book = &mut *guard;
         let mut touched = false;
+        let mut ended = Vec::new();
         for session in book
             .list
             .iter_mut()
@@ -392,19 +420,26 @@ impl Sessions {
                 None => {
                     end(session, None, true, now);
                     session.message = "the runner no longer holds it".to_owned();
+                    ended.push((session.id, session.terminal));
                 }
                 Some(SessionReport {
                     end: Some((code, killed)),
                     ..
-                }) => end(session, *code, *killed, now),
+                }) => {
+                    end(session, *code, *killed, now);
+                    ended.push((session.id, session.terminal));
+                }
                 Some(report) => {
                     session.state = SessionState::Running;
                     session.terminal = Some(report.terminal);
                 }
             }
         }
+        for (id, terminal) in ended {
+            claims::release_session(&mut book.claims, id, name, terminal);
+        }
         if touched {
-            self.changed(&mut book);
+            self.changed(book);
         }
     }
 
@@ -439,6 +474,20 @@ impl Sessions {
             s.kind == SessionKind::Plan && s.repo == repo && s.doc == proposal && s.state.is_live()
         }) {
             return Ok(live.clone());
+        }
+        if let Some(number) = proposal
+            && let Some(held) = book.claims.iter().find(|claim| {
+                claim.subject
+                    == (ClaimSubject::Proposal {
+                        repo: repo.to_owned(),
+                        number,
+                    })
+            })
+        {
+            return Err(format!(
+                "proposal #{number} of {repo} is being planned by {}",
+                held.holder_text()
+            ));
         }
         let views = self.runners.views();
         let hosts = self.session_hosts(&views);
@@ -508,6 +557,153 @@ impl Sessions {
             Err(format!("session {id} is not running"))
         }
     }
+
+    /// Every live claim.
+    pub fn claims(&self) -> Vec<ClaimView> {
+        lock(&self.book).claims.clone()
+    }
+
+    /// Takes `subject` for `holder` (see [`claims::take`]): a proposal that
+    /// is open or planned, or a pipeline that exists. The holder's live CI
+    /// session, by id or by its terminal, names the claim.
+    pub fn claim(
+        &self,
+        subject: ClaimSubject,
+        mut holder: ClaimHolder,
+        now: u64,
+    ) -> Result<(ClaimView, bool), String> {
+        if !crate::config::valid_name(&holder.runner) {
+            return Err(format!("runner name {:?} is not valid", holder.runner));
+        }
+        let config = self.config.get();
+        let repo = subject.repo();
+        if !config.repos.contains_key(repo) {
+            return Err(format!("no repository {repo}"));
+        }
+        let channel = match &subject {
+            ClaimSubject::Proposal { number, .. } => {
+                let open = docs::load(&self.state_dir, &config, repo, *number).is_some_and(|doc| {
+                    doc.kind == DocKind::Proposal
+                        && matches!(doc.state, DocState::Open | DocState::Planned)
+                });
+                if !open {
+                    return Err(format!(
+                        "#{number} of {repo} is no open or planned proposal"
+                    ));
+                }
+                String::new()
+            }
+            ClaimSubject::Pipeline { number, .. } => {
+                crate::scheduler::load_pipeline(&self.state_dir, repo, *number)
+                    .map_err(|_| format!("no pipeline {repo} #{number}"))?
+                    .channel()
+            }
+        };
+        let mut book = lock(&self.book);
+        let session = book.list.iter().find(|s| {
+            s.state.is_live()
+                && s.runner == holder.runner
+                && (holder.session == Some(s.id) || s.terminal == Some(holder.terminal))
+        });
+        holder.session = session.map(|s| s.id);
+        let label = session.map(session_label).unwrap_or_default();
+        let before = book.claims.len();
+        let (claim, ours) = claims::take(&mut book.claims, subject, holder, label, channel, now);
+        if book.claims.len() != before {
+            self.changed(&mut book);
+        } else if ours {
+            self.write(&book);
+        }
+        Ok((claim, ours))
+    }
+
+    /// Renews every claim of `holder`.
+    pub fn renew_claims(&self, holder: &ClaimHolder, now: u64) {
+        let mut book = lock(&self.book);
+        if claims::renew(&mut book.claims, holder, now) > 0 {
+            self.write(&book);
+        }
+    }
+
+    /// Releases `subject` of `holder`, or all its claims without one.
+    pub fn release_claims(&self, holder: &ClaimHolder, subject: Option<&ClaimSubject>) {
+        let mut book = lock(&self.book);
+        if claims::release(&mut book.claims, holder, subject) {
+            self.changed(&mut book);
+        }
+    }
+
+    /// Who is responsible for pipeline `number` of `repo` (see
+    /// [`zeughaus_link::responsible`]).
+    pub fn responsible(&self, repo: &str, number: u64) -> Result<Option<ClaimView>, String> {
+        let record = crate::scheduler::load_pipeline(&self.state_dir, repo, number)
+            .map_err(|_| format!("no pipeline {repo} #{number}"))?;
+        let claims = self.claims();
+        let failed_of = |m| {
+            crate::scheduler::load_pipeline(&self.state_dir, repo, m)
+                .map(|record| failed_jobs(&record))
+                .unwrap_or_default()
+        };
+        Ok(zeughaus_link::responsible(
+            &claims,
+            repo,
+            number,
+            &record.channel(),
+            &failed_jobs(&record),
+            failed_of,
+        )
+        .cloned())
+    }
+
+    /// Pipeline `number` of `repo` in `channel` changed: a success settles
+    /// the channel's claims up to it, a cancel its own.
+    pub fn pipeline_changed(&self, repo: &str, channel: &str, number: u64) {
+        let held = lock(&self.book).claims.iter().any(|claim| {
+            matches!(claim.subject, ClaimSubject::Pipeline { .. })
+                && claim.subject.repo() == repo
+                && claim.channel == channel
+        });
+        if !held {
+            return;
+        }
+        let Ok(record) = crate::scheduler::load_pipeline(&self.state_dir, repo, number) else {
+            return;
+        };
+        let succeeded = match record.status {
+            PipelineStatus::Succeeded => true,
+            PipelineStatus::Cancelled => false,
+            _ => return,
+        };
+        let mut book = lock(&self.book);
+        if claims::pipeline_ended(&mut book.claims, repo, channel, number, succeeded) {
+            self.changed(&mut book);
+        }
+    }
+
+    /// `repo`'s documents changed: a claim on a proposal that is no longer
+    /// open or planned goes.
+    pub fn docs_changed(&self, repo: &str) {
+        let mut book = lock(&self.book);
+        let held = book.claims.iter().any(|claim| {
+            matches!(claim.subject, ClaimSubject::Proposal { .. }) && claim.subject.repo() == repo
+        });
+        if !held {
+            return;
+        }
+        let docs = docs::list(&self.state_dir, &self.config.get(), repo);
+        let before = book.claims.len();
+        book.claims.retain(|claim| match &claim.subject {
+            ClaimSubject::Proposal { repo: r, number } if r == repo => docs.iter().any(|doc| {
+                doc.number == *number
+                    && doc.kind == DocKind::Proposal
+                    && matches!(doc.state, DocState::Open | DocState::Planned)
+            }),
+            _ => true,
+        });
+        if book.claims.len() != before {
+            self.changed(&mut book);
+        }
+    }
 }
 
 /// Session ended with `code`, or `killed` without one.
@@ -520,6 +716,24 @@ fn end(session: &mut SessionView, code: Option<i32>, killed: bool, now: u64) {
         (Some(code), false) => format!("exit {code}"),
         (None, false) => "ended without a code".to_owned(),
     };
+}
+
+/// `master zeughaus #38`, `plan zeughaus`: a session as the editor names it.
+fn session_label(session: &SessionView) -> String {
+    match session.doc {
+        Some(doc) => format!("{} {} #{doc}", session.kind.name(), session.repo),
+        None => format!("{} {}", session.kind.name(), session.repo),
+    }
+}
+
+/// The names of a pipeline record's failed jobs.
+pub(crate) fn failed_jobs(record: &crate::scheduler::Pipeline) -> Vec<String> {
+    record
+        .jobs
+        .iter()
+        .filter(|job| job.status == JobStatus::Failed)
+        .map(|job| job.def.name.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -793,6 +1007,158 @@ mod tests {
             assert_eq!(lost.state, SessionState::Ended);
             assert!(f.sessions.close(master).is_err());
             assert!(f.sessions.close(kept.id).is_ok());
+        }
+
+        fn open_proposal(f: &Fixture) -> u64 {
+            docs::create(
+                &f.state,
+                &f.config,
+                "demo",
+                docs::NewDoc {
+                    kind: DocKind::Proposal,
+                    title: "p",
+                    body: "body",
+                    source: "elsewhere",
+                    proposals: &[],
+                    runs_on: &[],
+                    onboard: None,
+                },
+                1,
+            )
+            .unwrap()
+        }
+
+        fn holder(terminal: u64) -> ClaimHolder {
+            ClaimHolder {
+                runner: "a".to_owned(),
+                terminal,
+                session: None,
+            }
+        }
+
+        fn proposal(number: u64) -> ClaimSubject {
+            ClaimSubject::Proposal {
+                repo: "demo".to_owned(),
+                number,
+            }
+        }
+
+        #[test]
+        fn the_first_holder_of_a_proposal_keeps_it_from_other_plan_sessions() {
+            let f = fixture("claim-proposal");
+            let _a = connect(&f.runners, "a", "linux");
+            let number = open_proposal(&f);
+            let (claim, ours) = f.sessions.claim(proposal(number), holder(3), 5).unwrap();
+            assert!(ours);
+            assert_eq!(claim.since, 5);
+            let (theirs, ours) = f.sessions.claim(proposal(number), holder(4), 6).unwrap();
+            assert!(!ours);
+            assert_eq!(theirs.holder.terminal, 3);
+            assert_eq!(
+                f.sessions.open_plan("demo", Some(number), None, 7),
+                Err(format!(
+                    "proposal #{number} of demo is being planned by a session on a, terminal 3"
+                ))
+            );
+            assert_eq!(
+                f.sessions.claim(proposal(99), holder(3), 8),
+                Err("#99 of demo is no open or planned proposal".to_owned())
+            );
+            let bad = ClaimHolder {
+                runner: "A B".to_owned(),
+                ..holder(3)
+            };
+            assert!(f.sessions.claim(proposal(number), bad, 8).is_err());
+        }
+
+        #[test]
+        fn an_ended_session_drops_the_claims_of_its_terminal() {
+            let f = fixture("claim-session");
+            let _a = connect(&f.runners, "a", "linux");
+            let number = open_proposal(&f);
+            let session = f.sessions.open_plan("demo", None, None, 1).unwrap();
+            f.sessions.on_runner(
+                "a",
+                FromRunner::SessionOpened {
+                    id: session.id,
+                    terminal: 9,
+                },
+                2,
+            );
+            let (claim, _) = f.sessions.claim(proposal(number), holder(9), 3).unwrap();
+            assert_eq!(claim.holder.session, Some(session.id));
+            assert_eq!(claim.label, "plan demo");
+            f.sessions.on_runner(
+                "a",
+                FromRunner::SessionEnded {
+                    id: session.id,
+                    code: Some(0),
+                    killed: false,
+                },
+                4,
+            );
+            assert!(f.sessions.claims().is_empty());
+        }
+
+        fn write_pipeline(f: &Fixture, number: u64, status: &str, failed: &[&str]) {
+            let dir = crate::ci_dir(&f.state).join("pipelines").join("demo");
+            std::fs::create_dir_all(&dir).unwrap();
+            let event = crate::event::CiEvent {
+                repo: "demo".to_owned(),
+                kind: crate::event::EventKind::Push,
+                git_ref: "main".to_owned(),
+                sha: None,
+                actor: "test".to_owned(),
+                delivery: None,
+                upload: None,
+                upstream: None,
+                received: 0,
+            };
+            let jobs: Vec<serde_json::Value> = failed
+                .iter()
+                .map(|name| {
+                    serde_json::json!({
+                        "def": {
+                            "name": name, "file": format!("{name}.sh"), "on": [], "needs": [],
+                            "image": null, "machine": null, "secrets": [], "env": {},
+                            "timeout_minutes": 30, "interpreter": "sh",
+                        },
+                        "status": "failed",
+                    })
+                })
+                .collect();
+            let record = serde_json::json!({
+                "repo": "demo", "number": number, "key": "push main", "event": event,
+                "sha": null, "status": status, "created": 0, "jobs": jobs, "channel": "dev",
+            });
+            std::fs::write(dir.join(format!("{number}.json")), record.to_string()).unwrap();
+        }
+
+        #[test]
+        fn a_later_success_of_the_channel_settles_its_pipeline_claims() {
+            let f = fixture("claim-pipeline");
+            write_pipeline(&f, 1, "failed", &["check"]);
+            write_pipeline(&f, 2, "failed", &["check"]);
+            let pipeline = |number| ClaimSubject::Pipeline {
+                repo: "demo".to_owned(),
+                number,
+            };
+            let (claim, _) = f.sessions.claim(pipeline(1), holder(3), 1).unwrap();
+            assert_eq!(claim.channel, "dev");
+            f.sessions.claim(pipeline(2), holder(4), 1).unwrap();
+            assert_eq!(
+                f.sessions.claim(pipeline(9), holder(4), 1),
+                Err("no pipeline demo #9".to_owned())
+            );
+            // #2 failed the job #1 failed: #1's holder is responsible for it.
+            let responsible = f.sessions.responsible("demo", 2).unwrap().unwrap();
+            assert_eq!(responsible.holder.terminal, 3);
+            // A failure leaves its holder responsible.
+            f.sessions.pipeline_changed("demo", "dev", 2);
+            assert_eq!(f.sessions.claims().len(), 2);
+            write_pipeline(&f, 3, "succeeded", &[]);
+            f.sessions.pipeline_changed("demo", "dev", 3);
+            assert!(f.sessions.claims().is_empty());
         }
     }
 }

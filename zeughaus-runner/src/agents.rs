@@ -308,10 +308,7 @@ mod unix {
             if let Some(n) = spec.doc {
                 args.extend([doc_flag.to_owned(), n.to_string()]);
             }
-            let mut env = vec![
-                ("ZEUGHAUS_SESSION".to_owned(), spec.id.to_string()),
-                ("ZEUGHAUS_RUNNER".to_owned(), spec.runner.clone()),
-            ];
+            let mut env = vec![("ZEUGHAUS_SESSION".to_owned(), spec.id.to_string())];
             if !spec.ci.is_empty() {
                 env.push(("ZEUGHAUS_CI".to_owned(), spec.ci.clone()));
             }
