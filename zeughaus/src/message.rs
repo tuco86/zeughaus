@@ -323,9 +323,9 @@ pub enum Message {
         crate::workspace::RunnerKey,
         Result<Vec<zeughaus_link::ActivityEntry>, String>,
     ),
-    // What a runner's CI answered one of this editor's CI views, or what the
-    // user did in one. The key is the runner, not its CI section. Native
-    // only: the browser editor reaches no runner.
+    // What a CI answered one of this editor's CI views, or what the user did
+    // in one. The key is the CI's link. Native only: the browser editor
+    // reaches no runner.
     #[cfg(not(target_arch = "wasm32"))]
     Ci(crate::workspace::RunnerKey, CiMsg),
     // The clock that keeps every CI view current: asks each CI runner for
@@ -333,23 +333,58 @@ pub enum Message {
     // does; a subscription's map cannot capture a runner, so it names none.
     #[cfg(not(target_arch = "wasm32"))]
     CiPoll,
+    // The CI page: the titlebar chip or the palette opens and closes it, the
+    // sidebar shows a view, the arrow keys and j/k move its cursor, Enter
+    // acts on the row under it, a click on a row acts on that row, a click
+    // on a row of Sessions or Runners puts the cursor on it.
+    #[cfg(not(target_arch = "wasm32"))]
+    TogglePage,
+    #[cfg(not(target_arch = "wasm32"))]
+    PageShow(crate::app::PageView),
+    #[cfg(not(target_arch = "wasm32"))]
+    PageStep(i32),
+    #[cfg(not(target_arch = "wasm32"))]
+    PageEnter,
+    #[cfg(not(target_arch = "wasm32"))]
+    PageOpen(crate::app::AttentionTarget),
+    #[cfg(not(target_arch = "wasm32"))]
+    PageCursor(usize),
+    // What a terminal the page docks reported the user did.
+    #[cfg(not(target_arch = "wasm32"))]
+    PageTerminal(
+        crate::workspace::RunnerKey,
+        zeughaus_mux::TerminalId,
+        iced_terminal::Action,
+    ),
 }
 
-/// What a letter asks of the CI list in front.
+/// What a letter asks of the CI page in front.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CiShortcut {
+    /// `r`: rerun a pipeline, reject a plan.
     Rerun,
     Cancel,
     /// The log of the first failed job, else of the first job.
     OpenLog,
+    /// `j` and `k`: the cursor down and up.
+    Next,
+    Previous,
+    /// `a`: approve the selected plan.
+    Approve,
+    /// `p`: plan the selected proposal.
+    Plan,
 }
 
 /// What a click on a notice opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub enum NoticeTarget {
     /// The tab that shows a runner's terminal, attached when none does.
     Terminal(crate::workspace::RunnerKey, zeughaus_mux::TerminalId),
+    /// A view of the CI page.
+    #[cfg(not(target_arch = "wasm32"))]
+    CiPage(crate::app::PageView),
 }
 
 /// What one runner's CI views say.

@@ -6,6 +6,9 @@
 //! its key; any other notice also goes by itself after
 //! [`TRANSIENT_LIFETIME`].
 
+// The browser editor reaches no runner, so nothing raises a notice there.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
+
 use std::time::{Duration, SystemTime};
 
 use crate::message::NoticeTarget;

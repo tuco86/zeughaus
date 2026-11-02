@@ -400,7 +400,9 @@ impl App {
                     title,
                     body,
                     true,
-                    None,
+                    Some(crate::message::NoticeTarget::CiPage(
+                        super::PageView::Overview,
+                    )),
                 );
             }
             // Not state either: the CI views ask the runner for the pipeline.

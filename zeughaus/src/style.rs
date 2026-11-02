@@ -3,7 +3,10 @@
 //! look like it. [`Tokens`] derives the surfaces from the theme's palette; the
 //! style functions are built from them.
 
-use iced::theme::palette::{deviate, mix};
+// The browser editor has no CI page and raises no notices.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
+
+use iced::theme::palette::{Extended, Pair, deviate, mix};
 use iced::widget::{button, container};
 use iced::{Background, Border, Color, Font, Shadow, Vector};
 use zeughaus_theme::Theme;
@@ -54,6 +57,26 @@ fn muted(text: Color, background: Color, floor: Color) -> Color {
         .unwrap_or(text)
 }
 
+/// A panel filled with `color`, its corners rounded by `radius`.
+fn panel(color: Color, radius: iced::border::Radius) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(color)),
+        border: Border {
+            radius,
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
+}
+
+/// A container filled with `color` and nothing else.
+pub fn solid(color: Color) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(color)),
+        ..container::Style::default()
+    }
+}
+
 /// List entry button; `selected` entries keep the hover background.
 pub fn channel_button(
     t: &Tokens,
@@ -81,7 +104,135 @@ pub fn channel_button(
     }
 }
 
-/// Quiet bordered button for secondary actions.
+/// Background of a list row that is selected or under the pointer, its
+/// actions included.
+pub fn row_highlight(t: &Tokens, active: bool) -> impl Fn(&Theme) -> container::Style + use<> {
+    let c = t.surface_hover;
+    move |_| {
+        if active {
+            panel(c, 4.0.into())
+        } else {
+            container::Style::default()
+        }
+    }
+}
+
+/// Main button of a row drawn by [`row_highlight`]: no fill of its own,
+/// bright text while the row is `active` or the button is hovered.
+pub fn row_entry_button(
+    t: &Tokens,
+    active: bool,
+) -> impl Fn(&Theme, button::Status) -> button::Style + use<> {
+    let muted = t.muted_text;
+    move |theme, status| {
+        let text = theme.base().palette().text;
+        let text_color = match status {
+            button::Status::Disabled => muted,
+            button::Status::Hovered | button::Status::Pressed => text,
+            button::Status::Active if active => text,
+            button::Status::Active => muted,
+        };
+        button::Style {
+            background: None,
+            text_color,
+            border: Border {
+                radius: 4.0.into(),
+                ..Border::default()
+            },
+            ..button::Style::default()
+        }
+    }
+}
+
+/// Action button inside a row drawn by [`row_highlight`]: its hover fill is
+/// one step stronger than the row's, so it stays visible on the highlighted
+/// row.
+pub fn row_action_button(t: &Tokens) -> impl Fn(&Theme, button::Status) -> button::Style + use<> {
+    let t = *t;
+    move |theme, status| {
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        let text_color = match status {
+            button::Status::Disabled => t.muted_text,
+            _ if hovered => theme.base().palette().text,
+            _ => t.muted_text,
+        };
+        button::Style {
+            background: hovered.then_some(Background::Color(t.border)),
+            text_color,
+            border: Border {
+                radius: 4.0.into(),
+                ..Border::default()
+            },
+            ..button::Style::default()
+        }
+    }
+}
+
+/// Rounded primary button: the primary fill with its readable text.
+pub fn pill_button(t: &Tokens) -> impl Fn(&Theme, button::Status) -> button::Style + use<> {
+    filled_pill(t, |e| e.primary.base)
+}
+
+/// Rounded destructive button: the danger fill with its readable text.
+pub fn danger_button(t: &Tokens) -> impl Fn(&Theme, button::Status) -> button::Style + use<> {
+    filled_pill(t, |e| e.danger.base)
+}
+
+fn luminance(c: Color) -> f32 {
+    0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b
+}
+
+fn scale(c: Color, k: f32) -> Color {
+    Color {
+        r: (c.r * k).min(1.0),
+        g: (c.g * k).min(1.0),
+        b: (c.b * k).min(1.0),
+        a: c.a,
+    }
+}
+
+/// `pair`'s fill moved away from its text by `amount`, so hover and press keep
+/// the contrast.
+pub fn emphasize(pair: Pair, amount: f32) -> Color {
+    if luminance(pair.text) > 0.5 {
+        scale(pair.color, 1.0 - amount)
+    } else {
+        mix(pair.color, Color::WHITE, amount * 1.5)
+    }
+}
+
+/// A pill filled with one of the theme's colour pairs, its text in the pair's
+/// readable colour.
+pub fn filled_pill(
+    t: &Tokens,
+    pair: fn(&Extended) -> Pair,
+) -> impl Fn(&Theme, button::Status) -> button::Style + use<> {
+    let t = *t;
+    move |theme, status| {
+        let pair = pair(theme.extended());
+        let background = match status {
+            button::Status::Active => pair.color,
+            button::Status::Hovered => emphasize(pair, 0.1),
+            button::Status::Pressed => emphasize(pair, 0.2),
+            button::Status::Disabled => t.surface_hover,
+        };
+        button::Style {
+            background: Some(Background::Color(background)),
+            text_color: if status == button::Status::Disabled {
+                t.muted_text
+            } else {
+                pair.text
+            },
+            border: Border {
+                radius: 999.0.into(),
+                ..Border::default()
+            },
+            ..button::Style::default()
+        }
+    }
+}
+
+/// Quiet bordered button for secondary actions next to a [`pill_button`].
 pub fn secondary_button(t: &Tokens) -> impl Fn(&Theme, button::Status) -> button::Style + use<> {
     let t = *t;
     move |theme, status| {
@@ -99,6 +250,36 @@ pub fn secondary_button(t: &Tokens) -> impl Fn(&Theme, button::Status) -> button
                 radius: 999.0.into(),
             },
             ..button::Style::default()
+        }
+    }
+}
+
+/// A small pill with a count or a status word: `accent` for what wants
+/// attention, else a neutral surface.
+pub fn badge(t: &Tokens, accent: bool) -> impl Fn(&Theme) -> container::Style + use<> {
+    let t = *t;
+    move |theme| {
+        let p = theme.base().palette();
+        let (background, border) = if accent {
+            (
+                Color {
+                    a: 0.18,
+                    ..p.primary
+                },
+                p.primary,
+            )
+        } else {
+            (t.surface_hover, t.border)
+        };
+        container::Style {
+            background: Some(Background::Color(background)),
+            text_color: Some(p.text),
+            border: Border {
+                color: border,
+                width: 1.0,
+                radius: 999.0.into(),
+            },
+            ..container::Style::default()
         }
     }
 }

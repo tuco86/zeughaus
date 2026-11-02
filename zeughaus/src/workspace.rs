@@ -58,10 +58,6 @@ const RESIZE_INTERVAL: Duration = Duration::from_millis(100);
 /// click.
 const DRAG_THRESHOLD: f32 = 4.0;
 
-/// What a change to a CI section is refused with: the editor makes those
-/// sections itself, and no runner has a structure behind them to change.
-const CI_REFUSAL: &str = "the CI view takes no structural changes";
-
 /// The colours a new group cycles through: distinct at 25 % alpha on dark and
 /// light chrome alike.
 pub const GROUP_COLORS: [[u8; 4]; 8] = [
@@ -75,9 +71,9 @@ pub const GROUP_COLORS: [[u8; 4]; 8] = [
     [0x8d, 0x6e, 0x63, 0xff],
 ];
 
-/// Which section something belongs to: a runner's fingerprint text, one of
-/// the two synthetic sections ([`RunnerKey::LOCAL`], [`RunnerKey::OFFLINE`]),
-/// or the CI section of a runner ([`RunnerKey::ci`]).
+/// Which section something belongs to: a runner's fingerprint text, or one
+/// of the two synthetic sections ([`RunnerKey::LOCAL`],
+/// [`RunnerKey::OFFLINE`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RunnerKey(pub Arc<str>);
 
@@ -86,10 +82,6 @@ impl RunnerKey {
     pub const LOCAL: &'static str = "local";
     /// The section of graphs whose runner is not connected.
     pub const OFFLINE: &'static str = "offline";
-    /// What the section of a runner's CI starts with, followed by that
-    /// runner's own key. The section holds this editor's views of the runner's
-    /// pipelines, not the runner's workspace.
-    pub const CI_PREFIX: &'static str = "ci:";
 
     pub fn new(text: &str) -> RunnerKey {
         RunnerKey(Arc::from(text))
@@ -103,30 +95,14 @@ impl RunnerKey {
         RunnerKey::new(Self::OFFLINE)
     }
 
-    /// The CI section of `runner`. The browser editor reaches no runner, so
-    /// it makes none.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    pub fn ci(runner: &RunnerKey) -> RunnerKey {
-        RunnerKey::new(&format!("{}{}", Self::CI_PREFIX, runner.as_str()))
-    }
-
-    /// The runner this is the CI section of; `None` for any other section.
-    pub fn ci_runner(&self) -> Option<RunnerKey> {
-        self.as_str()
-            .strip_prefix(Self::CI_PREFIX)
-            .map(RunnerKey::new)
-    }
-
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
     /// Whether this is a section no runner's workspace stands behind: the
-    /// two without a runner, and the CI sections, which the editor builds
-    /// itself. Such a section takes no structural commands.
+    /// two without a runner. Such a section takes no structural commands.
     pub fn is_synthetic(&self) -> bool {
         matches!(self.as_str(), Self::LOCAL | Self::OFFLINE)
-            || self.as_str().starts_with(Self::CI_PREFIX)
     }
 }
 
@@ -355,17 +331,6 @@ pub fn graph_snapshot(graphs: impl IntoIterator<Item = (NodeId, String)>) -> Wor
                 })
             })
             .collect(),
-        ..empty_snapshot()
-    }
-}
-
-/// A CI section's snapshot around `items`, which the editor lays out itself.
-/// The ids in it are the editor's own, like the graph ids of a synthetic
-/// section: no runner stands behind the section.
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-pub fn ci_snapshot(items: Vec<WorkspaceItem>) -> WorkspaceSnapshot {
-    WorkspaceSnapshot {
-        items,
         ..empty_snapshot()
     }
 }
@@ -898,9 +863,6 @@ impl Workspace {
             Message::DissolveGroup(key, group) => {
                 self.remote(&key, TopologyCommand::DissolveGroup { group })
             }
-            Message::RenameGroupStart(key, _) if key.ci_runner().is_some() => {
-                Update::hint(CI_REFUSAL)
-            }
             Message::RenameGroupStart(key, group) => {
                 let name = self
                     .section(&key)
@@ -927,9 +889,6 @@ impl Workspace {
                 ),
                 _ => Update::none(),
             },
-            Message::RenameTabStart(tab) if tab.runner.ci_runner().is_some() => {
-                Update::hint(CI_REFUSAL)
-            }
             Message::RenameTabStart(tab) => {
                 let title = self
                     .section(&tab.runner)
@@ -1120,9 +1079,6 @@ impl Workspace {
     /// A structural change: the section's runner's to make, or refused while
     /// there is no runner attached to make it.
     fn remote(&self, key: &RunnerKey, command: TopologyCommand) -> Update {
-        if key.ci_runner().is_some() {
-            return Update::hint(CI_REFUSAL);
-        }
         if key.is_synthetic() {
             return Update::hint("no runner executes these graphs");
         }

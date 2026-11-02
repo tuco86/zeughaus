@@ -34,6 +34,7 @@ const CLOSE: char = '\u{ea76}';
 
 impl App {
     /// Raises a notice now; see [`notices::Notices::raise`].
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(super) fn raise(
         &mut self,
         key: Option<String>,

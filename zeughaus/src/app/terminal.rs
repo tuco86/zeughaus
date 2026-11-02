@@ -106,9 +106,11 @@ impl LiveTerminal {
 
 impl App {
     /// Whether the user is looking at `terminal` of runner `key`: the
-    /// window has the keyboard and the focused pane shows it.
+    /// window has the keyboard, no CI page covers the workspace, and the
+    /// focused pane shows it.
     pub(super) fn watched(&self, key: &RunnerKey, terminal: zeughaus_mux::TerminalId) -> bool {
         self.window_focused
+            && !self.page.open
             && self.workspace.focused_pane().is_some_and(|pane| {
                 pane.runner == *key
                     && self.workspace.surface_of(pane) == Some(Surface::Terminal(terminal))
@@ -300,13 +302,15 @@ impl App {
         let Some(endpoint) = self.runtime.links.get(key).map(|l| l.endpoint.clone()) else {
             return Task::none();
         };
-        // The transcripts a CI view of this runner shows are its terminals
-        // too, though no pane of its workspace names them.
-        let replays: Vec<zeughaus_mux::TerminalId> = self
+        // The transcripts a CI view of this runner shows and the terminals
+        // the CI page docks are its terminals too, though no pane of its
+        // workspace names them.
+        let mut replays: Vec<zeughaus_mux::TerminalId> = self
             .ci
             .get(key)
             .map(|client| client.terminals().collect())
             .unwrap_or_default();
+        replays.extend(self.page_terminals(key));
         let Some(mux) = self.mux.get_mut(key) else {
             return Task::none();
         };
@@ -535,24 +539,41 @@ impl App {
         let Some(Surface::Terminal(terminal)) = self.workspace.surface_of(&pane) else {
             return Task::none();
         };
-        // A pane of a CI section shows a transcript of that runner's: its
-        // terminal, replayed to this editor and never driven from it. Only
-        // its size follows the pane.
-        let replay = pane.runner.ci_runner();
-        let key = replay.clone().unwrap_or_else(|| pane.runner.clone());
+        let key = pane.runner.clone();
+        self.terminal_action(&key, terminal, action, Some(pane))
+    }
+
+    /// What a terminal the CI page docks reported the user did. It is looked
+    /// at, not driven: only its size follows the dock.
+    pub(super) fn apply_page_terminal_action(
+        &mut self,
+        key: RunnerKey,
+        terminal: zeughaus_mux::TerminalId,
+        action: TerminalAction,
+    ) -> Task<Message> {
+        self.terminal_action(&key, terminal, action, None)
+    }
+
+    /// One terminal's action; without a pane it is read-only.
+    fn terminal_action(
+        &mut self,
+        key: &RunnerKey,
+        terminal: zeughaus_mux::TerminalId,
+        action: TerminalAction,
+        pane: Option<PaneRef>,
+    ) -> Task<Message> {
+        let read_only = pane.is_none();
         match action {
             TerminalAction::Command(command @ zeughaus_mux::TerminalCommand::Resize { .. }) => {
-                self.send_input(&key, terminal, command);
+                self.send_input(key, terminal, command);
                 Task::none()
             }
-            TerminalAction::Command(_) | TerminalAction::TakeControl if replay.is_some() => {
-                Task::none()
-            }
+            TerminalAction::Command(_) | TerminalAction::TakeControl if read_only => Task::none(),
             TerminalAction::Command(command) => {
-                self.send_input(&key, terminal, command);
+                self.send_input(key, terminal, command);
                 Task::none()
             }
-            TerminalAction::ScrollBy(lines) => self.scroll_terminal(&key, terminal, lines),
+            TerminalAction::ScrollBy(lines) => self.scroll_terminal(key, terminal, lines),
             TerminalAction::Copy(text) => iced::clipboard::write(text),
             TerminalAction::OpenLink(url) => {
                 // Only a Ctrl+click on the link gets here.
@@ -563,14 +584,11 @@ impl App {
                 Task::none()
             }
             TerminalAction::TakeControl => {
-                self.send_topology(
-                    &key,
-                    zeughaus_mux::TopologyCommand::TakeControl { terminal },
-                );
+                self.send_topology(key, zeughaus_mux::TopologyCommand::TakeControl { terminal });
                 Task::none()
             }
             TerminalAction::Focused(focused) => {
-                if focused {
+                if focused && let Some(pane) = pane {
                     self.workspace.focus(pane);
                 }
                 Task::none()
@@ -760,6 +778,41 @@ impl App {
         terminal: zeughaus_mux::TerminalId,
         read_only: bool,
     ) -> Element<'_, Message, Theme> {
+        // The palette or a name field takes the keyboard while it is open; a
+        // shell that kept it would receive everything typed there.
+        let focused = !self.palette_open
+            && self.workspace.renaming_group.is_none()
+            && self.workspace.renaming_tab.is_none()
+            && pane.is_some()
+            && pane.as_ref() == self.workspace.focused_pane();
+        let on_action = pane.map(|pane| {
+            Box::new(move |action| Message::TerminalAction(pane.clone(), action))
+                as Box<dyn Fn(TerminalAction) -> Message>
+        });
+        self.terminal_widget(key, terminal, read_only, focused, on_action)
+    }
+
+    /// A terminal the CI page docks: read-only, sized by the dock and
+    /// scrolled there.
+    pub(super) fn page_terminal(
+        &self,
+        key: &RunnerKey,
+        terminal: zeughaus_mux::TerminalId,
+    ) -> Element<'_, Message, Theme> {
+        let runner = key.clone();
+        let on_action: Box<dyn Fn(TerminalAction) -> Message> =
+            Box::new(move |action| Message::PageTerminal(runner.clone(), terminal, action));
+        self.terminal_widget(key, terminal, true, false, Some(on_action))
+    }
+
+    fn terminal_widget<'a>(
+        &'a self,
+        key: &RunnerKey,
+        terminal: zeughaus_mux::TerminalId,
+        read_only: bool,
+        focused: bool,
+        on_action: Option<Box<dyn Fn(TerminalAction) -> Message>>,
+    ) -> Element<'a, Message, Theme> {
         let Some((view, serials)) = self.terminal_view(key, terminal) else {
             return unavailable("Terminal", "Waiting for the runner's first screen.");
         };
@@ -773,13 +826,6 @@ impl App {
                 })
             })
         };
-        // The palette or a name field takes the keyboard while it is open; a
-        // shell that kept it would receive everything typed there.
-        let focused = !self.palette_open
-            && self.workspace.renaming_group.is_none()
-            && self.workspace.renaming_tab.is_none()
-            && pane.is_some()
-            && pane.as_ref() == self.workspace.focused_pane();
         let widget = iced_terminal::Terminal::new(Arc::clone(view), terminal.0)
             .controlling(controlling)
             .sizing(read_only)
@@ -789,11 +835,9 @@ impl App {
             .font_size(TERMINAL_FONT_SIZE)
             .padding(TERMINAL_PADDING)
             .scale_factor(self.scale_factor);
-        let widget: Element<'_, Message, Theme> = match pane {
+        let widget: Element<'a, Message, Theme> = match on_action {
             None => widget.into(),
-            Some(pane) => widget
-                .on_action(move |action| Message::TerminalAction(pane.clone(), action))
-                .into(),
+            Some(on_action) => widget.on_action(on_action).into(),
         };
         let background = self.theme.scheme().background;
         container(widget)

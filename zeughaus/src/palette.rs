@@ -191,6 +191,12 @@ fn runner_commands(state: &RunnerState<'_>) -> Vec<Command<Message>> {
             );
         }
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    commands.push(
+        command("ci.page", "CI / Open page".to_string())
+            .description("What needs you and what works; channels, plans, sessions, runners")
+            .action(Message::TogglePage),
+    );
     commands
 }
 

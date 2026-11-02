@@ -1,21 +1,17 @@
-//! The CI sections: what this editor shows of a runner's CI.
+//! The CI page's data and views: what this editor shows of a CI.
 //!
-//! A runner that runs CI gets a section of its own in the tab bar, beside its
-//! workspace: a Runners tab, and under a group per repository one tab per
-//! channel. The editor holds only what it was told over `/ci` and computes no
-//! status; when the runner announces that a pipeline changed it asks for that
-//! pipeline again. The sections are the editor's own, built the way the
-//! `local` section is built from the document: a snapshot whose ids this
-//! module mints and no runner knows.
+//! The editor holds only what it was told over `/ci` and computes no
+//! status; when the CI announces that a pipeline changed it asks for that
+//! pipeline again. Views and repositories get ids this module mints and no
+//! CI knows.
 //!
-//! A channel tab lists the channel's pipelines, newest on top, in a plain
+//! A channel lists the channel's pipelines, newest on top, in a plain
 //! scrollable: per pipeline its trigger, commit and status over a drawing of
 //! its jobs. The jobs are cards laid out by what they need, joined by cables
 //! drawn with the node graph's renderer; nothing in it pans, zooms or moves.
-//! Pressing a job asks the runner for a transcript: a read-only terminal of
-//! the runner's own mux that replays the job's recorded output, live while
-//! the job runs, and which the tab then shows beside the list like any other
-//! terminal.
+//! Pressing a job asks the CI for a transcript: a read-only terminal of its
+//! mux that replays the job's recorded output, live while the job runs,
+//! which the page shows beside the list.
 //!
 //! Native only: the browser editor reaches no runner.
 
@@ -32,10 +28,7 @@ use zeughaus_core::NodeId;
 use zeughaus_link::{
     CiOverview, CiReply, CiRequest, JobView, MachineJob, MachineView, PipelineView, QueuedView,
 };
-use zeughaus_mux::{
-    Axis, GroupId, GroupSnapshot, PaneId, PaneNode, SplitId, TabId, TabSnapshot, TerminalId,
-    WorkspaceItem, WorkspaceSnapshot,
-};
+use zeughaus_mux::TerminalId;
 use zeughaus_theme::Theme;
 
 use self::cables::{Cables, cable};
@@ -45,14 +38,11 @@ use super::{App, unavailable};
 use crate::feed;
 use crate::message::{CiMsg, CiShortcut, Message};
 use crate::transport::Endpoint;
-use crate::workspace::{self, RunnerKey, Surface, TabRef};
+use crate::workspace::RunnerKey;
 
 mod cables;
+pub(super) mod page;
 mod plans;
-
-/// The id of the Runners view, its tab and its pane. Every other id of a
-/// section comes from its client's counter, which starts above this.
-const RUNNERS: u64 = 1;
 
 /// Pipelines asked for at a time: a channel's first page, and each page
 /// "Load older" adds.
@@ -69,15 +59,6 @@ const GLYPH_ADVANCE: f32 = 0.55;
 fn list_id(view: u64) -> iced::widget::Id {
     iced::widget::Id::from(format!("ci-list-{view}"))
 }
-
-/// Set on a view's id for the split that holds its transcript and, with the
-/// next bit, for the pane of that transcript. Views, tabs and groups are
-/// numbered from a counter and never get near either bit.
-const SPLIT_BIT: u64 = 1 << 62;
-const TRANSCRIPT_BIT: u64 = 1 << 63;
-
-/// A repository's group has no colour of its own.
-const GROUP_GREY: [u8; 4] = [0x80, 0x80, 0x80, 0xff];
 
 /// The size of a job's card. It is a fixed box, so a pipeline's drawing can
 /// be sized without measuring what is in it.
@@ -210,19 +191,16 @@ pub(super) struct CiClient {
     last_overview: Option<std::time::Instant>,
 }
 
-/// A repository: its group in the tab bar, its Plans tab and the views of
-/// its channels.
+/// A repository: its Plans view and the views of its channels.
 struct Repo {
-    group: u64,
-    /// The view id of its Plans tab, the group's first.
+    /// The view id of its Plans.
     plans: u64,
     /// Channel name to view id.
     channels: BTreeMap<String, u64>,
 }
 
-/// One channel's tab: the pipelines loaded so far and what is open beside
-/// them. The tab is titled with the channel alone: its group names the
-/// repository.
+/// One channel's view: the pipelines loaded so far and the transcript
+/// beside them.
 struct ChannelState {
     repo: String,
     channel: String,
@@ -508,28 +486,6 @@ impl ChannelState {
             Err(at) => self.pipelines.insert(at, Shown::new(pipeline)),
         }
     }
-
-    /// The tab's pane tree: the graph, and the transcript beside it once the
-    /// runner has opened one.
-    fn root(&self, view: u64) -> PaneNode {
-        let graph = PaneNode::Leaf {
-            pane_id: PaneId(view),
-            surface: Surface::Ci(view),
-        };
-        match self.transcript.as_ref().and_then(|t| t.terminal) {
-            Some(terminal) => PaneNode::Split {
-                id: SplitId(view | SPLIT_BIT),
-                axis: Axis::Horizontal,
-                ratio: 0.5,
-                first: Box::new(graph),
-                second: Box::new(PaneNode::Leaf {
-                    pane_id: PaneId(view | TRANSCRIPT_BIT),
-                    surface: Surface::Terminal(TerminalId(terminal)),
-                }),
-            },
-            None => graph,
-        }
-    }
 }
 
 impl CiClient {
@@ -541,7 +497,7 @@ impl CiClient {
             overview_pending: false,
             overview_again: false,
             error: None,
-            next_id: RUNNERS + 1,
+            next_id: 1,
             repos: BTreeMap::new(),
             views: BTreeMap::new(),
             plans: BTreeMap::new(),
@@ -571,9 +527,9 @@ impl CiClient {
         self.terminals().any(|shown| shown == terminal)
     }
 
-    /// The colour of the dot on a channel's tab: how its newest pipeline
-    /// went, in the tone its cards use. None while there is nothing to say.
-    fn accent(&self, state: &ChannelState, theme: &Theme) -> Option<[u8; 4]> {
+    /// The colour of a channel's dot: how its newest pipeline went, in the
+    /// tone its cards use. None while there is nothing to say.
+    fn accent(&self, state: &ChannelState, theme: &Theme) -> Option<Color> {
         let channel = self
             .overview
             .as_ref()?
@@ -582,66 +538,19 @@ impl CiClient {
             .find(|c| c.repo == state.repo && c.channel == state.channel)?;
         match Tone::of(&channel.status) {
             Tone::Idle => None,
-            tone => Some(tone.color(theme).into_rgba8()),
+            tone => Some(tone.color(theme)),
         }
     }
 
-    /// The section's snapshot: the Runners tab, then a locked group per
-    /// repository with its Plans tab and a tab per channel.
-    fn snapshot(&self, theme: &Theme) -> WorkspaceSnapshot {
-        let mut items = vec![WorkspaceItem::Tab(TabSnapshot {
-            id: TabId(RUNNERS),
-            title: "Runners".to_owned(),
-            accent_rgba: None,
-            root: PaneNode::Leaf {
-                pane_id: PaneId(RUNNERS),
-                surface: Surface::Ci(RUNNERS),
-            },
-        })];
-        for (repo, known) in &self.repos {
-            let mut tabs = vec![TabSnapshot {
-                id: TabId(known.plans),
-                title: "Plans".to_owned(),
-                accent_rgba: self.plans_accent(repo, theme),
-                root: PaneNode::Leaf {
-                    pane_id: PaneId(known.plans),
-                    surface: Surface::Ci(known.plans),
-                },
-            }];
-            tabs.extend(
-                known
-                    .channels
-                    .values()
-                    .filter_map(|view| Some((*view, self.views.get(view)?)))
-                    .map(|(view, state)| TabSnapshot {
-                        id: TabId(view),
-                        title: state.channel.clone(),
-                        accent_rgba: self.accent(state, theme),
-                        root: state.root(view),
-                    }),
-            );
-            items.push(WorkspaceItem::Group(GroupSnapshot {
-                id: GroupId(known.group),
-                name: repo.clone(),
-                color_rgba: GROUP_GREY,
-                locked: true,
-                tabs,
-            }));
-        }
-        workspace::ci_snapshot(items)
-    }
-
-    /// A repository, with ids minted for its group and its Plans tab the
-    /// first time it is seen.
+    /// A repository, with an id minted for its Plans view the first time it
+    /// is seen.
     fn repo_of(&mut self, repo: &str) -> &mut Repo {
         if !self.repos.contains_key(repo) {
-            let group = self.mint();
             let plans = self.mint();
             self.plans.insert(plans, plans::PlansState::new(repo));
             self.repos.insert(
                 repo.to_owned(),
                 Repo {
-                    group,
                     plans,
                     channels: BTreeMap::new(),
                 },
@@ -1119,13 +1028,13 @@ async fn act(endpoint: Endpoint, repo: String, number: u64, cancel: bool) -> Res
 }
 
 impl App {
-    /// Brings the CI sections in line with the CI links: one client per
-    /// connected CI service, each with its section.
+    /// Brings the CI clients in line with the CI links: one per connected
+    /// CI service.
     ///
     /// A client stays while its CI restarts -- its traffic is lost for a
     /// moment, and a CI without a pinned port comes back on another one -- so
-    /// the tab in front does not change under the user; it goes when the link
-    /// is gone. The overview of a new client is asked for here, which is why
+    /// the page does not change under the user; it goes when the link is
+    /// gone. The overview of a new client is asked for here, which is why
     /// this returns a task.
     pub(super) fn sync_ci_sections(&mut self) -> Task<Message> {
         let ended: Vec<RunnerKey> = self
@@ -1141,7 +1050,6 @@ impl App {
             .collect();
         for key in ended {
             self.ci.remove(&key);
-            self.workspace.set_synthetic(RunnerKey::ci(&key), "", None);
         }
 
         let mut tasks = Vec::new();
@@ -1162,11 +1070,6 @@ impl App {
                     client.endpoint = link.endpoint.clone();
                 }
             }
-            self.workspace.set_synthetic(
-                RunnerKey::ci(key),
-                &format!("CI {}", client.label),
-                Some(client.snapshot(&self.theme)),
-            );
         }
         if tasks.is_empty() {
             Task::none()
@@ -1211,14 +1114,9 @@ impl App {
             CiMsg::LoadOlder { view } => client.ask_pipelines(&key, view, true),
             CiMsg::OpenJob { view, number, job } => {
                 let asked = client.open_job(&key, view, number, job);
-                // A job opened from the Runners tab is in another tab.
-                let tab = TabRef {
-                    runner: RunnerKey::ci(&key),
-                    tab: TabId(view),
-                };
-                if self.workspace.active_tab() != Some(&tab) {
-                    self.workspace.activate(tab);
-                }
+                // A job opened from the Runners view is in its channel.
+                self.page.open = true;
+                self.page.view = page::PageView::Channel(key.clone(), view);
                 // The transcript this one replaced is no longer wanted.
                 Task::batch([asked, self.reconcile_terminals(&key)])
             }
@@ -1297,32 +1195,37 @@ impl App {
         Task::batch(tasks)
     }
 
-    /// Whether something on screen counts seconds: the tab in front is a
-    /// channel with a running pipeline or job. The one-second clock runs
-    /// only while this holds, since every tick redraws the window.
+    /// Whether something on screen counts seconds: the page shows a channel
+    /// with a running pipeline or job. The one-second clock runs only while
+    /// this holds, since every tick redraws the window.
     pub(super) fn ci_clock_wanted(&self) -> bool {
-        let Some(front) = self.workspace.active_tab() else {
+        let Some((key, view)) = self.front_view() else {
             return false;
         };
-        front
-            .runner
-            .ci_runner()
-            .and_then(|runner| self.ci.get(&runner))
-            .and_then(|client| client.views.get(&front.tab.0))
+        self.ci
+            .get(&key)
+            .and_then(|client| client.views.get(&view))
             .is_some_and(ChannelState::ticking)
     }
 
-    /// The channel view in front, if the tab in front is one.
+    /// The CI and view of the channel the open page shows.
+    fn front_view(&self) -> Option<(RunnerKey, u64)> {
+        match &self.page.view {
+            page::PageView::Channel(key, view) if self.page.open => Some((key.clone(), *view)),
+            _ => None,
+        }
+    }
+
+    /// The channel the open page shows.
     fn front_channel(&mut self) -> Option<&mut ChannelState> {
-        let front = self.workspace.active_tab()?.clone();
-        let runner = front.runner.ci_runner()?;
-        self.ci.get_mut(&runner)?.views.get_mut(&front.tab.0)
+        let (key, view) = self.front_view()?;
+        self.ci.get_mut(&key)?.views.get_mut(&view)
     }
 
     /// Up and Down in front of a CI list move its cursor, and the list
     /// follows it.
     pub(super) fn step_front_ci_cursor(&mut self, step: isize) -> Task<Message> {
-        let Some(view) = self.workspace.active_tab().map(|front| front.tab.0) else {
+        let Some((_, view)) = self.front_view() else {
             return Task::none();
         };
         let Some(state) = self.front_channel() else {
@@ -1351,13 +1254,12 @@ impl App {
     /// A letter in front of a CI list: rerun, cancel or open the log of the
     /// pipeline under the cursor, the newest one while there is no cursor.
     pub(super) fn ci_shortcut(&mut self, shortcut: CiShortcut) -> Task<Message> {
-        let Some(front) = self.workspace.active_tab().cloned() else {
+        if let Some(task) = self.page_shortcut(shortcut) {
+            return task;
+        }
+        let Some((runner, view)) = self.front_view() else {
             return Task::none();
         };
-        let Some(runner) = front.runner.ci_runner() else {
-            return Task::none();
-        };
-        let view = front.tab.0;
         let Some(state) = self
             .ci
             .get(&runner)
@@ -1379,6 +1281,10 @@ impl App {
                 CiMsg::Cancel { view, number }
             }
             CiShortcut::Cancel => return Task::none(),
+            // The page's own letters, answered above where they apply.
+            CiShortcut::Next | CiShortcut::Previous | CiShortcut::Approve | CiShortcut::Plan => {
+                return Task::none();
+            }
             CiShortcut::OpenLog => {
                 let job = pipeline
                     .jobs
@@ -1409,25 +1315,22 @@ impl App {
         Task::none()
     }
 
-    /// Closes the log beside the CI list in front, if one is open: what
-    /// Escape does when nothing nearer took it.
+    /// What Escape does when nothing nearer took it: closes the log beside
+    /// the channel the page shows, and without one the page.
     pub(super) fn close_front_ci_log(&mut self) -> Task<Message> {
-        let Some(front) = self.workspace.active_tab().cloned() else {
-            return Task::none();
-        };
-        let Some(runner) = front.runner.ci_runner() else {
-            return Task::none();
-        };
-        let view = front.tab.0;
-        let open = self
-            .ci
-            .get(&runner)
-            .and_then(|client| client.views.get(&view))
-            .is_some_and(|state| state.transcript.is_some());
-        if !open {
-            return Task::none();
+        let open = self.front_view().filter(|(runner, view)| {
+            self.ci
+                .get(runner)
+                .and_then(|client| client.views.get(view))
+                .is_some_and(|state| state.transcript.is_some())
+        });
+        match open {
+            Some((runner, view)) => self.apply_ci(runner, CiMsg::CloseTranscript { view }),
+            None => {
+                self.page.open = false;
+                Task::none()
+            }
         }
-        self.apply_ci(runner, CiMsg::CloseTranscript { view })
     }
 
     /// A pipeline of `repo`'s `channel` changed. The pipeline is asked for
@@ -1517,59 +1420,6 @@ impl App {
         Task::batch(tasks)
     }
 
-    /// What a CI pane is called: its section's Runners tab, a repository's
-    /// Plans tab or a channel.
-    pub(super) fn ci_pane_title(&self, section: &RunnerKey, view: u64) -> String {
-        let client = section.ci_runner().and_then(|runner| self.ci.get(&runner));
-        match client {
-            Some(_) if view == RUNNERS => "Runners".to_owned(),
-            Some(client) if client.plans.contains_key(&view) => {
-                format!("{} / Plans", client.plans[&view].repo)
-            }
-            Some(client) => client.views.get(&view).map_or_else(
-                || "CI".to_owned(),
-                |state| format!("{} / {}", state.repo, state.channel),
-            ),
-            None => "CI".to_owned(),
-        }
-    }
-
-    /// What a transcript's terminal pane is called: `<repo> #<n> <job>`.
-    pub(super) fn ci_terminal_title(
-        &self,
-        section: &RunnerKey,
-        terminal: TerminalId,
-    ) -> Option<String> {
-        let client = self.ci.get(&section.ci_runner()?)?;
-        client.views.values().find_map(|state| {
-            let open = state
-                .transcript
-                .as_ref()
-                .filter(|t| t.terminal == Some(terminal.0))?;
-            Some(format!("{} #{} {}", state.repo, open.number, open.job))
-        })
-    }
-
-    /// One CI pane: the Runners tab, a repository's Plans tab, or a channel.
-    pub(super) fn ci_view(&self, section: &RunnerKey, view: u64) -> Element<'_, Message, Theme> {
-        let Some((runner, client)) = section
-            .ci_runner()
-            .and_then(|runner| self.ci.get_key_value(&runner))
-        else {
-            return unavailable("CI", "This section is not a runner's CI.");
-        };
-        if view == RUNNERS {
-            return self.runners_view(runner, client);
-        }
-        if let Some(state) = client.plans.get(&view) {
-            return self.plans_view(runner, client, view, state);
-        }
-        match client.views.get(&view) {
-            Some(state) => self.channel_view(runner, client, view, state),
-            None => unavailable("CI", "This view is gone."),
-        }
-    }
-
     /// A warning glyph and the reason, while the CI does not answer and the
     /// view shows what it last reported: its last error, or a report older
     /// than a few rounds of the clock (a request to a CI that is gone waits
@@ -1597,11 +1447,12 @@ impl App {
     }
 
     /// The machines the CI runs jobs on: a table under a toolbar, like a
-    /// channel's list.
+    /// channel's list. A row selects its machine; the one at `cursor` is lit.
     fn runners_view<'a>(
         &'a self,
         runner: &'a RunnerKey,
         client: &'a CiClient,
+        cursor: usize,
     ) -> Element<'a, Message, Theme> {
         let Some(overview) = &client.overview else {
             return unavailable(
@@ -1638,16 +1489,26 @@ impl App {
                 Space::new().width(ICON_COLUMN),
                 head("Machine").width(MACHINE_WIDTH),
                 head("State").width(STATE_WIDTH),
-                head("Running"),
+                head("Running").width(Length::FillPortion(2)),
+                head("Labels").width(Length::FillPortion(1)),
             ]
             .spacing(SP_3)
         ]
-        .spacing(SP_3)
+        .spacing(SP_2)
         .padding(SP_4);
-        for machine in &overview.machines {
-            table = table
-                .push(rule::horizontal(1))
-                .push(self.machine_row(runner, client, machine));
+        let t = crate::style::Tokens::of(&self.theme);
+        for (at, machine) in overview.machines.iter().enumerate() {
+            let active = at == cursor;
+            table = table.push(
+                container(
+                    button(self.machine_row(runner, client, machine))
+                        .width(Length::Fill)
+                        .padding([SP_1, 0.0])
+                        .style(crate::style::row_entry_button(&t, active))
+                        .on_press(Message::PageCursor(at)),
+                )
+                .style(crate::style::row_highlight(&t, active)),
+            );
         }
         let body = scrollable(table).width(Length::Fill).height(Length::Fill);
         column![toolbar, rule::horizontal(1), body].into()
@@ -1662,19 +1523,36 @@ impl App {
         machine: &'a MachineView,
     ) -> Element<'a, Message, Theme> {
         let muted = self.theme.muted();
-        let jobs: Element<'a, Message, Theme> = if machine.jobs.is_empty() {
+        // What it runs: its jobs, each a link, and a live agent session.
+        let session = client.overview.as_ref().and_then(|overview| {
+            overview
+                .sessions
+                .iter()
+                .find(|s| s.runner == machine.name && s.state.is_live())
+        });
+        let jobs: Element<'a, Message, Theme> = if machine.jobs.is_empty() && session.is_none() {
             // Indented like the links, whose padding is their hover area.
             container(text("Nothing").size(TEXT_SM).color(muted))
                 .padding([0.0, SP_2])
                 .into()
         } else {
-            row(machine
+            let mut running = row(machine
                 .jobs
                 .iter()
                 .map(|job| self.machine_job(runner, client, job)))
             .spacing(SP_3)
-            .wrap()
-            .into()
+            .align_y(Alignment::Center);
+            if let Some(session) = session {
+                let doc = session.doc.map(|n| format!(" #{n}")).unwrap_or_default();
+                running = running.push(
+                    container(
+                        text(format!("{} {}{doc}", session.kind.name(), session.repo))
+                            .size(TEXT_SM),
+                    )
+                    .padding([0.0, SP_2]),
+                );
+            }
+            running.wrap().into()
         };
         let (kind, kind_tip) = if machine.kind == "windows-vm" {
             (glyph::VM, "Windows VM")
@@ -1682,7 +1560,7 @@ impl App {
             (glyph::SERVER, "Runner")
         };
         let tone = state_tone(&machine.status);
-        let mut line = row![
+        row![
             container(tip(icon(kind, ICON_SIZE, muted), kind_tip.to_owned())).width(ICON_COLUMN),
             text(machine.name.as_str())
                 .size(TEXT_MD)
@@ -1696,25 +1574,15 @@ impl App {
             .spacing(SP_2)
             .align_y(Alignment::Center)
             .width(STATE_WIDTH),
-            jobs,
+            container(jobs).width(Length::FillPortion(2)),
+            text(machine.labels.join(", "))
+                .size(TEXT_SM)
+                .color(muted)
+                .width(Length::FillPortion(1)),
         ]
         .spacing(SP_3)
-        .align_y(Alignment::Center);
-        let session = client.overview.as_ref().and_then(|overview| {
-            overview
-                .sessions
-                .iter()
-                .find(|s| s.runner == machine.name && s.state.is_live())
-        });
-        if let Some(session) = session {
-            let doc = session.doc.map(|n| format!(" #{n}")).unwrap_or_default();
-            line = line
-                .push(text(format!("{} {}{doc}", session.kind.name(), session.repo)).size(TEXT_SM));
-        }
-        if !machine.labels.is_empty() {
-            line = line.push(text(machine.labels.join(", ")).size(TEXT_SM).color(muted));
-        }
-        line.into()
+        .align_y(Alignment::Center)
+        .into()
     }
 
     /// `<repo> #<n> <job>`: pressing it brings its channel's tab to the
@@ -1902,11 +1770,15 @@ impl App {
         let open = state.is_open(at, pipeline);
         let number = pipeline.number;
         let cursor = state.cursor == Some(number);
-        let row = button(self.pipeline_row(pipeline, open, size, now))
-            .width(Length::Fill)
-            .padding([SP_3, SP_4])
-            .style(move |theme: &Theme, status| row_style(theme, status, cursor))
-            .on_press_with(move || Message::Ci(runner.clone(), CiMsg::Toggle { view, number }));
+        let t = crate::style::Tokens::of(&self.theme);
+        let row = container(
+            button(self.pipeline_row(pipeline, open, size, now))
+                .width(Length::Fill)
+                .padding([SP_3, SP_4])
+                .style(crate::style::row_entry_button(&t, true))
+                .on_press_with(move || Message::Ci(runner.clone(), CiMsg::Toggle { view, number })),
+        )
+        .style(crate::style::row_highlight(&t, cursor));
         if !open {
             return row.into();
         }
@@ -2199,7 +2071,7 @@ impl App {
             detail = detail.push(
                 scrollable(self.job_graph(runner, view, state, shown, now))
                     .direction(scrollable::Direction::Horizontal(
-                        scrollable::Scrollbar::default(),
+                        scrollable::Scrollbar::default().spacing(SP_1),
                     ))
                     .width(Length::Fill),
             );
@@ -2610,31 +2482,6 @@ fn secondary_style(theme: &Theme, status: button::Status) -> button::Style {
             color: border,
             width: 1.0,
             radius: RADIUS.into(),
-        },
-        ..button::Style::default()
-    }
-}
-
-/// A pipeline's row: flat, a shade lighter under the pointer, and outlined
-/// in the accent while the arrow keys are on it.
-fn row_style(theme: &Theme, status: button::Status, cursor: bool) -> button::Style {
-    let palette = theme.extended();
-    let background = match status {
-        button::Status::Hovered => Some(palette.background.weakest.color.into()),
-        button::Status::Pressed => Some(palette.background.weaker.color.into()),
-        button::Status::Active | button::Status::Disabled => None,
-    };
-    button::Style {
-        background,
-        text_color: palette.background.base.text,
-        border: if cursor {
-            iced::Border {
-                color: palette.primary.base.color,
-                width: 1.0,
-                radius: RADIUS.into(),
-            }
-        } else {
-            iced::Border::default()
         },
         ..button::Style::default()
     }

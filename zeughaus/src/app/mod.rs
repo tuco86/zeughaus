@@ -71,6 +71,8 @@ use zeughaus_ml::MlPlugin;
 use zeughaus_theme::Theme;
 use zeughaus_transform::TransformPlugin;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use ci::page::{AttentionTarget, PageView};
 use graph::{EditorEdge, EditorNode, NodeEdges, Wire, flow_reaches, wire_refusal};
 use layout::auto_layout;
 pub use node_view::PinVisual;
@@ -270,6 +272,9 @@ pub struct App {
     /// key (its fingerprint). Runner links have none.
     #[cfg(not(target_arch = "wasm32"))]
     ci: BTreeMap<RunnerKey, ci::CiClient>,
+    /// The CI page over the workspace.
+    #[cfg(not(target_arch = "wasm32"))]
+    page: ci::page::Page,
     /// The runners the CIs announced last, as published to
     /// [`crate::directory`].
     #[cfg(not(target_arch = "wasm32"))]
@@ -427,6 +432,8 @@ impl App {
             mux: BTreeMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             ci: BTreeMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            page: ci::page::Page::default(),
             #[cfg(not(target_arch = "wasm32"))]
             directory: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -948,15 +955,21 @@ impl App {
                 {
                     return Task::none();
                 }
+                // A tab brought to the front is what the user wants to see:
+                // the page over it goes.
+                #[cfg(not(target_arch = "wasm32"))]
+                if matches!(
+                    message,
+                    workspace::Message::PressTab(_)
+                        | workspace::Message::CycleTab(_)
+                        | workspace::Message::NewShell(_)
+                ) {
+                    self.page.open = false;
+                }
                 // Closing what shows a top-level graph deletes the graph; a
                 // synthetic section has no runner to tell.
                 let mut closed = Task::none();
                 match &message {
-                    // A CI section is the editor's own: it has no runner's tab
-                    // to close.
-                    workspace::Message::CloseTab(tab) if tab.runner.ci_runner().is_some() => {
-                        return Task::none();
-                    }
                     workspace::Message::CloseTab(tab) => {
                         let surfaces: Vec<Surface> = self
                             .workspace
@@ -1295,10 +1308,13 @@ impl App {
             }
             Message::PaletteConfirm => {
                 if !self.palette_open {
-                    // Enter outside the palette opens or closes the pipeline
-                    // under a CI list's cursor.
+                    // Enter outside the palette acts on the row under the
+                    // CI page's cursor.
                     #[cfg(not(target_arch = "wasm32"))]
-                    return self.toggle_front_ci_cursor();
+                    if self.page.open {
+                        return self.apply_page(Message::PageEnter);
+                    }
+                    return Task::none();
                 }
                 if let Some(msg) = self.palette_confirm() {
                     return self.update(msg);
@@ -1329,7 +1345,21 @@ impl App {
                     return Task::none();
                 }
                 #[cfg(not(target_arch = "wasm32"))]
+                if self.page.open && !matches!(self.page.view, PageView::Channel(..)) {
+                    return self.apply_page(Message::PageStep(step as i32));
+                }
+                #[cfg(not(target_arch = "wasm32"))]
                 return self.step_front_ci_cursor(step);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            message @ (Message::TogglePage
+            | Message::PageShow(_)
+            | Message::PageStep(_)
+            | Message::PageEnter
+            | Message::PageOpen(_)
+            | Message::PageCursor(_)
+            | Message::PageTerminal(..)) => {
+                return self.apply_page(message);
             }
             Message::SpawnNode { type_id } => {
                 if self.current_graph == NodeId(0) {
@@ -1462,12 +1492,19 @@ impl App {
             // answered.
             Message::OpenNotice(id) => {
                 let target = self.notices.get(id).and_then(|n| n.open.clone());
-                if let Some(crate::message::NoticeTarget::Terminal(key, terminal)) = target {
-                    self.notice_center.go_mut(false, iced::time::Instant::now());
+                self.notice_center.go_mut(false, iced::time::Instant::now());
+                match target {
+                    Some(crate::message::NoticeTarget::Terminal(key, terminal)) => {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        return self.apply(Message::RevealTerminal(key, terminal));
+                        #[cfg(target_arch = "wasm32")]
+                        let _ = (key, terminal);
+                    }
                     #[cfg(not(target_arch = "wasm32"))]
-                    return self.apply(Message::RevealTerminal(key, terminal));
-                    #[cfg(target_arch = "wasm32")]
-                    let _ = (key, terminal);
+                    Some(crate::message::NoticeTarget::CiPage(view)) => {
+                        return self.apply_page(Message::PageShow(view));
+                    }
+                    None => {}
                 }
             }
             Message::NoticeTick => {
@@ -1660,6 +1697,8 @@ impl App {
             }
             #[cfg(not(target_arch = "wasm32"))]
             Message::RevealTerminal(key, terminal) => {
+                // The tab it brings to the front would be under the page.
+                self.page.open = false;
                 let shown = self.workspace.section(&key).is_some_and(|section| {
                     section
                         .snapshot
@@ -1910,6 +1949,15 @@ impl App {
             iced_tabs::Placement::Left => (None, Some(strip)),
         };
 
+        // The CI page takes the place of the tab in front, and of the tab
+        // tree beside it.
+        #[cfg(not(target_arch = "wasm32"))]
+        let (front, sidebar) = if self.page.open {
+            (self.page_view(), None)
+        } else {
+            (self.runner_tab_view(), sidebar)
+        };
+        #[cfg(target_arch = "wasm32")]
         let front = self.runner_tab_view();
         let body: Element<'_, Message, Theme> = match sidebar {
             Some(sidebar) => row![sidebar, front]
@@ -1989,22 +2037,16 @@ impl App {
         .unwrap_or_default()
     }
 
-    /// What a pane is called in its grip: its graph's, terminal's or CI
-    /// view's title.
+    /// What a pane is called in its grip: its graph's or terminal's title.
     fn pane_title(&self, key: &RunnerKey, surface: Surface) -> String {
         match surface {
             Surface::Graph(graph) => self
                 .nodes
                 .get(&NodeId(graph))
                 .map_or_else(|| "Graph".to_owned(), |node| node.display_name.clone()),
-            Surface::Empty => "Empty".to_owned(),
-            Surface::Ci(view) => self.ci_pane_title(key, view),
+            // A runner never sends a CI surface.
+            Surface::Empty | Surface::Ci(_) => "Empty".to_owned(),
             Surface::Terminal(terminal) => {
-                // A transcript is named for the job it replays.
-                #[cfg(not(target_arch = "wasm32"))]
-                if let Some(title) = self.ci_terminal_title(key, terminal) {
-                    return title;
-                }
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some((view, _)) = self.terminal_view(key, terminal) {
                     let guard = view.lock().unwrap_or_else(|e| e.into_inner());
@@ -2220,6 +2262,9 @@ impl App {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let corner = self.window_radius();
+            if let Some(chip) = self.page_chip() {
+                controls = controls.push(container(chip).padding([0, 8]));
+            }
             controls = controls
                 .push(window_button(
                     GLYPH_MINIMIZE,
@@ -2310,17 +2355,14 @@ impl App {
             });
             let body: Element<'_, Message, Theme> = match surface {
                 Surface::Graph(graph) => self.graph_view(NodeId(*graph)),
-                Surface::Empty => unavailable(
+                // A runner never sends a CI surface.
+                Surface::Empty | Surface::Ci(_) => unavailable(
                     "Empty pane",
                     "Its surface could not be restored. Close it or split it again.",
                 ),
-                // A transcript is the runner's terminal, shown to this editor
-                // and never typed into.
-                Surface::Terminal(terminal) => match key.ci_runner() {
-                    Some(runner) => self.terminal_pane(pane_ref.clone(), &runner, *terminal, true),
-                    None => self.terminal_pane(pane_ref.clone(), &key, *terminal, false),
-                },
-                Surface::Ci(view) => self.ci_view(&key, *view),
+                Surface::Terminal(terminal) => {
+                    self.terminal_pane(pane_ref.clone(), &key, *terminal, false)
+                }
             };
             // Always a stack with the body first: iced keeps a child's state
             // by its index, so the overlay coming and going with a drag
@@ -2444,17 +2486,6 @@ impl App {
             "Terminal",
             "Terminals run on the runner and are not shown in the browser editor.",
         )
-    }
-
-    /// A CI view in the browser editor, which reaches no runner.
-    #[cfg(target_arch = "wasm32")]
-    fn ci_view(&self, _section: &RunnerKey, _view: u64) -> Element<'_, Message, Theme> {
-        unavailable("CI", "CI views need the native editor")
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn ci_pane_title(&self, _section: &RunnerKey, _view: u64) -> String {
-        "CI".to_owned()
     }
 
     fn graph_view(&self, graph: NodeId) -> Element<'_, Message, Theme> {
@@ -2744,6 +2775,10 @@ impl App {
                     let shortcut = match (c.as_str(), modifiers) {
                         ("r", m) if m.is_empty() => Some(crate::message::CiShortcut::Rerun),
                         ("l", m) if m.is_empty() => Some(crate::message::CiShortcut::OpenLog),
+                        ("j", m) if m.is_empty() => Some(crate::message::CiShortcut::Next),
+                        ("k", m) if m.is_empty() => Some(crate::message::CiShortcut::Previous),
+                        ("a", m) if m.is_empty() => Some(crate::message::CiShortcut::Approve),
+                        ("p", m) if m.is_empty() => Some(crate::message::CiShortcut::Plan),
                         ("C" | "c", keyboard::Modifiers::SHIFT) => {
                             Some(crate::message::CiShortcut::Cancel)
                         }
@@ -2995,15 +3030,13 @@ impl App {
         key: &RunnerKey,
         tab: &'a zeughaus_mux::TabSnapshot,
     ) -> iced_tabs::Tab<'a, TabRef> {
-        // A CI tab is a view this editor makes, not something to close.
         let mut entry = iced_tabs::Tab::new(
             TabRef {
                 runner: key.clone(),
                 tab: tab.id,
             },
             tab.title.as_str(),
-        )
-        .closable(key.ci_runner().is_none());
+        );
         if let Some(accent) = workspace::accent(tab) {
             entry = entry.accent(accent);
         }

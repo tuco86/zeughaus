@@ -31,11 +31,24 @@ pub(super) fn agent_color(state: AgentState, theme: &Theme) -> Color {
 }
 
 /// The word of an agent's role.
-fn role_word(role: AgentRole) -> &'static str {
+pub(super) fn role_word(role: AgentRole) -> &'static str {
     match role {
         AgentRole::Work => "work",
         AgentRole::Plan => "plan",
         AgentRole::Master => "master",
+    }
+}
+
+/// The word of an agent's state.
+pub(super) fn state_word(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Idle => "idle",
+        AgentState::Working => "working",
+        AgentState::Waiting => "waiting",
+        AgentState::Asking => "asking",
+        AgentState::Review => "review",
+        AgentState::Failed => "failed",
+        AgentState::Ended => "ended",
     }
 }
 
