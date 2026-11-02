@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The CI page: the CI leaves the tab bar for a chip in the titlebar
+  (`N need you`, `M working`) and a full-window page over the workspace.
+  Its Overview lists what needs the user (agents that wait, plans to
+  approve, failed channels and sessions) and what works, with the row's
+  terminal docked beside the list; per CI the page has each repository's
+  channels (a job's transcript docked beside the pipelines) and Plans
+  (dense rows, an action bar with the primary action filled, the master's
+  terminal docked under an in-progress plan; `a`, `r`, `p` and `j`/`k` on
+  the keyboard), its Sessions and its Runners with each runner's activity.
+  "CI / Open page" in the palette opens it too.
+- A notice center after griasdi's replaces desktop notifications: a pull
+  tab at the window's bottom right counts the notices in the colour of the
+  worst and opens the panel; each notice shows its age, a pinned one stays
+  until it is dismissed or its cause resolves, the others go after 60 s.
+  CI alerts, failed sessions, agents waiting for their user and terminal
+  notifications (OSC 9/777) raise one, and a click on its title opens what
+  it is about.
+- Agent status: every omp in a zeughaus terminal reports its state
+  (idle, working, waiting, asking, review, failed) through the zeughaus omp
+  plugin (0.7.0) as the terminal user variable `zeughaus_agent`; the runner
+  sends it with the terminal's activity and drops it when the omp process
+  is gone, and the tab shows it as a glyph of the session's role (the
+  user's own, a plan session, a master) in the state's colour.
+- CI jobs, plan sessions and masters open in a locked group of their
+  repository in the runner's tab bar section, instead of `Triggered`
+  (jobs, plan sessions) or no tab at all (masters). A plan's `Open` brings
+  its master's tab to the front.
 - CI onboarding requests: a project the CI does not build files one with the
   MCP tool `onboard_request` (the repository name, its origin, grants and
   host prerequisites); proposals can be stored against it at once. The

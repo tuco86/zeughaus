@@ -296,8 +296,8 @@ The browser canvas stays rectangular.
 Below it are tabs of split panes (`iced_tabs::tree`, `pane_grid`). The tab
 bar has one section per connected runner, labelled with its host (and its
 port, or the start of its fingerprint, where two runners share one host), plus `Local` (no runner: the scratch graphs) or
-`Not running` (graphs whose runner is not connected), and after the runners
-a `CI <label>` section for each CI the editor dials (section 14). A runner section is
+`Not running` (graphs whose runner is not connected); the CIs the editor
+dials have no section but the CI page (section 14). A runner section is
 that runner's shared workspace: loose tabs and one level of coloured,
 collapsible groups, each tab a split tree whose leaves are terminals
 (section 9) or graphs, and order, groups, splits and ids come from the
@@ -729,6 +729,29 @@ same principal as an editor on that machine. No graph is involved.
 `zeughaus-runner mcp` is the subcommand that serves instead of asking once:
 see "The CI over MCP" in section 14.
 
+**Project groups.** A CI job's run (`JobSpec::group`, its repository), a plan session and a
+master get a tab in the runner's locked group of their repository instead
+(`OwnedPlacement::Project`), tinted by a hash of the name, made by the first
+run that needs it and gone with its last tab; a project group never takes
+the last group slot, which stays for `Triggered`, so without a slot such a
+run lands there. Closing a tab of a locked group ends its run or session.
+
+**Agent status.** Every terminal the runner starts sees its id as
+`ZEUGHAUS_TERMINAL`. The zeughaus omp plugin (`omp-plugin/src/agent-status.ts`)
+writes the main agent's state there as the user variable `zeughaus_agent`
+(`OSC 1337;SetUserVar`, base64 JSON `{"v":1,"state","role","repo","doc",
+"detail","at","pid","host"}`), only from the TUI and only on a change. The
+terminal engine reports user variable changes (`Session::on_user_var`) and
+keeps their values, which a reattached session gets back from its WAL's
+replay; the runner parses the value (`zeughaus_link::AgentStatus`) and sends
+it with the terminal's activity entry (`ActivityEntry::agent`), on
+`/activity` too. Every 2 s it drops the status of an agent on its own host
+whose `pid` is gone, until that terminal reports a new one. The editor
+shows the status as the tab's role glyph in the state's colour, raises a
+pinned notice for an agent that waits for its user while nobody looks at
+its terminal (resolved once it works again, ends or is looked at), and
+lists agents on the CI page's Overview.
+
 **Maintenance** (`zeughaus-runner/src/maintain.rs`). One thread reads
 `<state-dir>/maintain.toml` every 60 s, after 30 s at start; a file that
 does not parse or hold (bad or duplicate name, empty `command`, a period
@@ -743,7 +766,7 @@ While it runs the host counts as held: a CI `prepare` waits and a graph job
 is refused, so a toolchain update never swaps files under a build. A task
 that does not end with code 0 is logged as `[maintain] <name>: exited N |
 timed out | killed; log <run>/wal` and sent as `RuntimeEvent::Alert` on the
-`machine` topic, which every editor shows as a desktop notification.
+`machine` topic, which every editor shows as a notice.
 `zeughaus-runner maintain` prints one line per task from the files alone,
 so it runs beside the serving runner: `<name>  every <m> min  <never | ok |
 exit N | timed out | killed | running>  <age> ago  <run dir>`.
@@ -1116,7 +1139,7 @@ publish #136`). A failed job in a streak that began in an earlier pipeline
 posts `red since #<n>: <cause>`. The pipeline that turns a job red, and
 every red pipeline once a job has been red for an hour, raise an alert: a
 line in the journal and `RuntimeEvent::Alert` on the `ci` topic, which
-every connected editor shows as a desktop notification. A push to the
+every connected editor shows as a pinned notice. A push to the
 default branch whose commit has no `.zeughaus-ci/` is recorded as a
 `no-jobs` pipeline and posts an `error` on `zeughaus/pipeline`, naming a
 leftover `.ci/`; on other refs that stays silent.
@@ -1344,13 +1367,21 @@ job's `JobView` carries its `cause` line (the one the forge status shows,
 but also for jobs that hold secrets: editors are trusted peers and can
 open the transcript anyway) and the stored `excerpt`. Every saved record is announced as
 `RuntimeEvent::CiPipeline` on the `ci` topic. In the editor
-(`zeughaus/src/app/ci.rs`) each URL of `ci` is a link of its own, and its
-section `CI <label>` comes after the runners: a `Runners` tab with a table of the
-runners and machines (kind glyph, name, state dot and word, running jobs),
-whose running jobs open their transcripts, then one locked group per
-repository with a tab per channel, titled with the channel (the group names
-the repository), whose accent dot is the tone of the channel's newest
-pipeline. A channel tab lists its pipelines in a scrollable, newest on top
+(`zeughaus/src/app/ci.rs`, the page in `ci/page.rs`) each URL of `ci` is a
+link of its own, shown on the CI page, which a titlebar chip opens over the
+workspace (the chip says how many things need the user and how many work,
+coloured by the worst; the palette's "CI / Open page" does the same). The
+page's sidebar holds `Needs you` and `Working` (the Overview: agents that
+wait or work, as their terminals' activity reports them, plans awaiting
+approval, failed channels, sessions failed in the last day, running
+channels and live sessions; a terminal row's terminal is docked read-only
+beside the list, and Enter or a click brings its tab to the front), then
+per CI each repository with a row per channel (its dot the tone of the
+channel's newest pipeline) and its Plans, the CI's Sessions (a session's
+terminal docked, `Open tab`, `Stop`) and Runners (the table of runners and
+machines: kind glyph, name, state dot and word, running jobs that open
+their transcripts; beside it the selected runner's `/activity`, `Reopen` for
+an archived run). A channel lists its pipelines in a scrollable, newest on top
 and separated by rules, one row each: a status glyph (codicons from the
 bundled Nerd Font, so status never rests on colour alone), `#<n>` and the
 commit's subject (the CI reads it from its mirror when the pipeline starts,
@@ -1368,15 +1399,16 @@ the toolbar, and so is a CI that does not answer (an error, or no overview
 for 15 s): the views then show its last report. The overview also lists the
 queued events (`QueuedView`, each under the channel of the newest pipeline
 with its queue key), which a channel shows as `Queued` rows above its
-pipelines. Up and Down move a cursor over the list in front, Enter opens or
-closes the pipeline under it, `R` reruns it, Shift+`C` cancels it and `L`
-opens the log of its first failed job (letters no widget took), and Escape
-closes the transcript when no palette or rename takes it first. The
+pipelines. Up and Down (or `j` and `k`) move a cursor over the list in
+front, Enter opens or closes the pipeline under it, `r` reruns it, Shift+`C`
+cancels it and `l` opens the log of its first failed job (letters no widget
+took), and Escape closes the transcript, then the page, when no palette or
+rename takes it first. The
 list is at most 1200 px wide. While the channel in front has something running, a
 one-second clock moves its elapsed times. The cables between the cards are one
 `iced_nodegraph_sdf` primitive under them; nothing pans, zooms, moves or
 takes the wheel, so the list scrolls like any other. Pressing a job
-opens its transcript in a pane beside the list, and its card is tinted with
+docks its transcript beside the list, and its card is tinted with
 the accent while it is open: the CI creates a
 `Session::fed` (`zeughaus-terminal`), a screen that a follower task feeds
 from the stored `wal` every 200 ms and that ends with the `exit` file, and
@@ -1388,8 +1420,8 @@ a resize: the transcript pane sizes the screen without controlling it
 asked last, so it fills the pane and its lines wrap at the pane's edge. It
 keeps at most 16 transcript screens across editors and closes the least
 recently opened one first; an editor asks again for its open transcripts
-after the CI restarts. The section's ids are the editor's own
-(`SurfaceRef::Ci`), and it takes no structural command. An editor's link to
+after the CI restarts. The page's ids are the editor's own and no CI knows
+them (`SurfaceRef::Ci` stays in the wire type, unused). An editor's link to
 a CI takes no workspace, graph or feed of its own: only `/events`,
 `/snapshot`, `/ci` and `/mux`.
 

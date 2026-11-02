@@ -111,15 +111,23 @@ the left edge. Theme and tab bar placement persist in
 connected runner (plus `Local` without a runner, or `Not running` for graphs
 no runner's workspace shows); a section's terminal, graph and folder
 glyphs (tooltips say which) add a terminal tab, a graph that runner
-executes, or a coloured group. A `CI <label>` section for each CI the editor
-dials (the `ci = [..]` URLs) holds a `Runners` tab with the enlisted runners
-and their machines and a locked group per repository of `ci.toml` with
-its Plans tab (below) and one tab per channel (pipelines one row each, newest on
-top and open with its jobs, a cable animating while its artifact set moves,
-failures with their cause and log excerpt,
-`Rerun` and `Cancel`; pressing a job shows its transcript read-only, live
-while it runs; Up/Down and Enter walk and open the list, Escape closes the
-transcript). Channels come from `.zeughaus-ci/channels.toml`. Closing a graph's tab
+executes, or a coloured group. The CI each `ci = [..]` URL names is no tab
+section: a chip in the titlebar (`N need you`, `M working`, or `CI`; also
+"CI / Open page" in the palette) opens the CI page over the workspace. Its
+sidebar lists `Needs you` and `Working` (the Overview: agents that wait or
+work, plans awaiting approval, failed channels and sessions, running
+channels and sessions; a row's terminal docks read-only beside the list and
+Enter or a click brings its tab to the front), then per CI each repository
+with its channels and Plans, the CI's Sessions and its Runners (a runner's
+activity with `Reopen` for closed runs). A channel lists its pipelines one
+row each, newest on top and open with its jobs, a cable animating while its
+artifact set moves, failures with their cause and log excerpt, `Rerun` and
+`Cancel`; pressing a job docks its transcript read-only beside the list,
+live while it runs. Up/Down or j/k and Enter walk and open a list, `r`,
+`Shift+C` and `l` rerun, cancel and open a pipeline's log, in Plans `a`,
+`r` and `p` approve, reject and plan the selected document; Escape closes a
+transcript, then the page. Channels come from
+`.zeughaus-ci/channels.toml`. Closing a graph's tab
 deletes the graph. Double-clicking a
 tab or a group's name renames it; a tab that shows one graph renames the
 graph. A container node's `open` opens its contents in a tab. With the bar
@@ -146,9 +154,25 @@ palette opens it read-only in a tab. Every terminal the runner owns is
 reported on `/activity` and as `activity` events.
 `zeughaus-runner trigger <endpoint> <node-id> [payload]` and
 `zeughaus-runner hold <endpoint> on|off` do the same from a script, against
-the endpoint URL a runner prints at start; a triggered run's terminal (and a
-CI job's) lands in that runner's locked `Triggered` group, which exists only
-while it holds a tab.
+the endpoint URL a runner prints at start; a triggered run's terminal lands
+in that runner's locked `Triggered` group, a CI job's, a plan session's and
+a master's in the runner's locked group named after its repository; such a
+group exists only while it holds a tab, and closing a tab there ends its
+run or session.
+
+Every omp in a zeughaus terminal (`ZEUGHAUS_TERMINAL` is its id) reports
+its state through the zeughaus omp plugin as the terminal user variable
+`zeughaus_agent` (idle, working, waiting, asking, review, failed); the
+runner reports it with the terminal's activity and drops it once the omp
+process is gone. The tab shows it as a glyph of its role (person: the
+user's own session, lightbulb: plan session, rocket: master) in the
+state's colour. Notices replace desktop notifications: the pull tab at the
+window's bottom right counts them in the colour of the worst and opens the
+notice center (severity, title, body, age; a pinned one stays until
+dismissed or resolved, the others go after 60 s). An agent that waits for
+its user and is not looked at, a CI alert, a failed session and a
+terminal's own notification (OSC 9/777) raise one; a click on its title
+opens what it is about.
 
 `zeughaus-runner [--state-dir <dir>] mcp [--ci <url>]` is an MCP server on
 stdio, for an agent that starts it as a tool server. It dials the CI that
@@ -212,7 +236,7 @@ master session for it, then `done` (`plan_done`) or `rejected`. A plan or
 proposal names the machines its work needs in a `Runs on: <selector>[;
 <selector>]` line under its title (one label selector per machine, the
 first hosting the session, the others reached over ssh; editable in the
-Plans tab while it is open, saved or approved). A CI job of a repository
+Plans view while it is open, saved or approved). A CI job of a repository
 with `agent_sessions = true` in `ci.toml` requests a session by writing a
 plan body (at most 32 KiB) to `$CI_OUTPUT/agent-session.md`, on any exit
 status: the CI files it as an approved plan with source `job.<job>`, unless
@@ -221,8 +245,8 @@ progress, and says so in the job's note; manual runs file none. Each change
 is announced as `CiDocs` on `/events`. An onboarding request
 (`onboard_request`, kind `onboarding`) is how a project outside `ci.toml`
 asks to join: it gives the
-pending repository a directory, a Plans tab and an inbox for proposals at
-once; it is `open`, `approved` in the Plans tab, then `done`, or back to
+pending repository a directory, a Plans view and an inbox for proposals at
+once; it is `open`, `approved` in its Plans view, then `done`, or back to
 `open` with a note naming the failed step, or `rejected`. The CI's
 onboarding worker (every 2 s, `[onboarding]` of `ci.toml`) adds the bot as
 a collaborator and the push hook on Forgejo with `admin_token`, stores a
@@ -233,12 +257,12 @@ SIGHUP (`systemctl --user reload zeughaus-ci`) re-reads `[repos]` and
 `ci/onboarded/`, and refuses any other change. Sessions run on the runners, dispatched by the CI
 (`<state-dir>/ci/sessions.json`, announced as `CiSessions`): every 2 s it
 starts a master for each approved plan of a repository whose queue is not
-paused (`ci/docs/<repo>/paused`, the Plans tab's `Pause queue`) on a free
+paused (`ci/docs/<repo>/paused`, the Plans view's `Pause queue`) on a free
 connected runner with `sessions = true` that its first selector matches,
 reserving the `ssh` runners its other selectors match; a runner hosts one
 master at a time, so several plans run at once on different runners. The
-runner opens `zeughaus-runner master <repo> --plan <n>` in a detached
-terminal (attach it from the plan's `Attach`), in the session's own clone
+runner opens `zeughaus-runner master <repo> --plan <n>` in a tab of its
+repository's group (the plan's `Open` brings it to the front), in the session's own clone
 under `<state-dir>/agent-work/`, never in the user's checkouts (a missing
 one is cloned over ssh from the origin in that terminal first): it
 fast-forwards the master clone `agent-work/master/<origin>` to the default
@@ -246,10 +270,10 @@ branch, waiting while it is dirty or has unpushed commits, and runs `omp
 @<plan> <instruction>` with `ZEUGHAUS_PLAN=<repo>#<n>`, then exits with
 omp's code; the plan stays `in_progress` until `plan_done`, Requeue or Mark
 done. A session that fails to start puts its plan back in the queue and
-keeps its runner from masters for 5 minutes. The Plans tab's `Plan session`
-and an open proposal's `Plan` ask the CI for a plan session (on the
+keeps its runner from masters for 5 minutes. The Plans view's `Plan session`
+and an open proposal's `Plan this proposal` ask the CI for a plan session (on the
 editor's own runner when it hosts sessions), which opens `zeughaus-runner
-plan <repo> [--proposal <n>]` in the runner's `Triggered` group: it brings
+plan <repo> [--proposal <n>]` in the runner's group of the repository: it brings
 the plan clone `agent-work/plan/<origin>`, which borrows the objects of the
 master clone, detached to `origin/<default branch>` and runs omp there on
 the `plan` model role (`--model @plan`), the proposal attached to its first
@@ -276,7 +300,7 @@ default 30) by itself, one at a time and only while it is idle: each is a
 run without a tab (reopen it from the palette), and while it runs the runner counts as
 held, so a toolchain update never swaps files under a build. The file is read
 every minute, a symlink is fine, and without it nothing runs. A task that
-does not end with code 0 raises a desktop notification in every connected
+does not end with code 0 raises a notice in every connected
 editor; its log is `<state-dir>/runs/<id>/wal`.
 `zeughaus-runner [--state-dir D] maintain` prints each task with its last
 result and age from `<state-dir>/maintain/<name>.json`. The wohnzimmer
