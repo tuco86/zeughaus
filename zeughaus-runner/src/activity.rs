@@ -98,6 +98,7 @@ fn listing(mux: &MuxService, runs: &RunDirs, limit: usize) -> Vec<ActivityEntry>
             ended,
             code: end.code,
             killed: end.killed,
+            agent: None,
         });
     }
     entries

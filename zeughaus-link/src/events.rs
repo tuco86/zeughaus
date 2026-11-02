@@ -305,6 +305,7 @@ mod tests {
                     ended: None,
                     code: None,
                     killed: false,
+                    agent: None,
                 },
             },
             RuntimeEvent::CiSessions { seq: 19 },

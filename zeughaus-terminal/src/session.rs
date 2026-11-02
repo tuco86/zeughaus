@@ -211,10 +211,16 @@ struct Inner {
     /// The title reaches places no subscriber streams to (a workspace's tab
     /// bar), so it has its own notice besides `changes`.
     on_title: Mutex<Option<TitleListener>>,
+    /// Called by the reader after the child set a user variable, with its
+    /// name.
+    on_user_var: Mutex<Option<UserVarListener>>,
 }
 
 /// What [`Session::on_title_change`] registers.
 type TitleListener = Arc<dyn Fn() + Send + Sync>;
+
+/// What [`Session::on_user_var`] registers.
+type UserVarListener = Arc<dyn Fn(&str) + Send + Sync>;
 
 impl Inner {
     /// The shared state of a session whose child `io` drives. `writer` is
@@ -260,6 +266,7 @@ impl Inner {
             changes,
             wal: Mutex::new(wal),
             on_title: Mutex::new(None),
+            on_user_var: Mutex::new(None),
         })
     }
 
@@ -724,6 +731,25 @@ impl Session {
             .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(listener));
     }
 
+    /// Registers `listener` to be called with a user variable's name
+    /// whenever the child sets one, replacing any earlier one. Like
+    /// [`Session::on_title_change`] it runs on the PTY reader thread with no
+    /// lock of this session held and must not block.
+    pub fn on_user_var(&self, listener: impl Fn(&str) + Send + Sync + 'static) {
+        *self
+            .inner
+            .on_user_var
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(listener));
+    }
+
+    /// The value of the user variable `name` the child set
+    /// (`OSC 1337;SetUserVar`). A reattached session has it again: the
+    /// replay of its WAL goes through the parser.
+    pub fn user_var(&self, name: &str) -> Option<String> {
+        self.inner.model().user_var(name)
+    }
+
     /// Record who holds the control lease. The engine does not enforce it --
     /// the runner decides whose commands reach [`Session::apply`] -- but the
     /// change is an ordered event, so every viewer learns about a takeover in
@@ -951,6 +977,7 @@ fn consume(inner: &Inner, at: u64, chunk: &[u8], title: &mut String) {
         }
     }
     let mut retitled = false;
+    let mut changed_vars = Vec::new();
     {
         let mut model = inner.model();
         model.advance(chunk);
@@ -973,9 +1000,11 @@ fn consume(inner: &Inner, at: u64, chunk: &[u8], title: &mut String) {
                 Alert::ToastNotification { title, body, .. } => {
                     model.notify(title, body);
                 }
+                // The value is read from the terminal; the listener learns
+                // which one changed.
+                Alert::SetUserVar { name, .. } => changed_vars.push(name),
                 // The palette is state the next head or delta carries; the
-                // working directory, progress and user variables are not
-                // forwarded.
+                // working directory and progress are not forwarded.
                 _ => {}
             }
         }
@@ -996,6 +1025,18 @@ fn consume(inner: &Inner, at: u64, chunk: &[u8], title: &mut String) {
             .clone();
         if let Some(listener) = listener {
             listener();
+        }
+    }
+    if !changed_vars.is_empty() {
+        let listener = inner
+            .on_user_var
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(listener) = listener {
+            for name in &changed_vars {
+                listener(name);
+            }
         }
     }
 }

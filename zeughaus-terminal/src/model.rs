@@ -181,6 +181,11 @@ impl Model {
         &mut self.terminal
     }
 
+    /// The value of the user variable `name` (`OSC 1337;SetUserVar`).
+    pub(crate) fn user_var(&self, name: &str) -> Option<String> {
+        self.terminal.user_vars().get(name).cloned()
+    }
+
     /// The model's current sequence number: what a head is current at, and
     /// what a delta ends at.
     pub(crate) fn seq(&self) -> u64 {

@@ -44,8 +44,8 @@ pub mod runs;
 pub mod selector;
 
 pub use activity::{
-    ACTIVITY_PATH, ActivityEntry, ActivityKind, ActivityReply, ActivityRequest, ActivityState,
-    MAX_ACTIVITY_ENTRIES,
+    ACTIVITY_PATH, AGENT_VAR, ActivityEntry, ActivityKind, ActivityReply, ActivityRequest,
+    ActivityState, AgentRole, AgentState, AgentStatus, MAX_ACTIVITY_ENTRIES,
 };
 pub use ci::{
     ChannelView, CiOverview, CiReply, CiRequest, DocGroup, DocKind, DocState, DocView, JobDefView,

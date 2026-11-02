@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use weida::{IncomingRequest, Replier, TransferMeta};
 use zeughaus_job::{RunExit, read_run_end, record_run_end};
-use zeughaus_link::{ActivityEntry, ActivityKind, ActivityState};
+use zeughaus_link::{AGENT_VAR, ActivityEntry, ActivityKind, ActivityState, AgentStatus};
 use zeughaus_mux::message::{Capability, Command, ErrorCode};
 use zeughaus_mux::workspace::ProfileId;
 use zeughaus_mux::{
@@ -50,6 +50,11 @@ use crate::transport::principal_of;
 
 /// How often the reaper looks for terminals whose child exited.
 const REAP_EVERY: Duration = Duration::from_millis(250);
+
+/// Every this many sweeps (2 s) the reaper also looks for agents whose
+/// process is gone.
+#[cfg(unix)]
+const AGENT_CHECK_SWEEPS: u64 = 8;
 
 /// Closed terminals whose end [`MuxService::terminal_state`] remembers.
 #[cfg(unix)]
@@ -147,6 +152,9 @@ struct Inner {
     /// child had ended: what an owner that looks after the close learns.
     #[cfg(unix)]
     closed: Mutex<VecDeque<(TerminalId, Option<ExitState>)>>,
+    /// Agent statuses whose process is gone, by terminal and the status's
+    /// `at`: reported as no status until the agent reports a new one.
+    gone_agents: Mutex<HashSet<(TerminalId, u64)>>,
 }
 
 impl Inner {
@@ -203,6 +211,7 @@ impl MuxService {
                 activity: OnceLock::new(),
                 #[cfg(unix)]
                 closed: Mutex::new(VecDeque::new()),
+                gone_agents: Mutex::new(HashSet::new()),
             }),
         };
         #[cfg(unix)]
@@ -237,6 +246,7 @@ impl MuxService {
             ) {
                 Ok(session) => {
                     self.follow_title(&session);
+                    self.follow_agent(&session);
                     restored.insert(terminal.id, session);
                     meta.insert(
                         terminal.id,
@@ -408,7 +418,7 @@ impl MuxService {
     /// pane that controls it resizes it.
     pub fn spawn_owned(
         &self,
-        profile: Profile,
+        mut profile: Profile,
         wal: Wal,
         size: Dimensions,
         run: Option<SavedRun>,
@@ -416,9 +426,13 @@ impl MuxService {
         kind: ActivityKind,
     ) -> Result<TerminalId, String> {
         let id = TerminalId(self.inner.next_terminal.fetch_add(1, Ordering::Relaxed));
+        profile
+            .env
+            .push(("ZEUGHAUS_TERMINAL".to_owned(), id.0.to_string()));
         let session = Session::spawn(id, &profile, size, wal, &self.inner.host)
             .map_err(|e| format!("cannot start {}: {e}", profile.label))?;
         self.follow_title(&session);
+        self.follow_agent(&session);
         let meta = TerminalMeta {
             label: profile.label,
             scrollback_rows: profile.scrollback_rows,
@@ -427,7 +441,7 @@ impl MuxService {
             started: now_secs(),
             replay: false,
         };
-        let running = self.entry(id, &meta, ActivityState::Running, None);
+        let running = self.entry(id, &meta, ActivityState::Running, None, None);
         let revision = {
             // The lock order is the one `snapshot` takes: sessions, then
             // the workspace.
@@ -468,8 +482,10 @@ impl MuxService {
             .name("zeughaus-reaper".to_owned())
             .spawn(move || {
                 let mut seen: HashSet<TerminalId> = HashSet::new();
+                let mut sweep: u64 = 0;
                 loop {
-                    service.reap(&state_dir, &mut seen);
+                    service.reap(&state_dir, &mut seen, sweep);
+                    sweep = sweep.wrapping_add(1);
                     std::thread::sleep(REAP_EVERY);
                 }
             });
@@ -480,7 +496,13 @@ impl MuxService {
 
     /// One sweep of the reaper. `seen` holds the terminals whose exit was
     /// handled already.
-    fn reap(&self, state_dir: &Path, seen: &mut HashSet<TerminalId>) {
+    fn reap(&self, state_dir: &Path, seen: &mut HashSet<TerminalId>, sweep: u64) {
+        #[cfg(unix)]
+        if sweep.is_multiple_of(AGENT_CHECK_SWEEPS) {
+            self.reap_agents();
+        }
+        #[cfg(not(unix))]
+        let _ = sweep;
         let exited: Vec<(TerminalId, ExitState)> = {
             let sessions = self
                 .inner
@@ -504,7 +526,7 @@ impl MuxService {
                 let metas = self.inner.meta.lock().unwrap_or_else(|e| e.into_inner());
                 metas.get(&id).map(|meta| {
                     (
-                        self.entry(id, meta, ActivityState::Exited, Some(&exit)),
+                        self.entry(id, meta, ActivityState::Exited, Some(&exit), None),
                         meta.run.is_some(),
                         meta.replay,
                     )
@@ -524,6 +546,55 @@ impl MuxService {
         }
     }
 
+    /// Drops the status of every agent on this host whose process is gone:
+    /// one killed without saying so leaves its last status behind.
+    #[cfg(unix)]
+    fn reap_agents(&self) {
+        let host = local_hostname();
+        let gone: Vec<(TerminalId, AgentStatus)> = {
+            let sessions = self
+                .inner
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let known = self
+                .inner
+                .gone_agents
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            sessions
+                .iter()
+                .filter(|(_, session)| session.exit().is_none())
+                .filter_map(|(id, session)| Some((*id, agent_status(session)?)))
+                .filter(|(id, status)| {
+                    !known.contains(&(*id, status.at))
+                        && status.host == host
+                        && status.pid.is_some_and(process_gone)
+                })
+                .collect()
+        };
+        if gone.is_empty() {
+            return;
+        }
+        self.inner
+            .gone_agents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(gone.iter().map(|(id, status)| (*id, status.at)));
+        let entries: Vec<ActivityEntry> = {
+            let metas = self.inner.meta.lock().unwrap_or_else(|e| e.into_inner());
+            gone.iter()
+                .filter_map(|(id, _)| {
+                    let meta = metas.get(id).filter(|meta| !meta.replay)?;
+                    Some(self.entry(*id, meta, ActivityState::Running, None, None))
+                })
+                .collect()
+        };
+        for entry in entries {
+            self.emit(entry);
+        }
+    }
+
     /// Sends `entry` to the activity channel, once there is one.
     fn emit(&self, entry: ActivityEntry) {
         if let Some(tx) = self.inner.activity.get() {
@@ -539,13 +610,15 @@ impl MuxService {
     }
 
     /// What activity says about terminal `id` in `state`. A terminal closed
-    /// without an exit code counts as killed.
+    /// without an exit code counts as killed. An `agent` whose process is
+    /// known to be gone is left out.
     fn entry(
         &self,
         id: TerminalId,
         meta: &TerminalMeta,
         state: ActivityState,
         exit: Option<&ExitState>,
+        agent: Option<AgentStatus>,
     ) -> ActivityEntry {
         let code = match exit {
             Some(ExitState::Exited { code }) => i32::try_from(*code).ok(),
@@ -555,6 +628,14 @@ impl MuxService {
             ActivityState::Closed => !matches!(exit, Some(ExitState::Exited { .. })),
             _ => matches!(exit, Some(ExitState::Killed)),
         };
+        let agent = agent.filter(|status| {
+            !self
+                .inner
+                .gone_agents
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&(id, status.at))
+        });
         ActivityEntry {
             terminal: id.0,
             run: self.run_of(meta),
@@ -565,6 +646,7 @@ impl MuxService {
             ended: (state != ActivityState::Running).then(now_secs),
             code,
             killed,
+            agent,
         }
     }
 
@@ -586,7 +668,8 @@ impl MuxService {
                 } else {
                     ActivityState::Running
                 };
-                Some(self.entry(*id, meta, state, exit.as_ref()))
+                let agent = agent_status(session);
+                Some(self.entry(*id, meta, state, exit.as_ref(), agent))
             })
             .collect();
         entries.sort_by_key(|e| std::cmp::Reverse((e.started, e.terminal)));
@@ -1203,6 +1286,35 @@ impl MuxService {
         });
     }
 
+    /// Reports the agent status an omp in `session` sets as the user
+    /// variable [`AGENT_VAR`] as activity of its terminal.
+    fn follow_agent(&self, session: &Session) {
+        // Weak: the service owns the session, which owns this listener.
+        let inner = Arc::downgrade(&self.inner);
+        let terminal = session.id();
+        session.on_user_var(move |name| {
+            if name != AGENT_VAR {
+                return;
+            }
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
+            let service = MuxService { inner };
+            let Some(session) = service.session(terminal) else {
+                return;
+            };
+            let agent = agent_status(&session);
+            let entry = {
+                let metas = service.inner.meta.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(meta) = metas.get(&terminal).filter(|meta| !meta.replay) else {
+                    return;
+                };
+                service.entry(terminal, meta, ActivityState::Running, None, agent)
+            };
+            service.emit(entry);
+        });
+    }
+
     /// The session behind a terminal id, if it still exists.
     pub fn session(&self, terminal: TerminalId) -> Option<Session> {
         self.inner
@@ -1341,9 +1453,13 @@ impl MuxService {
                 .get(profile.0 as usize)
                 .ok_or_else(|| format!("no profile {}", profile.0))?;
             let id = TerminalId(self.inner.next_terminal.fetch_add(1, Ordering::Relaxed));
+            let mut profile = profile.clone();
+            profile
+                .env
+                .push(("ZEUGHAUS_TERMINAL".to_owned(), id.0.to_string()));
             let session = Session::spawn(
                 id,
-                profile,
+                &profile,
                 Dimensions { cols: 80, rows: 24 },
                 Wal::Capped,
                 &self.inner.host,
@@ -1385,7 +1501,8 @@ impl MuxService {
                     let mut metas = self.inner.meta.lock().unwrap_or_else(|e| e.into_inner());
                     for (id, session, meta) in spawned {
                         self.follow_title(&session);
-                        running.push(self.entry(id, &meta, ActivityState::Running, None));
+                        self.follow_agent(&session);
+                        running.push(self.entry(id, &meta, ActivityState::Running, None, None));
                         sessions.insert(id, session);
                         metas.insert(id, meta);
                     }
@@ -1430,7 +1547,12 @@ impl MuxService {
                     closed.pop_front();
                 }
             }
-            let mut entry = self.entry(id, &meta, ActivityState::Closed, exit.as_ref());
+            self.inner
+                .gone_agents
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|(terminal, _)| *terminal != id);
+            let mut entry = self.entry(id, &meta, ActivityState::Closed, exit.as_ref(), None);
             if meta.run.is_none() {
                 let cols = session.as_ref().map_or(80, |s| s.size().cols);
                 entry.run = self.archive(id, &meta, exit.as_ref(), cols);
@@ -1469,6 +1591,39 @@ fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// The agent status the omp in `session` last reported, if it reports one.
+fn agent_status(session: &Session) -> Option<AgentStatus> {
+    AgentStatus::parse(&session.user_var(AGENT_VAR)?)
+}
+
+/// This host's name, as an agent on it reports it.
+#[cfg(unix)]
+fn local_hostname() -> &'static str {
+    static HOST: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let mut buf = [0_u8; 256];
+        // SAFETY: the buffer is valid for its length; gethostname writes at
+        // most that many bytes.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        if rc != 0 {
+            return String::new();
+        }
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..len]).into_owned()
+    });
+    &HOST
+}
+
+/// Whether no process `pid` exists.
+#[cfg(unix)]
+fn process_gone(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 only checks that the process exists.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 /// Copies the records of a shim's capped WAL (`wal.1`, then `wal`) into a

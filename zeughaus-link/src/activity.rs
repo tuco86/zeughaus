@@ -68,6 +68,113 @@ pub struct ActivityEntry {
     pub code: Option<i32>,
     #[serde(default)]
     pub killed: bool,
+    /// What the omp agent in this terminal reports, while one does.
+    #[serde(default)]
+    pub agent: Option<AgentStatus>,
+}
+
+/// The terminal user variable (iTerm2's `OSC 1337;SetUserVar`) an omp agent
+/// sets to report its [`AgentStatus`]: base64 of its JSON.
+pub const AGENT_VAR: &str = "zeughaus_agent";
+
+/// What an agent is doing, as the zeughaus omp plugin reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentState {
+    /// Started, no turn yet.
+    Idle,
+    /// A turn runs.
+    Working,
+    /// The turn ended; the agent waits for the next prompt.
+    Waiting,
+    /// The agent asked a question and waits for the answer.
+    Asking,
+    /// A plan waits for review.
+    Review,
+    /// The turn ended with an error.
+    Failed,
+    /// The agent quit: there is no status any more.
+    Ended,
+}
+
+/// Which kind of omp session it is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRole {
+    /// Someone's own session.
+    #[default]
+    Work,
+    /// A plan session: a proposal becoming a plan.
+    Plan,
+    /// A master executing a plan.
+    Master,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AgentStatus {
+    pub state: AgentState,
+    #[serde(default)]
+    pub role: AgentRole,
+    #[serde(default)]
+    pub repo: String,
+    /// The plan or proposal the session works on.
+    #[serde(default)]
+    pub doc: Option<u64>,
+    #[serde(default)]
+    pub detail: String,
+    /// When the agent reported it, in milliseconds since the epoch.
+    #[serde(default)]
+    pub at: u64,
+    /// The agent's process, to tell a dead one from a quiet one.
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// The host the agent runs on, which `pid` is on.
+    #[serde(default)]
+    pub host: String,
+}
+
+/// The longest `detail` kept, in chars.
+const MAX_AGENT_DETAIL: usize = 200;
+/// The longest `repo` kept, in chars.
+const MAX_AGENT_REPO: usize = 100;
+
+/// The plugin's wire object: the status plus its version.
+#[derive(Deserialize)]
+struct AgentWire {
+    v: u32,
+    #[serde(flatten)]
+    status: AgentStatus,
+}
+
+impl AgentStatus {
+    /// The status of the plugin's JSON object (`"v": 1`). `None` for another
+    /// version, malformed JSON, and an ended agent.
+    pub fn parse(json: &str) -> Option<AgentStatus> {
+        let wire: AgentWire = serde_json::from_str(json).ok()?;
+        if wire.v != 1 || wire.status.state == AgentState::Ended {
+            return None;
+        }
+        let mut status = wire.status;
+        cut_chars(&mut status.detail, MAX_AGENT_DETAIL);
+        cut_chars(&mut status.repo, MAX_AGENT_REPO);
+        Some(status)
+    }
+
+    /// Whether the agent waits for its user.
+    pub fn needs_attention(&self) -> bool {
+        matches!(
+            self.state,
+            AgentState::Waiting | AgentState::Asking | AgentState::Review | AgentState::Failed
+        )
+    }
+}
+
+/// Cuts `text` to at most `max` chars.
+fn cut_chars(text: &mut String, max: usize) {
+    if let Some((at, _)) = text.char_indices().nth(max) {
+        text.truncate(at);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +236,7 @@ mod tests {
                 ended: Some(160),
                 code: Some(0),
                 killed: false,
+                agent: None,
             }],
         };
         assert_eq!(ActivityReply::decode(&reply.encode()), Some(reply));
@@ -136,10 +244,49 @@ mod tests {
         let decoded = ActivityReply::decode(minimal).expect("decodes");
         assert_eq!(decoded.entries[0].kind, ActivityKind::Shell);
         assert_eq!(decoded.entries[0].run, None);
+        assert_eq!(decoded.entries[0].agent, None);
         assert_eq!(
             ActivityRequest::decode(&ActivityRequest { limit: 20 }.encode()),
             Some(ActivityRequest { limit: 20 })
         );
         assert_eq!(ActivityRequest::decode(b"nope"), None);
+    }
+
+    #[test]
+    fn an_agent_status_parses_from_the_plugins_object() {
+        let json = r#"{"v":1,"state":"asking","role":"master","repo":"zeughaus","doc":33,"detail":"Which way?","at":1700000000000,"pid":42,"host":"atik"}"#;
+        assert_eq!(
+            AgentStatus::parse(json),
+            Some(AgentStatus {
+                state: AgentState::Asking,
+                role: AgentRole::Master,
+                repo: "zeughaus".to_owned(),
+                doc: Some(33),
+                detail: "Which way?".to_owned(),
+                at: 1_700_000_000_000,
+                pid: Some(42),
+                host: "atik".to_owned(),
+            })
+        );
+        assert!(AgentStatus::parse(json).unwrap().needs_attention());
+    }
+
+    #[test]
+    fn another_version_an_ended_agent_and_garbage_give_no_status() {
+        assert_eq!(AgentStatus::parse(r#"{"v":2,"state":"working"}"#), None);
+        assert_eq!(AgentStatus::parse(r#"{"v":1,"state":"ended"}"#), None);
+        assert_eq!(AgentStatus::parse(r#"{"state":"working"}"#), None);
+        assert_eq!(AgentStatus::parse("{"), None);
+        let working = AgentStatus::parse(r#"{"v":1,"state":"working"}"#).unwrap();
+        assert_eq!(working.role, AgentRole::Work);
+        assert!(!working.needs_attention());
+    }
+
+    #[test]
+    fn a_long_detail_is_cut_to_200_chars() {
+        let detail = "\u{e4}".repeat(300);
+        let json = format!(r#"{{"v":1,"state":"failed","detail":"{detail}"}}"#);
+        let status = AgentStatus::parse(&json).unwrap();
+        assert_eq!(status.detail.chars().count(), 200);
     }
 }
