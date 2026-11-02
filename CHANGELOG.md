@@ -308,7 +308,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tab to the front.
 - CI advice on a project it does not build: `[advice]` in `ci.toml` names
   an Anthropic model (`claude-haiku-5-5` by default) and the OpenBao secret
-  with its API key or OAuth token. The editor's local runner gathers the
+  with a Claude subscription's OAuth token. The editor's local runner gathers the
   project's facts on `/projects` (its work checkout at HEAD, or what its
   forge says); the CI answers `Advise` with a summary, status lines and up
   to four ways to join (onboard, migrate, follow, deploy) whose settings it

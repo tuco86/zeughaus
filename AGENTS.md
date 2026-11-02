@@ -321,8 +321,8 @@ generated `<NAME>_WEBHOOK_SECRET` in OpenBao, writes
 the first push pipeline. The configuration is one swappable snapshot:
 SIGHUP (`systemctl --user reload zeughaus-ci`) re-reads `[repos]` and
 `ci/onboarded/`, and refuses any other change. `[advice]` of `ci.toml`
-(`key`: the OpenBao secret with an Anthropic API key or an OAuth token
-`sk-ant-oat...`; `model`, by default `claude-haiku-5-5`; `api`) is the
+(`key`: the OpenBao secret with a Claude subscription's OAuth token
+`sk-ant-oat...` from `claude setup-token`; `model`, by default `claude-haiku-5-5`; `api`) is the
 model the CI asks for a bare project's advice (`CiRequest::Advise` with
 the facts an editor's runner gathered on `/projects`): it adds its
 Forgejo, platforms, runners and repositories, keeps only settings it can

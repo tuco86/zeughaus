@@ -85,11 +85,12 @@ timeout_seconds = 5
 # hook_url = "https://ci.doodleshnookie.net/hook"
 
 # The language model the CI asks about a project that has not joined, for
-# the editor's Board of it: `key` names the secret with an Anthropic API
-# key, or an OAuth token (sk-ant-oat...). Without it the Board still
-# offers the onboarding form. Adding it takes a restart.
+# the editor's Board of it: `key` names the secret with a Claude
+# subscription's OAuth token (sk-ant-oat..., made by `claude setup-token`,
+# valid a year). Without it the Board still offers the onboarding form.
+# Adding it takes a restart.
 # [advice]
-# key = "ANTHROPIC_API_KEY"
+# key = "CLAUDE_CODE_OAUTH_TOKEN"
 # model = "claude-haiku-5-5"
 
 [repos.griasdi]

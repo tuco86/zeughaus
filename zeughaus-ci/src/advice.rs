@@ -1,6 +1,7 @@
 //! Advice on a project the CI does not build yet: `[advice]` of `ci.toml`
-//! names a language model on the Anthropic Messages API and the secret it
-//! is asked with. The editor sends the facts its runner gathered; the CI
+//! names a model on the Anthropic Messages API and the secret holding a
+//! Claude subscription's long-lived OAuth token (`claude setup-token`),
+//! which is asked the way Claude Code asks. The editor sends the facts its runner gathered; the CI
 //! adds what it knows of itself (its Forgejo, platforms, runners and
 //! repositories), asks the model for a forced tool call, keeps only what
 //! fits its configuration, and keeps the answer per origin under
@@ -40,6 +41,12 @@ const MAX_STATUS: usize = 8;
 
 /// The tool the model must call.
 const TOOL: &str = "advise";
+
+/// How a Claude subscription's OAuth token starts; nothing else is taken.
+const OAUTH_PREFIX: &str = "sk-ant-oat";
+
+/// The first system block of every request made with such a token.
+const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /// A kept answer and what it was asked from.
 #[derive(Serialize, Deserialize)]
@@ -251,8 +258,12 @@ fn request_body(advice: &AdviceConfig, system: &str, facts: &str) -> String {
     serde_json::json!({
         "model": advice.model,
         "max_tokens": MAX_TOKENS,
-        "temperature": 0,
-        "system": system,
+        // A subscription token is served only to requests whose system
+        // prompt opens with Claude Code's own first block.
+        "system": [
+            { "type": "text", "text": CLAUDE_CODE_IDENTITY },
+            { "type": "text", "text": system },
+        ],
         "messages": [{
             "role": "user",
             "content": format!("Facts about the project, gathered by the owner's machine:\n\n{facts}"),
@@ -267,22 +278,22 @@ fn request_body(advice: &AdviceConfig, system: &str, facts: &str) -> String {
     .to_string()
 }
 
-/// POSTs `body` to the Messages API with `key`, which travels in curl's
-/// config on stdin, never in argv.
-fn call(advice: &AdviceConfig, key: &str, body: &str) -> Result<String, String> {
-    let authorization = if key.starts_with("sk-ant-oat") {
-        format!("Authorization: Bearer {key}")
-    } else {
-        format!("x-api-key: {key}")
-    };
-    let mut headers = vec![
+/// POSTs `body` to the Messages API with `token`, a Claude subscription's
+/// OAuth token, which travels in curl's config on stdin, never in argv.
+fn call(advice: &AdviceConfig, token: &str, body: &str) -> Result<String, String> {
+    if !token.starts_with(OAUTH_PREFIX) {
+        return Err(format!(
+            "secret {} is no Claude OAuth token ({OAUTH_PREFIX}...); `claude setup-token` makes one",
+            advice.key
+        ));
+    }
+    let authorization = format!("Authorization: Bearer {token}");
+    let headers = [
         authorization.as_str(),
         "anthropic-version: 2023-06-01",
+        "anthropic-beta: claude-code-20250219,oauth-2025-04-20",
         "Content-Type: application/json",
     ];
-    if key.starts_with("sk-ant-oat") {
-        headers.push("anthropic-beta: oauth-2025-04-20");
-    }
     let mut command = Command::new("curl");
     command
         .args(["-sS", "--fail-with-body", "--max-time"])

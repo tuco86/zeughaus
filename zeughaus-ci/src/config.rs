@@ -65,8 +65,8 @@ pub struct CiConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdviceConfig {
-    /// Secret name: an API key (`x-api-key`), or an OAuth access token
-    /// (`sk-ant-oat...`, sent as a bearer token).
+    /// Secret name: a Claude subscription's OAuth token (`sk-ant-oat...`,
+    /// from `claude setup-token`), sent as a bearer token.
     pub key: String,
     #[serde(default = "default_advice_model")]
     pub model: String,

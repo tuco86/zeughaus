@@ -1898,8 +1898,9 @@ manifests, README, remotes and last commit, or else what the forge's API
 says, with push mirrors and a same-named repository on a Forgejo) and
 sends them in `CiRequest::Advise`. The CI adds what it knows of itself
 (its Forgejo, platforms, runners with labels, repositories), forces one
-tool call on the Messages API through curl with the key on stdin (`x-api-key`,
-or a bearer token with the OAuth beta header for `sk-ant-oat...`), and
+tool call on the Messages API through curl with the token on stdin (a
+bearer token, the Claude Code and OAuth betas, and Claude Code's identity
+as the first system block, without which a subscription token is refused), and
 keeps of the operations only what it can file: platforms of its
 `[platforms]`, event patterns that parse and follow one of its
 repositories, a valid name and secret names. The answer is kept under
