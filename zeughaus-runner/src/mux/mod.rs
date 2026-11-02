@@ -13,7 +13,7 @@ mod workspace;
 use std::collections::{HashMap, HashSet};
 
 pub use persist::SavedRun;
-pub use service::{MuxService, TerminalState};
+pub use service::MuxService;
 
 /// Where a terminal the runner starts for itself appears.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

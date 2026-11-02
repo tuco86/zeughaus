@@ -15,7 +15,9 @@
 //! from the sequence number it last sent -- a slow client gets fewer,
 //! larger deltas, never a queue of them.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+#[cfg(unix)]
+use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
@@ -50,16 +52,8 @@ use crate::transport::principal_of;
 const REAP_EVERY: Duration = Duration::from_millis(250);
 
 /// Closed terminals whose end [`MuxService::terminal_state`] remembers.
+#[cfg(unix)]
 const CLOSED_KEPT: usize = 256;
-
-/// What became of a terminal.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TerminalState {
-    Running,
-    Exited(ExitState),
-    /// Closed without an exit of its own, or unknown.
-    Gone,
-}
 
 /// How long after a client vanishes its leases are held for it, so a network
 /// blink does not make its terminals read-only.
@@ -151,6 +145,7 @@ struct Inner {
     activity: OnceLock<Sender<ActivityEntry>>,
     /// The newest [`CLOSED_KEPT`] terminals that were closed, with how their
     /// child had ended: what an owner that looks after the close learns.
+    #[cfg(unix)]
     closed: Mutex<VecDeque<(TerminalId, Option<ExitState>)>>,
 }
 
@@ -206,6 +201,7 @@ impl MuxService {
                 revision,
                 run_dirs,
                 activity: OnceLock::new(),
+                #[cfg(unix)]
                 closed: Mutex::new(VecDeque::new()),
             }),
         };
@@ -382,20 +378,21 @@ impl MuxService {
             .map(|(id, _)| *id)
     }
 
-    /// Whether terminal `id` still runs, how its child ended, or that it is
-    /// gone without an exit (or too long ago to remember).
-    pub fn terminal_state(&self, id: TerminalId) -> TerminalState {
+    /// Whether terminal `id` still runs (`Some(None)`), how its child ended
+    /// (`Some(Some(exit))`), or that it is gone without an exit, or too long
+    /// ago to remember (`None`). Only agent sessions ask, on Unix.
+    #[cfg(unix)]
+    pub fn terminal_state(&self, id: TerminalId) -> Option<Option<ExitState>> {
         if let Some(session) = self.session(id) {
-            return match session.exit() {
-                Some(exit) => TerminalState::Exited(exit),
-                None => TerminalState::Running,
-            };
+            return Some(session.exit());
         }
         let closed = self.inner.closed.lock().unwrap_or_else(|e| e.into_inner());
-        match closed.iter().rev().find(|(t, _)| *t == id) {
-            Some((_, Some(exit))) => TerminalState::Exited(exit.clone()),
-            _ => TerminalState::Gone,
-        }
+        closed
+            .iter()
+            .rev()
+            .find(|(t, _)| *t == id)
+            .and_then(|(_, exit)| exit.clone())
+            .map(Some)
     }
 
     /// Starts a terminal the runner owns: a job's process, not a pane's
@@ -1425,6 +1422,7 @@ impl MuxService {
     fn forgotten(&self, id: TerminalId, session: Option<Session>, meta: Option<TerminalMeta>) {
         if let Some(meta) = meta.filter(|meta| !meta.replay) {
             let exit = session.as_ref().and_then(Session::exit);
+            #[cfg(unix)]
             {
                 let mut closed = self.inner.closed.lock().unwrap_or_else(|e| e.into_inner());
                 closed.push_back((id, exit.clone()));

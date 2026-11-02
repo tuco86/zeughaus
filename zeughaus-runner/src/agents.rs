@@ -228,7 +228,7 @@ mod unix {
     };
     use crate::enlist::SessionHost;
     use crate::mcp::client::{Client, Link};
-    use crate::mux::{MuxService, OwnedPlacement, TerminalState};
+    use crate::mux::{MuxService, OwnedPlacement};
 
     /// Opens agent sessions in the runner's mux.
     pub struct Agents {
@@ -347,7 +347,7 @@ mod unix {
             self.mux.close_terminal(TerminalId(terminal))
         }
 
-        fn state(&self, terminal: u64) -> TerminalState {
+        fn state(&self, terminal: u64) -> Option<Option<zeughaus_mux::ExitState>> {
             self.mux.terminal_state(TerminalId(terminal))
         }
     }

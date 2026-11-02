@@ -16,7 +16,6 @@ use zeughaus_link::enlist::{FromRunner, SessionReport, SessionSpec};
 use zeughaus_mux::ExitState;
 
 use super::{Executor, lock};
-use crate::mux::TerminalState;
 
 /// How often a watcher looks at its session's terminal.
 const WATCH_EVERY: Duration = Duration::from_secs(1);
@@ -27,7 +26,9 @@ pub trait SessionHost: Send + Sync {
     /// The terminal the session runs in.
     fn open(&self, spec: &SessionSpec) -> Result<u64, String>;
     fn close(&self, terminal: u64) -> Result<(), String>;
-    fn state(&self, terminal: u64) -> TerminalState;
+    /// The terminal runs (`Some(None)`), its child ended (`Some(Some(exit))`),
+    /// or it is gone without an exit (`None`).
+    fn state(&self, terminal: u64) -> Option<Option<ExitState>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,9 +132,9 @@ impl Executor {
         };
         let end = loop {
             match host.state(terminal) {
-                TerminalState::Running => std::thread::sleep(WATCH_EVERY),
-                TerminalState::Exited(exit) => break ending(&exit),
-                TerminalState::Gone => break (None, true),
+                Some(None) => std::thread::sleep(WATCH_EVERY),
+                Some(Some(exit)) => break ending(&exit),
+                None => break (None, true),
             }
         };
         eprintln!("[enlist] session {id} ended");
