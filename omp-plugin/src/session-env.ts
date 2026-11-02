@@ -20,3 +20,11 @@ export function sessionId(): number | undefined {
   const id = process.env.ZEUGHAUS_SESSION ?? "";
   return /^[1-9][0-9]*$/.test(id) ? Number(id) : undefined;
 }
+
+/** `ZEUGHAUS_RUNNER`, `ZEUGHAUS_TERMINAL`: the zeughaus terminal this omp runs in, which holds its claims. */
+export function claimHolder(): { runner: string; terminal: number } | undefined {
+  const runner = process.env.ZEUGHAUS_RUNNER ?? "";
+  const terminal = process.env.ZEUGHAUS_TERMINAL ?? "";
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(runner) || !/^[0-9]+$/.test(terminal)) return undefined;
+  return { runner, terminal: Number(terminal) };
+}

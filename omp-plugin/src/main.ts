@@ -17,6 +17,12 @@
 //   result).
 // - in a zeughaus terminal (`ZEUGHAUS_TERMINAL`), reports the main agent's state (idle, working,
 //   waiting, asking, review, failed) to the runner, which shows it on the tab (agent-status.ts).
+// - in a zeughaus terminal (`ZEUGHAUS_RUNNER`, `ZEUGHAUS_TERMINAL`), holds claims in the CI for
+//   that terminal: a plan session claims its proposal (and is told who has it when another
+//   session does), a plan executed from its review claims the proposals it names, the push watch
+//   claims the pipeline it watches; a heartbeat (`ci renew`) keeps them, and the session's end
+//   releases them. A failure the watch reports names who is responsible for it when that is
+//   another session.
 //
 // The factory only registers: `omp plugin install` runs it against a throwaway API, so it must
 // do no work at load. Every handler skips subagents, which have prompts of their own, except the
@@ -32,7 +38,7 @@ import { PlanReviewOverlay } from "@oh-my-pi/pi-tui/overlays/plan-review-overlay
 import { copyToClipboard } from "@oh-my-pi/pi-coding-agent/utils/clipboard";
 import { agentReporter } from "./agent-status.ts";
 import { planModePrompt } from "./plan-mode.ts";
-import { masterPlan, planSession, sessionId } from "./session-env.ts";
+import { claimHolder, masterPlan, planSession, sessionId } from "./session-env.ts";
 
 // The parts of omp's extension API this plugin uses; omp ships no type package to import.
 interface Exec {
@@ -227,6 +233,8 @@ interface Watch {
   failures: number;
   /** The multiple of its expected time each running job was last reported at. */
   late: Map<string, number>;
+  /** Whether the watched pipeline was claimed for this terminal. */
+  claimed: boolean;
 }
 
 const RUNNER = "zeughaus-runner";
@@ -238,6 +246,8 @@ const APPEAR_LIMIT_MS = 10 * 60_000;
 const WATCH_LIMIT_MS = 5 * 60 * 60_000;
 const MAX_FIND_FAILURES = 3;
 const EXCERPT_LINES = 30;
+// The heartbeat of this terminal's claims; the CI drops a claim not renewed for 300 s.
+const CLAIM_RENEW_MS = 60_000;
 const KEY = "zeughaus-ci"; // status key and message customType
 const OPEN = "<zeughaus-ci>";
 const CLOSE = "</zeughaus-ci>";
@@ -835,6 +845,13 @@ export default function zeughausCi(pi: Pi): void {
   let decided = false;
   // What the main agent does, reported to the zeughaus terminal it runs in.
   const agent = agentReporter();
+  // The heartbeat that keeps this terminal's claims, started once per process.
+  let renewing = false;
+
+  /** Releases every claim of this terminal; nothing to do outside a zeughaus terminal. */
+  const releaseClaims = (cwd: string): void => {
+    if (claimHolder()) void exec(pi, RUNNER, ["ci", "release"], cwd, FIND_TIMEOUT_MS);
+  };
 
   const isMain = (ctx: Ctx): boolean => !ctx.agent || ctx.agent.kind === "main";
 
@@ -868,14 +885,22 @@ export default function zeughausCi(pi: Pi): void {
   };
 
   /** A pipeline of the pushed commit: reports a failure or the end, else keeps watching. */
-  const report = (w: Watch, p: PipelineView): void => {
+  const report = async (w: Watch, p: PipelineView): Promise<void> => {
     const sha7 = w.sha.slice(0, 7);
     const failed = p.jobs.find((job) => job.status === "failed");
     // With a failed job the pipeline cannot succeed any more; the line keeps what the watch ends on.
     progress = { sha7, pipeline: failed ? { ...p, status: "failed" } : p };
     showStatus(w.ctx);
     if (failed) {
-      const message = failedMessage(w.name, sha7, p, failed);
+      let message = failedMessage(w.name, sha7, p, failed);
+      const args = ["ci", "responsible", "--json", w.name, String(p.number)];
+      const r = await exec(pi, RUNNER, args, w.root, FIND_TIMEOUT_MS);
+      if (watch !== w) return;
+      const text = r.code === 0 ? jsonField(r.stdout, "text") : undefined;
+      const claim = r.code === 0 ? jsonField(r.stdout, "claim") : undefined;
+      if (jsonField(r.stdout, "ours") === false && claim != null && typeof text === "string") {
+        message += `\nResponsible: ${text}. Leave this fix to that session and ci_wait for the channel's next pipeline instead of fixing it in parallel.`;
+      }
       send(message, "aside", true);
       w.ctx.ui.notify(message.split("\n")[0] ?? message, "error");
       endWatch(w, true);
@@ -943,7 +968,11 @@ export default function zeughausCi(pi: Pi): void {
       }
       w.failures = 0;
       if (p !== null) {
-        report(w, p);
+        if (!w.claimed) {
+          w.claimed = true;
+          void exec(pi, RUNNER, ["ci", "claim", w.name, "pipeline", String(p.number)], w.root, FIND_TIMEOUT_MS);
+        }
+        await report(w, p);
         if (watch === w) await reportLate(w, p);
       } else if (Date.now() - w.started >= APPEAR_LIMIT_MS) {
         send(
@@ -971,6 +1000,7 @@ export default function zeughausCi(pi: Pi): void {
       busy: false,
       failures: 0,
       late: new Map(),
+      claimed: false,
     };
     watch = w;
     progress = { sha7: sha.slice(0, 7) };
@@ -1015,6 +1045,24 @@ export default function zeughausCi(pi: Pi): void {
     const doc = plan?.number ?? session?.proposal ?? null;
     agent.setRepo(plan?.repo ?? session?.repo ?? basename(ctx.cwd), doc);
     agent.report(ctx, "idle");
+    if (claimHolder()) {
+      if (!renewing) {
+        renewing = true;
+        ctx.setInterval(() => void exec(pi, RUNNER, ["ci", "renew"], ctx.cwd, FIND_TIMEOUT_MS), CLAIM_RENEW_MS);
+      }
+      const proposal = session?.proposal;
+      if (session && proposal !== undefined) {
+        void (async () => {
+          const args = ["ci", "claim", "--json", session.repo, "proposal", String(proposal)];
+          const r = await exec(pi, RUNNER, args, ctx.cwd, FIND_TIMEOUT_MS);
+          const text = jsonField(r.stdout, "text");
+          if (r.code !== 0 || jsonField(r.stdout, "ours") !== false || typeof text !== "string") return;
+          const line = `zeughaus-ci: ${text}. Leave this proposal to that session; plan something else or ask the user.`;
+          send(line, "aside", true);
+          ctx.ui.notify(line, "warning");
+        })().catch(() => undefined);
+      }
+    }
     void contextFor(ctx.cwd)
       .then((c) => {
         if (c.kind === "repo") agent.setRepo(c.view.name, doc);
@@ -1042,6 +1090,11 @@ export default function zeughausCi(pi: Pi): void {
       const r = await exec(pi, RUNNER, ["ci", "planned", c.view.name, path], c.root, FIND_TIMEOUT_MS);
       if (r.code !== 0) {
         ctx.ui.notify(`zeughaus-ci: proposals not marked planned: ${failure(r, "ci planned")}`, "warning");
+        return;
+      }
+      if (!claimHolder()) return;
+      for (const n of proposalsNamed(readFileSync(path, "utf8"))) {
+        await exec(pi, RUNNER, ["ci", "claim", c.view.name, "proposal", String(n)], c.root, FIND_TIMEOUT_MS);
       }
     })().catch(() => undefined);
   });
@@ -1081,7 +1134,9 @@ export default function zeughausCi(pi: Pi): void {
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
-    if (isMain(ctx)) agent.report(ctx, "ended");
+    if (!isMain(ctx)) return;
+    agent.report(ctx, "ended");
+    releaseClaims(ctx.cwd);
   });
 
   // A plan session's turn ends with ask or propose_plan; the second stop is let through, so the
@@ -1096,6 +1151,7 @@ export default function zeughausCi(pi: Pi): void {
   pi.on("session_switch", (_event, ctx) => {
     if (!isMain(ctx)) return;
     agent.report(ctx, "idle");
+    releaseClaims(ctx.cwd);
     if (watch) endWatch(watch, false);
     loaded = undefined;
     latest = { kind: "none" };
