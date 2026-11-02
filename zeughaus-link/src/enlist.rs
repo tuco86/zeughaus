@@ -21,7 +21,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The protocol major a runner and the CI must share.
-pub const ENLIST_MAJOR: u32 = 10;
+pub const ENLIST_MAJOR: u32 = 11;
 
 /// The most addresses a runner's `Hello` announces.
 pub const MAX_ADDRESSES: usize = 8;
@@ -61,6 +61,9 @@ pub enum FromRunner {
         /// The `ip:port` pairs where the runner's listener answers, best
         /// first; editors dial it there under its name.
         addresses: Vec<String>,
+        /// The agent sessions this runner holds or held since its last
+        /// exchange, so a reconnecting runner's sessions are not lost.
+        sessions: Vec<SessionReport>,
     },
     /// A machine behind the runner (a VM) changed status.
     Machine { name: String, status: String },
@@ -84,6 +87,44 @@ pub enum FromRunner {
         need: String,
         event: TransferEvent,
     },
+    /// The session's terminal runs.
+    SessionOpened { id: u64, terminal: u64 },
+    /// The session could not be started.
+    SessionFailed { id: u64, message: String },
+    /// The session's terminal ended (`code` of its child) or went away.
+    SessionEnded {
+        id: u64,
+        code: Option<i32>,
+        killed: bool,
+    },
+}
+
+/// An agent session a runner holds: its terminal, and how it ended once it
+/// did (`(code, killed)`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReport {
+    pub id: u64,
+    pub terminal: u64,
+    pub end: Option<(Option<i32>, bool)>,
+}
+
+/// An agent session the CI asks a runner to open.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSpec {
+    pub id: u64,
+    pub kind: crate::ci::SessionKind,
+    pub repo: String,
+    /// The repository as `normalize_origin` gives it.
+    pub origin: String,
+    pub default_branch: String,
+    /// A master's plan, a plan session's proposal.
+    pub doc: Option<u64>,
+    /// The runner's name, as the session sees it in `ZEUGHAUS_RUNNER`.
+    pub runner: String,
+    /// The other machines the session reaches over ssh.
+    pub machines: Vec<crate::ci::SessionMachine>,
+    /// The CI's pinned URL, which the session's tools dial.
+    pub ci: String,
 }
 
 /// How far the transfer of one input has come.
@@ -178,6 +219,15 @@ pub enum ToRunner {
     /// The job `consumer` will not run here: delete what was fetched for it.
     DropPrefetch {
         consumer: String,
+    },
+    /// Open an agent session in a terminal; the answer is
+    /// [`FromRunner::SessionOpened`] or [`FromRunner::SessionFailed`].
+    OpenSession {
+        spec: Box<SessionSpec>,
+    },
+    /// End a session's terminal.
+    CloseSession {
+        id: u64,
     },
 }
 
@@ -919,6 +969,64 @@ mod tests {
             assert_eq!(
                 read_frame::<_, ToRunner>(&mut r).await.unwrap(),
                 Some(command)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_session_frames_round_trip() {
+        let spec = SessionSpec {
+            id: 3,
+            kind: crate::ci::SessionKind::Master,
+            repo: "zeughaus".to_owned(),
+            origin: "git.example.org/o/zeughaus".to_owned(),
+            default_branch: "main".to_owned(),
+            doc: Some(29),
+            runner: "atik".to_owned(),
+            machines: vec![crate::ci::SessionMachine {
+                name: "wohnzimmer".to_owned(),
+                ssh: Some("zeughaus@10.8.0.12".to_owned()),
+                labels: vec!["os=windows".to_owned()],
+                addresses: Vec::new(),
+            }],
+            ci: "weida://sha256:00@10.8.0.1:7444/".to_owned(),
+        };
+        let mut buf = Vec::new();
+        let to = [
+            ToRunner::OpenSession {
+                spec: Box::new(spec),
+            },
+            ToRunner::CloseSession { id: 3 },
+        ];
+        for command in &to {
+            write_frame(&mut buf, command).await.unwrap();
+        }
+        let from = [
+            FromRunner::SessionOpened { id: 3, terminal: 9 },
+            FromRunner::SessionFailed {
+                id: 4,
+                message: "no omp".to_owned(),
+            },
+            FromRunner::SessionEnded {
+                id: 3,
+                code: Some(0),
+                killed: false,
+            },
+        ];
+        for message in &from {
+            write_frame(&mut buf, message).await.unwrap();
+        }
+        let mut r: &[u8] = &buf;
+        for command in to {
+            assert_eq!(
+                read_frame::<_, ToRunner>(&mut r).await.unwrap(),
+                Some(command)
+            );
+        }
+        for message in from {
+            assert_eq!(
+                read_frame::<_, FromRunner>(&mut r).await.unwrap(),
+                Some(message)
             );
         }
     }

@@ -14,6 +14,11 @@ budget_gb = 50
 # Size limit of the blob cache under <state-dir>/ci/blobs: the files of the
 # artifact sets this runner fetched, kept so a file is fetched once.
 blob_cache_gb = 8
+# The ip:port pairs this runner's listener answers at, best first (at most
+# 8). The CI announces them under the runner's name, and editors dial the
+# runner there. By default the address of its endpoint URL, when that is an
+# IP another machine can reach.
+addresses = ["10.8.0.10:7444"]
 
 # Present: this runner runs `image = ...` jobs in rootless podman containers.
 # [containers] and [machines] need a unix host; a Windows runner refuses them.

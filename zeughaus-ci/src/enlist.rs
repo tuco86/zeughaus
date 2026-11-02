@@ -23,6 +23,7 @@ use crate::config::{CiConfig, RunnerOs, valid_name};
 use crate::now_secs;
 use crate::runners::{Connected, Runners};
 use crate::scheduler::{Msg, transcript_dir};
+use crate::sessions::Sessions;
 use crate::transport::principal_of;
 
 /// How long a dialled-in peer has to say who it is.
@@ -33,6 +34,7 @@ pub struct EnlistService {
     config: Arc<CiConfig>,
     runners: Arc<Runners>,
     scheduler: Sender<Msg>,
+    sessions: Arc<Sessions>,
 }
 
 impl EnlistService {
@@ -41,12 +43,14 @@ impl EnlistService {
         config: Arc<CiConfig>,
         runners: Arc<Runners>,
         scheduler: Sender<Msg>,
+        sessions: Arc<Sessions>,
     ) -> EnlistService {
         EnlistService {
             state_dir,
             config,
             runners,
             scheduler,
+            sessions,
         }
     }
 
@@ -113,6 +117,7 @@ impl EnlistService {
             artifacts,
             endpoint: _,
             addresses,
+            sessions: reports,
         } = hello
         else {
             refuse(reply, "the first frame must be a hello").await;
@@ -181,6 +186,14 @@ impl EnlistService {
             runs,
             artifacts,
         });
+        {
+            let sessions = Arc::clone(&self.sessions);
+            let name = name.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                sessions.resync(&name, &reports, now_secs());
+            })
+            .await;
+        }
 
         let mut reader = tokio::spawn(read_runner(
             body,
@@ -188,6 +201,7 @@ impl EnlistService {
             self.state_dir.clone(),
             Arc::clone(&self.runners),
             self.scheduler.clone(),
+            Arc::clone(&self.sessions),
         ));
         let mut canceled = std::pin::pin!(canceled);
         let cause = loop {
@@ -228,14 +242,16 @@ async fn refuse(mut reply: weida::OutgoingTransfer, message: &str) {
     let _ = reply.finish();
 }
 
-/// Reads a runner's frames until its end: output is stored, everything else
-/// goes to the scheduler. An `Err` ends the exchange.
+/// Reads a runner's frames until its end: output is stored, a session's
+/// report goes to the sessions, everything else to the scheduler. An `Err`
+/// ends the exchange.
 async fn read_runner(
     mut body: weida::IncomingTransfer,
     name: String,
     state_dir: std::path::PathBuf,
     runners: Arc<Runners>,
     scheduler: Sender<Msg>,
+    sessions: Arc<Sessions>,
 ) -> Result<(), String> {
     loop {
         let Some(message) = read_frame::<_, FromRunner>(&mut body).await? else {
@@ -257,6 +273,17 @@ async fn read_runner(
                 tokio::task::spawn_blocking(move || append_output(&wal, offset, &bytes))
                     .await
                     .map_err(|e| format!("the writer failed: {e}"))??;
+            }
+            message @ (FromRunner::SessionOpened { .. }
+            | FromRunner::SessionFailed { .. }
+            | FromRunner::SessionEnded { .. }) => {
+                let sessions = Arc::clone(&sessions);
+                let name = name.clone();
+                tokio::task::spawn_blocking(move || {
+                    sessions.on_runner(&name, message, now_secs());
+                })
+                .await
+                .map_err(|e| format!("the sessions failed: {e}"))?;
             }
             other => {
                 if scheduler

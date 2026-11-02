@@ -1878,8 +1878,12 @@ impl Scheduler {
 
     fn on_runner_message(&mut self, name: &str, message: FromRunner) {
         match message {
-            // The enlist service handles both before they get here.
-            FromRunner::Hello { .. } | FromRunner::Output { .. } => {}
+            // The enlist service handles these before they get here.
+            FromRunner::Hello { .. }
+            | FromRunner::Output { .. }
+            | FromRunner::SessionOpened { .. }
+            | FromRunner::SessionFailed { .. }
+            | FromRunner::SessionEnded { .. } => {}
             FromRunner::Machine {
                 name: machine,
                 status,

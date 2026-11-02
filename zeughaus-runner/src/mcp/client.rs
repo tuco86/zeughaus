@@ -74,15 +74,25 @@ struct EditorFile {
 }
 
 impl Link {
-    /// The CI is `ci`, else the first of `ci = [..]` in the state directory's
-    /// `zeughaus.toml`; the identity is the state directory's `client.pem`.
+    /// The CI is `ci`, else `$ZEUGHAUS_CI` (an agent session's), else the
+    /// first of `ci = [..]` in the state directory's `zeughaus.toml`, else
+    /// the `ci` of its `enlist.toml`; the identity is the state directory's
+    /// `client.pem`.
     pub fn resolve(ci: Option<String>, state_dir: &Path) -> Result<Link, String> {
         let config = state_dir.join("zeughaus.toml");
-        let url = match ci {
+        let from_env = std::env::var("ZEUGHAUS_CI")
+            .ok()
+            .filter(|url| !url.is_empty());
+        let url = match ci.or(from_env) {
             Some(url) => url,
-            None => first_ci(&config)?.ok_or_else(|| {
-                format!("no CI configured: add ci = [..] to {}", config.display())
-            })?,
+            None => match first_ci(&config)? {
+                Some(url) => url,
+                None => crate::enlist::config::load(state_dir)?
+                    .map(|enlist| enlist.ci)
+                    .ok_or_else(|| {
+                        format!("no CI configured: add ci = [..] to {}", config.display())
+                    })?,
+            },
         };
         let addr =
             EndpointAddr::parse(&url).map_err(|e| format!("the CI URL {url} is not valid: {e}"))?;
@@ -329,6 +339,7 @@ fn retries(request: &CiRequest) -> bool {
         | CiRequest::Repo { .. }
         | CiRequest::Docs { .. }
         | CiRequest::Doc { .. }
+        | CiRequest::Session { .. }
         | CiRequest::States { .. } => true,
         CiRequest::OpenTranscript { .. }
         | CiRequest::CloseTranscript { .. }
@@ -338,7 +349,10 @@ fn retries(request: &CiRequest) -> bool {
         | CiRequest::DocCreate { .. }
         | CiRequest::DocState { .. }
         | CiRequest::DocDelete { .. }
-        | CiRequest::PlanClaim { .. }
+        | CiRequest::DocRunsOn { .. }
+        | CiRequest::QueuePaused { .. }
+        | CiRequest::OpenSession { .. }
+        | CiRequest::CloseSession { .. }
         | CiRequest::StateDelete { .. } => false,
     }
 }
@@ -725,6 +739,7 @@ mod tests {
                             platforms: Vec::new(),
                             repos: Vec::new(),
                             build: 0,
+                            sessions: Vec::new(),
                         },
                     },
                     _ => CiReply::Error {

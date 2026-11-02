@@ -409,8 +409,8 @@ pub enum CiMsg {
         number: u64,
         result: Result<Option<Box<zeughaus_link::DocView>>, String>,
     },
-    /// The user moved a document to another state or deleted it: a
-    /// `DocState` or `DocDelete` request.
+    /// The user asked the CI something its answer to is `Accepted`: a
+    /// `DocState`, `DocDelete`, `DocRunsOn`, `QueuePaused` or `CloseSession`.
     DocAct {
         view: u64,
         request: zeughaus_link::CiRequest,
@@ -420,18 +420,22 @@ pub enum CiMsg {
         view: u64,
         result: Result<(), String>,
     },
-    /// The user asked for an agent session of the Plans tab's repository on
-    /// this editor's own runner; a planning one plans `proposal` when set.
-    OpenAgent {
+    /// The user edits the `Runs on` of a document.
+    RunsOnEdited {
         view: u64,
-        session: zeughaus_link::AgentSession,
+        number: u64,
+        text: String,
+    },
+    /// The user asked the CI for a plan session of the Plans tab's
+    /// repository; it plans `proposal` when set.
+    OpenSession {
+        view: u64,
         proposal: Option<u64>,
     },
-    /// What that runner answered; `runner` is its key.
-    AgentOpened {
+    /// What the CI answered.
+    SessionOpened {
         view: u64,
-        runner: crate::workspace::RunnerKey,
-        result: Result<zeughaus_link::AgentReply, String>,
+        result: Result<zeughaus_link::SessionView, String>,
     },
     /// The user pressed a link in a document.
     OpenLink(String),

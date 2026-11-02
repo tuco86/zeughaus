@@ -27,6 +27,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   archived under `runs/` with an `activity.json`; the palette's "Terminal /
   Reopen" opens it read-only (`ReplayRun`, mux protocol minor 1).
   Maintenance runs no longer open a tab.
+- Agent sessions dispatched by the CI: a plan or proposal names the
+  machines its work needs in a `Runs on: <selector>[; <selector>]` line
+  (label selectors such as `os=macos` or `os=windows,arch=amd64`, the first
+  hosting the session, the others reached over ssh), editable in the Plans
+  tab. The CI starts a master session for each approved plan on a free
+  runner with `sessions = true` that matches, one master per runner, so
+  several plans run at once; `zeughaus-runner master <repo> --plan <n>` now
+  executes exactly one plan. Plan sessions are opened through the CI too
+  (`CiRequest::OpenSession`), the Plans tab's `Master` button became `Pause
+  queue`, and a running master shows where it runs with `Attach` and
+  `Stop`. Sessions see `ZEUGHAUS_SESSION`, `ZEUGHAUS_RUNNER`, `ZEUGHAUS_CI`
+  and `ZEUGHAUS_MACHINES`; `zeughaus-runner ci session <id>` describes one
+  and the omp plugin (0.5.0) adds it to the session's prompt. The runner's
+  `/agent` path and `PlanClaim` are gone; the enlist protocol is major 11.
 - Upstream pipelines: a job header's `on = ["push main of weida"]` follows
   another repository of `ci.toml`. When a push to weida's `main` is set up
   and is still the branch's head, the CI queues an `upstream` event for

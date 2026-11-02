@@ -39,6 +39,7 @@ use crate::scheduler::{
     self, JobRecord, Pipeline, PipelineStatus, load_pipeline, load_pipelines, load_repo_pipelines,
     transcript_dir,
 };
+use crate::sessions::Sessions;
 use crate::transcripts::Transcripts;
 use crate::transport::editor_principal;
 
@@ -63,13 +64,14 @@ pub struct CiServer {
     config: Arc<CiConfig>,
     runners: Arc<Runners>,
     transcripts: Arc<Transcripts>,
-    /// Held by every request that changes a document: requests run on the
-    /// blocking pool, and numbering and the one-plan-in-progress rule must
-    /// not race.
-    docs: std::sync::Mutex<()>,
+    /// Held by every change of a document: requests run on the blocking
+    /// pool, the session dispatcher on a thread of its own, and numbering
+    /// must not race.
+    docs: Arc<std::sync::Mutex<()>>,
     /// The repository of each document change, for the service to announce
     /// on `/events`.
     docs_changed: std::sync::mpsc::Sender<String>,
+    sessions: Arc<Sessions>,
 }
 
 impl CiServer {
@@ -78,15 +80,18 @@ impl CiServer {
         config: Arc<CiConfig>,
         runners: Arc<Runners>,
         transcripts: Arc<Transcripts>,
+        docs: Arc<std::sync::Mutex<()>>,
         docs_changed: std::sync::mpsc::Sender<String>,
+        sessions: Arc<Sessions>,
     ) -> CiServer {
         CiServer {
             state_dir,
             config,
             runners,
             transcripts,
-            docs: std::sync::Mutex::new(()),
+            docs,
             docs_changed,
+            sessions,
         }
     }
 
@@ -165,6 +170,7 @@ impl CiServer {
                 body,
                 source,
                 proposals,
+                runs_on,
             } => {
                 let new = docs::NewDoc {
                     kind,
@@ -172,6 +178,7 @@ impl CiServer {
                     body: &body,
                     source: &source,
                     proposals: &proposals,
+                    runs_on: &runs_on,
                 };
                 let made = self.change_docs(&repo, |state, config, now| {
                     docs::create(state, config, &repo, new, now).map(|number| (number, true))
@@ -193,21 +200,36 @@ impl CiServer {
                     docs::delete(dir, config, &repo, number).map(|()| ((), true))
                 }))
             }
-            // A master asks every few seconds; only a claim that took a plan
-            // is announced.
-            CiRequest::PlanClaim { repo } => {
-                match self.change_docs(&repo, |dir, config, now| {
-                    docs::claim(dir, config, &repo, now).map(|doc| {
-                        let took = doc.is_some();
-                        (doc, took)
-                    })
-                }) {
-                    Ok(doc) => CiReply::Doc {
-                        doc: doc.map(Box::new),
-                    },
+            CiRequest::DocRunsOn {
+                repo,
+                number,
+                runs_on,
+            } => accepted(self.change_docs(&repo, |dir, config, now| {
+                docs::set_runs_on(dir, config, &repo, number, runs_on, now).map(|()| ((), true))
+            })),
+            CiRequest::QueuePaused { repo, paused } => {
+                accepted(self.change_docs(&repo, |dir, config, _| {
+                    docs::set_paused(dir, config, &repo, paused).map(|()| ((), true))
+                }))
+            }
+            CiRequest::OpenSession {
+                repo,
+                proposal,
+                runner,
+            } => {
+                match self
+                    .sessions
+                    .open_plan(&repo, proposal, runner.as_deref(), crate::now_secs())
+                {
+                    Ok(session) => CiReply::Session { session },
                     Err(e) => error(&e),
                 }
             }
+            CiRequest::Session { id } => match self.sessions.session(id) {
+                Some(session) => CiReply::Session { session },
+                None => error(&format!("no session {id}")),
+            },
+            CiRequest::CloseSession { id } => accepted(self.sessions.close(id)),
             CiRequest::States { repo } => {
                 if !self.config.repos.contains_key(&repo) {
                     return error(&format!("no repository {repo}"));
@@ -279,6 +301,7 @@ impl CiServer {
             platforms: self.platforms(),
             repos: docs::summary(&self.state_dir, &self.config),
             build: zeughaus_update::manifest::own_build(),
+            sessions: self.sessions.listed(),
         }
     }
 
@@ -1348,12 +1371,33 @@ mod tests {
 
     /// A server whose `ci.toml` also has `tables`.
     fn server_with(state: &Path, tables: &str) -> CiServer {
+        server_on(state, config(tables), std::sync::mpsc::channel().0)
+    }
+
+    /// A server on `config` that announces document changes on `docs`.
+    fn server_on(
+        state: &Path,
+        config: Arc<CiConfig>,
+        docs: std::sync::mpsc::Sender<String>,
+    ) -> CiServer {
+        let runners = Arc::new(Runners::new());
+        let lock = Arc::new(std::sync::Mutex::new(()));
+        let sessions = Arc::new(Sessions::new(
+            state.to_path_buf(),
+            Arc::clone(&config),
+            Arc::clone(&runners),
+            Arc::clone(&lock),
+            docs.clone(),
+            std::sync::mpsc::channel().0,
+        ));
         CiServer::new(
             state.to_path_buf(),
-            config(tables),
-            Arc::new(Runners::new()),
+            config,
+            runners,
             Arc::new(Transcripts::new(state.to_path_buf())),
-            std::sync::mpsc::channel().0,
+            lock,
+            docs,
+            sessions,
         )
     }
 
@@ -3011,11 +3055,9 @@ mod tests {
         fn a_stored_document_is_counted_listed_and_announced() {
             let state = scratch("docs");
             let (tx, rx) = std::sync::mpsc::channel();
-            let server = CiServer::new(
-                state.clone(),
+            let server = server_on(
+                &state,
                 config("[repos.demo]\nurl = \"https://git.example.org/o/demo.git\"\n"),
-                Arc::new(Runners::new()),
-                Arc::new(Transcripts::new(state.clone())),
                 tx,
             );
             let made = server.answer(CiRequest::DocCreate {
@@ -3025,6 +3067,7 @@ mod tests {
                 body: "# Smoke plan\n".to_owned(),
                 source: "demo".to_owned(),
                 proposals: Vec::new(),
+                runs_on: Vec::new(),
             });
             assert_eq!(made, CiReply::DocCreated { number: 1 });
             assert_eq!(rx.try_recv(), Ok("demo".to_owned()));
@@ -3040,7 +3083,8 @@ mod tests {
                     default_branch: "main".to_owned(),
                     awaiting: 1,
                     queued: 0,
-                    running: None,
+                    in_progress: Vec::new(),
+                    paused: false,
                     proposals: 0,
                 }]
             );
@@ -3054,12 +3098,23 @@ mod tests {
             assert_eq!(docs[0].state, DocState::Saved);
             assert!(docs[0].body.is_empty());
 
-            // A claim that finds nothing approved changes nothing to announce.
-            let none = server.answer(CiRequest::PlanClaim {
+            // Pausing the queue is a change of the documents, announced.
+            let paused = server.answer(CiRequest::QueuePaused {
                 repo: "demo".to_owned(),
+                paused: true,
             });
-            assert_eq!(none, CiReply::Doc { doc: None });
-            assert!(rx.try_recv().is_err());
+            assert_eq!(paused, CiReply::Accepted);
+            assert_eq!(rx.try_recv(), Ok("demo".to_owned()));
+            // No runner hosts sessions: a plan session is refused.
+            let refused = server.answer(CiRequest::OpenSession {
+                repo: "demo".to_owned(),
+                proposal: None,
+                runner: None,
+            });
+            assert_eq!(
+                refused,
+                error("no runner can host a session (sessions = true and connected)")
+            );
             let _ = std::fs::remove_dir_all(&state);
         }
     }

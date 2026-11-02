@@ -1,16 +1,15 @@
-//! Agent sessions an editor opens on its own runner, each in a terminal of
-//! the runner's locked `Triggered` group (closing the tab ends it):
+//! Agent sessions the CI opens on this runner, each in a terminal of the
+//! runner's mux:
 //!
 //! - `plan <repo> [--proposal <n>]`: omp in plan mode in the plan clone, a
 //!   checkout detached at the repository's default branch that this keeps
 //!   clean and current. It borrows the master clone's objects and never
 //!   builds. With a proposal, omp starts planning that open proposal of the
-//!   CI at once.
-//! - `master <repo>`: the loop that claims the repository's approved plans
-//!   from the CI one after another and executes each with omp in the master
-//!   clone, which it fast-forwards to the default branch before each claim.
-//!   One session works in a clone at a time: the CI refuses a claim while a
-//!   plan is in progress, and a dirty or unpushed clone is waited for.
+//!   CI at once. Its terminal opens as a tab of the locked `Triggered`
+//!   group.
+//! - `master <repo> --plan <n>`: omp executing plan `n`, which the CI put in
+//!   progress on this runner, in the master clone, fast-forwarded to the
+//!   default branch first. Its terminal stays detached.
 //!
 //! Both clones live in the runner's state directory, never among the user's
 //! own checkouts: `<state-dir>/agent-work/{master,plan}/<host>/<owner>/<repo>`.
@@ -105,16 +104,18 @@ struct SessionArgs {
     repo: String,
     branch: Option<String>,
     proposal: Option<u64>,
+    plan: Option<u64>,
     origin: Option<String>,
 }
 
-/// `<repo> [--branch <branch>] [--proposal <n>] [--origin <origin>]`, the
-/// arguments both sessions take.
+/// `<repo> [--branch <branch>] [--proposal <n>] [--plan <n>] [--origin
+/// <origin>]`, the arguments both sessions take.
 #[cfg(unix)]
 fn parse_args(args: &[String]) -> Result<SessionArgs, String> {
     let mut repo = None;
     let mut branch = None;
     let mut proposal = None;
+    let mut plan = None;
     let mut origin = None;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -123,10 +124,13 @@ fn parse_args(args: &[String]) -> Result<SessionArgs, String> {
                 Some(value) if !value.is_empty() => branch = Some(value.clone()),
                 _ => return Err("--branch needs a branch".to_owned()),
             },
-            "--proposal" => match rest.next().and_then(|value| value.parse::<u64>().ok()) {
-                Some(number) if number >= 1 => proposal = Some(number),
-                _ => return Err("--proposal needs a document number".to_owned()),
-            },
+            flag @ ("--proposal" | "--plan") => {
+                match rest.next().and_then(|value| value.parse::<u64>().ok()) {
+                    Some(number) if number >= 1 && flag == "--proposal" => proposal = Some(number),
+                    Some(number) if number >= 1 => plan = Some(number),
+                    _ => return Err(format!("{flag} needs a document number")),
+                }
+            }
             "--origin" => match rest.next() {
                 Some(value) if !value.is_empty() => origin = Some(value.clone()),
                 _ => return Err("--origin needs an origin".to_owned()),
@@ -144,22 +148,41 @@ fn parse_args(args: &[String]) -> Result<SessionArgs, String> {
         repo,
         branch,
         proposal,
+        plan,
         origin,
     })
 }
 
-/// How often the master looks for work.
+/// How often the master looks again at a clone it cannot start in.
 #[cfg(unix)]
-const MASTER_POLL: std::time::Duration = std::time::Duration::from_secs(15);
+const MASTER_RETRY: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// What the master tells omp to do with a claimed plan.
+/// The omp the sessions run: `$ZEUGHAUS_OMP`, else `omp` on the PATH.
 #[cfg(unix)]
-fn instruction(repo: &str, number: u64) -> String {
-    format!(
+fn omp_program() -> std::ffi::OsString {
+    std::env::var_os("ZEUGHAUS_OMP")
+        .filter(|program| !program.is_empty())
+        .unwrap_or_else(|| "omp".into())
+}
+
+/// What the master tells omp to do with its plan; `machines` is whether
+/// `ZEUGHAUS_MACHINES` names other hosts.
+#[cfg(unix)]
+fn instruction(repo: &str, number: u64, branch: &str, machines: bool) -> String {
+    let mut text = format!(
         "Execute the attached approved zeughaus plan #{number} of {repo} from top to bottom. \
          When its work is complete (gate passed, committed and pushed as AGENTS.md describes), \
-         call the zeughaus MCP tool plan_done with repo {repo} and number {number}."
-    )
+         call the zeughaus MCP tool plan_done with repo {repo} and number {number}. \
+         Other plans of this repository may be executing on other runners at the same time: \
+         fetch and rebase onto origin/{branch} right before every push."
+    );
+    if machines {
+        text.push_str(
+            " This session has the machines in ZEUGHAUS_MACHINES (name=ssh destination) for \
+             work on other hosts.",
+        );
+    }
+    text
 }
 
 /// What `plan` tells omp to do with an attached proposal.
@@ -186,30 +209,26 @@ pub fn master(_args: &[String], _state_dir: &Path) -> ExitCode {
 }
 
 #[cfg(unix)]
-pub use self::unix::{Agents, master, plan, serve};
+pub use self::unix::{Agents, master, plan};
 
 #[cfg(unix)]
 mod unix {
     use std::path::{Path, PathBuf};
     use std::process::{Command, ExitCode, Stdio};
-    use std::sync::Arc;
 
-    use weida::{Replier, TransferMeta};
-    use zeughaus_link::{
-        AgentReply, AgentRequest, AgentSession, CiReply, CiRequest, DocKind, DocState, DocView,
-        MAX_AGENT_BYTES,
-    };
+    use zeughaus_link::enlist::SessionSpec;
+    use zeughaus_link::{CiReply, CiRequest, DocKind, DocState, DocView, SessionKind};
     use zeughaus_mux::{Dimensions, TerminalId};
     use zeughaus_terminal::Profile;
     use zeughaus_terminal::wal::Wal;
 
     use super::{
-        MASTER_POLL, SESSION_LOCK, SessionArgs, agent_root, clone_url, instruction, master_dir,
-        parse_args, plan_clone_dir, proposal_instruction,
+        MASTER_RETRY, SESSION_LOCK, SessionArgs, agent_root, clone_url, instruction, master_dir,
+        omp_program, parse_args, plan_clone_dir, proposal_instruction,
     };
+    use crate::enlist::SessionHost;
     use crate::mcp::client::{Client, Link};
-    use crate::mcp::repo;
-    use crate::mux::{MuxService, OwnedPlacement};
+    use crate::mux::{MuxService, OwnedPlacement, TerminalState};
 
     /// Opens agent sessions in the runner's mux.
     pub struct Agents {
@@ -226,145 +245,110 @@ mod unix {
                 exe,
             }
         }
+    }
 
-        fn open(&self, request: &AgentRequest) -> AgentReply {
-            let refused = |message: String| AgentReply::Refused { message };
-            if !crate::names::valid_name(&request.repo) {
-                return refused(format!("{:?} is no repository name", request.repo));
+    /// `ZEUGHAUS_MACHINES`: `name=ssh` for each machine with an ssh
+    /// destination, `;`-separated.
+    fn machines_env(spec: &SessionSpec) -> String {
+        spec.machines
+            .iter()
+            .filter_map(|m| Some(format!("{}={}", m.name, m.ssh.as_deref()?)))
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    impl SessionHost for Agents {
+        fn open(&self, spec: &SessionSpec) -> Result<u64, String> {
+            if !crate::names::valid_name(&spec.repo) {
+                return Err(format!("{:?} is no repository name", spec.repo));
             }
-            let master = match master_dir(&self.state_dir, &request.origin) {
-                Ok(dir) => dir,
-                Err(e) => return refused(e),
-            };
-            let dir = match request.session {
-                AgentSession::Master => master.clone(),
-                AgentSession::Plan => match plan_clone_dir(&self.state_dir, &request.origin) {
-                    Ok(dir) => dir,
-                    Err(e) => return refused(e),
-                },
+            let master = master_dir(&self.state_dir, &spec.origin)?;
+            let dir = match spec.kind {
+                SessionKind::Master => master.clone(),
+                SessionKind::Plan => plan_clone_dir(&self.state_dir, &spec.origin)?,
             };
             for clone in [&master, &dir] {
                 if clone.exists() && !clone.is_dir() {
-                    return refused(format!("{} exists and is no checkout", clone.display()));
+                    return Err(format!("{} exists and is no checkout", clone.display()));
                 }
             }
-            let (word, label) = match (request.session, request.proposal) {
-                (AgentSession::Plan, Some(n)) => ("plan", format!("plan {} #{n}", request.repo)),
-                (AgentSession::Plan, None) => ("plan", format!("plan {}", request.repo)),
-                (AgentSession::Master, Some(_)) => {
-                    return refused("a master session takes no proposal".to_owned());
+            let (word, label, doc_flag) = match (spec.kind, spec.doc) {
+                (SessionKind::Plan, Some(n)) => {
+                    ("plan", format!("plan {} #{n}", spec.repo), "--proposal")
                 }
-                (AgentSession::Master, None) => ("master", format!("master {}", request.repo)),
+                (SessionKind::Plan, None) => ("plan", format!("plan {}", spec.repo), ""),
+                (SessionKind::Master, Some(n)) => {
+                    ("master", format!("master {} #{n}", spec.repo), "--plan")
+                }
+                (SessionKind::Master, None) => {
+                    return Err("a master session needs its plan".to_owned());
+                }
             };
-            if let Some(TerminalId(terminal)) = self.mux.find_labeled(&label) {
-                return AgentReply::Opened {
-                    terminal,
-                    existing: true,
-                };
-            }
             // A missing clone is made by the session itself, in the
             // terminal, so the terminal starts in the agent root.
             let cwd = if dir.is_dir() {
                 dir
             } else {
                 let root = agent_root(&self.state_dir);
-                if let Err(e) = std::fs::create_dir_all(&root) {
-                    return refused(format!("cannot create {}: {e}", root.display()));
-                }
+                std::fs::create_dir_all(&root)
+                    .map_err(|e| format!("cannot create {}: {e}", root.display()))?;
                 root
             };
             let mut args = vec![
                 "--state-dir".to_owned(),
                 self.state_dir.to_string_lossy().into_owned(),
                 word.to_owned(),
-                request.repo.clone(),
+                spec.repo.clone(),
                 "--branch".to_owned(),
-                request.default_branch.clone(),
+                spec.default_branch.clone(),
                 "--origin".to_owned(),
-                request.origin.clone(),
+                spec.origin.clone(),
             ];
-            if let Some(n) = request.proposal {
-                args.extend(["--proposal".to_owned(), n.to_string()]);
+            if let Some(n) = spec.doc {
+                args.extend([doc_flag.to_owned(), n.to_string()]);
+            }
+            let mut env = vec![
+                ("ZEUGHAUS_SESSION".to_owned(), spec.id.to_string()),
+                ("ZEUGHAUS_RUNNER".to_owned(), spec.runner.clone()),
+            ];
+            if !spec.ci.is_empty() {
+                env.push(("ZEUGHAUS_CI".to_owned(), spec.ci.clone()));
+            }
+            let machines = machines_env(spec);
+            if !machines.is_empty() {
+                env.push(("ZEUGHAUS_MACHINES".to_owned(), machines));
             }
             let profile = Profile {
                 label,
                 program: Some(self.exe.clone()),
                 args,
                 cwd: Some(cwd),
-                env: Vec::new(),
+                env,
                 scrollback_rows: 20_000,
             };
-            match self.mux.spawn_owned(
+            // A plan session is someone's conversation: it opens as a tab. A
+            // master works alone and is attached by whoever wants to look.
+            let placement = match spec.kind {
+                SessionKind::Plan => OwnedPlacement::Triggered,
+                SessionKind::Master => OwnedPlacement::Detached,
+            };
+            let TerminalId(terminal) = self.mux.spawn_owned(
                 profile,
                 Wal::Capped,
                 Dimensions { cols: 80, rows: 24 },
                 None,
-                OwnedPlacement::Triggered,
+                placement,
                 zeughaus_link::ActivityKind::Session,
-            ) {
-                Ok(TerminalId(terminal)) => AgentReply::Opened {
-                    terminal,
-                    existing: false,
-                },
-                Err(e) => refused(e),
-            }
+            )?;
+            Ok(terminal)
         }
-    }
 
-    /// Answers `/agent` requests.
-    pub async fn serve(replier: Replier, agents: Arc<Agents>) {
-        loop {
-            let mut request = match replier.accept().await {
-                Ok(request) => request,
-                Err(e) => {
-                    eprintln!("[runner] stopped serving agents: {e}");
-                    return;
-                }
-            };
-            let payload = match request.take_body().collect(MAX_AGENT_BYTES).await {
-                Ok(payload) => payload,
-                Err(e) => {
-                    eprintln!("[runner] unreadable agent request: {e}");
-                    continue;
-                }
-            };
-            let Some(asked) = AgentRequest::decode(&payload) else {
-                eprintln!(
-                    "[runner] refused a malformed agent request ({} bytes)",
-                    payload.len()
-                );
-                continue;
-            };
-            let opener = Arc::clone(&agents);
-            let answer = match tokio::task::spawn_blocking(move || opener.open(&asked)).await {
-                Ok(answer) => answer,
-                Err(e) => AgentReply::Refused {
-                    message: format!("the session could not be opened: {e}"),
-                },
-            };
-            match &answer {
-                AgentReply::Opened { terminal, existing } => eprintln!(
-                    "[runner] agent session in terminal {terminal}{}",
-                    if *existing { " (running)" } else { "" }
-                ),
-                AgentReply::Refused { message } => {
-                    eprintln!("[runner] agent session refused: {message}")
-                }
-            }
-            let mut reply = match request.reply(TransferMeta::default()).await {
-                Ok(reply) => reply,
-                Err(e) => {
-                    eprintln!("[runner] cannot reply to an agent request: {e}");
-                    continue;
-                }
-            };
-            if let Err(e) = reply.write_all(&answer.encode()).await {
-                eprintln!("[runner] cannot write an agent reply: {e}");
-                continue;
-            }
-            if let Err(e) = reply.finish() {
-                eprintln!("[runner] cannot finish an agent reply: {e}");
-            }
+        fn close(&self, terminal: u64) -> Result<(), String> {
+            self.mux.close_terminal(TerminalId(terminal))
+        }
+
+        fn state(&self, terminal: u64) -> TerminalState {
+            self.mux.terminal_state(TerminalId(terminal))
         }
     }
 
@@ -464,11 +448,15 @@ mod unix {
             ExitCode::FAILURE
         };
         let (repo, branch, proposal, origin) = match parse_args(args) {
+            Ok(SessionArgs { plan: Some(_), .. }) => {
+                return fail("--plan is for master only".to_owned());
+            }
             Ok(SessionArgs {
                 repo,
                 branch: Some(branch),
                 proposal,
                 origin: Some(origin),
+                ..
             }) => (repo, branch, proposal, origin),
             Ok(SessionArgs { branch: None, .. }) => return fail("--branch is needed".to_owned()),
             Ok(SessionArgs { origin: None, .. }) => return fail("--origin is needed".to_owned()),
@@ -537,7 +525,7 @@ mod unix {
             Ok(lock) => lock,
             Err(e) => return fail(e),
         };
-        let mut command = Command::new("omp");
+        let mut command = Command::new(omp_program());
         command
             .arg("--model")
             .arg("@plan")
@@ -570,6 +558,21 @@ mod unix {
 
     /// Proposal `number` of `repo` from the CI, refused unless it is one.
     fn fetch_proposal(repo: &str, number: u64, state_dir: &Path) -> Result<DocView, String> {
+        let doc = fetch_doc(repo, number, state_dir)?;
+        if doc.kind != DocKind::Proposal {
+            return Err(format!("#{number} of {repo} is a plan, not a proposal"));
+        }
+        if doc.state != DocState::Open {
+            println!(
+                "[plan] proposal #{number} is {}; planning it anyway",
+                doc.state.name()
+            );
+        }
+        Ok(doc)
+    }
+
+    /// Document `number` of `repo` from the CI, with its body.
+    fn fetch_doc(repo: &str, number: u64, state_dir: &Path) -> Result<DocView, String> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -585,57 +588,36 @@ mod unix {
             client.shutdown().await;
             asked
         });
-        let doc = match asked? {
-            CiReply::Doc { doc: Some(doc) } => *doc,
-            CiReply::Doc { doc: None } => return Err(format!("no proposal #{number} in {repo}")),
-            other => return Err(crate::mcp::unexpected(&other)),
-        };
-        if doc.kind != DocKind::Proposal {
-            return Err(format!("#{number} of {repo} is a plan, not a proposal"));
-        }
-        if doc.state != DocState::Open {
-            println!(
-                "[plan] proposal #{number} is {}; planning it anyway",
-                doc.state.name()
-            );
-        }
-        Ok(doc)
-    }
-
-    /// Prints a reason to wait, once while it stays the same.
-    struct Waiting {
-        last: Option<String>,
-    }
-
-    impl Waiting {
-        fn say(&mut self, reason: String) {
-            if self.last.as_deref() != Some(reason.as_str()) {
-                println!("[master] {reason}");
-                self.last = Some(reason);
-            }
+        match asked? {
+            CiReply::Doc { doc: Some(doc) } => Ok(*doc),
+            CiReply::Doc { doc: None } => Err(format!("no document #{number} in {repo}")),
+            other => Err(crate::mcp::unexpected(&other)),
         }
     }
 
-    /// `zeughaus-runner master <repo> --branch <b> --origin <o>` in the
-    /// master clone: claims the approved plans of `repo` one after another
-    /// and runs omp on each, holding the clone's session lock throughout.
+    /// `zeughaus-runner master <repo> --plan <n> --branch <b> --origin <o>`
+    /// in the master clone: brings the clone to the default branch, waiting
+    /// while it is dirty or ahead, and runs omp on plan `n`, which the CI put
+    /// in progress on this runner. Exits with omp's code.
     pub fn master(args: &[String], state_dir: &Path) -> ExitCode {
         let fail = |message: String| {
             eprintln!("[master] {message}");
             ExitCode::FAILURE
         };
-        let (repo, branch, origin) = match parse_args(args) {
+        let (repo, branch, origin, number) = match parse_args(args) {
             Ok(SessionArgs {
                 proposal: Some(_), ..
             }) => return fail("--proposal is for plan only".to_owned()),
+            Ok(SessionArgs { plan: None, .. }) => return fail("--plan is needed".to_owned()),
             Ok(SessionArgs { branch: None, .. }) => return fail("--branch is needed".to_owned()),
             Ok(SessionArgs { origin: None, .. }) => return fail("--origin is needed".to_owned()),
             Ok(SessionArgs {
                 repo,
                 branch: Some(branch),
                 origin: Some(origin),
+                plan: Some(number),
                 ..
-            }) => (repo, branch, origin),
+            }) => (repo, branch, origin, number),
             Err(e) => return fail(e),
         };
         let cwd = match master_dir(state_dir, &origin) {
@@ -652,89 +634,26 @@ mod unix {
             Ok(lock) => lock,
             Err(e) => return fail(e),
         };
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(e) => return fail(format!("cannot start the async runtime: {e}")),
+        let mut said: Option<String> = None;
+        while let Err(reason) = bring_up_to_date(&cwd, &branch) {
+            if said.as_deref() != Some(reason.as_str()) {
+                println!("[master] {reason}; trying again every 15 s");
+                said = Some(reason);
+            }
+            std::thread::sleep(MASTER_RETRY);
+        }
+        let plan = match fetch_doc(&repo, number, state_dir) {
+            Ok(doc) => doc,
+            Err(e) => return fail(e),
         };
-        let client = Client::new(Link::resolve(None, state_dir));
-        let ended = runtime.block_on(async {
-            let ended = serve_plans(&client, &repo, &branch, &cwd, state_dir).await;
-            client.shutdown().await;
-            ended
-        });
-        match ended {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => fail(e),
+        if plan.kind != DocKind::Plan || plan.state != DocState::InProgress {
+            println!(
+                "[master] plan #{number} is {}; nothing to do",
+                plan.state.name()
+            );
+            return ExitCode::SUCCESS;
         }
-    }
-
-    /// The master's loop; it only returns when the checkout is wrong.
-    async fn serve_plans(
-        client: &Client,
-        repo: &str,
-        branch: &str,
-        cwd: &Path,
-        state_dir: &Path,
-    ) -> Result<(), String> {
-        let checkout = repo::checkout(cwd)?;
-        match repo::ask(client, &checkout, false).await? {
-            Some(view) if view.name == repo => {}
-            Some(view) => {
-                return Err(format!(
-                    "{} is {} in the CI, not {repo}",
-                    checkout.root.display(),
-                    view.name
-                ));
-            }
-            None => {
-                return Err(format!(
-                    "{} is no repository of the CI's ci.toml",
-                    checkout.origin
-                ));
-            }
-        }
-        println!("[master] {repo} in {}", checkout.root.display());
-        let mut waiting = Waiting { last: None };
-        loop {
-            let (root, wanted) = (checkout.root.clone(), branch.to_owned());
-            let ready = tokio::task::spawn_blocking(move || bring_up_to_date(&root, &wanted))
-                .await
-                .unwrap_or_else(|e| Err(format!("the checkout could not be updated: {e}")));
-            if let Err(reason) = ready {
-                waiting.say(reason);
-                tokio::time::sleep(MASTER_POLL).await;
-                continue;
-            }
-            let claimed = client
-                .ci(CiRequest::PlanClaim {
-                    repo: repo.to_owned(),
-                })
-                .await;
-            let plan = match claimed {
-                Ok(CiReply::Doc { doc: Some(plan) }) => *plan,
-                Ok(CiReply::Doc { doc: None }) => {
-                    waiting.say(format!("waiting for an approved plan of {repo}"));
-                    tokio::time::sleep(MASTER_POLL).await;
-                    continue;
-                }
-                Ok(other) => {
-                    waiting.say(crate::mcp::unexpected(&other));
-                    tokio::time::sleep(MASTER_POLL).await;
-                    continue;
-                }
-                Err(e) => {
-                    waiting.say(e);
-                    tokio::time::sleep(MASTER_POLL).await;
-                    continue;
-                }
-            };
-            waiting.last = None;
-            run_plan(&plan, &checkout.root, state_dir).await?;
-            settle(client, repo, plan.number, &mut waiting).await;
-        }
+        run_plan(&plan, &cwd, &branch, state_dir)
     }
 
     /// Puts the master clone on `branch` at `origin/<branch>`, so a claimed
@@ -775,65 +694,38 @@ mod unix {
         Ok(())
     }
 
-    /// Runs omp on `plan` in the checkout, with the terminal's stdio.
-    async fn run_plan(plan: &DocView, root: &Path, state_dir: &Path) -> Result<(), String> {
+    /// Runs omp on `plan` in the checkout, with the terminal's stdio, and
+    /// answers with omp's exit.
+    fn run_plan(plan: &DocView, root: &Path, branch: &str, state_dir: &Path) -> ExitCode {
         let file = state_dir
             .join("agents")
             .join(&plan.repo)
             .join(format!("plan-{}.md", plan.number));
-        crate::files::write_atomic(&file, plan.body.as_bytes())?;
-        println!("[master] plan #{} {}", plan.number, plan.title);
-        let mut command = Command::new("omp");
-        command
-            .arg(format!("@{}", file.display()))
-            .arg(instruction(&plan.repo, plan.number))
-            .env("ZEUGHAUS_PLAN", format!("{}#{}", plan.repo, plan.number))
-            .current_dir(root);
-        let ran = tokio::task::spawn_blocking(move || command.status())
-            .await
-            .map_err(|e| format!("omp could not be waited for: {e}"))?;
-        match ran {
-            Ok(status) => println!("[master] omp ended ({status})"),
-            // The plan stays in progress; the user requeues it or marks it
-            // done, and the master waits for that below.
-            Err(e) => println!("[master] cannot start omp: {e}"),
+        if let Err(e) = crate::files::write_atomic(&file, plan.body.as_bytes()) {
+            eprintln!("[master] {e}");
+            return ExitCode::FAILURE;
         }
-        Ok(())
-    }
-
-    /// After omp ended: done goes on at once; anything else waits until
-    /// the plan is no longer in progress.
-    async fn settle(client: &Client, repo: &str, number: u64, waiting: &mut Waiting) {
-        loop {
-            let asked = client
-                .ci(CiRequest::Doc {
-                    repo: repo.to_owned(),
-                    number,
-                })
-                .await;
-            match asked {
-                Ok(CiReply::Doc { doc: Some(doc) }) if doc.state == DocState::Done => {
-                    println!("[master] plan #{number} done");
-                    return;
-                }
-                Ok(CiReply::Doc { doc: Some(doc) }) if doc.state == DocState::InProgress => {
-                    waiting.say(format!(
-                        "plan #{number} is in_progress after omp ended; Requeue or Mark done in \
-                         the desktop"
-                    ));
-                }
-                Ok(CiReply::Doc { doc: Some(doc) }) => {
-                    println!("[master] plan #{number} is {}", doc.state.name());
-                    return;
-                }
-                Ok(CiReply::Doc { doc: None }) => {
-                    println!("[master] plan #{number} is gone");
-                    return;
-                }
-                Ok(other) => waiting.say(crate::mcp::unexpected(&other)),
-                Err(e) => waiting.say(e),
+        println!("[master] plan #{} {}", plan.number, plan.title);
+        let machines = std::env::var_os("ZEUGHAUS_MACHINES").is_some_and(|m| !m.is_empty());
+        let status = Command::new(omp_program())
+            .arg(format!("@{}", file.display()))
+            .arg(instruction(&plan.repo, plan.number, branch, machines))
+            .env("ZEUGHAUS_PLAN", format!("{}#{}", plan.repo, plan.number))
+            .current_dir(root)
+            .status();
+        match status {
+            Ok(status) => {
+                println!("[master] omp ended ({status})");
+                status
+                    .code()
+                    .map_or(ExitCode::FAILURE, |code| ExitCode::from(code as u8))
             }
-            tokio::time::sleep(MASTER_POLL).await;
+            // The plan stays in progress; the user requeues it or marks it
+            // done.
+            Err(e) => {
+                eprintln!("[master] cannot start omp: {e}");
+                ExitCode::FAILURE
+            }
         }
     }
 }
@@ -902,12 +794,13 @@ mod tests {
     }
 
     #[test]
-    fn both_sessions_take_a_repository_a_branch_a_proposal_and_an_origin() {
+    fn both_sessions_take_a_repository_a_branch_a_document_and_an_origin() {
         let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let session = |branch: Option<&str>, proposal: Option<u64>| SessionArgs {
             repo: "demo".to_owned(),
             branch: branch.map(str::to_owned),
             proposal,
+            plan: None,
             origin: None,
         };
         assert_eq!(
@@ -925,6 +818,17 @@ mod tests {
                 origin: Some("h/o/demo".to_owned()),
                 ..session(Some("main"), None)
             })
+        );
+        assert_eq!(
+            parse_args(&args(&["demo", "--plan", "29"])),
+            Ok(SessionArgs {
+                plan: Some(29),
+                ..session(None, None)
+            })
+        );
+        assert_eq!(
+            parse_args(&args(&["demo", "--plan", "0"])),
+            Err("--plan needs a document number".to_owned())
         );
         assert_eq!(
             parse_args(&args(&["demo", "--origin"])),

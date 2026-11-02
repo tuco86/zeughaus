@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use tokio::io::BufReader;
-use zeughaus_link::{CiReply, CiRequest, DocKind, DocState, RepoView};
+use zeughaus_link::{CiReply, CiRequest, DocKind, DocState, MachineView, RepoView, SessionView};
 
 use self::client::{Client, Link};
 pub(crate) use self::tools::unexpected;
@@ -239,6 +239,10 @@ enum CiCommand {
         number: u64,
         job: String,
     },
+    Session {
+        json: bool,
+        id: u64,
+    },
 }
 
 /// How long `ci wait` waits: the longest a job may run by default. The
@@ -247,7 +251,7 @@ const CLI_WAIT_LIMIT: Duration = Duration::from_secs(4 * 3600);
 
 /// The arguments that follow `ci`.
 fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
-    const SUBCOMMANDS: &str = "repo, find, doc, plan-save, planned, wait or overdue";
+    const SUBCOMMANDS: &str = "repo, find, doc, plan-save, planned, wait, overdue or session";
     let Some((subcommand, rest)) = args.split_first() else {
         return Err(format!("ci needs a subcommand: {SUBCOMMANDS}"));
     };
@@ -348,6 +352,11 @@ fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
         ("overdue", _) => {
             Err("ci overdue takes a repository name, a pipeline number and a job".to_owned())
         }
+        ("session", [id]) => match id.parse::<u64>() {
+            Ok(id) if id >= 1 => Ok(CiCommand::Session { json, id }),
+            _ => Err(format!("{id:?} is no session number")),
+        },
+        ("session", _) => Err("ci session takes a session number".to_owned()),
         (other, _) => Err(format!("unknown ci subcommand {other:?}: {SUBCOMMANDS}")),
     }
 }
@@ -391,6 +400,70 @@ struct SavedAnswer<'a> {
     approved: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     approve_failed: Option<String>,
+}
+
+/// The line `ci session --json` prints.
+#[derive(Serialize)]
+struct SessionAnswer<'a> {
+    session: &'a SessionView,
+    runners: &'a [MachineView],
+    others: &'a [SessionView],
+}
+
+/// What an agent session is told about itself and the runners around it.
+fn session_text(session: &SessionView, runners: &[MachineView], others: &[SessionView]) -> String {
+    let doc = |s: &SessionView| s.doc.map(|n| format!(" #{n}")).unwrap_or_default();
+    let runner_of = |name: &str| runners.iter().find(|r| r.name == name);
+    let mut text = format!(
+        "session {} {} {}{} ({})\n",
+        session.id,
+        session.kind.name(),
+        session.repo,
+        doc(session),
+        session.state.name()
+    );
+    let host = runner_of(&session.runner);
+    text.push_str(&format!(
+        "runs on {}: labels {}; addresses {}\n",
+        session.runner,
+        host.map(|r| r.labels.join(",")).unwrap_or_default(),
+        host.map(|r| r.addresses.join(", ")).unwrap_or_default()
+    ));
+    if !session.machines.is_empty() {
+        text.push_str("machines:\n");
+        for machine in &session.machines {
+            text.push_str(&format!(
+                "  {} ssh {} labels {}\n",
+                machine.name,
+                machine.ssh.as_deref().unwrap_or("-"),
+                machine.labels.join(",")
+            ));
+        }
+    }
+    if !others.is_empty() {
+        text.push_str("other live sessions:\n");
+        for other in others {
+            text.push_str(&format!(
+                "  #{} {} {}{} on {}\n",
+                other.id,
+                other.kind.name(),
+                other.repo,
+                doc(other),
+                other.runner
+            ));
+        }
+    }
+    text.push_str("runners:\n");
+    for runner in runners {
+        text.push_str(&format!(
+            "  {} {}{} {}\n",
+            runner.name,
+            runner.status,
+            if runner.sessions { " sessions" } else { "" },
+            runner.labels.join(",")
+        ));
+    }
+    text
 }
 
 /// The plan in `file`; an empty one is no plan.
@@ -479,6 +552,7 @@ async fn ci_answer(client: &Arc<Client>, command: CiCommand) -> Result<String, F
         } => {
             let body = read_plan(&file)?;
             let proposals = docs::proposals_named(&body).map_err(Failure::bad_input)?;
+            let runs_on = docs::runs_on_named(&body).map_err(Failure::bad_input)?;
             let request = CiRequest::DocCreate {
                 repo: repo.clone(),
                 kind: DocKind::Plan,
@@ -486,6 +560,7 @@ async fn ci_answer(client: &Arc<Client>, command: CiCommand) -> Result<String, F
                 source: repo.clone(),
                 body,
                 proposals,
+                runs_on,
             };
             let number = match client.ci(request).await.map_err(Failure::no_answer)? {
                 CiReply::DocCreated { number } => number,
@@ -570,6 +645,43 @@ async fn ci_answer(client: &Arc<Client>, command: CiCommand) -> Result<String, F
             .late_report(&repo, number, &job)
             .await
             .map_err(Failure::no_answer),
+        CiCommand::Session { json, id } => {
+            let session = match client
+                .ci(CiRequest::Session { id })
+                .await
+                .map_err(Failure::no_answer)?
+            {
+                CiReply::Session { session } => session,
+                other => return Err(Failure::no_answer(unexpected(&other))),
+            };
+            let overview = match client
+                .ci(CiRequest::Overview)
+                .await
+                .map_err(Failure::no_answer)?
+            {
+                CiReply::Overview { overview } => overview,
+                other => return Err(Failure::no_answer(unexpected(&other))),
+            };
+            let runners: Vec<MachineView> = overview
+                .machines
+                .into_iter()
+                .filter(|m| m.kind == "runner")
+                .collect();
+            let others: Vec<SessionView> = overview
+                .sessions
+                .into_iter()
+                .filter(|s| s.id != id && s.state.is_live())
+                .collect();
+            if json {
+                encoded(&SessionAnswer {
+                    session: &session,
+                    runners: &runners,
+                    others: &others,
+                })
+            } else {
+                Ok(session_text(&session, &runners, &others))
+            }
+        }
     }
 }
 

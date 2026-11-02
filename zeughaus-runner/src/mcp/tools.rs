@@ -504,7 +504,11 @@ impl Toolbox {
             repo,
             title,
             body,
+            runs_on,
         } = args;
+        for selector in &runs_on {
+            zeughaus_link::selector::Selector::parse(selector)?;
+        }
         self.client.configured()?;
         let repo = match (path, repo) {
             (Some(path), None) => {
@@ -540,6 +544,7 @@ impl Toolbox {
             body,
             source,
             proposals: Vec::new(),
+            runs_on,
         };
         match self.client.ci(request).await? {
             CiReply::DocCreated { number } => Ok(format!("proposal #{number} stored in {repo}")),
@@ -1018,6 +1023,8 @@ struct ProposalArgs {
     repo: Option<String>,
     title: String,
     body: String,
+    #[serde(default)]
+    runs_on: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -1983,6 +1990,13 @@ fn definitions() -> Vec<Value> {
                     "type": "string",
                     "description": "The proposal in Markdown.",
                 },
+                "runs_on": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Label selectors of the machines the work needs, one per \
+                                    machine, the first hosts the session; for example \
+                                    [\"os=windows\"]",
+                },
             }),
             &["title", "body"],
             false,
@@ -2358,6 +2372,7 @@ mod tests {
             ],
             repos: Vec::new(),
             build: 116,
+            sessions: Vec::new(),
         };
         assert_eq!(
             status_text(&overview, 1_000),
@@ -2375,6 +2390,7 @@ mod tests {
             platforms: Vec::new(),
             repos: Vec::new(),
             build: 0,
+            sessions: Vec::new(),
         };
         assert_eq!(
             status_text(&empty, 0),
@@ -3144,6 +3160,8 @@ mod tests {
             approved: None,
             proposals: Vec::new(),
             plan: None,
+            runs_on: Vec::new(),
+            placement: Vec::new(),
             body: if body {
                 "# Smoke plan\n".to_owned()
             } else {
@@ -3927,6 +3945,7 @@ mod tests {
                     body: "Why.".to_owned(),
                     source: "weida".to_owned(),
                     proposals: Vec::new(),
+                    runs_on: Vec::new(),
                 })
             );
 

@@ -9,7 +9,7 @@
 //! and pure pixel math, no I/O, so the runtime's server and the editor's
 //! client cannot disagree about the protocol.
 //!
-//! One listener, fourteen paths, each a different weida pattern:
+//! One listener, thirteen paths, each a different weida pattern:
 //!
 //! | path | pattern | carries |
 //! |---|---|---|
@@ -20,7 +20,6 @@
 //! | [`RUNS_PATH`] | req/rep | [`runs`]: a range of one file of one run |
 //! | [`HOLD_PATH`] | req/rep | [`runs::HoldRequest`]: start no new runs |
 //! | [`ACTIVITY_PATH`] | req/rep | [`activity`]: the runner's terminals, live and archived |
-//! | [`AGENT_PATH`] | req/rep | [`agent`]: open a plan or master agent session in a terminal |
 //! | [`CI_PATH`] | req/rep | [`ci`]: channels, pipelines, machines, job transcripts |
 //! | [`ENLIST_PATH`] | one long exchange per runner | [`enlist`]: a runner takes assignments from the CI and streams output |
 //! | [`ARTIFACTS_PATH`] | one exchange per transfer | [`enlist::ArtifactRequest`]: a run's artifact set, streamed as chunks |
@@ -34,7 +33,6 @@
 //! the endpoint file through which a local editor finds its runner.
 
 pub mod activity;
-pub mod agent;
 pub mod ci;
 pub mod credentials;
 pub mod enlist;
@@ -49,13 +47,12 @@ pub use activity::{
     ACTIVITY_PATH, ActivityEntry, ActivityKind, ActivityReply, ActivityRequest, ActivityState,
     MAX_ACTIVITY_ENTRIES,
 };
-pub use agent::{AgentReply, AgentRequest, AgentSession, MAX_AGENT_BYTES};
 pub use ci::{
     ChannelView, CiOverview, CiReply, CiRequest, DocGroup, DocKind, DocState, DocView, JobDefView,
     JobTiming, JobView, MAX_CI_REPLY_BYTES, MAX_CI_REQUEST_BYTES, MAX_DOC_BYTES,
     MAX_DOC_TITLE_BYTES, MachineJob, MachineView, PipelineView, QueuedView, RepoDocsView, RepoView,
-    StateVersionView, StateView, TimedLine, TransferView, doc_groups, normalize_origin,
-    pipeline_load,
+    SessionKind, SessionMachine, SessionState, SessionView, StateVersionView, StateView, TimedLine,
+    TransferView, doc_groups, normalize_origin, pipeline_load,
 };
 pub use events::{
     ErrorRow, MAX_EVENT_BYTES, MAX_SNAPSHOT_BYTES, MAX_TRIGGER_BYTES, OutputRow, RejectionRow,
@@ -92,11 +89,6 @@ pub const RUNS_PATH: &str = "/runs";
 /// Req/Rep endpoint that holds and releases the runner: held, it starts no
 /// new run and lets the live ones finish.
 pub const HOLD_PATH: &str = "/hold";
-
-/// Req/Rep endpoint an editor opens an agent session on: a plan or master
-/// session of a repository, in a terminal of the runner's mux. Served only
-/// by a runner that has a mux, on Unix.
-pub const AGENT_PATH: &str = "/agent";
 
 /// Req/Rep endpoint a CI runner answers [`ci::CiRequest`]s on: its channels,
 /// pipelines, machines and job transcripts. Served only by a runner that

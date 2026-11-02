@@ -30,6 +30,7 @@ use crate::runners::Runners;
 use crate::scheduler::{self, Alert, CiChange, Started};
 use crate::secrets::{self, Secrets};
 use crate::serve::{self, CiServer};
+use crate::sessions::Sessions;
 use crate::transcripts::{self, Transcripts};
 use crate::{hook, manual, transport};
 
@@ -37,6 +38,9 @@ const USAGE: &str = "usage: zeughaus-ci serve --listen <host:port> [--hook <host
 
 /// How often the loop looks for alerts and changes the scheduler produced.
 const DRAIN_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How often the session dispatcher looks for approved plans to start.
+const DISPATCH_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
@@ -237,6 +241,29 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
     let transcripts = Arc::new(Transcripts::new(state_dir.to_path_buf()));
     let seq = Arc::new(AtomicU64::new(0));
     let listener = &bound.listener;
+    let (docs_tx, docs_rx) = std::sync::mpsc::channel::<String>();
+    let (sessions_tx, sessions_rx) = std::sync::mpsc::channel::<()>();
+    let docs_lock = Arc::new(std::sync::Mutex::new(()));
+    let sessions = Arc::new(Sessions::new(
+        state_dir.to_path_buf(),
+        Arc::clone(&config),
+        Arc::clone(&runners),
+        Arc::clone(&docs_lock),
+        docs_tx.clone(),
+        sessions_tx,
+    ));
+    {
+        let sessions = Arc::clone(&sessions);
+        std::thread::Builder::new()
+            .name("zeughaus-ci-sessions".to_owned())
+            .spawn(move || {
+                loop {
+                    sessions.dispatch(crate::now_secs());
+                    std::thread::sleep(DISPATCH_INTERVAL);
+                }
+            })
+            .map_err(|e| format!("cannot start the session dispatcher: {e}"))?;
+    }
 
     match listener.replier(ENLIST_PATH) {
         Ok(replier) => {
@@ -245,6 +272,7 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
                 Arc::clone(&config),
                 Arc::clone(&runners),
                 tx,
+                Arc::clone(&sessions),
             ));
             rt.spawn(service.accept(replier));
         }
@@ -278,7 +306,6 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
         }
         Err(e) => return Err(format!("no artifact service: {e}")),
     }
-    let (docs_tx, docs_rx) = std::sync::mpsc::channel::<String>();
     match listener.replier(CI_PATH) {
         Ok(replier) => {
             let server = CiServer::new(
@@ -286,7 +313,9 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
                 Arc::clone(&config),
                 Arc::clone(&runners),
                 Arc::clone(&transcripts),
+                docs_lock,
                 docs_tx,
+                sessions,
             );
             rt.spawn(serve::serve(replier, Arc::new(server)));
         }
@@ -355,6 +384,9 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
         while let Ok(repo) = docs_rx.try_recv() {
             events.docs(repo);
         }
+        while sessions_rx.try_recv().is_ok() {
+            events.sessions();
+        }
         std::thread::sleep(DRAIN_INTERVAL);
     }
 }
@@ -392,6 +424,11 @@ impl Events {
     fn docs(&mut self, repo: String) {
         let seq = self.next_seq();
         self.emit(RuntimeEvent::CiDocs { seq, repo });
+    }
+
+    fn sessions(&mut self) {
+        let seq = self.next_seq();
+        self.emit(RuntimeEvent::CiSessions { seq });
     }
 
     fn next_seq(&self) -> u64 {

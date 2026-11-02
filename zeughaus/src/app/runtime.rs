@@ -394,6 +394,10 @@ impl App {
             Traffic::Event(RuntimeEvent::CiDocs { repo, .. }) => {
                 return self.apply_ci_docs_event(&key, repo);
             }
+            // A session of the CI changed: the overview lists them.
+            Traffic::Event(RuntimeEvent::CiSessions { .. }) => {
+                return self.apply_ci_sessions_event(&key);
+            }
             // Events travel on streams of their own and may arrive out of
             // order; a terminal only ever moves from running to exited to
             // closed, so an older state never replaces a newer one.

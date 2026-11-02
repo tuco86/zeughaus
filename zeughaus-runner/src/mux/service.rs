@@ -15,7 +15,7 @@
 //! from the sequence number it last sent -- a slow client gets fewer,
 //! larger deltas, never a queue of them.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
@@ -48,6 +48,18 @@ use crate::transport::principal_of;
 
 /// How often the reaper looks for terminals whose child exited.
 const REAP_EVERY: Duration = Duration::from_millis(250);
+
+/// Closed terminals whose end [`MuxService::terminal_state`] remembers.
+const CLOSED_KEPT: usize = 256;
+
+/// What became of a terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalState {
+    Running,
+    Exited(ExitState),
+    /// Closed without an exit of its own, or unknown.
+    Gone,
+}
 
 /// How long after a client vanishes its leases are held for it, so a network
 /// blink does not make its terminals read-only.
@@ -137,6 +149,9 @@ struct Inner {
     run_dirs: Arc<RunDirs>,
     /// Where activity goes; set when the reaper starts.
     activity: OnceLock<Sender<ActivityEntry>>,
+    /// The newest [`CLOSED_KEPT`] terminals that were closed, with how their
+    /// child had ended: what an owner that looks after the close learns.
+    closed: Mutex<VecDeque<(TerminalId, Option<ExitState>)>>,
 }
 
 impl Inner {
@@ -191,6 +206,7 @@ impl MuxService {
                 revision,
                 run_dirs,
                 activity: OnceLock::new(),
+                closed: Mutex::new(VecDeque::new()),
             }),
         };
         #[cfg(unix)]
@@ -366,26 +382,20 @@ impl MuxService {
             .map(|(id, _)| *id)
     }
 
-    /// A terminal whose child still runs and that was started as `label`.
-    /// Only agent sessions look for one, and they exist on Unix only.
-    #[cfg(unix)]
-    pub fn find_labeled(&self, label: &str) -> Option<TerminalId> {
-        // The lock order `snapshot` takes, and `meta` last.
-        let sessions = self
-            .inner
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let meta = self.inner.meta.lock().unwrap_or_else(|e| e.into_inner());
-        meta.iter()
-            .filter(|(id, meta)| {
-                meta.label == label
-                    && sessions
-                        .get(id)
-                        .is_some_and(|session| session.exit().is_none())
-            })
-            .map(|(id, _)| *id)
-            .min()
+    /// Whether terminal `id` still runs, how its child ended, or that it is
+    /// gone without an exit (or too long ago to remember).
+    pub fn terminal_state(&self, id: TerminalId) -> TerminalState {
+        if let Some(session) = self.session(id) {
+            return match session.exit() {
+                Some(exit) => TerminalState::Exited(exit),
+                None => TerminalState::Running,
+            };
+        }
+        let closed = self.inner.closed.lock().unwrap_or_else(|e| e.into_inner());
+        match closed.iter().rev().find(|(t, _)| *t == id) {
+            Some((_, Some(exit))) => TerminalState::Exited(exit.clone()),
+            _ => TerminalState::Gone,
+        }
     }
 
     /// Starts a terminal the runner owns: a job's process, not a pane's
@@ -1415,6 +1425,13 @@ impl MuxService {
     fn forgotten(&self, id: TerminalId, session: Option<Session>, meta: Option<TerminalMeta>) {
         if let Some(meta) = meta.filter(|meta| !meta.replay) {
             let exit = session.as_ref().and_then(Session::exit);
+            {
+                let mut closed = self.inner.closed.lock().unwrap_or_else(|e| e.into_inner());
+                closed.push_back((id, exit.clone()));
+                while closed.len() > CLOSED_KEPT {
+                    closed.pop_front();
+                }
+            }
             let mut entry = self.entry(id, &meta, ActivityState::Closed, exit.as_ref());
             if meta.run.is_none() {
                 let cols = session.as_ref().map_or(80, |s| s.size().cols);

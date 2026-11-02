@@ -1,17 +1,20 @@
 //! A repository's Plans tab: the plans and proposals the CI stores for it,
-//! approved, rejected and cleaned up here, and the buttons that open its
-//! planning and master sessions on this editor's own runner.
+//! approved, rejected and cleaned up here, the `Runs on` of each, the plan
+//! sessions the CI opens on a runner that hosts them, and the master
+//! sessions it dispatches approved plans to.
 //!
 //! The list is grouped the way an agent reads it (awaiting approval, the
 //! queue, in progress, open proposals, history); the selected document is
 //! drawn as Markdown beside it. The CI announces every change on `/events`
-//! (`CiDocs`), and the tab asks for the list again.
+//! (`CiDocs`, `CiSessions`), and the tab asks for the list again.
 
-use iced::widget::{Space, button, column, container, markdown, row, rule, scrollable, text};
+use iced::widget::{
+    Space, button, column, container, markdown, row, rule, scrollable, text, text_input,
+};
 use iced::{Alignment, Element, Length, Task};
 use zeughaus_link::{
-    AgentReply, AgentRequest, AgentSession, CiReply, CiRequest, DocKind, DocState, DocView,
-    doc_groups,
+    CiReply, CiRequest, DocKind, DocState, DocView, MachineView, SessionKind, SessionState,
+    SessionView, doc_groups,
 };
 use zeughaus_mux::TerminalId;
 use zeughaus_theme::Theme;
@@ -21,7 +24,6 @@ use super::{
     action_button, ago, glyph, icon, now, row_style, tip,
 };
 use crate::app::App;
-use crate::app::runtime::LinkKind;
 use crate::feed;
 use crate::message::{CiMsg, Message};
 use crate::transport::Endpoint;
@@ -60,6 +62,8 @@ pub(super) struct PlansState {
     acting: bool,
     /// What the last action or session request came to.
     notice: Option<Notice>,
+    /// The `Runs on` being edited: the document and the text so far.
+    pub(super) runs_on_input: Option<(u64, String)>,
 }
 
 impl PlansState {
@@ -76,6 +80,7 @@ impl PlansState {
             shown_error: None,
             acting: false,
             notice: None,
+            runs_on_input: None,
         }
     }
 
@@ -274,6 +279,13 @@ async fn act(endpoint: Endpoint, request: CiRequest) -> Result<(), String> {
     }
 }
 
+async fn open(endpoint: Endpoint, request: CiRequest) -> Result<SessionView, String> {
+    match feed::ci(endpoint, request).await? {
+        CiReply::Session { session } => Ok(session),
+        _ => Err(UNEXPECTED.to_owned()),
+    }
+}
+
 /// What a document can be asked to do from its state: the button's glyph,
 /// words, tooltip and the state it moves to (`None`: deleted).
 fn actions(doc: &DocView) -> Vec<(char, &'static str, &'static str, Option<DocState>)> {
@@ -282,7 +294,7 @@ fn actions(doc: &DocView) -> Vec<(char, &'static str, &'static str, Option<DocSt
             (
                 CHECK,
                 "Approve",
-                "Queue it for the master session",
+                "Queue it for a master session on a runner it fits",
                 Some(DocState::Approved),
             ),
             (
@@ -331,6 +343,56 @@ fn row_detail(doc: &DocView, now: u64) -> String {
     line
 }
 
+impl CiClient {
+    /// The runner `name` as the overview lists it.
+    pub(super) fn runner_view(&self, name: &str) -> Option<&MachineView> {
+        self.overview
+            .as_ref()?
+            .machines
+            .iter()
+            .find(|m| m.kind == "runner" && m.name == name)
+    }
+
+    /// Whether a connected runner hosts sessions.
+    fn sessions_possible(&self) -> bool {
+        self.overview.as_ref().is_some_and(|overview| {
+            overview
+                .machines
+                .iter()
+                .any(|m| m.kind == "runner" && m.sessions && m.status != "offline")
+        })
+    }
+
+    /// The live master session of plan `number` of `repo`.
+    fn master_of(&self, repo: &str, number: u64) -> Option<&SessionView> {
+        self.overview.as_ref()?.sessions.iter().find(|s| {
+            s.kind == SessionKind::Master
+                && s.repo == repo
+                && s.doc == Some(number)
+                && s.state.is_live()
+        })
+    }
+
+    /// The runner key of runner `name`: its pinned fingerprint.
+    pub(super) fn runner_key(&self, name: &str) -> Option<RunnerKey> {
+        let fingerprint = self
+            .runner_view(name)?
+            .fingerprint
+            .parse::<weida::Fingerprint>()
+            .ok()?;
+        Some(RunnerKey::new(&fingerprint.to_string()))
+    }
+}
+
+/// The `Runs on` a text field says: `;`-separated selectors, trimmed; an
+/// empty text is any runner.
+fn runs_on_of(text: &str) -> Vec<String> {
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    text.split(';').map(|part| part.trim().to_owned()).collect()
+}
+
 impl App {
     /// A plan or proposal of `repo` changed: its Plans tab asks for the list
     /// again, and the overview for the counts.
@@ -354,103 +416,126 @@ impl App {
         Task::batch(tasks)
     }
 
-    /// The runner of this editor's own state directory, when it is
-    /// connected: the first of the runner URLs is its endpoint file.
-    fn own_runner(&self) -> Option<(RunnerKey, Endpoint)> {
-        let url = self.runner_urls.first()?;
-        let address = weida::EndpointAddr::parse(url).ok()?;
-        let key = RunnerKey::new(&address.peer.as_ref()?.to_string());
-        let link = self.runtime.links.get(&key)?;
-        (link.kind == LinkKind::Runner).then(|| (key, link.endpoint.clone()))
-    }
-
-    /// Asks the own runner to open a session of the Plans tab's repository,
-    /// a planning one with `proposal` planning that open proposal.
-    pub(super) fn open_agent(
-        &mut self,
-        key: &RunnerKey,
-        view: u64,
-        session: AgentSession,
-        proposal: Option<u64>,
-    ) -> Task<Message> {
-        let own = self.own_runner();
+    /// A session of the CI changed: the overview, which lists them, is asked
+    /// for again.
+    pub(in crate::app) fn apply_ci_sessions_event(&mut self, key: &RunnerKey) -> Task<Message> {
         let Some(client) = self.ci.get_mut(key) else {
             return Task::none();
         };
-        let Some(state) = client.plans.get_mut(&view) else {
-            return Task::none();
-        };
-        let say = |state: &mut PlansState, text: String| {
-            state.notice = Some(Notice { text, failed: true });
+        if client.overview_pending {
+            client.overview_again = true;
             Task::none()
-        };
-        let Some((runner, endpoint)) = own else {
-            return say(
-                state,
-                "No runner of this editor's state directory".to_owned(),
-            );
-        };
-        let Some(summary) = client
-            .overview
-            .as_ref()
-            .and_then(|overview| overview.repos.iter().find(|r| r.repo == state.repo))
-        else {
-            return say(state, format!("The CI does not list {}", state.repo));
-        };
-        let request = AgentRequest {
-            session,
-            repo: state.repo.clone(),
-            origin: summary.origin.clone(),
-            default_branch: summary.default_branch.clone(),
-            proposal,
-        };
-        state.notice = None;
-        let key = key.clone();
-        Task::perform(feed::agent(endpoint, request), move |result| {
-            Message::Ci(
-                key,
-                CiMsg::AgentOpened {
-                    view,
-                    runner,
-                    result,
-                },
-            )
-        })
+        } else {
+            client.ask_overview(key)
+        }
     }
 
-    /// The session runs: its tab comes to the front once the runner's
-    /// workspace shows it. A refusal is said in the toolbar.
-    pub(super) fn agent_opened(
+    /// The name the CI knows this editor's own runner by, when that runner
+    /// hosts sessions: the first of the runner URLs is its endpoint file.
+    fn own_session_runner(&self, client: &CiClient) -> Option<String> {
+        let url = self.runner_urls.first()?;
+        let own = weida::EndpointAddr::parse(url).ok()?.peer?.to_string();
+        client
+            .overview
+            .as_ref()?
+            .machines
+            .iter()
+            .find(|m| {
+                m.kind == "runner"
+                    && m.sessions
+                    && m.fingerprint
+                        .parse::<weida::Fingerprint>()
+                        .is_ok_and(|fp| fp.to_string() == own)
+            })
+            .map(|m| m.name.clone())
+    }
+
+    /// Asks the CI for a plan session of the Plans tab's repository, on this
+    /// editor's own runner when it hosts sessions; with `proposal` it plans
+    /// that open proposal.
+    pub(super) fn open_session(
         &mut self,
         key: &RunnerKey,
         view: u64,
-        runner: RunnerKey,
-        result: Result<AgentReply, String>,
+        proposal: Option<u64>,
     ) -> Task<Message> {
-        let failure = match result {
-            Ok(AgentReply::Opened { terminal, .. }) => {
-                self.reveal = Some((runner, TerminalId(terminal)));
-                return Task::none();
-            }
-            Ok(AgentReply::Refused { message }) => message,
-            Err(e) => e,
+        let Some(client) = self.ci.get(key) else {
+            return Task::none();
         };
-        if let Some(state) = self
-            .ci
-            .get_mut(key)
-            .and_then(|client| client.plans.get_mut(&view))
-        {
-            state.notice = Some(Notice {
-                text: failure,
-                failed: true,
-            });
+        let runner = self.own_session_runner(client);
+        let Some(state) = client.plans.get(&view) else {
+            return Task::none();
+        };
+        let request = CiRequest::OpenSession {
+            repo: state.repo.clone(),
+            proposal,
+            runner,
+        };
+        let endpoint = client.endpoint.clone();
+        if let Some(state) = self.ci.get_mut(key).and_then(|c| c.plans.get_mut(&view)) {
+            state.notice = None;
         }
-        Task::none()
+        let key = key.clone();
+        Task::perform(open(endpoint, request), move |result| {
+            Message::Ci(key, CiMsg::SessionOpened { view, result })
+        })
+    }
+
+    /// The CI took the session: its tab comes to the front once its runner
+    /// runs it. A refusal is said in the toolbar.
+    pub(super) fn session_opened(
+        &mut self,
+        key: &RunnerKey,
+        view: u64,
+        result: Result<SessionView, String>,
+    ) -> Task<Message> {
+        match result {
+            Ok(session) => {
+                self.reveal_session = Some((key.clone(), session.id));
+                self.apply_ci_sessions_event(key)
+            }
+            Err(e) => {
+                if let Some(state) = self.ci.get_mut(key).and_then(|c| c.plans.get_mut(&view)) {
+                    state.notice = Some(Notice {
+                        text: e,
+                        failed: true,
+                    });
+                }
+                Task::none()
+            }
+        }
     }
 
     /// Brings the tab of a terminal a runner just opened for this editor to
-    /// the front, once that runner's workspace has it.
+    /// the front, once that runner's workspace has it. A session the CI
+    /// opened names its terminal once its runner runs it; one that failed
+    /// says why.
     pub(in crate::app) fn reveal_opened_terminal(&mut self) {
+        if let Some((ci, id)) = self.reveal_session.clone() {
+            let session = self.ci.get(&ci).and_then(|client| {
+                let session = client
+                    .overview
+                    .as_ref()?
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == id)?;
+                Some((session.clone(), client.runner_key(&session.runner)))
+            });
+            match session {
+                Some((session, _)) if session.state == SessionState::Failed => {
+                    self.reveal_session = None;
+                    self.hint = Some((
+                        format!("session {id}: {}", session.message),
+                        iced::time::Instant::now(),
+                    ));
+                }
+                Some((session, Some(runner))) if session.terminal.is_some() => {
+                    self.reveal_session = None;
+                    self.reveal = session.terminal.map(|t| (runner, TerminalId(t)));
+                }
+                _ => {}
+            }
+        }
         let Some((runner, terminal)) = self.reveal.clone() else {
             return;
         };
@@ -516,48 +601,67 @@ impl App {
         {
             toolbar = toolbar.push(text(error.as_str()).size(TEXT_SM).color(self.theme.error()));
         }
-        let own = self.own_runner().is_some();
-        for (glyph, words, session, what) in [
-            (
-                EDIT,
-                "Plan session",
-                AgentSession::Plan,
-                "omp in plan mode in the -plan worktree of the default branch",
-            ),
+        let possible = client.sessions_possible();
+        let mut pressed = action_button(EDIT, "Plan session");
+        if possible {
+            pressed = pressed.on_press_with(move || {
+                Message::Ci(
+                    runner.clone(),
+                    CiMsg::OpenSession {
+                        view,
+                        proposal: None,
+                    },
+                )
+            });
+        }
+        let what = if possible {
+            "omp in plan mode on a session runner, through the CI"
+        } else {
+            "no connected runner hosts sessions (sessions = true in ci.toml)"
+        };
+        toolbar = toolbar.push(tip(pressed, what.to_owned()));
+        let paused = client
+            .overview
+            .as_ref()
+            .and_then(|o| o.repos.iter().find(|r| r.repo == state.repo))
+            .is_some_and(|r| r.paused);
+        let (glyph, words, what) = if paused {
             (
                 TERMINAL,
-                "Master",
-                AgentSession::Master,
-                "The session that executes the approved plans one after another",
-            ),
-        ] {
-            let mut pressed = action_button(glyph, words);
-            if own {
-                pressed = pressed.on_press_with(move || {
-                    Message::Ci(
-                        runner.clone(),
-                        CiMsg::OpenAgent {
-                            view,
-                            session,
-                            proposal: None,
-                        },
-                    )
-                });
-            }
-            let words = if own {
-                what.to_owned()
-            } else {
-                "no runner of this editor's state directory".to_owned()
+                "Resume queue",
+                "Dispatch the approved plans to runners again",
+            )
+        } else {
+            (
+                TERMINAL,
+                "Pause queue",
+                "Start no master for the approved plans until resumed",
+            )
+        };
+        let mut pressed = action_button(glyph, words);
+        if !state.acting {
+            let request = CiRequest::QueuePaused {
+                repo: state.repo.clone(),
+                paused: !paused,
             };
-            toolbar = toolbar.push(tip(pressed, words));
+            pressed = pressed.on_press_with(move || {
+                Message::Ci(
+                    runner.clone(),
+                    CiMsg::DocAct {
+                        view,
+                        request: request.clone(),
+                    },
+                )
+            });
         }
+        toolbar = toolbar.push(tip(pressed, what.to_owned()));
 
         let body: Element<'a, Message, Theme> = if state.docs.is_empty() {
             let why = match (&state.error, state.loaded) {
                 (Some(error), _) => error.as_str(),
                 (None, true) => {
-                    "No plans or proposals yet. A session saves its plan with /zeughaus save; \
-                     another project's session writes a proposal with proposal_write."
+                    "No plans or proposals yet. A plan session saves its plan from the plan \
+                     review; another project's session writes a proposal with proposal_write."
                 }
                 (None, false) => "Loading plans.",
             };
@@ -566,7 +670,7 @@ impl App {
             row![
                 self.doc_list(runner, view, state),
                 rule::vertical(1),
-                self.doc_detail(runner, view, state),
+                self.doc_detail(runner, client, view, state),
             ]
             .height(Length::Fill)
             .into()
@@ -618,6 +722,7 @@ impl App {
     fn doc_detail<'a>(
         &'a self,
         runner: &'a RunnerKey,
+        client: &'a CiClient,
         view: u64,
         state: &'a PlansState,
     ) -> Element<'a, Message, Theme> {
@@ -655,20 +760,19 @@ impl App {
         if doc.kind == DocKind::Proposal && doc.state == DocState::Open {
             let number = doc.number;
             let mut pressed = action_button(EDIT, "Plan");
-            let what = if self.own_runner().is_some() {
+            let what = if client.sessions_possible() {
                 pressed = pressed.on_press_with(move || {
                     Message::Ci(
                         runner.clone(),
-                        CiMsg::OpenAgent {
+                        CiMsg::OpenSession {
                             view,
-                            session: AgentSession::Plan,
                             proposal: Some(number),
                         },
                     )
                 });
-                "omp plans it in plan mode in the -plan worktree"
+                "omp plans it in plan mode on a session runner"
             } else {
-                "no runner of this editor's state directory"
+                "no connected runner hosts sessions (sessions = true in ci.toml)"
             };
             buttons = buttons.push(tip(pressed, what.to_owned()));
         }
@@ -713,12 +817,18 @@ impl App {
                 .into(),
             _ => text("Loading.").size(TEXT_SM).color(muted).into(),
         };
-        let head = column![
+        let mut head = column![
             text(doc.title.as_str()).size(TEXT_MD + 4.0),
             text(meta).size(TEXT_SM).color(muted),
-            buttons,
         ]
         .spacing(SP_2);
+        if let Some(line) = self.runs_on_line(runner, view, state, doc) {
+            head = head.push(line);
+        }
+        if let Some(line) = self.master_line(runner, view, client, state, doc) {
+            head = head.push(line);
+        }
+        head = head.push(buttons);
         scrollable(
             column![head, rule::horizontal(1), text_part]
                 .spacing(SP_3)
@@ -728,6 +838,103 @@ impl App {
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+    }
+
+    /// The `Runs on` of a document: a field while it can change (an open
+    /// proposal, a saved or approved plan), else a line when it names any.
+    fn runs_on_line<'a>(
+        &'a self,
+        runner: &'a RunnerKey,
+        view: u64,
+        state: &'a PlansState,
+        doc: &'a DocView,
+    ) -> Option<Element<'a, Message, Theme>> {
+        let muted = self.theme.muted();
+        let editable = matches!(
+            (doc.kind, doc.state),
+            (DocKind::Proposal, DocState::Open)
+                | (DocKind::Plan, DocState::Saved)
+                | (DocKind::Plan, DocState::Approved)
+        );
+        let label = text("Runs on").size(TEXT_SM).color(muted);
+        if !editable {
+            if doc.runs_on.is_empty() {
+                return None;
+            }
+            return Some(
+                row![label, text(doc.runs_on.join("; ")).size(TEXT_SM)]
+                    .spacing(SP_2)
+                    .into(),
+            );
+        }
+        let number = doc.number;
+        let value = match &state.runs_on_input {
+            Some((edited, value)) if *edited == number => value.clone(),
+            _ => doc.runs_on.join("; "),
+        };
+        let request = CiRequest::DocRunsOn {
+            repo: doc.repo.clone(),
+            number,
+            runs_on: runs_on_of(&value),
+        };
+        let field = text_input("any runner, or os=windows; os=linux", &value)
+            .size(TEXT_SM)
+            .on_input(move |text| {
+                Message::Ci(runner.clone(), CiMsg::RunsOnEdited { view, number, text })
+            })
+            .on_submit(Message::Ci(runner.clone(), CiMsg::DocAct { view, request }));
+        Some(
+            row![label, field]
+                .spacing(SP_2)
+                .align_y(Alignment::Center)
+                .into(),
+        )
+    }
+
+    /// Where a plan's master session runs, with its terminal to attach and
+    /// a stop; `None` without a live one.
+    fn master_line<'a>(
+        &'a self,
+        runner: &'a RunnerKey,
+        view: u64,
+        client: &'a CiClient,
+        state: &'a PlansState,
+        doc: &'a DocView,
+    ) -> Option<Element<'a, Message, Theme>> {
+        let session = client.master_of(&doc.repo, doc.number)?;
+        let mut place = format!("on {}", session.runner);
+        if !session.machines.is_empty() {
+            let names: Vec<&str> = session.machines.iter().map(|m| m.name.as_str()).collect();
+            place.push_str(&format!(" (+ {})", names.join(", ")));
+        }
+        let mut line = row![text(place).size(TEXT_SM).color(self.theme.muted())]
+            .spacing(SP_2)
+            .align_y(Alignment::Center);
+        let mut attach = action_button(TERMINAL, "Attach");
+        if let (Some(key), Some(terminal)) = (client.runner_key(&session.runner), session.terminal)
+        {
+            attach = attach
+                .on_press_with(move || Message::AttachTerminal(key.clone(), TerminalId(terminal)));
+        }
+        line = line.push(tip(
+            attach,
+            "Show the session's terminal in a tab".to_owned(),
+        ));
+        let mut stop = action_button(glyph::CLOSE, "Stop");
+        if !state.acting {
+            let request = CiRequest::CloseSession { id: session.id };
+            stop = stop.on_press_with(move || {
+                Message::Ci(
+                    runner.clone(),
+                    CiMsg::DocAct {
+                        view,
+                        request: request.clone(),
+                    },
+                )
+            });
+        }
+        line = line.push(tip(stop, "End the session's terminal".to_owned()));
+        Some(line.into())
     }
 }
 
@@ -760,11 +967,13 @@ mod tests {
                     default_branch: "main".to_owned(),
                     awaiting: 0,
                     queued: 0,
-                    running: None,
+                    in_progress: Vec::new(),
+                    paused: false,
                     proposals: 0,
                 })
                 .collect(),
             build: 0,
+            sessions: Vec::new(),
         }
     }
 

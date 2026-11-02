@@ -152,7 +152,8 @@ while it holds a tab.
 
 `zeughaus-runner [--state-dir <dir>] mcp [--ci <url>]` is an MCP server on
 stdio, for an agent that starts it as a tool server. It dials the CI that
-`--ci` names, else the first `ci = [..]` of `<state-dir>/zeughaus.toml`, with
+`--ci` names, else `$ZEUGHAUS_CI`, else the first `ci = [..]` of
+`<state-dir>/zeughaus.toml`, else the `ci` of its `enlist.toml`, with
 that directory's `client.pem`, so it is the same principal as an editor
 there; without either it still starts and every tool answers with what is
 missing. `ci_status`, `ci_pipelines`, `ci_pipeline`, `ci_log`, `ci_rerun`
@@ -191,8 +192,8 @@ proposals (below). Nothing but
 protocol messages is written to its stdout.
 `zeughaus-runner [--state-dir <dir>] ci repo [--json] [<path>]`, `ci
 find [--json] <repo> <sha>`, `ci doc [--json] <repo> <n>`, `ci plan-save
-[--json] [--approve] <repo> <file>`, `ci planned <repo> <file>` and `ci
-overdue <repo> <number> <job>` answer
+[--json] [--approve] <repo> <file>`, `ci planned <repo> <file>`, `ci
+overdue <repo> <number> <job>` and `ci session [--json] <id>` answer
 the same for a script (exit 3: the origin is no repository of `ci.toml`;
 2: no CI, no answer or a refusal); the
 `zeughaus-ci` omp plugin in `omp-plugin/` uses them for its session
@@ -204,26 +205,41 @@ Plans and proposals: the CI keeps them per repository in
 `<state-dir>/ci/docs/<repo>/<n>.json` (numbers shared by both kinds, never
 reused). A proposal is `open`, then `planned` (a plan names it in a
 `Proposals: #3, #5` line under its title) or `dismissed`; a plan is
-`saved`, `approved` in the editor, `in_progress` once a master claims it
-(only one per repository), then `done` (`plan_done`) or `rejected`. Each
-change is announced as `CiDocs` on `/events`. A CI section's repository
-group starts with its Plans tab, whose `Plan session` and `Master` buttons
-ask the editor's own runner on `/agent` (Unix) to open `zeughaus-runner
-plan <repo>` or `master <repo>` in a terminal of its `Triggered` group, in
-the session's own clone under `<state-dir>/agent-work/`, never in the
-user's checkouts (a missing one is cloned over ssh from the origin in that
-terminal first): `plan` brings the plan clone
-`agent-work/plan/<origin>`, which borrows the objects of the master clone,
-detached to `origin/<default branch>` and runs omp there on the `plan`
-model role (`--model @plan`); `master` claims approved plans
-one after another and runs `omp @<plan> <instruction>` with
-`ZEUGHAUS_PLAN=<repo>#<n>` in the master clone `agent-work/master/<origin>`,
-which it fast-forwards to the default branch before each claim, waiting
-while the clone is dirty or has unpushed commits or a plan is in progress.
-While it runs, a session holds a shared lock on the clone's
-`.git/zeughaus-session.lock`. An open proposal's `Plan`
-button opens `plan <repo> --proposal <n>` (tab `plan <repo> #<n>`), which
-attaches the proposal to omp's first prompt so planning starts at once.
+`saved`, `approved` in the editor, `in_progress` once the CI starts a
+master session for it, then `done` (`plan_done`) or `rejected`. A plan or
+proposal names the machines its work needs in a `Runs on: <selector>[;
+<selector>]` line under its title (one label selector per machine, the
+first hosting the session, the others reached over ssh; editable in the
+Plans tab while it is open, saved or approved). Each change is announced as
+`CiDocs` on `/events`. Sessions run on the runners, dispatched by the CI
+(`<state-dir>/ci/sessions.json`, announced as `CiSessions`): every 2 s it
+starts a master for each approved plan of a repository whose queue is not
+paused (`ci/docs/<repo>/paused`, the Plans tab's `Pause queue`) on a free
+connected runner with `sessions = true` that its first selector matches,
+reserving the `ssh` runners its other selectors match; a runner hosts one
+master at a time, so several plans run at once on different runners. The
+runner opens `zeughaus-runner master <repo> --plan <n>` in a detached
+terminal (attach it from the plan's `Attach`), in the session's own clone
+under `<state-dir>/agent-work/`, never in the user's checkouts (a missing
+one is cloned over ssh from the origin in that terminal first): it
+fast-forwards the master clone `agent-work/master/<origin>` to the default
+branch, waiting while it is dirty or has unpushed commits, and runs `omp
+@<plan> <instruction>` with `ZEUGHAUS_PLAN=<repo>#<n>`, then exits with
+omp's code; the plan stays `in_progress` until `plan_done`, Requeue or Mark
+done. A session that fails to start puts its plan back in the queue and
+keeps its runner from masters for 5 minutes. The Plans tab's `Plan session`
+and an open proposal's `Plan` ask the CI for a plan session (on the
+editor's own runner when it hosts sessions), which opens `zeughaus-runner
+plan <repo> [--proposal <n>]` in the runner's `Triggered` group: it brings
+the plan clone `agent-work/plan/<origin>`, which borrows the objects of the
+master clone, detached to `origin/<default branch>` and runs omp there on
+the `plan` model role (`--model @plan`), the proposal attached to its first
+prompt. Every session sees `ZEUGHAUS_SESSION`, `ZEUGHAUS_RUNNER`,
+`ZEUGHAUS_CI` (which its MCP server and `ci` commands dial) and
+`ZEUGHAUS_MACHINES` (`name=ssh;...`), and `ZEUGHAUS_OMP` overrides the omp
+it runs; `zeughaus-runner ci session [--json] <id>` describes it, which the
+omp plugin puts into the session's prompt. While it runs, a session holds a
+shared lock on the clone's `.git/zeughaus-session.lock`.
 In every session `plan` starts (`ZEUGHAUS_PLAN_SESSION=<repo>`), the omp
 plugin supplies the plan mode instead of omp's: a plan-session system
 prompt, a read-only working tree for every agent (`write`/`edit` only to

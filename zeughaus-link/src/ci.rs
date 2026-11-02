@@ -143,6 +143,10 @@ pub enum CiRequest {
         source: String,
         #[serde(default)]
         proposals: Vec<u64>,
+        /// One label selector per machine the work needs, the first hosting
+        /// the session (see [`crate::selector`]).
+        #[serde(default)]
+        runs_on: Vec<String>,
     },
     /// Moves a document to another state, where the state machine allows
     /// it. Answers [`CiReply::Accepted`].
@@ -153,10 +157,30 @@ pub enum CiRequest {
     },
     /// Deletes a finished document. Answers [`CiReply::Accepted`].
     DocDelete { repo: String, number: u64 },
-    /// The oldest approved plan becomes `in_progress` and comes back with its
-    /// body; answers [`CiReply::Doc`], `None` when nothing is approved, an
-    /// error while a plan is in progress.
-    PlanClaim { repo: String },
+    /// Sets the `Runs on` of an open proposal or of a saved or approved
+    /// plan. Answers [`CiReply::Accepted`].
+    DocRunsOn {
+        repo: String,
+        number: u64,
+        runs_on: Vec<String>,
+    },
+    /// Stops or resumes dispatching `repo`'s approved plans. Answers
+    /// [`CiReply::Accepted`].
+    QueuePaused { repo: String, paused: bool },
+    /// Opens a plan session of `repo` on a runner that hosts sessions: the
+    /// named one, else one matching the proposal's first `Runs on`, else
+    /// any. Answers [`CiReply::Session`].
+    OpenSession {
+        repo: String,
+        #[serde(default)]
+        proposal: Option<u64>,
+        #[serde(default)]
+        runner: Option<String>,
+    },
+    /// One session. Answers [`CiReply::Session`].
+    Session { id: u64 },
+    /// Ends a live session's terminal. Answers [`CiReply::Accepted`].
+    CloseSession { id: u64 },
     /// Queues an event of `repo` on its default branch: a push, or with
     /// `nightly` the repository's nightly, which waits for any other
     /// nightly that runs. The commit is the branch's head when the
@@ -319,6 +343,9 @@ pub enum CiReply {
     States {
         states: Vec<StateView>,
     },
+    Session {
+        session: SessionView,
+    },
     Error {
         message: String,
     },
@@ -339,9 +366,96 @@ pub struct CiOverview {
     /// Every repository of `ci.toml` and its documents, in name order.
     #[serde(default)]
     pub repos: Vec<RepoDocsView>,
-    /// The CI's own build (pipeline number); 0 for one built elsewhere.
     #[serde(default)]
     pub build: u64,
+    /// The live agent sessions, then the newest ended ones.
+    #[serde(default)]
+    pub sessions: Vec<SessionView>,
+}
+
+/// What an agent session does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    /// omp in plan mode in the repository's plan clone.
+    Plan,
+    /// omp executing one approved plan in the master clone.
+    Master,
+}
+
+impl SessionKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            SessionKind::Plan => "plan",
+            SessionKind::Master => "master",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    /// Sent to its runner, which has not answered yet.
+    Starting,
+    Running,
+    Ended,
+    /// It never ran: the runner refused it or went away.
+    Failed,
+}
+
+impl SessionState {
+    pub fn name(self) -> &'static str {
+        match self {
+            SessionState::Starting => "starting",
+            SessionState::Running => "running",
+            SessionState::Ended => "ended",
+            SessionState::Failed => "failed",
+        }
+    }
+
+    pub fn is_live(self) -> bool {
+        matches!(self, SessionState::Starting | SessionState::Running)
+    }
+}
+
+/// One more machine a session works on, reached over ssh.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMachine {
+    pub name: String,
+    #[serde(default)]
+    pub ssh: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub addresses: Vec<String>,
+}
+
+/// An agent session the CI dispatched to a runner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionView {
+    pub id: u64,
+    pub repo: String,
+    pub kind: SessionKind,
+    /// A master's plan, a plan session's proposal.
+    #[serde(default)]
+    pub doc: Option<u64>,
+    /// The runner the session runs on.
+    pub runner: String,
+    #[serde(default)]
+    pub machines: Vec<SessionMachine>,
+    pub state: SessionState,
+    /// Its terminal in the runner's mux, once it runs.
+    #[serde(default)]
+    pub terminal: Option<u64>,
+    /// Unix seconds.
+    pub started: u64,
+    #[serde(default)]
+    pub ended: Option<u64>,
+    #[serde(default)]
+    pub code: Option<i32>,
+    /// Why it failed, or how it ended.
+    #[serde(default)]
+    pub message: String,
 }
 
 /// What a plan or a proposal is.
@@ -421,6 +535,13 @@ pub struct DocView {
     /// A proposal: the plan that took it up.
     #[serde(default)]
     pub plan: Option<u64>,
+    /// One label selector per machine the work needs, the first hosting
+    /// the session; empty is any runner.
+    #[serde(default)]
+    pub runs_on: Vec<String>,
+    /// A plan: the runners it runs or ran on, the host first.
+    #[serde(default)]
+    pub placement: Vec<String>,
     /// Empty in lists.
     #[serde(default)]
     pub body: String,
@@ -437,8 +558,12 @@ pub struct RepoDocsView {
     pub awaiting: u32,
     /// Plans in `approved`.
     pub queued: u32,
-    /// The plan in `in_progress`.
-    pub running: Option<u64>,
+    /// The plans in `in_progress`.
+    #[serde(default)]
+    pub in_progress: Vec<u64>,
+    /// The CI dispatches none of its approved plans.
+    #[serde(default)]
+    pub paused: bool,
     /// Proposals in `open`.
     pub proposals: u32,
 }
@@ -1062,6 +1187,7 @@ mod tests {
                 body: "# Plan\n".to_owned(),
                 source: "griasdi".to_owned(),
                 proposals: vec![1, 2],
+                runs_on: vec!["os=linux".to_owned(), "os=windows".to_owned()],
             },
             CiRequest::DocState {
                 repo: "griasdi".to_owned(),
@@ -1072,9 +1198,22 @@ mod tests {
                 repo: "griasdi".to_owned(),
                 number: 3,
             },
-            CiRequest::PlanClaim {
+            CiRequest::DocRunsOn {
                 repo: "griasdi".to_owned(),
+                number: 3,
+                runs_on: vec!["os=macos".to_owned()],
             },
+            CiRequest::QueuePaused {
+                repo: "griasdi".to_owned(),
+                paused: true,
+            },
+            CiRequest::OpenSession {
+                repo: "griasdi".to_owned(),
+                proposal: Some(2),
+                runner: None,
+            },
+            CiRequest::Session { id: 4 },
+            CiRequest::CloseSession { id: 4 },
         ];
         for request in requests {
             assert_eq!(CiRequest::decode(&request.encode()), Some(request));
@@ -1132,10 +1271,12 @@ mod tests {
                         default_branch: "main".to_owned(),
                         awaiting: 1,
                         queued: 2,
-                        running: Some(4),
+                        in_progress: vec![4, 6],
+                        paused: true,
                         proposals: 3,
                     }],
                     build: 116,
+                    sessions: vec![session()],
                 },
             },
             CiReply::Pipelines {
@@ -1208,6 +1349,7 @@ mod tests {
             },
             CiReply::Doc { doc: None },
             CiReply::DocCreated { number: 5 },
+            CiReply::Session { session: session() },
             CiReply::Error {
                 message: "no such job".to_owned(),
             },
@@ -1344,7 +1486,31 @@ mod tests {
             approved: None,
             proposals: Vec::new(),
             plan: Some(4),
+            runs_on: vec!["os=windows".to_owned()],
+            placement: vec!["atik".to_owned(), "wohnzimmer".to_owned()],
             body: "Body".to_owned(),
+        }
+    }
+
+    fn session() -> SessionView {
+        SessionView {
+            id: 3,
+            repo: "griasdi".to_owned(),
+            kind: SessionKind::Master,
+            doc: Some(4),
+            runner: "atik".to_owned(),
+            machines: vec![SessionMachine {
+                name: "wohnzimmer".to_owned(),
+                ssh: Some("zeughaus@10.8.0.12".to_owned()),
+                labels: vec!["os=windows".to_owned()],
+                addresses: Vec::new(),
+            }],
+            state: SessionState::Running,
+            terminal: Some(12),
+            started: 100,
+            ended: None,
+            code: None,
+            message: String::new(),
         }
     }
 
@@ -1357,6 +1523,7 @@ mod tests {
             body: "b".to_owned(),
             source: "s".to_owned(),
             proposals: Vec::new(),
+            runs_on: Vec::new(),
         }
         .encode();
         let value: serde_json::Value = serde_json::from_slice(&wire).unwrap();

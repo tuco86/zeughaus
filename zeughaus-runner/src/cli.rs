@@ -26,8 +26,9 @@
 //! zeughaus-runner ci planned <repo> <file>
 //! zeughaus-runner ci wait <repo> <number|sha> [<job>]
 //! zeughaus-runner ci overdue <repo> <number> <job>
+//! zeughaus-runner ci session [--json] <id>
 //! zeughaus-runner plan <repo> --branch <branch> --origin <origin> [--proposal <n>]
-//! zeughaus-runner master <repo> --branch <branch> --origin <origin>
+//! zeughaus-runner master <repo> --plan <n> --branch <branch> --origin <origin>
 //! zeughaus-runner maintain
 //! zeughaus-runner tidy [--dry-run] [--list]
 //! zeughaus-runner timeout <seconds> -- <program> [args..]
@@ -63,8 +64,9 @@ usage: zeughaus-runner [--state-dir <dir>] [--feed-addr <host:port>] [--keep-run
        zeughaus-runner ci planned <repo> <file>
        zeughaus-runner ci wait <repo> <number|sha> [<job>]
        zeughaus-runner ci overdue <repo> <number> <job>
+       zeughaus-runner ci session [--json] <id>
        zeughaus-runner plan <repo> --branch <branch> --origin <origin> [--proposal <n>]
-       zeughaus-runner master <repo> --branch <branch> --origin <origin>
+       zeughaus-runner master <repo> --plan <n> --branch <branch> --origin <origin>
        zeughaus-runner maintain
        zeughaus-runner tidy [--dry-run] [--list]
        zeughaus-runner timeout <seconds> -- <program> [args..]

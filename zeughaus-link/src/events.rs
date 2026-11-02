@@ -95,6 +95,10 @@ pub enum RuntimeEvent {
         seq: u64,
         entry: crate::activity::ActivityEntry,
     },
+    /// An agent session of the CI started, changed state or ended. An
+    /// editor asks `/ci` for the overview. Only the CI sends it, on
+    /// [`TOPIC_CI`].
+    CiSessions { seq: u64 },
 }
 
 impl RuntimeEvent {
@@ -303,6 +307,7 @@ mod tests {
                     killed: false,
                 },
             },
+            RuntimeEvent::CiSessions { seq: 19 },
         ];
         for event in events {
             assert_eq!(RuntimeEvent::decode(&event.encode()), Some(event));

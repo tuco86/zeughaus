@@ -1731,13 +1731,34 @@ last number in `last`, so a deleted number is never given out again. The
 state machine (`docs::allowed`) is the whole contract: a proposal goes from
 `open` to `planned` or `dismissed`; a plan from `saved` to `approved` or
 `rejected`, `approved` to `rejected`, `in_progress` to `done` or back to
-`approved`. Only `PlanClaim` moves a plan to `in_progress`: the oldest
-approved one, refused while another is in progress, which is what keeps one
-master working in a checkout. The `/ci` server serializes every mutation
-behind one lock and announces each on `/events` as `CiDocs`. The runner's
-`/agent` path (Unix, `zeughaus-link::agent`) opens the `plan` and `master`
-sessions in its mux; their labels (`master <repo>`) are how a second request
-finds the running one.
+`approved`. Only the CI's session dispatcher (`zeughaus-ci/src/sessions.rs`)
+moves a plan to `in_progress`, recording the runners it placed it on. The
+`/ci` server and the dispatcher serialize every mutation behind one lock and
+announce each on `/events` as `CiDocs`.
+
+**Agent sessions.** The dispatcher runs every 2 s over the approved plans of
+every repository whose queue is not paused, by approval: a plan's `Runs on`
+is one label selector per machine (`zeughaus-link::selector`), the first
+placed on a connected runner with `sessions = true` that hosts no live master
+and is not cooling down after a failed start, the others on distinct
+connected runners with `ssh`, reserved for that master. A runner's labels are
+`ci.toml`'s plus `runner=`, `os=` and `arch=` from its offer. The CI sends
+the host `ToRunner::OpenSession` with a `SessionSpec`; the runner's agents
+(`zeughaus-runner/src/agents.rs`, Unix) open the session in a terminal of
+its mux and answer `SessionOpened` or `SessionFailed`, and a watcher per
+session reports `SessionEnded` from the terminal's end, which the mux
+remembers for closed terminals. A runner keeps its sessions in
+`<state-dir>/sessions.json` and reports them in `Hello`, so a reconnect
+settles sessions that ended meanwhile. Plan sessions are opened on request
+(`CiRequest::OpenSession`) and never count as busy. The registry is
+`<state-dir>/ci/sessions.json`, every change announced as `CiSessions`.
+
+**Runners by name.** A runner's `Hello` carries its endpoint and the
+addresses it answers at; the overview lists each runner's fingerprint,
+labels and addresses, and the editor dials a runner only a CI announces as
+`weida://<fp>@<name>.runner.zeughaus:<port>/`, which its own
+`weida::Resolver` (`zeughaus/src/directory.rs`) answers from those
+addresses.
 
 ## 15. Not built
 

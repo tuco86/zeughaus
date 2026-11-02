@@ -1,6 +1,7 @@
 //! Plans and proposals as an agent and a script read them, and what a plan
 //! file says about itself. Pure: the clock is an argument.
 
+use zeughaus_link::selector::Selector;
 use zeughaus_link::{DocView, MAX_DOC_TITLE_BYTES, doc_groups};
 
 /// How many lines under its title a plan may name its proposals in.
@@ -48,6 +49,32 @@ pub fn proposals_named(body: &str) -> Result<Vec<u64>, String> {
             digits.parse::<u64>().map_err(|_| malformed())
         })
         .collect()
+}
+
+/// The machines a plan needs, from a `Runs on: os=linux; os=windows` line
+/// among its first lines: one label selector per machine, the first hosting
+/// the session. None without such a line, which is any runner.
+pub fn runs_on_named(body: &str) -> Result<Vec<String>, String> {
+    let Some(line) = body
+        .lines()
+        .take(PROPOSALS_WITHIN)
+        .find(|line| line.starts_with("Runs on:"))
+    else {
+        return Ok(Vec::new());
+    };
+    let malformed = || format!("malformed Runs on line: {line}");
+    let list = line["Runs on:".len()..].trim();
+    if list.is_empty() {
+        return Err(malformed());
+    }
+    let selectors: Vec<String> = list.split(';').map(|part| part.trim().to_owned()).collect();
+    for selector in &selectors {
+        if selector.is_empty() {
+            return Err(malformed());
+        }
+        Selector::parse(selector).map_err(|_| malformed())?;
+    }
+    Ok(selectors)
 }
 
 /// `5m`, `3h`, `2d`: whole minutes below an hour, whole hours below a day,
@@ -122,6 +149,8 @@ mod tests {
             approved: None,
             proposals: Vec::new(),
             plan: None,
+            runs_on: Vec::new(),
+            placement: Vec::new(),
             body: String::new(),
         }
     }
@@ -162,6 +191,25 @@ mod tests {
             assert_eq!(
                 proposals_named(&format!("# T\n{bad}\n")),
                 Err(format!("malformed Proposals line: {bad}")),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plan_names_its_machines_in_a_runs_on_line() {
+        assert_eq!(
+            runs_on_named("# T\nProposals: #3\nRuns on: os=linux ; os=windows,arch=amd64\n"),
+            Ok(vec![
+                "os=linux".to_owned(),
+                "os=windows,arch=amd64".to_owned()
+            ])
+        );
+        assert_eq!(runs_on_named("# T\n\nbody\n"), Ok(Vec::new()));
+        for bad in ["Runs on:", "Runs on: os=linux;", "Runs on: OS=linux"] {
+            assert_eq!(
+                runs_on_named(&format!("# T\n{bad}\n")),
+                Err(format!("malformed Runs on line: {bad}")),
                 "{bad}"
             );
         }

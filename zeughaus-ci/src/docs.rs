@@ -3,14 +3,17 @@
 //! `<state-dir>/ci/docs/<repo>/<number>.json` holds one document as the
 //! view the editor shows, body included; `<state-dir>/ci/docs/<repo>/last`
 //! holds the last number assigned, so a deleted document's number is never
-//! given out again. Callers serialize the mutating functions (one lock in
-//! the `/ci` server): numbering and the one-plan-in-progress rule rely on it.
+//! given out again, and `<state-dir>/ci/docs/<repo>/paused`, when present,
+//! stops the CI from dispatching the repository's approved plans. Callers
+//! serialize the mutating functions (one lock shared by the `/ci` server
+//! and the session dispatcher): numbering relies on it.
 
 use std::path::{Path, PathBuf};
 
 use zeughaus_link::ci::{
     DocKind, DocState, DocView, MAX_DOC_BYTES, MAX_DOC_TITLE_BYTES, RepoDocsView, normalize_origin,
 };
+use zeughaus_link::selector::parse_runs_on;
 
 use crate::config::{CiConfig, valid_name};
 use crate::files::{read_json, write_atomic, write_json};
@@ -28,10 +31,11 @@ pub struct NewDoc<'a> {
     pub body: &'a str,
     pub source: &'a str,
     pub proposals: &'a [u64],
+    pub runs_on: &'a [String],
 }
 
 /// Whether a document of `kind` may move from `from` to `to` on request.
-/// `approved -> in_progress` is not among them: only [`claim`] does that.
+/// `approved -> in_progress` is not among them: only [`start`] does that.
 pub fn allowed(kind: DocKind, from: DocState, to: DocState) -> bool {
     use DocState::*;
     match kind {
@@ -141,6 +145,7 @@ pub fn create(
             "a source is 1 to {MAX_SOURCE_BYTES} of A-Z a-z 0-9 . _ -"
         ));
     }
+    parse_runs_on(new.runs_on)?;
     if new.kind == DocKind::Proposal && !new.proposals.is_empty() {
         return Err("only a plan names proposals".to_owned());
     }
@@ -183,6 +188,8 @@ pub fn create(
         approved: None,
         proposals: taken.iter().map(|doc| doc.number).collect(),
         plan: None,
+        runs_on: new.runs_on.to_vec(),
+        placement: Vec::new(),
         body: new.body.to_owned(),
     };
     write_json(&path_of(&dir, number), &doc)?;
@@ -208,7 +215,7 @@ pub fn set_state(
     now: u64,
 ) -> Result<(), String> {
     if to == DocState::InProgress {
-        return Err("only a master claims a plan".to_owned());
+        return Err("only the CI starts a plan".to_owned());
     }
     let dir = dir(state_dir, config, repo)?;
     let path = path_of(&dir, number);
@@ -250,35 +257,98 @@ pub fn delete(state_dir: &Path, config: &CiConfig, repo: &str, number: u64) -> R
     std::fs::remove_file(&path).map_err(|e| format!("cannot delete {}: {e}", path.display()))
 }
 
-/// The oldest approved plan of `repo` (by approval, then number) becomes
-/// `in_progress` and comes back with its body; `None` when no plan is
-/// approved. Refused while another plan is in progress: one master works in
-/// a checkout at a time.
-pub fn claim(
+/// Sets the `Runs on` of an open proposal or of a saved or approved plan.
+pub fn set_runs_on(
     state_dir: &Path,
     config: &CiConfig,
     repo: &str,
+    number: u64,
+    runs_on: Vec<String>,
     now: u64,
-) -> Result<Option<DocView>, String> {
+) -> Result<(), String> {
+    parse_runs_on(&runs_on)?;
     let dir = dir(state_dir, config, repo)?;
-    let plans: Vec<DocView> = read_all(&dir)
-        .into_iter()
-        .filter(|doc| doc.kind == DocKind::Plan)
-        .collect();
-    if let Some(running) = plans.iter().find(|doc| doc.state == DocState::InProgress) {
-        return Err(format!("plan #{} is in progress", running.number));
+    let path = path_of(&dir, number);
+    let mut doc: DocView = read_json(&path).map_err(|_| missing(repo, number))?;
+    let open = matches!(
+        (doc.kind, doc.state),
+        (DocKind::Proposal, DocState::Open)
+            | (DocKind::Plan, DocState::Saved)
+            | (DocKind::Plan, DocState::Approved)
+    );
+    if !open {
+        return Err(format!(
+            "#{number} is {}; its Runs on is fixed",
+            doc.state.name()
+        ));
     }
-    let Some(mut next) = plans
-        .into_iter()
-        .filter(|doc| doc.state == DocState::Approved)
-        .min_by_key(|doc| (doc.approved.unwrap_or(0), doc.number))
-    else {
-        return Ok(None);
-    };
-    next.state = DocState::InProgress;
-    next.changed = now;
-    write_json(&path_of(&dir, next.number), &next)?;
-    Ok(Some(next))
+    doc.runs_on = runs_on;
+    doc.changed = now;
+    write_json(&path, &doc)
+}
+
+/// Approved plan `number` becomes `in_progress` on the runners of
+/// `placement` (the host first) and comes back with its body.
+pub fn start(
+    state_dir: &Path,
+    config: &CiConfig,
+    repo: &str,
+    number: u64,
+    placement: Vec<String>,
+    now: u64,
+) -> Result<DocView, String> {
+    let dir = dir(state_dir, config, repo)?;
+    let path = path_of(&dir, number);
+    let mut doc: DocView = read_json(&path).map_err(|_| missing(repo, number))?;
+    if doc.kind != DocKind::Plan || doc.state != DocState::Approved {
+        return Err(format!(
+            "#{number} is {}; only an approved plan starts",
+            doc.state.name()
+        ));
+    }
+    doc.state = DocState::InProgress;
+    doc.placement = placement;
+    doc.changed = now;
+    write_json(&path, &doc)?;
+    Ok(doc)
+}
+
+/// Every repository's approved plans, bodies empty, in the order they are
+/// dispatched: by approval, then number.
+pub fn queue(state_dir: &Path, config: &CiConfig) -> Vec<DocView> {
+    let mut plans: Vec<DocView> = config
+        .repos
+        .keys()
+        .flat_map(|repo| list(state_dir, config, repo))
+        .filter(|doc| doc.kind == DocKind::Plan && doc.state == DocState::Approved)
+        .collect();
+    plans.sort_by_key(|doc| (doc.approved.unwrap_or(0), doc.number));
+    plans
+}
+
+/// Whether the CI dispatches none of `repo`'s approved plans.
+pub fn paused(state_dir: &Path, config: &CiConfig, repo: &str) -> bool {
+    dir(state_dir, config, repo).is_ok_and(|dir| dir.join("paused").exists())
+}
+
+pub fn set_paused(
+    state_dir: &Path,
+    config: &CiConfig,
+    repo: &str,
+    paused: bool,
+) -> Result<(), String> {
+    let dir = dir(state_dir, config, repo)?;
+    let file = dir.join("paused");
+    if paused {
+        write_atomic(&file, b"")
+    } else {
+        match std::fs::remove_file(&file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(format!("cannot remove {}: {e}", file.display()))
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 /// One line per repository of `ci.toml`, in name order: what waits for whom.
@@ -299,10 +369,12 @@ pub fn summary(state_dir: &Path, config: &CiConfig) -> Vec<RepoDocsView> {
                 default_branch: repo.default_branch.clone(),
                 awaiting: count(DocKind::Plan, DocState::Saved),
                 queued: count(DocKind::Plan, DocState::Approved),
-                running: docs
+                in_progress: docs
                     .iter()
-                    .find(|doc| doc.kind == DocKind::Plan && doc.state == DocState::InProgress)
-                    .map(|doc| doc.number),
+                    .filter(|doc| doc.kind == DocKind::Plan && doc.state == DocState::InProgress)
+                    .map(|doc| doc.number)
+                    .collect(),
+                paused: paused(state_dir, config, name),
                 proposals: count(DocKind::Proposal, DocState::Open),
             }
         })
@@ -363,6 +435,7 @@ mod tests {
                 body: "body",
                 source: "weida",
                 proposals,
+                runs_on: &[],
             }
         }
 
@@ -435,35 +508,63 @@ mod tests {
         }
 
         #[test]
-        fn a_claim_takes_the_oldest_approved_plan_one_at_a_time() {
-            let state = scratch("claim");
+        fn plans_start_in_approval_order_and_several_run_at_once() {
+            let state = scratch("start");
             let config = config();
             for title in ["a", "b", "c"] {
                 create(&state, &config, "demo", new(DocKind::Plan, title, &[]), 1).unwrap();
             }
-            assert_eq!(claim(&state, &config, "demo", 2), Ok(None));
+            assert!(queue(&state, &config).is_empty());
             // #2 approved before #1: the queue follows approval.
             set_state(&state, &config, "demo", 2, Approved, 10).unwrap();
             set_state(&state, &config, "demo", 1, Approved, 20).unwrap();
             assert_eq!(
                 set_state(&state, &config, "demo", 1, InProgress, 21),
-                Err("only a master claims a plan".to_owned())
+                Err("only the CI starts a plan".to_owned())
             );
+            let queued: Vec<u64> = queue(&state, &config).iter().map(|d| d.number).collect();
+            assert_eq!(queued, vec![2, 1]);
 
-            let first = claim(&state, &config, "demo", 30).unwrap().expect("a plan");
-            assert_eq!((first.number, first.state), (2, InProgress));
-            assert_eq!(first.body, "body");
+            let first = start(&state, &config, "demo", 2, vec!["atik".to_owned()], 30).unwrap();
+            assert_eq!((first.state, first.body.as_str()), (InProgress, "body"));
+            let second = start(&state, &config, "demo", 1, vec!["x".to_owned()], 31).unwrap();
+            assert_eq!(second.placement, vec!["x".to_owned()]);
+            assert_eq!(summary(&state, &config)[0].in_progress, vec![1, 2]);
             assert_eq!(
-                claim(&state, &config, "demo", 31),
-                Err("plan #2 is in progress".to_owned())
+                start(&state, &config, "demo", 3, Vec::new(), 32),
+                Err("#3 is saved; only an approved plan starts".to_owned())
             );
+            assert!(queue(&state, &config).is_empty());
+        }
+
+        #[test]
+        fn runs_on_is_fixed_once_a_plan_is_in_progress() {
+            let state = scratch("runs-on");
+            let config = config();
+            create(&state, &config, "demo", new(DocKind::Plan, "a", &[]), 1).unwrap();
+            let windows = vec!["os=windows".to_owned()];
+            set_runs_on(&state, &config, "demo", 1, windows.clone(), 2).unwrap();
+            assert_eq!(load(&state, &config, "demo", 1).unwrap().runs_on, windows);
+            assert!(set_runs_on(&state, &config, "demo", 1, vec!["Bad".to_owned()], 3).is_err());
+            set_state(&state, &config, "demo", 1, Approved, 4).unwrap();
+            start(&state, &config, "demo", 1, vec!["w".to_owned()], 5).unwrap();
             assert_eq!(
-                delete(&state, &config, "demo", 1),
-                Err("#1 is approved; only a finished document is deleted".to_owned())
+                set_runs_on(&state, &config, "demo", 1, Vec::new(), 6),
+                Err("#1 is in_progress; its Runs on is fixed".to_owned())
             );
-            set_state(&state, &config, "demo", 2, Done, 32).unwrap();
-            let second = claim(&state, &config, "demo", 33).unwrap().expect("a plan");
-            assert_eq!(second.number, 1);
+        }
+
+        #[test]
+        fn a_paused_queue_is_a_file() {
+            let state = scratch("paused");
+            let config = config();
+            assert!(!paused(&state, &config, "demo"));
+            set_paused(&state, &config, "demo", true).unwrap();
+            assert!(paused(&state, &config, "demo"));
+            assert!(summary(&state, &config)[0].paused);
+            set_paused(&state, &config, "demo", false).unwrap();
+            set_paused(&state, &config, "demo", false).unwrap();
+            assert!(!paused(&state, &config, "demo"));
         }
 
         #[test]
@@ -474,7 +575,7 @@ mod tests {
                 let made = create(&state, &config, repo, new(DocKind::Proposal, "a", &[]), 1);
                 assert_eq!(made, Err(format!("no repository {repo}")));
                 assert!(list(&state, &config, repo).is_empty());
-                assert!(claim(&state, &config, repo, 1).is_err());
+                assert!(start(&state, &config, repo, 1, Vec::new(), 1).is_err());
             }
             assert!(!state.join("ci").exists());
             assert!(!state.join("x").exists());

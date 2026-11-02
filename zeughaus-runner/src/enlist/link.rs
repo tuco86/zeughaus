@@ -136,6 +136,7 @@ async fn exchange(
         artifacts: exec.artifact_sets(),
         addresses: hello_addresses(&exec.config.addresses, &endpoint),
         endpoint,
+        sessions: exec.session_reports(),
     };
     if let Err(e) = write_frame(&mut request, &hello).await {
         return Ended::lost(format!("hello: {e}"));
@@ -162,6 +163,8 @@ async fn exchange(
         Ok(None) => return Ended::lost("the CI ended the exchange before it welcomed"),
         Err(e) => return Ended::lost(format!("welcome: {e}")),
     };
+    // The ends the hello carried are the CI's now.
+    exec.sessions_reported();
 
     let (tx, mut queue) = mpsc::channel::<FromRunner>(QUEUE);
     let generation = {
@@ -237,6 +240,11 @@ fn dispatch(exec: &Arc<Executor>, command: ToRunner) {
         ToRunner::DropArtifacts { run } => exec.drop_artifacts(&run),
         ToRunner::DropPrefetch { consumer } => exec.drop_prefetch(&consumer),
         ToRunner::Forget { run } => exec.forget(&run),
+        ToRunner::OpenSession { spec } => exec.open_session(*spec),
+        ToRunner::CloseSession { id } => {
+            let exec = Arc::clone(exec);
+            std::thread::spawn(move || exec.close_session(id));
+        }
         ToRunner::Welcome { .. } | ToRunner::Refused { .. } => {
             eprintln!("[enlist] the CI repeated its answer to hello; ignored");
         }

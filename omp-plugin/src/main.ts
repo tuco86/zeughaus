@@ -654,6 +654,22 @@ function planSession(): { repo: string; proposal?: number } | undefined {
   return /^[1-9][0-9]*$/.test(proposal) ? { repo, proposal: Number(proposal) } : { repo };
 }
 
+/** `ZEUGHAUS_SESSION=<id>`: a session the CI opened on a runner. */
+function sessionId(): number | undefined {
+  const id = process.env.ZEUGHAUS_SESSION ?? "";
+  return /^[1-9][0-9]*$/.test(id) ? Number(id) : undefined;
+}
+
+// The <zeughaus-session> block, asked for once per session.
+let sessionBlock: Promise<string> | undefined;
+
+/** What `zeughaus-runner ci session <id>` says about this session and the runners around it. */
+async function describeSession(pi: Pi, id: number, cwd: string): Promise<string> {
+  const r = await exec(pi, RUNNER, ["ci", "session", String(id)], cwd, CONTEXT_TIMEOUT_MS);
+  const text = r.code === 0 ? r.stdout.trim() : `zeughaus session ${id}: ${failure(r, "ci session")}`;
+  return `<zeughaus-session>\n${text}\n</zeughaus-session>`;
+}
+
 /** A plan's title: its first `# ` heading. */
 function planTitleOf(body: string): string {
   const line = body.split("\n").find((l) => l.startsWith("# "));
@@ -1067,6 +1083,12 @@ export default function zeughausCi(pi: Pi): void {
     if (session) {
       const prompt = planModePrompt(session.repo, session.proposal);
       if (!event.systemPrompt.includes(prompt)) added.push(prompt);
+    }
+    const id = sessionId();
+    if (id !== undefined) {
+      sessionBlock ??= describeSession(pi, id, ctx.cwd);
+      const described = await sessionBlock;
+      if (!event.systemPrompt.includes(described)) added.push(described);
     }
     return added.length === 0 ? undefined : { systemPrompt: [...event.systemPrompt, ...added] };
   });

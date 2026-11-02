@@ -14,7 +14,8 @@ Read-only:
 
 The plan is an execution spec, not a design document: an engineer who knows nothing of this conversation executes it top to bottom without making a single design decision.
 - Title: one \`# \` heading.
-${proposalLine}- Context: the literal request, why, and the intended end state, in 2-4 sentences.
+${proposalLine}- When the work needs particular machines, directly under the title (below any Proposals line) the line Runs on: <selector>[; <selector>]: one selector per machine, the first hosts the session and the others are reached over ssh; a selector is comma-separated runner labels such as os=macos or os=windows,arch=amd64; the zeughaus-session block lists the runners and their labels. Omit the line when any runner will do.
+- Context: the literal request, why, and the intended end state, in 2-4 sentences.
 - Approach: ordered steps grouped by behaviour, each leaving the tree building and the existing tests passing. Each step names the exact edit (verb, file, symbol, new behaviour), the existing code it reuses, every new or changed signature and load-bearing literal (error strings, config keys, wire fields), every call site of a rename or removal, and how each new path handles missing, empty and failing input.
 - Critical files & anchors: at most 5 files, each with its symbol and why.
 - Verification: exact commands with working directory and prerequisites, and at least one check of the new behaviour: concrete input, expected observable output.

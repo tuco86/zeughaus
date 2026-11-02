@@ -1178,16 +1178,12 @@ impl App {
     /// What a runner's CI answered, or what the user did in its views.
     pub(super) fn apply_ci(&mut self, key: RunnerKey, message: CiMsg) -> Task<Message> {
         match message {
-            CiMsg::OpenAgent {
-                view,
-                session,
-                proposal,
-            } => return self.open_agent(&key, view, session, proposal),
-            CiMsg::AgentOpened {
-                view,
-                runner,
-                result,
-            } => return self.agent_opened(&key, view, runner, result),
+            CiMsg::OpenSession { view, proposal } => {
+                return self.open_session(&key, view, proposal);
+            }
+            CiMsg::SessionOpened { view, result } => {
+                return self.session_opened(&key, view, result);
+            }
             CiMsg::OpenLink(url) => return self.open_doc_link(&url),
             _ => {}
         }
@@ -1277,8 +1273,14 @@ impl App {
             }
             CiMsg::DocAct { view, request } => client.doc_act(&key, view, request),
             CiMsg::DocActed { view, result } => client.doc_acted(&key, view, result),
+            CiMsg::RunsOnEdited { view, number, text } => {
+                if let Some(state) = client.plans.get_mut(&view) {
+                    state.runs_on_input = Some((number, text));
+                }
+                Task::none()
+            }
             // Answered above: they need more of the editor than this client.
-            CiMsg::OpenAgent { .. } | CiMsg::AgentOpened { .. } | CiMsg::OpenLink(_) => {
+            CiMsg::OpenSession { .. } | CiMsg::SessionOpened { .. } | CiMsg::OpenLink(_) => {
                 Task::none()
             }
         }
@@ -1680,7 +1682,7 @@ impl App {
             (glyph::SERVER, "Runner")
         };
         let tone = state_tone(&machine.status);
-        row![
+        let mut line = row![
             container(tip(icon(kind, ICON_SIZE, muted), kind_tip.to_owned())).width(ICON_COLUMN),
             text(machine.name.as_str())
                 .size(TEXT_MD)
@@ -1697,8 +1699,22 @@ impl App {
             jobs,
         ]
         .spacing(SP_3)
-        .align_y(Alignment::Center)
-        .into()
+        .align_y(Alignment::Center);
+        let session = client.overview.as_ref().and_then(|overview| {
+            overview
+                .sessions
+                .iter()
+                .find(|s| s.runner == machine.name && s.state.is_live())
+        });
+        if let Some(session) = session {
+            let doc = session.doc.map(|n| format!(" #{n}")).unwrap_or_default();
+            line = line
+                .push(text(format!("{} {}{doc}", session.kind.name(), session.repo)).size(TEXT_SM));
+        }
+        if !machine.labels.is_empty() {
+            line = line.push(text(machine.labels.join(", ")).size(TEXT_SM).color(muted));
+        }
+        line.into()
     }
 
     /// `<repo> #<n> <job>`: pressing it brings its channel's tab to the
@@ -3032,6 +3048,7 @@ mod tests {
             platforms: Vec::new(),
             repos: Vec::new(),
             build: 0,
+            sessions: Vec::new(),
         };
         let key = RunnerKey::new("sha256:ci");
         let mut client = CiClient::new(Endpoint("weida://ci/".to_owned()), "ci".to_owned());

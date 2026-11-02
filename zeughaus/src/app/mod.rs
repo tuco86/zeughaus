@@ -268,6 +268,10 @@ pub struct App {
     /// whose tab comes to the front once that runner's workspace shows it.
     #[cfg(not(target_arch = "wasm32"))]
     reveal: Option<(RunnerKey, zeughaus_mux::TerminalId)>,
+    /// A session a CI opened for this editor (the CI's key, the session's
+    /// id), whose terminal becomes [`App::reveal`] once its runner runs it.
+    #[cfg(not(target_arch = "wasm32"))]
+    reveal_session: Option<(RunnerKey, u64)>,
     /// Running without a window (`zeughaus --headless`): nobody sits in front
     /// of a file dialog, and rfd would open one on the desktop of whoever
     /// started the process.
@@ -413,6 +417,8 @@ impl App {
             directory: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             reveal: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            reveal_session: None,
             #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
             headless: false,
             #[cfg(not(target_arch = "wasm32"))]

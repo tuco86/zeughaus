@@ -503,6 +503,8 @@ mod tests {
             approved: None,
             proposals: Vec::new(),
             plan: None,
+            runs_on: Vec::new(),
+            placement: Vec::new(),
             body: String::new(),
         };
         let mut view = zeughaus();

@@ -41,7 +41,10 @@ mod link;
 mod machine;
 mod prefetch;
 mod run;
+mod sessions;
 mod stage;
+
+pub use self::sessions::SessionHost;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -192,12 +195,17 @@ pub struct Executor {
     prefetches: prefetch::Prefetches,
     /// The raw blobs fetched sets are materialized from.
     blobs: zeughaus_blobs::Store,
+    /// Opens agent sessions' terminals; `None` where none can run.
+    agents: Option<Arc<dyn SessionHost>>,
+    /// Serializes the changes of `<state-dir>/sessions.json`.
+    sessions_lock: Mutex<()>,
 }
 
 /// Starts enlisting: the executor's threads and the connection task. Called
 /// inside the runner's tokio runtime.
 pub fn start(
     host: Arc<JobHost>,
+    agents: Option<Arc<dyn SessionHost>>,
     config: EnlistConfig,
     state_dir: &Path,
     exe: PathBuf,
@@ -255,6 +263,8 @@ pub fn start(
         mirrors: Mutex::new(HashMap::new()),
         prefetches: prefetch::Prefetches::default(),
         blobs,
+        agents,
+        sessions_lock: Mutex::new(()),
     });
     // An earlier process fetched sets early for jobs it knew of; a job
     // assigned now fetches its inputs itself.
@@ -263,6 +273,7 @@ pub fn start(
     }
     executor.sweep_blobs(std::time::Duration::ZERO);
     executor.recover();
+    executor.recover_sessions();
     executor.sweep_inputs();
     control::spawn(&executor);
     tokio::spawn(link::keep(Arc::clone(&executor)));
