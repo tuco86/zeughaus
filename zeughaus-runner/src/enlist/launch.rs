@@ -12,7 +12,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use zeughaus_link::enlist::{Assignment, Checkout, Upload};
+use zeughaus_link::enlist::{Assignment, Checkout, SESSION_REQUEST_FILE, Upload};
 
 use super::CI_DIR;
 use super::stage::Engine;
@@ -532,6 +532,8 @@ fn launch_sh_windows_vm(launch: &Launch<'_>) -> String {
          [ -e \"$run/timeout\" ] && rc=124\n\
          if [ \"$rc\" -eq 0 ]; then\n\
          \tscp -q -r {host}:{dest_out} \"$run/artifacts\" || rc=74\n\
+         else\n\
+         \tmkdir -p \"$run/artifacts\" && scp -q -o ConnectTimeout=15 {host}:{request} \"$run/artifacts/{SESSION_REQUEST_FILE}\" </dev/null >/dev/null 2>&1 || true\n\
          fi\n\
          exit $rc\n",
         run = sh_path(run),
@@ -544,6 +546,7 @@ fn launch_sh_windows_vm(launch: &Launch<'_>) -> String {
         dest = sh_quote(&format!("{scp_dir}/")),
         dest_in = sh_quote(&format!("{scp_dir}/in")),
         dest_out = sh_quote(&format!("{scp_dir}/out")),
+        request = sh_quote(&format!("{scp_dir}/out/{SESSION_REQUEST_FILE}")),
         inner = sh_quote(&format!(
             r"powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File {guest}\inner.ps1"
         )),
@@ -1117,8 +1120,12 @@ mod tests {
                 "{calls}"
             );
             assert!(
-                !calls.contains("demo.7.build/out"),
-                "a failed run copies nothing back: {calls}"
+                calls.contains("win11:/W:/ci/runs/demo.7.build/out/agent-session.md"),
+                "a failed run copies the session request back: {calls}"
+            );
+            assert!(
+                !calls.contains("scp -q -r win11:/W:/ci/runs/demo.7.build/out"),
+                "a failed run copies only the session request back: {calls}"
             );
             assert!(!run.join("code").exists());
 

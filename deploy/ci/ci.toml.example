@@ -94,6 +94,7 @@ fetch_token = "GRIASDI_GITHUB_TOKEN" # secret name; omitted for public/local rep
 fetch_user = "x-access-token"
 status_token = "GRIASDI_GITHUB_TOKEN"
 webhook_secret = "GRIASDI_WEBHOOK_SECRET"
+# agent_sessions = true            # jobs may request agent sessions ($CI_OUTPUT/agent-session.md)
 
 [repos.griasdi.grants]             # secret -> event patterns it is released to
 GRIASDI_GITHUB_TOKEN = ["tag v*", "nightly"]

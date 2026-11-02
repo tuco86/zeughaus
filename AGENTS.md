@@ -212,9 +212,15 @@ master session for it, then `done` (`plan_done`) or `rejected`. A plan or
 proposal names the machines its work needs in a `Runs on: <selector>[;
 <selector>]` line under its title (one label selector per machine, the
 first hosting the session, the others reached over ssh; editable in the
-Plans tab while it is open, saved or approved). Each change is announced as
-`CiDocs` on `/events`. An onboarding request (`onboard_request`, kind
-`onboarding`) is how a project outside `ci.toml` asks to join: it gives the
+Plans tab while it is open, saved or approved). A CI job of a repository
+with `agent_sessions = true` in `ci.toml` requests a session by writing a
+plan body (at most 32 KiB) to `$CI_OUTPUT/agent-session.md`, on any exit
+status: the CI files it as an approved plan with source `job.<job>`, unless
+a plan of that job with the same body is still saved, approved or in
+progress, and says so in the job's note; manual runs file none. Each change
+is announced as `CiDocs` on `/events`. An onboarding request
+(`onboard_request`, kind `onboarding`) is how a project outside `ci.toml`
+asks to join: it gives the
 pending repository a directory, a Plans tab and an inbox for proposals at
 once; it is `open`, `approved` in the Plans tab, then `done`, or back to
 `open` with a note naming the failed step, or `rejected`. The CI's

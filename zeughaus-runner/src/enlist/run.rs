@@ -25,8 +25,9 @@ use zeughaus_job::{
     JobSpec, ProcessHost, RunExit, RunHandle, RunKind, read_run_end, record_run_end,
 };
 use zeughaus_link::enlist::{
-    Assignment, FromRunner, Input, InputSource, MAX_OUTPUT_CHUNK, MAX_STATES, Place, RunEnd,
-    StateOutcome, StateResult, StateSave, Upload, parse_run_id, run_id,
+    Assignment, FromRunner, Input, InputSource, MAX_OUTPUT_CHUNK, MAX_SESSION_REQUEST_BYTES,
+    MAX_STATES, Place, RunEnd, SESSION_REQUEST_FILE, SessionRequest, StateOutcome, StateResult,
+    StateSave, Upload, parse_run_id, run_id,
 };
 use zeughaus_link::manual::{MAX_MANUAL_DIRS, valid_dir_name};
 
@@ -199,6 +200,45 @@ fn remove_state(state: &Path) {
     if let Err(e) = cleanup::remove_tree(state) {
         eprintln!("[enlist] cannot remove {}: {e}", state.display());
     }
+}
+
+/// The session request in a run's output directory `output`. The job
+/// writes the file, so a symlink is refused: it would read a file of the
+/// runner's host into a plan.
+fn read_session_request(output: &Path) -> Option<SessionRequest> {
+    let path = output.join(SESSION_REQUEST_FILE);
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            return Some(SessionRequest::Refused(format!(
+                "cannot read {SESSION_REQUEST_FILE}: {e}"
+            )));
+        }
+    };
+    if !meta.file_type().is_file() {
+        return Some(SessionRequest::Refused(format!(
+            "{SESSION_REQUEST_FILE} is not a regular file"
+        )));
+    }
+    if meta.len() > MAX_SESSION_REQUEST_BYTES as u64 {
+        return Some(SessionRequest::Refused(format!(
+            "{SESSION_REQUEST_FILE} is {} bytes, at most {MAX_SESSION_REQUEST_BYTES}",
+            meta.len()
+        )));
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return Some(SessionRequest::Refused(format!(
+                "cannot read {SESSION_REQUEST_FILE}: {e}"
+            )));
+        }
+    };
+    Some(match String::from_utf8(bytes) {
+        Ok(text) => SessionRequest::Body(text),
+        Err(_) => SessionRequest::Refused(format!("{SESSION_REQUEST_FILE} is not UTF-8")),
+    })
 }
 
 impl Executor {
@@ -751,6 +791,7 @@ impl Executor {
         let a = &ctl.assignment;
         let timed_out = exit.code == Some(124) || run_dir.join("timeout").exists();
         let source = run_dir.join("artifacts");
+        let session_request = read_session_request(&source);
         let artifacts = exit.code == Some(0)
             && stage::has_entries(&source)
             && self.keep_artifacts(&a.run, &source);
@@ -761,6 +802,7 @@ impl Executor {
             timed_out,
             artifacts,
             state,
+            session_request,
         };
         if let Place::Machine { name } = &a.place
             && let Some(vm) = self.machines.get(name)
@@ -1311,6 +1353,54 @@ mod tests {
             assert_eq!(
                 pump(Path::new("/nonexistent/wal"), "r", &tx, &mut sent).ok(),
                 Some(0)
+            );
+        }
+
+        #[test]
+        fn a_session_request_is_read_only_from_a_small_regular_utf8_file() {
+            let dir = scratch("session-request");
+            let file = dir.join(SESSION_REQUEST_FILE);
+            assert_eq!(read_session_request(&dir), None);
+            assert_eq!(read_session_request(&dir.join("missing")), None);
+
+            std::fs::write(&file, "# T\n").unwrap();
+            assert_eq!(
+                read_session_request(&dir),
+                Some(SessionRequest::Body("# T\n".to_owned()))
+            );
+            std::fs::remove_file(&file).unwrap();
+
+            #[cfg(unix)]
+            {
+                let target = dir.join("target.md");
+                std::fs::write(&target, "# secret\n").unwrap();
+                std::os::unix::fs::symlink(&target, &file).unwrap();
+                assert_eq!(
+                    read_session_request(&dir),
+                    Some(SessionRequest::Refused(
+                        "agent-session.md is not a regular file".to_owned()
+                    ))
+                );
+                std::fs::remove_file(&file).unwrap();
+            }
+
+            std::fs::write(&file, vec![b'x'; MAX_SESSION_REQUEST_BYTES + 1]).unwrap();
+            assert_eq!(
+                read_session_request(&dir),
+                Some(SessionRequest::Refused(format!(
+                    "agent-session.md is {} bytes, at most {MAX_SESSION_REQUEST_BYTES}",
+                    MAX_SESSION_REQUEST_BYTES + 1
+                )))
+            );
+
+            std::fs::write(&file, [0xff]).unwrap();
+            let refused = read_session_request(&dir);
+            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(
+                refused,
+                Some(SessionRequest::Refused(
+                    "agent-session.md is not UTF-8".to_owned()
+                ))
             );
         }
     }

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use zeughaus_link::ci::{
     DocKind, DocState, DocView, MAX_DOC_BYTES, MAX_DOC_TITLE_BYTES, OnboardSpec, RepoDocsView,
-    normalize_origin,
+    normalize_origin, plan_title, runs_on_named,
 };
 use zeughaus_link::selector::parse_runs_on;
 
@@ -320,6 +320,66 @@ pub fn create(
         write_json(&path_of(&dir, proposal.number), &proposal)?;
     }
     Ok(number)
+}
+
+/// What [`file_request`] did with a job's session request.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Filed {
+    /// Stored as this approved plan.
+    Queued(u64),
+    /// This saved, approved or in-progress plan came from the same job with
+    /// the same body; nothing was stored.
+    StillOpen(u64),
+}
+
+/// Files the session request job `job` of `repo` left as an approved plan
+/// with source `job.<job>`, titled by its first `# ` line and placed by its
+/// `Runs on:` line. Refused for a repository without `agent_sessions`.
+pub fn file_request(
+    state_dir: &Path,
+    config: &CiConfig,
+    repo: &str,
+    job: &str,
+    body: &str,
+    now: u64,
+) -> Result<Filed, String> {
+    if !config.repos.get(repo).is_some_and(|r| r.agent_sessions) {
+        return Err(format!(
+            "{repo} does not allow agent sessions (agent_sessions in ci.toml)"
+        ));
+    }
+    let source = format!("job.{job}");
+    let dir = dir(state_dir, config, repo)?;
+    if let Some(open) = read_all(&dir).iter().find(|doc| {
+        doc.kind == DocKind::Plan
+            && doc.source == source
+            && matches!(
+                doc.state,
+                DocState::Saved | DocState::Approved | DocState::InProgress
+            )
+            && doc.body == body
+    }) {
+        return Ok(Filed::StillOpen(open.number));
+    }
+    let runs_on = runs_on_named(body)?;
+    let title = plan_title(body);
+    let number = create(
+        state_dir,
+        config,
+        repo,
+        NewDoc {
+            kind: DocKind::Plan,
+            title: &title,
+            body,
+            source: &source,
+            proposals: &[],
+            runs_on: &runs_on,
+            onboard: None,
+        },
+        now,
+    )?;
+    set_state(state_dir, config, repo, number, DocState::Approved, now)?;
+    Ok(Filed::Queued(number))
 }
 
 /// Moves document `number` to `to`, where [`allowed`] lets it. Approving a
@@ -874,6 +934,65 @@ mod tests {
             assert_eq!((done.state, done.note.as_str()), (Done, ""));
             // Done but not in ci.toml: no longer pending, so hidden.
             assert!(list(&state, &config, "scan-rs").is_empty());
+        }
+
+        #[test]
+        fn a_job_request_is_queued_once_while_its_plan_is_open() {
+            let state = scratch("job-request");
+            let config = CiConfig::parse(
+                "default_runner = \"x\"\n\
+                 [runners.x]\nfingerprint = \"sha256:0000000000000000000000000000000000000000000000000000000000000001\"\n\
+                 [repos.demo]\nurl = \"https://git.example.org/o/demo.git\"\nagent_sessions = true\n",
+            )
+            .expect("a valid ci.toml");
+            let body = "# Fix the sync\n\nRuns on: os=linux\n\nerror: maybe\n";
+
+            assert_eq!(
+                file_request(&state, &config, "demo", "sync", body, 1),
+                Ok(Filed::Queued(1))
+            );
+            let plan = load(&state, &config, "demo", 1).expect("stored");
+            assert_eq!(
+                (
+                    plan.kind,
+                    plan.state,
+                    plan.title.as_str(),
+                    plan.source.as_str()
+                ),
+                (DocKind::Plan, Approved, "Fix the sync", "job.sync")
+            );
+            assert_eq!(plan.runs_on, vec!["os=linux".to_owned()]);
+            assert_eq!(plan.approved, Some(1));
+
+            assert_eq!(
+                file_request(&state, &config, "demo", "sync", body, 2),
+                Ok(Filed::StillOpen(1))
+            );
+            assert_eq!(list(&state, &config, "demo").len(), 1);
+
+            assert_eq!(
+                file_request(&state, &config, "demo", "other", body, 3),
+                Ok(Filed::Queued(2))
+            );
+            assert_eq!(
+                file_request(&state, &config, "demo", "sync", "# Else\n", 4),
+                Ok(Filed::Queued(3))
+            );
+
+            set_state(&state, &config, "demo", 1, Rejected, 5).expect("reject");
+            assert_eq!(
+                file_request(&state, &config, "demo", "sync", body, 6),
+                Ok(Filed::Queued(4))
+            );
+
+            let plain = scratch("job-request-refused");
+            assert_eq!(
+                file_request(&plain, &self::config(), "demo", "sync", body, 7),
+                Err("demo does not allow agent sessions (agent_sessions in ci.toml)".to_owned())
+            );
+            assert!(!docs_root(&plain).exists());
+            let _ = std::fs::remove_dir_all(&state);
+            let _ = std::fs::remove_dir_all(&plain);
         }
     }
 }

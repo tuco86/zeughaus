@@ -1737,8 +1737,23 @@ state machine (`docs::allowed`) is the whole contract: a proposal goes from
 `rejected`, `approved` to `rejected`, `in_progress` to `done` or back to
 `approved`. Only the CI's session dispatcher (`zeughaus-ci/src/sessions.rs`)
 moves a plan to `in_progress`, recording the runners it placed it on. The
-`/ci` server and the dispatcher serialize every mutation behind one lock and
-announce each on `/events` as `CiDocs`.
+`/ci` server, the dispatcher and the scheduler serialize every mutation
+behind one lock and announce each on `/events` as `CiDocs`.
+
+**Session requests.** A job asks for an agent session by leaving
+`agent-session.md` in `CI_OUTPUT`, whatever its exit status. The runner
+reads it in `Executor::finish`, before the output is kept or dropped (a
+regular UTF-8 file of at most `MAX_SESSION_REQUEST_BYTES`, 32 KiB, so that
+`Hello`, which carries every ended run the CI has not forgotten, fits its
+frame; a symlink is refused), and carries its text, or why it was refused,
+in `RunEnd::session_request`; a Windows VM job copies that one file back
+from the guest after a failure too. `Scheduler::finish_job` hands it to
+`docs::file_request`, which files it as an approved plan with source
+`job.<job>`, titled and placed by the same header parsers `ci plan-save`
+uses (`zeughaus-link::ci`), when the repository's `agent_sessions` is set,
+and files nothing while a saved, approved or in-progress plan of that job
+has the same body. A manual run or a cancelled pipeline files none. What
+became of the request is a fragment of the job's note.
 
 **Onboarding.** A third kind, `onboarding`, is a project's request to join:
 an `OnboardSpec` (its origin, made the canonical url of `[onboarding] api`'s

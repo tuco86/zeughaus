@@ -74,6 +74,7 @@ pub fn repo_config(
         status_token: Some(onb.bot_token.clone()),
         webhook_secret: Some(webhook_secret_name(name)),
         grants: spec.grants.clone(),
+        agent_sessions: false,
     }
 }
 

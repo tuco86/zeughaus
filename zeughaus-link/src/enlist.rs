@@ -21,7 +21,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The protocol major a runner and the CI must share.
-pub const ENLIST_MAJOR: u32 = 11;
+pub const ENLIST_MAJOR: u32 = 12;
 
 /// The most addresses a runner's `Hello` announces.
 pub const MAX_ADDRESSES: usize = 8;
@@ -173,6 +173,26 @@ pub struct RunEnd {
     /// What became of each store of the assignment's `state`.
     #[serde(default)]
     pub state: Vec<StateResult>,
+    /// The session request the run left; `None` without the file.
+    #[serde(default)]
+    pub session_request: Option<SessionRequest>,
+}
+
+/// The file in `CI_OUTPUT` through which a job asks for an agent session.
+pub const SESSION_REQUEST_FILE: &str = "agent-session.md";
+
+/// The largest session request a runner takes. Below `MAX_DOC_BYTES`
+/// because every ended run the CI has not forgotten travels in `Hello`,
+/// which must fit `MAX_ENLIST_FRAME_BYTES`.
+pub const MAX_SESSION_REQUEST_BYTES: usize = 32 << 10;
+
+/// What a run left in `SESSION_REQUEST_FILE`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionRequest {
+    /// The file's text.
+    Body(String),
+    /// The file is there and was not taken: why.
+    Refused(String),
 }
 
 /// What the CI says to a runner.

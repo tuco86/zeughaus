@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The CI reloads `[repos]` of `ci.toml` and `ci/onboarded/` on SIGHUP
   (`systemctl --user reload zeughaus-ci`) without a restart; any other
   change is refused until the next restart.
+- Jobs request agent sessions: a job that leaves `agent-session.md` in
+  `CI_OUTPUT` (at most 32 KiB of UTF-8, kept whatever its exit status) gets
+  it filed as an approved plan with source `job.<job>` when its repository
+  sets `agent_sessions = true` in `ci.toml`; the same body from the same job
+  queues nothing while that plan is open, and manual runs file none. The
+  job's note says what became of the request. The enlist protocol is
+  major 12.
 - Runners by name: a runner's `enlist.toml` may list `addresses` (the
   `ip:port` pairs its listener answers at, best first; by default the
   endpoint URL's address when it is a reachable IP), and its `Hello` carries

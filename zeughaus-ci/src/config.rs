@@ -217,6 +217,10 @@ pub struct RepoConfig {
     /// Secret name to the event patterns it is released to.
     #[serde(default)]
     pub grants: BTreeMap<String, Vec<String>>,
+    /// Jobs of this repository may request agent sessions (`agent-session.md`
+    /// in `CI_OUTPUT`), which the CI files as approved plans.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent_sessions: bool,
 }
 
 impl RepoConfig {

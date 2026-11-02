@@ -14,11 +14,86 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::selector::Selector;
+
 /// The largest body of one plan or proposal, in bytes.
 pub const MAX_DOC_BYTES: usize = 256 << 10;
 
 /// The longest title of one plan or proposal, in bytes.
 pub const MAX_DOC_TITLE_BYTES: usize = 200;
+
+/// How many lines under its title a plan may name its proposals in.
+const PROPOSALS_WITHIN: usize = 20;
+
+/// The title of a plan file: its first `# ` heading, cut to
+/// [`MAX_DOC_TITLE_BYTES`] on a character boundary.
+pub fn plan_title(body: &str) -> String {
+    let Some(title) = body
+        .lines()
+        .find_map(|line| line.strip_prefix("# "))
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+    else {
+        return "Untitled plan".to_owned();
+    };
+    let mut end = title.len().min(MAX_DOC_TITLE_BYTES);
+    while !title.is_char_boundary(end) {
+        end -= 1;
+    }
+    title[..end].trim_end().to_owned()
+}
+
+/// The proposals a plan names in a `Proposals: #3, #5` line among its first
+/// lines; none without such a line.
+pub fn proposals_named(body: &str) -> Result<Vec<u64>, String> {
+    let Some(line) = body
+        .lines()
+        .take(PROPOSALS_WITHIN)
+        .find(|line| line.starts_with("Proposals:"))
+    else {
+        return Ok(Vec::new());
+    };
+    let malformed = || format!("malformed Proposals line: {line}");
+    let list = line["Proposals:".len()..].trim();
+    if list.is_empty() {
+        return Err(malformed());
+    }
+    list.split(',')
+        .map(|item| {
+            let digits = item.trim().strip_prefix('#').ok_or_else(malformed)?;
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(malformed());
+            }
+            digits.parse::<u64>().map_err(|_| malformed())
+        })
+        .collect()
+}
+
+/// The machines a plan needs, from a `Runs on: os=linux; os=windows` line
+/// among its first lines: one label selector per machine, the first hosting
+/// the session. None without such a line, which is any runner.
+pub fn runs_on_named(body: &str) -> Result<Vec<String>, String> {
+    let Some(line) = body
+        .lines()
+        .take(PROPOSALS_WITHIN)
+        .find(|line| line.starts_with("Runs on:"))
+    else {
+        return Ok(Vec::new());
+    };
+    let malformed = || format!("malformed Runs on line: {line}");
+    let list = line["Runs on:".len()..].trim();
+    if list.is_empty() {
+        return Err(malformed());
+    }
+    let selectors: Vec<String> = list.split(';').map(|part| part.trim().to_owned()).collect();
+    for selector in &selectors {
+        if selector.is_empty() {
+            return Err(malformed());
+        }
+        Selector::parse(selector).map_err(|_| malformed())?;
+    }
+    Ok(selectors)
+}
 
 /// Largest request the runner reads: a few identifiers, or one document
 /// (JSON escaping can double a body).
@@ -1106,6 +1181,66 @@ impl CiReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_plan_is_titled_by_its_first_heading() {
+        assert_eq!(
+            plan_title("intro\n## Sub\n#  Real title  \n# Second"),
+            "Real title"
+        );
+        assert_eq!(plan_title("no heading\n#nospace"), "Untitled plan");
+        assert_eq!(plan_title("# \n"), "Untitled plan");
+        // Cut on a character boundary: 'ä' is two bytes.
+        let long = format!("# {}", "ä".repeat(150));
+        let title = plan_title(&long);
+        assert_eq!(title, "ä".repeat(100));
+        assert!(title.len() <= MAX_DOC_TITLE_BYTES);
+    }
+
+    #[test]
+    fn a_plan_names_its_proposals_in_one_line_near_the_top() {
+        assert_eq!(
+            proposals_named("# T\n\nProposals: #3, #5\n"),
+            Ok(vec![3, 5])
+        );
+        assert_eq!(proposals_named("# T\nProposals:#7\n"), Ok(vec![7]));
+        assert_eq!(proposals_named("# T\n\nbody\n"), Ok(Vec::new()));
+        // Too far down is body text, not the line.
+        let late = format!("# T\n{}Proposals: #1\n", "x\n".repeat(25));
+        assert_eq!(proposals_named(&late), Ok(Vec::new()));
+        for bad in [
+            "Proposals: 3",
+            "Proposals:",
+            "Proposals: #3,",
+            "Proposals: #3 #4",
+            "Proposals: #x",
+        ] {
+            assert_eq!(
+                proposals_named(&format!("# T\n{bad}\n")),
+                Err(format!("malformed Proposals line: {bad}")),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plan_names_its_machines_in_a_runs_on_line() {
+        assert_eq!(
+            runs_on_named("# T\nProposals: #3\nRuns on: os=linux ; os=windows,arch=amd64\n"),
+            Ok(vec![
+                "os=linux".to_owned(),
+                "os=windows,arch=amd64".to_owned()
+            ])
+        );
+        assert_eq!(runs_on_named("# T\n\nbody\n"), Ok(Vec::new()));
+        for bad in ["Runs on:", "Runs on: os=linux;", "Runs on: OS=linux"] {
+            assert_eq!(
+                runs_on_named(&format!("# T\n{bad}\n")),
+                Err(format!("malformed Runs on line: {bad}")),
+                "{bad}"
+            );
+        }
+    }
 
     fn pipeline() -> PipelineView {
         PipelineView {

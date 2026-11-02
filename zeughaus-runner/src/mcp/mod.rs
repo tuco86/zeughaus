@@ -39,6 +39,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use tokio::io::BufReader;
+use zeughaus_link::ci::{plan_title, proposals_named, runs_on_named};
 use zeughaus_link::{CiReply, CiRequest, DocKind, DocState, MachineView, RepoView, SessionView};
 
 use self::client::{Client, Link};
@@ -556,12 +557,12 @@ async fn ci_answer(client: &Arc<Client>, command: CiCommand) -> Result<String, F
             file,
         } => {
             let body = read_plan(&file)?;
-            let proposals = docs::proposals_named(&body).map_err(Failure::bad_input)?;
-            let runs_on = docs::runs_on_named(&body).map_err(Failure::bad_input)?;
+            let proposals = proposals_named(&body).map_err(Failure::bad_input)?;
+            let runs_on = runs_on_named(&body).map_err(Failure::bad_input)?;
             let request = CiRequest::DocCreate {
                 repo: repo.clone(),
                 kind: DocKind::Plan,
-                title: docs::plan_title(&body),
+                title: plan_title(&body),
                 source: repo.clone(),
                 body,
                 proposals,
@@ -608,7 +609,7 @@ async fn ci_answer(client: &Arc<Client>, command: CiCommand) -> Result<String, F
         }
         CiCommand::Planned { repo, file } => {
             let body = read_plan(&file)?;
-            let numbers = docs::proposals_named(&body).map_err(Failure::bad_input)?;
+            let numbers = proposals_named(&body).map_err(Failure::bad_input)?;
             if numbers.is_empty() {
                 return Ok("the plan names no proposals\n".to_owned());
             }

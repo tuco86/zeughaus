@@ -9,8 +9,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -18,12 +18,13 @@ use chrono::{DateTime, Local, NaiveTime, TimeZone};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeughaus_link::enlist::{
-    Assignment, Checkout, FromRunner, Input, InputSource, Place, RunEnd, RunReport, StateMount,
-    StateOutcome, StateSave, ToRunner, TransferEvent, Upload, parse_run_id, run_id,
+    Assignment, Checkout, FromRunner, Input, InputSource, Place, RunEnd, RunReport, SessionRequest,
+    StateMount, StateOutcome, StateSave, ToRunner, TransferEvent, Upload, parse_run_id, run_id,
 };
 
 use crate::channels::{self, Channels};
 use crate::config::{CiConfig, RepoConfig, RunnerOs, Shared};
+use crate::docs::{self, Filed};
 use crate::event::{self, CiEvent, EventKind, Upstream};
 use crate::forge::{self, State, Status};
 use crate::header::JobDef;
@@ -496,6 +497,11 @@ struct Scheduler {
     running: Vec<Pipeline>,
     rx: Receiver<Msg>,
     runners: Arc<Runners>,
+    /// The documents' lock, shared with the `/ci` server and the session
+    /// dispatcher.
+    docs_lock: Arc<Mutex<()>>,
+    /// The repository of each document change, announced as `CiDocs`.
+    docs_tx: Sender<String>,
     statuses: Sender<Status>,
     /// The only reader of OpenBao in this process; jobs never see its token.
     secrets: Arc<Secrets>,
@@ -544,6 +550,8 @@ pub fn start(
     config: Arc<Shared>,
     secrets: Arc<Secrets>,
     runners: Arc<Runners>,
+    docs_lock: Arc<Mutex<()>>,
+    docs_tx: Sender<String>,
 ) -> Started {
     let current = config.get();
     eprintln!(
@@ -558,8 +566,9 @@ pub fn start(
     let spawned = std::thread::Builder::new()
         .name("zeughaus-ci".into())
         .spawn(move || {
-            let mut scheduler =
-                Scheduler::new(state_dir, config, secrets, runners, rx, alerts, changes);
+            let mut scheduler = Scheduler::new(
+                state_dir, config, secrets, runners, docs_lock, docs_tx, rx, alerts, changes,
+            );
             scheduler.recover();
             loop {
                 scheduler.tick();
@@ -578,11 +587,14 @@ pub fn start(
 }
 
 impl Scheduler {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         state_dir: PathBuf,
         shared: Arc<Shared>,
         secrets: Arc<Secrets>,
         runners: Arc<Runners>,
+        docs_lock: Arc<Mutex<()>>,
+        docs_tx: Sender<String>,
         rx: Receiver<Msg>,
         alerts: Sender<Alert>,
         changes: Sender<CiChange>,
@@ -596,6 +608,8 @@ impl Scheduler {
             running: Vec::new(),
             rx,
             runners,
+            docs_lock,
+            docs_tx,
             last_nightly_check: Local::now(),
             ready_since: HashMap::new(),
             alerts,
@@ -2049,6 +2063,13 @@ impl Scheduler {
             }
             note.push_str(&state_note);
         }
+        if let Some(request) = &end.session_request {
+            let filed = self.file_session_request(pi, &job, request, now);
+            if !note.is_empty() {
+                note.push_str("; ");
+            }
+            note.push_str(&filed);
+        }
 
         let cancelled = !succeeded && self.running[pi].cancelled;
         let record = &mut self.running[pi].jobs[ji];
@@ -2093,6 +2114,52 @@ impl Scheduler {
                 .send(&runner, ToRunner::Forget { run: run.clone() });
         }
         self.runners.unassign(&run);
+    }
+
+    /// Files the session request job `job` of pipeline `pi` left, and says
+    /// what became of it as a fragment of the job's note.
+    fn file_session_request(
+        &self,
+        pi: usize,
+        job: &str,
+        request: &SessionRequest,
+        now: u64,
+    ) -> String {
+        let pipeline = &self.running[pi];
+        let body = match request {
+            SessionRequest::Refused(why) => {
+                return format!("agent session request ignored: {why}");
+            }
+            SessionRequest::Body(body) => body,
+        };
+        if pipeline.event.kind == EventKind::Manual {
+            return "agent session request ignored: manual runs file none".to_owned();
+        }
+        if pipeline.cancelled {
+            return "agent session request ignored: the pipeline was cancelled".to_owned();
+        }
+        let filed = {
+            let _docs = self
+                .docs_lock
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            docs::file_request(
+                &self.state_dir,
+                &self.config,
+                &pipeline.repo,
+                job,
+                body,
+                now,
+            )
+        };
+        match filed {
+            Ok(Filed::Queued(n)) => {
+                let _ = self.docs_tx.send(pipeline.repo.clone());
+                format!("agent session queued as plan #{n}")
+            }
+            Ok(Filed::StillOpen(n)) => format!("agent session request already open as plan #{n}"),
+            Err(e) => format!("agent session request ignored: {e}"),
+        }
     }
 
     /// Tells the runner of every job that waits for the set job `ji` just
@@ -3045,6 +3112,7 @@ mod tests {
             timed_out,
             artifacts: false,
             state: Vec::new(),
+            session_request: None,
         };
         assert_eq!(
             failure_note(&end(Some(124), false, true), 30),
@@ -3215,6 +3283,7 @@ mod tests {
                     timed_out: false,
                     artifacts,
                     state: Vec::new(),
+                    session_request: None,
                 },
             },
         }
@@ -3413,6 +3482,8 @@ mod tests {
                 Shared::new(CiConfig::clone(&config)),
                 Secrets::new(None, state),
                 Arc::new(Runners::new()),
+                Arc::new(Mutex::new(())),
+                std::sync::mpsc::channel().0,
                 rx,
                 alerts,
                 changes,
@@ -4261,6 +4332,7 @@ mod tests {
                     timed_out: false,
                     artifacts: false,
                     state: Vec::new(),
+                    session_request: None,
                 },
             }));
             s.finish_pipelines();
@@ -4348,6 +4420,7 @@ mod tests {
                     from: Some(2),
                     outcome,
                 }],
+                session_request: None,
             };
             let running = || {
                 keeping(
@@ -4390,6 +4463,105 @@ mod tests {
                 saved.note
             );
             let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_session_request_is_filed_and_noted() {
+            let state = scratch("session-request");
+            let config = CiConfig::parse(&format!(
+                "default_runner = \"x\"\n\
+                 [runners.x]\nfingerprint = \"{FP_1}\"\n\
+                 [repos.view]\nurl = \"file:///nowhere\"\nagent_sessions = true\n"
+            ))
+            .expect("a valid config");
+            let mut s = scheduler_over(&state, Arc::new(config.clone()));
+            let _x = connect(&s.runners, "x", 0);
+            let body = "# Fix it\n\nerror\n";
+            let finish = |s: &mut Scheduler, number: u64, code, request: SessionRequest| {
+                let run = format!("view.{number}.a");
+                s.runners.assign(&run, "x");
+                s.handle(Msg::FromRunner {
+                    name: "x".to_owned(),
+                    message: FromRunner::Finished {
+                        run,
+                        end: RunEnd {
+                            code: Some(code),
+                            killed: false,
+                            timed_out: false,
+                            artifacts: false,
+                            state: Vec::new(),
+                            session_request: Some(request),
+                        },
+                    },
+                });
+            };
+            let running = || record("a", &[], "x", JobStatus::Running);
+            let note = |s: &Scheduler, i: usize| s.running[i].jobs[0].note.clone();
+
+            s.running.push(numbered(3, vec![running()]));
+            finish(&mut s, 3, 1, SessionRequest::Body(body.to_owned()));
+            assert_eq!(s.running[0].jobs[0].status, JobStatus::Failed);
+            assert_eq!(
+                note(&s, 0),
+                "failed with exit 1; agent session queued as plan #1"
+            );
+            let plan = docs::load(&state, &config, "view", 1).expect("filed");
+            assert_eq!(
+                (plan.kind, plan.state, plan.source.as_str()),
+                (
+                    zeughaus_link::DocKind::Plan,
+                    zeughaus_link::DocState::Approved,
+                    "job.a"
+                )
+            );
+
+            s.running.push(numbered(4, vec![running()]));
+            finish(&mut s, 4, 1, SessionRequest::Body(body.to_owned()));
+            assert!(
+                note(&s, 1).ends_with("; agent session request already open as plan #1"),
+                "{}",
+                note(&s, 1)
+            );
+
+            let mut manual = numbered(5, vec![running()]);
+            manual.event = stored_manual(&state, "view", &["a"], "abc");
+            s.running.push(manual);
+            finish(&mut s, 5, 0, SessionRequest::Body(body.to_owned()));
+            assert!(
+                note(&s, 2).ends_with("; agent session request ignored: manual runs file none"),
+                "{}",
+                note(&s, 2)
+            );
+
+            s.running.push(numbered(6, vec![running()]));
+            finish(
+                &mut s,
+                6,
+                1,
+                SessionRequest::Refused("agent-session.md is not UTF-8".to_owned()),
+            );
+            assert!(
+                note(&s, 3)
+                    .ends_with("; agent session request ignored: agent-session.md is not UTF-8"),
+                "{}",
+                note(&s, 3)
+            );
+
+            let plain = scratch("session-request-plain");
+            let mut s = scheduler(&plain);
+            let _x = connect(&s.runners, "x", 0);
+            s.running.push(numbered(3, vec![running()]));
+            finish(&mut s, 3, 1, SessionRequest::Body(body.to_owned()));
+            assert!(
+                note(&s, 0).ends_with(
+                    "; agent session request ignored: view does not allow agent sessions (agent_sessions in ci.toml)"
+                ),
+                "{}",
+                note(&s, 0)
+            );
+            assert!(!crate::ci_dir(&plain).join("docs/view/1.json").exists());
+            let _ = std::fs::remove_dir_all(&state);
+            let _ = std::fs::remove_dir_all(&plain);
         }
 
         #[test]
@@ -4919,6 +5091,7 @@ mod tests {
                         timed_out: false,
                         artifacts: true,
                         state: Vec::new(),
+                        session_request: None,
                     },
                 },
             });
@@ -5046,6 +5219,7 @@ mod tests {
                         timed_out: false,
                         artifacts: false,
                         state: Vec::new(),
+                        session_request: None,
                     },
                 },
             });

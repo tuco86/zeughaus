@@ -135,6 +135,7 @@ Set by the runner:
 |---|---|
 | `CI_WORKSPACE` | The place's workspace, where the job starts. Container: `/work` |
 | `CI_OUTPUT` | Directory for the job's artifacts. It exists, empty, when the job starts, and lies outside the workspace. A successful run that left files keeps them while a job that needs them can still run; nothing else is kept |
+| `$CI_OUTPUT/agent-session.md` | A job asks for an agent session by writing a plan body here, whatever its exit status: a regular UTF-8 file of at most 32768 bytes, titled by its first `# ` line, placed by an optional `Runs on:` line among its first 20 lines. Where `[repos.<name>]` sets `agent_sessions = true`, the CI files it as an approved plan with source `job.<job>`, which a master session then runs; the same body from the same job queues nothing while that plan is saved, approved or in progress. Manual runs never file one. The job's note says what happened |
 | `CI_INPUTS` | One directory `<need>/` for each job of `needs` that succeeded and left output. Container: `/ci/inputs` |
 | `CI_CPUS`, `CARGO_BUILD_JOBS` | The CPU count of the place: the runner's, the container's or the VM's |
 | `CI_SIBLINGS` | Manual runs only: the directory of the sibling checkouts, `<workspace>/.zci-siblings` (`/work/.zci-siblings` in a container). `$CI_SIBLINGS/<dir>` is the path dependency `<dir>` |
@@ -178,6 +179,7 @@ Besides these: the header's `env`, and the granted `secrets` by name. A `.ps1` j
 | `killed`, `died from a signal` | Killed by a cancel, or died from a signal |
 | `runner <R> lost the run`, `runner <R> lost` | The runner restarted and does not know the run, or stayed away past the job's timeout plus 15 minutes |
 | `runner <R> offers no containers`, `runner <R> offers no machine <vm>`, `runner <R> is not configured` | The placement does not match what the runner offers |
+| `agent session queued as plan #<n>`, `agent session request already open as plan #<n>`, `agent session request ignored: <why>` | The job left `$CI_OUTPUT/agent-session.md`: filed as an approved plan, the same request from this job is still open, or not filed (no `agent_sessions` for the repository, a manual run, a cancelled pipeline, a file that is not a small regular UTF-8 file) |
 
 A job that holds secrets keeps its `cause` out of the forge's commit status; `ci_pipeline` still shows it.
 
@@ -191,4 +193,4 @@ It lives on the CI host, not in the repository; `ci_repo` and `ci_status` show t
 | `[runners.<name>]` | `fingerprint`, `os` (`unix`, the default, or `windows`), `machines` (the VMs it boots), `wait_minutes` (15) |
 | `[platforms]` | Platform name to a runner or a machine of one |
 | `[nightly]` | `at = "HH:MM"`, the CI host's local time: the round that queues every repository's `nightly` and runs them one after another in name order; without it nothing runs nightly by itself |
-| `[repos.<name>]` | `url` (the repository's identity: an upload's `origin` must be the same repository), `forge` (`github`, `forgejo` or `none`), `slug`, `api`, `default_branch` (`main`), tokens, `grants` (secret name to event patterns) |
+| `[repos.<name>]` | `url` (the repository's identity: an upload's `origin` must be the same repository), `forge` (`github`, `forgejo` or `none`), `slug`, `api`, `default_branch` (`main`), tokens, `grants` (secret name to event patterns), `agent_sessions` (its jobs may request agent sessions) |

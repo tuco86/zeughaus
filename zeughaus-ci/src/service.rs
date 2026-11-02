@@ -228,6 +228,8 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
     // on this runtime and quinn's driver has to be reachable from this thread.
     let _enter = rt.enter();
     let runners = Arc::new(Runners::new());
+    let (docs_tx, docs_rx) = std::sync::mpsc::channel::<String>();
+    let docs_lock = Arc::new(std::sync::Mutex::new(()));
     let Started {
         alerts,
         changes,
@@ -237,13 +239,13 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
         Arc::clone(&config),
         Arc::clone(&secrets),
         Arc::clone(&runners),
+        Arc::clone(&docs_lock),
+        docs_tx.clone(),
     );
     let transcripts = Arc::new(Transcripts::new(state_dir.to_path_buf()));
     let seq = Arc::new(AtomicU64::new(0));
     let listener = &bound.listener;
-    let (docs_tx, docs_rx) = std::sync::mpsc::channel::<String>();
     let (sessions_tx, sessions_rx) = std::sync::mpsc::channel::<()>();
-    let docs_lock = Arc::new(std::sync::Mutex::new(()));
     let sessions = Arc::new(Sessions::new(
         state_dir.to_path_buf(),
         Arc::clone(&config),
