@@ -240,7 +240,8 @@ impl MuxService {
     }
 
     /// How [`TopologyCommand::OpenProject`] builds its shell. A second call
-    /// is ignored.
+    /// is ignored. Work shells are a Unix exec, like agent sessions.
+    #[cfg(unix)]
     pub fn set_project_profile(&self, f: ProjectProfile) {
         let _ = self.inner.project_profile.set(f);
     }
