@@ -24,7 +24,7 @@ use zeughaus_link::enlist::{
 
 use crate::channels::{self, Channels};
 use crate::config::{CiConfig, RepoConfig, RunnerOs};
-use crate::event::{self, CiEvent, EventKind};
+use crate::event::{self, CiEvent, EventKind, Upstream};
 use crate::forge::{self, State, Status};
 use crate::header::JobDef;
 use crate::runners::Runners;
@@ -749,6 +749,7 @@ impl Scheduler {
                 actor: "nightly".to_owned(),
                 delivery: None,
                 upload: None,
+                upstream: None,
                 received,
             };
             match event::write_inbox(&self.state_dir, &event) {
@@ -934,6 +935,9 @@ impl Scheduler {
         let mirror = self.fetch(name, repo)?;
         let sha = event_commit(&mirror, event)?;
         pipeline.sha = Some(sha.clone());
+        if event.kind == EventKind::Push {
+            self.queue_followers(name, event, &mirror, &sha);
+        }
         // Only shown, so a commit git cannot describe leaves it empty.
         pipeline.subject = git(&mirror, &["log", "-1", "--format=%s", &sha], &[])
             .map(|subject| subject.trim().to_owned())
@@ -956,6 +960,67 @@ impl Scheduler {
             planned.push(Planned { def, runner, place });
         }
         Ok(Some(planned))
+    }
+
+    /// Queues an `upstream` event for every other repository of ci.toml whose
+    /// default branch, as its mirror last saw it, has a job that the push
+    /// follows. Only a push whose commit is still its branch's head fans
+    /// out, so a rerun of an older commit does not move a follower back. A
+    /// repository without a mirror yet follows nothing until its first
+    /// pipeline has fetched it. An upstream event never fans out itself.
+    fn queue_followers(&self, upstream: &str, event: &CiEvent, mirror: &Path, sha: &str) {
+        match rev_parse(mirror, &format!("refs/heads/{}^{{commit}}", event.git_ref)) {
+            Ok(head) if head == sha => {}
+            _ => return,
+        }
+        for (name, repo) in &self.config.repos {
+            if name == upstream {
+                continue;
+            }
+            let follower = mirror_dir(&self.state_dir, name);
+            if !follower.join("HEAD").exists() {
+                continue;
+            }
+            let downstream = CiEvent {
+                repo: name.clone(),
+                kind: EventKind::Upstream,
+                git_ref: repo.default_branch.clone(),
+                sha: None,
+                actor: format!("{} via {upstream}", event.actor),
+                delivery: None,
+                upload: None,
+                upstream: Some(Upstream {
+                    repo: upstream.to_owned(),
+                    git_ref: event.git_ref.clone(),
+                    sha: sha.to_owned(),
+                }),
+                received: crate::now_secs(),
+            };
+            let Ok((files, containerfiles)) =
+                read_ci(&follower, &format!("refs/heads/{}", repo.default_branch))
+            else {
+                continue;
+            };
+            if files.is_empty() && containerfiles.is_empty() {
+                continue;
+            }
+            // A broken folder is reported by the follower's own pipelines.
+            let Ok(jobs) = pipeline::load_jobs(&files, &containerfiles) else {
+                continue;
+            };
+            // Whatever the channel, a selection needs a job whose `on` matches.
+            if pipeline::select(&jobs, &downstream, "").is_empty() {
+                continue;
+            }
+            match event::write_inbox(&self.state_dir, &downstream) {
+                Ok(_) => eprintln!(
+                    "[ci] {name}: upstream {upstream} {} {} queued",
+                    event.git_ref,
+                    &sha[..sha.len().min(7)]
+                ),
+                Err(e) => eprintln!("[ci] {name}: upstream {upstream}: {e}"),
+            }
+        }
     }
 
     /// The pipeline of a manual run: the jobs its upload names, read from the
@@ -1645,6 +1710,11 @@ impl Scheduler {
             ("CI_JOB".into(), job.name.clone()),
             ("CI_ACTOR".into(), pipeline.event.actor.clone()),
         ];
+        if let Some(up) = &pipeline.event.upstream {
+            env.push(("CI_UPSTREAM_REPO".into(), up.repo.clone()));
+            env.push(("CI_UPSTREAM_REF".into(), up.git_ref.clone()));
+            env.push(("CI_UPSTREAM_SHA".into(), up.sha.clone()));
+        }
         if let Some(platform) = &job.platform {
             env.push(("CI_PLATFORM".into(), platform.clone()));
         }
@@ -2553,7 +2623,7 @@ fn event_commit(mirror: &Path, event: &CiEvent) -> Result<String, String> {
         None => {
             let refname = match event.kind {
                 EventKind::Tag => format!("refs/tags/{}^{{commit}}", event.git_ref),
-                EventKind::Push | EventKind::Nightly => {
+                EventKind::Push | EventKind::Nightly | EventKind::Upstream => {
                     format!("refs/heads/{}^{{commit}}", event.git_ref)
                 }
                 EventKind::Manual => return Err("a manual event carries its sha".to_owned()),
@@ -2623,6 +2693,7 @@ mod tests {
                 actor: "test".to_owned(),
                 delivery: None,
                 upload: None,
+                upstream: None,
                 received: 0,
             },
             sha: None,
@@ -3551,6 +3622,154 @@ mod tests {
         }
 
         #[test]
+        fn an_upstream_push_queues_its_follower_with_the_pushed_commit() {
+            let up = scratch("follow-up");
+            let down = scratch("follow-down");
+            let state = scratch("follow-state");
+            let author = [
+                ("GIT_AUTHOR_NAME".to_owned(), "t".to_owned()),
+                ("GIT_AUTHOR_EMAIL".to_owned(), "t@t".to_owned()),
+                ("GIT_COMMITTER_NAME".to_owned(), "t".to_owned()),
+                ("GIT_COMMITTER_EMAIL".to_owned(), "t@t".to_owned()),
+            ];
+            git(&up, &["init", "-q", "-b", "main"], &author).unwrap();
+            git(
+                &up,
+                &["commit", "-q", "--allow-empty", "-m", "one"],
+                &author,
+            )
+            .unwrap();
+            let older = rev_parse(&up, "HEAD").unwrap();
+            git(&up, &["branch", "dev"], &author).unwrap();
+            git(
+                &up,
+                &["commit", "-q", "--allow-empty", "-m", "two"],
+                &author,
+            )
+            .unwrap();
+            let up_head = rev_parse(&up, "HEAD").unwrap();
+
+            let ci = down.join(CI_DIR);
+            std::fs::create_dir_all(&ci).unwrap();
+            std::fs::write(
+                ci.join("update.sh"),
+                "# /// ci\n# on = [\"push main of up\"]\n# ///\necho\n",
+            )
+            .unwrap();
+            std::fs::write(
+                ci.join("own.sh"),
+                "# /// ci\n# on = [\"push main\"]\n# ///\necho\n",
+            )
+            .unwrap();
+            git(&down, &["init", "-q", "-b", "main"], &author).unwrap();
+            git(&down, &["add", "."], &author).unwrap();
+            git(&down, &["commit", "-q", "-m", "ci"], &author).unwrap();
+            let down_head = rev_parse(&down, "HEAD").unwrap();
+
+            let config = Arc::new(
+                CiConfig::parse(&format!(
+                    "default_runner = \"x\"\n\
+                     [runners.x]\nfingerprint = \"{FP_1}\"\n\
+                     [repos.up]\nurl = '{}'\n\
+                     [repos.down]\nurl = '{}'\n",
+                    up.display(),
+                    down.display()
+                ))
+                .expect("a valid config"),
+            );
+            let mut s = scheduler_over(&state, Arc::clone(&config));
+            s.fetch("down", &config.repos["down"])
+                .expect("the follower's mirror");
+
+            let push = |git_ref: &str, sha: Option<&str>| CiEvent {
+                repo: "up".to_owned(),
+                kind: EventKind::Push,
+                git_ref: git_ref.to_owned(),
+                sha: sha.map(str::to_owned),
+                actor: "hannes".to_owned(),
+                delivery: None,
+                upload: None,
+                upstream: None,
+                received: 0,
+            };
+            let up_repo = config.repos["up"].clone();
+            let event = push("main", None);
+            let mut p = pipeline("");
+            p.repo = "up".to_owned();
+            p.event = event.clone();
+            assert!(matches!(s.set_up("up", &up_repo, &event, &mut p), Ok(None)));
+            event::drain_inbox(&state);
+            let queued = event::queued(&state);
+            assert_eq!(queued.len(), 1);
+            let (path, follow) = queued[0].clone();
+            assert_eq!(
+                (
+                    follow.repo.as_str(),
+                    follow.kind,
+                    follow.git_ref.as_str(),
+                    follow.sha.as_deref()
+                ),
+                ("down", EventKind::Upstream, "main", None)
+            );
+            assert_eq!(
+                follow.upstream,
+                Some(Upstream {
+                    repo: "up".to_owned(),
+                    git_ref: "main".to_owned(),
+                    sha: up_head.clone(),
+                })
+            );
+
+            // Another branch, and a commit that is no longer the branch's head,
+            // move no follower.
+            for event in [push("dev", None), push("main", Some(&older))] {
+                let mut p = pipeline("");
+                p.repo = "up".to_owned();
+                s.set_up("up", &up_repo, &event, &mut p).expect("set up");
+            }
+            event::drain_inbox(&state);
+            assert_eq!(event::queued(&state).len(), 1);
+
+            let mut x = connect(&s.runners, "x", 0);
+            let key = event::queue_key(&follow);
+            s.start_pipeline(&path, follow, key);
+            s.advance();
+            let jobs: Vec<&str> = s.running[0]
+                .jobs
+                .iter()
+                .map(|j| j.def.name.as_str())
+                .collect();
+            assert_eq!(jobs, ["update"]);
+            let a = assigned(&mut x);
+            assert_eq!(a.sha, down_head);
+            let env = |name: &str| {
+                a.env
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.as_str())
+            };
+            assert_eq!(
+                [
+                    env("CI_EVENT"),
+                    env("CI_REF"),
+                    env("CI_UPSTREAM_REPO"),
+                    env("CI_UPSTREAM_REF"),
+                    env("CI_UPSTREAM_SHA"),
+                ],
+                [
+                    Some("upstream"),
+                    Some("main"),
+                    Some("up"),
+                    Some("main"),
+                    Some(up_head.as_str()),
+                ]
+            );
+            for dir in [up, down, state] {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+
+        #[test]
         fn a_setup_error_lands_in_the_channel_of_its_refs_pipelines() {
             let origin = scratch("setup-error-origin");
             let state = scratch("setup-error-state");
@@ -3703,6 +3922,7 @@ mod tests {
                 actor: upload.actor,
                 delivery: None,
                 upload: Some(id),
+                upstream: None,
                 received: 0,
             }
         }

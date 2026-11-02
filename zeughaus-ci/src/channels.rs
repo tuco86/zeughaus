@@ -115,12 +115,14 @@ impl Channels {
 }
 
 /// push `<branch>` -> `<branch>`, tag -> `tags`, nightly -> `nightly`,
-/// manual run -> its ref, which is the repository's default branch.
+/// upstream -> `upstream`, manual run -> its ref, which is the repository's
+/// default branch.
 pub fn fallback(event: &CiEvent) -> String {
     match event.kind {
         EventKind::Push | EventKind::Manual => event.git_ref.clone(),
         EventKind::Tag => "tags".to_owned(),
         EventKind::Nightly => "nightly".to_owned(),
+        EventKind::Upstream => "upstream".to_owned(),
     }
 }
 
@@ -137,6 +139,7 @@ mod tests {
             actor: "test".to_owned(),
             delivery: None,
             upload: None,
+            upstream: None,
             received: 0,
         }
     }
@@ -195,6 +198,7 @@ on = ["tag v*"]
         assert_eq!(channels.of(&event(EventKind::Tag, "nightly-1")), "tags");
         assert_eq!(channels.of(&event(EventKind::Nightly, "main")), "nightly");
         assert_eq!(channels.of(&event(EventKind::Manual, "main")), "main");
+        assert_eq!(channels.of(&event(EventKind::Upstream, "main")), "upstream");
     }
 
     #[test]

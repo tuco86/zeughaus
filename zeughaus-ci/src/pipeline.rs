@@ -14,6 +14,12 @@ pub enum Pattern {
     Tag(String),
     /// `nightly`: the repository's nightly, which the CI's nightly round queues.
     Nightly,
+    /// `push <glob> of <repo>`: a push to a branch of another repository of
+    /// ci.toml.
+    Upstream {
+        glob: String,
+        repo: String,
+    },
 }
 
 /// `*` matches any sequence including empty and `/`; everything else is
@@ -59,7 +65,19 @@ impl Pattern {
             return Err(format!("pattern `{text}` needs an argument"));
         }
         match kind {
-            "push" => Ok(Pattern::Push(single_glob(kind, rest)?)),
+            "push" => match rest.split_whitespace().collect::<Vec<_>>()[..] {
+                [glob] => Ok(Pattern::Push(glob.to_owned())),
+                [glob, "of", repo] if crate::config::valid_name(repo) => Ok(Pattern::Upstream {
+                    glob: glob.to_owned(),
+                    repo: repo.to_owned(),
+                }),
+                [_, "of", repo] => Err(format!(
+                    "`of` names `{repo}`, which is no repository name ([a-z0-9][a-z0-9-]*)"
+                )),
+                _ => Err(format!(
+                    "`push` takes one glob, or a glob, `of` and a repository, got `{rest}`"
+                )),
+            },
             "tag" => Ok(Pattern::Tag(single_glob(kind, rest)?)),
             other => Err(format!(
                 "unknown pattern kind `{other}` (push, tag or nightly)"
@@ -74,6 +92,13 @@ impl Pattern {
             }
             Pattern::Tag(glob) => event.kind == EventKind::Tag && glob_match(glob, &event.git_ref),
             Pattern::Nightly => event.kind == EventKind::Nightly,
+            Pattern::Upstream { glob, repo } => {
+                event.kind == EventKind::Upstream
+                    && event
+                        .upstream
+                        .as_ref()
+                        .is_some_and(|up| &up.repo == repo && glob_match(glob, &up.git_ref))
+            }
         }
     }
 }
@@ -84,6 +109,7 @@ impl fmt::Display for Pattern {
             Pattern::Push(glob) => write!(f, "push {glob}"),
             Pattern::Tag(glob) => write!(f, "tag {glob}"),
             Pattern::Nightly => f.write_str("nightly"),
+            Pattern::Upstream { glob, repo } => write!(f, "push {glob} of {repo}"),
         }
     }
 }
@@ -259,6 +285,7 @@ mod tests {
             actor: "t".into(),
             delivery: None,
             upload: None,
+            upstream: None,
             received: 0,
         }
     }
@@ -298,6 +325,51 @@ mod tests {
         assert!(!tag.matches(&ev(EventKind::Push, "v1.0")));
         assert!(Pattern::parse("nonsense x").is_err());
         assert!(Pattern::parse("push").is_err());
+    }
+
+    fn upstream_ev(repo: &str, git_ref: &str) -> CiEvent {
+        CiEvent {
+            upstream: Some(crate::event::Upstream {
+                repo: repo.into(),
+                git_ref: git_ref.into(),
+                sha: "a".into(),
+            }),
+            ..ev(EventKind::Upstream, "main")
+        }
+    }
+
+    #[test]
+    fn an_upstream_pattern_matches_the_named_repositorys_push_only() {
+        let follow = Pattern::parse("push main of weida").unwrap();
+        assert!(follow.matches(&upstream_ev("weida", "main")));
+        assert!(!follow.matches(&upstream_ev("weida", "dev")));
+        assert!(!follow.matches(&upstream_ev("other", "main")));
+        assert!(!follow.matches(&ev(EventKind::Push, "main")));
+        assert!(!follow.matches(&ev(EventKind::Upstream, "main")));
+        assert!(
+            !Pattern::parse("push main")
+                .unwrap()
+                .matches(&upstream_ev("weida", "main"))
+        );
+        assert!(
+            Pattern::parse("push release/* of weida")
+                .unwrap()
+                .matches(&upstream_ev("weida", "release/1"))
+        );
+        assert_eq!(follow.to_string(), "push main of weida");
+        assert_eq!(Pattern::parse(&follow.to_string()).unwrap(), follow);
+
+        for bad in ["push main of", "push main from weida"] {
+            let err = Pattern::parse(bad).unwrap_err();
+            assert!(
+                err.starts_with("`push` takes one glob, or a glob, `of` and a repository"),
+                "{err}"
+            );
+        }
+        assert_eq!(
+            Pattern::parse("push main of Weida_X").unwrap_err(),
+            "`of` names `Weida_X`, which is no repository name ([a-z0-9][a-z0-9-]*)"
+        );
     }
 
     #[test]
@@ -478,5 +550,20 @@ mod tests {
             select(&jobs, &ev(EventKind::Nightly, "main"), "nightly"),
             ["nightly"]
         );
+    }
+
+    #[test]
+    fn an_upstream_event_selects_the_jobs_that_follow_it() {
+        let jobs = load(&[
+            file("update.sh", "on = [\"push main of weida\"]"),
+            file("after.sh", "needs = [\"update\"]"),
+            file("own.sh", "on = [\"push main\"]"),
+        ])
+        .unwrap();
+        assert_eq!(
+            select(&jobs, &upstream_ev("weida", "main"), "upstream"),
+            ["update", "after"]
+        );
+        assert_eq!(select(&jobs, &ev(EventKind::Push, "main"), "main"), ["own"]);
     }
 }

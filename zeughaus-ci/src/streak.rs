@@ -3,8 +3,8 @@
 //! deploy jobs all succeeded.
 //!
 //! Computed from the pipeline records, so `ci status` and the scheduler see
-//! the same thing and a restart forgets nothing. Push and nightly pipelines of
-//! the branch count; a job that a pipeline skipped or did not select
+//! the same thing and a restart forgets nothing. Push, nightly and upstream
+//! pipelines of the branch count; a job that a pipeline skipped or did not select
 //! says nothing about it, so the streak looks past that pipeline. A
 //! cancelled pipeline says nothing about the commit either and is left out
 //! whole.
@@ -34,12 +34,16 @@ pub struct Streak {
     pub last_deploy: Option<(u64, Vec<String>)>,
 }
 
-/// Whether `pipeline` ran for `branch` itself: a push to it or a nightly,
-/// which runs at its head. A manual run has the default branch as its ref
-/// and is neither: what it ran is a working tree no branch holds.
+/// Whether `pipeline` ran for `branch` itself: a push to it, a nightly or an
+/// upstream event, both of which run at its head. A manual run has the
+/// default branch as its ref and is neither: what it ran is a working tree
+/// no branch holds.
 pub fn is_branch(pipeline: &Pipeline, branch: &str) -> bool {
     pipeline.event.git_ref == branch
-        && matches!(pipeline.event.kind, EventKind::Push | EventKind::Nightly)
+        && matches!(
+            pipeline.event.kind,
+            EventKind::Push | EventKind::Nightly | EventKind::Upstream
+        )
 }
 
 /// The streak of `branch` over `pipelines`, the records of one repository
@@ -214,6 +218,7 @@ mod tests {
                 actor: "test".to_owned(),
                 delivery: None,
                 upload: None,
+                upstream: None,
                 received: 0,
             },
             sha: Some(format!("{number:07}abcdef")),
@@ -303,5 +308,12 @@ mod tests {
         let pipelines = vec![pipeline(1, "main", Succeeded, Succeeded), manual];
         assert!(!is_branch(&pipelines[1], "main"));
         assert!(of_branch(&pipelines, "main").red.is_empty());
+    }
+
+    #[test]
+    fn an_upstream_pipeline_runs_the_branch_itself() {
+        let mut upstream = pipeline(1, "main", JobStatus::Failed, JobStatus::Skipped);
+        upstream.event.kind = EventKind::Upstream;
+        assert!(is_branch(&upstream, "main"));
     }
 }

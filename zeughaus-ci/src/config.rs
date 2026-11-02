@@ -4,7 +4,7 @@
 //! (`[secrets]`, read by `crate::secrets`), so `ci.toml` holds nothing that
 //! must stay private.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::Deserialize;
@@ -333,6 +333,7 @@ impl CiConfig {
                 }
             }
         }
+        let repo_names: BTreeSet<String> = self.repos.keys().cloned().collect();
         for (name, repo) in &mut self.repos {
             if !valid_name(name) {
                 return Err(format!("repo name `{name}` must match [a-z0-9][a-z0-9-]*"));
@@ -353,8 +354,15 @@ impl CiConfig {
             }
             for (secret, patterns) in &repo.grants {
                 for pattern in patterns {
-                    Pattern::parse(pattern)
+                    let parsed = Pattern::parse(pattern)
                         .map_err(|e| format!("repo `{name}`: grant for {secret}: {e}"))?;
+                    if let Pattern::Upstream { repo: upstream, .. } = &parsed
+                        && !repo_names.contains(upstream)
+                    {
+                        return Err(format!(
+                            "repo `{name}`: grant for {secret}: `{pattern}` names `{upstream}`, which is no repository of ci.toml"
+                        ));
+                    }
                 }
             }
             if repo.forge != Forge::None && (repo.slug.is_empty() || repo.api.is_empty()) {
@@ -433,6 +441,7 @@ forge = "none"
             actor: "t".into(),
             delivery: None,
             upload: None,
+            upstream: None,
             received: 0,
         }
     }
@@ -596,6 +605,37 @@ forge = "none"
         let nightly = event(EventKind::Nightly, "main");
         assert!(repo.grants("GITHUB_TOKEN", &nightly));
         assert!(!repo.grants("OTHER", &nightly));
+    }
+
+    #[test]
+    fn an_upstream_grant_releases_a_secret_to_the_followed_push() {
+        let grant = |pattern: &str| {
+            CiConfig::parse(&format!(
+                "{EXAMPLE}[repos.smoke.grants]\nGITHUB_TOKEN = [\"{pattern}\"]\n"
+            ))
+        };
+        let config = grant("push main of griasdi").unwrap();
+        let smoke = &config.repos["smoke"];
+        let follow = |git_ref: &str| CiEvent {
+            repo: "smoke".into(),
+            upstream: Some(crate::event::Upstream {
+                repo: "griasdi".into(),
+                git_ref: git_ref.into(),
+                sha: "a".into(),
+            }),
+            ..event(EventKind::Upstream, "main")
+        };
+        assert!(smoke.grants("GITHUB_TOKEN", &follow("main")));
+        assert!(!smoke.grants("GITHUB_TOKEN", &follow("dev")));
+        let push = CiEvent {
+            repo: "smoke".into(),
+            ..event(EventKind::Push, "main")
+        };
+        assert!(!smoke.grants("GITHUB_TOKEN", &push));
+        assert_eq!(
+            grant("push main of nope").unwrap_err(),
+            "repo `smoke`: grant for GITHUB_TOKEN: `push main of nope` names `nope`, which is no repository of ci.toml"
+        );
     }
 
     #[test]

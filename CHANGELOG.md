@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Upstream pipelines: a job header's `on = ["push main of weida"]` follows
+  another repository of `ci.toml`. When a push to weida's `main` is set up
+  and is still the branch's head, the CI queues an `upstream` event for
+  every repository whose default branch has such a job; its pipeline runs
+  that repository's default-branch head with `CI_UPSTREAM_REPO`,
+  `CI_UPSTREAM_REF` and `CI_UPSTREAM_SHA`. Upstream pushes queued behind a
+  running follower pipeline collapse into one for the newest commit.
+  Channels and grants take the same pattern, the fallback channel is
+  `upstream`, and `zeughaus-ci check` and `plan [DIR] push <ref> of <repo>`
+  know it.
 - Job state: a job header's `state = ["fuzz-corpus"]` names stores the CI
   keeps for that job from one pipeline to the next, independent of
   workspaces, `clean` channels and runner budgets. The runner fills

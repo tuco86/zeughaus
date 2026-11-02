@@ -387,6 +387,7 @@ impl ManualService {
             actor: upload.actor,
             delivery: None,
             upload: Some(id.clone()),
+            upstream: None,
             received: crate::now_secs(),
         };
         if let Err(e) = event::write_inbox(&self.state_dir, &event) {

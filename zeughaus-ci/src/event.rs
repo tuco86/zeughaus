@@ -4,7 +4,9 @@
 //! `ci/queue/<key>.json` by the scheduler. The key is the repository, the
 //! event kind and the ref, so a newer event for the same ref replaces the one
 //! still waiting; a running pipeline is never cancelled by it. A manual run's
-//! key is its upload instead, so no manual run replaces another.
+//! key is its upload instead, so no manual run replaces another. An upstream
+//! event's key also covers the upstream repository and branch, so a newer
+//! push of that branch replaces the one still waiting.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -25,6 +27,10 @@ pub enum EventKind {
     /// queue files written while nightlies were cron events say `cron`.
     #[serde(alias = "cron")]
     Nightly,
+    /// Started by a push to another repository of ci.toml that a job of
+    /// this one follows (`push <glob> of <repo>`); runs this repository's
+    /// default branch.
+    Upstream,
     /// A working-tree snapshot an editor's agent uploaded on `/manual`, to
     /// run named jobs of the repository's pipeline from.
     Manual,
@@ -36,6 +42,7 @@ impl fmt::Display for EventKind {
             EventKind::Push => "push",
             EventKind::Tag => "tag",
             EventKind::Nightly => "nightly",
+            EventKind::Upstream => "upstream",
             EventKind::Manual => "manual",
         })
     }
@@ -49,12 +56,22 @@ impl FromStr for EventKind {
             "push" => Ok(EventKind::Push),
             "tag" => Ok(EventKind::Tag),
             "nightly" => Ok(EventKind::Nightly),
+            "upstream" => Ok(EventKind::Upstream),
             "manual" => Ok(EventKind::Manual),
             other => Err(format!(
-                "unknown event kind `{other}` (push, tag, nightly or manual)"
+                "unknown event kind `{other}` (push, tag, nightly, upstream or manual)"
             )),
         }
     }
+}
+
+/// The push of another repository an `upstream` event follows: its
+/// repository name in ci.toml, branch, and the commit the push resolved to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Upstream {
+    pub repo: String,
+    pub git_ref: String,
+    pub sha: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +88,9 @@ pub struct CiEvent {
     /// `ci/manual/<upload>/` holds it; `None` for every other event.
     #[serde(default)]
     pub upload: Option<String>,
+    /// The push an `upstream` event follows; `None` for every other kind.
+    #[serde(default)]
+    pub upstream: Option<Upstream>,
     /// Unix seconds.
     pub received: u64,
 }
@@ -96,6 +116,8 @@ pub fn write_inbox(state_dir: &Path, event: &CiEvent) -> Result<PathBuf, String>
 
 /// `<repo>.<kind>.<first 12 hex of sha256(git_ref \n)>`, and for a manual
 /// run `<repo>.manual.<upload>`: every manual run runs, none replaces another.
+/// An upstream event's hash also covers `<upstream repo> \n <upstream ref> \n`
+/// (not its commit), so a newer push of that branch replaces the queued one.
 pub fn queue_key(event: &CiEvent) -> String {
     if let (EventKind::Manual, Some(upload)) = (event.kind, &event.upload) {
         return format!("{}.manual.{upload}", event.repo);
@@ -103,6 +125,12 @@ pub fn queue_key(event: &CiEvent) -> String {
     let mut hasher = Sha256::new();
     hasher.update(event.git_ref.as_bytes());
     hasher.update(b"\n");
+    if let Some(up) = &event.upstream {
+        hasher.update(up.repo.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(up.git_ref.as_bytes());
+        hasher.update(b"\n");
+    }
     let digest = hex::encode(hasher.finalize());
     format!("{}.{}.{}", event.repo, event.kind, &digest[..12])
 }
@@ -218,6 +246,7 @@ mod tests {
             actor: "manual".into(),
             delivery: None,
             upload: None,
+            upstream: None,
             received,
         }
     }
@@ -272,11 +301,47 @@ mod tests {
     }
 
     #[test]
+    fn an_upstream_events_key_covers_the_upstream_branch_not_its_commit() {
+        let push = event("x", 0);
+        let push_key = queue_key(&push);
+        let mut a = push.clone();
+        a.kind = EventKind::Upstream;
+        a.sha = None;
+        a.upstream = Some(Upstream {
+            repo: "weida".into(),
+            git_ref: "main".into(),
+            sha: "a".into(),
+        });
+        let key = queue_key(&a);
+        assert!(key.starts_with("smoke.upstream."));
+        let hash = &key["smoke.upstream.".len()..];
+        assert_eq!(hash.len(), 12);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let mut other_sha = a.clone();
+        other_sha.upstream.as_mut().unwrap().sha = "b".into();
+        assert_eq!(queue_key(&other_sha), key);
+        let mut other_repo = a.clone();
+        other_repo.upstream.as_mut().unwrap().repo = "other".into();
+        assert_ne!(queue_key(&other_repo), key);
+        let mut other_ref = a.clone();
+        other_ref.upstream.as_mut().unwrap().git_ref = "dev".into();
+        assert_ne!(queue_key(&other_ref), key);
+        assert_eq!(queue_key(&event("x", 0)), push_key);
+
+        let mut old = serde_json::to_value(&a).unwrap();
+        assert!(old.as_object_mut().unwrap().remove("upstream").is_some());
+        let old: CiEvent = serde_json::from_value(old).unwrap();
+        assert_eq!(old.upstream, None);
+    }
+
+    #[test]
     fn kind_round_trips() {
         for kind in [
             EventKind::Push,
             EventKind::Tag,
             EventKind::Nightly,
+            EventKind::Upstream,
             EventKind::Manual,
         ] {
             assert_eq!(kind.to_string().parse::<EventKind>().unwrap(), kind);

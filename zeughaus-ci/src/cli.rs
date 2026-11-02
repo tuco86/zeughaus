@@ -6,6 +6,7 @@
 //! serve --listen <host:port> [--hook <host:port>]
 //! check [DIR]
 //! plan [DIR] <push|tag> <ref>
+//! plan [DIR] push <ref> of <repo>
 //! plan [DIR] nightly
 //! run <repo> <push|tag> <ref> [<sha>]
 //! run <repo> nightly
@@ -36,7 +37,7 @@ use zeughaus_link::credentials;
 use crate::CI_DIR;
 use crate::channels::{CHANNELS_FILE, Channels};
 use crate::config::CiConfig;
-use crate::event::{self, CiEvent, EventKind};
+use crate::event::{self, CiEvent, EventKind, Upstream};
 use crate::excerpt;
 use crate::header::JobDef;
 use crate::pipeline::{self, Pattern};
@@ -45,7 +46,8 @@ use crate::secrets::{self, Secrets};
 use crate::streak;
 
 const USAGE: &str = "usage: zeughaus-ci [--state-dir DIR] serve --listen <host:port> \
-[--hook <host:port>] | check [DIR] | plan [DIR] <push|tag> <ref> | plan [DIR] nightly | \
+[--hook <host:port>] | check [DIR] | plan [DIR] <push|tag> <ref> | plan [DIR] push <ref> of <repo> | \
+plan [DIR] nightly | \
 run <repo> <push|tag> <ref> [<sha>] | run <repo> nightly | status [N] | \
 log <repo> <pipeline> <job> [--tail N] | forget <repo> <pipeline> | forge-check <repo> | \
 secrets-check | version | \
@@ -163,12 +165,13 @@ fn ignored_key_warnings(jobs: &[JobDef]) -> Vec<String> {
 /// Every channel a job names exists: in `channels.toml`, or one of the
 /// fallback names an event without a listed channel gets.
 fn check_job_channels(jobs: &[JobDef], channels: &Channels) -> Result<(), String> {
-    let known =
-        |c: &str| matches!(c, "tags" | "nightly") || channels.names().any(|(name, ..)| name == c);
+    let known = |c: &str| {
+        matches!(c, "tags" | "nightly" | "upstream") || channels.names().any(|(name, ..)| name == c)
+    };
     for job in jobs {
         if let Some(c) = job.channels.iter().find(|c| !known(c)) {
             return Err(format!(
-                "{CI_DIR}/{}: channel `{c}` is not in {CHANNELS_FILE} and is no fallback name (tags, nightly)",
+                "{CI_DIR}/{}: channel `{c}` is not in {CHANNELS_FILE} and is no fallback name (tags, nightly, upstream)",
                 job.file
             ));
         }
@@ -206,7 +209,7 @@ fn check(state_dir: &Path, args: &[String]) -> Result<(), String> {
         }
     };
     if let Some(config) = &config {
-        let problems: Vec<String> = jobs
+        let mut problems: Vec<String> = jobs
             .iter()
             .filter_map(|job| {
                 place_job(config, "check", job, |image| {
@@ -217,6 +220,26 @@ fn check(state_dir: &Path, args: &[String]) -> Result<(), String> {
                 .err()
             })
             .collect();
+        let unknown_upstream = |pattern: &Pattern| match pattern {
+            Pattern::Upstream { repo, .. } if !config.repos.contains_key(repo) => Some(format!(
+                "`{pattern}` names `{repo}`, which is no repository of ci.toml"
+            )),
+            _ => None,
+        };
+        for job in &jobs {
+            for pattern in job.on.iter().filter_map(|p| Pattern::parse(p).ok()) {
+                if let Some(problem) = unknown_upstream(&pattern) {
+                    problems.push(format!("{CI_DIR}/{}: on: {problem}", job.file));
+                }
+            }
+        }
+        for (name, patterns, _) in channels.names() {
+            for problem in patterns.iter().filter_map(unknown_upstream) {
+                problems.push(format!(
+                    "{CI_DIR}/{CHANNELS_FILE}: channel `{name}`: {problem}"
+                ));
+            }
+        }
         if !problems.is_empty() {
             return Err(problems.join("\n"));
         }
@@ -268,6 +291,7 @@ fn parse_event(
         actor: "manual".to_owned(),
         delivery: None,
         upload: None,
+        upstream: None,
         received: crate::now_secs(),
     })
 }
@@ -281,11 +305,30 @@ fn plan(args: &[String]) -> Result<(), String> {
     let [kind, rest @ ..] = rest else {
         return Err(USAGE.to_owned());
     };
-    let operands = if kind == "nightly" { 0 } else { 1 };
-    if rest.len() != operands {
-        return Err(USAGE.to_owned());
-    }
-    let event = parse_event("", kind, rest, "main")?;
+    let event = match (kind.as_str(), rest) {
+        ("push", [git_ref, of, upstream]) if of == "of" => CiEvent {
+            repo: String::new(),
+            kind: EventKind::Upstream,
+            git_ref: "main".to_owned(),
+            sha: None,
+            actor: "manual".to_owned(),
+            delivery: None,
+            upload: None,
+            upstream: Some(Upstream {
+                repo: upstream.clone(),
+                git_ref: git_ref.clone(),
+                sha: String::new(),
+            }),
+            received: crate::now_secs(),
+        },
+        _ => {
+            let operands = if kind == "nightly" { 0 } else { 1 };
+            if rest.len() != operands {
+                return Err(USAGE.to_owned());
+            }
+            parse_event("", kind, rest, "main")?
+        }
+    };
     let (jobs, channels) = load_dir(Path::new(dir))?;
     println!("channel {}", channels.of(&event));
     let selected = pipeline::select(&jobs, &event, &channels.of(&event));
@@ -501,7 +544,7 @@ mod tests {
             "[[channel]]\nname = \"dev\"\non = [\"push main\"]\n".to_owned(),
         )])
         .unwrap();
-        let ok = job_in("\"dev\", \"tags\", \"nightly\"");
+        let ok = job_in("\"dev\", \"tags\", \"nightly\", \"upstream\"");
         assert!(check_job_channels(&[ok], &channels).is_ok());
         let err = check_job_channels(&[job_in("\"nightlyy\"")], &channels).unwrap_err();
         assert!(

@@ -228,6 +228,7 @@ fn handle(
             actor: actor.to_owned(),
             delivery: delivery.map(str::to_owned),
             upload: None,
+            upstream: None,
             received: now,
         }),
     )

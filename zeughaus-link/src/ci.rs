@@ -552,7 +552,7 @@ pub struct QueuedView {
     /// of the same ref, else the one the event names without a
     /// `channels.toml`. The pipeline's own channel is decided when it starts.
     pub channel: String,
-    /// `push`, `tag`, `nightly` or `manual`.
+    /// `push`, `tag`, `nightly`, `upstream` or `manual`.
     pub event: String,
     pub git_ref: String,
     /// Pinned by a rerun or a webhook; `None` builds the ref's head.
@@ -581,7 +581,7 @@ pub struct PipelineView {
     pub repo: String,
     pub number: u64,
     pub channel: String,
-    /// `push`, `tag`, `nightly` or `manual`.
+    /// `push`, `tag`, `nightly`, `upstream` or `manual`.
     pub event: String,
     pub git_ref: String,
     pub sha: Option<String>,

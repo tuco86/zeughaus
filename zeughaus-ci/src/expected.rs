@@ -93,6 +93,7 @@ mod tests {
                 actor: "test".to_owned(),
                 delivery: None,
                 upload: None,
+                upstream: None,
                 received: 0,
             },
             sha: None,

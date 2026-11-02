@@ -770,10 +770,10 @@ as `ci = ["<endpoint>"]` next to `remotes` in `zeughaus.toml`. In production:
 between `# /// ci` and `# ///` is a job named after its file. The header
 holds these keys:
 
-- `on`: `push <glob>`, `tag <glob>`, or `nightly`;
+- `on`: `push <glob>`, `push <glob> of <repo>`, `tag <glob>`, or `nightly`;
 - `needs`: exactly one of `on` and `needs` is set;
 - `channels`: only with `needs`; the channels the job is added in (names from
-  `channels.toml`, or `tags`, `nightly`); without it a job with `needs`
+  `channels.toml`, or `tags`, `nightly`, `upstream`); without it a job with `needs`
   runs in every channel that selects what it needs;
 - `image` (a `.zeughaus-ci/<image>.Containerfile`), `machine` (a runner or
   a Windows VM of one, by name) or `platform` (a key of `ci.toml`
@@ -826,7 +826,8 @@ there. A newer push to a ref therefore replaces the one queued behind a
 running pipeline and never cancels the running one. Without `--hook` the
 service has no HTTP listener and pipelines come from `run`, the nightly
 round and manual runs (**Manual runs**, whose events are keyed by upload:
-none replaces another).
+none replaces another). An upstream event's hash also covers the upstream
+repository and branch, not its commit.
 
 **The nightly round.** `ci.toml`'s `[nightly] at = "HH:MM"` (the CI host's
 local time; without it there is no round) is when the scheduler queues a
@@ -838,6 +839,24 @@ nightly`, `ci_run` or a rerun queued it. A round missed while the CI was
 down does not run, and a repository without nightly jobs leaves no record.
 Records and queue files from before the round say `cron` and read as
 nightlies.
+
+**Following another repository.** A job header's `push <glob> of <repo>`
+selects the job for an `upstream` event: a push to a matching branch of
+`<repo>`, another repository of `ci.toml`. When the scheduler sets up the
+pipeline of a push (`set_up`, `queue_followers`), and the pushed commit is
+still its branch's head, it reads the `.zeughaus-ci/` of every other
+repository's default branch from that repository's mirror, without a fetch,
+and writes an `upstream` event to the inbox for each one in which the event
+selects a job. The event names the follower's default branch and carries
+the push (`upstream`: repository, branch, commit); its pipeline fetches
+and runs the follower's head, and its jobs see `CI_UPSTREAM_REPO`,
+`CI_UPSTREAM_REF` and `CI_UPSTREAM_SHA`. Only push events fan out, so
+there are no chains; a repository without a mirror follows nothing until
+its first pipeline. Several upstream pushes queued behind a running
+follower pipeline collapse into one for the newest commit through the
+queue key. An upstream pipeline counts toward the default branch's streak,
+like a nightly. Grants take the same pattern; `ci.toml` and `zeughaus-ci
+check` refuse one that names no repository.
 
 **Pipelines** (`scheduler.rs`, one thread):
 
@@ -854,7 +873,7 @@ patterns; the first channel whose `on` matches the event gets the pipeline
 (`release` on `tag v*`, `nightly` on `nightly`, `dev` on `push main` in
 zeughaus's own file). Without
 a match, or without the file, a push lands in a channel named after its
-branch, a tag in `tags`, a nightly in `nightly`, a manual run in the channel of the
+branch, a tag in `tags`, a nightly in `nightly`, an upstream event in `upstream`, a manual run in the channel of the
 default branch, and records from before channels
 are grouped the same way. The channel is decided in setup and kept in the
 record; an invalid file fails the setup like an invalid job header. `check`

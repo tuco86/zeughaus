@@ -408,6 +408,7 @@ impl CiServer {
             actor: actor.to_owned(),
             delivery: None,
             upload: None,
+            upstream: None,
             received: crate::now_secs(),
         };
         match event::write_inbox(&self.state_dir, &event) {
@@ -1318,6 +1319,7 @@ mod tests {
                 actor: "test".to_owned(),
                 delivery: None,
                 upload: None,
+                upstream: None,
                 received: 0,
             },
             sha: Some(format!("{number:040}")),

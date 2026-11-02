@@ -27,13 +27,13 @@ A header with an `env` table:
 
 | key | value | rule |
 |---|---|---|
-| `on` | list of patterns | `push <glob>`, `tag <glob>` or `nightly`. A glob is one word; `*` matches any run of characters, `/` and nothing included, everything else is literal (`main`, `v*`, `release/*`). `nightly` takes no argument: the CI's nightly round (ci.toml `[nightly] at`, the CI host's local time) runs it against the default branch's head, one repository after another in name order. Empty when the job has `needs` |
+| `on` | list of patterns | `push <glob>`, `push <glob> of <repo>`, `tag <glob>` or `nightly`. A glob is one word; `*` matches any run of characters, `/` and nothing included, everything else is literal (`main`, `v*`, `release/*`). `nightly` takes no argument: the CI's nightly round (ci.toml `[nightly] at`, the CI host's local time) runs it against the default branch's head, one repository after another in name order. `push <glob> of <repo>` follows another repository of ci.toml: a push to a matching branch of `<repo>` starts an `upstream` pipeline of this repository's default-branch head (see Following another repository). Empty when the job has `needs` |
 | `needs` | list of job names | Each names another job of the folder; no cycles. The job is selected only when all its needs are selected, and is skipped when one of them fails or is skipped. A need that succeeded and left output is staged as `$CI_INPUTS/<need>` |
-| `channels` | list of channel names | Only with `needs` (a job with `on` is selected by its own patterns). The job joins a pipeline only in these channels; without the key, in every channel that selects what it needs. A name is a channel of `channels.toml`, or `tags` or `nightly` (`zeughaus-ci check` refuses others) |
+| `channels` | list of channel names | Only with `needs` (a job with `on` is selected by its own patterns). The job joins a pipeline only in these channels; without the key, in every channel that selects what it needs. A name is a channel of `channels.toml`, or `tags`, `nightly` or `upstream` (`zeughaus-ci check` refuses others) |
 | `image` | name | `[a-z0-9][a-z0-9-]*` with a file `.zeughaus-ci/<image>.Containerfile`. The job runs in a container built from it (build context `.zeughaus-ci/`) on the platform's runner, else on the default runner. A unix runner only. Exclusive with `machine` |
 | `machine` | name | A runner of ci.toml (the job runs on its host) or a machine (Windows VM) a runner lists. Exclusive with `image` and `platform` |
 | `platform` | name | `[a-z0-9][a-z0-9-]*`, a key of ci.toml `[platforms]`, whose value is the runner or VM that builds it. Exclusive with `machine`. The job sees it as `CI_PLATFORM` |
-| `secrets` | list of names | Each `[A-Z_][A-Z0-9_]*`. A secret reaches the job as an environment variable of that name when the repository's `grants` in ci.toml release it to the event (`push main`, `tag v*`, `nightly`). Otherwise the job fails with `secret <name> is not granted for <event> <ref>`. A manual run gives none |
+| `secrets` | list of names | Each `[A-Z_][A-Z0-9_]*`. A secret reaches the job as an environment variable of that name when the repository's `grants` in ci.toml release it to the event (`push main`, `tag v*`, `nightly`, `push main of weida`). Otherwise the job fails with `secret <name> is not granted for <event> <ref>`. A manual run gives none |
 | `env` | table of strings | More variables for the job. Names `[A-Z_][A-Z0-9_]*`, none starting with `CI_` or `ZEUGHAUS_` |
 | `timeout_minutes` | integer | 1..=1440, default 240. At the deadline the job gets SIGTERM and, 60 s later, SIGKILL. Its note is `timed out after <n> min` |
 | `state` | list of names | At most 8, each `[a-z0-9][a-z0-9-]*`, none twice. Stores the CI keeps for this job from one pipeline to the next, independent of workspaces, `clean` and runner budgets (a fuzz corpus, a cache that must survive a clean nightly). Before the job starts, `$CI_STATE/<name>/` holds the store's newest version (empty while it has none); when the job ends, that directory becomes the pipeline's version. The CI keeps the 3 newest versions, each at most `state_max_mb` of ci.toml (1024 MB by default). Not on a Windows VM. Manual runs read the stores and never save |
@@ -50,8 +50,18 @@ Rules across keys:
 
 - First the jobs whose `on` matches the event; then, repeatedly, every job with `needs` whose needs are all selected and whose `channels` is empty or names the event's channel.
 - Nothing selected: no pipeline is made (the CI only logs `no jobs`). A push to a ref no job's `on` names starts nothing. A push to the default branch whose commit has no `.zeughaus-ci/` is recorded as `no-jobs` and posts an error on the forge.
-- A push or tag event runs the commit it names; a nightly runs the default branch's head; a manual run runs its uploaded working tree.
+- A push or tag event runs the commit it names; a nightly and an upstream event run the default branch's head; a manual run runs its uploaded working tree.
 - Nightlies run one at a time across the whole CI: a queued nightly waits while any repository's nightly runs, whether the round, `ci_run` or a rerun queued it.
+
+## Following another repository
+
+A job with `on = ["push main of weida"]` runs when weida's `main` is pushed. When the CI sets up the pipeline of a push of `weida`, it reads the `.zeughaus-ci/` of every other repository's default branch from that repository's mirror (no fetch) and queues an `upstream` event for each one with a job that the push selects. That pipeline fetches the follower and runs its default-branch head; `CI_UPSTREAM_REPO`, `CI_UPSTREAM_REF` and `CI_UPSTREAM_SHA` name the push.
+
+- Only a push whose commit is still its branch's head fans out, so a rerun of an older commit moves no follower. Tags, nightlies, manual runs and upstream pipelines never fan out, so there are no chains.
+- A follower needs a mirror: a newly registered repository follows nothing until its first pipeline (`zeughaus-ci run <repo> push main`) has fetched it.
+- Pushes queued behind a running upstream pipeline of the same follower collapse into one run for the newest upstream commit: the queue key covers the upstream repository and branch, not the commit.
+- An upstream pipeline counts toward the follower's default-branch streak and raises red alerts, like a nightly. Without a matching channel it lands in `upstream`.
+- `zeughaus-ci check` with a ci.toml refuses a pattern that names no repository of it; ci.toml refuses such a grant. `zeughaus-ci plan [DIR] push <ref> of <repo>` shows what a push selects.
 
 ## Placement
 
@@ -97,7 +107,7 @@ clean = true
 | `clean` | Boolean, default false. The first job of a pipeline of this channel at each place starts its workspace from nothing |
 
 - The first channel in file order whose `on` matches the event names the pipeline's channel. Unknown keys are an error.
-- No match, or no file: a push goes to a channel named after its branch, a tag to `tags`, a nightly to `nightly`. A manual run goes to the channel a push to the default branch selects.
+- No match, or no file: a push goes to a channel named after its branch, a tag to `tags`, a nightly to `nightly`, an upstream event to `upstream`. A manual run goes to the channel a push to the default branch selects.
 - A channel sorts pipelines (`ci_pipelines` takes one; the CI keeps the 200 newest per channel) and sets `clean`. It starts nothing: a job's `on` does.
 
 ## Job environment
@@ -110,12 +120,13 @@ Set by the CI:
 | `ZEUGHAUS_CI` | `1` |
 | `CI_REPO` | The repository's name in ci.toml |
 | `CI_REPO_SLUG` | Its `slug`, `owner/name`; empty when ci.toml gives none |
-| `CI_EVENT` | `push`, `tag`, `nightly` or `manual` |
-| `CI_REF` | Branch or tag name without `refs/`; the default branch for `nightly` and `manual` |
+| `CI_EVENT` | `push`, `tag`, `nightly`, `upstream` or `manual` |
+| `CI_REF` | Branch or tag name without `refs/`; the default branch for `nightly`, `upstream` and `manual` |
 | `CI_SHA` | The commit id (a tag's commit). For `manual`, the snapshot commit of the uploaded working tree, not HEAD |
 | `CI_PIPELINE` | The pipeline number |
 | `CI_JOB` | The job's name |
-| `CI_ACTOR` | Who caused it: the forge user of a push or tag, `nightly`, `rerun of #<n>`, `manual` for `zeughaus-ci run`, `<user>@<host>` of a manual run or of an event `ci_run` queued |
+| `CI_ACTOR` | Who caused it: the forge user of a push or tag, `nightly`, `rerun of #<n>`, `manual` for `zeughaus-ci run`, `<user>@<host>` of a manual run or of an event `ci_run` queued, `<actor> via <repo>` for an upstream event |
+| `CI_UPSTREAM_REPO`, `CI_UPSTREAM_REF`, `CI_UPSTREAM_SHA` | `upstream` only: the followed repository's name in ci.toml, the pushed branch and the commit it resolved to |
 | `CI_PLATFORM` | The job's `platform`; set only when the header has one |
 
 Set by the runner:
