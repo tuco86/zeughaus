@@ -21,7 +21,7 @@ use zeughaus_mux::workspace::{MAX_TITLE_BYTES, MAX_TREE_DEPTH, MIN_RATIO, Profil
 use zeughaus_mux::{
     AttachTarget, Axis, DetachedTerminal, GroupId, GroupSnapshot, PaneId, PaneNode, PaneTarget,
     RunnerIncarnation, SplitId, SurfaceRef, TabId, TabSnapshot, TerminalId, TopologyCommand,
-    WorkspaceItem, WorkspaceSnapshot,
+    WorkspaceItem, WorkspaceSnapshot, project_color,
 };
 
 /// Why a tab or pane does not cross the boundary of a locked group: its
@@ -35,27 +35,6 @@ const LOCKED_SPLIT: &str = "a locked group takes no new panes";
 /// run. A client can neither create nor dissolve one.
 const TRIGGERED_NAME: &str = "Triggered";
 const TRIGGERED_COLOR: [u8; 4] = [128, 128, 128, 64];
-
-/// Tints of runner-made project groups, picked by the name's hash so a
-/// project keeps its colour.
-const PROJECT_COLORS: [[u8; 4]; 8] = [
-    [0x4c, 0x9a, 0xff, 64],
-    [0x3f, 0xb9, 0x50, 64],
-    [0xd2, 0x99, 0x22, 64],
-    [0xbc, 0x8c, 0xff, 64],
-    [0xff, 0x7b, 0x72, 64],
-    [0x39, 0xc5, 0xcf, 64],
-    [0xf7, 0x78, 0xba, 64],
-    [0xa5, 0xd6, 0xff, 64],
-];
-
-/// The tint of the project group named `name`: FNV-1a over its bytes.
-fn project_color(name: &str) -> [u8; 4] {
-    let hash = name.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
-        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
-    });
-    PROJECT_COLORS[(hash % PROJECT_COLORS.len() as u32) as usize]
-}
 
 /// What a tree holds while it is taken apart and put back together.
 const PLACEHOLDER: PaneNode = PaneNode::Leaf {
@@ -80,8 +59,8 @@ struct Group {
     color: [u8; 4],
     /// See [`GroupSnapshot::locked`].
     locked: bool,
-    /// The repository of a runner-made project group. `None` is a user
-    /// group, or the `Triggered` group when `locked`.
+    /// The origin (`host/owner/name`) of a runner-made project group.
+    /// `None` is a user group, or the `Triggered` group when `locked`.
     project: Option<String>,
     tabs: Vec<Tab>,
 }
@@ -190,11 +169,12 @@ impl Workspace {
         Ok(())
     }
 
-    /// The runner's locked group of `project`, or its `Triggered` group for
-    /// `None`, created at the end of the top level the first time a run
-    /// needs it. A project group never takes the last group slot, which is
-    /// kept for `Triggered`; without a slot a project run goes there. `None`
-    /// when not even `Triggered` fits.
+    /// The runner's locked group of the project at origin `project`
+    /// (`host/owner/name`, named after its last segment), or its `Triggered`
+    /// group for `None`, created at the end of the top level the first time
+    /// a run needs it. A project group never takes the last group slot,
+    /// which is kept for `Triggered`; without a slot a project run goes
+    /// there. `None` when not even `Triggered` fits.
     fn owned_group(&mut self, project: Option<&str>) -> Option<&mut Group> {
         let position = self.items.iter().position(|item| {
             matches!(item, Item::Group(group)
@@ -211,7 +191,10 @@ impl Workspace {
                 let (name, color) = match project {
                     Some(_) if groups >= MAX_GROUPS - 1 => return self.owned_group(None),
                     None if groups >= MAX_GROUPS => return None,
-                    Some(project) => (project.to_owned(), project_color(project)),
+                    Some(origin) => {
+                        let name = origin.rsplit('/').next().unwrap_or(origin);
+                        (name.to_owned(), project_color(name))
+                    }
                     None => (TRIGGERED_NAME.to_owned(), TRIGGERED_COLOR),
                 };
                 let id = GroupId(self.next_group);
@@ -484,6 +467,7 @@ impl Workspace {
                         color_rgba: group.color,
                         locked: group.locked,
                         tabs: group.tabs.iter().map(tab).collect(),
+                        project: group.project.clone(),
                     }),
                 })
                 .collect(),
@@ -582,6 +566,9 @@ impl Workspace {
             | TopologyCommand::ReleaseControl { .. }
             | TopologyCommand::ReplayRun { .. } => {
                 return Err("not a structural command".to_owned());
+            }
+            TopologyCommand::OpenProject { .. } => {
+                return Err("opening a project is the mux service's".to_owned());
             }
             TopologyCommand::AttachTerminal { terminal, target } => {
                 if !self.owned.contains(terminal) {
@@ -1916,21 +1903,21 @@ mod tests {
     fn project_runs_get_a_locked_group_per_repository() {
         let (mut ws, mut spawn) = with_tabs(1);
         let project = |name: &str| OwnedPlacement::Project(name.to_owned());
-        ws.add_owned(TerminalId(500), project("zeughaus"));
-        ws.add_owned(TerminalId(501), project("zeughaus"));
-        ws.add_owned(TerminalId(502), project("weida"));
+        ws.add_owned(TerminalId(500), project("h/o/zeughaus"));
+        ws.add_owned(TerminalId(501), project("h/o/zeughaus"));
+        ws.add_owned(TerminalId(502), project("h/o/weida"));
         ws.add_owned(TerminalId(503), OwnedPlacement::Triggered);
         assert_eq!(layout(&ws), ["T101", "G[T500 T501]", "G[T502]", "G[T503]"]);
-        let groups: Vec<(String, bool)> = snap(&ws)
+        let groups: Vec<(String, bool, Option<String>)> = snap(&ws)
             .groups()
-            .map(|g| (g.name.clone(), g.locked))
+            .map(|g| (g.name.clone(), g.locked, g.project.clone()))
             .collect();
         assert_eq!(
             groups,
             [
-                ("zeughaus".to_owned(), true),
-                ("weida".to_owned(), true),
-                ("Triggered".to_owned(), true)
+                ("zeughaus".to_owned(), true, Some("h/o/zeughaus".to_owned())),
+                ("weida".to_owned(), true, Some("h/o/weida".to_owned())),
+                ("Triggered".to_owned(), true, None)
             ]
         );
 
@@ -1947,8 +1934,30 @@ mod tests {
         let mut ws = Workspace::restore(RunnerIncarnation::from_bytes([1; 16]), &saved, |t| {
             alive.contains(&t)
         });
-        ws.add_owned(TerminalId(504), project("zeughaus"));
+        ws.add_owned(TerminalId(504), project("h/o/zeughaus"));
         assert_eq!(layout(&ws), ["T101", "G[T500 T501 T504]", "G[T503]"]);
+    }
+
+    #[test]
+    fn a_user_group_and_triggered_carry_no_project() {
+        let (mut ws, mut spawn) = with_tabs(1);
+        apply(
+            &mut ws,
+            &mut spawn,
+            TopologyCommand::NewGroup {
+                name: "mine".into(),
+                color_rgba: [1, 2, 3, 4],
+            },
+        );
+        ws.add_owned(TerminalId(500), OwnedPlacement::Triggered);
+        let groups: Vec<(String, Option<String>)> = snap(&ws)
+            .groups()
+            .map(|g| (g.name.clone(), g.project.clone()))
+            .collect();
+        assert_eq!(
+            groups,
+            [("mine".to_owned(), None), ("Triggered".to_owned(), None)]
+        );
     }
 
     #[test]
@@ -1964,7 +1973,10 @@ mod tests {
                 },
             );
         }
-        ws.add_owned(TerminalId(500), OwnedPlacement::Project("zeughaus".into()));
+        ws.add_owned(
+            TerminalId(500),
+            OwnedPlacement::Project("h/o/zeughaus".into()),
+        );
         let last = snap(&ws).groups().last().unwrap().clone();
         assert_eq!((last.name.as_str(), last.locked), ("Triggered", true));
         assert_eq!(layout(&ws).last().unwrap(), "G[T500]");

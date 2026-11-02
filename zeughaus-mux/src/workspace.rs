@@ -52,6 +52,32 @@ pub struct GroupSnapshot {
     /// tab goes and comes back with the next run.
     pub locked: bool,
     pub tabs: Vec<TabSnapshot>,
+    /// The project (`host/owner/name`) of a runner-made project group;
+    /// `None` for a user group and for `Triggered`. Never skipped when
+    /// serialized: `postcard` decodes by position.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+/// Tints of runner-made project groups, picked by the name's hash so a
+/// project keeps its colour wherever it is drawn.
+pub const PROJECT_COLORS: [[u8; 4]; 8] = [
+    [0x4c, 0x9a, 0xff, 64],
+    [0x3f, 0xb9, 0x50, 64],
+    [0xd2, 0x99, 0x22, 64],
+    [0xbc, 0x8c, 0xff, 64],
+    [0xff, 0x7b, 0x72, 64],
+    [0x39, 0xc5, 0xcf, 64],
+    [0xf7, 0x78, 0xba, 64],
+    [0xa5, 0xd6, 0xff, 64],
+];
+
+/// The tint of the project group named `name`: FNV-1a over its bytes.
+pub fn project_color(name: &str) -> [u8; 4] {
+    let hash = name.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    });
+    PROJECT_COLORS[(hash % PROJECT_COLORS.len() as u32) as usize]
 }
 
 /// One owned terminal no pane shows, with the title a client lists it under.
@@ -336,9 +362,16 @@ pub enum TopologyCommand {
         to: PaneTarget,
     },
     /// Open the output of a closed terminal the runner archived as run
-    /// `run` in a tab of its own, read-only. Needs minor 1.
+    /// `run` in a tab of its own, read-only.
     ReplayRun {
         run: u64,
+    },
+    /// A shell in the work checkout of `origin` (`host/owner/name`), cloned
+    /// first when missing with `branch` checked out, in the runner's project
+    /// group of `origin`.
+    OpenProject {
+        origin: String,
+        branch: String,
     },
 }
 
@@ -482,6 +515,7 @@ mod tests {
                     color_rgba: [1, 2, 3, 4],
                     locked: false,
                     tabs: vec![tab(2, leaf(20)), tab(3, leaf(30))],
+                    project: None,
                 }),
                 WorkspaceItem::Tab(tab(4, leaf(40))),
             ],

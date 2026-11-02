@@ -209,7 +209,7 @@ pub fn master(_args: &[String], _state_dir: &Path) -> ExitCode {
 }
 
 #[cfg(unix)]
-pub use self::unix::{Agents, master, plan};
+pub use self::unix::{Agents, master, plan, work, work_profile};
 
 #[cfg(unix)]
 mod unix {
@@ -223,8 +223,9 @@ mod unix {
     use zeughaus_terminal::wal::Wal;
 
     use super::{
-        MASTER_RETRY, SESSION_LOCK, SessionArgs, agent_root, clone_url, instruction, master_dir,
-        omp_program, parse_args, plan_clone_dir, proposal_instruction,
+        MASTER_RETRY, SESSION_LOCK, SessionArgs, agent_root, checkout_of, clone_url, instruction,
+        master_dir, omp_program, parse_args, parse_work_args, plan_clone_dir, proposal_instruction,
+        work_root,
     };
     use crate::enlist::SessionHost;
     use crate::mcp::client::{Client, Link};
@@ -329,7 +330,7 @@ mod unix {
             // Plan sessions and masters open as tabs in their repository's
             // locked group, where they are seen working; closing the tab
             // stops the session.
-            let placement = OwnedPlacement::Project(spec.repo.clone());
+            let placement = OwnedPlacement::Project(spec.origin.clone());
             let TerminalId(terminal) = self.mux.spawn_owned(
                 profile,
                 Wal::Capped,
@@ -726,11 +727,122 @@ mod unix {
             }
         }
     }
+
+    /// The profile of a shell in the work checkout of `origin`: the
+    /// runner's own `work` subcommand, which clones the checkout first when
+    /// it is missing and then becomes the user's shell there.
+    pub fn work_profile(
+        state_dir: &Path,
+        exe: &Path,
+        origin: &str,
+        branch: &str,
+    ) -> Result<Profile, String> {
+        let root = work_root().ok_or("no work root: HOME is not set")?;
+        let dir = checkout_of(&root, origin)?;
+        let name = origin.rsplit('/').next().unwrap_or(origin);
+        let cwd = if dir.is_dir() {
+            dir
+        } else {
+            std::fs::create_dir_all(&root)
+                .map_err(|e| format!("cannot create {}: {e}", root.display()))?;
+            root
+        };
+        Ok(Profile {
+            label: format!("~/work/{name}"),
+            program: Some(exe.to_owned()),
+            args: vec![
+                "--state-dir".to_owned(),
+                state_dir.to_string_lossy().into_owned(),
+                "work".to_owned(),
+                origin.to_owned(),
+                "--branch".to_owned(),
+                branch.to_owned(),
+            ],
+            cwd: Some(cwd),
+            env: Vec::new(),
+            scrollback_rows: 20_000,
+        })
+    }
+
+    /// `zeughaus-runner work <host/owner/name> [--branch <branch>]`: clones
+    /// the work checkout of the origin when it is missing, then replaces
+    /// itself with the user's shell in it (in the work root when the clone
+    /// failed).
+    pub fn work(args: &[String], _state_dir: &Path) -> ExitCode {
+        use std::os::unix::process::CommandExt;
+
+        let Some((origin, branch)) = parse_work_args(args) else {
+            eprintln!("usage: zeughaus-runner work <host/owner/name> [--branch <branch>]");
+            return ExitCode::FAILURE;
+        };
+        let Some(root) = work_root() else {
+            eprintln!("[work] no work root: HOME is not set");
+            return ExitCode::FAILURE;
+        };
+        let dir = match checkout_of(&root, &origin)
+            .and_then(|dir| ensure_clone("work", &dir, &origin, &branch, None).map(|()| dir))
+        {
+            Ok(dir) => dir,
+            Err(e) => {
+                eprintln!("[work] {e}");
+                root
+            }
+        };
+        let shell = std::env::var_os("SHELL")
+            .filter(|shell| !shell.is_empty())
+            .unwrap_or_else(|| "/bin/sh".into());
+        let e = Command::new(&shell).current_dir(&dir).exec();
+        eprintln!("[work] cannot start {}: {e}", Path::new(&shell).display());
+        ExitCode::FAILURE
+    }
+}
+
+/// The arguments of `work`: one origin and an optional `--branch`, `main`
+/// by default.
+#[cfg(unix)]
+fn parse_work_args(args: &[String]) -> Option<(String, String)> {
+    let mut origin = None;
+    let mut branch = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--branch" if branch.is_none() => branch = Some(args.next()?.clone()),
+            flag if flag.starts_with('-') => return None,
+            _ if origin.is_none() => origin = Some(arg.clone()),
+            _ => return None,
+        }
+    }
+    Some((origin?, branch.unwrap_or_else(|| "main".to_owned())))
+}
+
+#[cfg(not(unix))]
+pub fn work(_args: &[String], _state_dir: &Path) -> ExitCode {
+    eprintln!("[agent] not supported on this platform");
+    ExitCode::FAILURE
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn work_takes_one_origin_and_an_optional_branch() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let parsed = |origin: &str, branch: &str| Some((origin.to_owned(), branch.to_owned()));
+        assert_eq!(parse_work_args(&args(&["h/o/r"])), parsed("h/o/r", "main"));
+        assert_eq!(
+            parse_work_args(&args(&["--branch", "dev", "h/o/r"])),
+            parsed("h/o/r", "dev")
+        );
+        for bad in [
+            &[][..],
+            &["h/o/r", "h/o/s"],
+            &["h/o/r", "--branch"],
+            &["h/o/r", "--origin", "x"],
+        ] {
+            assert_eq!(parse_work_args(&args(bad)), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn an_origin_names_a_checkout_three_levels_down() {

@@ -47,8 +47,6 @@ pub struct JobSpec {
     pub artifacts: Vec<String>,
     /// What started this run, which decides where the host shows it.
     pub kind: RunKind,
-    /// The runner-owned tab group of a CI job's run: its repository.
-    pub group: Option<String>,
 }
 
 /// What started a run.

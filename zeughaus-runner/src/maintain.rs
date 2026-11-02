@@ -380,7 +380,6 @@ fn start_run(
         started: state.started,
         artifacts: Vec::new(),
         kind: RunKind::Maintenance,
-        group: None,
     })
 }
 

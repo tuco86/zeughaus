@@ -147,6 +147,7 @@ pub fn run(args: &[String], state_dir: &Path) -> Option<ExitCode> {
         // the session ends, beside the runner that started it.
         Some("plan") => return Some(crate::agents::plan(&positional[1..], state_dir)),
         Some("master") => return Some(crate::agents::master(&positional[1..], state_dir)),
+        Some("work") => return Some(crate::agents::work(&positional[1..], state_dir)),
         Some("trigger") => parse_trigger(&positional[1..]),
         Some("hold") => parse_hold(&positional[1..]),
         Some("maintain") => return Some(maintain(&positional[1..], state_dir)),

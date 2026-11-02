@@ -155,7 +155,14 @@ struct Inner {
     /// Agent statuses whose process is gone, by terminal and the status's
     /// `at`: reported as no status until the agent reports a new one.
     gone_agents: Mutex<HashSet<(TerminalId, u64)>>,
+    /// Builds the profile of a work shell for an origin and branch; unset
+    /// on a runner that opens no projects.
+    project_profile: OnceLock<ProjectProfile>,
 }
+
+/// The profile of a shell in the work checkout of `origin`, checked out at
+/// `branch` when it has to be cloned first.
+pub type ProjectProfile = Arc<dyn Fn(&str, &str) -> Result<Profile, String> + Send + Sync>;
 
 impl Inner {
     fn publish_revision(&self, revision: u64) {
@@ -212,6 +219,7 @@ impl MuxService {
                 #[cfg(unix)]
                 closed: Mutex::new(VecDeque::new()),
                 gone_agents: Mutex::new(HashSet::new()),
+                project_profile: OnceLock::new(),
             }),
         };
         #[cfg(unix)]
@@ -229,6 +237,12 @@ impl MuxService {
             #[cfg(unix)]
             TerminalHost::Shim(shim) => Some(shim.root.with_file_name("workspace.json")),
         }
+    }
+
+    /// How [`TopologyCommand::OpenProject`] builds its shell. A second call
+    /// is ignored.
+    pub fn set_project_profile(&self, f: ProjectProfile) {
+        let _ = self.inner.project_profile.set(f);
     }
 
     #[cfg(unix)]
@@ -1441,7 +1455,36 @@ impl MuxService {
         outcome
     }
 
+    /// A shell in the work checkout of `origin`, in the runner's project
+    /// group of that origin, like a session of it.
+    fn open_project(&self, origin: &str, branch: &str) -> CommandOutcome {
+        let refused = |reason: String| CommandOutcome::Refused { reason };
+        let Some(profile_of) = self.inner.project_profile.get() else {
+            return refused("this runner opens no projects".into());
+        };
+        let profile = match profile_of(origin, branch) {
+            Ok(profile) => profile,
+            Err(reason) => return refused(reason),
+        };
+        match self.spawn_owned(
+            profile,
+            Wal::Capped,
+            Dimensions { cols: 80, rows: 24 },
+            None,
+            OwnedPlacement::Project(origin.to_owned()),
+            ActivityKind::Shell,
+        ) {
+            Ok(_) => CommandOutcome::Applied {
+                revision: *self.inner.revision.borrow(),
+            },
+            Err(reason) => refused(reason),
+        }
+    }
+
     fn structural(&self, command: &TopologyCommand) -> CommandOutcome {
+        if let TopologyCommand::OpenProject { origin, branch } = command {
+            return self.open_project(origin, branch);
+        }
         if let TopologyCommand::ReplayRun { run } = command {
             return self.replay(*run);
         }

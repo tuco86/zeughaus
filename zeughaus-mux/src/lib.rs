@@ -53,6 +53,7 @@ pub use terminal::{
     Underline, WireColor,
 };
 pub use workspace::{
-    AttachTarget, Axis, DetachedTerminal, GroupSnapshot, PaneNode, PaneTarget, Side, SurfaceRef,
-    TabSlot, TabSnapshot, TopologyCommand, WorkspaceItem, WorkspaceSnapshot,
+    AttachTarget, Axis, DetachedTerminal, GroupSnapshot, PROJECT_COLORS, PaneNode, PaneTarget,
+    Side, SurfaceRef, TabSlot, TabSnapshot, TopologyCommand, WorkspaceItem, WorkspaceSnapshot,
+    project_color,
 };

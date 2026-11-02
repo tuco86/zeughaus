@@ -37,9 +37,9 @@ use crate::workspace::{
 };
 
 /// Protocol version. A major mismatch refuses the attach; a minor is the
-/// lower of the two sides'.
-pub const MAJOR: u8 = 4;
-pub const MINOR: u8 = 1;
+/// lower of the two sides'. The minor keeps counting across majors.
+pub const MAJOR: u8 = 5;
+pub const MINOR: u8 = 2;
 
 const MAGIC: [u8; 2] = *b"ZM";
 
@@ -420,7 +420,12 @@ fn validate_workspace(w: &WorkspaceSnapshot) -> Result<(), CodecError> {
     if w.groups().count() > MAX_GROUPS {
         return Err(CodecError::Invalid("too many groups"));
     }
-    if w.groups().any(|g| g.name.len() > MAX_TITLE_BYTES) {
+    if w.groups().any(|g| {
+        g.name.len() > MAX_TITLE_BYTES
+            || g.project
+                .as_ref()
+                .is_some_and(|p| p.len() > MAX_TITLE_BYTES)
+    }) {
         return Err(CodecError::Invalid("group name too long"));
     }
     let mut leaves = 0;
@@ -483,6 +488,11 @@ fn validate_command(c: &TopologyCommand) -> Result<(), CodecError> {
             if t.len() > MAX_TITLE_BYTES =>
         {
             Err(CodecError::Invalid("title too long"))
+        }
+        TopologyCommand::OpenProject { origin, branch }
+            if origin.len() > MAX_TITLE_BYTES || branch.len() > MAX_TITLE_BYTES =>
+        {
+            Err(CodecError::Invalid("project name too long"))
         }
         _ => Ok(()),
     }
@@ -663,7 +673,7 @@ mod tests {
         assert_eq!(
             bytes,
             [
-                b'Z', b'M', 4, 1, 0x12, 0x00, 0, 0, 0x04, 0x03, 0x02, 0x00, 0x88, 0x77, 0x66, 0x55,
+                b'Z', b'M', 5, 2, 0x12, 0x00, 0, 0, 0x04, 0x03, 0x02, 0x00, 0x88, 0x77, 0x66, 0x55,
                 0x44, 0x33, 0x22, 0x11
             ]
         );
@@ -821,6 +831,7 @@ mod tests {
                             surface: SurfaceRef::Terminal(TerminalId(5)),
                         },
                     }],
+                    project: Some("h/o/zeughaus".into()),
                 }),
             ],
             detached: vec![DetachedTerminal {
@@ -921,6 +932,10 @@ mod tests {
                 },
             },
             TopologyCommand::ReplayRun { run: 12 },
+            TopologyCommand::OpenProject {
+                origin: "git.doodleshnookie.net/tuco86/zeughaus".into(),
+                branch: "main".into(),
+            },
         ] {
             round_trip(Message::Command(Command {
                 request: RequestId(13),
@@ -1077,6 +1092,7 @@ mod tests {
                 color_rgba: [0; 4],
                 locked: false,
                 tabs: Vec::new(),
+                project: None,
             }));
         }
         let bytes = postcard::to_stdvec(&many_groups).unwrap();

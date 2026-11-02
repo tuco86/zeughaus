@@ -664,8 +664,8 @@ impl App {
                 label: link.label.as_str(),
                 detached: self.workspace.detached(key),
                 reachable: true,
-                // A replay needs mux minor 1 on both ends.
-                closed: if self.mux.get(key).is_some_and(|mux| mux.minor >= 1) {
+                // A replay needs the runner's mux attached.
+                closed: if self.mux.get(key).is_some_and(|mux| mux.attached) {
                     self.runtime
                         .activity
                         .get(key)

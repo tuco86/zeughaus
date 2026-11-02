@@ -1856,6 +1856,7 @@ mod tests {
                 color_rgba: [0; 4],
                 locked: false,
                 tabs: vec![tab(2, term(20)), tab(3, term(30))],
+                project: None,
             }),
             WorkspaceItem::Group(GroupSnapshot {
                 id: GroupId(6),
@@ -1863,6 +1864,7 @@ mod tests {
                 color_rgba: [0; 4],
                 locked: true,
                 tabs: vec![tab(4, term(40))],
+                project: None,
             }),
             WorkspaceItem::Tab(tab(7, term(70))),
         ])
