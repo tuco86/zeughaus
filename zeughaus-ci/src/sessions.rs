@@ -1,12 +1,14 @@
 //! Agent sessions: the registry of the sessions the CI started on its
-//! runners, and the dispatcher that starts a master session for each
-//! approved plan on a free runner its `Runs on` matches.
+//! runners, and the dispatcher that starts a plan session for each ready
+//! ticket and a master session for each approved one, each once the
+//! tickets it depends on are finished.
 //!
-//! A master session executes one plan and hosts nothing else: a runner runs
-//! at most one master at a time, and the runners a master reaches over ssh
-//! are reserved for it too, so several plans run at once on different
-//! runners. Plan sessions (omp in plan mode) are opened on request, never
-//! count as busy and reserve nothing.
+//! A master session executes one ticket's plan and hosts nothing else: a
+//! runner runs at most one master at a time, and the runners a master
+//! reaches over ssh are reserved for it too, so several plans run at once
+//! on different runners. Plan sessions (omp in plan mode) never count as
+//! busy and reserve nothing; a ticket's plan session after a Refine resumes
+//! on the runner that wrote its plan.
 //!
 //! The registry is `<state-dir>/ci/sessions.json`: every live session and
 //! the newest [`KEPT_ENDED`] ended ones. A runner reports what became of its
@@ -23,12 +25,12 @@ use serde::{Deserialize, Serialize};
 use zeughaus_link::enlist::{FromRunner, SessionReport, SessionSpec, ToRunner};
 use zeughaus_link::selector::{Selector, parse_runs_on};
 use zeughaus_link::{
-    ClaimHolder, ClaimSubject, ClaimView, DocKind, DocState, SessionKind, SessionMachine,
-    SessionState, SessionView, normalize_origin,
+    ClaimHolder, ClaimSubject, ClaimView, DocKind, DocState, DocView, SessionKind, SessionMachine,
+    SessionState, SessionView, blocked_by, normalize_origin,
 };
 
 use crate::claims;
-use crate::config::Shared;
+use crate::config::{CiConfig, Shared};
 use crate::docs;
 use crate::files::{read_json, write_json};
 use crate::runners::{RunnerView, Runners};
@@ -209,8 +211,9 @@ impl Sessions {
         }
     }
 
-    /// What the runner of `view` is sent to open it.
-    fn spec(&self, view: &SessionView) -> Option<SessionSpec> {
+    /// What the runner of `view` is sent to open it; `resume` is the omp
+    /// session file a plan session resumes.
+    fn spec(&self, view: &SessionView, resume: Option<String>) -> Option<SessionSpec> {
         let config = self.config.get();
         let repo = config.repos.get(&view.repo)?;
         Some(SessionSpec {
@@ -223,12 +226,28 @@ impl Sessions {
             runner: view.runner.clone(),
             machines: view.machines.clone(),
             ci: zeughaus_link::credentials::read_endpoint(&self.state_dir).unwrap_or_default(),
+            resume,
         })
     }
 
-    /// Starts a master for each approved plan that finds free runners, in
-    /// queue order. A plan that finds none stays queued; a later one may
-    /// still find its own.
+    /// Whether ticket `doc` waits for a `depends on` ticket; `lists` caches
+    /// each repository's tickets for one dispatch round.
+    fn blocked(
+        &self,
+        config: &CiConfig,
+        lists: &mut BTreeMap<String, Vec<DocView>>,
+        doc: &DocView,
+    ) -> bool {
+        let list = lists
+            .entry(doc.repo.clone())
+            .or_insert_with(|| docs::list(&self.state_dir, config, &doc.repo));
+        !blocked_by(doc, list).is_empty()
+    }
+
+    /// Starts a plan session for each ready ticket and a master for each
+    /// approved ticket that finds free runners, in queue order, skipping
+    /// those that wait for their dependencies. A ticket that finds no
+    /// runner stays queued; a later one may still find its own.
     pub fn dispatch(&self, now: u64) {
         {
             let mut book = lock(&self.book);
@@ -237,13 +256,18 @@ impl Sessions {
             }
         }
         let config = self.config.get();
+        let views = self.runners.views();
+        let mut lists: BTreeMap<String, Vec<DocView>> = BTreeMap::new();
+        self.dispatch_planning(&config, &views, &mut lists, now);
         let queue = docs::queue(&self.state_dir, &config);
         if queue.is_empty() {
             return;
         }
-        let views = self.runners.views();
         for plan in queue {
             if docs::paused(&self.state_dir, &config, &plan.repo) {
+                continue;
+            }
+            if self.blocked(&config, &mut lists, &plan) {
                 continue;
             }
             let Ok(selectors) = parse_runs_on(&plan.runs_on) else {
@@ -311,7 +335,7 @@ impl Sessions {
                 plan.number,
                 placement.join(", ")
             );
-            let sent = self.spec(&view).is_some_and(|spec| {
+            let sent = self.spec(&view, None).is_some_and(|spec| {
                 self.runners.send(
                     &view.runner,
                     ToRunner::OpenSession {
@@ -328,8 +352,140 @@ impl Sessions {
         }
     }
 
-    /// Marks session `id` failed with `message`; a master's plan goes back
-    /// to the queue and its host gets no other master for a while.
+    /// Opens a plan session for each ready ticket whose dependencies are
+    /// finished and that nobody plans yet: on the runner that wrote its
+    /// plan when it has one (it waits while that runner is away), else on
+    /// the first session host its first `Runs on` matches, else the first.
+    fn dispatch_planning(
+        &self,
+        config: &CiConfig,
+        views: &BTreeMap<String, RunnerView>,
+        lists: &mut BTreeMap<String, Vec<DocView>>,
+        now: u64,
+    ) {
+        for ticket in docs::ready(&self.state_dir, config) {
+            if self.blocked(config, lists, &ticket) {
+                continue;
+            }
+            let mut book = lock(&self.book);
+            let subject = ClaimSubject::Ticket {
+                repo: ticket.repo.clone(),
+                number: ticket.number,
+            };
+            if book.claims.iter().any(|claim| claim.subject == subject) {
+                continue;
+            }
+            if book.list.iter().any(|s| {
+                s.kind == SessionKind::Plan
+                    && s.repo == ticket.repo
+                    && s.doc == Some(ticket.number)
+                    && s.state.is_live()
+            }) {
+                continue;
+            }
+            let hosts = self.session_hosts(views);
+            let host = match &ticket.planner {
+                Some(planner) => hosts
+                    .iter()
+                    .find(|(name, _)| *name == planner.runner)
+                    .map(|(name, _)| name.clone()),
+                None => {
+                    let wanted = parse_runs_on(&ticket.runs_on)
+                        .ok()
+                        .and_then(|selectors| selectors.into_iter().next())
+                        .unwrap_or_default();
+                    hosts
+                        .iter()
+                        .find(|(_, labels)| wanted.matches(labels))
+                        .or_else(|| hosts.first())
+                        .map(|(name, _)| name.clone())
+                }
+            };
+            let Some(host) = host else {
+                continue;
+            };
+            let started = {
+                let _held = lock(&self.docs_lock);
+                docs::start_planning(&self.state_dir, config, &ticket.repo, ticket.number, now)
+            };
+            let doc = match started {
+                Ok(doc) => doc,
+                Err(e) => {
+                    eprintln!("[ci] sessions: {}#{}: {e}", ticket.repo, ticket.number);
+                    continue;
+                }
+            };
+            let _ = self.docs_tx.send(ticket.repo.clone());
+            book.next += 1;
+            let view = SessionView {
+                id: book.next,
+                repo: ticket.repo.clone(),
+                kind: SessionKind::Plan,
+                doc: Some(ticket.number),
+                runner: host,
+                machines: Vec::new(),
+                state: SessionState::Starting,
+                terminal: None,
+                started: now,
+                ended: None,
+                code: None,
+                message: String::new(),
+            };
+            let resume = doc.planner.map(|planner| planner.omp_session);
+            eprintln!(
+                "[ci] session {} plan {}#{} on {}{}",
+                view.id,
+                ticket.repo,
+                ticket.number,
+                view.runner,
+                if resume.is_some() { " (resuming)" } else { "" }
+            );
+            let sent = self.spec(&view, resume).is_some_and(|spec| {
+                self.runners.send(
+                    &view.runner,
+                    ToRunner::OpenSession {
+                        spec: Box::new(spec),
+                    },
+                )
+            });
+            let id = view.id;
+            book.list.push(view);
+            if !sent {
+                self.fail(&mut book, id, "the runner went away", now);
+            }
+            self.changed(&mut book);
+        }
+    }
+
+    /// Plan session `session` ended: its ticket, when still in planning, got
+    /// no plan and goes back with `note`. The caller holds the book.
+    fn plan_ended(&self, session: &SessionView, note: &str, now: u64) {
+        let (SessionKind::Plan, Some(number)) = (session.kind, session.doc) else {
+            return;
+        };
+        let ended = {
+            let _held = lock(&self.docs_lock);
+            docs::planning_ended(
+                &self.state_dir,
+                &self.config.get(),
+                &session.repo,
+                number,
+                note,
+                now,
+            )
+        };
+        match ended {
+            Ok(true) => {
+                let _ = self.docs_tx.send(session.repo.clone());
+            }
+            Ok(false) => {}
+            Err(e) => eprintln!("[ci] sessions: {}#{number}: {e}", session.repo),
+        }
+    }
+
+    /// Marks session `id` failed with `message`; a master's ticket goes back
+    /// to the queue and its host gets no other master for a while, a plan
+    /// session's ticket back to where it was.
     fn fail(&self, book: &mut Book, id: u64, message: &str, now: u64) {
         let Some(session) = book.list.iter_mut().find(|s| s.id == id) else {
             return;
@@ -338,6 +494,14 @@ impl Sessions {
         session.message = message.to_owned();
         session.ended = Some(now);
         claims::release_session(&mut book.claims, id, &session.runner, session.terminal);
+        if session.kind == SessionKind::Plan {
+            let session = session.clone();
+            self.plan_ended(
+                &session,
+                &format!("the plan session failed: {message}"),
+                now,
+            );
+        }
         if session.kind == SessionKind::Master {
             lock(&self.cooldown).insert(session.runner.clone(), now + COOLDOWN_SECS);
             if let Some(number) = session.doc {
@@ -396,6 +560,8 @@ impl Sessions {
                         &session.runner,
                         session.terminal,
                     );
+                    let session = session.clone();
+                    self.plan_ended(&session, "the plan session ended without a plan", now);
                 }
             }
             _ => {}
@@ -420,14 +586,14 @@ impl Sessions {
                 None => {
                     end(session, None, true, now);
                     session.message = "the runner no longer holds it".to_owned();
-                    ended.push((session.id, session.terminal));
+                    ended.push(session.clone());
                 }
                 Some(SessionReport {
                     end: Some((code, killed)),
                     ..
                 }) => {
                     end(session, *code, *killed, now);
-                    ended.push((session.id, session.terminal));
+                    ended.push(session.clone());
                 }
                 Some(report) => {
                     session.state = SessionState::Running;
@@ -435,22 +601,22 @@ impl Sessions {
                 }
             }
         }
-        for (id, terminal) in ended {
-            claims::release_session(&mut book.claims, id, name, terminal);
+        for session in ended {
+            claims::release_session(&mut book.claims, session.id, name, session.terminal);
+            self.plan_ended(&session, "the plan session ended with its runner", now);
         }
         if touched {
             self.changed(book);
         }
     }
 
-    /// Opens a plan session of `repo` (planning `proposal` when named) on a
-    /// runner that hosts sessions: `runner` when named, else the first that
-    /// matches the proposal's first `Runs on`, else the first. A live plan
-    /// session for the same repository and proposal is answered as it is.
+    /// Opens a plan session of `repo` without a ticket on a runner that
+    /// hosts sessions: `runner` when named, else the first. Its plan becomes
+    /// a new ticket. A live such session of the repository is answered as
+    /// it is.
     pub fn open_plan(
         &self,
         repo: &str,
-        proposal: Option<u64>,
         runner: Option<&str>,
         now: u64,
     ) -> Result<SessionView, String> {
@@ -458,36 +624,11 @@ impl Sessions {
         if !config.repos.contains_key(repo) {
             return Err(format!("no repository {repo}"));
         }
-        let mut wanted = Selector::default();
-        if let Some(number) = proposal {
-            let doc = docs::load(&self.state_dir, &config, repo, number)
-                .ok_or_else(|| format!("no proposal #{number} in {repo}"))?;
-            if doc.kind != DocKind::Proposal || doc.state != DocState::Open {
-                return Err(format!("#{number} of {repo} is no open proposal"));
-            }
-            if let Some(first) = parse_runs_on(&doc.runs_on)?.into_iter().next() {
-                wanted = first;
-            }
-        }
         let mut book = lock(&self.book);
         if let Some(live) = book.list.iter().find(|s| {
-            s.kind == SessionKind::Plan && s.repo == repo && s.doc == proposal && s.state.is_live()
+            s.kind == SessionKind::Plan && s.repo == repo && s.doc.is_none() && s.state.is_live()
         }) {
             return Ok(live.clone());
-        }
-        if let Some(number) = proposal
-            && let Some(held) = book.claims.iter().find(|claim| {
-                claim.subject
-                    == (ClaimSubject::Proposal {
-                        repo: repo.to_owned(),
-                        number,
-                    })
-            })
-        {
-            return Err(format!(
-                "proposal #{number} of {repo} is being planned by {}",
-                held.holder_text()
-            ));
         }
         let views = self.runners.views();
         let hosts = self.session_hosts(&views);
@@ -497,21 +638,16 @@ impl Sessions {
                 .find(|(name, _)| name == named)
                 .map(|(name, _)| name.clone())
                 .ok_or_else(|| format!("runner {named} cannot host a session now"))?,
-            None => hosts
-                .iter()
-                .find(|(_, labels)| wanted.matches(labels))
-                .or_else(|| hosts.first())
-                .map(|(name, _)| name.clone())
-                .ok_or_else(|| {
-                    "no runner can host a session (sessions = true and connected)".to_owned()
-                })?,
+            None => hosts.first().map(|(name, _)| name.clone()).ok_or_else(|| {
+                "no runner can host a session (sessions = true and connected)".to_owned()
+            })?,
         };
         book.next += 1;
         let view = SessionView {
             id: book.next,
             repo: repo.to_owned(),
             kind: SessionKind::Plan,
-            doc: proposal,
+            doc: None,
             runner: host,
             machines: Vec::new(),
             state: SessionState::Starting,
@@ -521,7 +657,7 @@ impl Sessions {
             code: None,
             message: String::new(),
         };
-        let sent = self.spec(&view).is_some_and(|spec| {
+        let sent = self.spec(&view, None).is_some_and(|spec| {
             self.runners.send(
                 &view.runner,
                 ToRunner::OpenSession {
@@ -563,8 +699,8 @@ impl Sessions {
         lock(&self.book).claims.clone()
     }
 
-    /// Takes `subject` for `holder` (see [`claims::take`]): a proposal that
-    /// is open or planned, or a pipeline that exists. The holder's live CI
+    /// Takes `subject` for `holder` (see [`claims::take`]): a ticket that is
+    /// not finished, or a pipeline that exists. The holder's live CI
     /// session, by id or by its terminal, names the claim.
     pub fn claim(
         &self,
@@ -581,15 +717,11 @@ impl Sessions {
             return Err(format!("no repository {repo}"));
         }
         let channel = match &subject {
-            ClaimSubject::Proposal { number, .. } => {
-                let open = docs::load(&self.state_dir, &config, repo, *number).is_some_and(|doc| {
-                    doc.kind == DocKind::Proposal
-                        && matches!(doc.state, DocState::Open | DocState::Planned)
-                });
+            ClaimSubject::Ticket { number, .. } => {
+                let open = docs::load(&self.state_dir, &config, repo, *number)
+                    .is_some_and(|doc| ticket_open(&doc));
                 if !open {
-                    return Err(format!(
-                        "#{number} of {repo} is no open or planned proposal"
-                    ));
+                    return Err(format!("#{number} of {repo} is no open ticket"));
                 }
                 String::new()
             }
@@ -680,12 +812,12 @@ impl Sessions {
         }
     }
 
-    /// `repo`'s documents changed: a claim on a proposal that is no longer
-    /// open or planned goes.
+    /// `repo`'s documents changed: a claim on a ticket that is finished
+    /// goes.
     pub fn docs_changed(&self, repo: &str) {
         let mut book = lock(&self.book);
         let held = book.claims.iter().any(|claim| {
-            matches!(claim.subject, ClaimSubject::Proposal { .. }) && claim.subject.repo() == repo
+            matches!(claim.subject, ClaimSubject::Ticket { .. }) && claim.subject.repo() == repo
         });
         if !held {
             return;
@@ -693,17 +825,24 @@ impl Sessions {
         let docs = docs::list(&self.state_dir, &self.config.get(), repo);
         let before = book.claims.len();
         book.claims.retain(|claim| match &claim.subject {
-            ClaimSubject::Proposal { repo: r, number } if r == repo => docs.iter().any(|doc| {
-                doc.number == *number
-                    && doc.kind == DocKind::Proposal
-                    && matches!(doc.state, DocState::Open | DocState::Planned)
-            }),
+            ClaimSubject::Ticket { repo: r, number } if r == repo => docs
+                .iter()
+                .any(|doc| doc.number == *number && ticket_open(doc)),
             _ => true,
         });
         if book.claims.len() != before {
             self.changed(&mut book);
         }
     }
+}
+
+/// A ticket that is not finished: a claim on it means something.
+fn ticket_open(doc: &DocView) -> bool {
+    doc.kind == DocKind::Ticket
+        && !matches!(
+            doc.state,
+            DocState::Done | DocState::Dismissed | DocState::Merged
+        )
 }
 
 /// Session ended with `code`, or `killed` without one.
@@ -795,6 +934,8 @@ mod tests {
         use tokio::sync::mpsc::UnboundedReceiver;
         use zeughaus_link::enlist::Offer;
 
+        use zeughaus_link::{DocLink, LinkKind, Planner};
+
         use crate::config::CiConfig;
 
         fn scratch(name: &str) -> PathBuf {
@@ -876,18 +1017,18 @@ mod tests {
 
         fn approved_plan(f: &Fixture, runs_on: &[&str]) -> u64 {
             let runs_on: Vec<String> = runs_on.iter().map(|s| (*s).to_owned()).collect();
-            let number = docs::create(
+            let number = docs::write_plan(
                 &f.state,
                 &f.config,
                 "demo",
-                docs::NewDoc {
-                    kind: DocKind::Plan,
+                None,
+                docs::PlanText {
                     title: "p",
-                    body: "body",
-                    source: "demo",
-                    proposals: &[],
+                    plan: "# p\n",
+                    includes: &[],
                     runs_on: &runs_on,
-                    onboard: None,
+                    source: "demo",
+                    planner: None,
                 },
                 1,
             )
@@ -980,16 +1121,13 @@ mod tests {
             let _a = connect(&f.runners, "a", "linux");
             // `w` hosts no sessions.
             assert_eq!(
-                f.sessions.open_plan("demo", None, Some("w"), 1),
+                f.sessions.open_plan("demo", Some("w"), 1),
                 Err("runner w cannot host a session now".to_owned())
             );
-            let kept = f.sessions.open_plan("demo", None, None, 1).unwrap();
+            let kept = f.sessions.open_plan("demo", None, 1).unwrap();
             assert_eq!(kept.runner, "a");
             // Asked again: the live session is the answer.
-            assert_eq!(
-                f.sessions.open_plan("demo", None, None, 2).unwrap().id,
-                kept.id
-            );
+            assert_eq!(f.sessions.open_plan("demo", None, 2).unwrap().id, kept.id);
             approved_plan(&f, &[]);
             f.sessions.dispatch(3);
             let master = f.sessions.listed()[1].id;
@@ -1009,23 +1147,36 @@ mod tests {
             assert!(f.sessions.close(kept.id).is_ok());
         }
 
-        fn open_proposal(f: &Fixture) -> u64 {
+        fn open_ticket(f: &Fixture, depends: &[u64]) -> u64 {
+            let links: Vec<DocLink> = depends
+                .iter()
+                .map(|&number| DocLink {
+                    kind: LinkKind::DependsOn,
+                    number,
+                })
+                .collect();
             docs::create(
                 &f.state,
                 &f.config,
                 "demo",
                 docs::NewDoc {
-                    kind: DocKind::Proposal,
-                    title: "p",
+                    kind: DocKind::Ticket,
+                    title: "t",
                     body: "body",
                     source: "elsewhere",
-                    proposals: &[],
+                    links: &links,
                     runs_on: &[],
                     onboard: None,
                 },
                 1,
             )
             .unwrap()
+        }
+
+        fn ready_ticket(f: &Fixture, depends: &[u64]) -> u64 {
+            let number = open_ticket(f, depends);
+            docs::set_state(&f.state, &f.config, "demo", number, DocState::Ready, 2).unwrap();
+            number
         }
 
         fn holder(terminal: u64) -> ClaimHolder {
@@ -1036,47 +1187,128 @@ mod tests {
             }
         }
 
-        fn proposal(number: u64) -> ClaimSubject {
-            ClaimSubject::Proposal {
+        fn ticket(number: u64) -> ClaimSubject {
+            ClaimSubject::Ticket {
                 repo: "demo".to_owned(),
                 number,
             }
         }
 
         #[test]
-        fn the_first_holder_of_a_proposal_keeps_it_from_other_plan_sessions() {
-            let f = fixture("claim-proposal");
-            let _a = connect(&f.runners, "a", "linux");
-            let number = open_proposal(&f);
-            let (claim, ours) = f.sessions.claim(proposal(number), holder(3), 5).unwrap();
+        fn a_ready_ticket_gets_a_plan_session_once_its_dependencies_are_done() {
+            let f = fixture("planning");
+            let mut a = connect(&f.runners, "a", "linux");
+            let first = open_ticket(&f, &[]);
+            let waiting = ready_ticket(&f, &[first]);
+            let free = ready_ticket(&f, &[]);
+
+            f.sessions.dispatch(10);
+            let Ok(ToRunner::OpenSession { spec }) = a.try_recv() else {
+                panic!("the free ticket gets a plan session");
+            };
+            assert_eq!(
+                (spec.kind, spec.doc, spec.resume.clone()),
+                (SessionKind::Plan, Some(free), None)
+            );
+            assert!(a.try_recv().is_err(), "the waiting ticket gets none");
+            assert_eq!(state_of(&f, free), DocState::Planning);
+            assert_eq!(state_of(&f, waiting), DocState::Ready);
+
+            // The session ends without a plan: the ticket goes back open.
+            f.sessions.on_runner(
+                "a",
+                FromRunner::SessionEnded {
+                    id: spec.id,
+                    code: Some(0),
+                    killed: false,
+                },
+                11,
+            );
+            let back = docs::load(&f.state, &f.config, "demo", free).unwrap();
+            assert_eq!(
+                (back.state, back.note.as_str()),
+                (DocState::Open, "the plan session ended without a plan")
+            );
+
+            docs::set_state(&f.state, &f.config, "demo", first, DocState::Dismissed, 12).unwrap();
+            f.sessions.dispatch(13);
+            let Ok(ToRunner::OpenSession { spec }) = a.try_recv() else {
+                panic!("the unblocked ticket gets a plan session");
+            };
+            assert_eq!(spec.doc, Some(waiting));
+        }
+
+        #[test]
+        fn a_refined_ticket_resumes_on_the_runner_that_planned_it() {
+            let f = fixture("resume");
+            let refined = |runner: &str| {
+                let number = ready_ticket(&f, &[]);
+                docs::start_planning(&f.state, &f.config, "demo", number, 3).unwrap();
+                let planner = Planner {
+                    runner: runner.to_owned(),
+                    omp_session: format!("/s/{runner}.jsonl"),
+                };
+                let text = docs::PlanText {
+                    title: "p",
+                    plan: "# p\n",
+                    includes: &[],
+                    runs_on: &[],
+                    source: "demo",
+                    planner: Some(planner),
+                };
+                docs::write_plan(&f.state, &f.config, "demo", Some(number), text, 4).unwrap();
+                docs::refine(&f.state, &f.config, "demo", number, "shorter", 5).unwrap();
+                number
+            };
+            // Planned on `w`, which hosts no sessions: the ticket waits.
+            let elsewhere = refined("w");
+            let mut a = connect(&f.runners, "a", "linux");
+            f.sessions.dispatch(6);
+            assert!(a.try_recv().is_err());
+            assert_eq!(state_of(&f, elsewhere), DocState::Ready);
+
+            let here = refined("a");
+            f.sessions.dispatch(7);
+            let Ok(ToRunner::OpenSession { spec }) = a.try_recv() else {
+                panic!("the planner's runner resumes it");
+            };
+            assert_eq!(
+                (spec.doc, spec.resume.as_deref()),
+                (Some(here), Some("/s/a.jsonl"))
+            );
+        }
+
+        #[test]
+        fn the_first_holder_of_a_ticket_keeps_it_from_the_planning_dispatch() {
+            let f = fixture("claim-ticket");
+            let mut a = connect(&f.runners, "a", "linux");
+            let number = open_ticket(&f, &[]);
+            let (claim, ours) = f.sessions.claim(ticket(number), holder(3), 5).unwrap();
             assert!(ours);
             assert_eq!(claim.since, 5);
-            let (theirs, ours) = f.sessions.claim(proposal(number), holder(4), 6).unwrap();
+            let (theirs, ours) = f.sessions.claim(ticket(number), holder(4), 6).unwrap();
             assert!(!ours);
             assert_eq!(theirs.holder.terminal, 3);
+            docs::set_state(&f.state, &f.config, "demo", number, DocState::Ready, 7).unwrap();
+            f.sessions.dispatch(7);
+            assert!(a.try_recv().is_err(), "a claimed ticket is planned already");
             assert_eq!(
-                f.sessions.open_plan("demo", Some(number), None, 7),
-                Err(format!(
-                    "proposal #{number} of demo is being planned by a session on a, terminal 3"
-                ))
-            );
-            assert_eq!(
-                f.sessions.claim(proposal(99), holder(3), 8),
-                Err("#99 of demo is no open or planned proposal".to_owned())
+                f.sessions.claim(ticket(99), holder(3), 8),
+                Err("#99 of demo is no open ticket".to_owned())
             );
             let bad = ClaimHolder {
                 runner: "A B".to_owned(),
                 ..holder(3)
             };
-            assert!(f.sessions.claim(proposal(number), bad, 8).is_err());
+            assert!(f.sessions.claim(ticket(number), bad, 8).is_err());
         }
 
         #[test]
         fn an_ended_session_drops_the_claims_of_its_terminal() {
             let f = fixture("claim-session");
             let _a = connect(&f.runners, "a", "linux");
-            let number = open_proposal(&f);
-            let session = f.sessions.open_plan("demo", None, None, 1).unwrap();
+            let number = open_ticket(&f, &[]);
+            let session = f.sessions.open_plan("demo", None, 1).unwrap();
             f.sessions.on_runner(
                 "a",
                 FromRunner::SessionOpened {
@@ -1085,7 +1317,7 @@ mod tests {
                 },
                 2,
             );
-            let (claim, _) = f.sessions.claim(proposal(number), holder(9), 3).unwrap();
+            let (claim, _) = f.sessions.claim(ticket(number), holder(9), 3).unwrap();
             assert_eq!(claim.holder.session, Some(session.id));
             assert_eq!(claim.label, "plan demo");
             f.sessions.on_runner(

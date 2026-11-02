@@ -130,7 +130,7 @@ mod tests {
     }
 
     fn proposal(number: u64) -> ClaimSubject {
-        ClaimSubject::Proposal {
+        ClaimSubject::Ticket {
             repo: "demo".into(),
             number,
         }

@@ -117,7 +117,7 @@ pub struct SessionSpec {
     /// The repository as `normalize_origin` gives it.
     pub origin: String,
     pub default_branch: String,
-    /// A master's plan, a plan session's proposal.
+    /// The ticket.
     pub doc: Option<u64>,
     /// The runner's name, as the session sees it in `ZEUGHAUS_RUNNER`.
     pub runner: String,
@@ -125,6 +125,9 @@ pub struct SessionSpec {
     pub machines: Vec<crate::ci::SessionMachine>,
     /// The CI's pinned URL, which the session's tools dial.
     pub ci: String,
+    /// The omp session file a plan session resumes.
+    #[serde(default)]
+    pub resume: Option<String>,
 }
 
 /// How far the transfer of one input has come.
@@ -1010,6 +1013,7 @@ mod tests {
                 addresses: Vec::new(),
             }],
             ci: "weida://sha256:00@10.8.0.1:7444/".to_owned(),
+            resume: Some("/s/1.jsonl".to_owned()),
         };
         let mut buf = Vec::new();
         let to = [

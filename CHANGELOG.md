@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Tickets: a proposal and its plan are one ticket with one number from
+  proposal through planning, review and execution to done (`open`,
+  `ready`, `planning`, `review`, `approved`, `in_progress`, `done`, or
+  `dismissed`, or `merged` into the ticket whose plan includes it with an
+  `Includes: #3, #5` line). Tickets link to each other (`depends on`,
+  `related`); `Plan` releases a ticket and the CI opens its plan session by
+  itself once the tickets it depends on are done, as it starts a master
+  only then. The plan session ends with the omp plugin's `submit_plan`
+  (0.9.0), which stores the plan on the ticket (`zeughaus-runner ci
+  plan-write`) with the session's file; omp's own review in the session is
+  gone. A ticket opens in a popout over the workspace instead of the
+  Board's side detail: its proposal (editable while open or ready), its
+  plan in sections that are deleted or annotated, its links, sessions and
+  state; Refine sends the review back and resumes the planning session on
+  its runner (`omp --resume`). `New ticket` writes one from the Board. The
+  CI migrates stored proposals and plans to tickets at its start;
+  `ci plan-save` and `ci planned` are replaced by `ci plan-write`, and a
+  claim is on a `ticket`.
 
 - The CI page: the CI leaves the tab bar for a chip in the titlebar
   (`N need you`, `M working`) and a full-window page over the workspace.

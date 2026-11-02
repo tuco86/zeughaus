@@ -1,15 +1,15 @@
 //! Agent sessions the CI opens on this runner, each in a terminal of the
 //! runner's mux:
 //!
-//! - `plan <repo> [--proposal <n>]`: omp in plan mode in the plan clone, a
-//!   checkout detached at the repository's default branch that this keeps
-//!   clean and current. It borrows the master clone's objects and never
-//!   builds. With a proposal, omp starts planning that open proposal of the
-//!   CI at once. Its terminal opens as a tab of the locked `Triggered`
-//!   group.
-//! - `master <repo> --plan <n>`: omp executing plan `n`, which the CI put in
-//!   progress on this runner, in the master clone, fast-forwarded to the
-//!   default branch first. Its terminal stays detached.
+//! - `plan <repo> [--ticket <n> [--resume <file>]]`: omp in plan mode in
+//!   the plan clone, a checkout detached at the repository's default
+//!   branch that this keeps clean and current. It borrows the master
+//!   clone's objects and never builds. With a ticket, omp starts planning
+//!   that ticket of the CI at once; after a Refine it resumes the omp
+//!   session that wrote the ticket's plan with the user's review attached.
+//! - `master <repo> --ticket <n>`: omp executing the plan of ticket `n`,
+//!   which the CI put in progress on this runner, in the master clone,
+//!   fast-forwarded to the default branch first.
 //!
 //! Both clones live in the runner's state directory, never among the user's
 //! own checkouts: `<state-dir>/agent-work/{master,plan}/<host>/<owner>/<repo>`.
@@ -97,25 +97,37 @@ pub fn plan_clone_dir(state_dir: &Path, origin: &str) -> Result<PathBuf, String>
 #[cfg(unix)]
 pub const SESSION_LOCK: &str = "zeughaus-session.lock";
 
+/// Whether `value` is an omp session id rather than a session file: omp
+/// finds a session by id prefix in its session directory.
+pub fn is_session_id(value: &Path) -> bool {
+    value.to_str().is_some_and(|id| {
+        !id.is_empty()
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    })
+}
+
 /// What both sessions are started with.
 #[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 struct SessionArgs {
     repo: String,
     branch: Option<String>,
-    proposal: Option<u64>,
-    plan: Option<u64>,
+    ticket: Option<u64>,
+    /// The omp session file a plan session resumes.
+    resume: Option<PathBuf>,
     origin: Option<String>,
 }
 
-/// `<repo> [--branch <branch>] [--proposal <n>] [--plan <n>] [--origin
+/// `<repo> [--branch <branch>] [--ticket <n>] [--resume <file>] [--origin
 /// <origin>]`, the arguments both sessions take.
 #[cfg(unix)]
 fn parse_args(args: &[String]) -> Result<SessionArgs, String> {
     let mut repo = None;
     let mut branch = None;
-    let mut proposal = None;
-    let mut plan = None;
+    let mut ticket = None;
+    let mut resume = None;
     let mut origin = None;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -124,13 +136,14 @@ fn parse_args(args: &[String]) -> Result<SessionArgs, String> {
                 Some(value) if !value.is_empty() => branch = Some(value.clone()),
                 _ => return Err("--branch needs a branch".to_owned()),
             },
-            flag @ ("--proposal" | "--plan") => {
-                match rest.next().and_then(|value| value.parse::<u64>().ok()) {
-                    Some(number) if number >= 1 && flag == "--proposal" => proposal = Some(number),
-                    Some(number) if number >= 1 => plan = Some(number),
-                    _ => return Err(format!("{flag} needs a document number")),
-                }
-            }
+            "--ticket" => match rest.next().and_then(|value| value.parse::<u64>().ok()) {
+                Some(number) if number >= 1 => ticket = Some(number),
+                _ => return Err("--ticket needs a ticket number".to_owned()),
+            },
+            "--resume" => match rest.next() {
+                Some(value) if !value.is_empty() => resume = Some(PathBuf::from(value)),
+                _ => return Err("--resume needs a session file".to_owned()),
+            },
             "--origin" => match rest.next() {
                 Some(value) if !value.is_empty() => origin = Some(value.clone()),
                 _ => return Err("--origin needs an origin".to_owned()),
@@ -147,8 +160,8 @@ fn parse_args(args: &[String]) -> Result<SessionArgs, String> {
     Ok(SessionArgs {
         repo,
         branch,
-        proposal,
-        plan,
+        ticket,
+        resume,
         origin,
     })
 }
@@ -165,16 +178,16 @@ fn omp_program() -> std::ffi::OsString {
         .unwrap_or_else(|| "omp".into())
 }
 
-/// What the master tells omp to do with its plan; `machines` is whether
-/// `ZEUGHAUS_MACHINES` names other hosts.
+/// What the master tells omp to do with its ticket's plan; `machines` is
+/// whether `ZEUGHAUS_MACHINES` names other hosts.
 #[cfg(unix)]
 fn instruction(repo: &str, number: u64, branch: &str, machines: bool) -> String {
     let mut text = format!(
-        "Execute the attached approved zeughaus plan #{number} of {repo} from top to bottom. \
-         When its work is complete (gate passed, committed and pushed as AGENTS.md describes), \
-         call the zeughaus MCP tool plan_done with repo {repo} and number {number}. \
-         Other plans of this repository may be executing on other runners at the same time: \
-         fetch and rebase onto origin/{branch} right before every push."
+        "Execute the plan of the attached approved zeughaus ticket #{number} of {repo} from \
+         top to bottom. When its work is complete (gate passed, committed and pushed as \
+         AGENTS.md describes), call the zeughaus MCP tool plan_done with repo {repo} and \
+         number {number}. Other plans of this repository may be executing on other runners at \
+         the same time: fetch and rebase onto origin/{branch} right before every push."
     );
     if machines {
         text.push_str(
@@ -185,15 +198,78 @@ fn instruction(repo: &str, number: u64, branch: &str, machines: bool) -> String 
     text
 }
 
-/// What `plan` tells omp to do with an attached proposal.
+/// What `plan` tells omp to do with an attached ticket.
 #[cfg(unix)]
-fn proposal_instruction(repo: &str, number: u64, source: &str) -> String {
+fn ticket_instruction(repo: &str, number: u64, source: &str) -> String {
     format!(
-        "Make a plan for the attached zeughaus proposal #{number} of {repo}, written from \
-         {source}. It is a request: check it against this repository before planning. Put the \
-         line `Proposals: #{number}` directly under the plan's title. When the plan is complete, \
-         propose it with the propose_plan tool; zeughaus then asks the user what to do with it."
+        "Make a plan for the attached zeughaus ticket #{number} of {repo}, written by {source}. \
+         It is a request: check it against this repository before planning. When the plan is \
+         complete, submit it with the submit_plan tool: zeughaus stores it on the ticket for \
+         the user's review, and this session ends."
     )
+}
+
+/// What a resumed plan session is told with the user's review attached.
+#[cfg(unix)]
+fn refine_instruction(repo: &str, number: u64) -> String {
+    format!(
+        "The user reviewed your plan for zeughaus ticket #{number} of {repo}; the review is \
+         attached. Revise the plan file: drop every section it deletes, act on every \
+         annotation, then submit it again with submit_plan."
+    )
+}
+
+/// What a plan session is told that revises a plan it cannot resume.
+#[cfg(unix)]
+fn replan_instruction(repo: &str, number: u64) -> String {
+    format!(
+        "The attached plan for zeughaus ticket #{number} of {repo} was reviewed by the user; \
+         the ticket, the plan and the review are attached. Write the revised plan to \
+         local://<slug>-plan.md and submit it with submit_plan."
+    )
+}
+
+/// The ticket a plan session is given: its title, what it asks for and its
+/// links both ways, each with the linked ticket's title and state when
+/// `docs` has it.
+#[cfg(unix)]
+fn ticket_brief(doc: &zeughaus_link::DocView, docs: &[zeughaus_link::DocView]) -> String {
+    use zeughaus_link::LinkKind;
+    let mut text = format!("# #{} {}\n\n", doc.number, doc.title);
+    if doc.body.trim().is_empty() {
+        text.push_str("(no proposal text: this ticket started as a plan)\n");
+    } else {
+        text.push_str(doc.body.trim_end());
+        text.push('\n');
+    }
+    let line = |verb: &str, number: u64| match docs.iter().find(|d| d.number == number) {
+        Some(other) => format!(
+            "- {verb} #{number} {} ({})\n",
+            other.title,
+            other.state.name()
+        ),
+        None => format!("- {verb} #{number}\n"),
+    };
+    let mut links = String::new();
+    for link in &doc.links {
+        let verb = match link.kind {
+            LinkKind::DependsOn => "depends on",
+            LinkKind::Related => "related to",
+        };
+        links.push_str(&line(verb, link.number));
+    }
+    for (kind, number) in zeughaus_link::linked_from(doc.number, docs) {
+        let verb = match kind {
+            LinkKind::DependsOn => "blocks",
+            LinkKind::Related => "related to",
+        };
+        links.push_str(&line(verb, number));
+    }
+    if !links.is_empty() {
+        text.push_str("\n## Links\n\n");
+        text.push_str(&links);
+    }
+    text
 }
 
 #[cfg(not(unix))]
@@ -224,8 +300,8 @@ mod unix {
 
     use super::{
         MASTER_RETRY, SESSION_LOCK, SessionArgs, agent_root, checkout_of, clone_url, instruction,
-        master_dir, omp_program, parse_args, parse_work_args, plan_clone_dir, proposal_instruction,
-        work_root,
+        master_dir, omp_program, parse_args, parse_work_args, plan_clone_dir, refine_instruction,
+        replan_instruction, ticket_brief, ticket_instruction, work_root,
     };
     use crate::enlist::SessionHost;
     use crate::mcp::client::{Client, Link};
@@ -273,16 +349,12 @@ mod unix {
                     return Err(format!("{} exists and is no checkout", clone.display()));
                 }
             }
-            let (word, label, doc_flag) = match (spec.kind, spec.doc) {
-                (SessionKind::Plan, Some(n)) => {
-                    ("plan", format!("plan {} #{n}", spec.repo), "--proposal")
-                }
-                (SessionKind::Plan, None) => ("plan", format!("plan {}", spec.repo), ""),
-                (SessionKind::Master, Some(n)) => {
-                    ("master", format!("master {} #{n}", spec.repo), "--plan")
-                }
+            let (word, label) = match (spec.kind, spec.doc) {
+                (SessionKind::Plan, Some(n)) => ("plan", format!("plan {} #{n}", spec.repo)),
+                (SessionKind::Plan, None) => ("plan", format!("plan {}", spec.repo)),
+                (SessionKind::Master, Some(n)) => ("master", format!("master {} #{n}", spec.repo)),
                 (SessionKind::Master, None) => {
-                    return Err("a master session needs its plan".to_owned());
+                    return Err("a master session needs its ticket".to_owned());
                 }
             };
             // A missing clone is made by the session itself, in the
@@ -306,7 +378,10 @@ mod unix {
                 spec.origin.clone(),
             ];
             if let Some(n) = spec.doc {
-                args.extend([doc_flag.to_owned(), n.to_string()]);
+                args.extend(["--ticket".to_owned(), n.to_string()]);
+            }
+            if let Some(file) = &spec.resume {
+                args.extend(["--resume".to_owned(), file.clone()]);
             }
             let mut env = vec![("ZEUGHAUS_SESSION".to_owned(), spec.id.to_string())];
             if !spec.ci.is_empty() {
@@ -433,34 +508,32 @@ mod unix {
         Ok(file)
     }
 
-    /// `zeughaus-runner plan <repo> --branch <b> --origin <o> [--proposal
-    /// <n>]`: brings the plan clone to the default branch and runs omp in
-    /// plan mode there, planning proposal `n` of the CI when one is named.
-    /// It holds the clone's session lock until omp ends and exits with
-    /// omp's code.
+    /// `zeughaus-runner plan <repo> --branch <b> --origin <o> [--ticket <n>
+    /// [--resume <file>]]`: brings the plan clone to the default branch and
+    /// runs omp in plan mode there, planning ticket `n` of the CI when one is
+    /// named, and resuming the omp session `file` with the user's review
+    /// after a Refine. It holds the clone's session lock until omp ends and
+    /// exits with omp's code.
     pub fn plan(args: &[String], state_dir: &Path) -> ExitCode {
         let fail = |message: String| {
             eprintln!("[plan] {message}");
             ExitCode::FAILURE
         };
-        let (repo, branch, proposal, origin) = match parse_args(args) {
-            Ok(SessionArgs { plan: Some(_), .. }) => {
-                return fail("--plan is for master only".to_owned());
-            }
+        let (repo, branch, ticket, resume, origin) = match parse_args(args) {
             Ok(SessionArgs {
                 repo,
                 branch: Some(branch),
-                proposal,
+                ticket,
+                resume,
                 origin: Some(origin),
-                ..
-            }) => (repo, branch, proposal, origin),
+            }) => (repo, branch, ticket, resume, origin),
             Ok(SessionArgs { branch: None, .. }) => return fail("--branch is needed".to_owned()),
             Ok(SessionArgs { origin: None, .. }) => return fail("--origin is needed".to_owned()),
             Err(e) => return fail(e),
         };
-        let proposal = match proposal {
-            Some(n) => match fetch_proposal(&repo, n, state_dir) {
-                Ok(doc) => Some(doc),
+        let ticket = match ticket {
+            Some(n) => match fetch_ticket(&repo, n, state_dir) {
+                Ok(ticket) => Some(ticket),
                 Err(e) => return fail(e),
             },
             None => None,
@@ -528,18 +601,54 @@ mod unix {
             .env("ZEUGHAUS_PLAN_SESSION", &repo)
             .env("ZEUGHAUS_STATE_DIR", state_dir)
             .current_dir(&dir);
-        if let Some(doc) = &proposal {
-            let file = state_dir
-                .join("agents")
-                .join(&repo)
-                .join(format!("proposal-{}.md", doc.number));
-            if let Err(e) = crate::files::write_atomic(&file, doc.body.as_bytes()) {
+        if let Some((doc, docs)) = &ticket {
+            let n = doc.number;
+            let agents = state_dir.join("agents").join(&repo);
+            let write = |name: String, text: &str| {
+                let file = agents.join(name);
+                crate::files::write_atomic(&file, text.as_bytes()).map(|()| file)
+            };
+            let at = |file: &Path| format!("@{}", file.display());
+            let resumable = resume.filter(|file| {
+                let there = file.is_file() || super::is_session_id(file);
+                if !there {
+                    println!(
+                        "[plan] {} is gone; planning anew with the plan and its review attached",
+                        file.display()
+                    );
+                }
+                there
+            });
+            let written = match resumable {
+                Some(session) => write(format!("refine-{n}.md"), &doc.feedback).map(|refine| {
+                    command
+                        .arg("--resume")
+                        .arg(session)
+                        .arg(at(&refine))
+                        .arg(refine_instruction(&repo, n));
+                }),
+                None if !doc.feedback.is_empty() => {
+                    write(format!("ticket-{n}.md"), &ticket_brief(doc, docs)).and_then(|brief| {
+                        let plan = write(format!("plan-{n}.md"), &doc.plan_text)?;
+                        let refine = write(format!("refine-{n}.md"), &doc.feedback)?;
+                        command
+                            .arg(at(&brief))
+                            .arg(at(&plan))
+                            .arg(at(&refine))
+                            .arg(replan_instruction(&repo, n));
+                        Ok(())
+                    })
+                }
+                None => write(format!("ticket-{n}.md"), &ticket_brief(doc, docs)).map(|brief| {
+                    command
+                        .arg(at(&brief))
+                        .arg(ticket_instruction(&repo, n, &doc.source));
+                }),
+            };
+            if let Err(e) = written {
                 return fail(e);
             }
-            command
-                .arg(format!("@{}", file.display()))
-                .arg(proposal_instruction(&repo, doc.number, &doc.source))
-                .env("ZEUGHAUS_PROPOSAL", doc.number.to_string());
+            command.env("ZEUGHAUS_TICKET", n.to_string());
         }
         match command.status() {
             Ok(status) => status
@@ -552,49 +661,68 @@ mod unix {
         }
     }
 
-    /// Proposal `number` of `repo` from the CI, refused unless it is one.
-    fn fetch_proposal(repo: &str, number: u64, state_dir: &Path) -> Result<DocView, String> {
+    /// Ticket `number` of `repo` from the CI with its texts, refused unless
+    /// it is one, and the repository's tickets for the brief's links (none
+    /// when the list cannot be had).
+    fn fetch_ticket(
+        repo: &str,
+        number: u64,
+        state_dir: &Path,
+    ) -> Result<(DocView, Vec<DocView>), String> {
         let doc = fetch_doc(repo, number, state_dir)?;
-        if doc.kind != DocKind::Proposal {
-            return Err(format!("#{number} of {repo} is a plan, not a proposal"));
+        if doc.kind != DocKind::Ticket {
+            return Err(format!("#{number} of {repo} is no ticket"));
         }
-        if doc.state != DocState::Open {
+        if doc.state != DocState::Planning {
             println!(
-                "[plan] proposal #{number} is {}; planning it anyway",
+                "[plan] ticket #{number} is {}; planning it anyway",
                 doc.state.name()
             );
         }
-        Ok(doc)
+        let docs = match ask_ci(
+            CiRequest::Docs {
+                repo: repo.to_owned(),
+            },
+            state_dir,
+        ) {
+            Ok(CiReply::Docs { docs }) => docs,
+            _ => Vec::new(),
+        };
+        Ok((doc, docs))
     }
 
-    /// Document `number` of `repo` from the CI, with its body.
+    /// Document `number` of `repo` from the CI, with its texts.
     fn fetch_doc(repo: &str, number: u64, state_dir: &Path) -> Result<DocView, String> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("cannot start the async runtime: {e}"))?;
-        let client = Client::new(Link::resolve(None, state_dir));
-        let asked = runtime.block_on(async {
-            let asked = client
-                .ci(CiRequest::Doc {
-                    repo: repo.to_owned(),
-                    number,
-                })
-                .await;
-            client.shutdown().await;
-            asked
-        });
-        match asked? {
+        let request = CiRequest::Doc {
+            repo: repo.to_owned(),
+            number,
+        };
+        match ask_ci(request, state_dir)? {
             CiReply::Doc { doc: Some(doc) } => Ok(*doc),
             CiReply::Doc { doc: None } => Err(format!("no document #{number} in {repo}")),
             other => Err(crate::mcp::unexpected(&other)),
         }
     }
 
-    /// `zeughaus-runner master <repo> --plan <n> --branch <b> --origin <o>`
-    /// in the master clone: brings the clone to the default branch, waiting
-    /// while it is dirty or ahead, and runs omp on plan `n`, which the CI put
-    /// in progress on this runner. Exits with omp's code.
+    /// One request to the CI this state directory dials.
+    fn ask_ci(request: CiRequest, state_dir: &Path) -> Result<CiReply, String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("cannot start the async runtime: {e}"))?;
+        let client = Client::new(Link::resolve(None, state_dir));
+        runtime.block_on(async {
+            let asked = client.ci(request).await;
+            client.shutdown().await;
+            asked
+        })
+    }
+
+    /// `zeughaus-runner master <repo> --ticket <n> --branch <b> --origin
+    /// <o>` in the master clone: brings the clone to the default branch,
+    /// waiting while it is dirty or ahead, and runs omp on the plan of ticket
+    /// `n`, which the CI put in progress on this runner. Exits with omp's
+    /// code.
     pub fn master(args: &[String], state_dir: &Path) -> ExitCode {
         let fail = |message: String| {
             eprintln!("[master] {message}");
@@ -602,16 +730,16 @@ mod unix {
         };
         let (repo, branch, origin, number) = match parse_args(args) {
             Ok(SessionArgs {
-                proposal: Some(_), ..
-            }) => return fail("--proposal is for plan only".to_owned()),
-            Ok(SessionArgs { plan: None, .. }) => return fail("--plan is needed".to_owned()),
+                resume: Some(_), ..
+            }) => return fail("--resume is for plan only".to_owned()),
+            Ok(SessionArgs { ticket: None, .. }) => return fail("--ticket is needed".to_owned()),
             Ok(SessionArgs { branch: None, .. }) => return fail("--branch is needed".to_owned()),
             Ok(SessionArgs { origin: None, .. }) => return fail("--origin is needed".to_owned()),
             Ok(SessionArgs {
                 repo,
                 branch: Some(branch),
                 origin: Some(origin),
-                plan: Some(number),
+                ticket: Some(number),
                 ..
             }) => (repo, branch, origin, number),
             Err(e) => return fail(e),
@@ -642,9 +770,9 @@ mod unix {
             Ok(doc) => doc,
             Err(e) => return fail(e),
         };
-        if plan.kind != DocKind::Plan || plan.state != DocState::InProgress {
+        if plan.kind != DocKind::Ticket || plan.state != DocState::InProgress {
             println!(
-                "[master] plan #{number} is {}; nothing to do",
+                "[master] ticket #{number} is {}; nothing to do",
                 plan.state.name()
             );
             return ExitCode::SUCCESS;
@@ -697,11 +825,11 @@ mod unix {
             .join("agents")
             .join(&plan.repo)
             .join(format!("plan-{}.md", plan.number));
-        if let Err(e) = crate::files::write_atomic(&file, plan.body.as_bytes()) {
+        if let Err(e) = crate::files::write_atomic(&file, plan.plan_text.as_bytes()) {
             eprintln!("[master] {e}");
             return ExitCode::FAILURE;
         }
-        println!("[master] plan #{} {}", plan.number, plan.title);
+        println!("[master] ticket #{} {}", plan.number, plan.title);
         let machines = std::env::var_os("ZEUGHAUS_MACHINES").is_some_and(|m| !m.is_empty());
         let status = Command::new(omp_program())
             .arg(format!("@{}", file.display()))
@@ -821,6 +949,7 @@ pub fn work(_args: &[String], _state_dir: &Path) -> ExitCode {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use zeughaus_link::{DocKind, DocLink, DocState, DocView, LinkKind};
 
     #[test]
     fn work_takes_one_origin_and_an_optional_branch() {
@@ -901,13 +1030,13 @@ mod tests {
     }
 
     #[test]
-    fn both_sessions_take_a_repository_a_branch_a_document_and_an_origin() {
+    fn both_sessions_take_a_repository_a_branch_a_ticket_and_an_origin() {
         let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let session = |branch: Option<&str>, proposal: Option<u64>| SessionArgs {
+        let session = |branch: Option<&str>, ticket: Option<u64>| SessionArgs {
             repo: "demo".to_owned(),
             branch: branch.map(str::to_owned),
-            proposal,
-            plan: None,
+            ticket,
+            resume: None,
             origin: None,
         };
         assert_eq!(
@@ -916,7 +1045,7 @@ mod tests {
         );
         assert_eq!(parse_args(&args(&["demo"])), Ok(session(None, None)));
         assert_eq!(
-            parse_args(&args(&["demo", "--branch", "main", "--proposal", "4"])),
+            parse_args(&args(&["demo", "--branch", "main", "--ticket", "4"])),
             Ok(session(Some("main"), Some(4)))
         );
         assert_eq!(
@@ -927,15 +1056,15 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_args(&args(&["demo", "--plan", "29"])),
+            parse_args(&args(&["demo", "--ticket", "29", "--resume", "/s/a.jsonl"])),
             Ok(SessionArgs {
-                plan: Some(29),
-                ..session(None, None)
+                resume: Some(PathBuf::from("/s/a.jsonl")),
+                ..session(None, Some(29))
             })
         );
         assert_eq!(
-            parse_args(&args(&["demo", "--plan", "0"])),
-            Err("--plan needs a document number".to_owned())
+            parse_args(&args(&["demo", "--resume"])),
+            Err("--resume needs a session file".to_owned())
         );
         assert_eq!(
             parse_args(&args(&["demo", "--origin"])),
@@ -945,16 +1074,78 @@ mod tests {
         assert!(parse_args(&args(&["demo", "--branch"])).is_err());
         assert!(parse_args(&args(&["demo", "other"])).is_err());
         assert!(parse_args(&args(&["../x"])).is_err());
+        assert!(parse_args(&args(&["demo", "--plan", "3"])).is_err());
         for bad in [
-            &["demo", "--proposal"][..],
-            &["demo", "--proposal", "0"],
-            &["demo", "--proposal", "x"],
+            &["demo", "--ticket"][..],
+            &["demo", "--ticket", "0"],
+            &["demo", "--ticket", "x"],
         ] {
             assert_eq!(
                 parse_args(&args(bad)),
-                Err("--proposal needs a document number".to_owned()),
+                Err("--ticket needs a ticket number".to_owned()),
                 "{bad:?}"
             );
         }
+    }
+
+    fn ticket(number: u64, title: &str, state: DocState, links: Vec<DocLink>) -> DocView {
+        DocView {
+            repo: "demo".to_owned(),
+            number,
+            kind: DocKind::Ticket,
+            title: title.to_owned(),
+            state,
+            source: "user".to_owned(),
+            created: 1,
+            changed: 1,
+            approved: None,
+            released: None,
+            links,
+            merged: Vec::new(),
+            into: None,
+            runs_on: Vec::new(),
+            placement: Vec::new(),
+            body: String::new(),
+            plan_text: String::new(),
+            revision: 0,
+            planner: None,
+            feedback: String::new(),
+            onboard: None,
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_ticket_brief_names_its_links_both_ways() {
+        let link = |kind, number| DocLink { kind, number };
+        let mut planned = ticket(
+            3,
+            "Tickets",
+            DocState::Planning,
+            vec![link(LinkKind::DependsOn, 1), link(LinkKind::Related, 9)],
+        );
+        planned.body = "Do it.\n\n".to_owned();
+        let docs = vec![
+            ticket(1, "Claims", DocState::Done, Vec::new()),
+            planned.clone(),
+            ticket(
+                5,
+                "Popout",
+                DocState::Open,
+                vec![link(LinkKind::DependsOn, 3)],
+            ),
+        ];
+        assert_eq!(
+            ticket_brief(&planned, &docs),
+            "# #3 Tickets\n\nDo it.\n\n## Links\n\n\
+             - depends on #1 Claims (done)\n\
+             - related to #9\n\
+             - blocks #5 Popout (open)\n"
+        );
+        let bare = ticket(4, "Plan only", DocState::Planning, Vec::new());
+        assert_eq!(
+            ticket_brief(&bare, &[]),
+            "# #4 Plan only\n\n(no proposal text: this ticket started as a plan)\n"
+        );
     }
 }

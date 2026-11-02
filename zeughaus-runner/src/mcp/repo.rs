@@ -181,27 +181,30 @@ pub fn describe(view: &RepoView, head: Option<&str>) -> String {
     lines.join("\n")
 }
 
-/// The open proposals and the plans that wait or run, each line left out
-/// when it has none.
+/// The open tickets and the tickets that are planned, wait or run, each
+/// line left out when it has none.
 fn doc_lines(view: &RepoView) -> Vec<String> {
-    let proposals: Vec<String> = view
-        .docs
-        .iter()
-        .filter(|doc| doc.kind == DocKind::Proposal && doc.state == DocState::Open)
+    let tickets = view.docs.iter().filter(|doc| doc.kind == DocKind::Ticket);
+    let open: Vec<String> = tickets
+        .clone()
+        .filter(|doc| doc.state == DocState::Open)
         .map(|doc| format!("#{} {} (from {})", doc.number, doc.title, doc.source))
         .collect();
-    let plans: Vec<String> = view
-        .docs
-        .iter()
-        .filter(|doc| doc.kind == DocKind::Plan)
+    let active: Vec<String> = tickets
+        .filter(|doc| {
+            !matches!(
+                doc.state,
+                DocState::Open | DocState::Done | DocState::Dismissed | DocState::Merged
+            )
+        })
         .map(|doc| format!("#{} {} {}", doc.number, doc.state.name(), doc.title))
         .collect();
     let mut lines = Vec::new();
-    if !proposals.is_empty() {
-        lines.push(format!("Open proposals: {}", proposals.join(", ")));
+    if !open.is_empty() {
+        lines.push(format!("Open tickets: {}", open.join(", ")));
     }
-    if !plans.is_empty() {
-        lines.push(format!("Plans: {}", plans.join(", ")));
+    if !active.is_empty() {
+        lines.push(format!("Tickets: {}", active.join(", ")));
     }
     lines
 }
@@ -545,36 +548,43 @@ mod tests {
     }
 
     #[test]
-    fn open_proposals_and_waiting_plans_close_the_description() {
-        let doc = |number, kind, state, title: &str| zeughaus_link::DocView {
+    fn open_and_active_tickets_close_the_description() {
+        let doc = |number, state, title: &str| zeughaus_link::DocView {
             repo: "zeughaus".to_owned(),
             number,
-            kind,
+            kind: DocKind::Ticket,
             title: title.to_owned(),
             state,
             source: "weida".to_owned(),
             created: 0,
             changed: 0,
             approved: None,
-            proposals: Vec::new(),
-            plan: None,
+            released: None,
+            links: Vec::new(),
+            merged: Vec::new(),
+            into: None,
             runs_on: Vec::new(),
             placement: Vec::new(),
             body: String::new(),
+            plan_text: String::new(),
+            revision: 0,
+            planner: None,
+            feedback: String::new(),
             onboard: None,
             note: String::new(),
         };
         let mut view = zeughaus();
         view.docs = vec![
-            doc(1, DocKind::Plan, DocState::Approved, "Store plans"),
-            doc(3, DocKind::Proposal, DocState::Open, "Expose the clock"),
-            doc(4, DocKind::Plan, DocState::Saved, "Plans tab"),
+            doc(1, DocState::Approved, "Store plans"),
+            doc(3, DocState::Open, "Expose the clock"),
+            doc(4, DocState::Review, "Plans tab"),
+            doc(5, DocState::Ready, "Popout"),
         ];
         let text = describe(&view, Some(HEAD));
         assert!(
             text.ends_with(
-                "\nOpen proposals: #3 Expose the clock (from weida)\n\
-                 Plans: #1 approved Store plans, #4 saved Plans tab"
+                "\nOpen tickets: #3 Expose the clock (from weida)\n\
+                 Tickets: #1 approved Store plans, #4 review Plans tab, #5 ready Popout"
             ),
             "{text}"
         );
@@ -608,11 +618,17 @@ mod tests {
             created: 0,
             changed: 0,
             approved: None,
-            proposals: Vec::new(),
-            plan: None,
+            released: None,
+            links: Vec::new(),
+            merged: Vec::new(),
+            into: None,
             runs_on: Vec::new(),
             placement: Vec::new(),
             body: String::new(),
+            plan_text: String::new(),
+            revision: 0,
+            planner: None,
+            feedback: String::new(),
             onboard: None,
             note: String::new(),
         };

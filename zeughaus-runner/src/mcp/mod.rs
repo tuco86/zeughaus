@@ -20,7 +20,7 @@
 //!
 //! - [`rpc`]: the JSON-RPC framing and the calls running in parallel;
 //! - [`tools`]: the fifteen tools and the text they answer with;
-//! - [`docs`]: plans and proposals as text, and what a plan file names;
+//! - [`docs`]: tickets as text;
 //! - [`client`]: the CI's `/ci` and `/manual` exchanges;
 //! - [`repo`]: a checkout, and the CI's view of the repository it belongs to;
 //! - [`snapshot`]: a working tree and its path dependencies as git bundles.
@@ -39,15 +39,15 @@ use std::time::Duration;
 
 use serde::Serialize;
 use tokio::io::BufReader;
-use zeughaus_link::ci::{plan_title, proposals_named, runs_on_named};
+use zeughaus_link::ci::{includes_named, plan_title, runs_on_named};
 use zeughaus_link::{
-    CiReply, CiRequest, ClaimHolder, ClaimSubject, ClaimView, DocKind, DocState, MachineView,
-    RepoView, SessionView,
+    CiReply, CiRequest, ClaimHolder, ClaimSubject, ClaimView, MachineView, Planner, RepoView,
+    SessionView,
 };
 
 use self::client::{Client, Link};
 pub(crate) use self::tools::unexpected;
-use self::tools::{Toolbox, find, is_sha_prefix, one_line, pipeline_text, read_doc};
+use self::tools::{Toolbox, find, is_sha_prefix, one_line, pipeline_text, read_doc, read_docs};
 
 /// How long the process waits for work on the blocking pool once the session
 /// is over. The pool holds the blocking read of stdin, which only ends when
@@ -136,15 +136,15 @@ const EXIT_LATE: u8 = 4;
 /// - `ci find [--json] <repo> <sha>`: the newest pipeline of a commit, as
 ///   `ci_pipeline` tells it. `--json` prints the pipeline's record, or
 ///   `null` when there is none.
-/// - `ci doc [--json] <repo> <number>`: one plan or proposal, as `doc_read`
-///   tells it; `--json` prints its record with the body.
-/// - `ci plan-save [--json] [--approve] <repo> <file>`: stores the plan in
-///   `file`, titled by its first heading, taking up the proposals its
-///   `Proposals:` line names; `--approve` approves it for the master right
-///   away. `--json` prints `{"repo": .., "number": .., "approved": ..}`,
-///   with `approve_failed` saying why an asked approval did not go through.
-/// - `ci planned <repo> <file>`: marks the proposals that the plan in
-///   `file` names as planned, for a plan executed without being saved.
+/// - `ci doc [--json] <repo> <number>`: one ticket, as `doc_read` tells
+///   it; `--json` prints its record with its texts.
+/// - `ci plan-write [--json] [--ticket <n>] [--omp-session <file>] <repo>
+///   <file>`: stores the plan in `file`, titled by its first heading and
+///   including the tickets its `Includes:` line names, on ticket `n` (which
+///   a plan session works on) or as a new ticket; either is then in review.
+///   `--omp-session` names the omp session file a Refine resumes, kept
+///   with the runner of `ZEUGHAUS_RUNNER`. `--json` prints `{"repo": ..,
+///   "number": ..}`.
 /// - `ci wait <repo> <number|sha> [<job>]`: waits until the pipeline (or
 ///   that job of it) has settled, up to [`CLI_WAIT_LIMIT`], and prints it
 ///   as `ci_wait` does; an agent runs it as a background command. It ends
@@ -152,20 +152,19 @@ const EXIT_LATE: u8 = 4;
 /// - `ci overdue <repo> <number> <job>`: the late report of a running job
 ///   (how far into its expected time, its machine's other jobs, its last
 ///   lines), which the omp plugin's push watch sends at each multiple.
-/// - `ci claim [--json] <repo> proposal|pipeline <n>`: takes the proposal
+/// - `ci claim [--json] <repo> ticket|pipeline <n>`: takes the ticket
 ///   or pipeline for this terminal (`ZEUGHAUS_RUNNER`, `ZEUGHAUS_TERMINAL`),
 ///   or says who holds it. `--json` prints `{"ours": .., "claim": ..,
 ///   "text": ..}`.
 /// - `ci renew`: renews every claim of this terminal.
-/// - `ci release [<repo> proposal|pipeline <n>]`: releases one claim of
+/// - `ci release [<repo> ticket|pipeline <n>]`: releases one claim of
 ///   this terminal, or all of them.
 /// - `ci responsible [--json] <repo> <n>`: who is responsible for a
 ///   pipeline's failure. `--json` prints `{"ours": .., "claim": ..|null,
 ///   "text": ..}`, `ours` when this terminal holds it.
 ///
-/// Exit 0: answered (for `ci wait`: settled, whatever its status); an
-/// `--approve` that the CI refused still exits 0 and says so, because the
-/// plan is stored. 1: the arguments, the directory or the file were wrong.
+/// Exit 0: answered (for `ci wait`: settled, whatever its status). 1: the
+/// arguments, the directory or the file were wrong.
 /// 2: no CI is configured, it could not be asked, it refused (no such
 /// document, a state that cannot change, a job that is not running or has
 /// no expected time), or the wait ran out. 3: `ci repo` only, no
@@ -232,14 +231,11 @@ enum CiCommand {
         repo: String,
         number: u64,
     },
-    PlanSave {
+    PlanWrite {
         json: bool,
-        approve: bool,
         repo: String,
-        file: PathBuf,
-    },
-    Planned {
-        repo: String,
+        ticket: Option<u64>,
+        omp_session: Option<PathBuf>,
         file: PathBuf,
     },
     Wait {
@@ -299,7 +295,7 @@ pub(crate) fn env_holder() -> Option<ClaimHolder> {
     )
 }
 
-/// What a claim is on, from `<repo> proposal|pipeline <n>`.
+/// What a claim is on, from `<repo> ticket|pipeline <n>`.
 fn subject_of(repo: &str, kind: &str, number: &str) -> Result<ClaimSubject, String> {
     let n = match number.parse::<u64>() {
         Ok(n) if n >= 1 => n,
@@ -307,9 +303,9 @@ fn subject_of(repo: &str, kind: &str, number: &str) -> Result<ClaimSubject, Stri
     };
     let repo = repo.to_owned();
     match kind {
-        "proposal" => Ok(ClaimSubject::Proposal { repo, number: n }),
+        "ticket" => Ok(ClaimSubject::Ticket { repo, number: n }),
         "pipeline" => Ok(ClaimSubject::Pipeline { repo, number: n }),
-        _ => Err(format!("{kind:?} is neither proposal nor pipeline")),
+        _ => Err(format!("{kind:?} is neither ticket nor pipeline")),
     }
 }
 
@@ -319,25 +315,36 @@ const CLI_WAIT_LIMIT: Duration = Duration::from_secs(4 * 3600);
 
 /// The arguments that follow `ci`.
 fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
-    const SUBCOMMANDS: &str = "repo, find, doc, plan-save, planned, wait, overdue, session, \
-                               claim, renew, release or responsible";
+    const SUBCOMMANDS: &str = "repo, find, doc, plan-write, wait, overdue, session, claim, \
+                               renew, release or responsible";
     let Some((subcommand, rest)) = args.split_first() else {
         return Err(format!("ci needs a subcommand: {SUBCOMMANDS}"));
     };
     let mut json = false;
-    let mut approve = false;
+    let mut ticket = None;
+    let mut omp_session = None;
     let mut operands: Vec<&String> = Vec::new();
-    for arg in rest {
+    let mut rest = rest.iter();
+    while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--json"
                 if !matches!(
                     subcommand.as_str(),
-                    "planned" | "wait" | "overdue" | "renew" | "release"
+                    "wait" | "overdue" | "renew" | "release"
                 ) =>
             {
                 json = true
             }
-            "--approve" if subcommand == "plan-save" => approve = true,
+            "--ticket" if subcommand == "plan-write" => {
+                match rest.next().and_then(|value| value.parse::<u64>().ok()) {
+                    Some(n) if n >= 1 => ticket = Some(n),
+                    _ => return Err("--ticket needs a ticket number".to_owned()),
+                }
+            }
+            "--omp-session" if subcommand == "plan-write" => match rest.next() {
+                Some(value) if !value.is_empty() => omp_session = Some(PathBuf::from(value)),
+                _ => return Err("--omp-session needs a file".to_owned()),
+            },
             flag if flag.len() > 1 && flag.starts_with('-') => {
                 return Err(format!("unknown flag {flag:?} for ci {subcommand}"));
             }
@@ -367,18 +374,14 @@ fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
             _ => Err(format!("{number:?} is no document number")),
         },
         ("doc", _) => Err("ci doc takes a repository name and a number".to_owned()),
-        ("plan-save", [repo, file]) => Ok(CiCommand::PlanSave {
+        ("plan-write", [repo, file]) => Ok(CiCommand::PlanWrite {
             json,
-            approve,
             repo: (*repo).clone(),
+            ticket,
+            omp_session,
             file: PathBuf::from(file),
         }),
-        ("plan-save", _) => Err("ci plan-save takes a repository name and a file".to_owned()),
-        ("planned", [repo, file]) => Ok(CiCommand::Planned {
-            repo: (*repo).clone(),
-            file: PathBuf::from(file),
-        }),
-        ("planned", _) => Err("ci planned takes a repository name and a file".to_owned()),
+        ("plan-write", _) => Err("ci plan-write takes a repository name and a file".to_owned()),
         ("wait", [repo, target, rest @ ..]) if rest.len() <= 1 => {
             // Up to 7 digits is a pipeline number; more digits are a sha
             // prefix that happens to have no letter.
@@ -436,7 +439,7 @@ fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
             subject: subject_of(repo, kind, number)?,
         }),
         ("claim", _) => {
-            Err("ci claim takes a repository name, proposal or pipeline, and a number".to_owned())
+            Err("ci claim takes a repository name, ticket or pipeline, and a number".to_owned())
         }
         ("renew", []) => Ok(CiCommand::Renew),
         ("renew", _) => Err("ci renew takes nothing".to_owned()),
@@ -445,7 +448,7 @@ fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
             subject: Some(subject_of(repo, kind, number)?),
         }),
         ("release", _) => Err(
-            "ci release takes nothing, or a repository name, proposal or pipeline, and a number"
+            "ci release takes nothing, or a repository name, ticket or pipeline, and a number"
                 .to_owned(),
         ),
         ("responsible", [repo, number]) => match number.parse::<u64>() {
@@ -494,14 +497,11 @@ struct RepoAnswer<'a> {
     text: &'a str,
 }
 
-/// The line `ci plan-save --json` prints.
+/// The line `ci plan-write --json` prints.
 #[derive(Serialize)]
-struct SavedAnswer<'a> {
+struct WrittenAnswer<'a> {
     repo: &'a str,
     number: u64,
-    approved: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    approve_failed: Option<String>,
 }
 
 /// The line `ci session --json` prints.
@@ -672,88 +672,66 @@ async fn ci_answer(client: &Arc<Client>, command: CiCommand) -> Result<String, F
             if json {
                 encoded(&doc)
             } else {
+                let all = read_docs(client, &repo).await.unwrap_or_default();
                 Ok(format!(
                     "{}\n",
-                    docs::doc_text(&doc, crate::enlist::now_secs()).trim_end()
+                    docs::doc_text(&doc, &all, crate::enlist::now_secs()).trim_end()
                 ))
             }
         }
-        CiCommand::PlanSave {
+        CiCommand::PlanWrite {
             json,
-            approve,
             repo,
+            ticket,
+            omp_session,
             file,
         } => {
-            let body = read_plan(&file)?;
-            let proposals = proposals_named(&body).map_err(Failure::bad_input)?;
-            let runs_on = runs_on_named(&body).map_err(Failure::bad_input)?;
-            let request = CiRequest::DocCreate {
+            let plan = read_plan(&file)?;
+            let includes = includes_named(&plan).map_err(Failure::bad_input)?;
+            let runs_on = runs_on_named(&plan).map_err(Failure::bad_input)?;
+            // A Refine resumes the session on the runner that wrote the
+            // plan, so the session is kept only together with that runner:
+            // its file by canonical path, or an omp session id as given.
+            let runner = std::env::var("ZEUGHAUS_RUNNER")
+                .ok()
+                .filter(|name| crate::names::valid_name(name));
+            let planner = runner.zip(omp_session).and_then(|(runner, session)| {
+                let omp_session = match std::fs::canonicalize(&session) {
+                    Ok(file) if file.is_file() => file.to_string_lossy().into_owned(),
+                    _ if crate::agents::is_session_id(&session) => {
+                        session.to_string_lossy().into_owned()
+                    }
+                    _ => return None,
+                };
+                Some(Planner {
+                    runner,
+                    omp_session,
+                })
+            });
+            let request = CiRequest::PlanWrite {
                 repo: repo.clone(),
-                kind: DocKind::Plan,
-                title: plan_title(&body),
-                source: repo.clone(),
-                body,
-                proposals,
+                number: ticket,
+                title: plan_title(&plan),
+                plan,
+                includes,
                 runs_on,
-                onboard: None,
+                source: repo.clone(),
+                planner,
             };
             let number = match client.ci(request).await.map_err(Failure::no_answer)? {
                 CiReply::DocCreated { number } => number,
                 other => return Err(Failure::no_answer(unexpected(&other))),
             };
-            // The plan is stored either way: a refused approval is said,
-            // not an exit code, and the Plans tab approves it later.
-            let approve_failed = if approve {
-                let request = CiRequest::DocState {
-                    repo: repo.clone(),
-                    number,
-                    state: DocState::Approved,
-                };
-                match client.ci(request).await {
-                    Ok(CiReply::Accepted) => None,
-                    Ok(other) => Some(unexpected(&other)),
-                    Err(e) => Some(e),
-                }
-            } else {
-                None
-            };
-            let approved = approve && approve_failed.is_none();
             if json {
-                encoded(&SavedAnswer {
+                encoded(&WrittenAnswer {
                     repo: &repo,
                     number,
-                    approved,
-                    approve_failed,
                 })
-            } else if approved {
-                Ok(format!("saved and approved plan #{number} of {repo}\n"))
-            } else if let Some(why) = approve_failed {
-                Ok(format!(
-                    "saved plan #{number} of {repo}; approving it failed: {why}\n"
-                ))
             } else {
-                Ok(format!("saved plan #{number} of {repo}\n"))
+                Ok(format!(
+                    "stored the plan as ticket #{number} of {repo} for review\n"
+                ))
             }
-        }
-        CiCommand::Planned { repo, file } => {
-            let body = read_plan(&file)?;
-            let numbers = proposals_named(&body).map_err(Failure::bad_input)?;
-            if numbers.is_empty() {
-                return Ok("the plan names no proposals\n".to_owned());
-            }
-            for &number in &numbers {
-                let request = CiRequest::DocState {
-                    repo: repo.clone(),
-                    number,
-                    state: DocState::Planned,
-                };
-                match client.ci(request).await.map_err(Failure::no_answer)? {
-                    CiReply::Accepted => {}
-                    other => return Err(Failure::no_answer(unexpected(&other))),
-                }
-            }
-            let marked: Vec<String> = numbers.iter().map(|n| format!("#{n}")).collect();
-            Ok(format!("marked {} planned\n", marked.join(", ")))
         }
         CiCommand::Wait {
             repo,
@@ -959,28 +937,31 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_ci(&args(&["plan-save", "demo", "/tmp/p.md", "--json"])),
-            Ok(CiCommand::PlanSave {
+            parse_ci(&args(&["plan-write", "demo", "/tmp/p.md", "--json"])),
+            Ok(CiCommand::PlanWrite {
                 json: true,
-                approve: false,
                 repo: "demo".to_owned(),
+                ticket: None,
+                omp_session: None,
                 file: PathBuf::from("/tmp/p.md")
             })
         );
         assert_eq!(
-            parse_ci(&args(&["plan-save", "--approve", "demo", "f"])),
-            Ok(CiCommand::PlanSave {
+            parse_ci(&args(&[
+                "plan-write",
+                "--ticket",
+                "4",
+                "demo",
+                "--omp-session",
+                "/s/1.jsonl",
+                "f"
+            ])),
+            Ok(CiCommand::PlanWrite {
                 json: false,
-                approve: true,
                 repo: "demo".to_owned(),
+                ticket: Some(4),
+                omp_session: Some(PathBuf::from("/s/1.jsonl")),
                 file: PathBuf::from("f")
-            })
-        );
-        assert_eq!(
-            parse_ci(&args(&["planned", "demo", "/tmp/p.md"])),
-            Ok(CiCommand::Planned {
-                repo: "demo".to_owned(),
-                file: PathBuf::from("/tmp/p.md")
             })
         );
         let wait = |number: Option<u64>, sha: Option<&str>, job: Option<&str>| CiCommand::Wait {
@@ -1023,14 +1004,30 @@ mod tests {
             ),
             (&["doc", "demo", "0"][..], "\"0\" is no document number"),
             (&["doc", "demo"][..], "ci doc takes"),
-            (&["plan-save", "demo"][..], "ci plan-save takes"),
+            (&["plan-write", "demo"][..], "ci plan-write takes"),
             (
-                &["planned", "--json", "demo", "f"][..],
-                "unknown flag \"--json\" for ci planned",
+                &["plan-write", "demo", "f", "--ticket"][..],
+                "--ticket needs a ticket number",
             ),
             (
-                &["doc", "--approve", "demo", "1"][..],
-                "unknown flag \"--approve\" for ci doc",
+                &["plan-write", "--ticket", "0", "demo", "f"][..],
+                "--ticket needs a ticket number",
+            ),
+            (
+                &["plan-write", "demo", "f", "--omp-session"][..],
+                "--omp-session needs a file",
+            ),
+            (
+                &["doc", "--ticket", "3", "demo", "1"][..],
+                "unknown flag \"--ticket\" for ci doc",
+            ),
+            (
+                &["planned", "demo", "f"][..],
+                "unknown ci subcommand \"planned\"",
+            ),
+            (
+                &["plan-write", "--approve", "demo", "f"][..],
+                "unknown flag \"--approve\" for ci plan-write",
             ),
             (
                 &["find", "zeughaus", "abc"][..],
@@ -1052,7 +1049,7 @@ mod tests {
             ),
             (
                 &["claim", "demo", "plan", "3"][..],
-                "\"plan\" is neither proposal nor pipeline",
+                "\"plan\" is neither ticket nor pipeline",
             ),
             (
                 &["claim", "demo", "pipeline", "0"][..],
@@ -1078,12 +1075,12 @@ mod tests {
     }
 
     #[test]
-    fn ci_claims_a_proposal_or_pipeline_and_asks_who_is_responsible() {
+    fn ci_claims_a_ticket_or_pipeline_and_asks_who_is_responsible() {
         assert_eq!(
-            parse_ci(&args(&["claim", "--json", "demo", "proposal", "3"])),
+            parse_ci(&args(&["claim", "--json", "demo", "ticket", "3"])),
             Ok(CiCommand::Claim {
                 json: true,
-                subject: ClaimSubject::Proposal {
+                subject: ClaimSubject::Ticket {
                     repo: "demo".to_owned(),
                     number: 3
                 }

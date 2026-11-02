@@ -398,6 +398,9 @@ pub enum Message {
     OnboardProject(String),
     #[cfg(not(target_arch = "wasm32"))]
     Onboarded(Result<(), String>),
+    // The ticket popout of a Board.
+    #[cfg(not(target_arch = "wasm32"))]
+    Ticket(TicketMsg),
 }
 
 /// What a letter asks of the CI page in front.
@@ -495,19 +498,20 @@ pub enum CiMsg {
         cancel: bool,
         result: Result<(), String>,
     },
-    /// A repository's plans and proposals, bodies empty, for its Plans tab.
+    /// A repository's tickets, texts empty, for its Board.
     Docs {
         view: u64,
         result: Result<Vec<zeughaus_link::DocView>, String>,
     },
-    /// One document with its body; `None` when the CI no longer has it.
+    /// One document with its texts; `None` when the CI no longer has it.
     Shown {
         view: u64,
         number: u64,
         result: Result<Option<Box<zeughaus_link::DocView>>, String>,
     },
     /// The user asked the CI something its answer to is `Accepted`: a
-    /// `DocState`, `DocDelete`, `DocRunsOn`, `QueuePaused` or `CloseSession`.
+    /// `DocState`, `DocDelete`, `DocRunsOn`, `DocEdit`, `DocLinks`,
+    /// `DocRefine`, `QueuePaused` or `CloseSession`.
     DocAct {
         view: u64,
         request: zeughaus_link::CiRequest,
@@ -523,16 +527,63 @@ pub enum CiMsg {
         number: u64,
         text: String,
     },
-    /// The user asked the CI for a plan session of the Plans tab's
-    /// repository; it plans `proposal` when set.
+    /// The user asked the CI for a plan session of the Board's repository
+    /// without a ticket; its plan becomes a new ticket.
     OpenSession {
         view: u64,
-        proposal: Option<u64>,
     },
     /// What the CI answered.
     SessionOpened(Result<zeughaus_link::SessionView, String>),
     /// The user pressed a link in a document.
     OpenLink(String),
+}
+
+/// Which part of a ticket its popout shows.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketTab {
+    Proposal,
+    Plan,
+}
+
+/// What the ticket popout over the workspace says; `ci` and `view` name the
+/// CI and its Board the ticket belongs to.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone)]
+pub enum TicketMsg {
+    Open {
+        ci: crate::workspace::RunnerKey,
+        view: u64,
+        number: u64,
+    },
+    /// A ticket written in the popout before it exists.
+    New {
+        ci: crate::workspace::RunnerKey,
+        view: u64,
+    },
+    Close,
+    Tab(TicketTab),
+    /// The title and proposal of an open or ready ticket become editable.
+    Edit,
+    EditTitle(String),
+    EditBody(iced::widget::text_editor::Action),
+    EditSave,
+    EditCancel,
+    /// The `#12` typed beside the link buttons.
+    LinkInput(String),
+    LinkAdd(zeughaus_link::LinkKind),
+    LinkRemove(zeughaus_link::LinkKind, u64),
+    /// The new ticket goes to the CI, and its answer.
+    Create,
+    Created(Result<u64, String>),
+    /// The plan review: a section folded, deleted or restored, its note
+    /// opened or typed in, the overall feedback, and Refine.
+    Collapse(usize),
+    Delete(usize),
+    Annotate(usize),
+    Note(usize, iced::widget::text_editor::Action),
+    Overall(iced::widget::text_editor::Action),
+    Refine,
 }
 
 #[cfg(test)]

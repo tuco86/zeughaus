@@ -2155,9 +2155,9 @@ impl Scheduler {
         match filed {
             Ok(Filed::Queued(n)) => {
                 let _ = self.docs_tx.send(pipeline.repo.clone());
-                format!("agent session queued as plan #{n}")
+                format!("agent session queued as ticket #{n}")
             }
-            Ok(Filed::StillOpen(n)) => format!("agent session request already open as plan #{n}"),
+            Ok(Filed::StillOpen(n)) => format!("agent session request already open as ticket #{n}"),
             Err(e) => format!("agent session request ignored: {e}"),
         }
     }
@@ -4503,13 +4503,13 @@ mod tests {
             assert_eq!(s.running[0].jobs[0].status, JobStatus::Failed);
             assert_eq!(
                 note(&s, 0),
-                "failed with exit 1; agent session queued as plan #1"
+                "failed with exit 1; agent session queued as ticket #1"
             );
             let plan = docs::load(&state, &config, "view", 1).expect("filed");
             assert_eq!(
                 (plan.kind, plan.state, plan.source.as_str()),
                 (
-                    zeughaus_link::DocKind::Plan,
+                    zeughaus_link::DocKind::Ticket,
                     zeughaus_link::DocState::Approved,
                     "job.a"
                 )
@@ -4518,7 +4518,7 @@ mod tests {
             s.running.push(numbered(4, vec![running()]));
             finish(&mut s, 4, 1, SessionRequest::Body(body.to_owned()));
             assert!(
-                note(&s, 1).ends_with("; agent session request already open as plan #1"),
+                note(&s, 1).ends_with("; agent session request already open as ticket #1"),
                 "{}",
                 note(&s, 1)
             );

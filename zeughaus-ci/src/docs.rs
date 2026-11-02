@@ -1,26 +1,30 @@
-//! Plans and proposals of each repository (see [`zeughaus_link::ci::DocView`]).
+//! Tickets and onboarding requests of each repository (see
+//! [`zeughaus_link::ci::DocView`]).
 //!
 //! `<state-dir>/ci/docs/<repo>/<number>.json` holds one document as the
-//! view the editor shows, body included; `<state-dir>/ci/docs/<repo>/last`
-//! holds the last number assigned, so a deleted document's number is never
-//! given out again, and `<state-dir>/ci/docs/<repo>/paused`, when present,
-//! stops the CI from dispatching the repository's approved plans. Callers
-//! serialize the mutating functions (one lock shared by the `/ci` server
-//! and the session dispatcher): numbering relies on it.
+//! view the editor shows, proposal and plan included;
+//! `<state-dir>/ci/docs/<repo>/last` holds the last number assigned, so a
+//! deleted document's number is never given out again, and
+//! `<state-dir>/ci/docs/<repo>/paused`, when present, stops the CI from
+//! dispatching the repository's approved tickets. Callers serialize the
+//! mutating functions (one lock shared by the `/ci` server and the session
+//! dispatcher): numbering relies on it.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use zeughaus_link::ci::{
-    DocKind, DocState, DocView, MAX_DOC_BYTES, MAX_DOC_TITLE_BYTES, OnboardSpec, RepoDocsView,
-    normalize_origin, plan_title, runs_on_named,
+    DocKind, DocLink, DocState, DocView, LinkKind, MAX_DOC_BYTES, MAX_DOC_TITLE_BYTES, OnboardSpec,
+    Planner, RepoDocsView, normalize_origin, plan_title, runs_on_named,
 };
 use zeughaus_link::selector::parse_runs_on;
 
 use crate::config::{CiConfig, valid_name};
 use crate::files::{read_json, write_atomic, write_json};
 
-/// The most proposals one plan may name.
-const MAX_PLAN_PROPOSALS: usize = 32;
+/// The most links one ticket carries, and the most tickets one plan
+/// includes.
+const MAX_LINKS: usize = 32;
 
 /// The longest `source` a document may carry.
 const MAX_SOURCE_BYTES: usize = 100;
@@ -31,23 +35,39 @@ pub struct NewDoc<'a> {
     pub title: &'a str,
     pub body: &'a str,
     pub source: &'a str,
-    pub proposals: &'a [u64],
+    pub links: &'a [DocLink],
     pub runs_on: &'a [String],
     /// An onboarding request: the repository it asks for.
     pub onboard: Option<&'a OnboardSpec>,
 }
 
-/// Whether a document of `kind` may move from `from` to `to` on request.
-/// `approved -> in_progress` is not among them: only [`start`] does that.
+/// What [`write_plan`] stores.
+pub struct PlanText<'a> {
+    pub title: &'a str,
+    pub plan: &'a str,
+    pub includes: &'a [u64],
+    pub runs_on: &'a [String],
+    pub source: &'a str,
+    pub planner: Option<Planner>,
+}
+
+/// Whether a document of `kind` may move from `from` to `to` on a user's
+/// request. The CI's own moves (`ready -> planning -> review`,
+/// `approved -> in_progress`, `merged`) are not among them.
 pub fn allowed(kind: DocKind, from: DocState, to: DocState) -> bool {
     use DocState::*;
     match kind {
-        DocKind::Proposal => matches!((from, to), (Open, Planned) | (Open, Dismissed)),
-        DocKind::Plan => matches!(
+        DocKind::Ticket => matches!(
             (from, to),
-            (Saved, Approved)
-                | (Saved, Rejected)
-                | (Approved, Rejected)
+            (Open, Ready)
+                | (Open, Dismissed)
+                | (Ready, Open)
+                | (Ready, Dismissed)
+                | (Review, Approved)
+                | (Review, Open)
+                | (Review, Dismissed)
+                | (Approved, Review)
+                | (Approved, Dismissed)
                 | (InProgress, Done)
                 | (InProgress, Approved)
         ),
@@ -173,8 +193,8 @@ fn read_all(dir: &Path) -> Vec<DocView> {
     docs
 }
 
-/// Every document of `repo` without its body, in number order; nothing for
-/// a repository that is not in `ci.toml`.
+/// Every document of `repo` without its proposal, plan and review, in
+/// number order; nothing for a repository that is not in `ci.toml`.
 pub fn list(state_dir: &Path, config: &CiConfig, repo: &str) -> Vec<DocView> {
     let Ok(dir) = dir(state_dir, config, repo) else {
         return Vec::new();
@@ -182,6 +202,8 @@ pub fn list(state_dir: &Path, config: &CiConfig, repo: &str) -> Vec<DocView> {
     let mut docs = read_all(&dir);
     for doc in &mut docs {
         doc.body.clear();
+        doc.plan_text.clear();
+        doc.feedback.clear();
     }
     docs
 }
@@ -214,9 +236,123 @@ fn valid_source(source: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// Stores a new document and answers its number. A proposal starts `open`,
-/// a plan `saved`; the proposals a plan names become `planned` by it. A
-/// refusal writes nothing.
+/// The trimmed title, or why it is refused.
+fn checked_title(title: &str) -> Result<&str, String> {
+    let title = title.trim();
+    if title.is_empty() || title.len() > MAX_DOC_TITLE_BYTES || title.contains(['\n', '\r']) {
+        return Err(format!(
+            "a title is one line of 1 to {MAX_DOC_TITLE_BYTES} bytes"
+        ));
+    }
+    Ok(title)
+}
+
+fn check_body(body: &str) -> Result<(), String> {
+    if body.is_empty() || body.len() > MAX_DOC_BYTES {
+        return Err(format!("a body is 1 to {MAX_DOC_BYTES} bytes"));
+    }
+    Ok(())
+}
+
+/// `links` of ticket `number` without duplicates, or why they are refused:
+/// too many, a link to itself, a target that is no ticket of `repo`, or a
+/// dependency that closes a cycle through the stored tickets.
+fn check_links(
+    dir: &Path,
+    repo: &str,
+    number: u64,
+    links: &[DocLink],
+) -> Result<Vec<DocLink>, String> {
+    let mut clean: Vec<DocLink> = Vec::with_capacity(links.len());
+    for link in links {
+        if !clean.contains(link) {
+            clean.push(link.clone());
+        }
+    }
+    if clean.len() > MAX_LINKS {
+        return Err(format!("a ticket has at most {MAX_LINKS} links"));
+    }
+    let stored = read_all(dir);
+    for link in &clean {
+        if link.number == number {
+            return Err(format!("#{number} cannot link to itself"));
+        }
+        match stored.iter().find(|doc| doc.number == link.number) {
+            None => return Err(format!("no ticket #{} in {repo}", link.number)),
+            Some(doc) if doc.kind != DocKind::Ticket => {
+                return Err(format!("#{} is no ticket", link.number));
+            }
+            Some(_) => {}
+        }
+    }
+    // Who each ticket depends on, with the new set in place of `number`'s.
+    let depends = |of: u64| -> Vec<u64> {
+        let links = if of == number {
+            &clean
+        } else {
+            match stored.iter().find(|doc| doc.number == of) {
+                Some(doc) => &doc.links,
+                None => return Vec::new(),
+            }
+        };
+        links
+            .iter()
+            .filter(|link| link.kind == LinkKind::DependsOn)
+            .map(|link| link.number)
+            .collect()
+    };
+    for link in clean.iter().filter(|link| link.kind == LinkKind::DependsOn) {
+        if let Some(path) = path_to(link.number, number, &depends) {
+            let through = &path[1..path.len() - 1];
+            if through.is_empty() {
+                return Err(format!(
+                    "#{number} depends on #{}, which depends on #{number}",
+                    link.number
+                ));
+            }
+            let names: Vec<String> = through.iter().map(|n| format!("#{n}")).collect();
+            return Err(format!(
+                "a dependency on #{} would close a cycle through {}",
+                link.number,
+                names.join(", ")
+            ));
+        }
+    }
+    Ok(clean)
+}
+
+/// A dependency path from `from` to `to`, both included, by a depth-first
+/// walk over `depends`; `None` when `to` is not reached.
+fn path_to(from: u64, to: u64, depends: &dyn Fn(u64) -> Vec<u64>) -> Option<Vec<u64>> {
+    let mut seen = BTreeSet::new();
+    let mut path = vec![from];
+    fn walk(
+        at: u64,
+        to: u64,
+        depends: &dyn Fn(u64) -> Vec<u64>,
+        seen: &mut BTreeSet<u64>,
+        path: &mut Vec<u64>,
+    ) -> bool {
+        if at == to {
+            return true;
+        }
+        if !seen.insert(at) {
+            return false;
+        }
+        for next in depends(at) {
+            path.push(next);
+            if walk(next, to, depends, seen, path) {
+                return true;
+            }
+            path.pop();
+        }
+        false
+    }
+    walk(from, to, depends, &mut seen, &mut path).then_some(path)
+}
+
+/// Stores a new document and answers its number. A ticket and an
+/// onboarding request start `open`. A refusal writes nothing.
 pub fn create(
     state_dir: &Path,
     config: &CiConfig,
@@ -243,96 +379,128 @@ pub fn create(
     } else {
         dir(state_dir, config, repo)?
     };
-    if new.kind == DocKind::Plan && !config.repos.contains_key(repo) {
-        return Err(format!(
-            "{repo} is not in ci.toml yet; plans wait for its onboarding"
-        ));
-    }
-    let title = new.title.trim();
-    if title.is_empty() || title.len() > MAX_DOC_TITLE_BYTES || title.contains(['\n', '\r']) {
-        return Err(format!(
-            "a title is one line of 1 to {MAX_DOC_TITLE_BYTES} bytes"
-        ));
-    }
-    if new.body.is_empty() || new.body.len() > MAX_DOC_BYTES {
-        return Err(format!("a body is 1 to {MAX_DOC_BYTES} bytes"));
-    }
+    let title = checked_title(new.title)?;
+    check_body(new.body)?;
     if !valid_source(new.source) {
         return Err(format!(
             "a source is 1 to {MAX_SOURCE_BYTES} of A-Z a-z 0-9 . _ -"
         ));
     }
     parse_runs_on(new.runs_on)?;
-    if new.kind != DocKind::Plan && !new.proposals.is_empty() {
-        return Err("only a plan names proposals".to_owned());
-    }
-    if new.proposals.len() > MAX_PLAN_PROPOSALS {
-        return Err(format!(
-            "a plan names at most {MAX_PLAN_PROPOSALS} proposals"
-        ));
-    }
-    let mut taken = Vec::with_capacity(new.proposals.len());
-    for &number in new.proposals {
-        match read_json::<DocView>(&path_of(&dir, number)) {
-            Ok(doc) if doc.kind == DocKind::Proposal && doc.state == DocState::Open => {
-                if !taken.iter().any(|d: &DocView| d.number == number) {
-                    taken.push(doc);
-                }
-            }
-            Ok(doc) if doc.kind == DocKind::Proposal => {
-                return Err(format!(
-                    "proposal #{number} is {}; a plan takes up open proposals only",
-                    doc.state.name()
-                ));
-            }
-            Ok(_) => return Err(format!("#{number} is no proposal")),
-            Err(_) => return Err(format!("no proposal #{number} in {repo}")),
+    if !new.links.is_empty() {
+        if new.kind != DocKind::Ticket {
+            return Err("only a ticket has links".to_owned());
+        }
+        if !config.repos.contains_key(repo) {
+            return Err(format!(
+                "{repo} is not in ci.toml yet; links wait for its onboarding"
+            ));
         }
     }
     let number = last_number(&dir) + 1;
+    let links = check_links(&dir, repo, number, new.links)?;
     let doc = DocView {
         repo: repo.to_owned(),
         number,
         kind: new.kind,
         title: title.to_owned(),
-        state: match new.kind {
-            DocKind::Proposal | DocKind::Onboarding => DocState::Open,
-            DocKind::Plan => DocState::Saved,
-        },
+        state: DocState::Open,
         source: new.source.to_owned(),
         created: now,
         changed: now,
         approved: None,
-        proposals: taken.iter().map(|doc| doc.number).collect(),
-        plan: None,
+        released: None,
+        links,
+        merged: Vec::new(),
+        into: None,
         runs_on: new.runs_on.to_vec(),
         placement: Vec::new(),
         body: new.body.to_owned(),
+        plan_text: String::new(),
+        revision: 0,
+        planner: None,
+        feedback: String::new(),
         onboard,
         note: String::new(),
     };
     write_json(&path_of(&dir, number), &doc)?;
     write_atomic(&dir.join("last"), number.to_string().as_bytes())?;
-    for mut proposal in taken {
-        proposal.state = DocState::Planned;
-        proposal.plan = Some(number);
-        proposal.changed = now;
-        write_json(&path_of(&dir, proposal.number), &proposal)?;
-    }
     Ok(number)
+}
+
+/// The ticket at `path`, or that it is none.
+fn read_ticket(path: &Path, repo: &str, number: u64) -> Result<DocView, String> {
+    let doc: DocView = read_json(path).map_err(|_| missing(repo, number))?;
+    if doc.kind != DocKind::Ticket {
+        return Err(format!("#{number} is no ticket"));
+    }
+    Ok(doc)
+}
+
+/// Replaces the title and proposal of an open or ready ticket.
+pub fn edit(
+    state_dir: &Path,
+    config: &CiConfig,
+    repo: &str,
+    number: u64,
+    title: &str,
+    body: &str,
+    now: u64,
+) -> Result<(), String> {
+    let dir = dir(state_dir, config, repo)?;
+    let path = path_of(&dir, number);
+    let mut doc = read_ticket(&path, repo, number)?;
+    if !matches!(doc.state, DocState::Open | DocState::Ready) {
+        return Err(format!(
+            "#{number} is {}; its text is fixed",
+            doc.state.name()
+        ));
+    }
+    let title = checked_title(title)?;
+    check_body(body)?;
+    doc.title = title.to_owned();
+    doc.body = body.to_owned();
+    doc.changed = now;
+    write_json(&path, &doc)
+}
+
+/// Replaces the outgoing links of a ticket that is not finished.
+pub fn set_links(
+    state_dir: &Path,
+    config: &CiConfig,
+    repo: &str,
+    number: u64,
+    links: Vec<DocLink>,
+    now: u64,
+) -> Result<(), String> {
+    let dir = dir(state_dir, config, repo)?;
+    let path = path_of(&dir, number);
+    let mut doc = read_ticket(&path, repo, number)?;
+    if matches!(
+        doc.state,
+        DocState::Done | DocState::Dismissed | DocState::Merged
+    ) {
+        return Err(format!(
+            "#{number} is {}; its links are fixed",
+            doc.state.name()
+        ));
+    }
+    doc.links = check_links(&dir, repo, number, &links)?;
+    doc.changed = now;
+    write_json(&path, &doc)
 }
 
 /// What [`file_request`] did with a job's session request.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Filed {
-    /// Stored as this approved plan.
+    /// Stored as this approved ticket.
     Queued(u64),
-    /// This saved, approved or in-progress plan came from the same job with
-    /// the same body; nothing was stored.
+    /// This ticket in review, approved or in progress came from the same
+    /// job with the same plan; nothing was stored.
     StillOpen(u64),
 }
 
-/// Files the session request job `job` of `repo` left as an approved plan
+/// Files the session request job `job` of `repo` left as an approved ticket
 /// with source `job.<job>`, titled by its first `# ` line and placed by its
 /// `Runs on:` line. Refused for a repository without `agent_sessions`.
 pub fn file_request(
@@ -351,30 +519,30 @@ pub fn file_request(
     let source = format!("job.{job}");
     let dir = dir(state_dir, config, repo)?;
     if let Some(open) = read_all(&dir).iter().find(|doc| {
-        doc.kind == DocKind::Plan
+        doc.kind == DocKind::Ticket
             && doc.source == source
             && matches!(
                 doc.state,
-                DocState::Saved | DocState::Approved | DocState::InProgress
+                DocState::Review | DocState::Approved | DocState::InProgress
             )
-            && doc.body == body
+            && doc.plan_text == body
     }) {
         return Ok(Filed::StillOpen(open.number));
     }
     let runs_on = runs_on_named(body)?;
     let title = plan_title(body);
-    let number = create(
+    let number = write_plan(
         state_dir,
         config,
         repo,
-        NewDoc {
-            kind: DocKind::Plan,
+        None,
+        PlanText {
             title: &title,
-            body,
-            source: &source,
-            proposals: &[],
+            plan: body,
+            includes: &[],
             runs_on: &runs_on,
-            onboard: None,
+            source: &source,
+            planner: None,
         },
         now,
     )?;
@@ -382,10 +550,41 @@ pub fn file_request(
     Ok(Filed::Queued(number))
 }
 
-/// Moves document `number` to `to`, where [`allowed`] lets it. Approving a
-/// plan stamps `approved`, which orders the queue; a requeued plan keeps
-/// its stamp and with it its place. The proposals a plan took up follow it:
-/// back to `open` when it is rejected, `done` when it is done.
+/// The tickets merged into `number`: back to `open`, or `done` with it.
+fn settle_merged(
+    dir: &Path,
+    number: u64,
+    merged: &[u64],
+    done: bool,
+    now: u64,
+) -> Result<(), String> {
+    for &other in merged {
+        let path = path_of(dir, other);
+        let Ok(mut doc) = read_json::<DocView>(&path) else {
+            continue;
+        };
+        if doc.kind != DocKind::Ticket || doc.state != DocState::Merged || doc.into != Some(number)
+        {
+            continue;
+        }
+        if done {
+            doc.state = DocState::Done;
+        } else {
+            doc.state = DocState::Open;
+            doc.into = None;
+        }
+        doc.changed = now;
+        write_json(&path, &doc)?;
+    }
+    Ok(())
+}
+
+/// Moves document `number` to `to`, where [`allowed`] lets it. Releasing a
+/// ticket stamps `released`, which orders the planning queue; approving it
+/// stamps `approved`, which orders the masters' queue, and a requeued
+/// ticket keeps its stamp and with it its place. The tickets a plan
+/// includes follow it: `done` with it, back to `open` when it is dismissed
+/// or its plan discarded.
 pub fn set_state(
     state_dir: &Path,
     config: &CiConfig,
@@ -394,8 +593,11 @@ pub fn set_state(
     to: DocState,
     now: u64,
 ) -> Result<(), String> {
-    if to == DocState::InProgress {
-        return Err("only the CI starts a plan".to_owned());
+    if matches!(
+        to,
+        DocState::InProgress | DocState::Planning | DocState::Merged
+    ) {
+        return Err(format!("only the CI moves a ticket to {}", to.name()));
     }
     let dir = dir(state_dir, config, repo)?;
     let path = path_of(&dir, number);
@@ -407,46 +609,271 @@ pub fn set_state(
             to.name()
         ));
     }
-    if doc.state == DocState::Saved && to == DocState::Approved {
-        doc.approved = Some(now);
+    let from = doc.state;
+    match (from, to) {
+        (DocState::Open, DocState::Ready) => {
+            doc.released = Some(now);
+            doc.note.clear();
+        }
+        (DocState::Review, DocState::Approved) => {
+            doc.approved = Some(now);
+            doc.feedback.clear();
+        }
+        (DocState::Review, DocState::Open) => {
+            doc.plan_text.clear();
+            doc.planner = None;
+            doc.feedback.clear();
+        }
+        _ => {}
+    }
+    let reopen = doc.kind == DocKind::Ticket
+        && (to == DocState::Dismissed || (from, to) == (DocState::Review, DocState::Open));
+    let close = doc.kind == DocKind::Ticket && to == DocState::Done;
+    let merged = doc.merged.clone();
+    if reopen {
+        doc.merged.clear();
     }
     doc.state = to;
     doc.changed = now;
     write_json(&path, &doc)?;
-    if doc.kind == DocKind::Plan && matches!(to, DocState::Rejected | DocState::Done) {
-        for proposal in &doc.proposals {
-            let path = path_of(&dir, *proposal);
-            let Ok(mut taken) = read_json::<DocView>(&path) else {
-                continue;
-            };
-            if taken.kind != DocKind::Proposal
-                || taken.state != DocState::Planned
-                || taken.plan != Some(number)
-            {
-                continue;
-            }
-            if to == DocState::Rejected {
-                taken.state = DocState::Open;
-                taken.plan = None;
-            } else {
-                taken.state = DocState::Done;
-            }
-            taken.changed = now;
-            write_json(&path, &taken)?;
-        }
+    if reopen || close {
+        settle_merged(&dir, number, &merged, close, now)?;
     }
     Ok(())
 }
 
-/// Deletes a document that is finished with: `planned`, `dismissed`,
-/// `done` or `rejected`.
+/// Stores a plan on ticket `number`, which a plan session works on, or as a
+/// new ticket without one, and answers the ticket's number; either is then
+/// in `review`. The tickets the plan includes become `merged` into it, and
+/// those an earlier revision included and this one does not go back to
+/// `open`. A refusal writes nothing.
+pub fn write_plan(
+    state_dir: &Path,
+    config: &CiConfig,
+    repo: &str,
+    number: Option<u64>,
+    plan: PlanText<'_>,
+    now: u64,
+) -> Result<u64, String> {
+    if !config.repos.contains_key(repo) {
+        return Err(format!(
+            "{repo} is not in ci.toml yet; plans wait for its onboarding"
+        ));
+    }
+    let dir = dir(state_dir, config, repo)?;
+    if plan.plan.is_empty() || plan.plan.len() > MAX_DOC_BYTES {
+        return Err(format!("a plan is 1 to {MAX_DOC_BYTES} bytes"));
+    }
+    let title = checked_title(plan.title)?;
+    if !valid_source(plan.source) {
+        return Err(format!(
+            "a source is 1 to {MAX_SOURCE_BYTES} of A-Z a-z 0-9 . _ -"
+        ));
+    }
+    parse_runs_on(plan.runs_on)?;
+    if plan.includes.len() > MAX_LINKS {
+        return Err(format!("a plan includes at most {MAX_LINKS} tickets"));
+    }
+    let fresh = number.is_none();
+    let (number, mut doc) = match number {
+        Some(n) => {
+            let doc = read_ticket(&path_of(&dir, n), repo, n)?;
+            if doc.state != DocState::Planning {
+                return Err(format!(
+                    "#{n} is {}; a plan is written for a ticket in planning",
+                    doc.state.name()
+                ));
+            }
+            (n, doc)
+        }
+        None => {
+            let n = last_number(&dir) + 1;
+            let doc = DocView {
+                repo: repo.to_owned(),
+                number: n,
+                kind: DocKind::Ticket,
+                title: title.to_owned(),
+                state: DocState::Review,
+                source: plan.source.to_owned(),
+                created: now,
+                changed: now,
+                approved: None,
+                released: None,
+                links: Vec::new(),
+                merged: Vec::new(),
+                into: None,
+                runs_on: Vec::new(),
+                placement: Vec::new(),
+                body: String::new(),
+                plan_text: String::new(),
+                revision: 0,
+                planner: None,
+                feedback: String::new(),
+                onboard: None,
+                note: String::new(),
+            };
+            (n, doc)
+        }
+    };
+    let mut includes: Vec<u64> = Vec::with_capacity(plan.includes.len());
+    let mut taken: Vec<DocView> = Vec::new();
+    for &other in plan.includes {
+        if other == number || includes.contains(&other) {
+            continue;
+        }
+        let included = read_json::<DocView>(&path_of(&dir, other))
+            .map_err(|_| format!("no ticket #{other} in {repo}"))?;
+        if included.kind != DocKind::Ticket {
+            return Err(format!("#{other} is no ticket"));
+        }
+        let fits = matches!(included.state, DocState::Open | DocState::Ready)
+            || (included.state == DocState::Merged && included.into == Some(number));
+        if !fits {
+            return Err(format!(
+                "#{other} is {}; a plan includes open or ready tickets only",
+                included.state.name()
+            ));
+        }
+        includes.push(other);
+        taken.push(included);
+    }
+    let dropped: Vec<u64> = doc
+        .merged
+        .iter()
+        .copied()
+        .filter(|n| !includes.contains(n))
+        .collect();
+    doc.plan_text = plan.plan.to_owned();
+    doc.revision += 1;
+    doc.planner = plan.planner;
+    doc.feedback.clear();
+    doc.note.clear();
+    if !plan.runs_on.is_empty() {
+        doc.runs_on = plan.runs_on.to_vec();
+    }
+    doc.merged = includes;
+    doc.state = DocState::Review;
+    doc.changed = now;
+    write_json(&path_of(&dir, number), &doc)?;
+    if fresh {
+        write_atomic(&dir.join("last"), number.to_string().as_bytes())?;
+    }
+    settle_merged(&dir, number, &dropped, false, now)?;
+    for mut included in taken {
+        if included.state == DocState::Merged {
+            continue;
+        }
+        included.state = DocState::Merged;
+        included.into = Some(number);
+        included.changed = now;
+        write_json(&path_of(&dir, included.number), &included)?;
+    }
+    Ok(number)
+}
+
+/// Sends the user's review back to the plan session of a ticket in review:
+/// the ticket is `ready` again, at its old place in the planning queue.
+pub fn refine(
+    state_dir: &Path,
+    config: &CiConfig,
+    repo: &str,
+    number: u64,
+    feedback: &str,
+    now: u64,
+) -> Result<(), String> {
+    let dir = dir(state_dir, config, repo)?;
+    let path = path_of(&dir, number);
+    let mut doc = read_ticket(&path, repo, number)?;
+    if doc.state != DocState::Review {
+        return Err(format!(
+            "#{number} is {}; only a plan in review is refined",
+            doc.state.name()
+        ));
+    }
+    if feedback.is_empty() || feedback.len() > MAX_DOC_BYTES {
+        return Err(format!("a review is 1 to {MAX_DOC_BYTES} bytes"));
+    }
+    doc.feedback = feedback.to_owned();
+    doc.state = DocState::Ready;
+    doc.released.get_or_insert(now);
+    doc.changed = now;
+    write_json(&path, &doc)
+}
+
+/// Ready ticket `number` gets a plan session: it becomes `planning` and
+/// comes back whole.
+pub fn start_planning(
+    state_dir: &Path,
+    config: &CiConfig,
+    repo: &str,
+    number: u64,
+    now: u64,
+) -> Result<DocView, String> {
+    let dir = dir(state_dir, config, repo)?;
+    let path = path_of(&dir, number);
+    let mut doc = read_ticket(&path, repo, number)?;
+    if doc.state != DocState::Ready {
+        return Err(format!(
+            "#{number} is {}; only a ready ticket is planned",
+            doc.state.name()
+        ));
+    }
+    doc.state = DocState::Planning;
+    doc.changed = now;
+    write_json(&path, &doc)?;
+    Ok(doc)
+}
+
+/// The plan session of ticket `number` ended. A ticket still in `planning`
+/// got no new plan: back to `review` with its last plan, else to `open`,
+/// with `note` saying why. Answers whether the ticket changed.
+pub fn planning_ended(
+    state_dir: &Path,
+    config: &CiConfig,
+    repo: &str,
+    number: u64,
+    note: &str,
+    now: u64,
+) -> Result<bool, String> {
+    let dir = dir(state_dir, config, repo)?;
+    let path = path_of(&dir, number);
+    let mut doc = read_ticket(&path, repo, number)?;
+    if doc.state != DocState::Planning {
+        return Ok(false);
+    }
+    doc.state = if doc.plan_text.is_empty() {
+        DocState::Open
+    } else {
+        DocState::Review
+    };
+    doc.note = note.to_owned();
+    doc.changed = now;
+    write_json(&path, &doc)?;
+    Ok(true)
+}
+
+/// Every repository's ready tickets, without their texts, in the order
+/// plan sessions take them: by release, then number.
+pub fn ready(state_dir: &Path, config: &CiConfig) -> Vec<DocView> {
+    let mut tickets: Vec<DocView> = config
+        .repos
+        .keys()
+        .flat_map(|repo| list(state_dir, config, repo))
+        .filter(|doc| doc.kind == DocKind::Ticket && doc.state == DocState::Ready)
+        .collect();
+    tickets.sort_by_key(|doc| (doc.released.unwrap_or(0), doc.number));
+    tickets
+}
+
+/// Deletes a document that is finished with: `done`, `dismissed`,
+/// `merged` or `rejected`.
 pub fn delete(state_dir: &Path, config: &CiConfig, repo: &str, number: u64) -> Result<(), String> {
     let dir = dir(state_dir, config, repo)?;
     let path = path_of(&dir, number);
     let doc: DocView = read_json(&path).map_err(|_| missing(repo, number))?;
     if !matches!(
         doc.state,
-        DocState::Planned | DocState::Dismissed | DocState::Done | DocState::Rejected
+        DocState::Done | DocState::Dismissed | DocState::Merged | DocState::Rejected
     ) {
         return Err(format!(
             "#{number} is {}; only a finished document is deleted",
@@ -460,7 +887,8 @@ pub fn delete(state_dir: &Path, config: &CiConfig, repo: &str, number: u64) -> R
     std::fs::remove_file(&path).map_err(|e| format!("cannot delete {}: {e}", path.display()))
 }
 
-/// Sets the `Runs on` of an open proposal or of a saved or approved plan.
+/// Sets the `Runs on` of a ticket that is open, ready, in review or
+/// approved.
 pub fn set_runs_on(
     state_dir: &Path,
     config: &CiConfig,
@@ -473,12 +901,11 @@ pub fn set_runs_on(
     let dir = dir(state_dir, config, repo)?;
     let path = path_of(&dir, number);
     let mut doc: DocView = read_json(&path).map_err(|_| missing(repo, number))?;
-    let open = matches!(
-        (doc.kind, doc.state),
-        (DocKind::Proposal, DocState::Open)
-            | (DocKind::Plan, DocState::Saved)
-            | (DocKind::Plan, DocState::Approved)
-    );
+    let open = doc.kind == DocKind::Ticket
+        && matches!(
+            doc.state,
+            DocState::Open | DocState::Ready | DocState::Review | DocState::Approved
+        );
     if !open {
         return Err(format!(
             "#{number} is {}; its Runs on is fixed",
@@ -490,8 +917,8 @@ pub fn set_runs_on(
     write_json(&path, &doc)
 }
 
-/// Approved plan `number` becomes `in_progress` on the runners of
-/// `placement` (the host first) and comes back with its body.
+/// Approved ticket `number` becomes `in_progress` on the runners of
+/// `placement` (the host first) and comes back with its plan.
 pub fn start(
     state_dir: &Path,
     config: &CiConfig,
@@ -503,9 +930,9 @@ pub fn start(
     let dir = dir(state_dir, config, repo)?;
     let path = path_of(&dir, number);
     let mut doc: DocView = read_json(&path).map_err(|_| missing(repo, number))?;
-    if doc.kind != DocKind::Plan || doc.state != DocState::Approved {
+    if doc.kind != DocKind::Ticket || doc.state != DocState::Approved {
         return Err(format!(
-            "#{number} is {}; only an approved plan starts",
+            "#{number} is {}; only an approved ticket starts",
             doc.state.name()
         ));
     }
@@ -516,20 +943,20 @@ pub fn start(
     Ok(doc)
 }
 
-/// Every repository's approved plans, bodies empty, in the order they are
-/// dispatched: by approval, then number.
+/// Every repository's approved tickets, without their texts, in the order
+/// they are dispatched: by approval, then number.
 pub fn queue(state_dir: &Path, config: &CiConfig) -> Vec<DocView> {
-    let mut plans: Vec<DocView> = config
+    let mut tickets: Vec<DocView> = config
         .repos
         .keys()
         .flat_map(|repo| list(state_dir, config, repo))
-        .filter(|doc| doc.kind == DocKind::Plan && doc.state == DocState::Approved)
+        .filter(|doc| doc.kind == DocKind::Ticket && doc.state == DocState::Approved)
         .collect();
-    plans.sort_by_key(|doc| (doc.approved.unwrap_or(0), doc.number));
-    plans
+    tickets.sort_by_key(|doc| (doc.approved.unwrap_or(0), doc.number));
+    tickets
 }
 
-/// Whether the CI dispatches none of `repo`'s approved plans.
+/// Whether the CI dispatches none of `repo`'s approved tickets.
 pub fn paused(state_dir: &Path, config: &CiConfig, repo: &str) -> bool {
     dir(state_dir, config, repo).is_ok_and(|dir| dir.join("paused").exists())
 }
@@ -554,6 +981,12 @@ pub fn set_paused(
     }
 }
 
+fn count(docs: &[DocView], states: &[DocState]) -> u32 {
+    docs.iter()
+        .filter(|doc| doc.kind == DocKind::Ticket && states.contains(&doc.state))
+        .count() as u32
+}
+
 /// One line per repository of `ci.toml`, then per repository with a
 /// pending onboarding request, all in name order: what waits for whom.
 pub fn summary(state_dir: &Path, config: &CiConfig) -> Vec<RepoDocsView> {
@@ -562,24 +995,20 @@ pub fn summary(state_dir: &Path, config: &CiConfig) -> Vec<RepoDocsView> {
         .iter()
         .map(|(name, repo)| {
             let docs = list(state_dir, config, name);
-            let count = |kind: DocKind, state: DocState| {
-                docs.iter()
-                    .filter(|doc| doc.kind == kind && doc.state == state)
-                    .count() as u32
-            };
             RepoDocsView {
                 repo: name.clone(),
                 origin: normalize_origin(&repo.url),
                 default_branch: repo.default_branch.clone(),
-                awaiting: count(DocKind::Plan, DocState::Saved),
-                queued: count(DocKind::Plan, DocState::Approved),
+                awaiting: count(&docs, &[DocState::Review]),
+                queued: count(&docs, &[DocState::Approved]),
                 in_progress: docs
                     .iter()
-                    .filter(|doc| doc.kind == DocKind::Plan && doc.state == DocState::InProgress)
+                    .filter(|doc| doc.kind == DocKind::Ticket && doc.state == DocState::InProgress)
                     .map(|doc| doc.number)
                     .collect(),
                 paused: paused(state_dir, config, name),
-                proposals: count(DocKind::Proposal, DocState::Open),
+                open: count(&docs, &[DocState::Open]),
+                planning: count(&docs, &[DocState::Ready, DocState::Planning]),
                 onboarding: None,
             }
         })
@@ -588,10 +1017,7 @@ pub fn summary(state_dir: &Path, config: &CiConfig) -> Vec<RepoDocsView> {
         let Some(spec) = &request.onboard else {
             continue;
         };
-        let proposals = list(state_dir, config, &request.repo)
-            .iter()
-            .filter(|doc| doc.kind == DocKind::Proposal && doc.state == DocState::Open)
-            .count() as u32;
+        let docs = list(state_dir, config, &request.repo);
         let open = request.state == DocState::Open;
         views.push(RepoDocsView {
             repo: request.repo.clone(),
@@ -605,12 +1031,98 @@ pub fn summary(state_dir: &Path, config: &CiConfig) -> Vec<RepoDocsView> {
                 vec![request.number]
             },
             paused: false,
-            proposals,
+            open: count(&docs, &[DocState::Open]),
+            planning: 0,
             onboarding: Some(request.number),
         });
     }
     views.sort_by(|a, b| a.repo.cmp(&b.repo));
     views
+}
+
+/// Rewrites every stored proposal and plan from before tickets as a
+/// ticket, and answers how many documents it changed. A file that does
+/// not parse is left alone.
+pub fn migrate(state_dir: &Path) -> Result<usize, String> {
+    let mut changed = 0;
+    for repo in doc_dirs(state_dir) {
+        let dir = docs_root(state_dir).join(&repo);
+        let Ok(files) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for path in files.flatten().map(|file| file.path()) {
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let Ok(mut doc) = read_json::<serde_json::Value>(&path) else {
+                continue;
+            };
+            if migrate_doc(&mut doc) {
+                write_json(&path, &doc)?;
+                changed += 1;
+            }
+        }
+    }
+    Ok(changed)
+}
+
+/// One stored document from before tickets as a ticket: a proposal keeps
+/// its text and a `planned` one is `merged` into its plan; a plan becomes a
+/// ticket whose plan is its body and which includes its proposals. Answers
+/// whether it changed anything.
+fn migrate_doc(doc: &mut serde_json::Value) -> bool {
+    use serde_json::Value;
+    let Some(object) = doc.as_object_mut() else {
+        return false;
+    };
+    let kind = object.get("kind").and_then(Value::as_str).unwrap_or("");
+    let state = object
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    match kind {
+        "proposal" => {
+            let plan = object.get("plan").and_then(Value::as_u64);
+            let state = match (state.as_str(), plan) {
+                ("planned", Some(plan)) => {
+                    object.insert("into".to_owned(), Value::from(plan));
+                    "merged"
+                }
+                ("planned", None) => "done",
+                (other, _) => match other {
+                    "open" | "dismissed" | "done" => other,
+                    _ => "open",
+                },
+            }
+            .to_owned();
+            object.insert("state".to_owned(), Value::from(state));
+        }
+        "plan" => {
+            let body = object.remove("body").unwrap_or(Value::from(""));
+            object.insert("plan_text".to_owned(), body);
+            object.insert("body".to_owned(), Value::from(""));
+            let merged = object
+                .get("proposals")
+                .cloned()
+                .unwrap_or(Value::Array(Vec::new()));
+            object.insert("merged".to_owned(), merged);
+            object.insert("revision".to_owned(), Value::from(1));
+            let state = match state.as_str() {
+                "saved" => "review",
+                "approved" => "approved",
+                "in_progress" => "in_progress",
+                "done" => "done",
+                _ => "dismissed",
+            };
+            object.insert("state".to_owned(), Value::from(state));
+        }
+        _ => return false,
+    }
+    object.insert("kind".to_owned(), Value::from("ticket"));
+    object.remove("proposals");
+    object.remove("plan");
+    true
 }
 
 #[cfg(test)]
@@ -620,24 +1132,37 @@ mod tests {
 
     #[test]
     fn only_the_transitions_of_the_table_are_allowed() {
-        let plan = |from, to| allowed(DocKind::Plan, from, to);
-        let proposal = |from, to| allowed(DocKind::Proposal, from, to);
-        assert!(proposal(Open, Planned));
-        assert!(proposal(Open, Dismissed));
-        assert!(plan(Saved, Approved));
-        assert!(plan(Saved, Rejected));
-        assert!(plan(Approved, Rejected));
-        assert!(plan(InProgress, Done));
-        assert!(plan(InProgress, Approved));
-
-        assert!(!plan(Approved, InProgress));
-        assert!(!plan(Saved, Done));
-        assert!(!plan(Done, Approved));
-        assert!(!plan(Rejected, Approved));
-        assert!(!plan(Open, Planned));
-        assert!(!proposal(Planned, Open));
-        assert!(!proposal(Dismissed, Planned));
-        assert!(!proposal(Saved, Approved));
+        let ticket = |from, to| allowed(DocKind::Ticket, from, to);
+        for (from, to) in [
+            (Open, Ready),
+            (Open, Dismissed),
+            (Ready, Open),
+            (Ready, Dismissed),
+            (Review, Approved),
+            (Review, Open),
+            (Review, Dismissed),
+            (Approved, Review),
+            (Approved, Dismissed),
+            (InProgress, Done),
+            (InProgress, Approved),
+        ] {
+            assert!(ticket(from, to), "{from:?} -> {to:?}");
+        }
+        for (from, to) in [
+            (Open, Review),
+            (Open, Approved),
+            (Ready, Planning),
+            (Planning, Review),
+            (Planning, Open),
+            (Approved, InProgress),
+            (Review, Done),
+            (Done, Open),
+            (Merged, Open),
+            (Dismissed, Open),
+            (Open, Rejected),
+        ] {
+            assert!(!ticket(from, to), "{from:?} -> {to:?}");
+        }
     }
 
     #[test]
@@ -649,6 +1174,74 @@ mod tests {
         assert!(!onboarding(Open, Done));
         assert!(!onboarding(Approved, Open));
         assert!(!onboarding(Approved, Rejected));
+    }
+
+    fn migrated(text: &str) -> Option<serde_json::Value> {
+        let mut doc: serde_json::Value = serde_json::from_str(text).unwrap();
+        migrate_doc(&mut doc).then_some(doc)
+    }
+
+    const HEAD: &str = r#""repo":"demo","title":"T","source":"s","created":1,"changed":2"#;
+
+    #[test]
+    fn a_planned_proposal_becomes_merged_into_its_plan() {
+        let doc = migrated(&format!(
+            r#"{{{HEAD},"number":1,"kind":"proposal","state":"planned","plan":2,"proposals":[],"body":"B"}}"#
+        ))
+        .unwrap();
+        let view: DocView = serde_json::from_value(doc.clone()).unwrap();
+        assert_eq!(
+            (view.kind, view.state, view.into, view.body.as_str()),
+            (DocKind::Ticket, Merged, Some(2), "B")
+        );
+        assert!(doc.get("plan").is_none() && doc.get("proposals").is_none());
+
+        let orphan = migrated(&format!(
+            r#"{{{HEAD},"number":1,"kind":"proposal","state":"planned"}}"#
+        ))
+        .unwrap();
+        let view: DocView = serde_json::from_value(orphan).unwrap();
+        assert_eq!((view.state, view.into), (Done, None));
+    }
+
+    #[test]
+    fn a_saved_plan_becomes_a_ticket_in_review_that_includes_its_proposals() {
+        let doc = migrated(&format!(
+            r##"{{{HEAD},"number":2,"kind":"plan","state":"saved","proposals":[1,3],"plan":null,"body":"# Old plan\n"}}"##
+        ))
+        .unwrap();
+        let view: DocView = serde_json::from_value(doc).unwrap();
+        assert_eq!(
+            (
+                view.kind,
+                view.state,
+                view.merged,
+                view.revision,
+                view.body.as_str(),
+                view.plan_text.as_str()
+            ),
+            (DocKind::Ticket, Review, vec![1, 3], 1, "", "# Old plan\n")
+        );
+        let rejected = migrated(&format!(
+            r#"{{{HEAD},"number":2,"kind":"plan","state":"rejected","body":"x"}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            serde_json::from_value::<DocView>(rejected).unwrap().state,
+            Dismissed
+        );
+    }
+
+    #[test]
+    fn an_onboarding_request_and_a_ticket_are_not_migrated() {
+        for kind in ["onboarding", "ticket"] {
+            assert!(
+                migrated(&format!(
+                    r#"{{{HEAD},"number":1,"kind":"{kind}","state":"open","body":"b"}}"#
+                ))
+                .is_none()
+            );
+        }
     }
 
     /// Tests that touch the filesystem: the integration tier.
@@ -671,32 +1264,60 @@ mod tests {
             .expect("a valid ci.toml")
         }
 
-        fn new<'a>(kind: DocKind, title: &'a str, proposals: &'a [u64]) -> NewDoc<'a> {
+        fn new<'a>(title: &'a str, links: &'a [DocLink]) -> NewDoc<'a> {
             NewDoc {
-                kind,
+                kind: DocKind::Ticket,
                 title,
                 body: "body",
                 source: "weida",
-                proposals,
+                links,
                 runs_on: &[],
                 onboard: None,
             }
+        }
+
+        fn plan<'a>(includes: &'a [u64]) -> PlanText<'a> {
+            PlanText {
+                title: "Plan",
+                plan: "# Plan\n",
+                includes,
+                runs_on: &[],
+                source: "demo",
+                planner: None,
+            }
+        }
+
+        fn depends(numbers: &[u64]) -> Vec<DocLink> {
+            numbers
+                .iter()
+                .map(|&number| DocLink {
+                    kind: LinkKind::DependsOn,
+                    number,
+                })
+                .collect()
         }
 
         fn state_of(state: &Path, config: &CiConfig, number: u64) -> DocState {
             load(state, config, "demo", number).expect("stored").state
         }
 
+        /// Ticket `number` from open through a plan session to review.
+        fn planned(state: &Path, config: &CiConfig, number: u64, includes: &[u64], now: u64) {
+            set_state(state, config, "demo", number, Ready, now).unwrap();
+            start_planning(state, config, "demo", number, now).unwrap();
+            write_plan(state, config, "demo", Some(number), plan(includes), now).unwrap();
+        }
+
         #[test]
         fn numbers_rise_across_kinds_and_a_deleted_one_is_not_reused() {
             let state = scratch("numbers");
             let config = config();
-            let a = create(&state, &config, "demo", new(DocKind::Proposal, "a", &[]), 1);
-            let b = create(&state, &config, "demo", new(DocKind::Plan, "b", &[]), 2);
+            let a = create(&state, &config, "demo", new("a", &[]), 1);
+            let b = write_plan(&state, &config, "demo", None, plan(&[]), 2);
             assert_eq!((a, b), (Ok(1), Ok(2)));
-            set_state(&state, &config, "demo", 2, Rejected, 3).expect("reject");
+            set_state(&state, &config, "demo", 2, Dismissed, 3).expect("dismiss");
             delete(&state, &config, "demo", 2).expect("delete");
-            let c = create(&state, &config, "demo", new(DocKind::Plan, "c", &[]), 4);
+            let c = create(&state, &config, "demo", new("c", &[]), 4);
             assert_eq!(c, Ok(3));
             let numbers: Vec<u64> = list(&state, &config, "demo")
                 .iter()
@@ -715,89 +1336,171 @@ mod tests {
         }
 
         #[test]
-        fn a_plan_takes_up_the_open_proposals_it_names_and_only_those() {
-            let state = scratch("takes-up");
+        fn a_plan_merges_the_tickets_it_includes_and_a_revision_lets_one_go() {
+            let state = scratch("includes");
             let config = config();
-            create(
-                &state,
-                &config,
-                "demo",
-                new(DocKind::Proposal, "p1", &[]),
-                1,
-            )
-            .unwrap();
-            create(
-                &state,
-                &config,
-                "demo",
-                new(DocKind::Proposal, "p2", &[]),
-                1,
-            )
-            .unwrap();
-            set_state(&state, &config, "demo", 2, Dismissed, 2).unwrap();
+            for title in ["main", "a", "b", "c"] {
+                create(&state, &config, "demo", new(title, &[]), 1).unwrap();
+            }
+            set_state(&state, &config, "demo", 4, Dismissed, 1).unwrap();
+            set_state(&state, &config, "demo", 1, Ready, 2).unwrap();
+            start_planning(&state, &config, "demo", 1, 2).unwrap();
+            assert_eq!(
+                write_plan(&state, &config, "demo", Some(1), plan(&[2, 4]), 3),
+                Err("#4 is dismissed; a plan includes open or ready tickets only".to_owned())
+            );
+            // Nothing written by the refusal.
+            assert_eq!(state_of(&state, &config, 2), Open);
+            assert_eq!(state_of(&state, &config, 1), Planning);
 
-            let refused = create(&state, &config, "demo", new(DocKind::Plan, "x", &[1, 2]), 3);
-            assert!(refused.unwrap_err().contains("#2"));
-            let unknown = create(&state, &config, "demo", new(DocKind::Plan, "x", &[9]), 3);
-            assert_eq!(unknown, Err("no proposal #9 in demo".to_owned()));
-            // Nothing written: no plan, #1 still open.
-            assert_eq!(list(&state, &config, "demo").len(), 2);
-            assert_eq!(state_of(&state, &config, 1), Open);
+            let planner = Planner {
+                runner: "atik".to_owned(),
+                omp_session: "/s/1.jsonl".to_owned(),
+            };
+            let first = PlanText {
+                planner: Some(planner.clone()),
+                ..plan(&[2, 3, 1])
+            };
+            assert_eq!(
+                write_plan(&state, &config, "demo", Some(1), first, 4),
+                Ok(1)
+            );
+            let ticket = load(&state, &config, "demo", 1).unwrap();
+            assert_eq!(
+                (ticket.state, ticket.revision, ticket.merged.clone()),
+                (Review, 1, vec![2, 3])
+            );
+            assert_eq!(ticket.planner, Some(planner));
+            for number in [2, 3] {
+                let merged = load(&state, &config, "demo", number).unwrap();
+                assert_eq!((merged.state, merged.into), (Merged, Some(1)));
+            }
 
-            let plan = create(&state, &config, "demo", new(DocKind::Plan, "x", &[1]), 4);
-            assert_eq!(plan, Ok(3));
-            let proposal = load(&state, &config, "demo", 1).unwrap();
-            assert_eq!((proposal.state, proposal.plan), (Planned, Some(3)));
-            assert_eq!(load(&state, &config, "demo", 3).unwrap().proposals, vec![1]);
+            // Refine, plan again without #3: it goes back to open.
+            refine(&state, &config, "demo", 1, "Overall:\nless", 5).unwrap();
+            assert_eq!(state_of(&state, &config, 1), Ready);
+            start_planning(&state, &config, "demo", 1, 6).unwrap();
+            write_plan(&state, &config, "demo", Some(1), plan(&[2]), 7).unwrap();
+            let ticket = load(&state, &config, "demo", 1).unwrap();
+            assert_eq!(
+                (ticket.revision, ticket.merged, ticket.feedback.as_str()),
+                (2, vec![2], "")
+            );
+            assert_eq!(state_of(&state, &config, 2), Merged);
+            let free = load(&state, &config, "demo", 3).unwrap();
+            assert_eq!((free.state, free.into), (Open, None));
         }
 
         #[test]
-        fn proposals_follow_their_plan_and_only_their_own() {
+        fn included_tickets_close_with_their_ticket_or_reopen_when_its_plan_goes() {
             let state = scratch("follow");
             let config = config();
-            for title in ["p1", "p2", "p3"] {
-                create(
-                    &state,
-                    &config,
-                    "demo",
-                    new(DocKind::Proposal, title, &[]),
-                    1,
-                )
-                .unwrap();
+            for title in ["a", "b", "c", "d"] {
+                create(&state, &config, "demo", new(title, &[]), 1).unwrap();
             }
-            let rejected = create(&state, &config, "demo", new(DocKind::Plan, "a", &[1, 2]), 2);
-            assert_eq!(rejected, Ok(4));
-            set_state(&state, &config, "demo", 4, Rejected, 3).unwrap();
-            for number in [1, 2] {
-                let proposal = load(&state, &config, "demo", number).unwrap();
-                assert_eq!(
-                    (proposal.state, proposal.plan, proposal.changed),
-                    (Open, None, 3)
-                );
-            }
+            planned(&state, &config, 1, &[2], 2);
+            // Discarding the plan reopens what it included.
+            set_state(&state, &config, "demo", 1, Open, 3).unwrap();
+            let discarded = load(&state, &config, "demo", 1).unwrap();
+            assert_eq!(
+                (discarded.plan_text.as_str(), discarded.merged.len()),
+                ("", 0)
+            );
+            assert_eq!(discarded.revision, 1);
+            let reopened = load(&state, &config, "demo", 2).unwrap();
+            assert_eq!((reopened.state, reopened.into), (Open, None));
 
-            let done = create(&state, &config, "demo", new(DocKind::Plan, "b", &[1]), 4).unwrap();
-            let other = create(&state, &config, "demo", new(DocKind::Plan, "c", &[2]), 4).unwrap();
-            // `done` also names #2, which `other` took up.
-            let path = path_of(&dir(&state, &config, "demo").unwrap(), done);
-            let mut plan: DocView = read_json(&path).unwrap();
-            plan.proposals = vec![1, 2];
-            write_json(&path, &plan).unwrap();
-            set_state(&state, &config, "demo", done, Approved, 5).unwrap();
-            start(&state, &config, "demo", done, vec!["x".to_owned()], 6).unwrap();
-            set_state(&state, &config, "demo", done, Done, 7).unwrap();
-            assert_eq!(state_of(&state, &config, 1), Done);
-            let kept = load(&state, &config, "demo", 2).unwrap();
-            assert_eq!((kept.state, kept.plan), (Planned, Some(other)));
-            assert_eq!(state_of(&state, &config, 3), Open);
+            planned(&state, &config, 1, &[2], 4);
+            planned(&state, &config, 3, &[4], 4);
+            set_state(&state, &config, "demo", 1, Approved, 5).unwrap();
+            start(&state, &config, "demo", 1, vec!["x".to_owned()], 6).unwrap();
+            set_state(&state, &config, "demo", 1, Done, 7).unwrap();
+            assert_eq!(state_of(&state, &config, 2), Done);
+            // Another ticket's merged ticket stays.
+            assert_eq!(state_of(&state, &config, 4), Merged);
+            set_state(&state, &config, "demo", 3, Dismissed, 8).unwrap();
+            assert_eq!(state_of(&state, &config, 4), Open);
         }
 
         #[test]
-        fn plans_start_in_approval_order_and_several_run_at_once() {
+        fn a_dependency_that_closes_a_cycle_is_refused() {
+            let state = scratch("cycles");
+            let config = config();
+            create(&state, &config, "demo", new("a", &[]), 1).unwrap();
+            create(&state, &config, "demo", new("b", &depends(&[1])), 1).unwrap();
+            create(&state, &config, "demo", new("c", &depends(&[2])), 1).unwrap();
+            assert_eq!(
+                set_links(&state, &config, "demo", 1, depends(&[2]), 2),
+                Err("#1 depends on #2, which depends on #1".to_owned())
+            );
+            assert_eq!(
+                set_links(&state, &config, "demo", 1, depends(&[3]), 2),
+                Err("a dependency on #3 would close a cycle through #2".to_owned())
+            );
+            assert_eq!(
+                set_links(&state, &config, "demo", 1, depends(&[1]), 2),
+                Err("#1 cannot link to itself".to_owned())
+            );
+            assert_eq!(
+                set_links(&state, &config, "demo", 1, depends(&[9]), 2),
+                Err("no ticket #9 in demo".to_owned())
+            );
+            // A related link closes no cycle, and duplicates collapse.
+            let related = DocLink {
+                kind: LinkKind::Related,
+                number: 3,
+            };
+            set_links(
+                &state,
+                &config,
+                "demo",
+                1,
+                vec![related.clone(), related.clone()],
+                3,
+            )
+            .unwrap();
+            assert_eq!(
+                load(&state, &config, "demo", 1).unwrap().links,
+                vec![related]
+            );
+        }
+
+        #[test]
+        fn a_planning_ticket_without_a_plan_goes_back_with_a_note() {
+            let state = scratch("planning-ended");
+            let config = config();
+            create(&state, &config, "demo", new("a", &[]), 1).unwrap();
+            set_state(&state, &config, "demo", 1, Ready, 2).unwrap();
+            assert_eq!(
+                start_planning(&state, &config, "demo", 1, 3).unwrap().state,
+                Planning
+            );
+            assert!(start_planning(&state, &config, "demo", 1, 3).is_err());
+            assert_eq!(
+                planning_ended(&state, &config, "demo", 1, "no plan", 4),
+                Ok(true)
+            );
+            let back = load(&state, &config, "demo", 1).unwrap();
+            assert_eq!((back.state, back.note.as_str()), (Open, "no plan"));
+            assert_eq!(
+                planning_ended(&state, &config, "demo", 1, "no plan", 5),
+                Ok(false)
+            );
+            // Releasing again clears the note; a revision keeps its plan.
+            planned(&state, &config, 1, &[], 6);
+            assert_eq!(load(&state, &config, "demo", 1).unwrap().note, "");
+            refine(&state, &config, "demo", 1, "redo", 7).unwrap();
+            start_planning(&state, &config, "demo", 1, 8).unwrap();
+            planning_ended(&state, &config, "demo", 1, "ended", 9).unwrap();
+            assert_eq!(state_of(&state, &config, 1), Review);
+        }
+
+        #[test]
+        fn tickets_start_in_approval_order_and_several_run_at_once() {
             let state = scratch("start");
             let config = config();
-            for title in ["a", "b", "c"] {
-                create(&state, &config, "demo", new(DocKind::Plan, title, &[]), 1).unwrap();
+            for _ in 0..3 {
+                write_plan(&state, &config, "demo", None, plan(&[]), 1).unwrap();
             }
             assert!(queue(&state, &config).is_empty());
             // #2 approved before #1: the queue follows approval.
@@ -805,28 +1508,31 @@ mod tests {
             set_state(&state, &config, "demo", 1, Approved, 20).unwrap();
             assert_eq!(
                 set_state(&state, &config, "demo", 1, InProgress, 21),
-                Err("only the CI starts a plan".to_owned())
+                Err("only the CI moves a ticket to in_progress".to_owned())
             );
             let queued: Vec<u64> = queue(&state, &config).iter().map(|d| d.number).collect();
             assert_eq!(queued, vec![2, 1]);
 
             let first = start(&state, &config, "demo", 2, vec!["atik".to_owned()], 30).unwrap();
-            assert_eq!((first.state, first.body.as_str()), (InProgress, "body"));
+            assert_eq!(
+                (first.state, first.plan_text.as_str()),
+                (InProgress, "# Plan\n")
+            );
             let second = start(&state, &config, "demo", 1, vec!["x".to_owned()], 31).unwrap();
             assert_eq!(second.placement, vec!["x".to_owned()]);
             assert_eq!(summary(&state, &config)[0].in_progress, vec![1, 2]);
             assert_eq!(
                 start(&state, &config, "demo", 3, Vec::new(), 32),
-                Err("#3 is saved; only an approved plan starts".to_owned())
+                Err("#3 is review; only an approved ticket starts".to_owned())
             );
             assert!(queue(&state, &config).is_empty());
         }
 
         #[test]
-        fn runs_on_is_fixed_once_a_plan_is_in_progress() {
+        fn runs_on_is_fixed_once_a_ticket_is_in_progress() {
             let state = scratch("runs-on");
             let config = config();
-            create(&state, &config, "demo", new(DocKind::Plan, "a", &[]), 1).unwrap();
+            write_plan(&state, &config, "demo", None, plan(&[]), 1).unwrap();
             let windows = vec!["os=windows".to_owned()];
             set_runs_on(&state, &config, "demo", 1, windows.clone(), 2).unwrap();
             assert_eq!(load(&state, &config, "demo", 1).unwrap().runs_on, windows);
@@ -857,13 +1563,46 @@ mod tests {
             let state = scratch("outside");
             let config = config();
             for repo in ["other", "../x"] {
-                let made = create(&state, &config, repo, new(DocKind::Proposal, "a", &[]), 1);
+                let made = create(&state, &config, repo, new("a", &[]), 1);
                 assert_eq!(made, Err(format!("no repository {repo}")));
                 assert!(list(&state, &config, repo).is_empty());
                 assert!(start(&state, &config, repo, 1, Vec::new(), 1).is_err());
             }
             assert!(!state.join("ci").exists());
             assert!(!state.join("x").exists());
+        }
+
+        #[test]
+        fn old_proposals_and_plans_on_disk_become_tickets() {
+            let state = scratch("migrate");
+            let config = config();
+            let dir = docs_root(&state).join("demo");
+            std::fs::create_dir_all(&dir).unwrap();
+            let head = r#""repo":"demo","source":"s","created":1,"changed":2"#;
+            std::fs::write(
+                dir.join("1.json"),
+                format!(
+                    r#"{{{head},"number":1,"kind":"proposal","title":"P","state":"planned","plan":2,"body":"ask"}}"#
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("2.json"),
+                format!(
+                    r##"{{{head},"number":2,"kind":"plan","title":"Old plan","state":"saved","proposals":[1],"body":"# Old plan\n"}}"##
+                ),
+            )
+            .unwrap();
+            std::fs::write(dir.join("last"), "2").unwrap();
+            assert_eq!(migrate(&state), Ok(2));
+            assert_eq!(migrate(&state), Ok(0));
+            let proposal = load(&state, &config, "demo", 1).unwrap();
+            assert_eq!((proposal.state, proposal.into), (Merged, Some(2)));
+            let plan = load(&state, &config, "demo", 2).unwrap();
+            assert_eq!(
+                (plan.state, plan.plan_text.as_str(), plan.merged),
+                (Review, "# Old plan\n", vec![1])
+            );
         }
 
         fn onboarding_config() -> CiConfig {
@@ -884,7 +1623,7 @@ mod tests {
                 title: "join",
                 body: "body",
                 source: "scan-rs",
-                proposals: &[],
+                links: &[],
                 runs_on: &[],
                 onboard: Some(spec),
             }
@@ -900,7 +1639,7 @@ mod tests {
         }
 
         #[test]
-        fn a_pending_repository_takes_proposals_and_shows_in_the_summary() {
+        fn a_pending_repository_takes_tickets_and_shows_in_the_summary() {
             let state = scratch("pending");
             let config = onboarding_config();
             let asked = spec("git@git.example.org:O/Scan-RS.git");
@@ -914,18 +1653,13 @@ mod tests {
                 "https://git.example.org/o/scan-rs.git"
             );
             assert_eq!(stored.state, Open);
+            assert_eq!(create(&state, &config, "scan-rs", new("p", &[]), 2), Ok(2));
             assert_eq!(
-                create(
-                    &state,
-                    &config,
-                    "scan-rs",
-                    new(DocKind::Proposal, "p", &[]),
-                    2
-                ),
-                Ok(2)
+                create(&state, &config, "scan-rs", new("q", &depends(&[2])), 3),
+                Err("scan-rs is not in ci.toml yet; links wait for its onboarding".to_owned())
             );
             assert_eq!(
-                create(&state, &config, "scan-rs", new(DocKind::Plan, "x", &[]), 3),
+                write_plan(&state, &config, "scan-rs", None, plan(&[]), 3),
                 Err("scan-rs is not in ci.toml yet; plans wait for its onboarding".to_owned())
             );
             let summary = summary(&state, &config);
@@ -933,7 +1667,7 @@ mod tests {
             assert_eq!(names, ["demo", "scan-rs"]);
             let pending = &summary[1];
             assert_eq!(pending.onboarding, Some(1));
-            assert_eq!((pending.awaiting, pending.proposals), (1, 1));
+            assert_eq!((pending.awaiting, pending.open), (1, 1));
             assert_eq!(pending.origin, "git.example.org/o/scan-rs");
             assert_eq!(summary[0].onboarding, None);
 
@@ -1002,7 +1736,7 @@ mod tests {
         }
 
         #[test]
-        fn a_job_request_is_queued_once_while_its_plan_is_open() {
+        fn a_job_request_is_queued_once_while_its_ticket_is_open() {
             let state = scratch("job-request");
             let config = CiConfig::parse(
                 "default_runner = \"x\"\n\
@@ -1016,18 +1750,19 @@ mod tests {
                 file_request(&state, &config, "demo", "sync", body, 1),
                 Ok(Filed::Queued(1))
             );
-            let plan = load(&state, &config, "demo", 1).expect("stored");
+            let ticket = load(&state, &config, "demo", 1).expect("stored");
             assert_eq!(
                 (
-                    plan.kind,
-                    plan.state,
-                    plan.title.as_str(),
-                    plan.source.as_str()
+                    ticket.kind,
+                    ticket.state,
+                    ticket.title.as_str(),
+                    ticket.source.as_str(),
+                    ticket.plan_text.as_str(),
                 ),
-                (DocKind::Plan, Approved, "Fix the sync", "job.sync")
+                (DocKind::Ticket, Approved, "Fix the sync", "job.sync", body)
             );
-            assert_eq!(plan.runs_on, vec!["os=linux".to_owned()]);
-            assert_eq!(plan.approved, Some(1));
+            assert_eq!(ticket.runs_on, vec!["os=linux".to_owned()]);
+            assert_eq!(ticket.approved, Some(1));
 
             assert_eq!(
                 file_request(&state, &config, "demo", "sync", body, 2),
@@ -1044,7 +1779,7 @@ mod tests {
                 Ok(Filed::Queued(3))
             );
 
-            set_state(&state, &config, "demo", 1, Rejected, 5).expect("reject");
+            set_state(&state, &config, "demo", 1, Dismissed, 5).expect("dismiss");
             assert_eq!(
                 file_request(&state, &config, "demo", "sync", body, 6),
                 Ok(Filed::Queued(4))

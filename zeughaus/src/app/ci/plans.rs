@@ -1,50 +1,57 @@
-//! A repository's Plans tab: the plans and proposals the CI stores for it,
-//! approved, rejected and cleaned up here, the `Runs on` of each, the plan
-//! sessions the CI opens on a runner that hosts them, and the master
-//! sessions it dispatches approved plans to.
+//! A repository's tickets as the Board and the ticket popout show them: the
+//! list the CI stores, the ticket the popout shows with its proposal and
+//! its plan in sections, what each state lets the user do, the `Runs on`
+//! of each, the plan sessions the CI opens on a runner that hosts them and
+//! the master sessions it dispatches approved tickets to.
 //!
-//! The list is grouped the way an agent reads it (awaiting approval, the
-//! queue, in progress, open proposals, history); the selected document is
-//! drawn as Markdown beside it. The CI announces every change on `/events`
-//! (`CiDocs`, `CiSessions`), and the tab asks for the list again.
+//! The CI announces every change on `/events` (`CiDocs`, `CiSessions`), and
+//! the list is asked for again; a shown ticket whose list entry changed is
+//! asked for again too.
 
-use iced::widget::{
-    Space, button, column, container, markdown, row, rule, scrollable, text, text_input,
-};
+use iced::widget::{Space, button, markdown, row, text, text_input};
 use iced::{Alignment, Element, Length, Task};
 use zeughaus_link::{
     CiReply, CiRequest, ClaimSubject, DocKind, DocState, DocView, MachineView, SessionKind,
-    SessionState, SessionView,
+    SessionState, SessionView, blocked_by,
 };
 use zeughaus_mux::TerminalId;
 use zeughaus_theme::Theme;
 
 use super::{
     CiClient, Notice, SP_1, SP_2, SP_3, SP_4, TEXT_MD, TEXT_SM, TOOLBAR_HEIGHT, UNEXPECTED,
-    action_button, ago, glyph, icon, now, tip,
+    action_button, glyph, icon, tip,
 };
 use crate::app::App;
 use crate::feed;
-use crate::message::{CiMsg, CiShortcut, Message};
+use crate::message::{CiMsg, CiShortcut, Message, TicketMsg};
 use crate::notices::Severity;
 use crate::style::{self, Tokens};
 use crate::transport::Endpoint;
 use crate::workspace::{RunnerKey, TabRef};
 
-/// The widest a document's text grows.
-const BODY_MAX_WIDTH: f32 = 900.0;
+/// The widest a ticket's text grows.
+pub(super) const BODY_MAX_WIDTH: f32 = 900.0;
 
-/// The glyphs of the Plans tab's buttons (codicons of the bundled Nerd Font).
-const CHECK: char = '\u{eab2}';
-const TRASH: char = '\u{ea81}';
-const EDIT: char = '\u{ea73}';
+/// The glyphs of the ticket buttons (codicons of the bundled Nerd Font).
+pub(super) const CHECK: char = '\u{eab2}';
+pub(super) const TRASH: char = '\u{ea81}';
+pub(super) const EDIT: char = '\u{ea73}';
 const PAUSE: char = '\u{ead1}';
 const PLAY: char = '\u{eb2c}';
 
-/// One repository's Plans tab.
+/// The ticket the popout shows, with its texts parsed.
+pub(super) struct Shown {
+    pub(super) number: u64,
+    pub(super) doc: DocView,
+    pub(super) body: markdown::Content,
+    /// The plan in its sections, each with its own Markdown.
+    pub(super) sections: Vec<(super::review::Section, markdown::Content)>,
+}
+
+/// One repository's tickets.
 pub(super) struct PlansState {
     pub(super) repo: String,
-    /// Bodies empty, in number order.
+    /// Texts empty, in number order.
     docs: Vec<DocView>,
     loaded: bool,
     loading: bool,
@@ -53,19 +60,19 @@ pub(super) struct PlansState {
     again: bool,
     /// Why the list did not arrive.
     error: Option<String>,
-    /// The document drawn beside the list.
+    /// The ticket the popout shows.
     selected: Option<u64>,
-    /// Its body, once the CI has sent it.
-    shown: Option<(u64, markdown::Content)>,
+    /// It with its texts, once the CI has sent it.
+    pub(super) shown: Option<Shown>,
     /// Why it did not.
-    shown_error: Option<String>,
-    /// An approval, rejection or deletion on its way: the buttons wait.
-    acting: bool,
+    pub(super) shown_error: Option<String>,
+    /// An action on its way: the buttons wait.
+    pub(super) acting: bool,
     /// The document an action is on and what it does (`approving`), from
     /// the request until the list shows its result: its card pulses.
     pub(super) acting_on: Option<(u64, &'static str)>,
     /// What the last action or session request came to.
-    notice: Option<Notice>,
+    pub(super) notice: Option<Notice>,
     /// The `Runs on` being edited: the document and the text so far.
     pub(super) runs_on_input: Option<(u64, String)>,
 }
@@ -100,21 +107,21 @@ impl PlansState {
         &self.docs
     }
 
-    /// The document whose detail is shown.
-    pub(super) fn selected(&self) -> Option<u64> {
-        self.selected
+    /// Ticket `number` as the list has it.
+    pub(super) fn doc(&self, number: u64) -> Option<&DocView> {
+        self.docs.iter().find(|doc| doc.number == number)
     }
 }
 
 impl CiClient {
-    /// When the newest plan awaiting approval in Plans `view` last changed,
+    /// When the newest ticket awaiting review in Plans `view` last changed,
     /// once the list has loaded.
     pub(super) fn awaiting_since(&self, view: u64) -> Option<u64> {
         self.plans
             .get(&view)?
             .docs
             .iter()
-            .filter(|doc| doc.kind == DocKind::Plan && doc.state == DocState::Saved)
+            .filter(|doc| doc.kind == DocKind::Ticket && doc.state == DocState::Review)
             .map(|doc| doc.changed)
             .max()
     }
@@ -174,14 +181,24 @@ impl CiClient {
             }
             Err(e) => state.error = Some(e),
         }
-        if std::mem::take(&mut state.again) {
-            self.ask_docs(key, view)
-        } else {
-            Task::none()
+        // The shown ticket changed: its texts are asked for again.
+        let stale = state.shown.as_ref().and_then(|shown| {
+            let listed = state.docs.iter().find(|doc| doc.number == shown.number)?;
+            (listed.changed != shown.doc.changed).then_some(shown.number)
+        });
+        let again = std::mem::take(&mut state.again);
+        let mut tasks = Vec::new();
+        if let Some(number) = stale {
+            state.selected = None;
+            tasks.push(self.select(key, view, number));
         }
+        if again {
+            tasks.push(self.ask_docs(key, view));
+        }
+        Task::batch(tasks)
     }
 
-    /// Shows a document beside the list, its body asked for now.
+    /// Shows a ticket in the popout, its texts asked for now.
     pub(super) fn select(&mut self, key: &RunnerKey, view: u64, number: u64) -> Task<Message> {
         let Some(state) = self.plans.get_mut(&view) else {
             return Task::none();
@@ -190,7 +207,11 @@ impl CiClient {
             return Task::none();
         }
         state.selected = Some(number);
-        state.shown = None;
+        // The ticket shown stays until the new answer replaces it, so a
+        // refresh does not flicker.
+        if state.shown.as_ref().is_some_and(|s| s.number != number) {
+            state.shown = None;
+        }
         state.shown_error = None;
         let (key, repo) = (key.clone(), state.repo.clone());
         Task::perform(doc(self.endpoint.clone(), repo, number), move |result| {
@@ -220,7 +241,33 @@ impl CiClient {
         }
         match result {
             Ok(Some(doc)) => {
-                state.shown = Some((number, markdown::Content::parse(&doc.shown_text())))
+                // A ticket's note is said in its action row; an onboarding
+                // request's text says what it asks for.
+                let shown_text = match doc.kind {
+                    DocKind::Onboarding => doc.shown_text(),
+                    DocKind::Ticket => doc.body.clone(),
+                };
+                let body = markdown::Content::parse(&shown_text);
+                // Each section's text without its heading, which its card
+                // draws itself.
+                let sections = super::review::sections(&doc.plan_text)
+                    .into_iter()
+                    .map(|section| {
+                        let slice = &doc.plan_text[section.range.clone()];
+                        let body = if section.level > 0 {
+                            slice.split_once('\n').map_or("", |(_, rest)| rest)
+                        } else {
+                            slice
+                        };
+                        (section, markdown::Content::parse(body))
+                    })
+                    .collect();
+                state.shown = Some(Shown {
+                    number,
+                    doc: *doc,
+                    body,
+                    sections,
+                });
             }
             Ok(None) => state.shown_error = Some(format!("#{number} is gone")),
             Err(e) => state.shown_error = Some(e),
@@ -282,17 +329,22 @@ fn acting_on(request: &CiRequest) -> Option<(u64, &'static str)> {
     match request {
         CiRequest::DocState { number, state, .. } => {
             let verb = match state {
+                DocState::Ready => "releasing",
+                DocState::Open => "holding",
                 DocState::Approved => "approving",
-                DocState::Rejected => "rejecting",
+                DocState::Review => "unqueueing",
                 DocState::Done => "finishing",
                 DocState::Dismissed => "dismissing",
-                DocState::Planned => "planning",
+                DocState::Rejected => "rejecting",
                 _ => return None,
             };
             Some((*number, verb))
         }
         CiRequest::DocDelete { number, .. } => Some((*number, "deleting")),
-        CiRequest::DocRunsOn { number, .. } => Some((*number, "saving")),
+        CiRequest::DocRefine { number, .. } => Some((*number, "refining")),
+        CiRequest::DocRunsOn { number, .. }
+        | CiRequest::DocEdit { number, .. }
+        | CiRequest::DocLinks { number, .. } => Some((*number, "saving")),
         _ => None,
     }
 }
@@ -322,6 +374,14 @@ async fn act(endpoint: Endpoint, request: CiRequest) -> Result<(), String> {
     }
 }
 
+/// The number of the ticket the CI stored.
+pub(super) async fn create(endpoint: Endpoint, request: CiRequest) -> Result<u64, String> {
+    match feed::ci(endpoint, request).await? {
+        CiReply::DocCreated { number } => Ok(number),
+        _ => Err(UNEXPECTED.to_owned()),
+    }
+}
+
 async fn open(endpoint: Endpoint, request: CiRequest) -> Result<SessionView, String> {
     match feed::ci(endpoint, request).await? {
         CiReply::Session { session } => Ok(session),
@@ -331,29 +391,58 @@ async fn open(endpoint: Endpoint, request: CiRequest) -> Result<SessionView, Str
 
 /// What a document can be asked to do from its state: the button's glyph,
 /// words, tooltip and the state it moves to (`None`: deleted).
-fn actions(doc: &DocView) -> Vec<(char, &'static str, &'static str, Option<DocState>)> {
+pub(super) fn actions(doc: &DocView) -> Vec<(char, &'static str, &'static str, Option<DocState>)> {
+    let dismiss = (
+        glyph::CLOSE,
+        "Dismiss",
+        "It will not be done",
+        Some(DocState::Dismissed),
+    );
     match (doc.kind, doc.state) {
-        (DocKind::Plan, DocState::Saved) => vec![
+        (DocKind::Ticket, DocState::Open) => vec![
+            (
+                EDIT,
+                "Plan",
+                "Release it for planning: the CI opens a plan session once its dependencies are \
+                 done",
+                Some(DocState::Ready),
+            ),
+            dismiss,
+        ],
+        (DocKind::Ticket, DocState::Ready) => vec![
+            (
+                glyph::CLOSE,
+                "Hold",
+                "Back to open: no plan session starts",
+                Some(DocState::Open),
+            ),
+            dismiss,
+        ],
+        (DocKind::Ticket, DocState::Review) => vec![
             (
                 CHECK,
                 "Approve",
-                "Queue it for a master session on a runner it fits",
+                "Queue its plan for a master on a runner it fits",
                 Some(DocState::Approved),
             ),
             (
-                glyph::CLOSE,
-                "Reject",
-                "It will not be executed",
-                Some(DocState::Rejected),
+                TRASH,
+                "Discard plan",
+                "Back to open without its plan; the tickets it includes are open again",
+                Some(DocState::Open),
             ),
+            dismiss,
         ],
-        (DocKind::Plan, DocState::Approved) => vec![(
-            glyph::CLOSE,
-            "Reject",
-            "Take it out of the queue",
-            Some(DocState::Rejected),
-        )],
-        (DocKind::Plan, DocState::InProgress) => vec![
+        (DocKind::Ticket, DocState::Approved) => vec![
+            (
+                glyph::RERUN,
+                "Back to review",
+                "Take it out of the queue",
+                Some(DocState::Review),
+            ),
+            dismiss,
+        ],
+        (DocKind::Ticket, DocState::InProgress) => vec![
             (
                 CHECK,
                 "Mark done",
@@ -367,12 +456,8 @@ fn actions(doc: &DocView) -> Vec<(char, &'static str, &'static str, Option<DocSt
                 Some(DocState::Approved),
             ),
         ],
-        (DocKind::Proposal, DocState::Open) => vec![(
-            glyph::CLOSE,
-            "Dismiss",
-            "No plan will take it up",
-            Some(DocState::Dismissed),
-        )],
+        // The CI moves it on by itself.
+        (DocKind::Ticket, DocState::Planning) => Vec::new(),
         (DocKind::Onboarding, DocState::Open) => vec![
             (
                 CHECK,
@@ -501,15 +586,10 @@ impl App {
             .map(|m| m.name.clone())
     }
 
-    /// Asks the CI for a plan session of the Plans tab's repository, on this
-    /// editor's own runner when it hosts sessions; with `proposal` it plans
-    /// that open proposal.
-    pub(super) fn open_session(
-        &mut self,
-        key: &RunnerKey,
-        view: u64,
-        proposal: Option<u64>,
-    ) -> Task<Message> {
+    /// Asks the CI for a plan session of the Board's repository without a
+    /// ticket, on this editor's own runner when it hosts sessions; its plan
+    /// becomes a new ticket.
+    pub(super) fn open_session(&mut self, key: &RunnerKey, view: u64) -> Task<Message> {
         let Some(client) = self.ci.get(key) else {
             return Task::none();
         };
@@ -519,11 +599,10 @@ impl App {
         };
         let request = CiRequest::OpenSession {
             repo: state.repo.clone(),
-            proposal,
             runner,
         };
         let endpoint = client.endpoint.clone();
-        self.opening_session = Some((key.clone(), state.repo.clone(), proposal));
+        self.opening_session = Some((key.clone(), state.repo.clone()));
         if let Some(state) = self.ci.get_mut(key).and_then(|c| c.plans.get_mut(&view)) {
             state.notice = None;
         }
@@ -653,21 +732,25 @@ impl App {
         {
             toolbar = toolbar.push(text(error.as_str()).size(TEXT_SM).color(self.theme.error()));
         }
+        let mut pressed = action_button(EDIT, "New ticket");
+        pressed = pressed.on_press_with(move || {
+            Message::Ticket(TicketMsg::New {
+                ci: runner.clone(),
+                view,
+            })
+        });
+        toolbar = toolbar.push(tip(
+            pressed,
+            "Write a ticket for this repository".to_owned(),
+        ));
         let possible = client.sessions_possible();
         let mut pressed = action_button(EDIT, "Plan session");
         if possible {
-            pressed = pressed.on_press_with(move || {
-                Message::Ci(
-                    runner.clone(),
-                    CiMsg::OpenSession {
-                        view,
-                        proposal: None,
-                    },
-                )
-            });
+            pressed = pressed
+                .on_press_with(move || Message::Ci(runner.clone(), CiMsg::OpenSession { view }));
         }
         let what = if possible {
-            "omp in plan mode on a session runner, through the CI"
+            "omp in plan mode on a session runner, through the CI; its plan becomes a new ticket"
         } else {
             "no connected runner hosts sessions (sessions = true in ci.toml)"
         };
@@ -710,104 +793,20 @@ impl App {
         toolbar.into()
     }
 
-    /// The selected document: an action bar that stays on top, the master's
-    /// terminal under it while one works on the plan, then the title, what
-    /// the document is and its text.
-    pub(super) fn doc_detail<'a>(
-        &'a self,
-        runner: &'a RunnerKey,
-        client: &'a CiClient,
-        view: u64,
-        state: &'a PlansState,
-    ) -> Element<'a, Message, Theme> {
-        let muted = self.theme.muted();
-        let Some(doc) = state
-            .selected
-            .and_then(|number| state.docs.iter().find(|doc| doc.number == number))
-        else {
-            return container(
-                text("Select a plan or proposal (j, k or the arrows).")
-                    .size(TEXT_SM)
-                    .color(muted),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center(Length::Fill)
-            .into();
-        };
-        let now = now();
-        let mut meta = format!(
-            "{} \u{b7} {} \u{b7} from {} \u{b7} created {}",
-            doc.kind.name(),
-            doc.state.name().replace('_', " "),
-            doc.source,
-            ago(doc.created, now)
-        );
-        if let Some(plan) = doc.plan {
-            meta.push_str(&format!(" \u{b7} taken up by #{plan}"));
-        }
-        if !doc.proposals.is_empty() {
-            let named: Vec<String> = doc.proposals.iter().map(|n| format!("#{n}")).collect();
-            meta.push_str(&format!(" \u{b7} from proposals {}", named.join(", ")));
-        }
-        if let Some(place) = master_place(client, doc) {
-            meta.push_str(&format!(" \u{b7} master {place}"));
-        }
-        let text_part: Element<'a, Message, Theme> = match (&state.shown, &state.shown_error) {
-            (Some((number, content)), _) if *number == doc.number => {
-                // The editor's face, and theme roles for inline code, not
-                // the platform's sans and a fixed highlight.
-                let palette = self.theme.base().palette();
-                let mut style = markdown::Style::from_palette(palette);
-                style.font = crate::font::UI;
-                style.inline_code_font = crate::font::UI;
-                style.code_block_font = crate::font::UI;
-                style.inline_code_highlight.background =
-                    Tokens::of(&self.theme).surface_hover.into();
-                style.inline_code_color = palette.text;
-                let settings = markdown::Settings::with_text_size(TEXT_MD, style);
-                markdown::view(content.items(), settings)
-                    .map(move |uri| Message::Ci(runner.clone(), CiMsg::OpenLink(uri)))
-            }
-            (_, Some(error)) => text(error.as_str())
-                .size(TEXT_SM)
-                .color(self.theme.error())
-                .into(),
-            _ => text("Loading.").size(TEXT_SM).color(muted).into(),
-        };
-        // The body opens with the title as its heading.
-        let mut head = column![text(meta).size(TEXT_SM).color(muted)].spacing(SP_2);
-        if let Some(line) = self.runs_on_line(runner, view, state, doc) {
-            head = head.push(line);
-        }
-        let body = scrollable(
-            column![head, rule::horizontal(1), text_part]
-                .spacing(SP_3)
-                .padding(SP_4)
-                .max_width(BODY_MAX_WIDTH),
-        )
-        .width(Length::Fill)
-        .height(Length::FillPortion(1));
-        let mut detail = column![
-            self.action_bar(runner, client, view, state, doc),
-            rule::horizontal(1),
-        ];
-        if let Some((key, terminal)) = self.docked_master(runner, view) {
-            detail = detail
-                .push(
-                    container(self.page_terminal(&key, terminal))
-                        .width(Length::Fill)
-                        .height(Length::FillPortion(1)),
-                )
-                .push(rule::horizontal(1));
-        }
-        detail.push(body).height(Length::Fill).into()
+    /// Whether the review being written of ticket `doc` of CI `ci` has
+    /// anything to send: a deletion, a note or overall feedback.
+    pub(super) fn review_pending(&self, ci: &RunnerKey, doc: &DocView) -> bool {
+        self.reviews
+            .get(&(ci.clone(), doc.repo.clone(), doc.number))
+            .is_some_and(|draft| draft.revision == doc.revision && !draft.is_empty())
     }
 
-    /// The buttons a document's state allows, the primary one filled:
-    /// `Approve` for a saved plan, `Plan this proposal` for an open
-    /// proposal, `Open` for a plan a master works on, with `Stop` beside it.
-    fn action_bar<'a>(
+    /// The buttons a ticket's state allows, the primary one filled, and what
+    /// it waits for: `Open session` for a ticket a session holds, `Open` and
+    /// `Stop` while a master works on it, the state's actions, `Refine`
+    /// beside `Approve` for a plan in review, `Edit` for an open or ready
+    /// ticket, and the reason the CI last sent it back.
+    pub(super) fn action_bar<'a>(
         &'a self,
         runner: &'a RunnerKey,
         client: &'a CiClient,
@@ -816,6 +815,7 @@ impl App {
         doc: &'a DocView,
     ) -> Element<'a, Message, Theme> {
         let t = Tokens::of(&self.theme);
+        let muted = self.theme.muted();
         let mut bar = row![].spacing(SP_2).align_y(Alignment::Center);
         let mut primary_taken = false;
         let pill = |words: &'a str, primary: bool| {
@@ -830,37 +830,20 @@ impl App {
                     }
                 })
         };
-        if doc.kind == DocKind::Proposal && doc.state == DocState::Open {
-            let number = doc.number;
-            let held = client.claim_on(&ClaimSubject::Proposal {
+        let ticket = doc.kind == DocKind::Ticket;
+        let open_or_ready = ticket && matches!(doc.state, DocState::Open | DocState::Ready);
+        if open_or_ready
+            && let Some(claim) = client.claim_on(&ClaimSubject::Ticket {
                 repo: doc.repo.clone(),
-                number,
-            });
-            if let Some(claim) = held {
-                let mut pressed = pill("Open session", true);
-                if let Some((key, terminal)) = client.holder_target(claim) {
-                    pressed = pressed
-                        .on_press_with(move || Message::RevealTerminal(key.clone(), terminal));
-                }
-                bar = bar.push(tip(pressed, claim.holder_text()));
-            } else {
-                let mut pressed = pill("Plan this proposal", true);
-                let what = if client.sessions_possible() {
-                    pressed = pressed.on_press_with(move || {
-                        Message::Ci(
-                            runner.clone(),
-                            CiMsg::OpenSession {
-                                view,
-                                proposal: Some(number),
-                            },
-                        )
-                    });
-                    "omp plans it in plan mode on a session runner (p)"
-                } else {
-                    "no connected runner hosts sessions (sessions = true in ci.toml)"
-                };
-                bar = bar.push(tip(pressed, what.to_owned()));
+                number: doc.number,
+            })
+        {
+            let mut pressed = pill("Open session", true);
+            if let Some((key, terminal)) = client.holder_target(claim) {
+                pressed =
+                    pressed.on_press_with(move || Message::RevealTerminal(key.clone(), terminal));
             }
+            bar = bar.push(tip(pressed, claim.holder_text()));
             primary_taken = true;
         }
         if let Some(session) = client.master_of(&doc.repo, doc.number) {
@@ -891,8 +874,11 @@ impl App {
             bar = bar.push(tip(stop, "End the master's session".to_owned()));
             primary_taken = true;
         }
+        let in_review = ticket && doc.state == DocState::Review;
+        let pending = in_review && self.review_pending(runner, doc);
         for (_, words, what, to) in actions(doc) {
-            let primary = !primary_taken && words == "Approve";
+            let held = words == "Approve" && pending;
+            let primary = !primary_taken && !held && matches!(words, "Approve" | "Plan");
             primary_taken |= primary;
             let request = match to {
                 Some(state) => CiRequest::DocState {
@@ -906,7 +892,7 @@ impl App {
                 },
             };
             let mut pressed = pill(words, primary);
-            if !state.acting {
+            if !state.acting && !held {
                 pressed = pressed.on_press_with(move || {
                     Message::Ci(
                         runner.clone(),
@@ -917,61 +903,92 @@ impl App {
                     )
                 });
             }
+            let what = if held {
+                "Your deletions and notes go back with Refine; Approve executes the plan as it is"
+            } else {
+                what
+            };
             let key = match words {
                 "Approve" => " (a)",
-                "Reject" => " (r)",
+                "Dismiss" | "Reject" => " (r)",
+                "Plan" => " (p)",
                 _ => "",
             };
             bar = bar.push(tip(pressed, format!("{what}{key}")));
+            if words == "Approve" && in_review {
+                let mut refine = pill("Refine", pending);
+                if pending && !state.acting {
+                    refine = refine.on_press(Message::Ticket(TicketMsg::Refine));
+                }
+                let what = if pending {
+                    "Send your review to the plan session, which revises the plan"
+                } else {
+                    "Delete or annotate a part, or write overall feedback"
+                };
+                bar = bar.push(tip(refine, what.to_owned()));
+            }
         }
-        let bar = container(bar).padding([SP_2, SP_4]);
-        if doc.kind != DocKind::Plan || doc.proposals.is_empty() {
-            return bar.into();
+        if open_or_ready {
+            let mut edit = pill("Edit", false);
+            if !state.acting {
+                edit = edit.on_press(Message::Ticket(TicketMsg::Edit));
+            }
+            bar = bar.push(tip(edit, "Change its title and proposal".to_owned()));
         }
-        let named: Vec<String> = doc.proposals.iter().map(|n| format!("#{n}")).collect();
-        column![
-            bar,
-            container(
-                text(format!("From {}", named.join(", ")))
+        let mut waits = Vec::new();
+        if matches!(doc.state, DocState::Ready | DocState::Approved) {
+            let blocked: Vec<String> = blocked_by(doc, state.docs())
+                .iter()
+                .map(|n| format!("#{n}"))
+                .collect();
+            if !blocked.is_empty() {
+                waits.push(format!("waits for {}", blocked.join(", ")));
+            }
+        }
+        if doc.state == DocState::Ready
+            && let Some(planner) = &doc.planner
+            && !client.hosts_sessions(&planner.runner)
+        {
+            waits.push(format!(
+                "waits for {}, where its plan session ran",
+                planner.runner
+            ));
+        }
+        if doc.state == DocState::Approved && client.paused(&doc.repo) {
+            waits.push("queue paused".to_owned());
+        }
+        for wait in waits {
+            bar = bar.push(text(wait).size(TEXT_SM).color(muted));
+        }
+        if !doc.note.is_empty() {
+            bar = bar.push(
+                text(doc.note.as_str())
                     .size(TEXT_SM)
-                    .color(self.theme.muted())
-            )
-            .padding([0.0, SP_4])
-        ]
-        .spacing(SP_1)
-        .padding(iced::Padding {
-            bottom: SP_2,
-            ..iced::Padding::ZERO
-        })
-        .into()
+                    .color(self.theme.error()),
+            );
+        }
+        bar.wrap().vertical_spacing(SP_2).into()
     }
 
-    /// The `Runs on` of a document: a field while it can change (an open
-    /// proposal, a saved or approved plan), else a line when it names any.
-    fn runs_on_line<'a>(
+    /// The `Runs on` of a ticket: a field while it can change (open, ready,
+    /// in review or approved), else a line when it names any.
+    pub(super) fn runs_on_line<'a>(
         &'a self,
         runner: &'a RunnerKey,
         view: u64,
         state: &'a PlansState,
         doc: &'a DocView,
     ) -> Option<Element<'a, Message, Theme>> {
-        let muted = self.theme.muted();
-        let editable = matches!(
-            (doc.kind, doc.state),
-            (DocKind::Proposal, DocState::Open)
-                | (DocKind::Plan, DocState::Saved)
-                | (DocKind::Plan, DocState::Approved)
-        );
-        let label = text("Runs on").size(TEXT_SM).color(muted);
+        let editable = doc.kind == DocKind::Ticket
+            && matches!(
+                doc.state,
+                DocState::Open | DocState::Ready | DocState::Review | DocState::Approved
+            );
         if !editable {
             if doc.runs_on.is_empty() {
                 return None;
             }
-            return Some(
-                row![label, text(doc.runs_on.join("; ")).size(TEXT_SM)]
-                    .spacing(SP_2)
-                    .into(),
-            );
+            return Some(text(doc.runs_on.join("; ")).size(TEXT_SM).into());
         }
         let number = doc.number;
         let value = match &state.runs_on_input {
@@ -983,70 +1000,46 @@ impl App {
             number,
             runs_on: runs_on_of(&value),
         };
-        let field = text_input("any runner, or os=windows; os=linux", &value)
-            .size(TEXT_SM)
-            .on_input(move |text| {
-                Message::Ci(runner.clone(), CiMsg::RunsOnEdited { view, number, text })
-            })
-            .on_submit(Message::Ci(runner.clone(), CiMsg::DocAct { view, request }));
         Some(
-            row![label, field]
-                .spacing(SP_2)
-                .align_y(Alignment::Center)
+            text_input("any runner, or os=windows; os=linux", &value)
+                .size(TEXT_SM)
+                .on_input(move |text| {
+                    Message::Ci(runner.clone(), CiMsg::RunsOnEdited { view, number, text })
+                })
+                .on_submit(Message::Ci(runner.clone(), CiMsg::DocAct { view, request }))
                 .into(),
         )
     }
 
-    /// The master's runner and terminal of the plan selected in Plans `view`
-    /// of CI `ci`, while one works on it: what the plan's detail docks.
-    pub(super) fn docked_master(
-        &self,
-        ci: &RunnerKey,
-        view: u64,
-    ) -> Option<(RunnerKey, TerminalId)> {
-        let client = self.ci.get(ci)?;
-        let state = client.plans.get(&view)?;
-        let number = state.selected?;
-        let session = client.master_of(&state.repo, number)?;
-        Some((
-            client.runner_key(&session.runner)?,
-            TerminalId(session.terminal?),
-        ))
-    }
-
-    /// `a`, `r` and `p` on the selected document of Plans `view`: approve,
-    /// reject, or plan an open proposal, each only where the document
-    /// offers it.
+    /// `a`, `r` and `p` on ticket `number` of Plans `view`: approve,
+    /// dismiss (reject an onboarding request) or release it for planning,
+    /// each only where the ticket offers it. A plan with a review being
+    /// written is not approved: the review goes back with Refine.
     pub(super) fn plans_letter(
         &mut self,
         ci: &RunnerKey,
         view: u64,
+        number: u64,
         shortcut: CiShortcut,
     ) -> Task<Message> {
-        let Some(client) = self.ci.get(ci) else {
-            return Task::none();
-        };
-        let Some(doc) = client.plans.get(&view).and_then(|state| {
-            let number = state.selected?;
-            state.docs.iter().find(|doc| doc.number == number)
-        }) else {
+        let Some(doc) = self
+            .ci
+            .get(ci)
+            .and_then(|client| client.plans.get(&view))
+            .and_then(|state| state.doc(number))
+        else {
             return Task::none();
         };
         let wanted = match shortcut {
             CiShortcut::Approve => "Approve",
-            CiShortcut::Rerun => "Reject",
-            CiShortcut::Plan => {
-                if doc.kind == DocKind::Proposal
-                    && doc.state == DocState::Open
-                    && client.sessions_possible()
-                {
-                    let proposal = Some(doc.number);
-                    return self.open_session(ci, view, proposal);
-                }
-                return Task::none();
-            }
+            CiShortcut::Rerun if doc.kind == DocKind::Onboarding => "Reject",
+            CiShortcut::Rerun => "Dismiss",
+            CiShortcut::Plan => "Plan",
             _ => return Task::none(),
         };
+        if wanted == "Approve" && doc.state == DocState::Review && self.review_pending(ci, doc) {
+            return Task::none();
+        }
         let Some((_, _, _, to)) = actions(doc).into_iter().find(|(_, w, _, _)| *w == wanted) else {
             return Task::none();
         };
@@ -1066,15 +1059,20 @@ impl App {
     }
 }
 
-/// Where a plan's live master runs: `on <runner> (+ <machines>)`.
-fn master_place(client: &CiClient, doc: &DocView) -> Option<String> {
-    let session = client.master_of(&doc.repo, doc.number)?;
-    let mut place = format!("on {}", session.runner);
-    if !session.machines.is_empty() {
-        let names: Vec<&str> = session.machines.iter().map(|m| m.name.as_str()).collect();
-        place.push_str(&format!(" (+ {})", names.join(", ")));
+impl CiClient {
+    /// Whether runner `name` is connected and hosts sessions.
+    pub(super) fn hosts_sessions(&self, name: &str) -> bool {
+        self.runner_view(name)
+            .is_some_and(|m| m.sessions && m.status != "offline")
     }
-    Some(place)
+
+    /// Whether the CI dispatches none of `repo`'s approved tickets.
+    pub(super) fn paused(&self, repo: &str) -> bool {
+        self.overview
+            .as_ref()
+            .and_then(|o| o.repos.iter().find(|r| r.repo == repo))
+            .is_some_and(|r| r.paused)
+    }
 }
 
 #[cfg(test)]
@@ -1109,7 +1107,8 @@ mod tests {
                     queued: 0,
                     in_progress: Vec::new(),
                     paused: false,
-                    proposals: 0,
+                    open: 0,
+                    planning: 0,
                     onboarding: None,
                 })
                 .collect(),

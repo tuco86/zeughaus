@@ -16,14 +16,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::selector::Selector;
 
-/// The largest body of one plan or proposal, in bytes.
+/// The largest body of one ticket's proposal or plan, in bytes.
 pub const MAX_DOC_BYTES: usize = 256 << 10;
 
-/// The longest title of one plan or proposal, in bytes.
+/// The longest title of one ticket, in bytes.
 pub const MAX_DOC_TITLE_BYTES: usize = 200;
 
-/// How many lines under its title a plan may name its proposals in.
-const PROPOSALS_WITHIN: usize = 20;
+/// How many lines under its title a plan may carry its header lines in.
+const HEADER_LINES: usize = 20;
 
 /// The title of a plan file: its first `# ` heading, cut to
 /// [`MAX_DOC_TITLE_BYTES`] on a character boundary.
@@ -43,18 +43,18 @@ pub fn plan_title(body: &str) -> String {
     title[..end].trim_end().to_owned()
 }
 
-/// The proposals a plan names in a `Proposals: #3, #5` line among its first
+/// The tickets a plan includes in an `Includes: #3, #5` line among its first
 /// lines; none without such a line.
-pub fn proposals_named(body: &str) -> Result<Vec<u64>, String> {
+pub fn includes_named(body: &str) -> Result<Vec<u64>, String> {
     let Some(line) = body
         .lines()
-        .take(PROPOSALS_WITHIN)
-        .find(|line| line.starts_with("Proposals:"))
+        .take(HEADER_LINES)
+        .find(|line| line.starts_with("Includes:"))
     else {
         return Ok(Vec::new());
     };
-    let malformed = || format!("malformed Proposals line: {line}");
-    let list = line["Proposals:".len()..].trim();
+    let malformed = || format!("malformed Includes line: {line}");
+    let list = line["Includes:".len()..].trim();
     if list.is_empty() {
         return Err(malformed());
     }
@@ -75,7 +75,7 @@ pub fn proposals_named(body: &str) -> Result<Vec<u64>, String> {
 pub fn runs_on_named(body: &str) -> Result<Vec<String>, String> {
     let Some(line) = body
         .lines()
-        .take(PROPOSALS_WITHIN)
+        .take(HEADER_LINES)
         .find(|line| line.starts_with("Runs on:"))
     else {
         return Ok(Vec::new());
@@ -206,14 +206,14 @@ pub enum CiRequest {
         #[serde(default)]
         setup: bool,
     },
-    /// Every plan and proposal of a repository, bodies empty, in number
-    /// order. Answers [`CiReply::Docs`].
+    /// Every ticket and onboarding request of a repository, bodies and plans
+    /// empty, in number order. Answers [`CiReply::Docs`].
     Docs { repo: String },
     /// One document with its body; answers [`CiReply::Doc`], `None` when it
     /// does not exist.
     Doc { repo: String, number: u64 },
-    /// Stores a new document. A plan may name the open proposals it was made
-    /// from; they become `planned`. Answers [`CiReply::DocCreated`].
+    /// Stores a new ticket (open) or onboarding request. Answers
+    /// [`CiReply::DocCreated`].
     DocCreate {
         repo: String,
         /// Renamed on the wire: `kind` is the request's own tag.
@@ -222,8 +222,9 @@ pub enum CiRequest {
         title: String,
         body: String,
         source: String,
+        /// The ticket's outgoing links.
         #[serde(default)]
-        proposals: Vec<u64>,
+        links: Vec<DocLink>,
         /// One label selector per machine the work needs, the first hosting
         /// the session (see [`crate::selector`]).
         #[serde(default)]
@@ -241,23 +242,60 @@ pub enum CiRequest {
     },
     /// Deletes a finished document. Answers [`CiReply::Accepted`].
     DocDelete { repo: String, number: u64 },
-    /// Sets the `Runs on` of an open proposal or of a saved or approved
-    /// plan. Answers [`CiReply::Accepted`].
+    /// Sets the `Runs on` of a ticket that is open, ready, in review or
+    /// approved. Answers [`CiReply::Accepted`].
     DocRunsOn {
         repo: String,
         number: u64,
         runs_on: Vec<String>,
     },
+    /// Replaces the title and proposal of an open or ready ticket. Answers
+    /// [`CiReply::Accepted`].
+    DocEdit {
+        repo: String,
+        number: u64,
+        title: String,
+        body: String,
+    },
+    /// Replaces a ticket's outgoing links. Answers [`CiReply::Accepted`].
+    DocLinks {
+        repo: String,
+        number: u64,
+        links: Vec<DocLink>,
+    },
+    /// Sends a review back to the plan session of a ticket in review: the
+    /// ticket becomes ready again and its planner resumes. Answers
+    /// [`CiReply::Accepted`].
+    DocRefine {
+        repo: String,
+        number: u64,
+        feedback: String,
+    },
+    /// Stores a plan on ticket `number`, which is in planning, or as a new
+    /// ticket without one; either is then in review. Answers
+    /// [`CiReply::DocCreated`].
+    PlanWrite {
+        repo: String,
+        #[serde(default)]
+        number: Option<u64>,
+        title: String,
+        plan: String,
+        #[serde(default)]
+        includes: Vec<u64>,
+        #[serde(default)]
+        runs_on: Vec<String>,
+        source: String,
+        #[serde(default)]
+        planner: Option<Planner>,
+    },
     /// Stops or resumes dispatching `repo`'s approved plans. Answers
     /// [`CiReply::Accepted`].
     QueuePaused { repo: String, paused: bool },
-    /// Opens a plan session of `repo` on a runner that hosts sessions: the
-    /// named one, else one matching the proposal's first `Runs on`, else
-    /// any. Answers [`CiReply::Session`].
+    /// Opens a plan session without a ticket on a runner that hosts
+    /// sessions: the named one, else any; its plan becomes a new ticket.
+    /// Answers [`CiReply::Session`].
     OpenSession {
         repo: String,
-        #[serde(default)]
-        proposal: Option<u64>,
         #[serde(default)]
         runner: Option<String>,
     },
@@ -578,34 +616,39 @@ pub struct SessionView {
 /// How long a claim lives without a renewal, in seconds.
 pub const CLAIM_LEASE_SECS: u64 = 300;
 
-/// What a claim is about: a proposal a session plans, or a pipeline a
+/// What a claim is about: a ticket a session plans, or a pipeline a
 /// session started or waits on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "on", rename_all = "snake_case")]
 pub enum ClaimSubject {
-    Proposal { repo: String, number: u64 },
-    Pipeline { repo: String, number: u64 },
+    #[serde(alias = "proposal")]
+    Ticket {
+        repo: String,
+        number: u64,
+    },
+    Pipeline {
+        repo: String,
+        number: u64,
+    },
 }
 
 impl ClaimSubject {
     pub fn repo(&self) -> &str {
         match self {
-            ClaimSubject::Proposal { repo, .. } | ClaimSubject::Pipeline { repo, .. } => repo,
+            ClaimSubject::Ticket { repo, .. } | ClaimSubject::Pipeline { repo, .. } => repo,
         }
     }
 
     pub fn number(&self) -> u64 {
         match self {
-            ClaimSubject::Proposal { number, .. } | ClaimSubject::Pipeline { number, .. } => {
-                *number
-            }
+            ClaimSubject::Ticket { number, .. } | ClaimSubject::Pipeline { number, .. } => *number,
         }
     }
 
-    /// `proposal #3 of zeughaus`, `pipeline #12 of zeughaus`.
+    /// `ticket #3 of zeughaus`, `pipeline #12 of zeughaus`.
     pub fn text(&self) -> String {
         let kind = match self {
-            ClaimSubject::Proposal { .. } => "proposal",
+            ClaimSubject::Ticket { .. } => "ticket",
             ClaimSubject::Pipeline { .. } => "pipeline",
         };
         format!("{kind} #{} of {}", self.number(), self.repo())
@@ -642,7 +685,7 @@ pub struct ClaimView {
     /// #38`), or empty.
     #[serde(default)]
     pub label: String,
-    /// A pipeline's channel; empty for a proposal.
+    /// A pipeline's channel; empty for a ticket.
     #[serde(default)]
     pub channel: String,
     /// Unix seconds.
@@ -707,34 +750,37 @@ pub fn responsible<'a>(
         .or_else(own)
 }
 
-/// What a plan or a proposal is.
+/// What a document is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DocKind {
-    /// A change another project's session asks this repository for.
-    Proposal,
-    /// A finished plan of work in this repository.
-    Plan,
+    /// One piece of work from proposal to execution: what is asked, its
+    /// plan, and the master that executes it, under one number.
+    Ticket,
     /// A project asks to join the CI as a new repository.
     Onboarding,
 }
 
-/// Where a document stands. A proposal is `open`, then `planned` or
-/// `dismissed`; a `planned` proposal follows its plan, back to `open` when
-/// the plan is rejected and to `done` when it is done. A plan is `saved`,
-/// `approved`, `in_progress`, then `done`, or `rejected`. An onboarding
-/// request is `open`, then `approved`, then `done` or back to `open` with a
-/// note, or `rejected`.
+/// Where a document stands. A ticket is `open` (a proposal), `ready`
+/// (released for planning; waits for its dependencies), `planning` (a plan
+/// session works on it), `review` (its plan waits for the user), `approved`
+/// (queued for a master; waits for its dependencies), `in_progress`, then
+/// `done`. A ticket leaves as `dismissed`, or as `merged` into the ticket
+/// whose plan includes it, which it then follows. An onboarding request is
+/// `open`, then `approved`, then `done` or back to `open` with a note, or
+/// `rejected`; `rejected` is an onboarding request's only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DocState {
     Open,
-    Planned,
-    Dismissed,
-    Saved,
+    Ready,
+    Planning,
+    Review,
     Approved,
     InProgress,
     Done,
+    Merged,
+    Dismissed,
     Rejected,
 }
 
@@ -743,26 +789,64 @@ impl DocState {
     pub fn name(self) -> &'static str {
         match self {
             DocState::Open => "open",
-            DocState::Planned => "planned",
-            DocState::Dismissed => "dismissed",
-            DocState::Saved => "saved",
+            DocState::Ready => "ready",
+            DocState::Planning => "planning",
+            DocState::Review => "review",
             DocState::Approved => "approved",
             DocState::InProgress => "in_progress",
             DocState::Done => "done",
+            DocState::Merged => "merged",
+            DocState::Dismissed => "dismissed",
             DocState::Rejected => "rejected",
         }
     }
 }
 
 impl DocKind {
-    /// The wire name: `proposal`, `plan` or `onboarding`.
+    /// The wire name: `ticket` or `onboarding`.
     pub fn name(self) -> &'static str {
         match self {
-            DocKind::Proposal => "proposal",
-            DocKind::Plan => "plan",
+            DocKind::Ticket => "ticket",
             DocKind::Onboarding => "onboarding",
         }
     }
+}
+
+/// How one ticket refers to another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkKind {
+    /// Neither its plan session nor its master starts before the target is
+    /// finished.
+    DependsOn,
+    /// Informational only.
+    Related,
+}
+
+impl LinkKind {
+    /// `depends on` or `related`.
+    pub fn name(self) -> &'static str {
+        match self {
+            LinkKind::DependsOn => "depends on",
+            LinkKind::Related => "related",
+        }
+    }
+}
+
+/// One outgoing link of a ticket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocLink {
+    pub kind: LinkKind,
+    pub number: u64,
+}
+
+/// Where a ticket's plan was made: the runner its plan session ran on and
+/// the absolute path of that session's omp session file, which a Refine
+/// resumes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Planner {
+    pub runner: String,
+    pub omp_session: String,
 }
 
 /// The repository an onboarding request asks the CI to add.
@@ -785,7 +869,8 @@ fn main_branch() -> String {
     "main".into()
 }
 
-/// One plan or proposal of a repository. The CI stores exactly this.
+/// One ticket or onboarding request of a repository. The CI stores exactly
+/// this.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocView {
     pub repo: String,
@@ -794,36 +879,56 @@ pub struct DocView {
     pub kind: DocKind,
     pub title: String,
     pub state: DocState,
-    /// A proposal: the source project's checkout directory name; a plan: the
-    /// repository itself.
+    /// Who wrote it: a project's checkout name, `user` from the editor,
+    /// `job.<job>`, or the repository itself.
     pub source: String,
     /// Seconds since the UNIX epoch.
     pub created: u64,
     /// The last state change.
     pub changed: u64,
-    /// A plan: when it was approved; orders the queue.
+    /// When its plan was approved; orders the queue.
     #[serde(default)]
     pub approved: Option<u64>,
-    /// A plan: the proposals it was made from.
+    /// When the ticket was released for planning; orders the planning queue.
     #[serde(default)]
-    pub proposals: Vec<u64>,
-    /// A proposal: the plan that took it up.
+    pub released: Option<u64>,
+    /// This ticket's outgoing links.
     #[serde(default)]
-    pub plan: Option<u64>,
+    pub links: Vec<DocLink>,
+    /// The tickets its plan includes.
+    #[serde(default)]
+    pub merged: Vec<u64>,
+    /// A `merged` ticket: the ticket whose plan includes it.
+    #[serde(default)]
+    pub into: Option<u64>,
     /// One label selector per machine the work needs, the first hosting
     /// the session; empty is any runner.
     #[serde(default)]
     pub runs_on: Vec<String>,
-    /// A plan: the runners it runs or ran on, the host first.
+    /// The runners its master runs or ran on, the host first.
     #[serde(default)]
     pub placement: Vec<String>,
-    /// Empty in lists.
+    /// The proposal: what the ticket asks for; empty in lists, and empty for
+    /// a ticket that started as a plan.
     #[serde(default)]
     pub body: String,
+    /// The plan Markdown; empty in lists.
+    #[serde(default)]
+    pub plan_text: String,
+    /// How many plans were written; kept in lists.
+    #[serde(default)]
+    pub revision: u32,
+    /// The plan session that wrote the plan.
+    #[serde(default)]
+    pub planner: Option<Planner>,
+    /// The review a Refine sends; empty in lists.
+    #[serde(default)]
+    pub feedback: String,
     /// An onboarding request: the repository it asks for.
     #[serde(default)]
     pub onboard: Option<OnboardSpec>,
-    /// An onboarding request: why the CI's last attempt failed.
+    /// Why the CI's last attempt failed: an onboarding step, or a plan
+    /// session that ended without a plan.
     #[serde(default)]
     pub note: String,
 }
@@ -862,6 +967,51 @@ impl DocView {
     }
 }
 
+/// The `depends on` targets of `doc` that are not finished, in link order.
+/// Finished is `done` or `dismissed`, a number missing from `docs`
+/// (deleted), or `merged` into a ticket that is itself done or dismissed;
+/// a target merged into `doc` itself is its own work and blocks nothing.
+pub fn blocked_by(doc: &DocView, docs: &[DocView]) -> Vec<u64> {
+    let closed = |number: u64| {
+        docs.iter()
+            .find(|d| d.number == number)
+            .is_none_or(|d| matches!(d.state, DocState::Done | DocState::Dismissed))
+    };
+    doc.links
+        .iter()
+        .filter(|link| link.kind == LinkKind::DependsOn)
+        .map(|link| link.number)
+        .filter(|&number| {
+            let Some(target) = docs.iter().find(|d| d.number == number) else {
+                return false;
+            };
+            match target.state {
+                DocState::Done | DocState::Dismissed => false,
+                DocState::Merged => {
+                    target.into != Some(doc.number) && !target.into.is_none_or(closed)
+                }
+                _ => true,
+            }
+        })
+        .collect()
+}
+
+/// The links that point at ticket `number`: every `(kind, n)` where ticket
+/// `n` links to it, in number order.
+pub fn linked_from(number: u64, docs: &[DocView]) -> Vec<(LinkKind, u64)> {
+    let mut incoming: Vec<(LinkKind, u64)> = docs
+        .iter()
+        .flat_map(|doc| {
+            doc.links
+                .iter()
+                .filter(move |link| link.number == number && doc.number != number)
+                .map(move |link| (link.kind, doc.number))
+        })
+        .collect();
+    incoming.sort_by_key(|&(_, n)| n);
+    incoming
+}
+
 /// One repository of `ci.toml` and how many of its documents wait for whom.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoDocsView {
@@ -869,18 +1019,22 @@ pub struct RepoDocsView {
     /// The repository url as [`normalize_origin`] gives it: `host/owner/name`.
     pub origin: String,
     pub default_branch: String,
-    /// Plans in `saved`.
+    /// Tickets in `review`, and an open onboarding request.
     pub awaiting: u32,
-    /// Plans in `approved`.
+    /// Tickets in `approved`.
     pub queued: u32,
-    /// The plans in `in_progress`.
+    /// The tickets in `in_progress`.
     #[serde(default)]
     pub in_progress: Vec<u64>,
-    /// The CI dispatches none of its approved plans.
+    /// The CI dispatches none of its approved tickets.
     #[serde(default)]
     pub paused: bool,
-    /// Proposals in `open`.
-    pub proposals: u32,
+    /// Tickets in `open`.
+    #[serde(default)]
+    pub open: u32,
+    /// Tickets in `ready` or `planning`.
+    #[serde(default)]
+    pub planning: u32,
     /// The open or approved onboarding request's number while the
     /// repository is not in ci.toml yet.
     #[serde(default)]
@@ -890,14 +1044,16 @@ pub struct RepoDocsView {
 /// The groups a repository's documents are shown in, in this order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocGroup {
-    /// Plans in `saved`.
-    Awaiting,
-    /// Plans in `approved`, the next one first.
+    /// Tickets in `review`, an open onboarding request.
+    Review,
+    /// Tickets in `approved`, the next one first.
     Queue,
-    /// The plan in `in_progress`.
+    /// Tickets in `in_progress`, an approved onboarding request.
     InProgress,
-    /// Proposals in `open`.
-    Proposals,
+    /// Tickets in `ready` or `planning`, the first released first.
+    Planning,
+    /// Tickets in `open`.
+    Open,
     /// Everything else, newest change first.
     History,
 }
@@ -905,37 +1061,42 @@ pub enum DocGroup {
 impl DocGroup {
     pub fn title(self) -> &'static str {
         match self {
-            DocGroup::Awaiting => "Awaiting approval",
+            DocGroup::Review => "Awaiting review",
             DocGroup::Queue => "Queue",
             DocGroup::InProgress => "In progress",
-            DocGroup::Proposals => "Open proposals",
+            DocGroup::Planning => "Planning",
+            DocGroup::Open => "Open",
             DocGroup::History => "History",
         }
     }
 
     fn of(doc: &DocView) -> DocGroup {
         match (doc.kind, doc.state) {
-            (DocKind::Plan, DocState::Saved) => DocGroup::Awaiting,
-            (DocKind::Plan, DocState::Approved) => DocGroup::Queue,
-            (DocKind::Plan, DocState::InProgress) => DocGroup::InProgress,
-            (DocKind::Proposal, DocState::Open) => DocGroup::Proposals,
-            (DocKind::Onboarding, DocState::Open) => DocGroup::Awaiting,
-            (DocKind::Onboarding, DocState::Approved) => DocGroup::InProgress,
+            (DocKind::Ticket, DocState::Review) | (DocKind::Onboarding, DocState::Open) => {
+                DocGroup::Review
+            }
+            (DocKind::Ticket, DocState::Approved) => DocGroup::Queue,
+            (DocKind::Ticket, DocState::InProgress) | (DocKind::Onboarding, DocState::Approved) => {
+                DocGroup::InProgress
+            }
+            (DocKind::Ticket, DocState::Ready | DocState::Planning) => DocGroup::Planning,
+            (DocKind::Ticket, DocState::Open) => DocGroup::Open,
             _ => DocGroup::History,
         }
     }
 }
 
 /// `docs` in their groups, the empty groups left out: the queue in the
-/// order a master takes it, the history newest change first, the rest by
-/// number.
+/// order a master takes it, planning in the order plan sessions take it,
+/// the history newest change first, the rest by number.
 pub fn doc_groups(docs: &[DocView]) -> Vec<(DocGroup, Vec<&DocView>)> {
     let mut groups = Vec::new();
     for group in [
-        DocGroup::Awaiting,
+        DocGroup::Review,
         DocGroup::Queue,
         DocGroup::InProgress,
-        DocGroup::Proposals,
+        DocGroup::Planning,
+        DocGroup::Open,
         DocGroup::History,
     ] {
         let mut members: Vec<&DocView> = docs
@@ -944,6 +1105,9 @@ pub fn doc_groups(docs: &[DocView]) -> Vec<(DocGroup, Vec<&DocView>)> {
             .collect();
         match group {
             DocGroup::Queue => members.sort_by_key(|doc| (doc.approved.unwrap_or(0), doc.number)),
+            DocGroup::Planning => {
+                members.sort_by_key(|doc| (doc.released.unwrap_or(0), doc.number))
+            }
             DocGroup::History => members.sort_by_key(|doc| {
                 (
                     std::cmp::Reverse(doc.changed),
@@ -1368,26 +1532,23 @@ mod tests {
     }
 
     #[test]
-    fn a_plan_names_its_proposals_in_one_line_near_the_top() {
-        assert_eq!(
-            proposals_named("# T\n\nProposals: #3, #5\n"),
-            Ok(vec![3, 5])
-        );
-        assert_eq!(proposals_named("# T\nProposals:#7\n"), Ok(vec![7]));
-        assert_eq!(proposals_named("# T\n\nbody\n"), Ok(Vec::new()));
+    fn a_plan_names_its_included_tickets_in_one_line_near_the_top() {
+        assert_eq!(includes_named("# T\n\nIncludes: #3, #5\n"), Ok(vec![3, 5]));
+        assert_eq!(includes_named("# T\nIncludes:#7\n"), Ok(vec![7]));
+        assert_eq!(includes_named("# T\n\nbody\n"), Ok(Vec::new()));
         // Too far down is body text, not the line.
-        let late = format!("# T\n{}Proposals: #1\n", "x\n".repeat(25));
-        assert_eq!(proposals_named(&late), Ok(Vec::new()));
+        let late = format!("# T\n{}Includes: #1\n", "x\n".repeat(25));
+        assert_eq!(includes_named(&late), Ok(Vec::new()));
         for bad in [
-            "Proposals: 3",
-            "Proposals:",
-            "Proposals: #3,",
-            "Proposals: #3 #4",
-            "Proposals: #x",
+            "Includes: 3",
+            "Includes:",
+            "Includes: #3,",
+            "Includes: #3 #4",
+            "Includes: #x",
         ] {
             assert_eq!(
-                proposals_named(&format!("# T\n{bad}\n")),
-                Err(format!("malformed Proposals line: {bad}")),
+                includes_named(&format!("# T\n{bad}\n")),
+                Err(format!("malformed Includes line: {bad}")),
                 "{bad}"
             );
         }
@@ -1396,7 +1557,7 @@ mod tests {
     #[test]
     fn a_plan_names_its_machines_in_a_runs_on_line() {
         assert_eq!(
-            runs_on_named("# T\nProposals: #3\nRuns on: os=linux ; os=windows,arch=amd64\n"),
+            runs_on_named("# T\nIncludes: #3\nRuns on: os=linux ; os=windows,arch=amd64\n"),
             Ok(vec![
                 "os=linux".to_owned(),
                 "os=windows,arch=amd64".to_owned()
@@ -1575,11 +1736,14 @@ mod tests {
             },
             CiRequest::DocCreate {
                 repo: "griasdi".to_owned(),
-                kind: DocKind::Plan,
-                title: "Plan".to_owned(),
-                body: "# Plan\n".to_owned(),
+                kind: DocKind::Ticket,
+                title: "Ticket".to_owned(),
+                body: "Body\n".to_owned(),
                 source: "griasdi".to_owned(),
-                proposals: vec![1, 2],
+                links: vec![DocLink {
+                    kind: LinkKind::DependsOn,
+                    number: 2,
+                }],
                 runs_on: vec!["os=linux".to_owned(), "os=windows".to_owned()],
                 onboard: None,
             },
@@ -1589,7 +1753,7 @@ mod tests {
                 title: "Join".to_owned(),
                 body: "Body".to_owned(),
                 source: "scan-rs".to_owned(),
-                proposals: Vec::new(),
+                links: Vec::new(),
                 runs_on: Vec::new(),
                 onboard: Some(spec()),
             },
@@ -1607,19 +1771,50 @@ mod tests {
                 number: 3,
                 runs_on: vec!["os=macos".to_owned()],
             },
+            CiRequest::DocEdit {
+                repo: "griasdi".to_owned(),
+                number: 3,
+                title: "T".to_owned(),
+                body: "B".to_owned(),
+            },
+            CiRequest::DocLinks {
+                repo: "griasdi".to_owned(),
+                number: 3,
+                links: vec![DocLink {
+                    kind: LinkKind::Related,
+                    number: 1,
+                }],
+            },
+            CiRequest::DocRefine {
+                repo: "griasdi".to_owned(),
+                number: 3,
+                feedback: "Overall:\nshorter".to_owned(),
+            },
+            CiRequest::PlanWrite {
+                repo: "griasdi".to_owned(),
+                number: Some(3),
+                title: "Plan".to_owned(),
+                plan: "# Plan\n".to_owned(),
+                includes: vec![4, 5],
+                runs_on: vec!["os=linux".to_owned()],
+                source: "griasdi".to_owned(),
+                planner: Some(Planner {
+                    runner: "atik".to_owned(),
+                    omp_session: "/s/1.jsonl".to_owned(),
+                }),
+            },
             CiRequest::QueuePaused {
                 repo: "griasdi".to_owned(),
                 paused: true,
             },
             CiRequest::OpenSession {
                 repo: "griasdi".to_owned(),
-                proposal: Some(2),
                 runner: None,
             },
             CiRequest::Session { id: 4 },
             CiRequest::CloseSession { id: 4 },
             CiRequest::Claim {
-                subject: ClaimSubject::Proposal {
+                subject: ClaimSubject::Ticket {
                     repo: "griasdi".to_owned(),
                     number: 3,
                 },
@@ -1705,7 +1900,8 @@ mod tests {
                         in_progress: vec![4, 6],
                         onboarding: Some(7),
                         paused: true,
-                        proposals: 3,
+                        open: 3,
+                        planning: 1,
                     }],
                     build: 116,
                     sessions: vec![session()],
@@ -1931,18 +2127,27 @@ mod tests {
         DocView {
             repo: "griasdi".to_owned(),
             number: 3,
-            kind: DocKind::Proposal,
+            kind: DocKind::Ticket,
             title: "Expose the clock".to_owned(),
-            state: DocState::Planned,
+            state: DocState::Merged,
             source: "weida".to_owned(),
             created: 10,
             changed: 20,
             approved: None,
-            proposals: Vec::new(),
-            plan: Some(4),
+            released: Some(15),
+            links: vec![DocLink {
+                kind: LinkKind::Related,
+                number: 1,
+            }],
+            merged: Vec::new(),
+            into: Some(4),
             runs_on: vec!["os=windows".to_owned()],
             placement: vec!["atik".to_owned(), "wohnzimmer".to_owned()],
             body: "Body".to_owned(),
+            plan_text: String::new(),
+            revision: 0,
+            planner: None,
+            feedback: String::new(),
             onboard: None,
             note: String::new(),
         }
@@ -2019,18 +2224,31 @@ mod tests {
     fn a_doc_create_carries_its_kind_beside_the_request_tag() {
         let wire = CiRequest::DocCreate {
             repo: "r".to_owned(),
-            kind: DocKind::Proposal,
+            kind: DocKind::Ticket,
             title: "t".to_owned(),
             body: "b".to_owned(),
             source: "s".to_owned(),
-            proposals: Vec::new(),
+            links: Vec::new(),
             runs_on: Vec::new(),
             onboard: None,
         }
         .encode();
         let value: serde_json::Value = serde_json::from_slice(&wire).unwrap();
         assert_eq!(value["kind"], "doc_create");
-        assert_eq!(value["doc_kind"], "proposal");
+        assert_eq!(value["doc_kind"], "ticket");
+    }
+
+    #[test]
+    fn a_claim_on_a_proposal_stored_before_tickets_loads_as_a_ticket_claim() {
+        let old: ClaimSubject =
+            serde_json::from_str(r#"{"on":"proposal","repo":"r","number":3}"#).unwrap();
+        assert_eq!(
+            old,
+            ClaimSubject::Ticket {
+                repo: "r".to_owned(),
+                number: 3
+            }
+        );
     }
 
     #[test]
@@ -2073,14 +2291,18 @@ mod tests {
             changed,
             ..doc()
         };
-        let docs = vec![
-            make(1, DocKind::Plan, DocState::Done, None, 5),
-            make(2, DocKind::Plan, DocState::Approved, Some(30), 30),
-            make(3, DocKind::Proposal, DocState::Open, None, 1),
-            make(4, DocKind::Plan, DocState::Approved, Some(20), 20),
-            make(5, DocKind::Proposal, DocState::Dismissed, None, 9),
-            make(6, DocKind::Plan, DocState::Saved, None, 2),
+        let mut docs = vec![
+            make(1, DocKind::Ticket, DocState::Done, None, 5),
+            make(2, DocKind::Ticket, DocState::Approved, Some(30), 30),
+            make(3, DocKind::Ticket, DocState::Open, None, 1),
+            make(4, DocKind::Ticket, DocState::Approved, Some(20), 20),
+            make(5, DocKind::Ticket, DocState::Dismissed, None, 9),
+            make(6, DocKind::Ticket, DocState::Review, None, 2),
+            make(7, DocKind::Ticket, DocState::Planning, None, 3),
+            make(8, DocKind::Ticket, DocState::Ready, None, 4),
         ];
+        docs[6].released = Some(50);
+        docs[7].released = Some(40);
         let groups: Vec<(DocGroup, Vec<u64>)> = doc_groups(&docs)
             .into_iter()
             .map(|(group, docs)| (group, docs.iter().map(|doc| doc.number).collect()))
@@ -2088,12 +2310,72 @@ mod tests {
         assert_eq!(
             groups,
             vec![
-                (DocGroup::Awaiting, vec![6]),
+                (DocGroup::Review, vec![6]),
                 (DocGroup::Queue, vec![4, 2]),
-                (DocGroup::Proposals, vec![3]),
+                (DocGroup::Planning, vec![8, 7]),
+                (DocGroup::Open, vec![3]),
                 (DocGroup::History, vec![5, 1]),
             ]
         );
+    }
+
+    fn ticket(number: u64, state: DocState, depends: &[u64]) -> DocView {
+        DocView {
+            number,
+            state,
+            into: None,
+            links: depends
+                .iter()
+                .map(|&number| DocLink {
+                    kind: LinkKind::DependsOn,
+                    number,
+                })
+                .collect(),
+            ..doc()
+        }
+    }
+
+    #[test]
+    fn only_unfinished_dependencies_block_a_ticket() {
+        let mut docs = vec![
+            ticket(1, DocState::Done, &[]),
+            ticket(2, DocState::Dismissed, &[]),
+            ticket(3, DocState::Open, &[]),
+            ticket(4, DocState::Merged, &[]),
+            ticket(5, DocState::Review, &[]),
+            // Depends on the done, the dismissed, a deleted (#9), the open
+            // and the merged ticket, and is related to #5.
+            ticket(6, DocState::Ready, &[1, 2, 9, 3, 4]),
+        ];
+        docs[3].into = Some(5);
+        docs[5].links.push(DocLink {
+            kind: LinkKind::Related,
+            number: 5,
+        });
+        assert_eq!(blocked_by(&docs[5], &docs), vec![3, 4]);
+        // The merged ticket follows the one that includes it.
+        docs[4].state = DocState::Done;
+        assert_eq!(blocked_by(&docs[5], &docs), vec![3]);
+        docs[2].state = DocState::Dismissed;
+        assert!(blocked_by(&docs[5], &docs).is_empty());
+    }
+
+    #[test]
+    fn incoming_links_of_both_kinds_are_listed_in_number_order() {
+        let mut docs = vec![
+            ticket(1, DocState::Open, &[]),
+            ticket(2, DocState::Open, &[1]),
+            ticket(3, DocState::Open, &[]),
+        ];
+        docs[2].links.push(DocLink {
+            kind: LinkKind::Related,
+            number: 1,
+        });
+        assert_eq!(
+            linked_from(1, &docs),
+            vec![(LinkKind::DependsOn, 2), (LinkKind::Related, 3)]
+        );
+        assert!(linked_from(3, &docs).is_empty());
     }
 
     /// A finished job that ran `secs` against `expected`, beside `shared`

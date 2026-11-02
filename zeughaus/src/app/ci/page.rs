@@ -4,9 +4,10 @@
 //! -- are docked read-only beside or under it.
 //!
 //! The Board is a project's lifecycle on one screen, read left to right:
-//! proposals become plans, plans queue, run and finish, with the channels'
-//! health above. Two lanes appear between the columns while something
-//! passes through them: a proposal a session plans, a master that starts.
+//! tickets are proposed, planned, reviewed, queued, run and finish, with the
+//! channels' health above. Two lanes appear between the columns while
+//! something passes through them: a ticket a session plans, a master that
+//! starts. A ticket opens in a popout over the workspace (`ticket.rs`).
 //! What runs or waits pulses; a card the CI moves to another slot arrives
 //! with an accent ring that fades over [`MOVED_FOR`].
 
@@ -23,7 +24,7 @@ use iced::{Alignment, Border, Color, Element, Length, Task};
 use zeughaus_link::{
     ActivityKind, ActivityState, AgentRole, AgentState, CiRequest, ClaimSubject, ClaimView,
     DocGroup, DocKind, DocState, DocView, OnboardSpec, RepoDocsView, SessionKind, SessionState,
-    SessionView, doc_groups,
+    SessionView, blocked_by, doc_groups,
 };
 use zeughaus_mux::TerminalId;
 use zeughaus_theme::Theme;
@@ -31,7 +32,7 @@ use zeughaus_theme::Theme;
 use super::{CiClient, Tone, glyph, now, unavailable};
 use crate::app::App;
 use crate::app::agents::{agent_color, attention_title, role_glyph, role_word, state_word};
-use crate::message::{CiShortcut, Message};
+use crate::message::{CiShortcut, Message, TicketMsg};
 use crate::notices::{self, Severity};
 use crate::style::{self, Tokens};
 use crate::workspace::RunnerKey;
@@ -121,8 +122,6 @@ pub(in crate::app) struct Board {
     origin: String,
     column: usize,
     row: usize,
-    /// Whether the selected document's detail is open beside the board.
-    detail: bool,
     /// The slot each document was last seen in, by repository and number.
     columns: HashMap<(String, u64), usize>,
     /// When the CI moved a document to another slot.
@@ -162,7 +161,7 @@ enum Card {
 const SLOTS: [(&str, bool); 7] = [
     ("Proposals", false),
     ("Planning", true),
-    ("Plans", false),
+    ("Review", false),
     ("Queue", false),
     ("Starting", true),
     ("Running", false),
@@ -207,23 +206,24 @@ pub(super) fn faded(color: Color, a: f32) -> Color {
     Color { a, ..color }
 }
 
-/// A repository's cards in their slots: its documents, its live plan
-/// sessions and a session asked for (`opening`: `Some` with the proposal it
-/// plans). A proposal a session plans (it holds the claim, its session
-/// runs, or this editor asked for one) is in the PLANNING lane; a plan
-/// whose master starts is in the STARTING lane. A planned proposal whose
-/// plan is still open is left out: the plan's card names it. `sessions`
-/// and `claims` are the repository's.
+/// A repository's cards in their slots: its tickets, its live plan
+/// sessions and a free plan session asked for (`opening`). An open ticket a
+/// session holds the claim on, and a ready or planning ticket, is in the
+/// PLANNING lane, except a ready one that waits for its dependencies, which
+/// stays with the proposals; a ticket whose master starts is in the
+/// STARTING lane. A ticket merged into one that is not finished is left
+/// out: the including ticket's card names it. `sessions` and `claims` are
+/// the repository's.
 fn board_columns(
     docs: &[DocView],
     sessions: &[&SessionView],
     claims: &[&ClaimView],
-    opening: Option<Option<u64>>,
+    opening: bool,
 ) -> Slots {
     let mut slots: Slots = Default::default();
     let claimed = |number: u64| {
         claims.iter().any(
-            |claim| matches!(claim.subject, ClaimSubject::Proposal { number: n, .. } if n == number),
+            |claim| matches!(claim.subject, ClaimSubject::Ticket { number: n, .. } if n == number),
         )
     };
     let live = |kind: SessionKind, number: u64| {
@@ -231,45 +231,34 @@ fn board_columns(
             .iter()
             .find(|s| s.kind == kind && s.doc == Some(number) && s.state.is_live())
     };
-    let open_plan = |plan: u64| {
-        docs.iter().any(|doc| {
-            doc.number == plan
-                && doc.kind == DocKind::Plan
-                && matches!(
-                    doc.state,
-                    DocState::Saved | DocState::Approved | DocState::InProgress
-                )
-        })
+    let finished = |number: u64| {
+        docs.iter()
+            .find(|doc| doc.number == number)
+            .is_none_or(|doc| matches!(doc.state, DocState::Done | DocState::Dismissed))
     };
     let mut done = 0;
     for (group, members) in doc_groups(docs) {
         for doc in members {
             let number = doc.number;
             let slot = match group {
-                DocGroup::Proposals => {
-                    if claimed(number)
-                        || live(SessionKind::Plan, number).is_some()
-                        || opening == Some(Some(number))
-                    {
-                        PLANNING
-                    } else {
-                        PROPOSALS
-                    }
+                DocGroup::Open if claimed(number) => PLANNING,
+                DocGroup::Open => PROPOSALS,
+                DocGroup::Planning
+                    if doc.state == DocState::Ready && !blocked_by(doc, docs).is_empty() =>
+                {
+                    PROPOSALS
                 }
-                DocGroup::Awaiting => PLANS,
+                DocGroup::Planning => PLANNING,
+                DocGroup::Review => PLANS,
                 DocGroup::Queue => QUEUE,
                 DocGroup::InProgress => match live(SessionKind::Master, number) {
                     Some(master) if master.state == SessionState::Starting => STARTING,
                     _ => RUNNING,
                 },
                 DocGroup::History
-                    if doc.kind == DocKind::Proposal && doc.state == DocState::Planned =>
+                    if doc.state == DocState::Merged && !doc.into.is_none_or(finished) =>
                 {
-                    match doc.plan {
-                        Some(plan) if open_plan(plan) => continue,
-                        None if claimed(number) => RUNNING,
-                        _ => DONE,
-                    }
+                    continue;
                 }
                 DocGroup::History => DONE,
             };
@@ -295,7 +284,7 @@ fn board_columns(
             slots[PLANNING].push(Card::Session(session.id));
         }
     }
-    if opening == Some(None) {
+    if opening {
         slots[PLANNING].push(Card::Opening);
     }
     slots
@@ -441,7 +430,7 @@ impl App {
                     severity: Severity::Info,
                     glyph: glyph::PASS,
                     title: format!(
-                        "{}: {n} plan{} await{} approval",
+                        "{}: {n} ticket{} await{} review",
                         summary.repo,
                         if n == 1 { "" } else { "s" },
                         if n == 1 { "s" } else { "" }
@@ -605,11 +594,6 @@ impl App {
                 Some(AttentionTarget::Terminal(runner, terminal)) => Some((runner, terminal)),
                 _ => None,
             },
-            PageView::Board(origin) if self.page.board.detail => {
-                self.ci_of(origin).and_then(|(ci, client, repo)| {
-                    self.docked_master(ci, client.plans_view_of(&repo.repo)?)
-                })
-            }
             PageView::Board(_) | PageView::Channel(..) => None,
         };
         docked
@@ -642,6 +626,7 @@ impl App {
             }
             Message::PageShow(view) => {
                 self.page.open = true;
+                self.ticket = None;
                 let asked = match &view {
                     PageView::Overview => self.ask_projects(false),
                     PageView::Board(origin) => {
@@ -651,7 +636,6 @@ impl App {
                             self.page.board.origin.clone_from(origin);
                             self.page.board.column = 0;
                             self.page.board.row = 0;
-                            self.page.board.detail = false;
                             self.page.board.card = None;
                         }
                         Task::none()
@@ -734,10 +718,19 @@ impl App {
     }
 
     /// The page's letters: j and k move its cursor; on a Board h and l (and
-    /// the arrows) change the column and `a`, `r` and `p` approve, reject
-    /// and plan the selected document. `None` for a letter the page leaves
-    /// to the channel in front.
+    /// the arrows) change the column and `a`, `r` and `p` approve, dismiss
+    /// and release the ticket under the cursor, or the one an open popout
+    /// shows. `None` for a letter the page leaves to the channel in front.
     pub(in crate::app) fn page_shortcut(&mut self, shortcut: CiShortcut) -> Option<Task<Message>> {
+        if let Some(popout) = &self.ticket {
+            let (ci, view, number) = (popout.ci.clone(), popout.view, popout.number);
+            return Some(match (shortcut, number) {
+                (CiShortcut::Approve | CiShortcut::Rerun | CiShortcut::Plan, Some(number)) => {
+                    self.plans_letter(&ci, view, number, shortcut)
+                }
+                _ => Task::none(),
+            });
+        }
         if !self.page.open {
             return None;
         }
@@ -765,10 +758,7 @@ impl App {
                 CiShortcut::Right | CiShortcut::OpenLog => self.board_move(&origin, 1, 0),
                 CiShortcut::Approve | CiShortcut::Rerun | CiShortcut::Plan => {
                     match self.board_doc(&origin) {
-                        Some((ci, view, number)) => {
-                            let selected = self.select_doc(&ci, view, number);
-                            Task::batch([selected, self.plans_letter(&ci, view, shortcut)])
-                        }
+                        Some((ci, view, number)) => self.plans_letter(&ci, view, number, shortcut),
                         None => Task::none(),
                     }
                 }
@@ -778,7 +768,7 @@ impl App {
     }
 
     /// What Escape does on the page when nothing nearer took it: closes the
-    /// Overview, a Board's detail, a channel's transcript.
+    /// Overview, a channel's transcript.
     pub(in crate::app) fn page_escape(&mut self) -> Task<Message> {
         if !self.page.open {
             return Task::none();
@@ -788,10 +778,7 @@ impl App {
                 self.page.open = false;
                 self.redock()
             }
-            PageView::Board(_) => {
-                self.page.board.detail = false;
-                self.redock()
-            }
+            PageView::Board(_) => Task::none(),
             PageView::Channel(..) => self.close_front_ci_log(),
         }
     }
@@ -816,13 +803,12 @@ impl App {
         board_columns(docs, &sessions, &claims, self.opening_on(ci, repo))
     }
 
-    /// The plan session this editor asked CI `ci` for in `repo`, while it
-    /// has none: `Some` with the proposal it plans.
-    fn opening_on(&self, ci: &RunnerKey, repo: &str) -> Option<Option<u64>> {
+    /// Whether this editor asked CI `ci` for a plan session of `repo`
+    /// without a ticket, which has no session yet.
+    fn opening_on(&self, ci: &RunnerKey, repo: &str) -> bool {
         self.opening_session
             .as_ref()
-            .filter(|(key, asked, _)| key == ci && asked == repo)
-            .map(|(_, _, proposal)| *proposal)
+            .is_some_and(|(key, asked)| key == ci && asked == repo)
     }
 
     /// The document under the Board's cursor, with its CI and Plans view.
@@ -835,21 +821,9 @@ impl App {
         }
     }
 
-    /// Selects a document of a Plans view, which asks for its body.
-    fn select_doc(&mut self, ci: &RunnerKey, view: u64, number: u64) -> Task<Message> {
-        let Some(client) = self.ci.get_mut(ci) else {
-            return Task::none();
-        };
-        if client.plans.get(&view).and_then(|s| s.selected()) == Some(number) {
-            return Task::none();
-        }
-        client.select(ci, view, number)
-    }
-
-    /// Moves the Board's cursor by columns and rows, staying on a card; the
-    /// detail, while open, follows it.
+    /// Moves the Board's cursor by columns and rows, staying on a card.
     fn board_move(&mut self, origin: &str, columns: isize, rows: isize) -> Task<Message> {
-        let Some((ci, view, _, cards)) = self.board_cards(origin) else {
+        let Some((_, _, _, cards)) = self.board_cards(origin) else {
             return Task::none();
         };
         let board = &mut self.page.board;
@@ -883,16 +857,12 @@ impl App {
             (board.row as isize + rows).clamp(0, len as isize - 1) as usize
         };
         board.card = cards[board.column].get(board.row).copied();
-        let selected = match (board.detail, board.card) {
-            (true, Some(Card::Doc(number))) => self.select_doc(&ci, view, number),
-            _ => Task::none(),
-        };
-        Task::batch([selected, self.redock()])
+        self.redock()
     }
 
     /// Enter on the Board, and a press on a card: a card of work a session
     /// does brings that session's tab to the front; any other opens the
-    /// document's detail.
+    /// ticket's popout.
     fn board_enter(&mut self, origin: &str) -> Task<Message> {
         let Some((ci, view, repo, cards)) = self.board_cards(origin) else {
             return Task::none();
@@ -912,13 +882,11 @@ impl App {
         let Card::Doc(number) = card else {
             return Task::none();
         };
-        self.page.board.detail = true;
-        let selected = self.select_doc(&ci, view, number);
-        Task::batch([selected, self.redock()])
+        self.apply_ticket(TicketMsg::Open { ci, view, number })
     }
 
-    /// The live session of a card: a plan's master, a proposal's plan
-    /// session (numbers are shared by both kinds), a plan session itself.
+    /// The live session of a card: a ticket's master or plan session, a
+    /// plan session itself.
     fn card_session(&self, ci: &RunnerKey, repo: &str, card: Card) -> Option<&SessionView> {
         let client = self.ci.get(ci)?;
         match card {
@@ -931,7 +899,7 @@ impl App {
     }
 
     /// The runner and terminal responsible for a card: its session's, else
-    /// the holder of the claim on its proposal.
+    /// the holder of the claim on its ticket.
     fn card_holder(
         &self,
         ci: &RunnerKey,
@@ -948,7 +916,7 @@ impl App {
         let Card::Doc(number) = card else {
             return None;
         };
-        client.holder_target(client.claim_on(&ClaimSubject::Proposal {
+        client.holder_target(client.claim_on(&ClaimSubject::Ticket {
             repo: repo.to_owned(),
             number,
         })?)
@@ -1369,9 +1337,8 @@ impl App {
         }
     }
 
-    /// A project's Board: the toolbar, the channel rail, the columns with
-    /// the lanes between them, and the selected document's detail beside
-    /// them.
+    /// A project's Board: the toolbar, the channel rail and the columns
+    /// with the lanes between them.
     fn board_view<'a>(&'a self, t: &Tokens, origin: &'a str) -> Element<'a, Message, Theme> {
         let muted = self.theme.muted();
         let Some((ci, client, repo)) = self.ci_of(origin) else {
@@ -1465,27 +1432,16 @@ impl App {
                 columns.into()
             }
         });
-        let board = column![
+        column![
             self.plans_toolbar(ci, client, view, state),
             rule::horizontal(1),
             rail,
             rule::horizontal(1),
             columns,
         ]
-        .width(Length::FillPortion(5))
-        .height(Length::Fill);
-        if self.page.board.detail && state.selected().is_some() {
-            row![
-                board,
-                rule::vertical(1),
-                container(self.doc_detail(ci, client, view, state))
-                    .width(Length::FillPortion(4))
-                    .height(Length::Fill),
-            ]
-            .into()
-        } else {
-            board.into()
-        }
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 
     /// The rail over a Board: each channel with its newest pipelines, led
@@ -1630,9 +1586,10 @@ impl App {
             })
     }
 
-    /// One card: number and title, age, `Runs on` and proposal chips; in a
-    /// lane or RUNNING also who works on it, what is being done to it, what
-    /// its master waits on. A card in a lane carries a flow bar.
+    /// One card: number and title, age, `Runs on` chips, the tickets it
+    /// includes, what it waits for and its plan's revision; in a lane or
+    /// RUNNING also who works on it, what is being done to it, what its
+    /// master waits on. A card in a lane carries a flow bar.
     #[allow(clippy::too_many_arguments)]
     fn board_card<'a>(
         &'a self,
@@ -1690,19 +1647,28 @@ impl App {
             for selector in &doc.runs_on {
                 second = second.push(chip(selector.clone()));
             }
-            if doc.kind == DocKind::Plan {
-                for number in &doc.proposals {
-                    second = second.push(chip(format!("#{number}")));
+            for number in &doc.merged {
+                second = second.push(chip(format!("#{number}")));
+            }
+            if matches!(
+                doc.state,
+                DocState::Ready | DocState::Approved | DocState::Open
+            ) {
+                for number in blocked_by(doc, state.docs()) {
+                    second = second.push(text(format!("after #{number}")).size(11).color(muted));
                 }
+            }
+            if doc.revision > 0 {
+                second = second.push(
+                    text(format!("plan v{}", doc.revision))
+                        .size(11)
+                        .color(muted),
+                );
             }
         }
         let mut lines = column![first, second].spacing(4);
         if active(column) {
-            let opening = match card {
-                Card::Opening => true,
-                Card::Doc(number) => self.opening_on(ci, &repo.repo) == Some(Some(number)),
-                Card::Session(_) => false,
-            };
+            let opening = card == Card::Opening;
             lines = lines.push(match self.card_holder(ci, &repo.repo, card) {
                 Some((runner, terminal)) => self.running_line(runner, terminal),
                 None => text(if opening {
@@ -1932,7 +1898,7 @@ impl App {
             title: format!("Onboard {name}"),
             body: format!("Requested from the editor for {origin}."),
             source: name,
-            proposals: Vec::new(),
+            links: Vec::new(),
             runs_on: Vec::new(),
             onboard: Some(OnboardSpec {
                 url: format!("https://{origin}"),
@@ -2090,22 +2056,28 @@ mod tests {
     use super::*;
     use zeughaus_link::ClaimHolder;
 
-    fn doc(number: u64, kind: DocKind, state: DocState, changed: u64) -> DocView {
+    fn doc(number: u64, state: DocState, changed: u64) -> DocView {
         DocView {
             repo: "r".to_owned(),
             number,
-            kind,
+            kind: DocKind::Ticket,
             title: format!("d{number}"),
             state,
             source: "r".to_owned(),
             created: 0,
             changed,
             approved: None,
-            proposals: Vec::new(),
-            plan: None,
+            released: None,
+            links: Vec::new(),
+            merged: Vec::new(),
+            into: None,
             runs_on: Vec::new(),
             placement: Vec::new(),
             body: String::new(),
+            plan_text: String::new(),
+            revision: 0,
+            planner: None,
+            feedback: String::new(),
             onboard: None,
             note: String::new(),
         }
@@ -2129,31 +2101,39 @@ mod tests {
     }
 
     #[test]
-    fn documents_fall_into_the_lifecycle_slots_and_done_keeps_the_newest() {
+    fn tickets_fall_into_the_lifecycle_slots_and_done_keeps_the_newest() {
+        let mut blocked = doc(2, DocState::Ready, 1);
+        blocked.links = vec![zeughaus_link::DocLink {
+            kind: zeughaus_link::LinkKind::DependsOn,
+            number: 1,
+        }];
         let mut docs = vec![
-            doc(1, DocKind::Proposal, DocState::Open, 1),
-            doc(2, DocKind::Plan, DocState::Saved, 1),
-            doc(3, DocKind::Plan, DocState::Approved, 1),
-            doc(4, DocKind::Plan, DocState::InProgress, 1),
+            doc(1, DocState::Open, 1),
+            blocked,
+            doc(3, DocState::Ready, 1),
+            doc(4, DocState::Review, 1),
+            doc(5, DocState::Approved, 1),
+            doc(6, DocState::InProgress, 1),
         ];
-        docs.extend((10..30).map(|n| doc(n, DocKind::Plan, DocState::Done, n)));
+        docs.extend((10..30).map(|n| doc(n, DocState::Done, n)));
         let planning = session(7, SessionKind::Plan, None, SessionState::Running);
-        let master = session(8, SessionKind::Master, Some(4), SessionState::Running);
-        let slots = board_columns(&docs, &[&planning, &master], &[], None);
-        assert_eq!(slots[PROPOSALS], [Card::Doc(1)]);
-        assert_eq!(slots[PLANNING], [Card::Session(7)]);
-        assert_eq!(slots[PLANS], [Card::Doc(2)]);
-        assert_eq!(slots[QUEUE], [Card::Doc(3)]);
+        let master = session(8, SessionKind::Master, Some(6), SessionState::Running);
+        let slots = board_columns(&docs, &[&planning, &master], &[], false);
+        // A ready ticket that waits for #1 stays with the proposals.
+        assert_eq!(slots[PROPOSALS], [Card::Doc(2), Card::Doc(1)]);
+        assert_eq!(slots[PLANNING], [Card::Doc(3), Card::Session(7)]);
+        assert_eq!(slots[PLANS], [Card::Doc(4)]);
+        assert_eq!(slots[QUEUE], [Card::Doc(5)]);
         assert!(slots[STARTING].is_empty());
-        assert_eq!(slots[RUNNING], [Card::Doc(4)]);
+        assert_eq!(slots[RUNNING], [Card::Doc(6)]);
         assert_eq!(slots[DONE].len(), DONE_SHOWN);
         assert_eq!(slots[DONE][0], Card::Doc(29));
     }
 
     #[test]
-    fn work_in_passage_takes_the_lanes_and_a_planned_proposal_follows_its_plan() {
+    fn work_in_passage_takes_the_lanes_and_a_merged_ticket_follows_its_plan() {
         let claim = ClaimView {
-            subject: ClaimSubject::Proposal {
+            subject: ClaimSubject::Ticket {
                 repo: "r".to_owned(),
                 number: 1,
             },
@@ -2167,34 +2147,37 @@ mod tests {
             since: 0,
             renewed: 0,
         };
-        let open = |n| doc(n, DocKind::Proposal, DocState::Open, 1);
-        // Claimed, planned by a live session, asked for: each in PLANNING.
-        let docs = vec![open(1), open(2), open(3), open(4)];
+        // Claimed, or planned by a live session: each in PLANNING.
+        let docs = vec![
+            doc(1, DocState::Open, 1),
+            doc(2, DocState::Planning, 1),
+            doc(4, DocState::Open, 1),
+        ];
         let planning = session(7, SessionKind::Plan, Some(2), SessionState::Running);
-        let slots = board_columns(&docs, &[&planning], &[&claim], Some(Some(3)));
+        let slots = board_columns(&docs, &[&planning], &[&claim], false);
         assert_eq!(slots[PROPOSALS], [Card::Doc(4)]);
-        assert_eq!(slots[PLANNING], [Card::Doc(1), Card::Doc(2), Card::Doc(3)]);
-        // A session asked for without a proposal has a card of its own.
-        let slots = board_columns(&docs, &[], &[], Some(None));
-        assert_eq!(slots[PLANNING], [Card::Opening]);
+        assert_eq!(slots[PLANNING], [Card::Doc(2), Card::Doc(1)]);
+        // A session asked for without a ticket has a card of its own.
+        let slots = board_columns(&docs, &[], &[], true);
+        assert_eq!(slots[PLANNING], [Card::Doc(2), Card::Opening]);
 
-        // A planned proposal is left to its saved plan's card.
-        let mut planned = doc(1, DocKind::Proposal, DocState::Planned, 2);
-        planned.plan = Some(5);
-        let mut plan = doc(5, DocKind::Plan, DocState::Saved, 2);
-        plan.proposals = vec![1];
-        let slots = board_columns(&[planned, plan.clone()], &[], &[], None);
+        // A merged ticket is left to the card of the ticket in review.
+        let mut merged = doc(1, DocState::Merged, 2);
+        merged.into = Some(5);
+        let mut plan = doc(5, DocState::Review, 2);
+        plan.merged = vec![1];
+        let slots = board_columns(&[merged.clone(), plan.clone()], &[], &[], false);
         assert_eq!(slots[PLANS], [Card::Doc(5)]);
         assert!(slots.iter().all(|slot| !slot.contains(&Card::Doc(1))));
-        // The plan rejected, the proposal is open again.
-        plan.state = DocState::Rejected;
-        let slots = board_columns(&[open(1), plan], &[], &[], None);
-        assert_eq!(slots[PROPOSALS], [Card::Doc(1)]);
+        // Done with its plan, it is done too.
+        plan.state = DocState::Done;
+        let slots = board_columns(&[merged, plan], &[], &[], false);
+        assert_eq!(slots[DONE], [Card::Doc(5), Card::Doc(1)]);
 
-        // A master that has not started yet puts its plan in STARTING.
-        let docs = vec![doc(6, DocKind::Plan, DocState::InProgress, 3)];
+        // A master that has not started yet puts its ticket in STARTING.
+        let docs = vec![doc(6, DocState::InProgress, 3)];
         let starting = session(9, SessionKind::Master, Some(6), SessionState::Starting);
-        let slots = board_columns(&docs, &[&starting], &[], None);
+        let slots = board_columns(&docs, &[&starting], &[], false);
         assert_eq!(slots[STARTING], [Card::Doc(6)]);
         assert!(slots[RUNNING].is_empty());
     }

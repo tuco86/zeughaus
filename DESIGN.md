@@ -1406,7 +1406,7 @@ link of its own. A titlebar chip opens the Overview over the workspace
 (the chip says how many things need the user and how many work, coloured
 by the worst; the palette's "CI / Open page" does the same): `Needs you`
 and `Working` (agents that wait or work, as their terminals' activity
-reports them, plans awaiting approval, failed channels, sessions failed in
+reports them, tickets awaiting review, failed channels, sessions failed in
 the last day, running channels and live sessions; a terminal row's terminal
 is docked read-only beside the list, and Enter or a click brings its tab
 to the front), the projects (the local runner's `/projects` and every CI
@@ -1419,26 +1419,38 @@ screen: the channel rail (glyph in the tone of the newest pipeline, name,
 the queued events as hollow pulsing dots, then the newest 12 pipelines as
 dots that open the channel at that pipeline; a running one pulses, a held
 one wears a ring in its holder's agent colour), then the columns
-PROPOSALS, PLANS, QUEUE, RUNNING and DONE (the newest 12) with two lanes
-between them that are drawn only while a card passes through: PLANNING (a
-proposal that is claimed, planned by a live plan session or asked a
-session for, and plan sessions of their own) and STARTING (a plan whose
-master has not started yet). A planned proposal whose plan is still open
-is left out; the plan's card names it. Cards show number, title, age,
-`Runs on` and proposal chips; a card in a lane or RUNNING adds its holder's
-host glyph and its agent's role and state, a running plan the pipelines its
-master holds (`waits on`, `fixing`, `holds`), a queued one `queue paused`,
-and an action on its way its verb. A lane card has a flowing bar and a
-breathing border, as has a card an action is on; the page ticks every
-50 ms while anything pulses. `h`/`l` and Left/Right change
-the column, `j`/`k` and Up/Down the card, Enter on a card of the lanes or
-RUNNING brings its session's (else its claim holder's) tab to the front
-and on any other opens the document's detail
-(text, actions, the master docked) beside the columns, `a`, `r` and `p`
-approve, reject and plan where the document offers it, and Escape closes
-the detail. A card the CI moved to another column carries an accent ring
-that fades over 2 s. A project no CI builds gets an `Onboard` button that
-files an onboarding request with the first CI. A channel lists its pipelines in a scrollable, newest on top
+PROPOSALS, REVIEW, QUEUE, RUNNING and DONE (the newest 12) with two lanes
+between them that are drawn only while a card passes through: PLANNING (an
+open ticket a session holds the claim on, a ready or planning ticket, and
+plan sessions without a ticket) and STARTING (a ticket whose master has not
+started yet). A ready ticket that waits for a ticket it depends on stays in
+PROPOSALS with an `after #n` chip; a ticket merged into one that is not
+finished is left out, the including ticket's card names it. Cards show
+number, title, age, `Runs on`, the tickets it includes and `plan v<n>`; a
+card in a lane or RUNNING adds its holder's host glyph and its agent's role
+and state, a running ticket the pipelines its master holds (`waits on`,
+`fixing`, `holds`), a queued one `queue paused`, and an action on its way
+its verb. A lane card has a flowing bar and a breathing border, as has a
+card an action is on; the page ticks every 50 ms while anything pulses.
+`h`/`l` and Left/Right change the column, `j`/`k` and Up/Down the card,
+Enter on a card of the lanes or RUNNING brings its session's (else its
+claim holder's) tab to the front and on any other opens the ticket's
+popout, and `a`, `r` and `p` approve, dismiss and release for planning
+where the ticket offers it. The popout (`ci/ticket.rs`) lies over the
+workspace under the notice center and the palette: the ticket's number,
+title and state, its actions (`Edit` of an open or ready ticket, what it
+waits for, the note of a session that ended without a plan), the tabs
+`Proposal` and `Plan v<n>`, and a side column with its state, source,
+`Runs on`, links both ways (added by number, removed), the tickets it
+includes, its sessions and its claim's holder. A plan in review is drawn
+in the sections `ci/review.rs` splits it into at its headings; each is
+folded, deleted with its subsections or annotated, beside an overall note,
+and `Refine` sends that review (`DocRefine`) while `Approve` waits until
+the review is empty. Escape or a press on the scrim closes it; `New
+ticket` on the Board writes one in it. A card the CI moved to another
+column carries an accent ring that fades over 2 s. A project no CI builds
+gets an `Onboard` button that files an onboarding request with the first
+CI. A channel lists its pipelines in a scrollable, newest on top
 and separated by rules, one row each: a status glyph (codicons from the
 bundled Nerd Font, so status never rests on colour alone), `#<n>` and the
 commit's subject (the CI reads it from its mirror when the pipeline starts,
@@ -1819,17 +1831,27 @@ trial (a build that does not stay up is replaced by the previous one after 3
 starts and refused until a newer one is published) and `update rollback`
 by hand. `release bundle` and `release verify` exist on every platform.
 
-**Plans and proposals.** The CI also stores the documents an agent workflow
-passes around: proposals (one project asks another for a change) and plans
-(a finished plan of work). `zeughaus-ci/src/docs.rs` keeps each as the
-`DocView` the editor shows, in `<state-dir>/ci/docs/<repo>/<n>.json`, and the
-last number in `last`, so a deleted number is never given out again. The
-state machine (`docs::allowed`) is the whole contract: a proposal goes from
-`open` to `planned` or `dismissed`; a plan from `saved` to `approved` or
-`rejected`, `approved` to `rejected`, `in_progress` to `done` or back to
-`approved`. Only the CI's session dispatcher (`zeughaus-ci/src/sessions.rs`)
-moves a plan to `in_progress`, recording the runners it placed it on. The
-`/ci` server, the dispatcher and the scheduler serialize every mutation
+**Tickets.** The CI also stores the work an agent workflow passes around as
+tickets: one number from proposal through plan to execution.
+`zeughaus-ci/src/docs.rs` keeps each as the `DocView` the editor shows, in
+`<state-dir>/ci/docs/<repo>/<n>.json`, with its proposal (`body`), its plan
+(`plan_text`, `revision`, and the `planner`: the runner and omp session
+file that wrote it), its links (`depends on`, `related`) and the tickets its
+plan includes (`merged`), and the last number in `last`, so a deleted
+number is never given out again. The state machine (`docs::allowed`) is
+the user's contract: `open` -> `ready` (released for planning) or
+`dismissed`, `ready` -> `open` or `dismissed`, `review` -> `approved`,
+`open` (the plan discarded) or `dismissed`, `approved` -> `review` or
+`dismissed`, `in_progress` -> `done` or `approved`. The CI moves the rest:
+`ready` -> `planning` when it opens a plan session, `planning` -> `review`
+when `PlanWrite` stores a plan (`ci plan-write`, the plugin's
+`submit_plan`), or back with a note when the session ends without one;
+`review` -> `ready` on a `DocRefine`; `approved` -> `in_progress` when a
+master starts. A plan's `Includes:` line makes those tickets `merged` into
+it; they close with it, and go back to `open` when it is dismissed or its
+plan discarded. A link that would close a dependency cycle is refused. At
+start the CI rewrites documents stored before tickets (`docs::migrate`).
+The `/ci` server, the dispatcher and the scheduler serialize every mutation
 behind one lock and announce each on `/events` as `CiDocs`.
 
 **Session requests.** A job asks for an agent session by leaving
@@ -1840,11 +1862,11 @@ regular UTF-8 file of at most `MAX_SESSION_REQUEST_BYTES`, 32 KiB, so that
 frame; a symlink is refused), and carries its text, or why it was refused,
 in `RunEnd::session_request`; a Windows VM job copies that one file back
 from the guest after a failure too. `Scheduler::finish_job` hands it to
-`docs::file_request`, which files it as an approved plan with source
-`job.<job>`, titled and placed by the same header parsers `ci plan-save`
+`docs::file_request`, which files it as an approved ticket with source
+`job.<job>`, titled and placed by the same header parsers `ci plan-write`
 uses (`zeughaus-link::ci`), when the repository's `agent_sessions` is set,
-and files nothing while a saved, approved or in-progress plan of that job
-has the same body. A manual run or a cancelled pipeline files none. What
+and files nothing while a ticket of that job in review, approved or in
+progress has the same plan. A manual run or a cancelled pipeline files none. What
 became of the request is a fragment of the job's note.
 
 **Onboarding.** A third kind, `onboarding`, is a project's request to join:
@@ -1852,8 +1874,8 @@ an `OnboardSpec` (its origin, made the canonical url of `[onboarding] api`'s
 Forgejo, its default branch, grants and host prerequisites) under the name
 it asks for, `open` -> `approved` or `rejected`. While it is open or
 approved the name has a document directory without being in `ci.toml`, so
-proposals can be stored against it and the overview lists it with
-`onboarding: Some(n)`, which gives it a Plans tab; plans wait. The
+tickets can be stored against it and the overview lists it with
+`onboarding: Some(n)`, which gives it a Board; plans wait. The
 onboarding worker (`zeughaus-ci/src/onboard.rs`, a thread every 2 s) takes
 each approved request: secrets present, bot collaborator, webhook secret
 (generated and patched into OpenBao, or reused), hook created or updated,
@@ -1868,9 +1890,15 @@ per tick). `CiConfig::load` merges `ci/onboarded/*.toml` into `[repos]`
 or after an onboarding, swaps the snapshot when only `[repos]` changed and
 refuses anything else, which still takes a restart.
 
-**Agent sessions.** The dispatcher runs every 2 s over the approved plans of
-every repository whose queue is not paused, by approval: a plan's `Runs on`
-is one label selector per machine (`zeughaus-link::selector`), the first
+**Agent sessions.** The dispatcher runs every 2 s. First every ready ticket,
+by release, whose `depends on` tickets are finished and which nobody holds
+or plans gets a plan session: on the runner of its `planner` when it has
+one (it waits while that runner is away; the session resumes the omp
+session file with the review attached), else on the first session host its
+first `Runs on` selector matches, else the first. Then the approved
+tickets of every repository whose queue is not paused, by approval and
+again only once their dependencies are finished: a ticket's `Runs on` is
+one label selector per machine (`zeughaus-link::selector`), the first
 placed on a connected runner with `sessions = true` that hosts no live master
 and is not cooling down after a failed start, the others on distinct
 connected runners with `ssh`, reserved for that master. A runner's labels are
@@ -1881,9 +1909,10 @@ its mux and answer `SessionOpened` or `SessionFailed`, and a watcher per
 session reports `SessionEnded` from the terminal's end, which the mux
 remembers for closed terminals. A runner keeps its sessions in
 `<state-dir>/sessions.json` and reports them in `Hello`, so a reconnect
-settles sessions that ended meanwhile. Plan sessions are opened on request
-(`CiRequest::OpenSession`) and never count as busy. The registry is
-`<state-dir>/ci/sessions.json`, every change announced as `CiSessions`.
+settles sessions that ended meanwhile. A plan session without a ticket is
+opened on request (`CiRequest::OpenSession`); plan sessions never count as
+busy. The registry is `<state-dir>/ci/sessions.json`, every change
+announced as `CiSessions`.
 
 **Runners by name.** A runner's `Hello` carries its endpoint and the
 addresses it answers at; the overview lists each runner's fingerprint,

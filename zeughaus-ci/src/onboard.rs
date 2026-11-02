@@ -558,7 +558,7 @@ mod tests {
                     title: "Join",
                     body: "Scans.",
                     source: "scan-rs",
-                    proposals: &[],
+                    links: &[],
                     runs_on: &[],
                     onboard: Some(&spec),
                 },

@@ -12,7 +12,8 @@
 
 use iced::widget::overlay::menu;
 use iced::widget::{
-    button, checkbox, container, float, pane_grid, pick_list, rule, scrollable, text, text_input,
+    button, checkbox, container, float, pane_grid, pick_list, rule, scrollable, text, text_editor,
+    text_input,
 };
 // `iced::widget::svg` exists only when iced was built with its own `svg`
 // feature, which this crate's `svg` feature turns on.
@@ -72,6 +73,7 @@ forward_with_status!(button);
 forward_with_status!(checkbox);
 forward_with_status!(scrollable);
 forward_with_status!(text_input);
+forward_with_status!(text_editor);
 forward!(container);
 forward!(float);
 forward!(rule);

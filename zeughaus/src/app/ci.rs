@@ -43,6 +43,11 @@ use crate::workspace::RunnerKey;
 mod cables;
 pub(super) mod page;
 mod plans;
+mod review;
+mod ticket;
+
+pub(super) use self::review::ReviewDraft;
+pub(super) use self::ticket::TicketPopout;
 
 /// Pipelines asked for at a time: a channel's first page, and each page
 /// "Load older" adds.
@@ -1155,13 +1160,28 @@ impl App {
     /// What a runner's CI answered, or what the user did in its views.
     pub(super) fn apply_ci(&mut self, key: RunnerKey, message: CiMsg) -> Task<Message> {
         match message {
-            CiMsg::OpenSession { view, proposal } => {
-                return self.open_session(&key, view, proposal);
-            }
+            CiMsg::OpenSession { view } => return self.open_session(&key, view),
             CiMsg::SessionOpened(result) => {
                 return self.session_opened(&key, result);
             }
             CiMsg::OpenLink(url) => return self.open_doc_link(&url),
+            CiMsg::DocAct {
+                request:
+                    CiRequest::DocRefine {
+                        ref repo, number, ..
+                    },
+                ..
+            } => {
+                self.refining = Some((key.clone(), repo.clone(), number));
+            }
+            // A Refine the CI took leaves nothing to keep of its review.
+            CiMsg::DocActed { ref result, .. } => {
+                if let Some(refined) = self.refining.take()
+                    && result.is_ok()
+                {
+                    self.reviews.remove(&refined);
+                }
+            }
             _ => {}
         }
         let Some(client) = self.ci.get_mut(&key) else {
@@ -2445,6 +2465,7 @@ mod glyph {
     pub const CLOSE: char = '\u{ea76}';
     pub const VM: char = '\u{ea7a}';
     pub const CHEVRON_RIGHT: char = '\u{eab6}';
+    pub const CHEVRON_DOWN: char = '\u{eab4}';
     pub const DOT: char = '\u{ea71}';
     pub const WARNING: char = '\u{ea6c}';
 }

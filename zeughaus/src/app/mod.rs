@@ -300,10 +300,21 @@ pub struct App {
     /// id), whose terminal becomes [`App::reveal`] once its runner runs it.
     #[cfg(not(target_arch = "wasm32"))]
     reveal_session: Option<(RunnerKey, u64)>,
-    /// A plan session this editor asked a CI for, which has no session yet:
-    /// the CI's key, the repository and the proposal it plans.
+    /// A plan session without a ticket this editor asked a CI for, which
+    /// has no session yet: the CI's key and the repository.
     #[cfg(not(target_arch = "wasm32"))]
-    opening_session: Option<(RunnerKey, String, Option<u64>)>,
+    opening_session: Option<(RunnerKey, String)>,
+    /// The ticket popout over the workspace.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(in crate::app) ticket: Option<ci::TicketPopout>,
+    /// The plan reviews being written, by CI, repository and ticket.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(in crate::app) reviews:
+        std::collections::HashMap<(RunnerKey, String, u64), ci::ReviewDraft>,
+    /// The review a Refine sent, until the CI has answered it: its draft
+    /// goes once the CI took it.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(in crate::app) refining: Option<(RunnerKey, String, u64)>,
     /// Running without a window (`zeughaus --headless`): nobody sits in front
     /// of a file dialog, and rfd would open one on the desktop of whoever
     /// started the process.
@@ -463,6 +474,12 @@ impl App {
             reveal_session: None,
             #[cfg(not(target_arch = "wasm32"))]
             opening_session: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            ticket: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            reviews: std::collections::HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            refining: None,
             #[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
             headless: false,
             #[cfg(not(target_arch = "wasm32"))]
@@ -1052,6 +1069,8 @@ impl App {
                 }
                 return self.poll_ci();
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::Ticket(message) => return self.apply_ticket(message),
             Message::Workspace(message) => {
                 // A view in a project's group is this window's own.
                 #[cfg(not(target_arch = "wasm32"))]
@@ -1580,6 +1599,10 @@ impl App {
                 self.workspace.drag = None;
                 #[cfg(not(target_arch = "wasm32"))]
                 if !claimed {
+                    // The ticket popout lies over the page: it closes first.
+                    if self.ticket.take().is_some() {
+                        return Task::none();
+                    }
                     return self.page_escape();
                 }
                 #[cfg(target_arch = "wasm32")]
@@ -2086,8 +2109,13 @@ impl App {
                 background: Some(theme.extended().background.base.color.into()),
                 ..Default::default()
             });
-        // The notice center lies over the workspace and under the palette.
+        // The ticket popout lies over the workspace, the notice center over
+        // it, and the palette over both.
         let mut layers = vec![body.into()];
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(popout) = self.ticket_view() {
+            layers.push(popout);
+        }
         if let Some(center) = notices::center(self) {
             layers.push(center);
         }

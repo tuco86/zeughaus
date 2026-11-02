@@ -180,7 +180,7 @@ impl CiServer {
                 title,
                 body,
                 source,
-                proposals,
+                links,
                 runs_on,
                 onboard,
             } => {
@@ -189,7 +189,7 @@ impl CiServer {
                     title: &title,
                     body: &body,
                     source: &source,
-                    proposals: &proposals,
+                    links: &links,
                     runs_on: &runs_on,
                     onboard: onboard.as_ref(),
                 };
@@ -220,19 +220,64 @@ impl CiServer {
             } => accepted(self.change_docs(&repo, |dir, config, now| {
                 docs::set_runs_on(dir, config, &repo, number, runs_on, now).map(|()| ((), true))
             })),
+            CiRequest::DocEdit {
+                repo,
+                number,
+                title,
+                body,
+            } => accepted(self.change_docs(&repo, |dir, config, now| {
+                docs::edit(dir, config, &repo, number, &title, &body, now).map(|()| ((), true))
+            })),
+            CiRequest::DocLinks {
+                repo,
+                number,
+                links,
+            } => accepted(self.change_docs(&repo, |dir, config, now| {
+                docs::set_links(dir, config, &repo, number, links, now).map(|()| ((), true))
+            })),
+            CiRequest::DocRefine {
+                repo,
+                number,
+                feedback,
+            } => accepted(self.change_docs(&repo, |dir, config, now| {
+                docs::refine(dir, config, &repo, number, &feedback, now).map(|()| ((), true))
+            })),
+            CiRequest::PlanWrite {
+                repo,
+                number,
+                title,
+                plan,
+                includes,
+                runs_on,
+                source,
+                planner,
+            } => {
+                let text = docs::PlanText {
+                    title: &title,
+                    plan: &plan,
+                    includes: &includes,
+                    runs_on: &runs_on,
+                    source: &source,
+                    planner,
+                };
+                let written = self.change_docs(&repo, |dir, config, now| {
+                    docs::write_plan(dir, config, &repo, number, text, now)
+                        .map(|number| (number, true))
+                });
+                match written {
+                    Ok(number) => CiReply::DocCreated { number },
+                    Err(e) => error(&e),
+                }
+            }
             CiRequest::QueuePaused { repo, paused } => {
                 accepted(self.change_docs(&repo, |dir, config, _| {
                     docs::set_paused(dir, config, &repo, paused).map(|()| ((), true))
                 }))
             }
-            CiRequest::OpenSession {
-                repo,
-                proposal,
-                runner,
-            } => {
+            CiRequest::OpenSession { repo, runner } => {
                 match self
                     .sessions
-                    .open_plan(&repo, proposal, runner.as_deref(), crate::now_secs())
+                    .open_plan(&repo, runner.as_deref(), crate::now_secs())
                 {
                     Ok(session) => CiReply::Session { session },
                     Err(e) => error(&e),
@@ -631,7 +676,9 @@ impl CiServer {
                         matches!(
                             doc.state,
                             DocState::Open
-                                | DocState::Saved
+                                | DocState::Ready
+                                | DocState::Planning
+                                | DocState::Review
                                 | DocState::Approved
                                 | DocState::InProgress
                         )
@@ -3243,15 +3290,27 @@ mod tests {
             );
             let made = server.answer(CiRequest::DocCreate {
                 repo: "demo".to_owned(),
-                kind: zeughaus_link::DocKind::Plan,
-                title: "  Smoke plan ".to_owned(),
-                body: "# Smoke plan\n".to_owned(),
-                source: "demo".to_owned(),
-                proposals: Vec::new(),
+                kind: zeughaus_link::DocKind::Ticket,
+                title: "  Smoke ticket ".to_owned(),
+                body: "Please smoke.\n".to_owned(),
+                source: "user".to_owned(),
+                links: Vec::new(),
                 runs_on: Vec::new(),
                 onboard: None,
             });
             assert_eq!(made, CiReply::DocCreated { number: 1 });
+            assert_eq!(rx.try_recv(), Ok("demo".to_owned()));
+            let written = server.answer(CiRequest::PlanWrite {
+                repo: "demo".to_owned(),
+                number: None,
+                title: "Smoke plan".to_owned(),
+                plan: "# Smoke plan\n".to_owned(),
+                includes: vec![1],
+                runs_on: Vec::new(),
+                source: "demo".to_owned(),
+                planner: None,
+            });
+            assert_eq!(written, CiReply::DocCreated { number: 2 });
             assert_eq!(rx.try_recv(), Ok("demo".to_owned()));
 
             let CiReply::Overview { overview } = server.answer(CiRequest::Overview) else {
@@ -3267,7 +3326,8 @@ mod tests {
                     queued: 0,
                     in_progress: Vec::new(),
                     paused: false,
-                    proposals: 0,
+                    open: 0,
+                    planning: 0,
                     onboarding: None,
                 }]
             );
@@ -3276,10 +3336,16 @@ mod tests {
             }) else {
                 panic!("no docs");
             };
-            assert_eq!(docs.len(), 1);
-            assert_eq!(docs[0].title, "Smoke plan");
-            assert_eq!(docs[0].state, DocState::Saved);
-            assert!(docs[0].body.is_empty());
+            assert_eq!(docs.len(), 2);
+            assert_eq!(
+                (docs[0].title.as_str(), docs[0].state, docs[0].into),
+                ("Smoke ticket", DocState::Merged, Some(2))
+            );
+            assert_eq!(
+                (docs[1].title.as_str(), docs[1].state, docs[1].revision),
+                ("Smoke plan", DocState::Review, 1)
+            );
+            assert!(docs[1].plan_text.is_empty() && docs[0].body.is_empty());
 
             // Pausing the queue is a change of the documents, announced.
             let paused = server.answer(CiRequest::QueuePaused {
@@ -3291,7 +3357,6 @@ mod tests {
             // No runner hosts sessions: a plan session is refused.
             let refused = server.answer(CiRequest::OpenSession {
                 repo: "demo".to_owned(),
-                proposal: None,
                 runner: None,
             });
             assert_eq!(
@@ -3320,7 +3385,7 @@ mod tests {
                 title: "Join".to_owned(),
                 body: "Scans.\n".to_owned(),
                 source: "scan-rs".to_owned(),
-                proposals: Vec::new(),
+                links: Vec::new(),
                 runs_on: Vec::new(),
                 onboard: Some(zeughaus_link::OnboardSpec {
                     url: "git@git.example.org:o/scan-rs.git".to_owned(),

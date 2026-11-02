@@ -357,6 +357,10 @@ fn retries(request: &CiRequest) -> bool {
         | CiRequest::DocState { .. }
         | CiRequest::DocDelete { .. }
         | CiRequest::DocRunsOn { .. }
+        | CiRequest::DocEdit { .. }
+        | CiRequest::DocLinks { .. }
+        | CiRequest::DocRefine { .. }
+        | CiRequest::PlanWrite { .. }
         | CiRequest::QueuePaused { .. }
         | CiRequest::OpenSession { .. }
         | CiRequest::CloseSession { .. }

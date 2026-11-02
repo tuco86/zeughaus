@@ -228,6 +228,11 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
     // on this runtime and quinn's driver has to be reachable from this thread.
     let _enter = rt.enter();
     let runners = Arc::new(Runners::new());
+    match crate::docs::migrate(state_dir) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("[ci] docs: migrated {n} documents to tickets"),
+        Err(e) => eprintln!("[ci] docs: {e}"),
+    }
     let (docs_tx, docs_rx) = std::sync::mpsc::channel::<String>();
     let docs_lock = Arc::new(std::sync::Mutex::new(()));
     let Started {

@@ -129,18 +129,24 @@ forges of `[projects]` in its `zeughaus.toml` let the user push to
 for Forgejo and `token` as an argv such as `["get-secret", "..."]`) and the
 checkouts under its work root. A chip in the titlebar (`N need you`,
 `M working`, or `CI`; also "CI / Open page" in the palette) opens the
-Overview: `Needs you` and `Working` (agents that wait or work, plans
-awaiting approval, failed channels and sessions, running channels and
+Overview: `Needs you` and `Working` (agents that wait or work, tickets
+awaiting review, failed channels and sessions, running channels and
 sessions; a row's terminal docks read-only beside the list and Enter or a
 click brings its tab to the front), the projects with a search and
 `Refresh`, and each CI's runners (a runner's activity with `Reopen` for
 closed runs). A project's Board shows its channels as a rail of pipeline
-dots over the columns PROPOSALS, PLANS, QUEUE, RUNNING and DONE, with the
-lanes PLANNING and STARTING between them while a proposal is planned or a
+dots over the columns PROPOSALS, REVIEW, QUEUE, RUNNING and DONE, with the
+lanes PLANNING and STARTING between them while a ticket is planned or a
 master starts: `h`/`l`
-and `j`/`k` (or the arrows) move between cards, Enter opens a document's
-detail (or the agent tab of a card in a lane or RUNNING), `a`, `r` and `p` approve, reject
-and plan, Escape closes the detail; a project no CI builds offers
+and `j`/`k` (or the arrows) move between cards, Enter opens a ticket's
+popout (or the agent tab of a card in a lane or RUNNING), `a`, `r` and `p`
+approve, dismiss and release for planning; `New ticket` writes one. The
+popout lies over the workspace (Escape or the scrim closes it): the
+ticket's actions, its proposal (`Edit` while open or ready), its plan in
+sections that are folded, deleted or annotated with an overall note for
+`Refine`, and a side column with its state, `Runs on`, links (`depends
+on`, `related`, added by `#n`), the tickets it includes, its sessions and
+who holds it. A project no CI builds offers
 `Onboard`. A channel lists its pipelines one
 row each, newest on top and open with its jobs, a cable animating while its
 artifact set moves, failures with their cause and log excerpt, `Rerun` and
@@ -234,65 +240,71 @@ each, under `<state-dir>/ci/state/`), `ci_state_get` downloads one version
 into a directory and `ci_state_delete` removes a version or a store.
 `docs`, `doc_read`,
 `proposal_write`, `onboard_request` and `plan_done` read and write the
-repository's plans, proposals and onboarding requests (below); `ci_repo`
+repository's tickets and onboarding requests (below); `ci_repo`
 also checks the repository's setup (hook deliveries, the bot's push access,
 its secrets and grants). Nothing but
 protocol messages is written to its stdout.
 `zeughaus-runner [--state-dir <dir>] ci repo [--json] [<path>]`, `ci
-find [--json] <repo> <sha>`, `ci doc [--json] <repo> <n>`, `ci plan-save
-[--json] [--approve] <repo> <file>`, `ci planned <repo> <file>`, `ci
+find [--json] <repo> <sha>`, `ci doc [--json] <repo> <n>`, `ci plan-write
+[--json] [--ticket <n>] [--omp-session <file>] <repo> <file>`, `ci
 overdue <repo> <number> <job>`, `ci session [--json] <id>`, `ci claim
-[--json] <repo> proposal|pipeline <n>`, `ci renew`, `ci release [<repo>
-proposal|pipeline <n>]` and `ci responsible [--json] <repo> <n>` answer
+[--json] <repo> ticket|pipeline <n>`, `ci renew`, `ci release [<repo>
+ticket|pipeline <n>]` and `ci responsible [--json] <repo> <n>` answer
 the same for a script (exit 3: the origin is no repository of `ci.toml`;
 2: no CI, no answer or a refusal); the
 `zeughaus-ci` omp plugin in `omp-plugin/` uses them for its session
-context, its push watch and `/zeughaus save` (`ci overdue` prints the late
-report of one running job, which the push watch sends at each multiple of
-the job's expected time).
+context, its push watch, `submit_plan` and `/zeughaus save` (`ci overdue`
+prints the late report of one running job, which the push watch sends at
+each multiple of the job's expected time).
 
-Claims: the CI keeps who is responsible for a proposal or a pipeline as
+Claims: the CI keeps who is responsible for a ticket or a pipeline as
 leased claims in `<state-dir>/ci/sessions.json` (`Book.claims`). A claim
 is held by an agent's terminal, `ZEUGHAUS_RUNNER` (the runner's enlist
 name, set in every terminal of an enlisted runner) and `ZEUGHAUS_TERMINAL`;
 its holder's CI session names it. It lives while it is renewed within 300
 s (`ci renew`, the plugin's heartbeat every minute), and goes with its
 session's end, `ci release`, a later succeeded pipeline of its channel (a
-pipeline claim) or its proposal leaving `open` and `planned`. `ci claim`
+pipeline claim) or its ticket being done, dismissed or merged. `ci claim`
 takes one or says who has it; the MCP tools claim every pipeline they
 start or wait on, and `ci_pipeline`, a failed `ci_wait` and `ci
 responsible` name who is responsible for a failure: the holder of the
 earliest earlier pipeline of the channel that failed one of the same jobs,
-else the holder of the pipeline itself. It only informs; the CI refuses
-only a plan session for a proposal someone holds. The omp plugin claims a
-plan session's proposal, the proposals of a plan executed from its review
-and the pipeline its push watch follows, and releases them when its
-session ends. The editor shows claims on the Board (a held proposal in the
-PLANNING lane, a ring on a held pipeline's dot) and on a failed pipeline's
-row; a click brings the holder's tab to the front.
+else the holder of the pipeline itself. It only informs; the CI opens no
+plan session for a ticket someone holds. The omp plugin claims a
+plan session's ticket, the tickets a plan executed from omp's own review
+includes and the pipeline its push watch follows, and releases them when
+its session ends. The editor shows claims on the Board (a held ticket in
+the PLANNING lane, a ring on a held pipeline's dot), in the popout and on a
+failed pipeline's row; a click brings the holder's tab to the front.
 
-Plans and proposals: the CI keeps them per repository in
-`<state-dir>/ci/docs/<repo>/<n>.json` (numbers shared by both kinds, never
-reused). A proposal is `open`, then `planned` (a plan names it in a
-`Proposals: #3, #5` line under its title) or `dismissed`; a planned
-proposal follows its plan, back to `open` when the plan is rejected and to
-`done` when it is done. A plan is
-`saved`, `approved` in the editor, `in_progress` once the CI starts a
-master session for it, then `done` (`plan_done`) or `rejected`. A plan or
-proposal names the machines its work needs in a `Runs on: <selector>[;
+Tickets: the CI keeps them per repository in
+`<state-dir>/ci/docs/<repo>/<n>.json` (numbers shared with onboarding
+requests, never reused), one number from proposal through plan to
+execution, and migrates proposals and plans stored before tickets at its
+start. A ticket is `open` (a proposal: `proposal_write`, `New ticket`),
+`ready` once the user releases it with `Plan`, `planning` while its plan
+session runs, `review` once the plan is stored, `approved` in the editor,
+`in_progress` once the CI starts a master for it, then `done`
+(`plan_done`); it leaves as `dismissed`, or as `merged` into the ticket
+whose plan includes it in an `Includes: #3, #5` line under its title,
+which it then follows (done with it, `open` again when that plan is
+discarded or dismissed). Tickets link to each other: `depends on` (neither
+its plan session nor its master starts before the target is done or
+dismissed; a link that closes a cycle is refused) and `related`. A plan
+names the machines its work needs in a `Runs on: <selector>[;
 <selector>]` line under its title (one label selector per machine, the
 first hosting the session, the others reached over ssh; editable in the
-Plans view while it is open, saved or approved). A CI job of a repository
-with `agent_sessions = true` in `ci.toml` requests a session by writing a
-plan body (at most 32 KiB) to `$CI_OUTPUT/agent-session.md`, on any exit
-status: the CI files it as an approved plan with source `job.<job>`, unless
-a plan of that job with the same body is still saved, approved or in
-progress, and says so in the job's note; manual runs file none. Each change
-is announced as `CiDocs` on `/events`. An onboarding request
+popout while the ticket is open, ready, in review or approved). A CI job of
+a repository with `agent_sessions = true` in `ci.toml` requests a session
+by writing a plan (at most 32 KiB) to `$CI_OUTPUT/agent-session.md`, on any
+exit status: the CI files it as an approved ticket with source `job.<job>`,
+unless a ticket of that job with the same plan is still in review, approved
+or in progress, and says so in the job's note; manual runs file none. Each
+change is announced as `CiDocs` on `/events`. An onboarding request
 (`onboard_request`, kind `onboarding`) is how a project outside `ci.toml`
 asks to join: it gives the
-pending repository a directory, a Plans view and an inbox for proposals at
-once; it is `open`, `approved` in its Plans view, then `done`, or back to
+pending repository a directory, a Board and an inbox for tickets at
+once; it is `open`, `approved` on its Board, then `done`, or back to
 `open` with a note naming the failed step, or `rejected`. The CI's
 onboarding worker (every 2 s, `[onboarding]` of `ci.toml`) adds the bot as
 a collaborator and the push hook on Forgejo with `admin_token`, stores a
@@ -302,28 +314,35 @@ the first push pipeline. The configuration is one swappable snapshot:
 SIGHUP (`systemctl --user reload zeughaus-ci`) re-reads `[repos]` and
 `ci/onboarded/`, and refuses any other change. Sessions run on the runners, dispatched by the CI
 (`<state-dir>/ci/sessions.json`, announced as `CiSessions`): every 2 s it
-starts a master for each approved plan of a repository whose queue is not
-paused (`ci/docs/<repo>/paused`, the Plans view's `Pause queue`) on a free
+opens a plan session for each ready ticket whose dependencies are done and
+that nobody holds (on the runner that wrote its plan after a Refine, else
+one its first `Runs on` selector matches), and starts a master for each
+approved ticket whose dependencies are done of a repository whose queue is
+not paused (`ci/docs/<repo>/paused`, the Board's `Pause queue`) on a free
 connected runner with `sessions = true` that its first selector matches,
 reserving the `ssh` runners its other selectors match; a runner hosts one
 master at a time, so several plans run at once on different runners. The
-runner opens `zeughaus-runner master <repo> --plan <n>` in a tab of its
-repository's group (the plan's `Open` brings it to the front), in the session's own clone
+runner opens `zeughaus-runner master <repo> --ticket <n>` in a tab of its
+repository's group (the ticket's `Open` brings it to the front), in the session's own clone
 under `<state-dir>/agent-work/`, never in the user's checkouts (a missing
 one is cloned over ssh from the origin in that terminal first): it
 fast-forwards the master clone `agent-work/master/<origin>` to the default
 branch, waiting while it is dirty or has unpushed commits, and runs `omp
 @<plan> <instruction>` with `ZEUGHAUS_PLAN=<repo>#<n>`, then exits with
-omp's code; the plan stays `in_progress` until `plan_done`, Requeue or Mark
-done. A session that fails to start puts its plan back in the queue and
-keeps its runner from masters for 5 minutes. The Plans view's `Plan session`
-and an open proposal's `Plan this proposal` ask the CI for a plan session (on the
-editor's own runner when it hosts sessions), which opens `zeughaus-runner
-plan <repo> [--proposal <n>]` in the runner's group of the repository: it brings
-the plan clone `agent-work/plan/<origin>`, which borrows the objects of the
-master clone, detached to `origin/<default branch>` and runs omp there on
-the `plan` model role (`--model @plan`), the proposal attached to its first
-prompt. Every session sees `ZEUGHAUS_SESSION`, `ZEUGHAUS_RUNNER`,
+omp's code; the ticket stays `in_progress` until `plan_done`, Requeue or
+Mark done. A session that fails to start puts its ticket back in the queue
+and keeps its runner from masters for 5 minutes. A plan session opens
+`zeughaus-runner plan <repo> [--ticket <n> [--resume <file>]]` in the
+runner's group of the repository: it brings the plan clone
+`agent-work/plan/<origin>`, which borrows the objects of the master clone,
+detached to `origin/<default branch>` and runs omp there on the `plan`
+model role (`--model @plan`) with `ZEUGHAUS_TICKET=<n>`: the ticket's brief
+(its text and links) attached to its first prompt, or after a Refine `omp
+--resume <file>` with the review attached (the plan, the review and the
+brief when that file is gone). The Board's `Plan session` asks the CI for
+a plan session without a ticket (on the editor's own runner when it hosts
+sessions), whose plan becomes a new ticket. Every session sees
+`ZEUGHAUS_SESSION`, `ZEUGHAUS_RUNNER`,
 `ZEUGHAUS_CI` (which its MCP server and `ci` commands dial) and
 `ZEUGHAUS_MACHINES` (`name=ssh;...`), and `ZEUGHAUS_OMP` overrides the omp
 it runs; `zeughaus-runner ci session [--json] <id>` describes it, which the
@@ -333,12 +352,10 @@ In every session `plan` starts (`ZEUGHAUS_PLAN_SESSION=<repo>`), the omp
 plugin supplies the plan mode instead of omp's: a plan-session system
 prompt, a read-only working tree for every agent (`write`/`edit` only to
 `local://` and the internal devices, no `ast_edit`), a reminder when a
-turn ends without `ask` or `propose_plan`, and the `propose_plan` tool.
-That tool opens omp's plan review view with `Save and approve` and `Save`
-(store the plan with `ci plan-save [--approve]` and end the session) and
-`Refine` (the view's annotations return to the agent as the tool's
-result); the view also offers Copy and the external editor (`$VISUAL` or
-`$EDITOR`), and keeps a plan's annotations until they are sent.
+turn ends without `ask` or `submit_plan`, and the `submit_plan` tool,
+which stores the plan on the ticket with `ci plan-write --ticket <n>
+--omp-session <file>` (the session file a Refine resumes) and ends the
+session. The user reviews it in the ticket's popout.
 
 A runner also runs the tasks of `<state-dir>/maintain.toml` (`[[task]]` with
 `name`, `command` as an argv, `every_minutes` and `timeout_minutes`,

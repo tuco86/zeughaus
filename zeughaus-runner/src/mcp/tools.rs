@@ -38,10 +38,11 @@ ci_pipelines, ci_pipeline and ci_log show the CI's state and output; ci_timing s
 time went; ci_run queues the default branch's push or nightly pipeline now, ci_rerun a pipeline \
 again. ci_repo says which repository of the CI the current checkout is, its jobs and where \
 each runs, and whether HEAD and the default branch are green; in such a checkout `repo` can be \
-omitted. Plans and proposals of a repository live in the CI too: docs lists them, doc_read reads \
-one, proposal_write stores a proposal for another repository of the CI (instead of a \
+omitted. Tickets of a repository live in the CI too, one number from proposal through plan to \
+execution: docs lists them, doc_read reads one with its proposal, plan and links, \
+proposal_write stores an open ticket for another repository of the CI (instead of a \
 PROPOSAL-*.md in its root), onboard_request asks for a project the CI does not build yet to \
-join it, and a session executing a plan from zeughaus calls plan_done once its \
+join it, and a session executing a ticket's plan from zeughaus calls plan_done once its \
 work is committed and pushed. A job that names `state = [..]` in its header keeps data from one \
 pipeline to the next: ci_state lists those stores and their versions, ci_state_get downloads one \
 version into a directory and ci_state_delete removes a version or a whole store. The session \
@@ -476,27 +477,21 @@ impl Toolbox {
         }
     }
 
-    /// `docs`: a repository's plans and proposals, one line each.
+    /// `docs`: a repository's tickets, one line each.
     async fn docs(&self, args: RepoOnlyArgs) -> Result<String, String> {
         let repo = self.repo_or_checkout(args.repo).await?;
-        match self
-            .client
-            .ci(CiRequest::Docs { repo: repo.clone() })
-            .await?
-        {
-            CiReply::Docs { docs } if docs.is_empty() => {
-                Ok(format!("no plans or proposals in {repo}"))
-            }
-            CiReply::Docs { docs } => Ok(docs::docs_text(&docs, now())),
-            other => Err(unexpected(&other)),
+        match read_docs(&self.client, &repo).await? {
+            docs if docs.is_empty() => Ok(format!("no tickets in {repo}")),
+            docs => Ok(docs::docs_text(&docs, now())),
         }
     }
 
-    /// `doc_read`: one plan or proposal with its body.
+    /// `doc_read`: one ticket with its texts and links.
     async fn doc_read(&self, args: PipelineArgs) -> Result<String, String> {
         let repo = self.repo_or_checkout(args.repo).await?;
         let doc = read_doc(&self.client, &repo, args.number).await?;
-        Ok(docs::doc_text(&doc, now()))
+        let all = read_docs(&self.client, &repo).await.unwrap_or_default();
+        Ok(docs::doc_text(&doc, &all, now()))
     }
 
     /// `ci_state`: a repository's job state stores, or one store's versions.
@@ -561,8 +556,8 @@ impl Toolbox {
         })
     }
 
-    /// `proposal_write`: stores a proposal for another repository of the
-    /// CI, from the project this server works in.
+    /// `proposal_write`: stores a ticket for another repository of the CI,
+    /// from the project this server works in.
     async fn proposal_write(&self, args: ProposalArgs) -> Result<String, String> {
         let ProposalArgs {
             path,
@@ -599,16 +594,16 @@ impl Toolbox {
         let source = self.own_source().await?;
         let request = CiRequest::DocCreate {
             repo: repo.clone(),
-            kind: DocKind::Proposal,
+            kind: DocKind::Ticket,
             title,
             body,
             source,
-            proposals: Vec::new(),
+            links: Vec::new(),
             runs_on,
             onboard: None,
         };
         match self.client.ci(request).await? {
-            CiReply::DocCreated { number } => Ok(format!("proposal #{number} stored in {repo}")),
+            CiReply::DocCreated { number } => Ok(format!("stored ticket #{number} of {repo}")),
             other => Err(unexpected(&other)),
         }
     }
@@ -656,7 +651,7 @@ impl Toolbox {
             title,
             body,
             source,
-            proposals: Vec::new(),
+            links: Vec::new(),
             runs_on: Vec::new(),
             onboard: Some(OnboardSpec {
                 url: origin,
@@ -674,7 +669,7 @@ impl Toolbox {
         }
     }
 
-    /// `plan_done`: the plan this session executed is finished.
+    /// `plan_done`: the ticket this session executed is finished.
     async fn plan_done(&self, args: PipelineArgs) -> Result<String, String> {
         let repo = self.repo_or_checkout(args.repo).await?;
         let request = CiRequest::DocState {
@@ -683,7 +678,7 @@ impl Toolbox {
             state: DocState::Done,
         };
         match self.client.ci(request).await? {
-            CiReply::Accepted => Ok(format!("plan #{} of {repo} is done", args.number)),
+            CiReply::Accepted => Ok(format!("ticket #{} of {repo} is done", args.number)),
             other => Err(unexpected(&other)),
         }
     }
@@ -1061,6 +1056,17 @@ pub(super) async fn read_doc(client: &Client, repo: &str, number: u64) -> Result
     match client.ci(request).await? {
         CiReply::Doc { doc: Some(doc) } => Ok(*doc),
         CiReply::Doc { doc: None } => Err(format!("no document #{number} in {repo}")),
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// Every ticket of `repo`, without their texts.
+pub(super) async fn read_docs(client: &Client, repo: &str) -> Result<Vec<DocView>, String> {
+    let request = CiRequest::Docs {
+        repo: repo.to_owned(),
+    };
+    match client.ci(request).await? {
+        CiReply::Docs { docs } => Ok(docs),
         other => Err(unexpected(&other)),
     }
 }
@@ -1863,7 +1869,7 @@ fn definitions() -> Vec<Value> {
     let doc_number = json!({
         "type": "integer",
         "minimum": 1,
-        "description": "Number of the plan or proposal, as docs lists it.",
+        "description": "Number of the ticket, as docs lists it.",
     });
     let state_name = json!({
         "type": "string",
@@ -2118,17 +2124,17 @@ fn definitions() -> Vec<Value> {
         ),
         tool(
             "docs",
-            "The plans and proposals of a repository, one line each, grouped: awaiting \
-             approval, the queue of approved plans in the order they run, in progress, open \
-             proposals, then the history.",
+            "The tickets of a repository, one line each, grouped: awaiting review, the queue \
+             of approved tickets in the order they run, in progress, planning, open, then the \
+             history. A ticket that waits for the tickets it depends on says `(after #n)`.",
             json!({ "repo": repo }),
             &[],
             true,
         ),
         tool(
             "doc_read",
-            "One plan or proposal of a repository with its whole text: number, kind, state, \
-             title, where it came from, its age, then the body.",
+            "One ticket of a repository with its whole text: number, kind, state, title, where \
+             it came from, its age, its links, then its proposal and its plan.",
             json!({ "repo": repo, "number": doc_number }),
             &["number"],
             true,
@@ -2137,9 +2143,9 @@ fn definitions() -> Vec<Value> {
             "proposal_write",
             "Store a proposal for another repository of the CI, or for a project with an \
              onboarding request: what changed in this project and why, what the receiving \
-             project would change, and the checks. It waits there as an open proposal until a \
-             plan takes it up. Name the receiving project by the path of its checkout or by its \
-             repository name. Answers with its number.",
+             project would change, and the checks. It is an open ticket there, which keeps its \
+             number through its plan and execution. Name the receiving project by the path of \
+             its checkout or by its repository name. Answers with its number.",
             json!({
                 "path": {
                     "type": "string",
@@ -2226,8 +2232,8 @@ fn definitions() -> Vec<Value> {
         ),
         tool(
             "plan_done",
-            "Mark the plan this session executed as done, once its work is committed and \
-             pushed. The plan must be in progress.",
+            "Mark the ticket this session executed as done, once its work is committed and \
+             pushed. The ticket must be in progress; the tickets its plan includes close with it.",
             json!({ "repo": repo, "number": doc_number }),
             &["number"],
             false,
@@ -3327,13 +3333,10 @@ mod tests {
                     doc: Some(Box::new(fake_doc(true))),
                 },
                 CiRequest::Doc { .. } => CiReply::Doc { doc: None },
-                CiRequest::DocCreate { .. } => CiReply::DocCreated { number: 7 },
+                CiRequest::DocCreate { .. } | CiRequest::PlanWrite { .. } => {
+                    CiReply::DocCreated { number: 7 }
+                }
                 CiRequest::DocState { number: 2, .. } => CiReply::Accepted,
-                CiRequest::DocState {
-                    number: 7,
-                    state: DocState::Approved,
-                    ..
-                } => CiReply::Accepted,
                 CiRequest::DocState { number, .. } => CiReply::Error {
                     message: format!("no document #{number} in demo"),
                 },
@@ -3425,34 +3428,40 @@ mod tests {
             .holding(None)
     }
 
-    /// Plan #2 of the fake: saved an hour after the epoch.
+    /// Ticket #2 of the fake: in review an hour after the epoch.
     fn fake_doc(body: bool) -> DocView {
         DocView {
             repo: "demo".to_owned(),
             number: 2,
-            kind: DocKind::Plan,
+            kind: DocKind::Ticket,
             title: "Smoke plan".to_owned(),
-            state: DocState::Saved,
+            state: DocState::Review,
             source: "demo".to_owned(),
             created: 3600,
             changed: 3600,
             approved: None,
-            proposals: Vec::new(),
-            plan: None,
+            released: None,
+            links: Vec::new(),
+            merged: Vec::new(),
+            into: None,
             runs_on: Vec::new(),
             placement: Vec::new(),
-            body: if body {
+            body: String::new(),
+            plan_text: if body {
                 "# Smoke plan\n".to_owned()
             } else {
                 String::new()
             },
+            revision: 1,
+            planner: None,
+            feedback: String::new(),
             onboard: None,
             note: String::new(),
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_document_tools_list_and_read_plans() {
+    async fn the_document_tools_list_and_read_tickets() {
         let ci = fake_ci(0, None).await;
         let tools = toolbox_for(&ci);
 
@@ -3461,7 +3470,7 @@ mod tests {
             .await
             .expect("docs");
         assert!(
-            list.starts_with("Awaiting approval:\n  #2 plan saved: Smoke plan ("),
+            list.starts_with("Awaiting review:\n  #2 ticket review: Smoke plan ("),
             "{list}"
         );
 
@@ -3470,10 +3479,13 @@ mod tests {
             .await
             .expect("doc");
         assert!(
-            read.starts_with("#2 plan saved: Smoke plan\nfrom demo\ncreated "),
+            read.starts_with("#2 ticket review: Smoke plan\nfrom demo\ncreated "),
             "{read}"
         );
-        assert!(read.ends_with(" ago\n\n# Smoke plan\n"), "{read}");
+        assert!(
+            read.ends_with(" ago\n\n## Plan (revision 1)\n\n# Smoke plan\n"),
+            "{read}"
+        );
 
         let err = tools
             .call("doc_read", json!({ "repo": "demo", "number": 9 }))
@@ -3483,14 +3495,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn plan_done_marks_the_plan_done() {
+    async fn plan_done_marks_the_ticket_done() {
         let ci = fake_ci(0, None).await;
         let tools = toolbox_for(&ci);
         let text = tools
             .call("plan_done", json!({ "repo": "demo", "number": 2 }))
             .await
             .expect("done");
-        assert_eq!(text, "plan #2 of demo is done");
+        assert_eq!(text, "ticket #2 of demo is done");
         assert_eq!(
             ci.seen.asked.lock().unwrap().last(),
             Some(&CiRequest::DocState {
@@ -4255,16 +4267,16 @@ mod tests {
                 )
                 .await
                 .expect("stored");
-            assert_eq!(text, "proposal #7 stored in demo");
+            assert_eq!(text, "stored ticket #7 of demo");
             assert_eq!(
                 ci.seen.asked.lock().unwrap().last(),
                 Some(&CiRequest::DocCreate {
                     repo: "demo".to_owned(),
-                    kind: DocKind::Proposal,
+                    kind: DocKind::Ticket,
                     title: "Expose the clock".to_owned(),
                     body: "Why.".to_owned(),
                     source: "weida".to_owned(),
-                    proposals: Vec::new(),
+                    links: Vec::new(),
                     runs_on: Vec::new(),
                     onboard: None,
                 })
@@ -4363,7 +4375,7 @@ mod tests {
                     title: "Join".to_owned(),
                     body: "Scans.".to_owned(),
                     source,
-                    proposals: Vec::new(),
+                    links: Vec::new(),
                     runs_on: Vec::new(),
                     onboard: Some(OnboardSpec {
                         url: "git@example.invalid:o/scan-rs.git".to_owned(),
@@ -4697,31 +4709,37 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn plan_save_with_approve_stores_and_approves() {
+        async fn plan_write_stores_the_plan_on_its_ticket() {
             let ci = fake_ci(0, None).await;
             let file = std::env::temp_dir()
-                .join(format!("zeughaus-mcp-approve-{}.md", std::process::id()));
-            std::fs::write(&file, "# T\n\nbody\n").unwrap();
+                .join(format!("zeughaus-mcp-plan-write-{}.md", std::process::id()));
+            std::fs::write(&file, "# T\nIncludes: #3\n\nbody\n").unwrap();
             let client = ci_client(&ci);
             let line = ci_answer(
                 &client,
-                CiCommand::PlanSave {
+                CiCommand::PlanWrite {
                     json: true,
-                    approve: true,
                     repo: "demo".to_owned(),
+                    ticket: Some(4),
+                    omp_session: None,
                     file: file.clone(),
                 },
             )
             .await
-            .expect("stored and approved");
+            .expect("stored");
             let json: Value = serde_json::from_str(&line).expect("JSON");
-            assert_eq!(json, json!({"repo": "demo", "number": 7, "approved": true}));
+            assert_eq!(json, json!({"repo": "demo", "number": 7}));
             assert_eq!(
                 ci.seen.asked.lock().unwrap().last(),
-                Some(&CiRequest::DocState {
+                Some(&CiRequest::PlanWrite {
                     repo: "demo".to_owned(),
-                    number: 7,
-                    state: DocState::Approved,
+                    number: Some(4),
+                    title: "T".to_owned(),
+                    plan: "# T\nIncludes: #3\n\nbody\n".to_owned(),
+                    includes: vec![3],
+                    runs_on: Vec::new(),
+                    source: "demo".to_owned(),
+                    planner: None,
                 })
             );
             client.shutdown().await;
