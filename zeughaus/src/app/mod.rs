@@ -2355,7 +2355,10 @@ impl App {
         let tree = mouse_area(tree).on_exit(Message::Workspace(W::LeftBar));
 
         match placement {
+            // A gap keeps the last visible tab off the toolbar when the tabs
+            // overflow and scroll.
             iced_tabs::Placement::Top => row![container(tree).width(Length::Fill), self.toolbar()]
+                .spacing(12)
                 .align_y(iced::Alignment::Center)
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -2394,10 +2397,7 @@ impl App {
                         .links
                         .get(&section.key)
                         .map_or(section.label.as_str(), |link| link.label.as_str());
-                    let text = match self.host_of(&section.key) {
-                        None => format!("{name} (local)"),
-                        Some((glyph, _)) => format!("{glyph} {name}"),
-                    };
+                    let text = format!("{} {name}", self.device_glyph_of(&section.key));
                     RunnerChoice {
                         key: section.key.clone(),
                         text,
@@ -2453,14 +2453,19 @@ impl App {
             .gap(4);
             let mut split = row![press].align_y(iced::Alignment::Center);
             if choices.len() >= 2 {
+                // The runner a press uses, so the field says where the
+                // button opens it.
+                let default = choices
+                    .iter()
+                    .find(|choice| Some(&choice.key) == local.as_ref())
+                    .cloned();
                 split = split.push(
-                    iced::widget::pick_list(choices.clone(), None::<RunnerChoice>, move |choice| {
+                    iced::widget::pick_list(choices.clone(), default, move |choice| {
                         pick(choice.key)
                     })
-                    .placeholder("")
                     .font(crate::font::UI)
                     .text_size(12)
-                    .padding([2, 2])
+                    .padding([2, 4])
                     .handle(iced::widget::pick_list::Handle::Static(
                         iced::widget::pick_list::Icon {
                             font: crate::font::UI,
@@ -2494,7 +2499,7 @@ impl App {
             split.into()
         };
         let graph_target = local.clone().unwrap_or_else(RunnerKey::local);
-        row![
+        let bar = row![
             split(
                 GLYPH_SHELL,
                 "New shell",
@@ -2512,13 +2517,20 @@ impl App {
             split(
                 GLYPH_GROUP,
                 "New group",
-                local.map(|key| Message::Workspace(W::NewGroup(key))),
+                local
+                    .clone()
+                    .map(|key| Message::Workspace(W::NewGroup(key))),
                 |key| Message::Workspace(W::NewGroup(key)),
             ),
         ]
         .spacing(2)
-        .align_y(iced::Alignment::Center)
-        .into()
+        .align_y(iced::Alignment::Center);
+        // The sidebar is too narrow for three buttons and their choices on
+        // one line.
+        match self.workspace.placement {
+            iced_tabs::Placement::Top => bar.into(),
+            iced_tabs::Placement::Left => bar.wrap().vertical_spacing(2.0).into(),
+        }
     }
 
     /// The window's own titlebar, drawn because the system's is turned off:

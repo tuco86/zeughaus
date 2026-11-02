@@ -192,6 +192,9 @@ pub(super) struct ProjectsUi {
     /// The projects whose group was composed in this window before: a new
     /// one starts collapsed while the bar is on top.
     seen: HashSet<String>,
+    /// The project whose Board or channel view was in front at the last
+    /// sync: a change opens its group.
+    shown: Option<String>,
     /// What the local runner last listed.
     pub(super) listing: Option<ProjectsReply>,
     /// Why the last listing did not arrive.
@@ -389,6 +392,27 @@ impl App {
                     GroupTab::Board | GroupTab::Runner(_) => {}
                 }
             }
+        }
+        // A Board or channel view that just came to the front shows its tab:
+        // its group opens once, and the user may close it again.
+        let shown = match &self.page.view {
+            PageView::Board(origin) if self.page.open => Some(origin.clone()),
+            PageView::Channel(ci, view) if self.page.open => self
+                .ci
+                .get(ci)
+                .and_then(|client| client.origin_of_view(*view)),
+            _ => None,
+        };
+        if shown != self.projects.shown {
+            if let Some(board) = shown
+                .as_ref()
+                .and_then(|origin| self.projects.id(&ViewSlot::Board(origin.clone())))
+            {
+                self.workspace
+                    .collapsed
+                    .remove(&CollapseKey::Group(RunnerKey::projects(), GroupId(board)));
+            }
+            self.projects.shown = shown;
         }
         self.projects.groups = groups;
     }

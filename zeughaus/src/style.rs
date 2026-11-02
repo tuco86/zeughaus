@@ -173,9 +173,14 @@ pub fn pill_button(t: &Tokens) -> impl Fn(&Theme, button::Status) -> button::Sty
     filled_pill(t, |e| e.primary.base)
 }
 
-/// Rounded destructive button: the danger fill with its readable text.
+/// Destructive button: the secondary look with its words in the danger
+/// colour, so it never outweighs the primary action beside it.
 pub fn danger_button(t: &Tokens) -> impl Fn(&Theme, button::Status) -> button::Style + use<> {
-    filled_pill(t, |e| e.danger.base)
+    let quiet = secondary_button(t);
+    move |theme, status| button::Style {
+        text_color: theme.base().extended_palette().danger.base.color,
+        ..quiet(theme, status)
+    }
 }
 
 fn luminance(c: Color) -> f32 {

@@ -1541,7 +1541,11 @@ impl App {
                 Space::new().width(ICON_COLUMN),
                 head("Machine").width(MACHINE_WIDTH),
                 head("State").width(STATE_WIDTH),
-                head("Running").width(Length::FillPortion(2)),
+                // Indented like the job links below it, whose padding is their
+                // hover area.
+                container(head("Running"))
+                    .padding([0.0, SP_2])
+                    .width(Length::FillPortion(2)),
                 head("Labels").width(Length::FillPortion(1)),
             ]
             .spacing(SP_3)
@@ -1627,10 +1631,15 @@ impl App {
             .align_y(Alignment::Center)
             .width(STATE_WIDTH),
             container(jobs).width(Length::FillPortion(2)),
-            text(machine.labels.join(", "))
-                .size(TEXT_SM)
-                .color(muted)
-                .width(Length::FillPortion(1)),
+            // One line: a row's height is its glyph's, not its labels'.
+            container(
+                text(machine.labels.join(", "))
+                    .size(TEXT_SM)
+                    .color(muted)
+                    .wrapping(Wrapping::None),
+            )
+            .clip(true)
+            .width(Length::FillPortion(1)),
         ]
         .spacing(SP_3)
         .align_y(Alignment::Center)

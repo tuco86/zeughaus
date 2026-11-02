@@ -37,8 +37,9 @@ const BODY_MAX_WIDTH: f32 = 900.0;
 /// The glyphs of the Plans tab's buttons (codicons of the bundled Nerd Font).
 const CHECK: char = '\u{eab2}';
 const TRASH: char = '\u{ea81}';
-const TERMINAL: char = '\u{ea85}';
 const EDIT: char = '\u{ea73}';
+const PAUSE: char = '\u{ead1}';
+const PLAY: char = '\u{eb2c}';
 
 /// One repository's Plans tab.
 pub(super) struct PlansState {
@@ -647,13 +648,13 @@ impl App {
             .is_some_and(|r| r.paused);
         let (glyph, words, what) = if paused {
             (
-                TERMINAL,
+                PLAY,
                 "Resume queue",
                 "Dispatch the approved plans to runners again",
             )
         } else {
             (
-                TERMINAL,
+                PAUSE,
                 "Pause queue",
                 "Start no master for the approved plans until resumed",
             )
@@ -723,10 +724,17 @@ impl App {
         }
         let text_part: Element<'a, Message, Theme> = match (&state.shown, &state.shown_error) {
             (Some((number, content)), _) if *number == doc.number => {
-                let settings = markdown::Settings::with_text_size(
-                    TEXT_MD,
-                    markdown::Style::from_palette(self.theme.base().palette()),
-                );
+                // The editor's face, and theme roles for inline code, not
+                // the platform's sans and a fixed highlight.
+                let palette = self.theme.base().palette();
+                let mut style = markdown::Style::from_palette(palette);
+                style.font = crate::font::UI;
+                style.inline_code_font = crate::font::UI;
+                style.code_block_font = crate::font::UI;
+                style.inline_code_highlight.background =
+                    Tokens::of(&self.theme).surface_hover.into();
+                style.inline_code_color = palette.text;
+                let settings = markdown::Settings::with_text_size(TEXT_MD, style);
                 markdown::view(content.items(), settings)
                     .map(move |uri| Message::Ci(runner.clone(), CiMsg::OpenLink(uri)))
             }

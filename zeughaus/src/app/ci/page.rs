@@ -51,6 +51,8 @@ const PIPELINE_DOT: f32 = 8.0;
 const DONE_SHOWN: usize = 12;
 /// How long a card the CI moved carries its ring.
 const MOVED_FOR: Duration = Duration::from_secs(2);
+/// The narrowest a Board column gets before the board scrolls sideways.
+const COLUMN_MIN: f32 = 168.0;
 
 /// The glyphs of a project's channels: dev, nightly, release, and any
 /// other.
@@ -789,18 +791,23 @@ impl App {
         Task::batch([selected, self.redock()])
     }
 
-    /// The runner and terminal of a running card: a plan's master, a plan
-    /// session's own.
-    fn card_terminal(&self, ci: &RunnerKey, card: Card) -> Option<(RunnerKey, TerminalId)> {
+    /// The live session of a running card: a plan's master, a plan
+    /// session itself.
+    fn card_session(&self, ci: &RunnerKey, card: Card) -> Option<&SessionView> {
         let client = self.ci.get(ci)?;
-        let session = match card {
+        match card {
             Card::Doc(number) => client.sessions().find(|s| {
                 s.kind == SessionKind::Master && s.doc == Some(number) && s.state.is_live()
-            })?,
-            Card::Session(id) => client.sessions().find(|s| s.id == id)?,
-        };
+            }),
+            Card::Session(id) => client.sessions().find(|s| s.id == id),
+        }
+    }
+
+    /// The runner and terminal of a running card's session.
+    fn card_terminal(&self, ci: &RunnerKey, card: Card) -> Option<(RunnerKey, TerminalId)> {
+        let session = self.card_session(ci, card)?;
         Some((
-            client.runner_key(&session.runner)?,
+            self.ci.get(ci)?.runner_key(&session.runner)?,
             TerminalId(session.terminal?),
         ))
     }
@@ -1034,28 +1041,32 @@ impl App {
                 .map(|(_, at)| *at);
             tables = tables.push(self.runners_view(ci, client, cursor));
         }
-        let activity: Element<'_, Message, Theme> = match &self.page.machine {
-            Some((ci, at)) => match self.ci.get(ci).and_then(|client| {
-                let machine = client.overview.as_ref()?.machines.get(*at)?;
-                Some((client, machine))
-            }) {
-                Some((client, machine)) => self.runner_activity(t, client, &machine.name),
-                None => Space::new().into(),
-            },
-            None => container(
-                text("Choose a runner to see what it runs.")
-                    .size(ROW_TEXT)
-                    .color(self.theme.muted()),
-            )
-            .padding(12)
+        // What a runner runs takes the lower part once one is chosen; until
+        // then the tables keep the height and a line says how.
+        let chosen = self.page.machine.as_ref().and_then(|(ci, at)| {
+            let client = self.ci.get(ci)?;
+            let machine = client.overview.as_ref()?.machines.get(*at)?;
+            Some((client, machine))
+        });
+        match chosen {
+            Some((client, machine)) => column![
+                container(tables).height(Length::FillPortion(3)),
+                rule::horizontal(1),
+                container(self.runner_activity(t, client, &machine.name))
+                    .height(Length::FillPortion(2)),
+            ]
             .into(),
-        };
-        column![
-            container(tables).height(Length::FillPortion(3)),
-            rule::horizontal(1),
-            container(activity).height(Length::FillPortion(2)),
-        ]
-        .into()
+            None => column![
+                container(tables).height(Length::Fill),
+                container(
+                    text("Choose a runner to see what it runs.")
+                        .size(CAPTION_TEXT)
+                        .color(self.theme.muted()),
+                )
+                .padding([8, 16]),
+            ]
+            .into(),
+        }
     }
 
     /// One row of the Overview: the glyph in its severity's colour, the
@@ -1247,42 +1258,63 @@ impl App {
                 .collect::<Vec<_>>(),
         );
         let cursor = self.page.board.at(&cards);
-        let mut columns = row![].spacing(12).padding([8, 16]).height(Length::Fill);
-        for (at, (title, cards)) in COLUMNS.iter().zip(cards.iter()).enumerate() {
-            let count = container(text(cards.len().to_string()).size(11))
-                .padding([0, 6])
-                .style(style::badge(t, false));
-            let mut list = column![].spacing(8);
-            if cards.is_empty() {
-                list = list.push(text("Nothing here").size(CAPTION_TEXT).color(muted));
-            }
-            for (row_at, card) in cards.iter().enumerate() {
-                let selected = cursor == (at, row_at);
-                list = list.push(self.board_card(
-                    t,
-                    ci,
-                    client,
-                    state.docs(),
-                    *card,
-                    at,
-                    row_at,
-                    selected,
-                ));
-            }
-            columns = columns.push(
-                column![
-                    row![
-                        text(title.to_uppercase()).size(CAPTION_TEXT).color(muted),
-                        count
+        // Five equal columns, each at least `COLUMN_MIN` wide: below that
+        // the columns keep their width and the board scrolls sideways.
+        let t = *t;
+        let columns = iced::widget::responsive(move |size| {
+            let narrow = size.width < COLUMNS.len() as f32 * (COLUMN_MIN + 12.0) + 32.0;
+            let width = if narrow {
+                Length::Fixed(COLUMN_MIN)
+            } else {
+                Length::FillPortion(1)
+            };
+            let mut columns = row![].spacing(12).padding([8, 16]).height(Length::Fill);
+            for (at, (title, cards)) in COLUMNS.iter().zip(cards.iter()).enumerate() {
+                let count = container(text(cards.len().to_string()).size(11))
+                    .padding([0, 6])
+                    .style(style::badge(&t, false));
+                let mut list = column![].spacing(6);
+                if cards.is_empty() {
+                    list = list.push(text("Nothing here").size(CAPTION_TEXT).color(muted));
+                }
+                for (row_at, card) in cards.iter().enumerate() {
+                    let selected = cursor == (at, row_at);
+                    list = list.push(self.board_card(
+                        &t,
+                        ci,
+                        client,
+                        state.docs(),
+                        *card,
+                        at,
+                        row_at,
+                        selected,
+                    ));
+                }
+                columns = columns.push(
+                    column![
+                        row![
+                            text(title.to_uppercase()).size(CAPTION_TEXT).color(muted),
+                            count
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                        scrollable(list).height(Length::Fill),
                     ]
-                    .spacing(6)
-                    .align_y(Alignment::Center),
-                    scrollable(list).height(Length::Fill),
-                ]
-                .spacing(8)
-                .width(Length::FillPortion(1)),
-            );
-        }
+                    .spacing(8)
+                    .width(width),
+                );
+            }
+            if narrow {
+                scrollable(columns)
+                    .direction(scrollable::Direction::Horizontal(
+                        scrollable::Scrollbar::new(),
+                    ))
+                    .height(Length::Fill)
+                    .into()
+            } else {
+                columns.into()
+            }
+        });
         let board = column![
             self.plans_toolbar(ci, client, view, state),
             rule::horizontal(1),
@@ -1359,8 +1391,14 @@ impl App {
         }
         first = first.push(text(head).size(ROW_TEXT).width(Length::Fill));
         let mut second = row![].spacing(6).align_y(Alignment::Center);
-        if let Some(changed) = changed {
-            second = second.push(text(age_of(changed)).size(CAPTION_TEXT).color(muted));
+        // A running card counts from its session's start, the rest from
+        // their last change.
+        let since = match self.card_session(ci, card) {
+            Some(session) if column == 3 => Some(session.started),
+            _ => changed,
+        };
+        if let Some(since) = since {
+            second = second.push(text(age_of(since)).size(CAPTION_TEXT).color(muted));
         }
         for selector in runs_on {
             second = second.push(
@@ -1372,9 +1410,12 @@ impl App {
         if column == 3 {
             second = second.push(self.running_line(ci, card));
         }
+        // The ring of a card the CI just moved eases out around it, outside
+        // the border that marks the selection.
         let ring = key
             .and_then(|key| self.page.board.moved.get(&key))
-            .map(|at| 1.0 - (at.elapsed().as_secs_f32() / MOVED_FOR.as_secs_f32()).min(1.0))
+            .map(|at| (1.0 - at.elapsed().as_secs_f32() / MOVED_FOR.as_secs_f32()).max(0.0))
+            .map(|left| left * left)
             .filter(|alpha| *alpha > 0.0);
         let accent = self.theme.accent();
         let surface = t.surface;
@@ -1385,8 +1426,6 @@ impl App {
             .style(move |_: &Theme| {
                 let (color, width) = if selected {
                     (accent, 2.0)
-                } else if let Some(alpha) = ring {
-                    (Color { a: alpha, ..accent }, 2.0)
                 } else {
                     (border, 1.0)
                 };
@@ -1400,7 +1439,20 @@ impl App {
                     ..container::Style::default()
                 }
             });
-        mouse_area(body)
+        let halo = container(body)
+            .padding(3)
+            .style(move |_: &Theme| container::Style {
+                border: Border {
+                    color: Color {
+                        a: ring.unwrap_or(0.0),
+                        ..accent
+                    },
+                    width: 2.0,
+                    radius: 9.0.into(),
+                },
+                ..container::Style::default()
+            });
+        mouse_area(halo)
             .interaction(iced::mouse::Interaction::Pointer)
             .on_press(Message::BoardSelect(column, row_at))
             .into()
@@ -1412,8 +1464,9 @@ impl App {
         let muted = self.theme.muted();
         let mut line = row![].spacing(4).align_y(Alignment::Center);
         let Some((runner, terminal)) = self.card_terminal(ci, card) else {
+            // In progress, but no session works on it now.
             return line
-                .push(text("running").size(CAPTION_TEXT).color(muted))
+                .push(text("no session").size(CAPTION_TEXT).color(muted))
                 .into();
         };
         if let Some((glyph, name)) = self.host_of(&runner) {

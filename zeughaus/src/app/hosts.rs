@@ -23,6 +23,19 @@ pub(super) fn device_glyph(labels: &[String]) -> char {
 pub(super) const OFFLINE_GLYPH: char = '\u{ead0}';
 
 impl App {
+    /// The device glyph of runner `key`, this machine's included.
+    pub(super) fn device_glyph_of(&self, key: &RunnerKey) -> char {
+        device_glyph(self.labels_of(key))
+    }
+
+    /// What the CIs list as runner `key`'s labels.
+    fn labels_of(&self, key: &RunnerKey) -> &[String] {
+        self.directory
+            .iter()
+            .find(|runner| runner.fingerprint == key.as_str())
+            .map_or(&[][..], |runner| runner.labels.as_slice())
+    }
+
     /// The glyph and name of the machine behind section `key`: `None` for
     /// this machine's own runner and for the editor's local graphs.
     pub(super) fn host_of(&self, key: &RunnerKey) -> Option<(char, String)> {
@@ -34,17 +47,12 @@ impl App {
         if self.local_runner.as_ref() == Some(key) {
             return None;
         }
-        let labels = self
-            .directory
-            .iter()
-            .find(|runner| runner.fingerprint == key.as_str())
-            .map_or(&[][..], |runner| runner.labels.as_slice());
         let name = self
             .runtime
             .links
             .get(key)
             .map(|link| link.label.clone())
             .unwrap_or_default();
-        Some((device_glyph(labels), name))
+        Some((self.device_glyph_of(key), name))
     }
 }
