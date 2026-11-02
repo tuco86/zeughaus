@@ -748,7 +748,7 @@ impl Executor {
                 }
                 let from = artifacts_dir(&self.state_dir).join(run);
                 if from.is_dir() {
-                    stage::link_tree(&from, &dest)
+                    stage::stage_tree(&from, &dest)
                         .map_err(|e| format!("cannot stage inputs of {}: {e}", input.need))?;
                 }
             }

@@ -1,5 +1,6 @@
 //! Files a run is staged from: secrets only its owner reads, input trees
-//! shared by hard link, and the container engine.
+//! (hard links, or clones under Apple's `container`), and the container
+//! engine.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -47,6 +48,24 @@ pub fn write_secret(path: &Path, text: &str) -> Result<(), String> {
 /// Hard-links every file under `from` into `to` (copying where a link is
 /// refused), creating directories as needed.
 pub fn link_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    put_tree(from, to, true)
+}
+
+/// Puts a local artifact set under a job's `inputs/<need>`. Where the
+/// host's container engine is Apple's `container`, each job gets its own
+/// copy of every file (a clone on APFS, which costs what a link does): its
+/// VMs see the run directory over virtiofs with the inputs mounted
+/// writable, and removing one name of a hard-linked file there made the
+/// file vanish under the other names in a running job. Elsewhere the files
+/// are hard links into the set.
+pub fn stage_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    put_tree(from, to, Engine::host() != Engine::Apple)
+}
+
+/// Puts every file under `from` into `to`, creating directories as needed:
+/// a hard link when `link` (a copy where the link is refused), else a copy.
+/// Symlinks are recreated (copied on Windows).
+fn put_tree(from: &Path, to: &Path, link: bool) -> std::io::Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
@@ -54,7 +73,7 @@ pub fn link_tree(from: &Path, to: &Path) -> std::io::Result<()> {
         let target = to.join(entry.file_name());
         let kind = entry.file_type()?;
         if kind.is_dir() {
-            link_tree(&source, &target)?;
+            put_tree(&source, &target, link)?;
         } else if kind.is_symlink() {
             let _ = std::fs::remove_file(&target);
             #[cfg(unix)]
@@ -64,8 +83,9 @@ pub fn link_tree(from: &Path, to: &Path) -> std::io::Result<()> {
             #[cfg(not(unix))]
             std::fs::copy(&source, &target)?;
         } else {
+            // A clone fails on an existing destination.
             let _ = std::fs::remove_file(&target);
-            if std::fs::hard_link(&source, &target).is_err() {
+            if !link || std::fs::hard_link(&source, &target).is_err() {
                 std::fs::copy(&source, &target)?;
             }
         }
@@ -142,6 +162,30 @@ mod tests {
                 == std::fs::metadata(to.join("sub/a")).unwrap().ino();
             let _ = std::fs::remove_dir_all(&base);
             assert!(same);
+        }
+
+        #[test]
+        fn a_staged_tree_is_its_own_copy_exactly_under_apples_engine() {
+            use std::os::unix::fs::MetadataExt;
+            let base = std::env::temp_dir().join(format!("zci-stage-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let from = base.join("from");
+            std::fs::create_dir_all(from.join("lib")).unwrap();
+            std::fs::write(from.join("lib/libweida.so"), "lib").unwrap();
+            let (one, two) = (base.join("one"), base.join("two"));
+            stage_tree(&from, &one).unwrap();
+            stage_tree(&from, &two).unwrap();
+            let ino = |dir: &Path| {
+                std::fs::metadata(dir.join("lib/libweida.so"))
+                    .unwrap()
+                    .ino()
+            };
+            let shared = ino(&from) == ino(&one) && ino(&one) == ino(&two);
+            std::fs::remove_dir_all(&one).unwrap();
+            let left = std::fs::read_to_string(two.join("lib/libweida.so"));
+            let _ = std::fs::remove_dir_all(&base);
+            assert_eq!(shared, Engine::host() != Engine::Apple);
+            assert_eq!(left.unwrap(), "lib");
         }
     }
 }
