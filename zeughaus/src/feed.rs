@@ -414,6 +414,27 @@ pub async fn activity(endpoint: Endpoint, limit: u32) -> Result<Vec<ActivityEntr
         .ok_or_else(|| "activity: malformed".to_owned())
 }
 
+/// What the local runner lists as openable projects; `refresh` asks the
+/// forges again instead of the runner's cache.
+pub async fn projects(
+    endpoint: Endpoint,
+    refresh: bool,
+) -> Result<zeughaus_link::ProjectsReply, String> {
+    let quic = QUIC.as_ref().ok_or("no QUIC runtime")?;
+    let url = endpoint.path(zeughaus_link::PROJECTS_PATH)?;
+    let requester = quic.requester(client_tls());
+    first_dial(&url, || requester.connect(&url)).await?;
+    let reply = requester
+        .request(&zeughaus_link::ProjectsRequest { refresh }.encode())
+        .await
+        .map_err(|e| format!("projects: {e}"))?;
+    let encoded = reply
+        .collect(zeughaus_link::MAX_PROJECTS_REPLY_BYTES)
+        .await
+        .map_err(|e| format!("projects: {e}"))?;
+    zeughaus_link::ProjectsReply::decode(&encoded).ok_or_else(|| "projects: malformed".to_owned())
+}
+
 /// Asks a CI runner one question about its pipelines, machines or job
 /// transcripts. The runner's own refusal comes back as the error.
 pub async fn ci(endpoint: Endpoint, request: CiRequest) -> Result<CiReply, String> {

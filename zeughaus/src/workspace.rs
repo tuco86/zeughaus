@@ -82,6 +82,9 @@ impl RunnerKey {
     pub const LOCAL: &'static str = "local";
     /// The section of graphs whose runner is not connected.
     pub const OFFLINE: &'static str = "offline";
+    /// The section of the projects: their Boards, work shells, sessions and
+    /// channel views, from every runner.
+    pub const PROJECTS: &'static str = "projects";
 
     pub fn new(text: &str) -> RunnerKey {
         RunnerKey(Arc::from(text))
@@ -95,15 +98,36 @@ impl RunnerKey {
         RunnerKey::new(Self::OFFLINE)
     }
 
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn projects() -> RunnerKey {
+        RunnerKey::new(Self::PROJECTS)
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
     /// Whether this is a section no runner's workspace stands behind: the
-    /// two without a runner. Such a section takes no structural commands.
+    /// ones without a runner and the projects, whose tabs belong to many.
+    /// Such a section takes no structural commands.
     pub fn is_synthetic(&self) -> bool {
-        matches!(self.as_str(), Self::LOCAL | Self::OFFLINE)
+        matches!(self.as_str(), Self::LOCAL | Self::OFFLINE | Self::PROJECTS)
     }
+}
+
+/// The index `step` places after `at` in a list of `len`, wrapping at either
+/// end; without `at`, the first or (stepping back) the last. How
+/// Ctrl+PageDown and Ctrl+PageUp walk the bar.
+pub fn cycle_index(len: usize, at: Option<usize>, step: isize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let len = len as isize;
+    Some(match at {
+        Some(at) => (at as isize + step).rem_euclid(len) as usize,
+        None if step < 0 => (len - 1) as usize,
+        None => 0,
+    })
 }
 
 /// A tab, named across sections.
@@ -680,12 +704,10 @@ impl Workspace {
         self.active = Some(tab);
     }
 
-    /// Brings the tab `step` places after the one in front to the front, in
-    /// the bar's order across every section and wrapping at either end;
-    /// `-1` is the previous tab. With no tab in front, the first or the last.
-    pub fn cycle_tab(&mut self, step: isize) {
-        let order: Vec<TabRef> = self
-            .sections
+    /// Every tab of every section, in the sections' order.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub fn tab_order(&self) -> Vec<TabRef> {
+        self.sections
             .iter()
             .flat_map(|section| {
                 section.snapshot.tabs().map(|tab| TabRef {
@@ -693,21 +715,7 @@ impl Workspace {
                     tab: tab.id,
                 })
             })
-            .collect();
-        if order.is_empty() {
-            return;
-        }
-        let len = order.len() as isize;
-        let next = match self
-            .active
-            .as_ref()
-            .and_then(|active| order.iter().position(|tab| tab == active))
-        {
-            Some(index) => (index as isize + step).rem_euclid(len),
-            None if step < 0 => len - 1,
-            None => 0,
-        };
-        self.activate(order[next as usize].clone());
+            .collect()
     }
 
     /// The tab showing `graph`, preferring the one in front.
@@ -772,10 +780,6 @@ impl Workspace {
                 if let Some(pane) = self.stable(pane) {
                     self.focus(pane);
                 }
-                Update::none()
-            }
-            Message::CycleTab(step) => {
-                self.cycle_tab(step);
                 Update::none()
             }
             Message::TogglePlacement => {
@@ -1555,8 +1559,6 @@ impl Update {
 #[derive(Debug, Clone)]
 pub enum Message {
     ActivatePane(Pane),
-    /// The next (`1`) or previous (`-1`) tab in the bar's order.
-    CycleTab(isize),
     TogglePlacement,
     /// Split the focused pane, the new half a terminal.
     SplitFocused(Axis),
@@ -2193,20 +2195,12 @@ mod tests {
     }
 
     #[test]
-    fn cycling_walks_the_bar_through_groups_and_wraps() {
-        let mut workspace = attached(tree());
-        workspace.activate(tab_ref(1));
-        let mut seen = Vec::new();
-        for _ in 0..6 {
-            workspace.update(Message::CycleTab(1));
-            seen.push(workspace.active_tab().map(|t| t.tab.0));
-        }
-        assert_eq!(seen, [2, 3, 4, 7, 1, 2].map(Some));
-        workspace.update(Message::CycleTab(-1));
-        workspace.update(Message::CycleTab(-1));
-        assert_eq!(workspace.active_tab(), Some(&tab_ref(7)));
-        // The front tab's default pane takes the keyboard with it.
-        assert_eq!(workspace.focused_pane().map(|p| p.pane), Some(PaneId(70)));
+    fn stepping_wraps_at_both_ends_and_starts_at_an_end_without_a_front() {
+        assert_eq!(cycle_index(3, Some(2), 1), Some(0));
+        assert_eq!(cycle_index(3, Some(0), -1), Some(2));
+        assert_eq!(cycle_index(3, None, 1), Some(0));
+        assert_eq!(cycle_index(3, None, -1), Some(2));
+        assert_eq!(cycle_index(0, None, 1), None);
     }
 
     #[test]

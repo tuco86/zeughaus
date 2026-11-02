@@ -8,14 +8,13 @@
 //! drawn as Markdown beside it. The CI announces every change on `/events`
 //! (`CiDocs`, `CiSessions`), and the tab asks for the list again.
 
-use iced::widget::text::Wrapping;
 use iced::widget::{
     Space, button, column, container, markdown, row, rule, scrollable, text, text_input,
 };
 use iced::{Alignment, Element, Length, Task};
 use zeughaus_link::{
     CiReply, CiRequest, DocKind, DocState, DocView, MachineView, SessionKind, SessionState,
-    SessionView, doc_groups,
+    SessionView,
 };
 use zeughaus_mux::TerminalId;
 use zeughaus_theme::Theme;
@@ -32,8 +31,6 @@ use crate::style::{self, Tokens};
 use crate::transport::Endpoint;
 use crate::workspace::{RunnerKey, TabRef};
 
-/// The width of the document list.
-const LIST_WIDTH: f32 = 360.0;
 /// The widest a document's text grows.
 const BODY_MAX_WIDTH: f32 = 900.0;
 
@@ -91,6 +88,16 @@ impl PlansState {
     /// attempt failed.
     pub(super) fn behind(&self) -> bool {
         (!self.loaded || self.error.is_some()) && !self.loading
+    }
+
+    /// The documents, bodies empty, in number order.
+    pub(super) fn docs(&self) -> &[DocView] {
+        &self.docs
+    }
+
+    /// The document whose detail is shown.
+    pub(super) fn selected(&self) -> Option<u64> {
+        self.selected
     }
 }
 
@@ -388,7 +395,7 @@ impl CiClient {
     }
 
     /// The runner key of runner `name`: its pinned fingerprint.
-    pub(super) fn runner_key(&self, name: &str) -> Option<RunnerKey> {
+    pub(in crate::app) fn runner_key(&self, name: &str) -> Option<RunnerKey> {
         let fingerprint = self
             .runner_view(name)?
             .fingerprint
@@ -578,9 +585,9 @@ impl App {
         Task::none()
     }
 
-    /// A repository's Plans tab: its toolbar, the list of its documents and
-    /// the selected one beside it.
-    pub(super) fn plans_view<'a>(
+    /// A repository's Board toolbar: its name, what the last action came
+    /// to, `Plan session` and `Pause queue`.
+    pub(super) fn plans_toolbar<'a>(
         &'a self,
         runner: &'a RunnerKey,
         client: &'a CiClient,
@@ -591,7 +598,7 @@ impl App {
         let mut toolbar = row![
             text(state.repo.as_str()).size(TEXT_MD).color(muted),
             icon(glyph::CHEVRON_RIGHT, TEXT_MD, muted),
-            text("Plans").size(TEXT_MD),
+            text("Board").size(TEXT_MD),
             Space::new().width(Length::Fill),
         ]
         .spacing(SP_2)
@@ -668,101 +675,13 @@ impl App {
             });
         }
         toolbar = toolbar.push(tip(pressed, what.to_owned()));
-
-        let body: Element<'a, Message, Theme> = if state.docs.is_empty() {
-            let why = match (&state.error, state.loaded) {
-                (Some(error), _) => error.as_str(),
-                (None, true) => {
-                    "No plans or proposals yet. A plan session saves its plan from the plan \
-                     review; another project's session writes a proposal with proposal_write."
-                }
-                (None, false) => "Loading plans.",
-            };
-            super::super::unavailable("Plans", why)
-        } else {
-            row![
-                self.doc_list(runner, client, view, state),
-                rule::vertical(1),
-                self.doc_detail(runner, client, view, state),
-            ]
-            .height(Length::Fill)
-            .into()
-        };
-        column![toolbar, rule::horizontal(1), body].into()
-    }
-
-    /// The documents in their groups, one dense row each that selects it:
-    /// its number and title, its `Runs on` selectors, where an in-progress
-    /// plan runs, and the age of its last change.
-    fn doc_list<'a>(
-        &'a self,
-        runner: &'a RunnerKey,
-        client: &'a CiClient,
-        view: u64,
-        state: &'a PlansState,
-    ) -> Element<'a, Message, Theme> {
-        let t = Tokens::of(&self.theme);
-        let muted = self.theme.muted();
-        let now = now();
-        let mut list = column![].spacing(SP_1).padding([SP_3, SP_2]);
-        for (group, docs) in doc_groups(&state.docs) {
-            list = list.push(
-                container(
-                    text(group.title().to_uppercase())
-                        .size(TEXT_SM)
-                        .color(muted),
-                )
-                .padding([SP_2, SP_2]),
-            );
-            for doc in docs {
-                let number = doc.number;
-                let selected = state.selected == Some(number);
-                let mut line = row![
-                    text(format!("#{number}")).size(TEXT_SM).color(muted),
-                    text(doc.title.as_str())
-                        .size(13)
-                        .wrapping(Wrapping::None)
-                        .width(Length::Fill),
-                ]
-                .spacing(SP_2)
-                .align_y(Alignment::Center);
-                for selector in &doc.runs_on {
-                    line = line.push(
-                        container(text(selector.as_str()).size(11))
-                            .padding([0, 6])
-                            .style(style::badge(&t, false)),
-                    );
-                }
-                if doc.state == DocState::InProgress
-                    && let Some(session) = client.master_of(&doc.repo, number)
-                {
-                    line = line.push(text(session.runner.as_str()).size(TEXT_SM).color(muted));
-                }
-                line = line.push(text(ago(doc.changed, now)).size(TEXT_SM).color(muted));
-                list = list.push(
-                    container(
-                        button(container(line).clip(true))
-                            .width(Length::Fill)
-                            .padding([SP_1 + 1.0, SP_2])
-                            .style(style::row_entry_button(&t, selected))
-                            .on_press_with(move || {
-                                Message::Ci(runner.clone(), CiMsg::Select { view, number })
-                            }),
-                    )
-                    .style(style::row_highlight(&t, selected)),
-                );
-            }
-        }
-        scrollable(list)
-            .width(LIST_WIDTH)
-            .height(Length::Fill)
-            .into()
+        toolbar.into()
     }
 
     /// The selected document: an action bar that stays on top, the master's
     /// terminal under it while one works on the plan, then the title, what
     /// the document is and its text.
-    fn doc_detail<'a>(
+    pub(super) fn doc_detail<'a>(
         &'a self,
         runner: &'a RunnerKey,
         client: &'a CiClient,
@@ -1022,32 +941,6 @@ impl App {
             client.runner_key(&session.runner)?,
             TerminalId(session.terminal?),
         ))
-    }
-
-    /// Moves the selection of Plans `view` `step` documents down the list
-    /// (up when negative), in the order the list shows them.
-    pub(super) fn plans_step(&mut self, ci: &RunnerKey, view: u64, step: i32) -> Task<Message> {
-        let Some(client) = self.ci.get_mut(ci) else {
-            return Task::none();
-        };
-        let Some(state) = client.plans.get(&view) else {
-            return Task::none();
-        };
-        let order: Vec<u64> = doc_groups(&state.docs)
-            .into_iter()
-            .flat_map(|(_, docs)| docs.into_iter().map(|doc| doc.number))
-            .collect();
-        if order.is_empty() {
-            return Task::none();
-        }
-        let at = match state
-            .selected
-            .and_then(|n| order.iter().position(|&o| o == n))
-        {
-            Some(at) => (at as i64 + i64::from(step)).clamp(0, order.len() as i64 - 1) as usize,
-            None => 0,
-        };
-        client.select(ci, view, order[at])
     }
 
     /// `a`, `r` and `p` on the selected document of Plans `view`: approve,

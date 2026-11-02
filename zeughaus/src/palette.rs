@@ -27,6 +27,9 @@ const HOLD_COMMAND_ID: &str = "runner.hold";
 const RELEASE_COMMAND_ID: &str = "runner.release";
 #[cfg(not(target_arch = "wasm32"))]
 const REOPEN_COMMAND_ID: &str = "terminal.reopen";
+/// Which project is runtime data as well.
+#[cfg(not(target_arch = "wasm32"))]
+const PROJECT_COMMAND_ID: &str = "project.open";
 
 /// The closed terminals per runner the palette offers to reopen.
 pub const REOPEN_LISTED: usize = 20;
@@ -43,6 +46,9 @@ pub struct RunnerState<'a> {
     pub runners: Vec<RunnerPalette<'a>>,
     /// Whether the focused pane's runner takes structural commands.
     pub pane_commands: bool,
+    /// The projects the user can open: name and origin.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub projects: Vec<(&'a str, &'a str)>,
 }
 
 /// What one runner offers.
@@ -194,9 +200,19 @@ fn runner_commands(state: &RunnerState<'_>) -> Vec<Command<Message>> {
     #[cfg(not(target_arch = "wasm32"))]
     commands.push(
         command("ci.page", "CI / Open page".to_string())
-            .description("What needs you and what works; channels, plans, sessions, runners")
+            .description("What needs you and what works, the projects and the runners")
             .action(Message::TogglePage),
     );
+    #[cfg(not(target_arch = "wasm32"))]
+    for (name, origin) in &state.projects {
+        commands.push(
+            command(PROJECT_COMMAND_ID, format!("Project / Open {name}"))
+                .description(format!(
+                    "{origin}: its group, and a shell in its work checkout"
+                ))
+                .action(Message::OpenProject((*origin).to_owned())),
+        );
+    }
     commands
 }
 

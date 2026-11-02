@@ -349,6 +349,12 @@ pub enum Message {
     PageOpen(crate::app::AttentionTarget),
     #[cfg(not(target_arch = "wasm32"))]
     PageCursor(usize),
+    // A runner of a CI's overview, whose activity the Overview shows.
+    #[cfg(not(target_arch = "wasm32"))]
+    PageMachine(crate::workspace::RunnerKey, usize),
+    // A pipeline dot of a Board's rail: its channel with the cursor on it.
+    #[cfg(not(target_arch = "wasm32"))]
+    PagePipeline(crate::workspace::RunnerKey, u64, u64),
     // What a terminal the page docks reported the user did.
     #[cfg(not(target_arch = "wasm32"))]
     PageTerminal(
@@ -356,6 +362,42 @@ pub enum Message {
         zeughaus_mux::TerminalId,
         iced_terminal::Action,
     ),
+    /// Ctrl+PageDown and Ctrl+PageUp: the next (`1`) or previous (`-1`) tab
+    /// in the bar's order, the Projects section's included.
+    CycleTab(isize),
+    // The Projects section of the bar: a press on a tab the editor made
+    // there (a Board, the button that starts a work shell, a channel view),
+    // opening a project with a shell or only its Board, closing a project's
+    // group, a channel badge of its header.
+    #[cfg(not(target_arch = "wasm32"))]
+    ProjectTab(zeughaus_mux::TabId),
+    #[cfg(not(target_arch = "wasm32"))]
+    OpenProject(String),
+    #[cfg(not(target_arch = "wasm32"))]
+    ShowProject(String),
+    #[cfg(not(target_arch = "wasm32"))]
+    DismissProject(String),
+    #[cfg(not(target_arch = "wasm32"))]
+    OpenChannelView(String, String),
+    // The Overview's project list: the section's `+` focuses its search,
+    // typing filters it, `Refresh` asks the forges again, and the local
+    // runner's answer.
+    #[cfg(not(target_arch = "wasm32"))]
+    OpenProjectSearch,
+    #[cfg(not(target_arch = "wasm32"))]
+    ProjectSearch(String),
+    #[cfg(not(target_arch = "wasm32"))]
+    RefreshProjects,
+    #[cfg(not(target_arch = "wasm32"))]
+    ProjectsArrived(Result<zeughaus_link::ProjectsReply, String>),
+    // A press on a card of a Board: its column and row.
+    #[cfg(not(target_arch = "wasm32"))]
+    BoardSelect(usize, usize),
+    // A Board's `Onboard` for a project no CI builds, and the CI's answer.
+    #[cfg(not(target_arch = "wasm32"))]
+    OnboardProject(String),
+    #[cfg(not(target_arch = "wasm32"))]
+    Onboarded(Result<(), String>),
 }
 
 /// What a letter asks of the CI page in front.
@@ -374,6 +416,9 @@ pub enum CiShortcut {
     Approve,
     /// `p`: plan the selected proposal.
     Plan,
+    /// `h` and Left, Right: a Board's column.
+    Left,
+    Right,
 }
 
 /// What a click on a notice opens.
@@ -454,11 +499,6 @@ pub enum CiMsg {
     Docs {
         view: u64,
         result: Result<Vec<zeughaus_link::DocView>, String>,
-    },
-    /// The user picked a document in a Plans tab.
-    Select {
-        view: u64,
-        number: u64,
     },
     /// One document with its body; `None` when the CI no longer has it.
     Shown {

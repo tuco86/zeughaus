@@ -294,20 +294,38 @@ with a transparent exterior and an opaque workspace. Maximizing removes
 the rounding and resize grips; restoring the window brings them back.
 The browser canvas stays rectangular.
 Below it are tabs of split panes (`iced_tabs::tree`, `pane_grid`). The tab
-bar has one section per connected runner, labelled with its host (and its
-port, or the start of its fingerprint, where two runners share one host), plus `Local` (no runner: the scratch graphs) or
-`Not running` (graphs whose runner is not connected); the CIs the editor
-dials have no section but the CI page (section 14). A runner section is
-that runner's shared workspace: loose tabs and one level of coloured,
+bar holds every connected runner's tabs and groups one after the other,
+without section headers, plus the editor's `Local` scratch graphs (no
+runner) or `Not running` graphs (their runner is not connected). A runner's
+part is its shared workspace: loose tabs and one level of coloured,
 collapsible groups, each tab a split tree whose leaves are terminals
 (section 9) or graphs, and order, groups, splits and ids come from the
-runner. Tabs never move between sections. Section controls add a shell, a
-graph (created for that runner) or a group. In both bar placements tabs are
+runner. Tabs never move between runners. A tab or group of a runner other
+than this machine's (the one its endpoint file names) carries its host's
+glyph, the `device=` label the CI lists for it (laptop, desktop, media,
+server) or a remote glyph without one (`zeughaus/src/app/hosts.rs`). The
+bar's toolbar opens a shell, a graph or a group on this machine's runner,
+and the choice beside each on another one.
+
+After the runners the `Projects` section holds one locked group per project
+(`zeughaus/src/app/projects.rs`, `compose`): every project the user opened
+(saved as `projects` in `editor.toml`) and every one a runner has a project
+group for (`GroupSnapshot::project`), unless the user closed its group and
+no tab came since. The group is named after the repository, tinted by its
+name, and its header carries one glyph per CI channel (dev, nightly,
+release, the rest) in the colour of its newest pipeline, each opening that
+channel's view as a tab of the group. Its tabs are the project's Board, its
+work shell (or `~/work/<name>`, which asks this machine's runner for one with
+`OpenProject`), its masters, its plan sessions, its other runner tabs and the
+channel views opened, in that order; the runner tabs stay their runners'
+and carry their host's glyph. A collapsed group repeats the badge of a tab
+whose agent waits. Ctrl+PageDown and Ctrl+PageUp walk all of it in the
+bar's order. In both bar placements tabs are
 dragged into and out of groups (collapsed ones too), onto another tab's
 content to split it, and a pane is dragged by its grip back into the bar to
 become a tab (`zeughaus/src/workspace.rs`, `drop_allowed`). A tab dropped on
 another tab lands before or after it by the half the pointer is over; the
-bar's empty rest after the last section is that section's end, and a drop
+bar's empty rest after the last runner is that runner's end, and a drop
 onto the place an item already has sends nothing (`drop_command`). Each
 pane draws its own graph; the camera is kept per graph, the focused pane's
 graph is where the palette spawns nodes, and the selection is dropped when
@@ -1383,21 +1401,32 @@ job's `JobView` carries its `cause` line (the one the forge status shows,
 but also for jobs that hold secrets: editors are trusted peers and can
 open the transcript anyway) and the stored `excerpt`. Every saved record is announced as
 `RuntimeEvent::CiPipeline` on the `ci` topic. In the editor
-(`zeughaus/src/app/ci.rs`, the page in `ci/page.rs`) each URL of `ci` is a
-link of its own, shown on the CI page, which a titlebar chip opens over the
-workspace (the chip says how many things need the user and how many work,
-coloured by the worst; the palette's "CI / Open page" does the same). The
-page's sidebar holds `Needs you` and `Working` (the Overview: agents that
-wait or work, as their terminals' activity reports them, plans awaiting
-approval, failed channels, sessions failed in the last day, running
-channels and live sessions; a terminal row's terminal is docked read-only
-beside the list, and Enter or a click brings its tab to the front), then
-per CI each repository with a row per channel (its dot the tone of the
-channel's newest pipeline) and its Plans, the CI's Sessions (a session's
-terminal docked, `Open tab`, `Stop`) and Runners (the table of runners and
-machines: kind glyph, name, state dot and word, running jobs that open
-their transcripts; beside it the selected runner's `/activity`, `Reopen` for
-an archived run). A channel lists its pipelines in a scrollable, newest on top
+(`zeughaus/src/app/ci.rs`, the views in `ci/page.rs`) each URL of `ci` is a
+link of its own. A titlebar chip opens the Overview over the workspace
+(the chip says how many things need the user and how many work, coloured
+by the worst; the palette's "CI / Open page" does the same): `Needs you`
+and `Working` (agents that wait or work, as their terminals' activity
+reports them, plans awaiting approval, failed channels, sessions failed in
+the last day, running channels and live sessions; a terminal row's terminal
+is docked read-only beside the list, and Enter or a click brings its tab
+to the front), the projects (the local runner's `/projects` and every CI
+repository, filtered by a search, each shown as a group with its Board on
+Enter), and each CI's runners (device glyph, name, state, running jobs
+that open their transcripts; under them the chosen runner's `/activity`,
+`Reopen` for an archived run). A project's Board and its channel views are
+tabs of its group in the bar. The Board is the project's lifecycle on one
+screen: the channel rail (glyph in the tone of the newest pipeline, name,
+the newest 12 pipelines as dots that open the channel at that pipeline),
+then five columns PROPOSALS, PLANS, QUEUE, RUNNING and DONE (the newest 12)
+of cards (number, title, age, `Runs on` chips; a running card adds its
+host's glyph and its agent's role and state). `h`/`l` and Left/Right change
+the column, `j`/`k` and Up/Down the card, Enter on a running card brings
+its agent's tab to the front and on any other opens the document's detail
+(text, actions, the master docked) beside the columns, `a`, `r` and `p`
+approve, reject and plan where the document offers it, and Escape closes
+the detail. A card the CI moved to another column carries an accent ring
+that fades over 2 s. A project no CI builds gets an `Onboard` button that
+files an onboarding request with the first CI. A channel lists its pipelines in a scrollable, newest on top
 and separated by rules, one row each: a status glyph (codicons from the
 bundled Nerd Font, so status never rests on colour alone), `#<n>` and the
 commit's subject (the CI reads it from its mirror when the pipeline starts,
@@ -1418,8 +1447,8 @@ with its queue key), which a channel shows as `Queued` rows above its
 pipelines. Up and Down (or `j` and `k`) move a cursor over the list in
 front, Enter opens or closes the pipeline under it, `r` reruns it, Shift+`C`
 cancels it and `l` opens the log of its first failed job (letters no widget
-took), and Escape closes the transcript, then the page, when no palette or
-rename takes it first. The
+took), and Escape closes the transcript (the Overview, on the Overview),
+when no palette or rename takes it first. The
 list is at most 1200 px wide. While the channel in front has something running, a
 one-second clock moves its elapsed times. The cables between the cards are one
 `iced_nodegraph_sdf` primitive under them; nothing pans, zooms, moves or

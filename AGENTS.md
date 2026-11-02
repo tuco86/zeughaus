@@ -101,32 +101,51 @@ In the editor: `Ctrl+Space` (on macOS also `Cmd+Shift+P`) opens the command
 palette (spawn nodes into the
 focused graph pane, save/load one graph as a `.zgh` file, auto layout, pick a theme,
 split or close the focused pane, attach or close a job's
-terminal, hold or release a runner), and `Ctrl+PageDown`/`Ctrl+PageUp`
+terminal, hold or release a runner, `Project / Open <name>`), and
+`Ctrl+PageDown`/`Ctrl+PageUp`
 switch to the next or previous tab, also from a terminal, whose child no
 longer receives them. The window draws its
 own titlebar; the button in its corner moves the tab bar between the top and
-the left edge. Theme and tab bar placement persist in
+the left edge. Theme, tab bar placement and the open projects persist in
 `<state-dir>/editor.toml`; WezTerm colour schemes dropped into
-`<state-dir>/themes/` appear as themes. The tab bar has one section per
-connected runner (plus `Local` without a runner, or `Not running` for graphs
-no runner's workspace shows); a section's terminal, graph and folder
-glyphs (tooltips say which) add a terminal tab, a graph that runner
-executes, or a coloured group. The CI each `ci = [..]` URL names is no tab
-section: a chip in the titlebar (`N need you`, `M working`, or `CI`; also
-"CI / Open page" in the palette) opens the CI page over the workspace. Its
-sidebar lists `Needs you` and `Working` (the Overview: agents that wait or
-work, plans awaiting approval, failed channels and sessions, running
-channels and sessions; a row's terminal docks read-only beside the list and
-Enter or a click brings its tab to the front), then per CI each repository
-with its channels and Plans, the CI's Sessions and its Runners (a runner's
-activity with `Reopen` for closed runs). A channel lists its pipelines one
+`<state-dir>/themes/` appear as themes. The tab bar holds every connected
+runner's tabs and groups without section headers (plus `Local` without a
+runner, or `Not running` for graphs no runner's workspace shows); a tab or
+group of a runner other than this machine's carries its host's glyph (the
+`device=` label of `ci.toml`: laptop, desktop, media, server). The toolbar's
+terminal, graph and folder glyphs open a shell, a graph or a group on this
+machine's runner, the choice beside each on another runner. After them the
+`Projects` section has one locked group per project the user opened (its
+`+` searches the projects on the Overview) or that a runner has a project
+group for: its header shows the dev, nightly and release channels in the
+colour of their newest pipeline (a press opens the channel as a tab of the
+group), and its tabs are the project's Board, its work shell in
+`~/work/<origin>` (or `~/work/<name>`, which opens one on this machine's
+runner, cloning the checkout first), its masters, its plan sessions and the
+opened channels; closing the group hides it until it is opened again or a
+new tab of it appears. A runner lists the projects (`/projects`): what the
+forges of `[projects]` in its `zeughaus.toml` let the user push to
+(`primary`, `[[projects.forge]]` with `kind = "forgejo"`/`"github"`, `url`
+for Forgejo and `token` as an argv such as `["get-secret", "..."]`) and the
+checkouts under its work root. A chip in the titlebar (`N need you`,
+`M working`, or `CI`; also "CI / Open page" in the palette) opens the
+Overview: `Needs you` and `Working` (agents that wait or work, plans
+awaiting approval, failed channels and sessions, running channels and
+sessions; a row's terminal docks read-only beside the list and Enter or a
+click brings its tab to the front), the projects with a search and
+`Refresh`, and each CI's runners (a runner's activity with `Reopen` for
+closed runs). A project's Board shows its channels as a rail of pipeline
+dots over five columns PROPOSALS, PLANS, QUEUE, RUNNING and DONE: `h`/`l`
+and `j`/`k` (or the arrows) move between cards, Enter opens a document's
+detail (or a running card's agent tab), `a`, `r` and `p` approve, reject
+and plan, Escape closes the detail; a project no CI builds offers
+`Onboard`. A channel lists its pipelines one
 row each, newest on top and open with its jobs, a cable animating while its
 artifact set moves, failures with their cause and log excerpt, `Rerun` and
 `Cancel`; pressing a job docks its transcript read-only beside the list,
 live while it runs. Up/Down or j/k and Enter walk and open a list, `r`,
-`Shift+C` and `l` rerun, cancel and open a pipeline's log, in Plans `a`,
-`r` and `p` approve, reject and plan the selected document; Escape closes a
-transcript, then the page. Channels come from
+`Shift+C` and `l` rerun, cancel and open a pipeline's log; Escape closes a
+transcript, or the Overview. Channels come from
 `.zeughaus-ci/channels.toml`. Closing a graph's tab
 deletes the graph. Double-clicking a
 tab or a group's name renames it; a tab that shows one graph renames the
@@ -135,7 +154,7 @@ on top or at the left, tabs are dragged into and
 out of groups, onto another tab's content to split it, and a pane of a split
 tab is dragged by its grip back into the bar; a tab dropped on a tab lands
 before or after it by the half under the pointer, and the bar's empty rest
-is the end of the last section. "Pane / Split Horizontal|Vertical" in the palette splits
+is the end of the last runner's tabs. "Pane / Split Horizontal|Vertical" in the palette splits
 the focused pane with a terminal, "Pane / Close" closes it and kills its
 child (a job's terminal is only detached); `Ctrl+Shift+T` takes control of a
 terminal someone else drives, `Ctrl+Shift+C`/`V` copy and paste,

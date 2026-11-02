@@ -109,6 +109,8 @@ pub(super) struct DirectoryRunner {
     /// As `weida::Fingerprint` writes it, the spelling a [`RunnerKey`] holds.
     pub fingerprint: String,
     pub addresses: Vec<std::net::SocketAddr>,
+    /// Its labels in `ci.toml`, `device=` among them.
+    pub labels: Vec<String>,
 }
 
 impl App {
@@ -137,6 +139,7 @@ impl App {
                     .iter()
                     .filter_map(|a| a.parse().ok())
                     .collect(),
+                labels: machine.labels.clone(),
             });
         }
         out
@@ -527,21 +530,6 @@ impl CiClient {
         self.terminals().any(|shown| shown == terminal)
     }
 
-    /// The colour of a channel's dot: how its newest pipeline went, in the
-    /// tone its cards use. None while there is nothing to say.
-    fn accent(&self, state: &ChannelState, theme: &Theme) -> Option<Color> {
-        let channel = self
-            .overview
-            .as_ref()?
-            .channels
-            .iter()
-            .find(|c| c.repo == state.repo && c.channel == state.channel)?;
-        match Tone::of(&channel.status) {
-            Tone::Idle => None,
-            tone => Some(tone.color(theme)),
-        }
-    }
-
     /// A repository, with an id minted for its Plans view the first time it
     /// is seen.
     fn repo_of(&mut self, repo: &str) -> &mut Repo {
@@ -571,6 +559,67 @@ impl CiClient {
             known.channels.insert(channel.to_owned(), view);
         }
         view
+    }
+
+    /// The CI's agent sessions, live ones and the newest ended ones.
+    pub(super) fn sessions(&self) -> impl Iterator<Item = &zeughaus_link::SessionView> {
+        self.overview.iter().flat_map(|overview| &overview.sessions)
+    }
+
+    /// Every repository of the CI's `ci.toml` (and pending onboarding).
+    pub(super) fn repo_docs(&self) -> impl Iterator<Item = &zeughaus_link::RepoDocsView> {
+        self.overview.iter().flat_map(|overview| &overview.repos)
+    }
+
+    /// The repository of the CI whose origin is `origin`.
+    pub(super) fn repo_docs_by_origin(&self, origin: &str) -> Option<&zeughaus_link::RepoDocsView> {
+        self.repo_docs().find(|repo| repo.origin == origin)
+    }
+
+    /// The repository named `repo`.
+    pub(super) fn repo_docs_named(&self, repo: &str) -> Option<&zeughaus_link::RepoDocsView> {
+        self.repo_docs().find(|known| known.repo == repo)
+    }
+
+    /// The view id of `repo`'s `channel`, while the CI lists it.
+    pub(super) fn channel_view(&self, repo: &str, channel: &str) -> Option<u64> {
+        self.repos.get(repo)?.channels.get(channel).copied()
+    }
+
+    /// The Plans view id of `repo`.
+    pub(super) fn plans_view_of(&self, repo: &str) -> Option<u64> {
+        self.repos.get(repo).map(|known| known.plans)
+    }
+
+    /// The origin of the repository channel view `view` belongs to.
+    pub(super) fn origin_of_view(&self, view: u64) -> Option<String> {
+        let repo = &self.views.get(&view)?.repo;
+        Some(self.repo_docs_named(repo)?.origin.clone())
+    }
+
+    /// The channel that channel view `view` shows.
+    pub(super) fn channel_name(&self, view: u64) -> Option<&str> {
+        Some(self.views.get(&view)?.channel.as_str())
+    }
+
+    /// `repo`'s channels as the CI's overview lists them: dev, nightly and
+    /// release first, then the rest by name.
+    pub(super) fn channels_of(&self, repo: &str) -> Vec<&zeughaus_link::ChannelView> {
+        let rank = |name: &str| match name {
+            "dev" => 0,
+            "nightly" => 1,
+            "release" => 2,
+            _ => 3,
+        };
+        let mut channels: Vec<&zeughaus_link::ChannelView> = self
+            .overview
+            .iter()
+            .flat_map(|overview| &overview.channels)
+            .filter(|channel| channel.repo == repo)
+            .collect();
+        channels
+            .sort_by(|a, b| (rank(&a.channel), &a.channel).cmp(&(rank(&b.channel), &b.channel)));
+        channels
     }
 
     fn ask_overview(&mut self, key: &RunnerKey) -> Task<Message> {
@@ -1114,11 +1163,13 @@ impl App {
             CiMsg::LoadOlder { view } => client.ask_pipelines(&key, view, true),
             CiMsg::OpenJob { view, number, job } => {
                 let asked = client.open_job(&key, view, number, job);
-                // A job opened from the Runners view is in its channel.
-                self.page.open = true;
-                self.page.view = page::PageView::Channel(key.clone(), view);
+                // A job opened from a runner is in its channel.
+                let shown = self.apply_page(Message::PageShow(page::PageView::Channel(
+                    key.clone(),
+                    view,
+                )));
                 // The transcript this one replaced is no longer wanted.
-                Task::batch([asked, self.reconcile_terminals(&key)])
+                Task::batch([asked, shown, self.reconcile_terminals(&key)])
             }
             CiMsg::Transcript {
                 view,
@@ -1160,7 +1211,6 @@ impl App {
                 }
             }
             CiMsg::Docs { view, result } => client.docs_arrived(&key, view, result),
-            CiMsg::Select { view, number } => client.select(&key, view, number),
             CiMsg::Shown {
                 view,
                 number,
@@ -1282,7 +1332,12 @@ impl App {
             }
             CiShortcut::Cancel => return Task::none(),
             // The page's own letters, answered above where they apply.
-            CiShortcut::Next | CiShortcut::Previous | CiShortcut::Approve | CiShortcut::Plan => {
+            CiShortcut::Next
+            | CiShortcut::Previous
+            | CiShortcut::Approve
+            | CiShortcut::Plan
+            | CiShortcut::Left
+            | CiShortcut::Right => {
                 return Task::none();
             }
             CiShortcut::OpenLog => {
@@ -1315,8 +1370,8 @@ impl App {
         Task::none()
     }
 
-    /// What Escape does when nothing nearer took it: closes the log beside
-    /// the channel the page shows, and without one the page.
+    /// What Escape does in front of a channel when nothing nearer took it:
+    /// closes the log beside it.
     pub(super) fn close_front_ci_log(&mut self) -> Task<Message> {
         let open = self.front_view().filter(|(runner, view)| {
             self.ci
@@ -1326,10 +1381,7 @@ impl App {
         });
         match open {
             Some((runner, view)) => self.apply_ci(runner, CiMsg::CloseTranscript { view }),
-            None => {
-                self.page.open = false;
-                Task::none()
-            }
+            None => Task::none(),
         }
     }
 
@@ -1447,12 +1499,12 @@ impl App {
     }
 
     /// The machines the CI runs jobs on: a table under a toolbar, like a
-    /// channel's list. A row selects its machine; the one at `cursor` is lit.
+    /// channel's list. A row chooses its machine; the one at `cursor` is lit.
     fn runners_view<'a>(
         &'a self,
         runner: &'a RunnerKey,
         client: &'a CiClient,
-        cursor: usize,
+        cursor: Option<usize>,
     ) -> Element<'a, Message, Theme> {
         let Some(overview) = &client.overview else {
             return unavailable(
@@ -1498,14 +1550,14 @@ impl App {
         .padding(SP_4);
         let t = crate::style::Tokens::of(&self.theme);
         for (at, machine) in overview.machines.iter().enumerate() {
-            let active = at == cursor;
+            let active = Some(at) == cursor;
             table = table.push(
                 container(
                     button(self.machine_row(runner, client, machine))
                         .width(Length::Fill)
                         .padding([SP_1, 0.0])
                         .style(crate::style::row_entry_button(&t, active))
-                        .on_press(Message::PageCursor(at)),
+                        .on_press_with(move || Message::PageMachine(runner.clone(), at)),
                 )
                 .style(crate::style::row_highlight(&t, active)),
             );
@@ -1557,7 +1609,7 @@ impl App {
         let (kind, kind_tip) = if machine.kind == "windows-vm" {
             (glyph::VM, "Windows VM")
         } else {
-            (glyph::SERVER, "Runner")
+            (crate::app::hosts::device_glyph(&machine.labels), "Runner")
         };
         let tone = state_tone(&machine.status);
         row![
@@ -2265,7 +2317,6 @@ mod glyph {
     pub const STOP: char = '\u{ead7}';
     pub const LOG: char = '\u{eb9d}';
     pub const CLOSE: char = '\u{ea76}';
-    pub const SERVER: char = '\u{eb50}';
     pub const VM: char = '\u{ea7a}';
     pub const CHEVRON_RIGHT: char = '\u{eab6}';
     pub const DOT: char = '\u{ea71}';

@@ -78,6 +78,10 @@ pub struct RestoreState {
     /// Nested containers open as views in a section without a runner.
     #[serde(default)]
     pub views: Vec<u64>,
+    /// Project groups the user closed: the origin and the runner tabs
+    /// `(runner key, tab)` the group held then.
+    #[serde(default)]
+    pub dismissed: Vec<(String, Vec<(String, u64)>)>,
 }
 
 /// The parts of a restore still waiting for what they apply to.
@@ -166,6 +170,13 @@ impl App {
                 Some(group) => CollapseKey::Group(runner, GroupId(*group)),
             });
         }
+        for (origin, tabs) in state.dismissed {
+            let tabs = tabs
+                .into_iter()
+                .map(|(runner, tab)| (RunnerKey::new(&runner), TabId(tab)))
+                .collect();
+            app.projects.dismissed.insert(origin, tabs);
+        }
         app.window_size = iced::Size::new(state.width, state.height);
         app.window_maximized = state.maximized;
         for &(node, width, height) in &state.node_sizes {
@@ -231,13 +242,18 @@ impl App {
         node_sizes.sort_by_key(|size| size.0);
         let mut selected: Vec<u64> = self.selected.iter().map(|node| node.0).collect();
         selected.sort_unstable();
+        // The Projects section's ids are this process's own; a new one
+        // mints its own and collapses its groups as a new window does.
         let mut collapsed: Vec<(String, Option<u64>)> = self
             .workspace
             .collapsed
             .iter()
-            .map(|key| match key {
-                CollapseKey::Section(runner) => (runner.as_str().to_owned(), None),
-                CollapseKey::Group(runner, group) => (runner.as_str().to_owned(), Some(group.0)),
+            .filter_map(|key| match key {
+                CollapseKey::Section(runner) => Some((runner.as_str().to_owned(), None)),
+                CollapseKey::Group(runner, _) if runner.as_str() == RunnerKey::PROJECTS => None,
+                CollapseKey::Group(runner, group) => {
+                    Some((runner.as_str().to_owned(), Some(group.0)))
+                }
             })
             .collect();
         collapsed.sort();
@@ -272,6 +288,18 @@ impl App {
                 .map(|(runner, terminal, rows)| (runner.as_str().to_owned(), terminal.0, rows))
                 .collect(),
             views: self.local_views.iter().map(|view| view.0).collect(),
+            dismissed: self
+                .projects
+                .dismissed
+                .iter()
+                .map(|(origin, tabs)| {
+                    let tabs = tabs
+                        .iter()
+                        .map(|(runner, tab)| (runner.as_str().to_owned(), tab.0))
+                        .collect();
+                    (origin.clone(), tabs)
+                })
+                .collect(),
         }
     }
 
@@ -392,6 +420,7 @@ mod tests {
             rename: None,
             scrolls: vec![("sha256:aa".into(), 9, 12)],
             views: vec![5, 6],
+            dismissed: Vec::new(),
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: RestoreState = serde_json::from_str(&json).unwrap();

@@ -1075,6 +1075,7 @@ mod tests {
             name: name.to_owned(),
             fingerprint: fingerprint.to_owned(),
             addresses: addresses.iter().map(|a| a.parse().unwrap()).collect(),
+            labels: Vec::new(),
         }
     }
 

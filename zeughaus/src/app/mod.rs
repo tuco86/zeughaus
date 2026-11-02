@@ -16,12 +16,18 @@ mod ci;
 /// The graph as the editor holds it: nodes, edges, node instances, and the
 /// rules a wire has to pass.
 mod graph;
+/// Which machine a tab or a card runs on, as a glyph.
+#[cfg(not(target_arch = "wasm32"))]
+mod hosts;
 /// Arranging a graph in columns by depth.
 mod layout;
 /// What one node draws.
 mod node_view;
 /// The notice center: the pull tab and the panel of notices.
 mod notices;
+/// The Projects section of the tab bar and the project listing.
+#[cfg(not(target_arch = "wasm32"))]
+mod projects;
 /// What a restarting editor leaves for the process that replaces it.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod restore;
@@ -279,6 +285,13 @@ pub struct App {
     /// [`crate::directory`].
     #[cfg(not(target_arch = "wasm32"))]
     directory: Vec<ci::DirectoryRunner>,
+    /// This machine's runner, by the fingerprint its endpoint file pins:
+    /// where a project's shell opens and whose tabs draw no host glyph.
+    #[cfg(not(target_arch = "wasm32"))]
+    local_runner: Option<RunnerKey>,
+    /// The Projects section of the bar and the projects the Overview lists.
+    #[cfg(not(target_arch = "wasm32"))]
+    projects: projects::ProjectsUi,
     /// A terminal a runner just opened for this editor (an agent session),
     /// whose tab comes to the front once that runner's workspace shows it.
     #[cfg(not(target_arch = "wasm32"))]
@@ -436,6 +449,10 @@ impl App {
             page: ci::page::Page::default(),
             #[cfg(not(target_arch = "wasm32"))]
             directory: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            local_runner: sources.local.as_deref().and_then(runner_key_of),
+            #[cfg(not(target_arch = "wasm32"))]
+            projects: projects::ProjectsUi::with_open(prefs.projects),
             #[cfg(not(target_arch = "wasm32"))]
             reveal: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -684,11 +701,16 @@ impl App {
             .workspace
             .focused_pane()
             .is_some_and(|pane| self.workspace.attached(&pane.runner));
+        let listed = self.listed_projects();
         let commands = palette::build_commands(
             &self.catalog,
             &palette::RunnerState {
                 runners,
                 pane_commands,
+                projects: listed
+                    .iter()
+                    .map(|p| (p.name.as_str(), p.origin.as_str()))
+                    .collect(),
             },
             &self.themes,
         );
@@ -753,6 +775,11 @@ impl App {
         self.reveal_opened_terminal();
         #[cfg(not(target_arch = "wasm32"))]
         self.resolve_watched_agents();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.sync_projects();
+            self.track_board_moves();
+        }
         if let Some(graph) = self.pending_graph_focus
             && ((self.workspace.show_graph(graph) && !self.awaits_runner_tab(graph))
                 || !self.nodes.contains_key(&graph))
@@ -931,7 +958,11 @@ impl App {
     /// written is worth a line on stderr and nothing more.
     #[cfg(not(target_arch = "wasm32"))]
     fn save_prefs(&self) {
-        crate::prefs::save(self.theme.name(), self.workspace.placement);
+        crate::prefs::save(
+            self.theme.name(),
+            self.workspace.placement,
+            self.projects.open.iter().cloned().collect(),
+        );
     }
 
     fn apply(&mut self, message: Message) -> Task<Message> {
@@ -945,14 +976,83 @@ impl App {
             self.flush_pending();
         }
         match message {
-            Message::Workspace(message) => {
+            Message::CycleTab(step) => {
                 // The palette or a name field has the keyboard: the tab
                 // behind it must not change under the user's typing.
-                if matches!(message, workspace::Message::CycleTab(_))
-                    && (self.palette_open
-                        || self.workspace.renaming_tab.is_some()
-                        || self.workspace.renaming_group.is_some())
+                if self.palette_open
+                    || self.workspace.renaming_tab.is_some()
+                    || self.workspace.renaming_group.is_some()
                 {
+                    return Task::none();
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                return self.cycle_bar(step);
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let order = self.workspace.tab_order();
+                    let at = self
+                        .workspace
+                        .active_tab()
+                        .and_then(|active| order.iter().position(|tab| tab == active));
+                    if let Some(next) = workspace::cycle_index(order.len(), at, step) {
+                        self.workspace.activate(order[next].clone());
+                    }
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::ProjectTab(tab) => return self.project_tab(tab),
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::OpenProject(origin) => return self.open_project(origin),
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::ShowProject(origin) => return self.show_project(origin),
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::DismissProject(origin) => self.dismiss_project(origin),
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::OpenChannelView(origin, channel) => {
+                return self.open_channel_view(origin, channel);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::OpenProjectSearch => {
+                let shown = self.apply_page(Message::PageShow(PageView::Overview));
+                return Task::batch([
+                    shown,
+                    iced::widget::operation::focus(ci::page::PROJECT_SEARCH),
+                ]);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::ProjectSearch(search) => {
+                self.projects.search = search;
+                // Enter opens the first project the search leaves.
+                self.page.cursor = self.overview_items().len();
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::RefreshProjects => return self.ask_projects(true),
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::ProjectsArrived(result) => self.projects_arrived(result),
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::OnboardProject(origin) => return self.onboard_project(origin),
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::Onboarded(result) => {
+                if let Err(message) = result {
+                    self.notices.raise(
+                        None,
+                        crate::notices::Severity::Error,
+                        "Onboarding refused",
+                        message,
+                        false,
+                        None,
+                        std::time::SystemTime::now(),
+                    );
+                }
+                return self.poll_ci();
+            }
+            Message::Workspace(message) => {
+                // A view in a project's group is this window's own.
+                #[cfg(not(target_arch = "wasm32"))]
+                if let workspace::Message::CloseTab(tab) = &message
+                    && tab.runner.as_str() == RunnerKey::PROJECTS
+                {
+                    self.close_project_tab(tab.tab);
                     return Task::none();
                 }
                 // A tab brought to the front is what the user wants to see:
@@ -960,9 +1060,7 @@ impl App {
                 #[cfg(not(target_arch = "wasm32"))]
                 if matches!(
                     message,
-                    workspace::Message::PressTab(_)
-                        | workspace::Message::CycleTab(_)
-                        | workspace::Message::NewShell(_)
+                    workspace::Message::PressTab(_) | workspace::Message::NewShell(_)
                 ) {
                     self.page.open = false;
                 }
@@ -1293,6 +1391,11 @@ impl App {
                 if self.palette_open {
                     self.palette_input.clear();
                     self.palette_selected = 0;
+                    // The palette lists the projects; a listing older than
+                    // its cache is asked for again on the way.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    return Task::batch([iced_palette::focus_input(), self.ask_projects(false)]);
+                    #[cfg(target_arch = "wasm32")]
                     return iced_palette::focus_input();
                 }
             }
@@ -1358,6 +1461,9 @@ impl App {
             | Message::PageEnter
             | Message::PageOpen(_)
             | Message::PageCursor(_)
+            | Message::PageMachine(..)
+            | Message::PagePipeline(..)
+            | Message::BoardSelect(..)
             | Message::PageTerminal(..)) => {
                 return self.apply_page(message);
             }
@@ -1468,7 +1574,7 @@ impl App {
                 self.workspace.drag = None;
                 #[cfg(not(target_arch = "wasm32"))]
                 if !claimed {
-                    return self.close_front_ci_log();
+                    return self.page_escape();
                 }
                 #[cfg(target_arch = "wasm32")]
                 let _ = claimed;
@@ -1579,6 +1685,7 @@ impl App {
                     if let Some(urls) = self.runner_sources.poll() {
                         self.runner_urls = urls.runners;
                         self.ci_urls = urls.ci;
+                        self.local_runner = urls.local.as_deref().and_then(runner_key_of);
                     }
                     self.commit_settled();
                     self.expire_hint();
@@ -1949,13 +2056,13 @@ impl App {
             iced_tabs::Placement::Left => (None, Some(strip)),
         };
 
-        // The CI page takes the place of the tab in front, and of the tab
-        // tree beside it.
+        // A CI view takes the place of the tab in front; the tab tree stays
+        // beside it, where the view is a tab too.
         #[cfg(not(target_arch = "wasm32"))]
-        let (front, sidebar) = if self.page.open {
-            (self.page_view(), None)
+        let front = if self.page.open {
+            self.page_view()
         } else {
-            (self.runner_tab_view(), sidebar)
+            self.runner_tab_view()
         };
         #[cfg(target_arch = "wasm32")]
         let front = self.runner_tab_view();
@@ -2062,8 +2169,11 @@ impl App {
         }
     }
 
-    /// The tab tree: one section per runner, laid out for where the bar
-    /// sits -- a row to live in the titlebar, or a column at the left edge.
+    /// The tab tree, laid out for where the bar sits -- a row to live in the
+    /// titlebar, or a column at the left edge: every runner's tabs and
+    /// groups without section headers, each remote one with its host's
+    /// glyph, then the Projects section, and the toolbar that opens a
+    /// terminal, a graph or a group.
     fn tab_strip(&self) -> Element<'_, Message, Theme> {
         use std::borrow::Cow;
         use workspace::{CollapseKey, Message as W};
@@ -2077,27 +2187,32 @@ impl App {
         } else {
             Length::Fixed(120.0)
         };
-        let sections = self
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let mut sections: Vec<_> = self
             .workspace
             .sections()
             .iter()
             .map(|section| {
                 let key = &section.key;
-                let mut controls: Vec<iced_tabs::Control<'_>> = Vec::new();
-                if !section.synthetic() {
-                    controls.push(header_control("shell", GLYPH_SHELL, "New shell"));
-                    controls.push(header_control("graph", GLYPH_GRAPH, "New graph"));
-                    controls.push(header_control("group", GLYPH_GROUP, "New group"));
-                } else if key.as_str() == RunnerKey::LOCAL {
-                    controls.push(header_control("graph", GLYPH_GRAPH, "New graph"));
-                }
-                let tab = |t| self.tab_entry(key, t);
+                #[cfg(not(target_arch = "wasm32"))]
+                let host = self.host_of(key);
+                #[cfg(target_arch = "wasm32")]
+                let host: Option<(char, String)> = None;
+                let tab = |t| {
+                    let entry = self.tab_entry(key, t);
+                    match &host {
+                        Some((glyph, name)) => entry.host(*glyph, name.clone()),
+                        None => entry,
+                    }
+                };
                 let items = section
                     .snapshot
                     .items
                     .iter()
-                    .map(|item| match item {
-                        WorkspaceItem::Tab(t) => iced_tabs::Item::Tab(tab(t)),
+                    .filter_map(|item| match item {
+                        WorkspaceItem::Tab(t) => Some(iced_tabs::Item::Tab(tab(t))),
+                        // A project's group is drawn in the Projects section.
+                        WorkspaceItem::Group(group) if group.project.is_some() => None,
                         WorkspaceItem::Group(group) => {
                             let editor = self
                                 .workspace
@@ -2116,7 +2231,7 @@ impl App {
                                         .on_submit(Message::Workspace(W::RenameGroupCommit))
                                         .into()
                                 });
-                            iced_tabs::Item::Group(iced_tabs::Group {
+                            Some(iced_tabs::Item::Group(iced_tabs::Group {
                                 id: group.id,
                                 label: Cow::Borrowed(group.name.as_str()),
                                 color: workspace::rgba(group.color_rgba),
@@ -2127,42 +2242,54 @@ impl App {
                                     .contains(&CollapseKey::Group(key.clone(), group.id)),
                                 tabs: group.tabs.iter().map(tab).collect(),
                                 editor,
-                                host: None,
+                                host: host.clone().map(|(glyph, name)| (glyph, name.into())),
                                 badges: Vec::new(),
                                 closable: false,
-                            })
+                            }))
                         }
                     })
                     .collect();
                 iced_tabs::Section {
                     id: key.clone(),
-                    label: Cow::Borrowed(section.label.as_str()),
-                    header: true,
-                    collapsed: self
-                        .workspace
-                        .collapsed
-                        .contains(&CollapseKey::Section(key.clone())),
-                    controls,
+                    label: Cow::Borrowed(""),
+                    header: false,
+                    collapsed: false,
+                    controls: Vec::new(),
                     items,
                 }
             })
             .collect();
+        // What the Projects section's close buttons and badges mean.
+        #[cfg(not(target_arch = "wasm32"))]
+        let (origins, badges) = {
+            let projects = self.projects_section();
+            sections.push(projects.section);
+            (projects.origins, projects.badges)
+        };
         let marker = self
             .workspace
             .drag
             .as_ref()
             .filter(|drag| drag.active)
             .and_then(|drag| drag.marker.clone());
+        #[cfg(not(target_arch = "wasm32"))]
+        let projects = |key: &RunnerKey| key.as_str() == RunnerKey::PROJECTS;
         let handlers = iced_tabs::Handlers {
+            // A view of a project's group is the editor's to close.
             on_close: Box::new(|tab| Message::Workspace(W::CloseTab(tab))),
             on_toggle_section: Box::new(|key| Message::Workspace(W::ToggleSection(key))),
             on_toggle_group: Box::new(|key, group| Message::Workspace(W::ToggleGroup(key, group))),
-            on_control: Box::new(|key, control| match control {
-                "graph" => Message::NewGraph(key),
-                "group" => Message::Workspace(W::NewGroup(key)),
-                _ => Message::Workspace(W::NewShell(key)),
+            #[cfg(not(target_arch = "wasm32"))]
+            on_control: Box::new(|_, _| Message::OpenProjectSearch),
+            #[cfg(target_arch = "wasm32")]
+            on_control: Box::new(|key, _| Message::NewGraph(key)),
+            on_press_tab: Box::new(move |tab| {
+                #[cfg(not(target_arch = "wasm32"))]
+                if projects(&tab.runner) {
+                    return Message::ProjectTab(tab.tab);
+                }
+                Message::Workspace(W::PressTab(tab))
             }),
-            on_press_tab: Box::new(|tab| Message::Workspace(W::PressTab(tab))),
             on_press_group: Box::new(|key, group| Message::Workspace(W::PressGroup(key, group))),
             on_hover: Box::new(|target| Message::Workspace(W::Hover(target))),
             on_rename_group: Box::new(|key, group| {
@@ -2175,9 +2302,24 @@ impl App {
             on_dissolve_group: Box::new(|key, group| {
                 Message::Workspace(W::DissolveGroup(key, group))
             }),
-            // No group of the runner sections has badges or a close button.
+            // Only a project's group has badges and a close button.
+            #[cfg(not(target_arch = "wasm32"))]
+            on_group_badge: Box::new(move |key, group, at| {
+                badges
+                    .get(&group)
+                    .and_then(|actions| actions.get(at))
+                    .cloned()
+                    .unwrap_or(Message::Workspace(W::PressGroup(key, group)))
+            }),
+            #[cfg(target_arch = "wasm32")]
             on_group_badge: Box::new(|key, group, _| Message::Workspace(W::PressGroup(key, group))),
-            on_close_group: Box::new(|key, group| Message::Workspace(W::DissolveGroup(key, group))),
+            #[cfg(not(target_arch = "wasm32"))]
+            on_close_group: Box::new(move |key, group| match origins.get(&group) {
+                Some(origin) if projects(&key) => Message::DismissProject(origin.clone()),
+                _ => Message::Workspace(W::PressGroup(key, group)),
+            }),
+            #[cfg(target_arch = "wasm32")]
+            on_close_group: Box::new(|key, group| Message::Workspace(W::PressGroup(key, group))),
         };
         let renaming = self.workspace.renaming_tab.as_ref().map(|(tab, draft)| {
             let field: Element<'_, Message, Theme> = iced::widget::text_input("Tab name", draft)
@@ -2190,9 +2332,19 @@ impl App {
                 .into();
             (tab.clone(), field)
         });
+        // A CI view in front is a tab of its project's group; the Overview
+        // is none.
+        #[cfg(not(target_arch = "wasm32"))]
+        let active = match self.shown_project_tab() {
+            Some(tab) => Some(tab),
+            None if self.page.open => None,
+            None => self.workspace.active_tab().cloned(),
+        };
+        #[cfg(target_arch = "wasm32")]
+        let active = self.workspace.active_tab().cloned();
         let tree = iced_tabs::tree(
             sections,
-            self.workspace.active_tab().cloned(),
+            active,
             placement,
             tab_glyphs(),
             marker,
@@ -2203,21 +2355,170 @@ impl App {
         let tree = mouse_area(tree).on_exit(Message::Workspace(W::LeftBar));
 
         match placement {
-            iced_tabs::Placement::Top => container(tree)
+            iced_tabs::Placement::Top => row![container(tree).width(Length::Fill), self.toolbar()]
+                .align_y(iced::Alignment::Center)
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into(),
             // The same chrome the titlebar has, so a selected tab reads as the
             // content reaching into the bar, as it does on top.
-            iced_tabs::Placement::Left => container(tree)
-                .width(SIDEBAR_WIDTH)
-                .height(Length::Fill)
-                .style(|theme: &Theme| container::Style {
-                    background: Some(theme.chrome().into()),
-                    ..Default::default()
-                })
-                .into(),
+            iced_tabs::Placement::Left => container(
+                column![container(self.toolbar()).padding([4, 6]), tree].height(Length::Fill),
+            )
+            .width(SIDEBAR_WIDTH)
+            .height(Length::Fill)
+            .style(|theme: &Theme| container::Style {
+                background: Some(theme.chrome().into()),
+                ..Default::default()
+            })
+            .into(),
         }
+    }
+
+    /// The bar's toolbar: a new shell, graph or group on this machine's
+    /// runner, and beside each a choice of another runner.
+    fn toolbar(&self) -> Element<'_, Message, Theme> {
+        use workspace::Message as W;
+
+        // Every runner whose workspace is attached, this machine's first.
+        #[cfg(not(target_arch = "wasm32"))]
+        let (local, choices) = {
+            let mut choices: Vec<RunnerChoice> = self
+                .workspace
+                .sections()
+                .iter()
+                .filter(|section| !section.synthetic() && section.attached)
+                .map(|section| {
+                    let name = self
+                        .runtime
+                        .links
+                        .get(&section.key)
+                        .map_or(section.label.as_str(), |link| link.label.as_str());
+                    let text = match self.host_of(&section.key) {
+                        None => format!("{name} (local)"),
+                        Some((glyph, _)) => format!("{glyph} {name}"),
+                    };
+                    RunnerChoice {
+                        key: section.key.clone(),
+                        text,
+                    }
+                })
+                .collect();
+            choices.sort_by_key(|choice| Some(&choice.key) != self.local_runner.as_ref());
+            let local = self
+                .local_runner
+                .clone()
+                .filter(|key| self.workspace.attached(key))
+                .or_else(|| choices.first().map(|choice| choice.key.clone()));
+            (local, choices)
+        };
+        #[cfg(target_arch = "wasm32")]
+        let (local, choices): (Option<RunnerKey>, Vec<RunnerChoice>) = (None, Vec::new());
+
+        let split = |glyph: char,
+                     words: &'static str,
+                     pressed: Option<Message>,
+                     pick: fn(RunnerKey) -> Message|
+         -> Element<'_, Message, Theme> {
+            let label = text(glyph.to_string())
+                .font(crate::font::UI)
+                .size(HEADER_GLYPH_SIZE)
+                .line_height(1.0);
+            let mut press = button(label)
+                .padding([2, 4])
+                .style(|theme: &Theme, status| button::text(theme.base(), status));
+            let tip = if pressed.is_some() {
+                words
+            } else {
+                "No runner"
+            };
+            if let Some(message) = pressed {
+                press = press.on_press(message);
+            }
+            let press = iced::widget::tooltip(
+                press,
+                container(text(tip).size(12))
+                    .padding([3, 6])
+                    .style(|theme: &Theme| {
+                        let style = iced_tabs::Catalog::tooltip(theme);
+                        container::Style {
+                            background: style.background,
+                            text_color: Some(style.text),
+                            border: style.border,
+                            ..container::Style::default()
+                        }
+                    }),
+                iced::widget::tooltip::Position::Bottom,
+            )
+            .gap(4);
+            let mut split = row![press].align_y(iced::Alignment::Center);
+            if choices.len() >= 2 {
+                split = split.push(
+                    iced::widget::pick_list(choices.clone(), None::<RunnerChoice>, move |choice| {
+                        pick(choice.key)
+                    })
+                    .placeholder("")
+                    .font(crate::font::UI)
+                    .text_size(12)
+                    .padding([2, 2])
+                    .handle(iced::widget::pick_list::Handle::Static(
+                        iced::widget::pick_list::Icon {
+                            font: crate::font::UI,
+                            code_point: '\u{eab4}',
+                            size: Some(10.0.into()),
+                            line_height: iced::widget::text::LineHeight::default(),
+                            shaping: iced::widget::text::Shaping::Advanced,
+                        },
+                    ))
+                    .style(|theme: &Theme, status| {
+                        let text_color = theme.extended().background.base.text;
+                        let hovered = !matches!(status, iced::widget::pick_list::Status::Active);
+                        iced::widget::pick_list::Style {
+                            text_color,
+                            placeholder_color: theme.muted(),
+                            handle_color: if hovered { text_color } else { theme.muted() },
+                            background: if hovered {
+                                crate::style::Tokens::of(theme).surface_hover.into()
+                            } else {
+                                iced::Color::TRANSPARENT.into()
+                            },
+                            border: iced::Border {
+                                radius: 4.0.into(),
+                                width: 0.0,
+                                color: iced::Color::TRANSPARENT,
+                            },
+                        }
+                    }),
+                );
+            }
+            split.into()
+        };
+        let graph_target = local.clone().unwrap_or_else(RunnerKey::local);
+        row![
+            split(
+                GLYPH_SHELL,
+                "New shell",
+                local
+                    .clone()
+                    .map(|key| Message::Workspace(W::NewShell(key))),
+                |key| Message::Workspace(W::NewShell(key)),
+            ),
+            split(
+                GLYPH_GRAPH,
+                "New graph",
+                Some(Message::NewGraph(graph_target)),
+                Message::NewGraph,
+            ),
+            split(
+                GLYPH_GROUP,
+                "New group",
+                local.map(|key| Message::Workspace(W::NewGroup(key))),
+                |key| Message::Workspace(W::NewGroup(key)),
+            ),
+        ]
+        .spacing(2)
+        .align_y(iced::Alignment::Center)
+        .into()
     }
 
     /// The window's own titlebar, drawn because the system's is turned off:
@@ -2770,24 +3071,39 @@ impl App {
                     return Some(Message::TogglePalette);
                 }
                 if let Some(step) = tab_step(&key, modifiers) {
-                    return Some(Message::Workspace(workspace::Message::CycleTab(step)));
+                    return Some(Message::CycleTab(step));
                 }
                 // Letters no widget took (a text field or a terminal would
                 // have): the CI list in front acts on its cursor. Cancel
                 // asks for Shift, since it stops work.
                 #[cfg(not(target_arch = "wasm32"))]
-                if status == iced::event::Status::Ignored
-                    && let keyboard::Key::Character(c) = &key
-                {
-                    let shortcut = match (c.as_str(), modifiers) {
-                        ("r", m) if m.is_empty() => Some(crate::message::CiShortcut::Rerun),
-                        ("l", m) if m.is_empty() => Some(crate::message::CiShortcut::OpenLog),
-                        ("j", m) if m.is_empty() => Some(crate::message::CiShortcut::Next),
-                        ("k", m) if m.is_empty() => Some(crate::message::CiShortcut::Previous),
-                        ("a", m) if m.is_empty() => Some(crate::message::CiShortcut::Approve),
-                        ("p", m) if m.is_empty() => Some(crate::message::CiShortcut::Plan),
-                        ("C" | "c", keyboard::Modifiers::SHIFT) => {
-                            Some(crate::message::CiShortcut::Cancel)
+                if status == iced::event::Status::Ignored {
+                    use crate::message::CiShortcut;
+                    let shortcut = match (&key, modifiers) {
+                        (keyboard::Key::Character(c), m) if m.is_empty() => match c.as_str() {
+                            "r" => Some(CiShortcut::Rerun),
+                            "l" => Some(CiShortcut::OpenLog),
+                            "h" => Some(CiShortcut::Left),
+                            "j" => Some(CiShortcut::Next),
+                            "k" => Some(CiShortcut::Previous),
+                            "a" => Some(CiShortcut::Approve),
+                            "p" => Some(CiShortcut::Plan),
+                            _ => None,
+                        },
+                        (keyboard::Key::Character(c), keyboard::Modifiers::SHIFT)
+                            if c.eq_ignore_ascii_case("c") =>
+                        {
+                            Some(CiShortcut::Cancel)
+                        }
+                        (keyboard::Key::Named(keyboard::key::Named::ArrowLeft), m)
+                            if m.is_empty() =>
+                        {
+                            Some(CiShortcut::Left)
+                        }
+                        (keyboard::Key::Named(keyboard::key::Named::ArrowRight), m)
+                            if m.is_empty() =>
+                        {
+                            Some(CiShortcut::Right)
                         }
                         _ => None,
                     };
@@ -2841,6 +3157,10 @@ impl App {
         // While any node is in error, drive ~30fps redraws so its marching-ants
         // border animates. Native only: iced::time::every needs the tokio
         // executor feature.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.board_animating() {
+            subs.push(iced::window::frames().map(|_| Message::Tick));
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if !self.failing_nodes().is_empty() {
             subs.push(
@@ -2965,6 +3285,13 @@ pub(crate) fn is_palette_shortcut(key: &keyboard::Key, modifiers: keyboard::Modi
             && matches!(key, keyboard::Key::Character(c) if c.eq_ignore_ascii_case("p")))
 }
 
+/// The section key of the runner a URL pins: its fingerprint.
+#[cfg(not(target_arch = "wasm32"))]
+fn runner_key_of(url: &str) -> Option<RunnerKey> {
+    let peer = weida::EndpointAddr::parse(url).ok()?.peer?;
+    Some(RunnerKey::new(&peer.to_string()))
+}
+
 /// Ctrl+PageDown and Ctrl+PageUp: the next and the previous tab, as in a
 /// browser.
 fn tab_step(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Option<isize> {
@@ -2997,7 +3324,7 @@ fn unavailable<'a>(what: &'a str, why: &'a str) -> Element<'a, Message, Theme> {
         .into()
 }
 
-/// Header glyphs from the bundled Nerd Font: codicons for terminal, type
+/// Toolbar glyphs from the bundled Nerd Font: codicons for terminal, type
 /// hierarchy (a node graph) and new folder (a group).
 const GLYPH_SHELL: char = '\u{ea85}';
 const GLYPH_GRAPH: char = '\u{ebb9}';
@@ -3018,15 +3345,18 @@ fn tab_glyphs() -> iced_tabs::Glyphs {
         control_size: HEADER_GLYPH_SIZE,
     }
 }
-/// A section header control: a glyph with a tooltip that says what it does.
-fn header_control(
-    key: &'static str,
-    glyph: char,
-    tip: &'static str,
-) -> iced_tabs::Control<'static> {
-    iced_tabs::Control::new(key, glyph.to_string())
-        .font(crate::font::UI)
-        .tooltip(tip)
+
+/// A runner the toolbar's choices offer, named as the bar shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunnerChoice {
+    key: RunnerKey,
+    text: String,
+}
+
+impl std::fmt::Display for RunnerChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
 }
 
 impl App {

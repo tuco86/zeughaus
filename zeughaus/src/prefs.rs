@@ -4,7 +4,8 @@
 //! the whole choice there and nothing outlives the tab.
 //!
 //! Two things live under the state directory: `editor.toml`, one flat table
-//! small enough to edit by hand, and `themes/`, whose `*.toml` files are
+//! small enough to edit by hand (theme, tab placement, open projects), and
+//! `themes/`, whose `*.toml` files are
 //! WezTerm colour schemes -- the format every iTerm2-Color-Schemes entry is
 //! published in, so a scheme is dropped in rather than converted.
 
@@ -35,6 +36,9 @@ pub struct Prefs {
     /// from `themes/` must not stop the editor from opening.
     pub theme: String,
     pub tabs: Tabs,
+    /// The origins (`host/owner/name`) of the projects the user opened in
+    /// the bar.
+    pub projects: Vec<String>,
 }
 
 impl Default for Prefs {
@@ -42,6 +46,7 @@ impl Default for Prefs {
         Self {
             theme: Theme::default().name().to_owned(),
             tabs: Tabs::Top,
+            projects: Vec::new(),
         }
     }
 }
@@ -101,12 +106,14 @@ pub fn load() -> Prefs {
     }
 }
 
-/// Records the theme and the tab placement. Best effort: a preference that
-/// cannot be written earns one line on stderr and nothing else.
-pub fn save(theme: &str, placement: Placement) {
+/// Records the theme, the tab placement and the projects shown in the bar.
+/// Best effort: a preference that cannot be written earns one line on
+/// stderr and nothing else.
+pub fn save(theme: &str, placement: Placement, projects: Vec<String>) {
     let prefs = Prefs {
         theme: theme.to_owned(),
         tabs: placement.into(),
+        projects,
     };
     let path = file();
     let text = match toml::to_string(&prefs) {
@@ -190,6 +197,9 @@ pub struct Sources {
     pub runners: Vec<String>,
     /// CI services.
     pub ci: Vec<String>,
+    /// The runner of this machine: its endpoint file's URL, when it pins a
+    /// peer.
+    pub local: Option<String>,
 }
 
 /// Which files the peer lists were read from, as of when.
@@ -242,9 +252,12 @@ fn read_sources(dir: &Path) -> Sources {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => eprintln!("[config] {}: {e}", path.display()),
     }
+    let local =
+        zeughaus_link::credentials::read_endpoint(dir).and_then(|url| pinned(vec![url]).pop());
     Sources {
         runners: read_runner_urls(dir, config.remotes),
         ci: read_ci_urls(config.ci),
+        local,
     }
 }
 
@@ -293,6 +306,7 @@ mod tests {
         let written = toml::to_string(&Prefs {
             theme: "Nord".to_owned(),
             tabs: Tabs::Left,
+            projects: Vec::new(),
         })
         .expect("prefs render");
         assert!(written.contains("theme = \"Nord\""), "{written}");
