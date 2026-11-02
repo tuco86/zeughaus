@@ -729,12 +729,28 @@ same principal as an editor on that machine. No graph is involved.
 `zeughaus-runner mcp` is the subcommand that serves instead of asking once:
 see "The CI over MCP" in section 14.
 
-**Project groups.** A CI job's run (`JobSpec::group`, its repository), a plan session and a
-master get a tab in the runner's locked group of their repository instead
-(`OwnedPlacement::Project`), tinted by a hash of the name, made by the first
-run that needs it and gone with its last tab; a project group never takes
-the last group slot, which stays for `Triggered`, so without a slot such a
-run lands there. Closing a tab of a locked group ends its run or session.
+**Project groups.** A plan session, a master and a work shell get a tab in
+the runner's locked group of their repository's origin instead
+(`OwnedPlacement::Project`, `GroupSnapshot::project`), named after the
+origin's last segment and tinted by a hash of that name
+(`zeughaus_mux::project_color`), made by the first run that needs it and
+gone with its last tab; a project group never takes the last group slot,
+which stays for `Triggered`, so without a slot such a run lands there.
+Closing a tab of a locked group ends its run or session. A CI job's run is
+detached: it is watched through the CI's transcript. A work shell comes from
+the mux command `OpenProject { origin, branch }`: the runner starts
+`zeughaus-runner work <origin> --branch <branch>`, which clones
+`<work root>/<origin>` when it is missing (the work root is
+`$ZEUGHAUS_WORK`, else `~/work`) and becomes `$SHELL` there.
+
+**Projects.** `/projects` (`zeughaus_link::projects`, JSON) lists what the
+runner's user can open: the repositories each forge of `[projects]` in
+`<state-dir>/zeughaus.toml` lists with push access (`[[projects.forge]]`
+with `kind = "forgejo"` and its `url`, or `kind = "github"`, and `token`,
+the argv whose stdout is the token), a mirror of a repository on
+`primary` left out, plus every checkout under the work root
+(`zeughaus-runner/src/projects.rs`). A listing is kept 300 s unless the
+request asks for a refresh; a forge that fails adds a line to `errors`.
 
 **Agent status.** Every terminal the runner starts sees its id as
 `ZEUGHAUS_TERMINAL`. The zeughaus omp plugin (`omp-plugin/src/agent-status.ts`)

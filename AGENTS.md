@@ -155,10 +155,11 @@ reported on `/activity` and as `activity` events.
 `zeughaus-runner trigger <endpoint> <node-id> [payload]` and
 `zeughaus-runner hold <endpoint> on|off` do the same from a script, against
 the endpoint URL a runner prints at start; a triggered run's terminal lands
-in that runner's locked `Triggered` group, a CI job's, a plan session's and
-a master's in the runner's locked group named after its repository; such a
-group exists only while it holds a tab, and closing a tab there ends its
-run or session.
+in that runner's locked `Triggered` group, a plan session's, a master's and
+a project's work shell in the runner's locked group of its repository's
+origin; such a group exists only while it holds a tab, and closing a tab
+there ends its run or session. A CI job's terminal is detached; its
+transcript is read through the CI.
 
 Every omp in a zeughaus terminal (`ZEUGHAUS_TERMINAL` is its id) reports
 its state through the zeughaus omp plugin as the terminal user variable

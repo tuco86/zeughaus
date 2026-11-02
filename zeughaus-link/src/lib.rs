@@ -20,6 +20,7 @@
 //! | [`RUNS_PATH`] | req/rep | [`runs`]: a range of one file of one run |
 //! | [`HOLD_PATH`] | req/rep | [`runs::HoldRequest`]: start no new runs |
 //! | [`ACTIVITY_PATH`] | req/rep | [`activity`]: the runner's terminals, live and archived |
+//! | [`PROJECTS_PATH`] | req/rep | [`projects`]: the repositories the runner's user can open |
 //! | [`CI_PATH`] | req/rep | [`ci`]: channels, pipelines, machines, job transcripts |
 //! | [`ENLIST_PATH`] | one long exchange per runner | [`enlist`]: a runner takes assignments from the CI and streams output |
 //! | [`ARTIFACTS_PATH`] | one exchange per transfer | [`enlist::ArtifactRequest`]: a run's artifact set, streamed as chunks |
@@ -40,6 +41,7 @@ pub mod events;
 pub mod feed;
 pub mod graph;
 pub mod manual;
+pub mod projects;
 pub mod runs;
 pub mod selector;
 
@@ -64,6 +66,10 @@ pub use feed::{
     FeedRequest, FrameHeader, MAX_DIMENSION, MAX_SAMPLES_PER_AXIS, ladder, scale_to_fit,
 };
 pub use graph::{GRAPH_MAJOR, GraphChange, GraphEdit, GraphMessage, MAX_GRAPH_FRAME_BYTES};
+pub use projects::{
+    MAX_PROJECTS_REPLY_BYTES, MAX_PROJECTS_REQUEST_BYTES, PROJECTS_PATH, ProjectView,
+    ProjectsReply, ProjectsRequest,
+};
 pub use runs::{
     HoldReply, HoldRequest, MAX_HOLD_BYTES, MAX_RUN_CHUNK_BYTES, MAX_RUN_REPLY_BYTES,
     MAX_RUN_REQUEST_BYTES, RunFileReply, RunFileRequest,

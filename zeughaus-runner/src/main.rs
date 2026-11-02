@@ -24,6 +24,8 @@ mod maintain;
 mod mcp;
 mod mux;
 mod names;
+#[cfg(unix)]
+mod projects;
 mod release;
 mod runner;
 mod runs;
@@ -44,6 +46,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use zeughaus_core::{NodeId, Value, ZeughausError};
+#[cfg(unix)]
+use zeughaus_link::PROJECTS_PATH;
 use zeughaus_link::{
     ACTIVITY_PATH, ActivityEntry, EVENTS_PATH, FEED_PATH, GRAPH_PATH, GraphChange, HOLD_PATH,
     MUX_PATH, RUNS_PATH, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, TriggerRequest, credentials,
@@ -331,6 +335,13 @@ fn main() -> ExitCode {
                     }
                     Err(e) => eprintln!("[runner] no activity service: {e}"),
                 }
+                #[cfg(unix)]
+                match listener.replier(PROJECTS_PATH) {
+                    Ok(replier) => {
+                        rt.spawn(projects::serve(replier, state_dir.clone()));
+                    }
+                    Err(e) => eprintln!("[runner] no projects service: {e}"),
+                }
                 job_host = Some(host);
                 mux_service = Some(service);
             }
@@ -346,14 +357,21 @@ fn main() -> ExitCode {
         }
         // Agent sessions the CI opens run in terminals of the mux; the
         // sessions drive omp through a Unix exec and a Unix shell's PATH.
+        // Work shells of a project are started the same way.
         #[cfg(unix)]
         let session_host: Option<Arc<dyn enlist::SessionHost>> = match (&mux_service, exe.as_ref())
         {
-            (Some(service), Ok(exe)) => Some(Arc::new(agents::Agents::new(
-                service.clone(),
-                state_dir.clone(),
-                exe.clone(),
-            ))),
+            (Some(service), Ok(exe)) => {
+                let (dir, program) = (state_dir.clone(), exe.clone());
+                service.set_project_profile(Arc::new(move |origin, branch| {
+                    agents::work_profile(&dir, &program, origin, branch)
+                }));
+                Some(Arc::new(agents::Agents::new(
+                    service.clone(),
+                    state_dir.clone(),
+                    exe.clone(),
+                )))
+            }
             _ => None,
         };
         #[cfg(not(unix))]
