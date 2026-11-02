@@ -291,6 +291,10 @@ pub enum Message {
     // these there.
     AttachTerminal(crate::workspace::RunnerKey, zeughaus_mux::TerminalId),
     CloseTerminal(crate::workspace::RunnerKey, zeughaus_mux::TerminalId),
+    // Bring the tab that shows one of a runner's terminals to the front, or
+    // attach it in a new tab when no tab shows it.
+    #[cfg(not(target_arch = "wasm32"))]
+    RevealTerminal(crate::workspace::RunnerKey, zeughaus_mux::TerminalId),
     // Hold a runner, which starts no new run and lets the live ones finish,
     // or release it again.
     HoldRunner(crate::workspace::RunnerKey, bool),

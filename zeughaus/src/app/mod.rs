@@ -1605,6 +1605,20 @@ impl App {
                 #[cfg(target_arch = "wasm32")]
                 let _ = (key, terminal);
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::RevealTerminal(key, terminal) => {
+                let shown = self.workspace.section(&key).is_some_and(|section| {
+                    section
+                        .snapshot
+                        .tabs()
+                        .any(|tab| tab.root.terminals().any(|t| t == terminal))
+                });
+                if shown {
+                    self.reveal = Some((key, terminal));
+                } else {
+                    return self.apply(Message::AttachTerminal(key, terminal));
+                }
+            }
             Message::CloseTerminal(key, terminal) => {
                 #[cfg(not(target_arch = "wasm32"))]
                 self.send_topology(

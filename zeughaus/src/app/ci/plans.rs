@@ -932,16 +932,13 @@ impl App {
         let mut line = row![text(place).size(TEXT_SM).color(self.theme.muted())]
             .spacing(SP_2)
             .align_y(Alignment::Center);
-        let mut attach = action_button(TERMINAL, "Attach");
+        let mut open = action_button(TERMINAL, "Open");
         if let (Some(key), Some(terminal)) = (client.runner_key(&session.runner), session.terminal)
         {
-            attach = attach
-                .on_press_with(move || Message::AttachTerminal(key.clone(), TerminalId(terminal)));
+            open = open
+                .on_press_with(move || Message::RevealTerminal(key.clone(), TerminalId(terminal)));
         }
-        line = line.push(tip(
-            attach,
-            "Show the session's terminal in a tab".to_owned(),
-        ));
+        line = line.push(tip(open, "Bring the master's tab to the front".to_owned()));
         let mut stop = action_button(glyph::CLOSE, "Stop");
         if !state.acting {
             let request = CiRequest::CloseSession { id: session.id };
