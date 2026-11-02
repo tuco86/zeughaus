@@ -5,7 +5,7 @@ description: "Repo has .zeughaus-ci/: debug a job or platform with run_jobs, CI 
 
 # zeughaus-ci
 
-zeughaus-ci is the user's own CI. Its runners are the machines they own, one per platform. A repository's jobs are scripts in its `.zeughaus-ci/` folder. You reach the CI through the tools of the MCP server `zeughaus`: `ci_repo`, `ci_status`, `ci_pipelines`, `ci_pipeline`, `ci_log`, `ci_timing`, `ci_wait`, `ci_rerun`, `ci_run`, `ci_cancel`, `run_jobs`, `docs`, `doc_read`, `proposal_write`, `plan_done`, and for the data a job keeps between pipelines (`state = [..]` in its header) `ci_state`, `ci_state_get`, `ci_state_delete`.
+zeughaus-ci is the user's own CI. Its runners are the machines they own, one per platform. A repository's jobs are scripts in its `.zeughaus-ci/` folder. You reach the CI through the tools of the MCP server `zeughaus`: `ci_repo`, `ci_status`, `ci_pipelines`, `ci_pipeline`, `ci_log`, `ci_timing`, `ci_wait`, `ci_rerun`, `ci_run`, `ci_cancel`, `run_jobs`, `docs`, `doc_read`, `proposal_write`, `onboard_request`, `plan_done`, and for the data a job keeps between pipelines (`state = [..]` in its header) `ci_state`, `ci_state_get`, `ci_state_delete`.
 
 ## 1. Orient
 
@@ -16,7 +16,8 @@ zeughaus-ci is the user's own CI. Its runners are the machines they own, one per
 - Read a job row as: name, runner, where on it (`host`, `image:<x>` or `machine:<vm>`), then `on <patterns>` or `needs <jobs>`, then `channels <names>`, `secrets <names> (none in run_jobs)` and `run_jobs cannot run it` when they apply. A job the CI cannot place says `cannot be placed: <why>` in place of the runner.
 - The job rows are read at the commit the `jobs at <sha7>` line names: HEAD once the CI has fetched it, else the default branch's head. Your uncommitted edits to `.zeughaus-ci/` are not in them; `run_jobs` reads those.
 - `HEAD <sha7>: no pipeline` means the commit is not pushed, or no job's `on` selects it.
-- An origin the CI does not know (`<origin> is no repository of the CI's ci.toml`): pushes start no pipeline and `run_jobs` is refused. Tell the user; do not work around it.
+- An origin the CI does not know (`<origin> is no repository of the CI's ci.toml`): pushes start no pipeline and `run_jobs` is refused. Ask the user, then file an onboarding request (`skill://zeughaus-ci/reference/onboarding.md`); do not work around it. An origin with a pending request says so (`onboarding request #<n> for <name> is open|approved`, and the last failure).
+- `ci_repo` ends with `setup:` lines: the hook's last delivery, the bot's push access, the secrets the repository names and whether every job secret is granted to some event.
 
 ## 2. Tests before a push: the unit tier only
 
@@ -67,7 +68,7 @@ zeughaus-ci is the user's own CI. Its runners are the machines they own, one per
 
 ## 7. Writing jobs
 
-- Read `skill://zeughaus-ci/reference/pipelines.md` (how to shape a pipeline for this CI, zeughaus's own as the example, a review checklist) and `skill://zeughaus-ci/reference/jobs.md` (header keys, channels, placement, environment, job notes).
+- Read `skill://zeughaus-ci/reference/pipelines.md` (how to shape a pipeline for this CI, zeughaus's own as the example, a review checklist), `skill://zeughaus-ci/reference/jobs.md` (header keys, channels, placement, environment, job notes) and, for a project that is to join the CI, `skill://zeughaus-ci/reference/onboarding.md` (the request, what approval does, starter headers).
 - Validate before pushing, where the binary exists: `zeughaus-ci check` (header rules, channels, ignored keys; placement too where the state directory has the CI's `ci.toml`) and `zeughaus-ci plan .zeughaus-ci push main` (the channel and the jobs an event selects).
 - Without the binary, `run_jobs` validates on the CI: a header error ends the run as `error`, with the message as the pipeline's note.
 
@@ -76,5 +77,5 @@ zeughaus-ci is the user's own CI. Its runners are the machines they own, one per
 - Plans and proposals of a repository live in the CI, numbered per repository. `docs` lists them (awaiting approval, the queue, in progress, open proposals, history); `doc_read` reads one with its text. The `<zeughaus-ci>` block names the open proposals and the plans that wait or run.
 - A plan made from proposals names them in one line directly under its title: `Proposals: #3, #5`. Saving the plan, or executing it from its review, marks them planned.
 - The user stores a finished plan with `/zeughaus save`; it waits in the desktop's Plans tab for approval. The CI dispatches each approved plan to a free runner matching the plan's `Runs on` line (one label selector per machine, the first hosting the session, for example `Runs on: os=macos`; without it any runner that hosts sessions), one master per runner, so several plans may run at once.
-- A change another repository of the CI needs: `proposal_write` with `path` = that repository's checkout (or `repo` = its name), a one-line title and the body (what changed here and why, what the receiving project would change, what this project does afterwards, the checks). A repository the CI does not build gets a `PROPOSAL-<source>-<topic>.md` in its root instead; the tool's refusal says where.
+- A change another repository of the CI needs: `proposal_write` with `path` = that repository's checkout (or `repo` = its name), a one-line title and the body (what changed here and why, what the receiving project would change, what this project does afterwards, the checks). A repository the CI does not build yet gets an onboarding request first (`onboard_request`); `proposal_write` stores proposals against it once the request exists.
 - A session executing a plan from zeughaus finds its number in `ZEUGHAUS_PLAN` (`<repo>#<n>`) and calls `plan_done` once its work is committed and pushed, and not before. A session the CI opened has a `<zeughaus-session>` block naming its runner, its machines (`ZEUGHAUS_MACHINES`, `name=ssh destination`) and the other runners with their labels.

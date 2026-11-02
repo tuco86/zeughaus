@@ -7345,6 +7345,7 @@ version = "0.3.0-dev"
 dependencies = [
  "base64 0.23.1",
  "chrono",
+ "getrandom 0.4.3",
  "hex",
  "hmac",
  "regex",

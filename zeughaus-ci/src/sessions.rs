@@ -26,7 +26,7 @@ use zeughaus_link::{
     DocKind, DocState, SessionKind, SessionMachine, SessionState, SessionView, normalize_origin,
 };
 
-use crate::config::CiConfig;
+use crate::config::Shared;
 use crate::docs;
 use crate::files::{read_json, write_json};
 use crate::runners::{RunnerView, Runners};
@@ -48,7 +48,7 @@ struct Book {
 
 pub struct Sessions {
     state_dir: PathBuf,
-    config: Arc<CiConfig>,
+    config: Arc<Shared>,
     runners: Arc<Runners>,
     /// The documents' lock, shared with the `/ci` server.
     docs_lock: Arc<Mutex<()>>,
@@ -97,7 +97,7 @@ pub fn place(
 impl Sessions {
     pub fn new(
         state_dir: PathBuf,
-        config: Arc<CiConfig>,
+        config: Arc<Shared>,
         runners: Arc<Runners>,
         docs_lock: Arc<Mutex<()>>,
         docs_tx: Sender<String>,
@@ -173,13 +173,14 @@ impl Sessions {
 
     /// The connected runners that may host sessions, with their labels.
     fn session_hosts(&self, views: &BTreeMap<String, RunnerView>) -> Vec<(String, Vec<String>)> {
-        self.config
+        let config = self.config.get();
+        config
             .runners
             .iter()
             .filter(|(_, runner)| runner.sessions)
             .filter_map(|(name, _)| {
                 let view = views.get(name)?;
-                Some((name.clone(), self.config.labels_of(name, Some(&view.offer))))
+                Some((name.clone(), config.labels_of(name, Some(&view.offer))))
             })
             .collect()
     }
@@ -187,17 +188,19 @@ impl Sessions {
     /// What a session needs to know of runner `name` as one of its machines.
     fn machine(&self, name: &str, views: &BTreeMap<String, RunnerView>) -> SessionMachine {
         let view = views.get(name);
+        let config = self.config.get();
         SessionMachine {
             name: name.to_owned(),
-            ssh: self.config.runners.get(name).and_then(|r| r.ssh.clone()),
-            labels: self.config.labels_of(name, view.map(|v| &v.offer)),
+            ssh: config.runners.get(name).and_then(|r| r.ssh.clone()),
+            labels: config.labels_of(name, view.map(|v| &v.offer)),
             addresses: view.map(|v| v.addresses.clone()).unwrap_or_default(),
         }
     }
 
     /// What the runner of `view` is sent to open it.
     fn spec(&self, view: &SessionView) -> Option<SessionSpec> {
-        let repo = self.config.repos.get(&view.repo)?;
+        let config = self.config.get();
+        let repo = config.repos.get(&view.repo)?;
         Some(SessionSpec {
             id: view.id,
             kind: view.kind,
@@ -215,13 +218,14 @@ impl Sessions {
     /// queue order. A plan that finds none stays queued; a later one may
     /// still find its own.
     pub fn dispatch(&self, now: u64) {
-        let queue = docs::queue(&self.state_dir, &self.config);
+        let config = self.config.get();
+        let queue = docs::queue(&self.state_dir, &config);
         if queue.is_empty() {
             return;
         }
         let views = self.runners.views();
         for plan in queue {
-            if docs::paused(&self.state_dir, &self.config, &plan.repo) {
+            if docs::paused(&self.state_dir, &config, &plan.repo) {
                 continue;
             }
             let Ok(selectors) = parse_runs_on(&plan.runs_on) else {
@@ -236,14 +240,13 @@ impl Sessions {
                 .into_iter()
                 .filter(|(name, _)| free(name) && cooldown.get(name).is_none_or(|&t| t <= now))
                 .collect();
-            let extras: Vec<(String, Vec<String>)> = self
-                .config
+            let extras: Vec<(String, Vec<String>)> = config
                 .runners
                 .iter()
                 .filter(|(name, runner)| runner.ssh.is_some() && free(name))
                 .filter_map(|(name, _)| {
                     let view = views.get(name)?;
-                    Some((name.clone(), self.config.labels_of(name, Some(&view.offer))))
+                    Some((name.clone(), config.labels_of(name, Some(&view.offer))))
                 })
                 .collect();
             let Some(placement) = place(&selectors, &hosts, &extras) else {
@@ -253,7 +256,7 @@ impl Sessions {
                 let _held = lock(&self.docs_lock);
                 docs::start(
                     &self.state_dir,
-                    &self.config,
+                    &config,
                     &plan.repo,
                     plan.number,
                     placement.clone(),
@@ -323,7 +326,7 @@ impl Sessions {
                     let _held = lock(&self.docs_lock);
                     docs::set_state(
                         &self.state_dir,
-                        &self.config,
+                        &self.config.get(),
                         &session.repo,
                         number,
                         DocState::Approved,
@@ -416,12 +419,13 @@ impl Sessions {
         runner: Option<&str>,
         now: u64,
     ) -> Result<SessionView, String> {
-        if !self.config.repos.contains_key(repo) {
+        let config = self.config.get();
+        if !config.repos.contains_key(repo) {
             return Err(format!("no repository {repo}"));
         }
         let mut wanted = Selector::default();
         if let Some(number) = proposal {
-            let doc = docs::load(&self.state_dir, &self.config, repo, number)
+            let doc = docs::load(&self.state_dir, &config, repo, number)
                 .ok_or_else(|| format!("no proposal #{number} in {repo}"))?;
             if doc.kind != DocKind::Proposal || doc.state != DocState::Open {
                 return Err(format!("#{number} of {repo} is no open proposal"));
@@ -577,6 +581,8 @@ mod tests {
         use tokio::sync::mpsc::UnboundedReceiver;
         use zeughaus_link::enlist::Offer;
 
+        use crate::config::CiConfig;
+
         fn scratch(name: &str) -> PathBuf {
             let dir =
                 std::env::temp_dir().join(format!("zci-sessions-{name}-{}", std::process::id()));
@@ -638,7 +644,7 @@ mod tests {
             let (events_tx, events) = channel();
             let sessions = Sessions::new(
                 state.clone(),
-                Arc::clone(&config),
+                Shared::new(CiConfig::clone(&config)),
                 Arc::clone(&runners),
                 Arc::new(Mutex::new(())),
                 docs_tx,
@@ -667,6 +673,7 @@ mod tests {
                     source: "demo",
                     proposals: &[],
                     runs_on: &runs_on,
+                    onboard: None,
                 },
                 1,
             )

@@ -68,6 +68,22 @@ role_id = "<printed by deploy/ci/openbao.sh>"
 cache_ttl_seconds = 30             # a read document answers from memory this long
 timeout_seconds = 5
 
+# Onboarding requests (the MCP tool onboard_request): once the owner approves
+# one in the Plans tab, the CI adds `bot` as a collaborator on Forgejo `api`
+# with `admin_token`, stores a webhook secret <NAME>_WEBHOOK_SECRET in the
+# [secrets] document (its policy needs `patch`), creates the hook
+# `<hook_url>/<name>`, writes the repository to
+# <state-dir>/ci/onboarded/<name>.toml and queues its first push pipeline.
+# The onboarded repositories use `bot_token` for fetches and statuses.
+# `systemctl --user reload zeughaus-ci` re-reads [repos] of this file and
+# those files; any other change of this file takes a restart.
+# [onboarding]
+# api = "https://git.doodleshnookie.net"
+# bot = "zeughaus-ci"
+# bot_token = "FORGEJO_TOKEN"
+# admin_token = "FORGEJO_ADMIN_TOKEN"
+# hook_url = "https://ci.doodleshnookie.net/hook"
+
 [repos.griasdi]
 url = "https://github.com/Griasdi/Griasdi.git"
 forge = "github"                   # github | forgejo | none

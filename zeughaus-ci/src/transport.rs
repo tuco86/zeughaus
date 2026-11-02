@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use weida::{IncomingMeta, PeerIdentity, Replier, TransferMeta};
 use zeughaus_link::Snapshot;
 
-use crate::config::CiConfig;
+use crate::config::{CiConfig, Shared};
 
 /// The name this process shows for a peer: the fingerprint it proved.
 pub fn principal_of(meta: &IncomingMeta) -> Option<String> {
@@ -38,7 +38,7 @@ pub fn editor_principal(config: &CiConfig, meta: &IncomingMeta) -> Result<String
 /// only needs the sequence number that its `/events` stream continues from.
 ///
 /// The request body carries nothing and is dropped unread.
-pub async fn serve_snapshots(replier: Replier, config: Arc<CiConfig>, seq: Arc<AtomicU64>) {
+pub async fn serve_snapshots(replier: Replier, config: Arc<Shared>, seq: Arc<AtomicU64>) {
     loop {
         let mut request = match replier.accept().await {
             Ok(request) => request,
@@ -47,7 +47,7 @@ pub async fn serve_snapshots(replier: Replier, config: Arc<CiConfig>, seq: Arc<A
                 return;
             }
         };
-        if let Err(why) = editor_principal(&config, request.meta()) {
+        if let Err(why) = editor_principal(&config.get(), request.meta()) {
             eprintln!("[ci] refused a snapshot request from a peer that {why}");
             request.refuse(weida::ErrorCode::Rejected).await;
             continue;

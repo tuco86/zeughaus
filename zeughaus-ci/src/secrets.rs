@@ -133,6 +133,76 @@ impl Secrets {
         }
     }
 
+    /// Adds field `name` with `value` to the document by a KV v2 merge
+    /// patch, which leaves every other field as it is. The cached document
+    /// is dropped, so the next read sees the field.
+    pub fn add(&self, name: &str, value: &str) -> Result<(), SecretError> {
+        let what = format!("{name} not stored");
+        let Some(config) = &self.config else {
+            return Err(SecretError::Absent(format!(
+                "no [secrets] in ci.toml; {what}"
+            )));
+        };
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let url = format!("{}/v1/{}/data/{}", config.addr, config.mount, config.path);
+        let body = json!({ "data": { name: value } }).to_string();
+        let mut retried = false;
+        loop {
+            let token = match &state.token {
+                Some(token) => token.clone(),
+                None => {
+                    let token = self.login(config, &what)?;
+                    state.token = Some(token.clone());
+                    token
+                }
+            };
+            // Token and value go over stdin as curl config, never in argv.
+            let stdin = crate::forge::curl_config(
+                &[
+                    &format!("X-Vault-Token: {token}"),
+                    "Content-Type: application/merge-patch+json",
+                ],
+                Some(&body),
+            );
+            let (code, _) = bao_curl(
+                &["-X", "PATCH", "-K", "-"],
+                &stdin,
+                &url,
+                config.timeout_seconds,
+            )
+            .map_err(|e| unreachable_error(config, &e, &what))?;
+            match code {
+                200 | 204 => {
+                    state.document = None;
+                    return Ok(());
+                }
+                403 => {
+                    state.token = None;
+                    if retried {
+                        return Err(SecretError::Unavailable(format!(
+                            "openbao: {}/{} denied the patch (policy zeughaus-ci needs patch; rerun deploy/ci/openbao.sh)",
+                            config.mount, config.path
+                        )));
+                    }
+                    retried = true;
+                }
+                404 => {
+                    return Err(SecretError::Absent(format!(
+                        "openbao: no document {}/{}",
+                        config.mount, config.path
+                    )));
+                }
+                503 => return Err(sealed_error(config)),
+                other => {
+                    return Err(SecretError::Unavailable(format!(
+                        "openbao {}: HTTP {other} on patch",
+                        config.addr
+                    )));
+                }
+            }
+        }
+    }
+
     /// Runs `use_document` on the document, read first when the cached one is
     /// older than `cache_ttl_seconds`. `what` ends the message of an error that
     /// means a value could not be had.
@@ -413,6 +483,12 @@ pub fn check(secrets: &Secrets, config: &CiConfig) -> Result<Vec<String>, String
         .repos
         .values()
         .flat_map(|repo| repo.secret_names())
+        .chain(
+            config
+                .onboarding
+                .iter()
+                .flat_map(|onb| [&onb.bot_token, &onb.admin_token]),
+        )
         .collect();
     if names.is_empty() && secrets.config.is_none() {
         return Ok(Vec::new());
@@ -475,6 +551,15 @@ mod tests {
         assert_eq!(check(&secrets, &config).unwrap(), Vec::<String>::new());
     }
 
+    #[test]
+    fn adding_without_a_config_is_absent() {
+        let secrets = Secrets::new(None, Path::new("/nonexistent"));
+        assert_eq!(
+            secrets.add("X", "v").unwrap_err(),
+            SecretError::Absent("no [secrets] in ci.toml; X not stored".to_owned())
+        );
+    }
+
     /// Tests that touch the filesystem, network, processes or real time: the
     /// integration tier (`.config/nextest.toml`).
     mod io {
@@ -494,6 +579,8 @@ mod tests {
             logins: Arc<AtomicUsize>,
             reads: Arc<AtomicUsize>,
             login_body: Arc<Mutex<String>>,
+            /// The bodies of the PATCHes of the document, which answer 204.
+            patches: Arc<Mutex<Vec<String>>>,
             stop: Arc<AtomicBool>,
             thread: Option<JoinHandle<()>>,
         }
@@ -508,12 +595,14 @@ mod tests {
                 let logins = Arc::new(AtomicUsize::new(0));
                 let reads = Arc::new(AtomicUsize::new(0));
                 let login_body = Arc::new(Mutex::new(String::new()));
+                let patches = Arc::new(Mutex::new(Vec::new()));
                 let stop = Arc::new(AtomicBool::new(false));
                 let thread = {
-                    let (logins, reads, login_body, stop) = (
+                    let (logins, reads, login_body, patches, stop) = (
                         Arc::clone(&logins),
                         Arc::clone(&reads),
                         Arc::clone(&login_body),
+                        Arc::clone(&patches),
                         Arc::clone(&stop),
                     );
                     std::thread::spawn(move || {
@@ -524,6 +613,7 @@ mod tests {
                                 continue;
                             };
                             let url = request.url().to_owned();
+                            let patch = request.method() == &tiny_http::Method::Patch;
                             let (code, body) = match url.as_str() {
                                 LOGIN_URL => {
                                     logins.fetch_add(1, Ordering::SeqCst);
@@ -531,6 +621,12 @@ mod tests {
                                     let _ = request.as_reader().read_to_string(&mut text);
                                     *login_body.lock().unwrap() = text;
                                     (200, r#"{"auth":{"client_token":"tok"}}"#.to_owned())
+                                }
+                                READ_URL if patch => {
+                                    let mut text = String::new();
+                                    let _ = request.as_reader().read_to_string(&mut text);
+                                    patches.lock().unwrap().push(text);
+                                    (204, String::new())
                                 }
                                 READ_URL => script(reads.fetch_add(1, Ordering::SeqCst)),
                                 _ => (500, String::new()),
@@ -546,6 +642,7 @@ mod tests {
                     logins,
                     reads,
                     login_body,
+                    patches,
                     stop,
                     thread: Some(thread),
                 }
@@ -774,6 +871,21 @@ mod tests {
             secrets.get("A").unwrap();
             let text = format!("{secrets:?}");
             assert!(!text.contains("alpha") && !text.contains("tok") && !text.contains("sid-1"));
+        }
+
+        #[test]
+        fn an_added_field_is_patched_in_and_read_again() {
+            let stub = Stub::start(|_| document(json!({ "A": "alpha" })));
+            let secrets = stub.secrets(30);
+            assert_eq!(secrets.get("A").unwrap(), "alpha");
+            secrets.add("X_WEBHOOK_SECRET", "v").unwrap();
+            let patches = stub.patches.lock().unwrap().clone();
+            let body: Value = serde_json::from_str(&patches[0]).unwrap();
+            assert_eq!(body, json!({ "data": { "X_WEBHOOK_SECRET": "v" } }));
+            assert_eq!(patches.len(), 1);
+            secrets.get("A").unwrap();
+            assert_eq!(stub.reads(), 2);
+            assert_eq!(stub.logins(), 1);
         }
 
         fn ci_config(addr: &str) -> CiConfig {

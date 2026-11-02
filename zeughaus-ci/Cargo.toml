@@ -30,6 +30,8 @@ tokio = { version = "1", features = [
     "net",
     "fs",
     "io-util",
+    # SIGHUP re-reads [repos] of ci.toml.
+    "signal",
 ] }
 serde.workspace = true
 serde_json = "1"
@@ -48,3 +50,5 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 zeughaus-update.workspace = true
 # ci_log's pattern search over a job's output.
 regex = "1"
+# The webhook secret onboarding generates.
+getrandom = "0.4"

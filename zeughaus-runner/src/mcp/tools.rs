@@ -1,4 +1,4 @@
-//! The eighteen tools, the schemas an agent sees and the text they answer with.
+//! The nineteen tools, the schemas an agent sees and the text they answer with.
 //!
 //! The text is for a model, so it is short, one fact per line and in a shape
 //! that is the same every time. The functions that build it take the records
@@ -18,7 +18,7 @@ use zeughaus_link::ci::{
 use zeughaus_link::manual::{MAX_MANUAL_JOBS, RunReply};
 use zeughaus_link::{
     CiOverview, CiReply, CiRequest, DocKind, DocState, DocView, JobTiming, JobView, MachineView,
-    PipelineView, StateView, TransferView,
+    OnboardSpec, PipelineView, StateView, TransferView,
 };
 
 use super::client::Client;
@@ -40,7 +40,8 @@ again. ci_repo says which repository of the CI the current checkout is, its jobs
 each runs, and whether HEAD and the default branch are green; in such a checkout `repo` can be \
 omitted. Plans and proposals of a repository live in the CI too: docs lists them, doc_read reads \
 one, proposal_write stores a proposal for another repository of the CI (instead of a \
-PROPOSAL-*.md in its root), and a session executing a plan from zeughaus calls plan_done once its \
+PROPOSAL-*.md in its root), onboard_request asks for a project the CI does not build yet to \
+join it, and a session executing a plan from zeughaus calls plan_done once its \
 work is committed and pushed. A job that names `state = [..]` in its header keeps data from one \
 pipeline to the next: ci_state lists those stores and their versions, ci_state_get downloads one \
 version into a directory and ci_state_delete removes a version or a whole store.";
@@ -134,15 +135,18 @@ impl Toolbox {
         }
     }
 
-    /// `ci_repo`: which repository of the CI the checkout is, and what the CI
-    /// knows of it.
+    /// `ci_repo`: which repository of the CI the checkout is, what the CI
+    /// knows of it and whether its setup is complete.
     async fn ci_repo(&self, args: RepoArgs) -> Result<String, String> {
         self.client.configured()?;
         let checkout = self.checkout_of(args.path.as_deref()).await?;
-        match repo::ask(&self.client, &checkout, true).await? {
-            Some(view) => Ok(repo::describe(&view, checkout.head.as_deref())),
-            None => Err(format!(
-                "{} is no repository of the CI's ci.toml: its jobs do not run there",
+        let answer = repo::ask_with(&self.client, &checkout, true, true).await?;
+        match (answer.repo, answer.pending) {
+            (Some(view), _) => Ok(repo::describe(&view, checkout.head.as_deref())),
+            (None, Some(doc)) => Err(repo::pending_text(&checkout.origin, &doc)),
+            (None, None) => Err(format!(
+                "{} is no repository of the CI's ci.toml: its jobs do not run there; \
+                 onboard_request asks for it to join",
                 checkout.origin
             )),
         }
@@ -513,12 +517,15 @@ impl Toolbox {
         let repo = match (path, repo) {
             (Some(path), None) => {
                 let checkout = self.checkout_of(Some(&path)).await?;
-                match repo::ask(&self.client, &checkout, false).await? {
-                    Some(view) => view.name,
-                    None => {
+                let answer = repo::ask_with(&self.client, &checkout, false, false).await?;
+                match (answer.repo, answer.pending) {
+                    (Some(view), _) => view.name,
+                    (None, Some(doc)) => doc.repo,
+                    (None, None) => {
                         return Err(format!(
-                            "{} is no repository of the CI; write \
-                             PROPOSAL-<source>-<topic>.md into {} instead",
+                            "{} is no repository of the CI and has no onboarding request; file \
+                             one with onboard_request from that project, or write \
+                             PROPOSAL-<source>-<topic>.md into {} when it is not to join the CI",
                             checkout.origin,
                             checkout.root.display()
                         ));
@@ -528,15 +535,7 @@ impl Toolbox {
             (None, Some(repo)) => repo,
             _ => return Err("name the receiving project: path of its checkout or repo".to_owned()),
         };
-        let own = self.checkout_path(None)?;
-        let root = tokio::task::spawn_blocking(move || snapshot::toplevel(&own))
-            .await
-            .map_err(|e| format!("the checkout could not be read: {e}"))??;
-        let source = root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| format!("{} has no name to give as the source", root.display()))?
-            .to_owned();
+        let source = self.own_source().await?;
         let request = CiRequest::DocCreate {
             repo: repo.clone(),
             kind: DocKind::Proposal,
@@ -545,9 +544,71 @@ impl Toolbox {
             source,
             proposals: Vec::new(),
             runs_on,
+            onboard: None,
         };
         match self.client.ci(request).await? {
             CiReply::DocCreated { number } => Ok(format!("proposal #{number} stored in {repo}")),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// The source a document of this project names: the directory name of
+    /// the working directory's checkout.
+    async fn own_source(&self) -> Result<String, String> {
+        let own = self.checkout_path(None)?;
+        let root = tokio::task::spawn_blocking(move || snapshot::toplevel(&own))
+            .await
+            .map_err(|e| format!("the checkout could not be read: {e}"))??;
+        root.file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("{} has no name to give as the source", root.display()))
+    }
+
+    /// `onboard_request`: asks for a project the CI does not build to join
+    /// it as repository `name`.
+    async fn onboard_request(&self, args: OnboardArgs) -> Result<String, String> {
+        let OnboardArgs {
+            path,
+            url,
+            name,
+            title,
+            body,
+            default_branch,
+            grants,
+            prerequisites,
+        } = args;
+        self.client.configured()?;
+        let origin = match (path, url) {
+            (Some(path), None) => self.checkout_of(Some(&path)).await?.origin,
+            (None, Some(url)) => url,
+            _ => {
+                return Err(
+                    "name the project that asks to join: path of its checkout or url".to_owned(),
+                );
+            }
+        };
+        let source = self.own_source().await?;
+        let request = CiRequest::DocCreate {
+            repo: name.clone(),
+            kind: DocKind::Onboarding,
+            title,
+            body,
+            source,
+            proposals: Vec::new(),
+            runs_on: Vec::new(),
+            onboard: Some(OnboardSpec {
+                url: origin,
+                default_branch: default_branch.unwrap_or_else(|| "main".to_owned()),
+                grants,
+                prerequisites,
+            }),
+        };
+        match self.client.ci(request).await? {
+            CiReply::DocCreated { number } => Ok(format!(
+                "onboarding request #{number} for {name} stored; the owner approves it in the \
+                 Plans tab of {name}"
+            )),
             other => Err(unexpected(&other)),
         }
     }
@@ -844,12 +905,16 @@ impl Toolbox {
         {
             return Ok(name.clone());
         }
-        match repo::ask(&self.client, &checkout, false).await? {
-            Some(view) => {
+        let answer = repo::ask_with(&self.client, &checkout, false, false).await?;
+        match (answer.repo, answer.pending) {
+            (Some(view), _) => {
                 *resolved = Some((checkout.root, view.name.clone()));
                 Ok(view.name)
             }
-            None => Err(format!(
+            // Not cached: the request's repository is soon a configured one,
+            // which the next call should learn of.
+            (None, Some(doc)) => Ok(doc.repo),
+            (None, None) => Err(format!(
                 "repo omitted, and {} is no repository of the CI's ci.toml",
                 checkout.origin
             )),
@@ -956,6 +1021,7 @@ impl Tools for Toolbox {
             "docs" => self.docs(arguments_of(arguments)?).await,
             "doc_read" => self.doc_read(arguments_of(arguments)?).await,
             "proposal_write" => self.proposal_write(arguments_of(arguments)?).await,
+            "onboard_request" => self.onboard_request(arguments_of(arguments)?).await,
             "plan_done" => self.plan_done(arguments_of(arguments)?).await,
             "ci_run" => self.ci_run(arguments_of(arguments)?).await,
             "ci_state" => self.state(arguments_of(arguments)?).await,
@@ -1025,6 +1091,21 @@ struct ProposalArgs {
     body: String,
     #[serde(default)]
     runs_on: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OnboardArgs {
+    path: Option<String>,
+    url: Option<String>,
+    name: String,
+    title: String,
+    body: String,
+    default_branch: Option<String>,
+    #[serde(default)]
+    grants: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    prerequisites: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -1228,6 +1309,23 @@ fn status_text(overview: &CiOverview, now: u64) -> String {
             .iter()
             .map(|(platform, target)| format!("{platform} -> {target}")),
     );
+    // Only while a request waits or runs: most of the time there is none.
+    let onboarding: Vec<String> = overview
+        .repos
+        .iter()
+        .filter_map(|r| {
+            let number = r.onboarding?;
+            let state = if r.awaiting > 0 {
+                "awaiting approval"
+            } else {
+                "onboarding"
+            };
+            Some(format!("{} #{number} {}: {state}", r.repo, r.origin))
+        })
+        .collect();
+    if !onboarding.is_empty() {
+        section(&mut text, "onboarding", onboarding.into_iter());
+    }
     text
 }
 
@@ -1966,10 +2064,11 @@ fn definitions() -> Vec<Value> {
         ),
         tool(
             "proposal_write",
-            "Store a proposal for another repository of the CI: what changed in this project \
-             and why, what the receiving project would change, and the checks. It waits there \
-             as an open proposal until a plan takes it up. Name the receiving project by the \
-             path of its checkout or by its repository name. Answers with its number.",
+            "Store a proposal for another repository of the CI, or for a project with an \
+             onboarding request: what changed in this project and why, what the receiving \
+             project would change, and the checks. It waits there as an open proposal until a \
+             plan takes it up. Name the receiving project by the path of its checkout or by its \
+             repository name. Answers with its number.",
             json!({
                 "path": {
                     "type": "string",
@@ -1999,6 +2098,59 @@ fn definitions() -> Vec<Value> {
                 },
             }),
             &["title", "body"],
+            false,
+        ),
+        tool(
+            "onboard_request",
+            "A project the CI does not build asks to join it: stores an onboarding request the \
+             owner approves in the editor's Plans tab, after which the CI adds its bot and \
+             webhook on the forge, stores the webhook secret, registers the repository and \
+             starts its first push pipeline. The body covers the project's purpose, the events \
+             it builds on (including `push main of <repo>` to follow another repository), the \
+             secrets each event needs, host prerequisites, and whether the project brings its \
+             own .zeughaus-ci/. Proposals to the project can be written with proposal_write as \
+             soon as the request is stored. Name the project by the path of its checkout or by \
+             its forge url.",
+            json!({
+                "path": {
+                    "type": "string",
+                    "description": "The joining project's checkout; its origin names it. Not \
+                                    together with url.",
+                },
+                "url": {
+                    "type": "string",
+                    "description": "The joining project's forge url, instead of path.",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "The repository name in ci.toml, [a-z0-9][a-z0-9-]*.",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "One line, at most 200 bytes.",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "The request in Markdown.",
+                },
+                "default_branch": {
+                    "type": "string",
+                    "description": "Default: main.",
+                },
+                "grants": {
+                    "type": "object",
+                    "additionalProperties": { "type": "array", "items": { "type": "string" } },
+                    "description": "Secret name to the event patterns it is released to, as \
+                                    ci.toml's grants; for example {\"DEPLOY_KEY\": [\"push main\"]}",
+                },
+                "prerequisites": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Host prerequisites the owner sets up by hand, one line \
+                                    each, for example a sudo rule for an install script.",
+                },
+            }),
+            &["name", "title", "body"],
             false,
         ),
         tool(
@@ -2146,7 +2298,7 @@ mod tests {
     }
 
     #[test]
-    fn there_are_eighteen_tools_and_each_takes_an_object() {
+    fn there_are_nineteen_tools_and_each_takes_an_object() {
         let definitions = definitions();
         let names: Vec<&str> = definitions
             .iter()
@@ -2168,6 +2320,7 @@ mod tests {
                 "docs",
                 "doc_read",
                 "proposal_write",
+                "onboard_request",
                 "plan_done",
                 "ci_run",
                 "ci_state",
@@ -2957,6 +3110,7 @@ mod tests {
             }],
             platforms: vec![("linux-amd64".to_owned(), "agent".to_owned())],
             docs: Vec::new(),
+            setup: Vec::new(),
         }
     }
 
@@ -3035,11 +3189,17 @@ mod tests {
                         truncated: true,
                     },
                 },
-                CiRequest::Repo { origin, sha, jobs } if origin == DEMO_ORIGIN => CiReply::Repo {
+                CiRequest::Repo {
+                    origin, sha, jobs, ..
+                } if origin == DEMO_ORIGIN => CiReply::Repo {
                     repo: Some(Box::new(demo_repo(sha.as_deref(), jobs))),
+                    pending: None,
                 },
                 // A remote that is none of the repositories of its ci.toml.
-                CiRequest::Repo { .. } => CiReply::Repo { repo: None },
+                CiRequest::Repo { .. } => CiReply::Repo {
+                    repo: None,
+                    pending: None,
+                },
                 // Every channel: pipeline 1, and once #1 was rerun the
                 // rerun as #2, newest first.
                 CiRequest::Pipelines { repo, channel, .. } if channel.is_empty() => {
@@ -3167,6 +3327,8 @@ mod tests {
             } else {
                 String::new()
             },
+            onboard: None,
+            note: String::new(),
         }
     }
 
@@ -3946,6 +4108,7 @@ mod tests {
                     source: "weida".to_owned(),
                     proposals: Vec::new(),
                     runs_on: Vec::new(),
+                    onboard: None,
                 })
             );
 
@@ -3986,12 +4149,89 @@ mod tests {
             assert_eq!(
                 err,
                 format!(
-                    "git@example.invalid:o/other.git is no repository of the CI; write \
-                     PROPOSAL-<source>-<topic>.md into {root} instead"
+                    "git@example.invalid:o/other.git is no repository of the CI and has no \
+                     onboarding request; file one with onboard_request from that project, or \
+                     write PROPOSAL-<source>-<topic>.md into {root} when it is not to join the CI"
                 )
             );
             let _ = std::fs::remove_dir_all(receiving.parent().unwrap());
             let _ = std::fs::remove_dir_all(own.parent().unwrap());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_onboarding_request_carries_the_checkouts_origin_and_the_spec() {
+            let ci = fake_ci(0, None).await;
+            let joining = checkout("onboard-from");
+            fx(
+                &joining,
+                &[
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "git@example.invalid:o/scan-rs.git",
+                ],
+            );
+            let tools = toolbox_for(&ci).working_in(joining.clone());
+
+            let text = tools
+                .call(
+                    "onboard_request",
+                    json!({
+                        "path": joining,
+                        "name": "scan-rs",
+                        "title": "Join",
+                        "body": "Scans.",
+                        "grants": { "DEPLOY_KEY": ["push main"] },
+                        "prerequisites": ["a sudo rule"],
+                    }),
+                )
+                .await
+                .expect("stored");
+            assert_eq!(
+                text,
+                "onboarding request #7 for scan-rs stored; the owner approves it in the Plans \
+                 tab of scan-rs"
+            );
+            let source = joining
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                ci.seen.asked.lock().unwrap().last(),
+                Some(&CiRequest::DocCreate {
+                    repo: "scan-rs".to_owned(),
+                    kind: DocKind::Onboarding,
+                    title: "Join".to_owned(),
+                    body: "Scans.".to_owned(),
+                    source,
+                    proposals: Vec::new(),
+                    runs_on: Vec::new(),
+                    onboard: Some(OnboardSpec {
+                        url: "git@example.invalid:o/scan-rs.git".to_owned(),
+                        default_branch: "main".to_owned(),
+                        grants: [("DEPLOY_KEY".to_owned(), vec!["push main".to_owned()])]
+                            .into_iter()
+                            .collect(),
+                        prerequisites: vec!["a sudo rule".to_owned()],
+                    }),
+                })
+            );
+
+            for both_or_neither in [
+                json!({ "name": "x", "title": "t", "body": "b" }),
+                json!({ "path": joining, "url": "https://h/o/x", "name": "x", "title": "t", "body": "b" }),
+            ] {
+                let err = tools
+                    .call("onboard_request", both_or_neither)
+                    .await
+                    .expect_err("no project");
+                assert_eq!(
+                    err,
+                    "name the project that asks to join: path of its checkout or url"
+                );
+            }
+            let _ = std::fs::remove_dir_all(joining.parent().unwrap());
         }
 
         /// Git as a test fixture runs it: its own identity, whatever the
@@ -4064,7 +4304,8 @@ mod tests {
                     CiRequest::Repo {
                         origin: DEMO_ORIGIN.to_owned(),
                         sha: None,
-                        jobs: false
+                        jobs: false,
+                        setup: false,
                     },
                     CiRequest::Pipelines {
                         repo: "demo".to_owned(),
@@ -4148,7 +4389,7 @@ mod tests {
             assert_eq!(
                 err,
                 "https://git.example.invalid/o/other.git is no repository of the CI's ci.toml: \
-             its jobs do not run there"
+             its jobs do not run there; onboard_request asks for it to join"
             );
             let _ = std::fs::remove_dir_all(dir.parent().unwrap());
         }
@@ -4182,7 +4423,8 @@ mod tests {
                 [CiRequest::Repo {
                     origin: DEMO_ORIGIN.to_owned(),
                     sha: Some(head.clone()),
-                    jobs: true
+                    jobs: true,
+                    setup: true,
                 }]
             );
 
@@ -4219,7 +4461,8 @@ mod tests {
                     CiRequest::Repo {
                         origin: DEMO_ORIGIN.to_owned(),
                         sha: Some(head.clone()),
-                        jobs: false
+                        jobs: false,
+                        setup: false,
                     },
                     CiRequest::Find {
                         repo: "demo".to_owned(),

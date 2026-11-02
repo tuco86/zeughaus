@@ -8,6 +8,9 @@ Type=simple
 # `zeughaus-ci install ci` fills in the binary directory (~/bin, owned by
 # this user, so the CI can update itself).
 ExecStart=@BINDIR@/zeughaus-ci --state-dir %h/state serve --listen 10.8.0.1:7444 --hook 127.0.0.1:8686
+# `systemctl --user reload zeughaus-ci` re-reads [repos] of ci.toml and the
+# onboarded repositories under ci/onboarded/; any other change takes a restart.
+ExecReload=/bin/kill -HUP $MAINPID
 # Everything the CI knows is on disk under the state directory and runs
 # live on the runners, so an update is a plain restart.
 Restart=always

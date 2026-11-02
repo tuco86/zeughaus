@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- CI onboarding requests: a project the CI does not build files one with the
+  MCP tool `onboard_request` (the repository name, its origin, grants and
+  host prerequisites); proposals can be stored against it at once. The
+  pending repository has a Plans tab, where approving the request makes the
+  CI add its bot as a collaborator and the push hook on Forgejo (with the
+  owner token `[onboarding] admin_token`), store a generated webhook secret
+  in OpenBao (the policy of `deploy/ci/openbao.sh` adds `patch`), register
+  the repository as `ci/onboarded/<name>.toml` and queue its first push
+  pipeline. A failed step returns the request to `open` with its note.
+  `ci_repo` reports the setup (hook deliveries, the bot's push access,
+  secrets, grants) and names a pending request; `ci_status` lists them.
+- The CI reloads `[repos]` of `ci.toml` and `ci/onboarded/` on SIGHUP
+  (`systemctl --user reload zeughaus-ci`) without a restart; any other
+  change is refused until the next restart.
 - Runners by name: a runner's `enlist.toml` may list `addresses` (the
   `ip:port` pairs its listener answers at, best first; by default the
   endpoint URL's address when it is a reachable IP), and its `Hello` carries

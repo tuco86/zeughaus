@@ -29,7 +29,7 @@ use zeughaus_mux::TerminalId;
 use zeughaus_terminal::wal;
 
 use crate::CI_DIR;
-use crate::config::{CiConfig, Forge, RepoConfig, valid_name};
+use crate::config::{CiConfig, Forge, RepoConfig, Shared, valid_name};
 use crate::docs;
 use crate::event::{self, EventKind};
 use crate::excerpt;
@@ -39,6 +39,7 @@ use crate::scheduler::{
     self, JobRecord, Pipeline, PipelineStatus, load_pipeline, load_pipelines, load_repo_pipelines,
     transcript_dir,
 };
+use crate::secrets::Secrets;
 use crate::sessions::Sessions;
 use crate::transcripts::Transcripts;
 use crate::transport::editor_principal;
@@ -61,7 +62,9 @@ const TIMING_TEXT_CHARS: usize = 200;
 
 pub struct CiServer {
     state_dir: PathBuf,
-    config: Arc<CiConfig>,
+    config: Arc<Shared>,
+    /// For the setup check of `Repo`: which secrets the document holds.
+    secrets: Arc<Secrets>,
     runners: Arc<Runners>,
     transcripts: Arc<Transcripts>,
     /// Held by every change of a document: requests run on the blocking
@@ -75,9 +78,11 @@ pub struct CiServer {
 }
 
 impl CiServer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         state_dir: PathBuf,
-        config: Arc<CiConfig>,
+        config: Arc<Shared>,
+        secrets: Arc<Secrets>,
         runners: Arc<Runners>,
         transcripts: Arc<Transcripts>,
         docs: Arc<std::sync::Mutex<()>>,
@@ -87,6 +92,7 @@ impl CiServer {
         CiServer {
             state_dir,
             config,
+            secrets,
             runners,
             transcripts,
             docs,
@@ -156,12 +162,17 @@ impl CiServer {
                 job,
                 top,
             } => self.timing(&repo, number, &job, top),
-            CiRequest::Repo { origin, sha, jobs } => self.repo(&origin, sha.as_deref(), jobs),
+            CiRequest::Repo {
+                origin,
+                sha,
+                jobs,
+                setup,
+            } => self.repo(&origin, sha.as_deref(), jobs, setup),
             CiRequest::Docs { repo } => CiReply::Docs {
-                docs: docs::list(&self.state_dir, &self.config, &repo),
+                docs: docs::list(&self.state_dir, &self.config.get(), &repo),
             },
             CiRequest::Doc { repo, number } => CiReply::Doc {
-                doc: docs::load(&self.state_dir, &self.config, &repo, number).map(Box::new),
+                doc: docs::load(&self.state_dir, &self.config.get(), &repo, number).map(Box::new),
             },
             CiRequest::DocCreate {
                 repo,
@@ -171,6 +182,7 @@ impl CiServer {
                 source,
                 proposals,
                 runs_on,
+                onboard,
             } => {
                 let new = docs::NewDoc {
                     kind,
@@ -179,6 +191,7 @@ impl CiServer {
                     source: &source,
                     proposals: &proposals,
                     runs_on: &runs_on,
+                    onboard: onboard.as_ref(),
                 };
                 let made = self.change_docs(&repo, |state, config, now| {
                     docs::create(state, config, &repo, new, now).map(|number| (number, true))
@@ -231,7 +244,7 @@ impl CiServer {
             },
             CiRequest::CloseSession { id } => accepted(self.sessions.close(id)),
             CiRequest::States { repo } => {
-                if !self.config.repos.contains_key(&repo) {
+                if !self.config.get().repos.contains_key(&repo) {
                     return error(&format!("no repository {repo}"));
                 }
                 match crate::state::list(&self.state_dir, &repo) {
@@ -244,7 +257,7 @@ impl CiServer {
                 name,
                 version,
             } => {
-                if !self.config.repos.contains_key(&repo) {
+                if !self.config.get().repos.contains_key(&repo) {
                     return error(&format!("no repository {repo}"));
                 }
                 accepted(crate::state::delete(&self.state_dir, &repo, &name, version))
@@ -263,7 +276,7 @@ impl CiServer {
             .docs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (done, changed) = change(&self.state_dir, &self.config, crate::now_secs())?;
+        let (done, changed) = change(&self.state_dir, &self.config.get(), crate::now_secs())?;
         if changed {
             let _ = self.docs_changed.send(repo.to_owned());
         }
@@ -290,6 +303,7 @@ impl CiServer {
     fn overview(&self) -> CiOverview {
         // One pass over every record feeds all three parts.
         let pipelines = load_pipelines(&self.state_dir);
+        let config = self.config.get();
         let queued = event::queued(&self.state_dir)
             .into_iter()
             .map(|(_, event)| event)
@@ -297,9 +311,9 @@ impl CiServer {
         CiOverview {
             channels: channel_views(&pipelines),
             machines: self.machine_views(&pipelines),
-            queued: queued_views(&pipelines, &queued, &self.config),
+            queued: queued_views(&pipelines, &queued, &config),
             platforms: self.platforms(),
-            repos: docs::summary(&self.state_dir, &self.config),
+            repos: docs::summary(&self.state_dir, &config),
             build: zeughaus_update::manifest::own_build(),
             sessions: self.sessions.listed(),
         }
@@ -309,6 +323,7 @@ impl CiServer {
     /// or machine that builds it.
     fn platforms(&self) -> Vec<(String, String)> {
         self.config
+            .get()
             .platforms
             .iter()
             .map(|(platform, target)| (platform.clone(), target.clone()))
@@ -322,7 +337,8 @@ impl CiServer {
         let connected = self.runners.views();
         let mut runners = Vec::new();
         let mut machines = Vec::new();
-        for name in self.config.runners.keys() {
+        let config = self.config.get();
+        for name in config.runners.keys() {
             let jobs = active
                 .iter()
                 .filter(|a| a.runner.as_deref() == Some(name) && a.machine.is_none())
@@ -335,7 +351,7 @@ impl CiServer {
             }
             .to_owned();
             let view = connected.get(name);
-            let configured = &self.config.runners[name];
+            let configured = &config.runners[name];
             runners.push(MachineView {
                 name: name.clone(),
                 kind: "runner".to_owned(),
@@ -343,7 +359,7 @@ impl CiServer {
                 jobs,
                 build: view.map_or(0, |view| view.build),
                 fingerprint: configured.fingerprint.clone(),
-                labels: self.config.labels_of(name, view.map(|v| &v.offer)),
+                labels: config.labels_of(name, view.map(|v| &v.offer)),
                 addresses: view.map(|v| v.addresses.clone()).unwrap_or_default(),
                 sessions: configured.sessions,
             });
@@ -415,7 +431,8 @@ impl CiServer {
     /// the branch's head. Only the default branch and no tag, because a tag
     /// is a release.
     fn queue(&self, repo: &str, nightly: bool, actor: &str) -> CiReply {
-        let Some(config) = self.config.repos.get(repo) else {
+        let config = self.config.get();
+        let Some(config) = config.repos.get(repo) else {
             return error("no such repository");
         };
         let valid_actor = (1..=64).contains(&actor.len())
@@ -495,11 +512,12 @@ impl CiServer {
 
     /// The repository of `ci.toml` whose url `origin`, the origin remote of
     /// an agent's checkout, names: where its default branch stands, the
-    /// newest pipeline of the checkout's commit `sha` and, with `jobs`, the
-    /// jobs of its `.zeughaus-ci/` and where each would run. Records and the
-    /// scheduler's mirror are only read, so the answer never waits for the
-    /// scheduler.
-    fn repo(&self, origin: &str, sha: Option<&str>, jobs: bool) -> CiReply {
+    /// newest pipeline of the checkout's commit `sha`, with `jobs` the jobs
+    /// of its `.zeughaus-ci/` and where each would run, and with `setup` the
+    /// check of its setup. Records and the scheduler's mirror are only read,
+    /// so the answer never waits for the scheduler. An origin no repository
+    /// has is answered with its pending onboarding request, if any.
+    fn repo(&self, origin: &str, sha: Option<&str>, jobs: bool, setup: bool) -> CiReply {
         if origin.is_empty() || origin.len() > MAX_ORIGIN_BYTES {
             return error(&format!("origin must be 1 to {MAX_ORIGIN_BYTES} bytes"));
         }
@@ -510,8 +528,24 @@ impl CiServer {
             },
             None => None,
         };
-        let Ok((name, repo)) = crate::manual::repo_of(&self.config, origin) else {
-            return CiReply::Repo { repo: None };
+        let config = self.config.get();
+        let Ok((name, repo)) = crate::manual::repo_of(&config, origin) else {
+            let wanted = zeughaus_link::ci::normalize_origin(origin);
+            let pending = docs::pending(&self.state_dir, &config)
+                .into_iter()
+                .find(|doc| {
+                    doc.onboard.as_ref().is_some_and(|spec| {
+                        zeughaus_link::ci::normalize_origin(&spec.url) == wanted
+                    })
+                })
+                .map(|mut doc| {
+                    doc.body.clear();
+                    Box::new(doc)
+                });
+            return CiReply::Repo {
+                repo: None,
+                pending,
+            };
         };
         // Only this repository's records are read: the jobs a machine shows
         // are the ones this repository runs on it.
@@ -520,6 +554,11 @@ impl CiServer {
             self.read_jobs(name, &repo.default_branch, sha.as_deref())
         } else {
             RepoJobs::default()
+        };
+        let setup = if setup {
+            self.setup_lines(name, repo, &read.jobs, jobs && read.note.is_empty())
+        } else {
+            Vec::new()
         };
         CiReply::Repo {
             repo: Some(Box::new(RepoView {
@@ -537,7 +576,7 @@ impl CiServer {
                 jobs_note: read.note,
                 machines: self.machine_views(&pipelines),
                 platforms: self.platforms(),
-                docs: docs::list(&self.state_dir, &self.config, name)
+                docs: docs::list(&self.state_dir, &config, name)
                     .into_iter()
                     .filter(|doc| {
                         matches!(
@@ -549,8 +588,90 @@ impl CiServer {
                         )
                     })
                     .collect(),
+                setup,
             })),
+            pending: None,
         }
+    }
+
+    /// Whether repository `name` is set up: its hook's last delivery, the
+    /// bot's push access, the secrets it names and, with `jobs_read`,
+    /// whether every secret a job asks for is granted to some event.
+    fn setup_lines(
+        &self,
+        name: &str,
+        repo: &RepoConfig,
+        jobs: &[JobDefView],
+        jobs_read: bool,
+    ) -> Vec<String> {
+        let mut lines = Vec::new();
+        if repo.forge != Forge::None {
+            lines.push(match crate::hook::last_delivery(&self.state_dir, name) {
+                Some(last) => format!(
+                    "hook: last delivery {} ago: {} {} {}",
+                    crate::streak::age(crate::now_secs().saturating_sub(last.at)),
+                    last.event,
+                    last.code,
+                    last.text
+                ),
+                None => format!(
+                    "hook: no delivery recorded; the next push to {} shows whether it arrives",
+                    repo.slug
+                ),
+            });
+            lines.push(if repo.status_token.is_none() {
+                "bot: no status_token in ci.toml".to_owned()
+            } else {
+                match crate::forge::push_access(&self.secrets, repo) {
+                    Ok(true) => format!("bot: push access to {}", repo.slug),
+                    Ok(false) => format!(
+                        "bot: no push access to {}; statuses and fetches fail",
+                        repo.slug
+                    ),
+                    Err(e) => format!("bot: {e}"),
+                }
+            });
+        }
+        let names: std::collections::BTreeSet<&String> = repo.secret_names().collect();
+        lines.push(if names.is_empty() {
+            "secrets: none named".to_owned()
+        } else {
+            match self.secrets.fields() {
+                Ok(fields) => format!(
+                    "secrets: {}",
+                    names
+                        .iter()
+                        .map(|name| {
+                            let state = if fields.contains(*name) {
+                                "ok"
+                            } else {
+                                "missing"
+                            };
+                            format!("{name} {state}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Err(e) => format!("secrets: {e}"),
+            }
+        });
+        if jobs_read {
+            let before = lines.len();
+            for job in jobs {
+                for secret in &job.secrets {
+                    if !repo.grants.contains_key(secret) {
+                        lines.push(format!(
+                            "grants: job {} needs {secret}, which ci.toml grants to no event",
+                            job.name
+                        ));
+                    }
+                }
+            }
+            if lines.len() == before {
+                lines.push("grants: every job secret is granted".to_owned());
+            }
+        }
+        lines
     }
 
     /// The jobs of `name`'s `.zeughaus-ci/` from the scheduler's mirror: at
@@ -585,7 +706,7 @@ impl CiServer {
                 let jobs: Vec<JobDefView> = defs
                     .iter()
                     .map(|def| {
-                        job_def_view(&self.config, name, def, |image| {
+                        job_def_view(&self.config.get(), name, def, |image| {
                             scheduler::containerfile_at(&mirror, &commit, image)
                         })
                     })
@@ -1217,7 +1338,7 @@ pub async fn serve(replier: Replier, server: Arc<CiServer>) {
                 return;
             }
         };
-        if let Err(why) = editor_principal(&server.config, request.meta()) {
+        if let Err(why) = editor_principal(&server.config.get(), request.meta()) {
             eprintln!("[ci] refused a ci request from a peer that {why}");
             request.refuse(weida::ErrorCode::Rejected).await;
             continue;
@@ -1382,6 +1503,7 @@ mod tests {
     ) -> CiServer {
         let runners = Arc::new(Runners::new());
         let lock = Arc::new(std::sync::Mutex::new(()));
+        let config = Shared::new(CiConfig::clone(&config));
         let sessions = Arc::new(Sessions::new(
             state.to_path_buf(),
             Arc::clone(&config),
@@ -1393,6 +1515,7 @@ mod tests {
         CiServer::new(
             state.to_path_buf(),
             config,
+            crate::secrets::Secrets::new(None, state),
             runners,
             Arc::new(Transcripts::new(state.to_path_buf())),
             lock,
@@ -2054,8 +2177,9 @@ mod tests {
                 origin: origin.to_owned(),
                 sha: sha.map(str::to_owned),
                 jobs,
+                setup: false,
             }) {
-                CiReply::Repo { repo } => repo.map(|view| *view),
+                CiReply::Repo { repo, .. } => repo.map(|view| *view),
                 other => panic!("unexpected reply {other:?}"),
             }
         }
@@ -2134,6 +2258,7 @@ mod tests {
                     origin: origin.to_owned(),
                     sha: sha.map(str::to_owned),
                     jobs: false,
+                    setup: false,
                 })
             };
 
@@ -2148,7 +2273,10 @@ mod tests {
             // The longest origin is looked up, and no repository has it.
             assert_eq!(
                 reply(&"a".repeat(MAX_ORIGIN_BYTES), None),
-                CiReply::Repo { repo: None }
+                CiReply::Repo {
+                    repo: None,
+                    pending: None
+                }
             );
 
             for bad in ["abc", "xyz1", "", &"a".repeat(41)] {
@@ -2162,7 +2290,7 @@ mod tests {
                 assert!(
                     matches!(
                         reply(VIEW_ORIGIN, Some(good)),
-                        CiReply::Repo { repo: Some(_) }
+                        CiReply::Repo { repo: Some(_), .. }
                     ),
                     "{good:?}"
                 );
@@ -3068,6 +3196,7 @@ mod tests {
                 source: "demo".to_owned(),
                 proposals: Vec::new(),
                 runs_on: Vec::new(),
+                onboard: None,
             });
             assert_eq!(made, CiReply::DocCreated { number: 1 });
             assert_eq!(rx.try_recv(), Ok("demo".to_owned()));
@@ -3086,6 +3215,7 @@ mod tests {
                     in_progress: Vec::new(),
                     paused: false,
                     proposals: 0,
+                    onboarding: None,
                 }]
             );
             let CiReply::Docs { docs } = server.answer(CiRequest::Docs {
@@ -3115,6 +3245,61 @@ mod tests {
                 refused,
                 error("no runner can host a session (sessions = true and connected)")
             );
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn onboarding_request_answers_for_its_origin() {
+            let state = scratch("onboarding");
+            let server = server_on(
+                &state,
+                config(
+                    "[repos.demo]\nurl = \"https://git.example.org/o/demo.git\"\n\
+                     [secrets]\naddr = \"http://127.0.0.1:1\"\npath = \"zeughaus/ci\"\nrole_id = \"r\"\n\
+                     [onboarding]\napi = \"https://git.example.org\"\nbot = \"ci\"\n\
+                     bot_token = \"BOT\"\nadmin_token = \"ADMIN\"\nhook_url = \"https://ci.example.org/hook\"\n",
+                ),
+                std::sync::mpsc::channel().0,
+            );
+            let made = server.answer(CiRequest::DocCreate {
+                repo: "scan-rs".to_owned(),
+                kind: zeughaus_link::DocKind::Onboarding,
+                title: "Join".to_owned(),
+                body: "Scans.\n".to_owned(),
+                source: "scan-rs".to_owned(),
+                proposals: Vec::new(),
+                runs_on: Vec::new(),
+                onboard: Some(zeughaus_link::OnboardSpec {
+                    url: "git@git.example.org:o/scan-rs.git".to_owned(),
+                    default_branch: "main".to_owned(),
+                    grants: Default::default(),
+                    prerequisites: Vec::new(),
+                }),
+            });
+            assert_eq!(made, CiReply::DocCreated { number: 1 });
+
+            let CiReply::Repo { repo, pending } = server.answer(CiRequest::Repo {
+                origin: "https://git.example.org/o/scan-rs".to_owned(),
+                sha: None,
+                jobs: true,
+                setup: true,
+            }) else {
+                panic!("no repo answer");
+            };
+            assert!(repo.is_none());
+            let pending = pending.expect("the pending request");
+            assert_eq!((pending.number, pending.repo.as_str()), (1, "scan-rs"));
+            assert!(pending.body.is_empty());
+
+            let CiReply::Overview { overview } = server.answer(CiRequest::Overview) else {
+                panic!("no overview");
+            };
+            let listed: Vec<(&str, Option<u64>)> = overview
+                .repos
+                .iter()
+                .map(|r| (r.repo.as_str(), r.onboarding))
+                .collect();
+            assert_eq!(listed, [("demo", None), ("scan-rs", Some(1))]);
             let _ = std::fs::remove_dir_all(&state);
         }
     }

@@ -30,7 +30,7 @@ use zeughaus_link::manual::{
     MAX_MANUAL_BUNDLE_BYTES, MAX_MANUAL_DIRS, MAX_MANUAL_JOBS, RunReply, RunUpload, valid_dir_name,
 };
 
-use crate::config::{CiConfig, RepoConfig, valid_name};
+use crate::config::{CiConfig, RepoConfig, Shared, valid_name};
 use crate::event::{self, CiEvent, EventKind};
 use crate::files::{read_json, write_json};
 use crate::scheduler::Pipeline;
@@ -284,7 +284,7 @@ async fn copy_exact(
 /// Answers `/manual` exchanges until the replier goes away, which for this
 /// process means never. Each exchange has a task of its own: an upload takes
 /// as long as its bundles do.
-pub async fn serve(replier: Replier, state_dir: PathBuf, config: Arc<CiConfig>) {
+pub async fn serve(replier: Replier, state_dir: PathBuf, config: Arc<Shared>) {
     let service = Arc::new(ManualService {
         state_dir,
         config,
@@ -306,14 +306,14 @@ pub async fn serve(replier: Replier, state_dir: PathBuf, config: Arc<CiConfig>) 
 
 struct ManualService {
     state_dir: PathBuf,
-    config: Arc<CiConfig>,
+    config: Arc<Shared>,
     /// How long an accepted upload waits for its pipeline's number.
     wait: Duration,
 }
 
 impl ManualService {
     async fn exchange(&self, mut request: IncomingRequest) {
-        let principal = match editor_principal(&self.config, request.meta()) {
+        let principal = match editor_principal(&self.config.get(), request.meta()) {
             Ok(principal) => principal,
             Err(why) => {
                 eprintln!("[ci] refused a manual upload from a peer that {why}");
@@ -366,8 +366,9 @@ impl ManualService {
     {
         validate(&upload)?;
         let (repo, default_branch) = {
-            let (name, config) = repo_of(&self.config, &upload.origin)?;
-            (name.to_owned(), config.default_branch.clone())
+            let config = self.config.get();
+            let (name, repo) = repo_of(&config, &upload.origin)?;
+            (name.to_owned(), repo.default_branch.clone())
         };
         let id = new_upload_id(principal);
         eprintln!(
@@ -453,16 +454,14 @@ mod tests {
 
     const FP: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
 
-    fn config() -> Arc<CiConfig> {
-        Arc::new(
-            CiConfig::parse(&format!(
-                "default_runner = \"x\"\n\
-                 [runners.x]\nfingerprint = \"{FP}\"\n\
-                 [repos.griasdi]\nurl = \"https://github.com/Griasdi/Griasdi.git\"\n\
-                 default_branch = \"trunk\"\n"
-            ))
-            .expect("a valid ci.toml"),
-        )
+    fn config() -> CiConfig {
+        CiConfig::parse(&format!(
+            "default_runner = \"x\"\n\
+             [runners.x]\nfingerprint = \"{FP}\"\n\
+             [repos.griasdi]\nurl = \"https://github.com/Griasdi/Griasdi.git\"\n\
+             default_branch = \"trunk\"\n"
+        ))
+        .expect("a valid ci.toml")
     }
 
     fn dir(name: &str, fill: char) -> UploadDir {
@@ -666,7 +665,7 @@ mod tests {
         fn service(state: &Path, wait: Duration) -> ManualService {
             ManualService {
                 state_dir: state.to_path_buf(),
-                config: config(),
+                config: Shared::new(config()),
                 wait,
             }
         }

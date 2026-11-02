@@ -50,9 +50,10 @@ pub use activity::{
 pub use ci::{
     ChannelView, CiOverview, CiReply, CiRequest, DocGroup, DocKind, DocState, DocView, JobDefView,
     JobTiming, JobView, MAX_CI_REPLY_BYTES, MAX_CI_REQUEST_BYTES, MAX_DOC_BYTES,
-    MAX_DOC_TITLE_BYTES, MachineJob, MachineView, PipelineView, QueuedView, RepoDocsView, RepoView,
-    SessionKind, SessionMachine, SessionState, SessionView, StateVersionView, StateView, TimedLine,
-    TransferView, doc_groups, normalize_origin, pipeline_load,
+    MAX_DOC_TITLE_BYTES, MachineJob, MachineView, OnboardSpec, PipelineView, QueuedView,
+    RepoDocsView, RepoView, SessionKind, SessionMachine, SessionState, SessionView,
+    StateVersionView, StateView, TimedLine, TransferView, doc_groups, normalize_origin,
+    pipeline_load,
 };
 pub use events::{
     ErrorRow, MAX_EVENT_BYTES, MAX_SNAPSHOT_BYTES, MAX_TRIGGER_BYTES, OutputRow, RejectionRow,

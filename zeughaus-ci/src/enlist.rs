@@ -19,7 +19,7 @@ use zeughaus_link::enlist::{
     read_frame, write_frame,
 };
 
-use crate::config::{CiConfig, RunnerOs, valid_name};
+use crate::config::{RunnerOs, Shared, valid_name};
 use crate::now_secs;
 use crate::runners::{Connected, Runners};
 use crate::scheduler::{Msg, transcript_dir};
@@ -31,7 +31,7 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct EnlistService {
     state_dir: std::path::PathBuf,
-    config: Arc<CiConfig>,
+    config: Arc<Shared>,
     runners: Arc<Runners>,
     scheduler: Sender<Msg>,
     sessions: Arc<Sessions>,
@@ -40,7 +40,7 @@ pub struct EnlistService {
 impl EnlistService {
     pub fn new(
         state_dir: std::path::PathBuf,
-        config: Arc<CiConfig>,
+        config: Arc<Shared>,
         runners: Arc<Runners>,
         scheduler: Sender<Msg>,
         sessions: Arc<Sessions>,
@@ -128,9 +128,10 @@ impl EnlistService {
             .filter(|a| a.parse::<std::net::SocketAddr>().is_ok())
             .take(MAX_ADDRESSES)
             .collect();
+        let config = self.config.get();
         let known = principal
             .as_deref()
-            .and_then(|principal| self.config.runner_of_fingerprint(principal));
+            .and_then(|principal| config.runner_of_fingerprint(principal));
         if known != Some(name.as_str()) {
             eprintln!("[ci] refused {name:?}: its key is not the one ci.toml pins for it");
             refuse(reply, "this key is not the runner's in ci.toml").await;
@@ -142,7 +143,7 @@ impl EnlistService {
         }
         // The jobs placed on a runner are scripts for the host ci.toml says
         // it has; a runner on another one would run none of them.
-        let windows = self.config.runner_os(&name) == RunnerOs::Windows;
+        let windows = config.runner_os(&name) == RunnerOs::Windows;
         if windows != (offer.os == "windows") {
             let configured = if windows { "windows" } else { "unix" };
             eprintln!(

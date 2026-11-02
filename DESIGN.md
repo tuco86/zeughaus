@@ -1320,14 +1320,18 @@ commit id starts with the 4 to 40 hex digits `sha` (`Pipeline`, empty when
 none does), answers `Repo { origin, sha, jobs }` (for an agent in a
 checkout: `origin` is its origin URL, at most 1024 bytes, matched against
 the `url`s of `ci.toml` as a manual upload's is; `None` when no repository
-has it) with the repository's name, forge, default branch and that branch's
+has it, with the pending onboarding request of that origin as `pending`)
+with the repository's name, forge, default branch and that branch's
 streak (`green`, or red since when), its channels, the newest pipeline of
 `sha`, the machines and the platforms, and with `jobs` also every job of its
 `.zeughaus-ci/` read from the CI's mirror at `sha` when the mirror has it,
 else at the default branch's head, each with the runner and place
 `place_job` picks (or why none), its secrets and whether a manual run can
 take it (not on a VM); `jobs_note` says why the list is empty (not fetched
-yet, unreadable) -- and takes two actions, both answered `Accepted`:
+yet, unreadable); with `setup` also the setup check (the hook's last
+delivery from `ci/hooks/<repo>.json`, the bot's push access asked of the
+forge, the secrets it names, the job secrets no grant releases) -- and
+takes two actions, both answered `Accepted`:
 `Rerun { repo, number }` writes the pipeline's event to the inbox again,
 pinned to the recorded sha, with the actor `rerun of #<n>` (a manual run is
 refused: its trees were the uploader's); `Cancel { repo,
@@ -1735,6 +1739,27 @@ state machine (`docs::allowed`) is the whole contract: a proposal goes from
 moves a plan to `in_progress`, recording the runners it placed it on. The
 `/ci` server and the dispatcher serialize every mutation behind one lock and
 announce each on `/events` as `CiDocs`.
+
+**Onboarding.** A third kind, `onboarding`, is a project's request to join:
+an `OnboardSpec` (its origin, made the canonical url of `[onboarding] api`'s
+Forgejo, its default branch, grants and host prerequisites) under the name
+it asks for, `open` -> `approved` or `rejected`. While it is open or
+approved the name has a document directory without being in `ci.toml`, so
+proposals can be stored against it and the overview lists it with
+`onboarding: Some(n)`, which gives it a Plans tab; plans wait. The
+onboarding worker (`zeughaus-ci/src/onboard.rs`, a thread every 2 s) takes
+each approved request: secrets present, bot collaborator, webhook secret
+(generated and patched into OpenBao, or reused), hook created or updated,
+`ci/onboarded/<name>.toml` written and the configuration reloaded, first
+push event queued. Every step may run again; a failure puts the request
+back to `open` with the step and the reason as its note.
+
+**Configuration reload.** Every service holds `config::Shared` and takes
+one snapshot of the configuration per request or loop turn (the scheduler
+per tick). `CiConfig::load` merges `ci/onboarded/*.toml` into `[repos]`
+(a name or url that repeats one is refused). `Shared::reload`, on SIGHUP
+or after an onboarding, swaps the snapshot when only `[repos]` changed and
+refuses anything else, which still takes a restart.
 
 **Agent sessions.** The dispatcher runs every 2 s over the approved plans of
 every repository whose queue is not paused, by approval: a plan's `Runs on`

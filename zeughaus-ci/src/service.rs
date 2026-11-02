@@ -24,7 +24,7 @@ use zeughaus_link::{
 };
 
 use crate::artifacts::ArtifactService;
-use crate::config::CiConfig;
+use crate::config::{CiConfig, Shared};
 use crate::enlist::EnlistService;
 use crate::runners::Runners;
 use crate::scheduler::{self, Alert, CiChange, Started};
@@ -161,7 +161,7 @@ fn announced_host(bind: SocketAddr) -> String {
 fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, String> {
     let args = parse_args(args)?;
     let config = match CiConfig::load(state_dir)? {
-        Some(config) => Arc::new(config),
+        Some(config) => Shared::new(config),
         None => return Err("no ci.toml".to_owned()),
     };
     std::fs::create_dir_all(state_dir)
@@ -176,8 +176,8 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
         zeughaus_update::boot(state_dir, exe, zeughaus_update::Product::Ci);
     }
 
-    let secrets = Secrets::new(config.secrets.clone(), state_dir);
-    match secrets::check(&secrets, &config) {
+    let secrets = Secrets::new(config.get().secrets.clone(), state_dir);
+    match secrets::check(&secrets, &config.get()) {
         Ok(lines) => {
             for line in lines {
                 eprintln!("[ci] secrets: {line}");
@@ -204,7 +204,7 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
         .map_err(|e| format!("cannot start the async runtime: {e}"))?;
     // Bound before anything is announced: an editor must never be handed an
     // endpoint that is not serving yet.
-    let bound = rt.block_on(bind(args.listen, state_dir, &config))?;
+    let bound = rt.block_on(bind(args.listen, state_dir, &config.get()))?;
     eprintln!("[ci] endpoint {}", bound.url);
     credentials::write_endpoint(state_dir, &bound.url)
         .map_err(|e| format!("cannot write the endpoint file: {e}"))?;
@@ -264,6 +264,26 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
             })
             .map_err(|e| format!("cannot start the session dispatcher: {e}"))?;
     }
+    {
+        let onboarder = crate::onboard::Onboarder::new(
+            state_dir.to_path_buf(),
+            Arc::clone(&config),
+            Arc::clone(&secrets),
+            Arc::clone(&docs_lock),
+            docs_tx.clone(),
+        );
+        std::thread::Builder::new()
+            .name("zeughaus-ci-onboard".to_owned())
+            .spawn(move || {
+                loop {
+                    onboarder.run_once(crate::now_secs());
+                    std::thread::sleep(DISPATCH_INTERVAL);
+                }
+            })
+            .map_err(|e| format!("cannot start the onboarding worker: {e}"))?;
+    }
+    #[cfg(unix)]
+    reload_on_hangup(&rt, Arc::clone(&config), state_dir, docs_tx.clone());
 
     match listener.replier(ENLIST_PATH) {
         Ok(replier) => {
@@ -311,6 +331,7 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
             let server = CiServer::new(
                 state_dir.to_path_buf(),
                 Arc::clone(&config),
+                Arc::clone(&secrets),
                 Arc::clone(&runners),
                 Arc::clone(&transcripts),
                 docs_lock,
@@ -389,6 +410,53 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
         }
         std::thread::sleep(DRAIN_INTERVAL);
     }
+}
+
+/// Re-reads `[repos]` of ci.toml and `ci/onboarded/` on every SIGHUP
+/// (`systemctl reload`), and tells editors which repositories changed.
+#[cfg(unix)]
+fn reload_on_hangup(
+    rt: &tokio::runtime::Runtime,
+    shared: Arc<Shared>,
+    state_dir: &Path,
+    docs_tx: std::sync::mpsc::Sender<String>,
+) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let _enter = rt.enter();
+    let mut hangups = match signal(SignalKind::hangup()) {
+        Ok(hangups) => hangups,
+        Err(e) => {
+            eprintln!("[ci] no SIGHUP handler: {e}");
+            return;
+        }
+    };
+    let state_dir = state_dir.to_path_buf();
+    rt.spawn(async move {
+        while hangups.recv().await.is_some() {
+            let reloaded = tokio::task::spawn_blocking({
+                let shared = Arc::clone(&shared);
+                let state_dir = state_dir.clone();
+                move || shared.reload(&state_dir)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("the reload failed: {e}")));
+            match reloaded {
+                Ok(changed) if changed.is_empty() => {
+                    eprintln!("[ci] ci.toml reloaded: no repository changed");
+                }
+                Ok(changed) => {
+                    eprintln!(
+                        "[ci] ci.toml reloaded: repos changed: {}",
+                        changed.join(", ")
+                    );
+                    for repo in changed {
+                        let _ = docs_tx.send(repo);
+                    }
+                }
+                Err(e) => eprintln!("[ci] ci.toml not reloaded: {e}"),
+            }
+        }
+    });
 }
 
 /// Publishes what the scheduler reports on `/events`, numbered by one

@@ -11,7 +11,8 @@
 use std::path::{Path, PathBuf};
 
 use zeughaus_link::ci::{
-    DocKind, DocState, DocView, MAX_DOC_BYTES, MAX_DOC_TITLE_BYTES, RepoDocsView, normalize_origin,
+    DocKind, DocState, DocView, MAX_DOC_BYTES, MAX_DOC_TITLE_BYTES, OnboardSpec, RepoDocsView,
+    normalize_origin,
 };
 use zeughaus_link::selector::parse_runs_on;
 
@@ -32,6 +33,8 @@ pub struct NewDoc<'a> {
     pub source: &'a str,
     pub proposals: &'a [u64],
     pub runs_on: &'a [String],
+    /// An onboarding request: the repository it asks for.
+    pub onboard: Option<&'a OnboardSpec>,
 }
 
 /// Whether a document of `kind` may move from `from` to `to` on request.
@@ -48,16 +51,107 @@ pub fn allowed(kind: DocKind, from: DocState, to: DocState) -> bool {
                 | (InProgress, Done)
                 | (InProgress, Approved)
         ),
+        DocKind::Onboarding => matches!((from, to), (Open, Approved) | (Open, Rejected)),
     }
 }
 
 /// The directory of `repo`'s documents. The name comes from a request and is
-/// joined into a path, so only a repository of `ci.toml` gets one.
+/// joined into a path, so only a repository of `ci.toml`, or one with a
+/// pending onboarding request, gets one.
 fn dir(state_dir: &Path, config: &CiConfig, repo: &str) -> Result<PathBuf, String> {
-    if !valid_name(repo) || !config.repos.contains_key(repo) {
+    if !valid_name(repo)
+        || !(config.repos.contains_key(repo) || pending_request(state_dir, config, repo).is_some())
+    {
         return Err(format!("no repository {repo}"));
     }
-    Ok(crate::ci_dir(state_dir).join("docs").join(repo))
+    Ok(docs_root(state_dir).join(repo))
+}
+
+fn docs_root(state_dir: &Path) -> PathBuf {
+    crate::ci_dir(state_dir).join("docs")
+}
+
+/// The names under `ci/docs/` that can be repositories.
+fn doc_dirs(state_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(docs_root(state_dir)) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| valid_name(name))
+        .collect();
+    names.sort();
+    names
+}
+
+fn is_pending(doc: &DocView) -> bool {
+    doc.kind == DocKind::Onboarding && matches!(doc.state, DocState::Open | DocState::Approved)
+}
+
+/// The open or approved onboarding request of `repo` while it is not in
+/// `ci.toml`.
+fn pending_request(state_dir: &Path, config: &CiConfig, repo: &str) -> Option<DocView> {
+    if !valid_name(repo) || config.repos.contains_key(repo) {
+        return None;
+    }
+    read_all(&docs_root(state_dir).join(repo))
+        .into_iter()
+        .find(is_pending)
+}
+
+/// Every open or approved onboarding request of a repository that is not
+/// in `ci.toml`, by repository.
+pub fn pending(state_dir: &Path, config: &CiConfig) -> Vec<DocView> {
+    doc_dirs(state_dir)
+        .iter()
+        .filter_map(|repo| pending_request(state_dir, config, repo))
+        .collect()
+}
+
+/// Every approved onboarding request, whether or not `ci.toml` has its
+/// repository already: a run cut short after the reload is finished too.
+pub fn approved_onboardings(state_dir: &Path) -> Vec<DocView> {
+    doc_dirs(state_dir)
+        .iter()
+        .flat_map(|repo| read_all(&docs_root(state_dir).join(repo)))
+        .filter(|doc| doc.kind == DocKind::Onboarding && doc.state == DocState::Approved)
+        .collect()
+}
+
+/// Records how the CI's attempt at approved onboarding request `number`
+/// went: `done`, or back to `open` with the reason as its note.
+pub fn finish_onboarding(
+    state_dir: &Path,
+    repo: &str,
+    number: u64,
+    result: Result<(), String>,
+    now: u64,
+) -> Result<(), String> {
+    if !valid_name(repo) {
+        return Err(format!("no repository {repo}"));
+    }
+    let path = path_of(&docs_root(state_dir).join(repo), number);
+    let mut doc: DocView = read_json(&path).map_err(|_| missing(repo, number))?;
+    if doc.kind != DocKind::Onboarding || doc.state != DocState::Approved {
+        return Err(format!(
+            "#{number} is no approved onboarding request ({} {})",
+            doc.kind.name(),
+            doc.state.name()
+        ));
+    }
+    match result {
+        Ok(()) => {
+            doc.state = DocState::Done;
+            doc.note.clear();
+        }
+        Err(note) => {
+            doc.state = DocState::Open;
+            doc.note = note;
+        }
+    }
+    doc.changed = now;
+    write_json(&path, &doc)
 }
 
 fn path_of(dir: &Path, number: u64) -> PathBuf {
@@ -130,7 +224,30 @@ pub fn create(
     new: NewDoc<'_>,
     now: u64,
 ) -> Result<u64, String> {
-    let dir = dir(state_dir, config, repo)?;
+    let onboard = match (new.kind, new.onboard) {
+        (DocKind::Onboarding, Some(spec)) => Some(crate::onboard::check_request(
+            state_dir, config, repo, spec,
+        )?),
+        (DocKind::Onboarding, None) => {
+            return Err("an onboarding request names the repository it asks for".to_owned());
+        }
+        (_, Some(_)) => {
+            return Err("only an onboarding request names a repository to onboard".to_owned());
+        }
+        (_, None) => None,
+    };
+    // A request's repository has no directory of its own yet: `dir` would
+    // refuse the name, which `check_request` has vetted.
+    let dir = if onboard.is_some() {
+        docs_root(state_dir).join(repo)
+    } else {
+        dir(state_dir, config, repo)?
+    };
+    if new.kind == DocKind::Plan && !config.repos.contains_key(repo) {
+        return Err(format!(
+            "{repo} is not in ci.toml yet; plans wait for its onboarding"
+        ));
+    }
     let title = new.title.trim();
     if title.is_empty() || title.len() > MAX_DOC_TITLE_BYTES || title.contains(['\n', '\r']) {
         return Err(format!(
@@ -146,7 +263,7 @@ pub fn create(
         ));
     }
     parse_runs_on(new.runs_on)?;
-    if new.kind == DocKind::Proposal && !new.proposals.is_empty() {
+    if new.kind != DocKind::Plan && !new.proposals.is_empty() {
         return Err("only a plan names proposals".to_owned());
     }
     if new.proposals.len() > MAX_PLAN_PROPOSALS {
@@ -179,7 +296,7 @@ pub fn create(
         kind: new.kind,
         title: title.to_owned(),
         state: match new.kind {
-            DocKind::Proposal => DocState::Open,
+            DocKind::Proposal | DocKind::Onboarding => DocState::Open,
             DocKind::Plan => DocState::Saved,
         },
         source: new.source.to_owned(),
@@ -191,6 +308,8 @@ pub fn create(
         runs_on: new.runs_on.to_vec(),
         placement: Vec::new(),
         body: new.body.to_owned(),
+        onboard,
+        note: String::new(),
     };
     write_json(&path_of(&dir, number), &doc)?;
     write_atomic(&dir.join("last"), number.to_string().as_bytes())?;
@@ -351,9 +470,10 @@ pub fn set_paused(
     }
 }
 
-/// One line per repository of `ci.toml`, in name order: what waits for whom.
+/// One line per repository of `ci.toml`, then per repository with a
+/// pending onboarding request, all in name order: what waits for whom.
 pub fn summary(state_dir: &Path, config: &CiConfig) -> Vec<RepoDocsView> {
-    config
+    let mut views: Vec<RepoDocsView> = config
         .repos
         .iter()
         .map(|(name, repo)| {
@@ -376,9 +496,37 @@ pub fn summary(state_dir: &Path, config: &CiConfig) -> Vec<RepoDocsView> {
                     .collect(),
                 paused: paused(state_dir, config, name),
                 proposals: count(DocKind::Proposal, DocState::Open),
+                onboarding: None,
             }
         })
-        .collect()
+        .collect();
+    for request in pending(state_dir, config) {
+        let Some(spec) = &request.onboard else {
+            continue;
+        };
+        let proposals = list(state_dir, config, &request.repo)
+            .iter()
+            .filter(|doc| doc.kind == DocKind::Proposal && doc.state == DocState::Open)
+            .count() as u32;
+        let open = request.state == DocState::Open;
+        views.push(RepoDocsView {
+            repo: request.repo.clone(),
+            origin: normalize_origin(&spec.url),
+            default_branch: spec.default_branch.clone(),
+            awaiting: u32::from(open),
+            queued: 0,
+            in_progress: if open {
+                Vec::new()
+            } else {
+                vec![request.number]
+            },
+            paused: false,
+            proposals,
+            onboarding: Some(request.number),
+        });
+    }
+    views.sort_by(|a, b| a.repo.cmp(&b.repo));
+    views
 }
 
 #[cfg(test)]
@@ -406,6 +554,17 @@ mod tests {
         assert!(!proposal(Planned, Open));
         assert!(!proposal(Dismissed, Planned));
         assert!(!proposal(Saved, Approved));
+    }
+
+    #[test]
+    fn an_onboarding_request_is_approved_or_rejected_and_the_ci_finishes_it() {
+        let onboarding = |from, to| allowed(DocKind::Onboarding, from, to);
+        assert!(onboarding(Open, Approved));
+        assert!(onboarding(Open, Rejected));
+        assert!(!onboarding(Approved, Done));
+        assert!(!onboarding(Open, Done));
+        assert!(!onboarding(Approved, Open));
+        assert!(!onboarding(Approved, Rejected));
     }
 
     /// Tests that touch the filesystem: the integration tier.
@@ -436,6 +595,7 @@ mod tests {
                 source: "weida",
                 proposals,
                 runs_on: &[],
+                onboard: None,
             }
         }
 
@@ -579,6 +739,141 @@ mod tests {
             }
             assert!(!state.join("ci").exists());
             assert!(!state.join("x").exists());
+        }
+
+        fn onboarding_config() -> CiConfig {
+            CiConfig::parse(
+                "default_runner = \"x\"\n\
+                 [runners.x]\nfingerprint = \"sha256:0000000000000000000000000000000000000000000000000000000000000001\"\n\
+                 [repos.demo]\nurl = \"https://git.example.org/o/demo.git\"\n\
+                 [secrets]\naddr = \"http://127.0.0.1:1\"\npath = \"zeughaus/ci\"\nrole_id = \"r\"\n\
+                 [onboarding]\napi = \"https://git.example.org\"\nbot = \"ci\"\n\
+                 bot_token = \"BOT\"\nadmin_token = \"ADMIN\"\nhook_url = \"https://ci.example.org/hook\"\n",
+            )
+            .expect("a valid ci.toml")
+        }
+
+        fn request<'a>(spec: &'a OnboardSpec) -> NewDoc<'a> {
+            NewDoc {
+                kind: DocKind::Onboarding,
+                title: "join",
+                body: "body",
+                source: "scan-rs",
+                proposals: &[],
+                runs_on: &[],
+                onboard: Some(spec),
+            }
+        }
+
+        fn spec(url: &str) -> OnboardSpec {
+            OnboardSpec {
+                url: url.to_owned(),
+                default_branch: "main".to_owned(),
+                grants: Default::default(),
+                prerequisites: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn a_pending_repository_takes_proposals_and_shows_in_the_summary() {
+            let state = scratch("pending");
+            let config = onboarding_config();
+            let asked = spec("git@git.example.org:O/Scan-RS.git");
+            assert_eq!(
+                create(&state, &config, "scan-rs", request(&asked), 1),
+                Ok(1)
+            );
+            let stored = load(&state, &config, "scan-rs", 1).unwrap();
+            assert_eq!(
+                stored.onboard.unwrap().url,
+                "https://git.example.org/o/scan-rs.git"
+            );
+            assert_eq!(stored.state, Open);
+            assert_eq!(
+                create(
+                    &state,
+                    &config,
+                    "scan-rs",
+                    new(DocKind::Proposal, "p", &[]),
+                    2
+                ),
+                Ok(2)
+            );
+            assert_eq!(
+                create(&state, &config, "scan-rs", new(DocKind::Plan, "x", &[]), 3),
+                Err("scan-rs is not in ci.toml yet; plans wait for its onboarding".to_owned())
+            );
+            let summary = summary(&state, &config);
+            let names: Vec<&str> = summary.iter().map(|r| r.repo.as_str()).collect();
+            assert_eq!(names, ["demo", "scan-rs"]);
+            let pending = &summary[1];
+            assert_eq!(pending.onboarding, Some(1));
+            assert_eq!((pending.awaiting, pending.proposals), (1, 1));
+            assert_eq!(pending.origin, "git.example.org/o/scan-rs");
+            assert_eq!(summary[0].onboarding, None);
+
+            let again = create(
+                &state,
+                &config,
+                "other",
+                request(&spec("https://git.example.org/o/scan-rs")),
+                4,
+            );
+            assert_eq!(
+                again,
+                Err("https://git.example.org/o/scan-rs is requested as scan-rs in #1".to_owned())
+            );
+            let twice = create(
+                &state,
+                &config,
+                "scan-rs",
+                request(&spec("https://git.example.org/o/x")),
+                4,
+            );
+            assert_eq!(
+                twice,
+                Err("scan-rs has onboarding request #1 already (open)".to_owned())
+            );
+            let known = create(
+                &state,
+                &config,
+                "x",
+                request(&spec("https://git.example.org/o/demo.git")),
+                4,
+            );
+            assert_eq!(
+                known,
+                Err("https://git.example.org/o/demo.git is repository demo already".to_owned())
+            );
+        }
+
+        #[test]
+        fn the_ci_finishes_an_approved_request_or_returns_it_with_a_note() {
+            let state = scratch("finish");
+            let config = onboarding_config();
+            let asked = spec("https://git.example.org/o/scan-rs");
+            create(&state, &config, "scan-rs", request(&asked), 1).unwrap();
+            assert!(approved_onboardings(&state).is_empty());
+            set_state(&state, &config, "scan-rs", 1, Approved, 2).unwrap();
+            assert_eq!(approved_onboardings(&state).len(), 1);
+            assert_eq!(summary(&state, &config)[1].in_progress, vec![1]);
+
+            finish_onboarding(&state, "scan-rs", 1, Err("collaborator: 403".to_owned()), 3)
+                .unwrap();
+            let failed = load(&state, &config, "scan-rs", 1).unwrap();
+            assert_eq!(
+                (failed.state, failed.note.as_str()),
+                (Open, "collaborator: 403")
+            );
+            assert!(finish_onboarding(&state, "scan-rs", 1, Ok(()), 4).is_err());
+
+            set_state(&state, &config, "scan-rs", 1, Approved, 5).unwrap();
+            finish_onboarding(&state, "scan-rs", 1, Ok(()), 6).unwrap();
+            let done =
+                read_json::<DocView>(&path_of(&docs_root(&state).join("scan-rs"), 1)).unwrap();
+            assert_eq!((done.state, done.note.as_str()), (Done, ""));
+            // Done but not in ci.toml: no longer pending, so hidden.
+            assert!(list(&state, &config, "scan-rs").is_empty());
         }
     }
 }

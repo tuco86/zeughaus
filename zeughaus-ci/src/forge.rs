@@ -155,17 +155,22 @@ fn curl(args: &[&str], headers: &str, body: Option<&Path>, url: &str) -> Result<
         data.push(body);
         command.arg("--data-binary").arg(data);
     }
+    command.arg(url);
+    run(command, headers)
+}
+
+/// Runs `command` with `stdin` piped in; answers its stdout, or its errors
+/// with a hint on a 401.
+fn run(mut command: Command, stdin: &str) -> Result<String, String> {
     command
-        .arg(url)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .map_err(|e| format!("cannot run curl: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(headers.as_bytes())
+    if let Some(mut pipe) = child.stdin.take() {
+        pipe.write_all(stdin.as_bytes())
             .map_err(|e| format!("cannot hand curl its headers: {e}"))?;
     }
     let output = child.wait_with_output().map_err(|e| format!("curl: {e}"))?;
@@ -180,6 +185,85 @@ fn curl(args: &[&str], headers: &str, body: Option<&Path>, url: &str) -> Result<
         message.push_str(" (token expired or revoked?)");
     }
     Err(message.trim().to_owned())
+}
+
+/// A curl config (`-K -`) of `headers` and a request `body`, each value a
+/// quoted string with curl's escapes, so neither a token nor a body ever
+/// reaches argv or the disk. A body must not start with `@`, which curl
+/// reads as a file name; JSON bodies start with `{`.
+pub(crate) fn curl_config(headers: &[&str], body: Option<&str>) -> String {
+    let quote = |value: &str| {
+        let mut quoted = String::with_capacity(value.len() + 2);
+        quoted.push('"');
+        for c in value.chars() {
+            match c {
+                '\\' => quoted.push_str("\\\\"),
+                '"' => quoted.push_str("\\\""),
+                '\n' => quoted.push_str("\\n"),
+                '\r' => quoted.push_str("\\r"),
+                '\t' => quoted.push_str("\\t"),
+                c => quoted.push(c),
+            }
+        }
+        quoted.push('"');
+        quoted
+    };
+    let mut config = String::new();
+    for header in headers {
+        config.push_str(&format!("header = {}\n", quote(header)));
+    }
+    if let Some(body) = body {
+        config.push_str(&format!("data-binary = {}\n", quote(body)));
+    }
+    config
+}
+
+/// A Forgejo or GitHub API call with `token`, the JSON `body` when there is
+/// one; answers the response body.
+pub(crate) fn send(
+    method: &str,
+    url: &str,
+    token: &str,
+    body: Option<&str>,
+) -> Result<String, String> {
+    let authorization = format!("Authorization: token {token}");
+    let mut headers = vec![authorization.as_str()];
+    if body.is_some() {
+        headers.push("Content-Type: application/json");
+    }
+    let mut command = Command::new("curl");
+    command
+        .args([
+            "-sS",
+            "--fail-with-body",
+            "--max-time",
+            "20",
+            "-K",
+            "-",
+            "-X",
+        ])
+        .arg(method)
+        .arg(url);
+    run(command, &curl_config(&headers, body))
+}
+
+/// Whether the status token of `repo` may push to it: the forge's
+/// `permissions.push` of the repository for the token's user.
+pub fn push_access(secrets: &Secrets, repo: &RepoConfig) -> Result<bool, String> {
+    let Some(url) = repo_url(repo) else {
+        return Err("the repo has forge = \"none\"".to_owned());
+    };
+    let Some(secret) = &repo.status_token else {
+        return Err("the repo has no status_token".to_owned());
+    };
+    let token = secrets.get(secret).map_err(|e| e.to_string())?;
+    let body = curl(&[], &auth_header(repo.forge, &token), None, &url)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("unexpected answer: {e}"))?;
+    value
+        .pointer("/permissions/push")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "the answer carries no permissions".to_owned())
 }
 
 /// `ci forge-check`: whether the status token can see the repository.
@@ -211,5 +295,19 @@ mod tests {
         let cut = truncate(&long);
         assert_eq!(cut.chars().count(), MAX_DESCRIPTION);
         assert_eq!(truncate("short"), "short");
+    }
+
+    #[test]
+    fn a_curl_config_quotes_headers_and_body() {
+        let config = curl_config(
+            &["Authorization: token t\"1"],
+            Some(r#"{"a":"b\\c","d":"e"}"#),
+        );
+        assert_eq!(
+            config,
+            "header = \"Authorization: token t\\\"1\"\n\
+             data-binary = \"{\\\"a\\\":\\\"b\\\\\\\\c\\\",\\\"d\\\":\\\"e\\\"}\"\n"
+        );
+        assert_eq!(curl_config(&["X: y"], None), "header = \"X: y\"\n");
     }
 }

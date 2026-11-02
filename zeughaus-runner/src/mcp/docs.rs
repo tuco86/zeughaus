@@ -105,7 +105,7 @@ pub fn doc_text(doc: &DocView, now: u64) -> String {
         doc.title,
         doc.source,
         age(now.saturating_sub(doc.created)),
-        doc.body
+        doc.shown_text()
     )
 }
 
@@ -152,6 +152,8 @@ mod tests {
             runs_on: Vec::new(),
             placement: Vec::new(),
             body: String::new(),
+            onboard: None,
+            note: String::new(),
         }
     }
 

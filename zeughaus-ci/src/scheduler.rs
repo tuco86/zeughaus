@@ -23,7 +23,7 @@ use zeughaus_link::enlist::{
 };
 
 use crate::channels::{self, Channels};
-use crate::config::{CiConfig, RepoConfig, RunnerOs};
+use crate::config::{CiConfig, RepoConfig, RunnerOs, Shared};
 use crate::event::{self, CiEvent, EventKind, Upstream};
 use crate::forge::{self, State, Status};
 use crate::header::JobDef;
@@ -490,7 +490,9 @@ struct Planned {
 
 struct Scheduler {
     state_dir: PathBuf,
+    /// This tick's snapshot of `shared`.
     config: Arc<CiConfig>,
+    shared: Arc<Shared>,
     running: Vec<Pipeline>,
     rx: Receiver<Msg>,
     runners: Arc<Runners>,
@@ -539,14 +541,15 @@ pub struct Started {
 /// Starts the CI scheduler thread.
 pub fn start(
     state_dir: &Path,
-    config: Arc<CiConfig>,
+    config: Arc<Shared>,
     secrets: Arc<Secrets>,
     runners: Arc<Runners>,
 ) -> Started {
+    let current = config.get();
     eprintln!(
         "[ci] {} repos, {} runners",
-        config.repos.len(),
-        config.runners.len()
+        current.repos.len(),
+        current.runners.len()
     );
     let (alerts, alerts_rx) = std::sync::mpsc::channel();
     let (changes, changes_rx) = std::sync::mpsc::channel();
@@ -577,7 +580,7 @@ pub fn start(
 impl Scheduler {
     fn new(
         state_dir: PathBuf,
-        config: Arc<CiConfig>,
+        shared: Arc<Shared>,
         secrets: Arc<Secrets>,
         runners: Arc<Runners>,
         rx: Receiver<Msg>,
@@ -588,7 +591,8 @@ impl Scheduler {
             statuses: forge::poster(state_dir.clone(), Arc::clone(&secrets)),
             secrets,
             state_dir,
-            config,
+            config: shared.get(),
+            shared,
             running: Vec::new(),
             rx,
             runners,
@@ -634,6 +638,7 @@ impl Scheduler {
     // ------------------------------------------------------------ tick
 
     fn tick(&mut self) {
+        self.config = self.shared.get();
         event::drain_inbox(&self.state_dir);
         self.fire_nightly();
         for (path, event) in event::queued(&self.state_dir) {
@@ -3405,7 +3410,7 @@ mod tests {
             let (changes, _) = std::sync::mpsc::channel();
             Scheduler::new(
                 state.to_path_buf(),
-                config,
+                Shared::new(CiConfig::clone(&config)),
                 Secrets::new(None, state),
                 Arc::new(Runners::new()),
                 rx,

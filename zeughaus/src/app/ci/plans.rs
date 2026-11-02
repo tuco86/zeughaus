@@ -200,7 +200,9 @@ impl CiClient {
             return;
         }
         match result {
-            Ok(Some(doc)) => state.shown = Some((number, markdown::Content::parse(&doc.body))),
+            Ok(Some(doc)) => {
+                state.shown = Some((number, markdown::Content::parse(&doc.shown_text())))
+            }
             Ok(None) => state.shown_error = Some(format!("#{number} is gone")),
             Err(e) => state.shown_error = Some(e),
         }
@@ -330,6 +332,23 @@ fn actions(doc: &DocView) -> Vec<(char, &'static str, &'static str, Option<DocSt
             "No plan will take it up",
             Some(DocState::Dismissed),
         )],
+        (DocKind::Onboarding, DocState::Open) => vec![
+            (
+                CHECK,
+                "Approve",
+                "The CI adds the bot and the hook, stores the webhook secret, registers the \
+                 repository and starts its first pipeline",
+                Some(DocState::Approved),
+            ),
+            (
+                glyph::CLOSE,
+                "Reject",
+                "It will not join the CI",
+                Some(DocState::Rejected),
+            ),
+        ],
+        // The CI is working on it.
+        (DocKind::Onboarding, DocState::Approved) => Vec::new(),
         _ => vec![(TRASH, "Delete", "Remove it from the CI", None)],
     }
 }
@@ -337,8 +356,11 @@ fn actions(doc: &DocView) -> Vec<(char, &'static str, &'static str, Option<DocSt
 /// The second line of a list row.
 fn row_detail(doc: &DocView, now: u64) -> String {
     let mut line = format!("{} \u{b7} {}", doc.state.name(), ago(doc.changed, now));
-    if doc.kind == DocKind::Proposal {
+    if matches!(doc.kind, DocKind::Proposal | DocKind::Onboarding) {
         line.push_str(&format!(" \u{b7} from {}", doc.source));
+    }
+    if !doc.note.is_empty() {
+        line.push_str(" \u{b7} failed");
     }
     line
 }
@@ -970,6 +992,7 @@ mod tests {
                     in_progress: Vec::new(),
                     paused: false,
                     proposals: 0,
+                    onboarding: None,
                 })
                 .collect(),
             build: 0,

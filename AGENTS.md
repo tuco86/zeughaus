@@ -187,8 +187,10 @@ the CI keeps for a job from one pipeline to the next, the 3 newest versions
 each, under `<state-dir>/ci/state/`), `ci_state_get` downloads one version
 into a directory and `ci_state_delete` removes a version or a store.
 `docs`, `doc_read`,
-`proposal_write` and `plan_done` read and write the repository's plans and
-proposals (below). Nothing but
+`proposal_write`, `onboard_request` and `plan_done` read and write the
+repository's plans, proposals and onboarding requests (below); `ci_repo`
+also checks the repository's setup (hook deliveries, the bot's push access,
+its secrets and grants). Nothing but
 protocol messages is written to its stdout.
 `zeughaus-runner [--state-dir <dir>] ci repo [--json] [<path>]`, `ci
 find [--json] <repo> <sha>`, `ci doc [--json] <repo> <n>`, `ci plan-save
@@ -211,7 +213,18 @@ proposal names the machines its work needs in a `Runs on: <selector>[;
 <selector>]` line under its title (one label selector per machine, the
 first hosting the session, the others reached over ssh; editable in the
 Plans tab while it is open, saved or approved). Each change is announced as
-`CiDocs` on `/events`. Sessions run on the runners, dispatched by the CI
+`CiDocs` on `/events`. An onboarding request (`onboard_request`, kind
+`onboarding`) is how a project outside `ci.toml` asks to join: it gives the
+pending repository a directory, a Plans tab and an inbox for proposals at
+once; it is `open`, `approved` in the Plans tab, then `done`, or back to
+`open` with a note naming the failed step, or `rejected`. The CI's
+onboarding worker (every 2 s, `[onboarding]` of `ci.toml`) adds the bot as
+a collaborator and the push hook on Forgejo with `admin_token`, stores a
+generated `<NAME>_WEBHOOK_SECRET` in OpenBao, writes
+`ci/onboarded/<name>.toml`, reloads the configuration in place and queues
+the first push pipeline. The configuration is one swappable snapshot:
+SIGHUP (`systemctl --user reload zeughaus-ci`) re-reads `[repos]` and
+`ci/onboarded/`, and refuses any other change. Sessions run on the runners, dispatched by the CI
 (`<state-dir>/ci/sessions.json`, announced as `CiSessions`): every 2 s it
 starts a master for each approved plan of a repository whose queue is not
 paused (`ci/docs/<repo>/paused`, the Plans tab's `Pause queue`) on a free

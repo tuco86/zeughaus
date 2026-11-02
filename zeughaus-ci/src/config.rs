@@ -5,9 +5,11 @@
 //! must stay private.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, PoisonError, RwLock};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use zeughaus_link::ci::normalize_origin;
 use zeughaus_link::enlist::Offer;
 use zeughaus_link::selector::valid_label;
 
@@ -16,7 +18,15 @@ use crate::pipeline::Pattern;
 
 pub const CONFIG_FILE: &str = "ci.toml";
 
-#[derive(Debug, Clone, Deserialize)]
+/// `ci/onboarded/<name>.toml`: one `[repos.<name>]` table each, written by
+/// the CI when it onboards a repository.
+pub const ONBOARDED_DIR: &str = "onboarded";
+
+pub fn onboarded_dir(state_dir: &Path) -> PathBuf {
+    crate::ci_dir(state_dir).join(ONBOARDED_DIR)
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CiConfig {
     /// The runner of jobs that name no `machine`.
@@ -41,10 +51,34 @@ pub struct CiConfig {
     /// When the CI runs every repository's nightly; no round without it.
     #[serde(default)]
     pub nightly: Option<NightlyConfig>,
+    /// How the CI onboards a repository; no onboarding requests without it.
+    #[serde(default)]
+    pub onboarding: Option<OnboardingConfig>,
+}
+
+/// `[onboarding]`: the Forgejo the CI adds repositories of, and the names
+/// of the secrets it does that with.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OnboardingConfig {
+    /// Forgejo base, e.g. `https://git.doodleshnookie.net`; a trailing `/`
+    /// is trimmed.
+    pub api: String,
+    /// The collaborator added with write access, e.g. `zeughaus-ci`.
+    pub bot: String,
+    /// Secret name: the `fetch_token` and `status_token` of an onboarded
+    /// repository.
+    pub bot_token: String,
+    /// Secret name: the owner-level token that adds the collaborator and the
+    /// hook.
+    pub admin_token: String,
+    /// e.g. `https://ci.doodleshnookie.net/hook`; the hook of repository
+    /// `<name>` is `{hook_url}/{name}`.
+    pub hook_url: String,
 }
 
 /// `[nightly]`: the CI-wide time of the nightly round.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NightlyConfig {
     /// `HH:MM` in the CI host's local time. A time inside a skipped DST
@@ -86,7 +120,7 @@ fn default_bao_timeout() -> u64 {
 }
 
 /// One KV v2 document in OpenBao, read with the runner's own AppRole.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretsConfig {
     /// `http://10.8.0.1:8200`; a trailing `/` is trimmed.
@@ -111,7 +145,7 @@ fn default_wait_minutes() -> u32 {
 }
 
 /// A runner that may enlist, pinned by the fingerprint of its certificate.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerConfig {
     pub fingerprint: String,
@@ -146,7 +180,7 @@ pub enum RunnerOs {
     Windows,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Forge {
     Github,
@@ -163,7 +197,7 @@ fn default_fetch_user() -> String {
     "x-access-token".into()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepoConfig {
     pub url: String,
@@ -256,14 +290,43 @@ impl CiConfig {
         labels
     }
 
+    /// `ci.toml`'s text alone.
+    #[cfg(test)]
     pub fn parse(text: &str) -> Result<CiConfig, String> {
+        Self::from_parts(text, &[])
+    }
+
+    /// `ci.toml`'s text plus the onboarded repositories, `(name, text)` of
+    /// each `ci/onboarded/<name>.toml`, validated as one configuration.
+    pub fn from_parts(text: &str, onboarded: &[(String, String)]) -> Result<CiConfig, String> {
         let mut config: CiConfig =
             toml::from_str(text).map_err(|e| format!("{CONFIG_FILE}: {e}"))?;
+        for (name, text) in onboarded {
+            let file = format!("ci/{ONBOARDED_DIR}/{name}.toml");
+            if !valid_name(name) {
+                return Err(format!("{file}: the file name is no repository name"));
+            }
+            let repo: RepoConfig = toml::from_str(text).map_err(|e| format!("{file}: {e}"))?;
+            if config.repos.contains_key(name) {
+                return Err(format!("{file}: ci.toml defines repository {name} already"));
+            }
+            let origin = normalize_origin(&repo.url);
+            if let Some(other) = config
+                .repos
+                .iter()
+                .find(|(_, other)| normalize_origin(&other.url) == origin)
+                .map(|(other, _)| other)
+            {
+                return Err(format!("{file}: its url is repository {other}'s"));
+            }
+            config.repos.insert(name.clone(), repo);
+        }
         config.validate()?;
         Ok(config)
     }
 
-    /// `Ok(None)` when there is no `ci.toml`: CI is off.
+    /// `Ok(None)` when there is no `ci.toml`: CI is off. The onboarded
+    /// repositories under `ci/onboarded/` are read in name order.
     pub fn load(state_dir: &Path) -> Result<Option<CiConfig>, String> {
         let path = state_dir.join(CONFIG_FILE);
         let text = match std::fs::read_to_string(&path) {
@@ -271,7 +334,31 @@ impl CiConfig {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
         };
-        Self::parse(&text).map(Some)
+        let dir = onboarded_dir(state_dir);
+        let mut onboarded = Vec::new();
+        match std::fs::read_dir(&dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+                    let file = entry.path();
+                    // `write_atomic` leaves `<name>.toml.tmp` behind a crash.
+                    let Some(name) = file
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .and_then(|n| n.strip_suffix(".toml"))
+                    else {
+                        continue;
+                    };
+                    let text = std::fs::read_to_string(&file)
+                        .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+                    onboarded.push((name.to_owned(), text));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("cannot read {}: {e}", dir.display())),
+        }
+        onboarded.sort();
+        Self::from_parts(&text, &onboarded).map(Some)
     }
 
     fn validate(&mut self) -> Result<(), String> {
@@ -387,6 +474,41 @@ impl CiConfig {
                 }
             }
         }
+        if let Some(onboarding) = &mut self.onboarding {
+            onboarding.api = onboarding.api.trim_end_matches('/').to_string();
+            onboarding.hook_url = onboarding.hook_url.trim_end_matches('/').to_string();
+            for (field, value) in [
+                ("api", &onboarding.api),
+                ("bot", &onboarding.bot),
+                ("bot_token", &onboarding.bot_token),
+                ("admin_token", &onboarding.admin_token),
+                ("hook_url", &onboarding.hook_url),
+            ] {
+                if value.is_empty() {
+                    return Err(format!("[onboarding]: `{field}` must not be empty"));
+                }
+            }
+            if onboarding
+                .bot
+                .chars()
+                .any(|c| c == '/' || c.is_whitespace())
+            {
+                return Err("[onboarding]: `bot` is a user name without `/` or whitespace".into());
+            }
+            for (field, value) in [
+                ("bot_token", &onboarding.bot_token),
+                ("admin_token", &onboarding.admin_token),
+            ] {
+                if !valid_env_name(value) {
+                    return Err(format!(
+                        "[onboarding]: `{field}` names secret `{value}`, which must match [A-Z_][A-Z0-9_]*"
+                    ));
+                }
+            }
+            if self.secrets.is_none() {
+                return Err("[onboarding] names secrets but ci.toml has no [secrets]".into());
+            }
+        }
         let repo_names: BTreeSet<String> = self.repos.keys().cloned().collect();
         for (name, repo) in &mut self.repos {
             if !valid_name(name) {
@@ -406,25 +528,93 @@ impl CiConfig {
                     "repo `{name}` names secrets but ci.toml has no [secrets]"
                 ));
             }
-            for (secret, patterns) in &repo.grants {
-                for pattern in patterns {
-                    let parsed = Pattern::parse(pattern)
-                        .map_err(|e| format!("repo `{name}`: grant for {secret}: {e}"))?;
-                    if let Pattern::Upstream { repo: upstream, .. } = &parsed
-                        && !repo_names.contains(upstream)
-                    {
-                        return Err(format!(
-                            "repo `{name}`: grant for {secret}: `{pattern}` names `{upstream}`, which is no repository of ci.toml"
-                        ));
-                    }
-                }
-            }
+            check_grants(name, &repo.grants, |upstream| repo_names.contains(upstream))?;
             if repo.forge != Forge::None && (repo.slug.is_empty() || repo.api.is_empty()) {
                 return Err(format!("repo `{name}`: a forge needs `slug` and `api`"));
             }
             repo.api = repo.api.trim_end_matches('/').to_string();
         }
         Ok(())
+    }
+}
+
+/// The secret names and event patterns of repository `name`'s grants; an
+/// upstream pattern must name a repository `known` accepts.
+pub fn check_grants(
+    name: &str,
+    grants: &BTreeMap<String, Vec<String>>,
+    known: impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    for (secret, patterns) in grants {
+        if !valid_env_name(secret) {
+            return Err(format!(
+                "repo `{name}`: secret name `{secret}` must match [A-Z_][A-Z0-9_]*"
+            ));
+        }
+        for pattern in patterns {
+            let parsed = Pattern::parse(pattern)
+                .map_err(|e| format!("repo `{name}`: grant for {secret}: {e}"))?;
+            if let Pattern::Upstream { repo: upstream, .. } = &parsed
+                && !known(upstream)
+            {
+                return Err(format!(
+                    "repo `{name}`: grant for {secret}: `{pattern}` names `{upstream}`, which is no repository of ci.toml"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The configuration every service reads, swapped whole when the CI
+/// reloads `[repos]` (SIGHUP, or an onboarding). A reader takes one
+/// snapshot per request or loop turn and keeps it for that turn.
+#[derive(Debug)]
+pub struct Shared {
+    current: RwLock<Arc<CiConfig>>,
+}
+
+impl Shared {
+    pub fn new(config: CiConfig) -> Arc<Shared> {
+        Arc::new(Shared {
+            current: RwLock::new(Arc::new(config)),
+        })
+    }
+
+    pub fn get(&self) -> Arc<CiConfig> {
+        self.current
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Swaps in `next` when it differs from the current configuration in
+    /// `[repos]` only, and answers the sorted names of the repositories that
+    /// were added, removed or changed.
+    pub fn replace(&self, next: CiConfig) -> Result<Vec<String>, String> {
+        let mut current = self.current.write().unwrap_or_else(PoisonError::into_inner);
+        let without_repos = |config: &CiConfig| CiConfig {
+            repos: BTreeMap::new(),
+            ..config.clone()
+        };
+        if without_repos(&current) != without_repos(&next) {
+            return Err("a change outside [repos] takes a restart".into());
+        }
+        let changed: BTreeSet<String> = current
+            .repos
+            .keys()
+            .chain(next.repos.keys())
+            .filter(|name| current.repos.get(*name) != next.repos.get(*name))
+            .cloned()
+            .collect();
+        *current = Arc::new(next);
+        Ok(changed.into_iter().collect())
+    }
+
+    /// [`CiConfig::load`] and [`Shared::replace`].
+    pub fn reload(&self, state_dir: &Path) -> Result<Vec<String>, String> {
+        let next = CiConfig::load(state_dir)?.ok_or("no ci.toml")?;
+        self.replace(next)
     }
 }
 
@@ -779,6 +969,114 @@ forge = "none"
         assert!(!valid_env_name("1X"));
         assert!(!valid_env_name("x"));
         assert!(!valid_env_name(""));
+    }
+
+    fn drop_in(name: &str, text: &str) -> Vec<(String, String)> {
+        vec![(name.to_owned(), text.to_owned())]
+    }
+
+    #[test]
+    fn an_onboarded_repository_joins_the_configuration() {
+        let config = CiConfig::from_parts(
+            EXAMPLE,
+            &drop_in(
+                "scan-rs",
+                "url = \"https://git.example/o/scan-rs.git\"\n[grants]\nGITHUB_TOKEN = [\"push main of griasdi\"]\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            config.repos["scan-rs"].url,
+            "https://git.example/o/scan-rs.git"
+        );
+        assert_eq!(config.repos.len(), 3);
+    }
+
+    #[test]
+    fn an_onboarded_repository_is_refused_when_it_repeats_one() {
+        let err = CiConfig::from_parts(EXAMPLE, &drop_in("smoke", "url = \"/elsewhere.git\""))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "ci/onboarded/smoke.toml: ci.toml defines repository smoke already"
+        );
+        let base = format!(
+            "{}[repos.r]\nurl = \"git@git.example:O/R.git\"\n",
+            with_runners("")
+        );
+        let err = CiConfig::from_parts(
+            &base,
+            &drop_in("other", "url = \"https://git.example/o/r\""),
+        )
+        .unwrap_err();
+        assert_eq!(err, "ci/onboarded/other.toml: its url is repository r's");
+        let err = CiConfig::from_parts(&base, &drop_in("Bad", "url = \"x\"")).unwrap_err();
+        assert_eq!(
+            err,
+            "ci/onboarded/Bad.toml: the file name is no repository name"
+        );
+    }
+
+    #[test]
+    fn an_onboarded_grant_must_parse() {
+        let err = CiConfig::from_parts(
+            EXAMPLE,
+            &drop_in(
+                "new",
+                "url = \"x\"\n[grants]\nGITHUB_TOKEN = [\"cron *\"]\n",
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("repo `new`: grant for GITHUB_TOKEN: "),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_reload_swaps_repositories_and_refuses_anything_else() {
+        let shared = Shared::new(CiConfig::parse(EXAMPLE).unwrap());
+        let next = CiConfig::from_parts(EXAMPLE, &drop_in("new", "url = \"/new.git\"")).unwrap();
+        assert_eq!(shared.replace(next).unwrap(), ["new"]);
+        assert!(shared.get().repos.contains_key("new"));
+        assert_eq!(
+            shared.replace(CiConfig::parse(EXAMPLE).unwrap()).unwrap(),
+            ["new"]
+        );
+        assert!(
+            shared
+                .replace(CiConfig::parse(EXAMPLE).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        let runners = EXAMPLE.replace("wait_minutes = 30", "wait_minutes = 31");
+        assert_eq!(
+            shared
+                .replace(CiConfig::parse(&runners).unwrap())
+                .unwrap_err(),
+            "a change outside [repos] takes a restart"
+        );
+        assert_eq!(shared.get().runners["atik"].wait_minutes, 30);
+    }
+
+    #[test]
+    fn onboarding_needs_its_fields_and_secrets() {
+        let table = "[onboarding]\napi = \"https://git.example/\"\nbot = \"ci\"\nbot_token = \"BOT\"\nadmin_token = \"ADMIN\"\nhook_url = \"https://ci.example/hook/\"\n";
+        let config = CiConfig::parse(&format!("{EXAMPLE}{table}")).unwrap();
+        let onboarding = config.onboarding.unwrap();
+        assert_eq!(onboarding.api, "https://git.example");
+        assert_eq!(onboarding.hook_url, "https://ci.example/hook");
+        let err = CiConfig::parse(&format!("{}{table}", with_runners(""))).unwrap_err();
+        assert_eq!(
+            err,
+            "[onboarding] names secrets but ci.toml has no [secrets]"
+        );
+        let err = CiConfig::parse(&format!("{EXAMPLE}{}", table.replace("\"ci\"", "\"a b\"")))
+            .unwrap_err();
+        assert!(err.contains("`bot`"), "{err}");
+        let err = CiConfig::parse(&format!("{EXAMPLE}{}", table.replace("\"BOT\"", "\"bot\"")))
+            .unwrap_err();
+        assert!(err.contains("`bot_token`"), "{err}");
     }
 
     /// Tests that touch the filesystem, network, processes or real time: the

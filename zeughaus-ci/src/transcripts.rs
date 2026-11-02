@@ -27,7 +27,7 @@ use zeughaus_terminal::frames::{ReadError, read_frame, write_frame};
 use zeughaus_terminal::serve::{fetch_resource, fetch_rows, stream_terminal};
 use zeughaus_terminal::wal::Follower;
 
-use crate::config::CiConfig;
+use crate::config::{CiConfig, Shared};
 use crate::scheduler::transcript_dir;
 use crate::transport::editor_principal;
 
@@ -252,11 +252,11 @@ fn follow(dir: PathBuf, follower: Option<Follower>, session: Session, stop: Arc<
 
 /// Serves `/mux` until the replier goes away, which for this process means
 /// never.
-pub async fn serve(replier: Replier, config: Arc<CiConfig>, transcripts: Arc<Transcripts>) {
+pub async fn serve(replier: Replier, config: Arc<Shared>, transcripts: Arc<Transcripts>) {
     loop {
         match replier.accept().await {
             Ok(request) => {
-                let config = Arc::clone(&config);
+                let config = config.get();
                 let transcripts = Arc::clone(&transcripts);
                 tokio::spawn(async move { exchange(request, &config, &transcripts).await });
             }

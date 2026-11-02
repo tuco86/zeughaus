@@ -10,6 +10,8 @@
 //! [`CiRequest::OpenTranscript`] answers with the terminal id, which the
 //! editor attaches through the normal mux exchanges.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// The largest body of one plan or proposal, in bytes.
@@ -124,6 +126,10 @@ pub enum CiRequest {
         origin: String,
         sha: Option<String>,
         jobs: bool,
+        /// Also check the repository's setup (hook deliveries, the bot's
+        /// access, its secrets and grants), which costs a forge call.
+        #[serde(default)]
+        setup: bool,
     },
     /// Every plan and proposal of a repository, bodies empty, in number
     /// order. Answers [`CiReply::Docs`].
@@ -147,6 +153,9 @@ pub enum CiRequest {
         /// the session (see [`crate::selector`]).
         #[serde(default)]
         runs_on: Vec<String>,
+        /// An onboarding request: the repository it asks the CI to add.
+        #[serde(default)]
+        onboard: Option<OnboardSpec>,
     },
     /// Moves a document to another state, where the state machine allows
     /// it. Answers [`CiReply::Accepted`].
@@ -329,6 +338,10 @@ pub enum CiReply {
     /// `None` when no repository of `ci.toml` has the asked origin.
     Repo {
         repo: Option<Box<RepoView>>,
+        /// When no repository has the origin: the open or approved
+        /// onboarding request whose url has it, without body.
+        #[serde(default)]
+        pending: Option<Box<DocView>>,
     },
     Docs {
         docs: Vec<DocView>,
@@ -466,11 +479,14 @@ pub enum DocKind {
     Proposal,
     /// A finished plan of work in this repository.
     Plan,
+    /// A project asks to join the CI as a new repository.
+    Onboarding,
 }
 
 /// Where a document stands. A proposal is `open`, then `planned` or
 /// `dismissed`; a plan is `saved`, `approved`, `in_progress`, then `done`,
-/// or `rejected`.
+/// or `rejected`. An onboarding request is `open`, then `approved`, then
+/// `done` or back to `open` with a note, or `rejected`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DocState {
@@ -501,13 +517,34 @@ impl DocState {
 }
 
 impl DocKind {
-    /// The wire name: `proposal` or `plan`.
+    /// The wire name: `proposal`, `plan` or `onboarding`.
     pub fn name(self) -> &'static str {
         match self {
             DocKind::Proposal => "proposal",
             DocKind::Plan => "plan",
+            DocKind::Onboarding => "onboarding",
         }
     }
+}
+
+/// The repository an onboarding request asks the CI to add.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnboardSpec {
+    /// The origin the request names; the CI stores its canonical clone url.
+    pub url: String,
+    #[serde(default = "main_branch")]
+    pub default_branch: String,
+    /// Secret name to the event patterns it is released to, as ci.toml's
+    /// grants.
+    #[serde(default)]
+    pub grants: BTreeMap<String, Vec<String>>,
+    /// Host prerequisites the owner confirms by hand, one line each.
+    #[serde(default)]
+    pub prerequisites: Vec<String>,
+}
+
+fn main_branch() -> String {
+    "main".into()
 }
 
 /// One plan or proposal of a repository. The CI stores exactly this.
@@ -545,6 +582,46 @@ pub struct DocView {
     /// Empty in lists.
     #[serde(default)]
     pub body: String,
+    /// An onboarding request: the repository it asks for.
+    #[serde(default)]
+    pub onboard: Option<OnboardSpec>,
+    /// An onboarding request: why the CI's last attempt failed.
+    #[serde(default)]
+    pub note: String,
+}
+
+impl DocView {
+    /// The text a reader is shown: the last failure of an onboarding
+    /// request, the body, and what the request asks for.
+    pub fn shown_text(&self) -> String {
+        let mut text = String::new();
+        if !self.note.is_empty() {
+            text.push_str(&format!("> Last attempt failed: {}\n\n", self.note));
+        }
+        text.push_str(&self.body);
+        if let Some(spec) = &self.onboard {
+            let grants = if spec.grants.is_empty() {
+                "none".to_owned()
+            } else {
+                spec.grants
+                    .iter()
+                    .map(|(name, patterns)| format!("{name}: {}", patterns.join(", ")))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            text.push_str(&format!(
+                "\n\n## Onboarding\n\n- repository: {}\n- default branch: {}\n- grants: {grants}",
+                spec.url, spec.default_branch
+            ));
+            if !spec.prerequisites.is_empty() {
+                text.push_str("\n- host prerequisites, confirmed by the owner:");
+                for line in &spec.prerequisites {
+                    text.push_str(&format!("\n  - [ ] {line}"));
+                }
+            }
+        }
+        text
+    }
 }
 
 /// One repository of `ci.toml` and how many of its documents wait for whom.
@@ -566,6 +643,10 @@ pub struct RepoDocsView {
     pub paused: bool,
     /// Proposals in `open`.
     pub proposals: u32,
+    /// The open or approved onboarding request's number while the
+    /// repository is not in ci.toml yet.
+    #[serde(default)]
+    pub onboarding: Option<u64>,
 }
 
 /// The groups a repository's documents are shown in, in this order.
@@ -600,6 +681,8 @@ impl DocGroup {
             (DocKind::Plan, DocState::Approved) => DocGroup::Queue,
             (DocKind::Plan, DocState::InProgress) => DocGroup::InProgress,
             (DocKind::Proposal, DocState::Open) => DocGroup::Proposals,
+            (DocKind::Onboarding, DocState::Open) => DocGroup::Awaiting,
+            (DocKind::Onboarding, DocState::Approved) => DocGroup::InProgress,
             _ => DocGroup::History,
         }
     }
@@ -939,6 +1022,9 @@ pub struct RepoView {
     /// `in_progress`, bodies empty.
     #[serde(default)]
     pub docs: Vec<DocView>,
+    /// With `setup`: one line per check of the repository's setup.
+    #[serde(default)]
+    pub setup: Vec<String>,
 }
 
 /// One job of a repository's `.zeughaus-ci/` and where it would run.
@@ -1167,11 +1253,13 @@ mod tests {
                 origin: "ssh://git@git.doodleshnookie.net/tuco86/zeughaus.git".to_owned(),
                 sha: Some("3635dad".to_owned()),
                 jobs: true,
+                setup: true,
             },
             CiRequest::Repo {
                 origin: "/tmp/demo.git".to_owned(),
                 sha: None,
                 jobs: false,
+                setup: false,
             },
             CiRequest::Docs {
                 repo: "griasdi".to_owned(),
@@ -1188,6 +1276,17 @@ mod tests {
                 source: "griasdi".to_owned(),
                 proposals: vec![1, 2],
                 runs_on: vec!["os=linux".to_owned(), "os=windows".to_owned()],
+                onboard: None,
+            },
+            CiRequest::DocCreate {
+                repo: "scan-rs".to_owned(),
+                kind: DocKind::Onboarding,
+                title: "Join".to_owned(),
+                body: "Body".to_owned(),
+                source: "scan-rs".to_owned(),
+                proposals: Vec::new(),
+                runs_on: Vec::new(),
+                onboard: Some(spec()),
             },
             CiRequest::DocState {
                 repo: "griasdi".to_owned(),
@@ -1272,6 +1371,7 @@ mod tests {
                         awaiting: 1,
                         queued: 2,
                         in_progress: vec![4, 6],
+                        onboarding: Some(7),
                         paused: true,
                         proposals: 3,
                     }],
@@ -1307,7 +1407,19 @@ mod tests {
                     truncated: true,
                 },
             },
-            CiReply::Repo { repo: None },
+            CiReply::Repo {
+                repo: None,
+                pending: None,
+            },
+            CiReply::Repo {
+                repo: None,
+                pending: Some(Box::new(DocView {
+                    kind: DocKind::Onboarding,
+                    onboard: Some(spec()),
+                    note: "collaborator: 403".to_owned(),
+                    ..doc()
+                })),
+            },
             CiReply::Repo {
                 repo: Some(Box::new(RepoView {
                     name: "zeughaus".to_owned(),
@@ -1341,7 +1453,9 @@ mod tests {
                     machines: Vec::new(),
                     platforms: vec![("linux-amd64".to_owned(), "tuco-pc".to_owned())],
                     docs: vec![doc()],
+                    setup: vec!["bot: push access to tuco86/zeughaus".to_owned()],
                 })),
+                pending: None,
             },
             CiReply::Docs { docs: vec![doc()] },
             CiReply::Doc {
@@ -1489,7 +1603,54 @@ mod tests {
             runs_on: vec!["os=windows".to_owned()],
             placement: vec!["atik".to_owned(), "wohnzimmer".to_owned()],
             body: "Body".to_owned(),
+            onboard: None,
+            note: String::new(),
         }
+    }
+
+    fn spec() -> OnboardSpec {
+        OnboardSpec {
+            url: "https://git.doodleshnookie.net/tuco86/scan-rs.git".to_owned(),
+            default_branch: "main".to_owned(),
+            grants: BTreeMap::from([(
+                "DEPLOY_KEY".to_owned(),
+                vec!["push main".to_owned(), "tag v*".to_owned()],
+            )]),
+            prerequisites: vec!["a sudo rule for install.sh".to_owned()],
+        }
+    }
+
+    #[test]
+    fn an_onboarding_request_shows_its_failure_and_what_it_asks_for() {
+        let request = DocView {
+            kind: DocKind::Onboarding,
+            body: "Body".to_owned(),
+            onboard: Some(OnboardSpec {
+                grants: BTreeMap::new(),
+                ..spec()
+            }),
+            note: "collaborator: HTTP 403".to_owned(),
+            ..doc()
+        };
+        assert_eq!(
+            request.shown_text(),
+            "> Last attempt failed: collaborator: HTTP 403\n\nBody\n\n## Onboarding\n\n\
+             - repository: https://git.doodleshnookie.net/tuco86/scan-rs.git\n\
+             - default branch: main\n- grants: none\n\
+             - host prerequisites, confirmed by the owner:\n  - [ ] a sudo rule for install.sh"
+        );
+        assert_eq!(doc().shown_text(), "Body");
+        let granted = DocView {
+            onboard: Some(spec()),
+            ..doc()
+        };
+        assert!(
+            granted
+                .shown_text()
+                .contains("\n- grants: DEPLOY_KEY: push main, tag v*\n"),
+            "{}",
+            granted.shown_text()
+        );
     }
 
     fn session() -> SessionView {
@@ -1524,6 +1685,7 @@ mod tests {
             source: "s".to_owned(),
             proposals: Vec::new(),
             runs_on: Vec::new(),
+            onboard: None,
         }
         .encode();
         let value: serde_json::Value = serde_json::from_slice(&wire).unwrap();

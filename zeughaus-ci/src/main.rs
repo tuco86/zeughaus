@@ -17,6 +17,7 @@ mod header;
 mod hook;
 mod install;
 mod manual;
+mod onboard;
 mod pipeline;
 mod runners;
 mod scheduler;

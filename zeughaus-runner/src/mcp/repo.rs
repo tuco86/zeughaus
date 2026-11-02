@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use zeughaus_link::{CiReply, CiRequest, DocKind, DocState, JobDefView, RepoView};
+use zeughaus_link::{CiReply, CiRequest, DocKind, DocState, DocView, JobDefView, RepoView};
 
 use super::client::Client;
 use super::snapshot::{git, toplevel, without_credentials};
@@ -59,24 +59,57 @@ pub fn checkout(path: &Path) -> Result<Checkout, String> {
     Ok(Checkout { root, origin, head })
 }
 
+/// What the CI answers of a checkout's origin: its repository, or, while
+/// none has the origin, the onboarding request that asks for it.
+#[derive(Debug, Default)]
+pub struct RepoAnswer {
+    pub repo: Option<RepoView>,
+    pub pending: Option<DocView>,
+}
+
 /// Asks the CI which of its repositories `checkout` is. With `jobs` the CI
 /// also reads the jobs of the repository's `.zeughaus-ci/`, which costs it
-/// git reads: a caller that only needs the name leaves it off. `None` means
-/// that no repository of the CI's `ci.toml` has this origin.
-pub async fn ask(
+/// git reads: a caller that only needs the name leaves it off. With `setup`
+/// it also checks the repository's setup, which costs it a forge call. No
+/// repository means that none of the CI's `ci.toml` has this origin; the
+/// answer then carries the onboarding request that asks for it, if any.
+pub async fn ask_with(
     client: &Client,
     checkout: &Checkout,
     jobs: bool,
-) -> Result<Option<RepoView>, String> {
+    setup: bool,
+) -> Result<RepoAnswer, String> {
     let request = CiRequest::Repo {
         origin: checkout.origin.clone(),
         sha: checkout.head.clone(),
         jobs,
+        setup,
     };
     match client.ci(request).await? {
-        CiReply::Repo { repo } => Ok(repo.map(|repo| *repo)),
+        CiReply::Repo { repo, pending } => Ok(RepoAnswer {
+            repo: repo.map(|repo| *repo),
+            pending: pending.map(|doc| *doc),
+        }),
         other => Err(unexpected(&other)),
     }
+}
+
+/// What an agent is told of an origin the CI does not build yet but has an
+/// onboarding request for.
+pub fn pending_text(origin: &str, doc: &DocView) -> String {
+    let mut text = format!(
+        "{origin} is not in the CI's ci.toml yet: onboarding request #{} for {} is {}",
+        doc.number,
+        doc.repo,
+        doc.state.name()
+    );
+    if doc.state == DocState::Approved {
+        text.push_str("; the CI is onboarding it");
+    }
+    if !doc.note.is_empty() {
+        text.push_str(&format!("\nlast attempt failed: {}", one_line(&doc.note)));
+    }
+    text
 }
 
 /// The repository as an agent is told of it, one fact per line and without a
@@ -126,6 +159,14 @@ pub fn describe(view: &RepoView, head: Option<&str>) -> String {
         )
     ));
     lines.extend(doc_lines(view));
+    if !view.setup.is_empty() {
+        lines.push("setup:".to_owned());
+        lines.extend(
+            view.setup
+                .iter()
+                .map(|line| format!("  {}", one_line(line))),
+        );
+    }
     lines.join("\n")
 }
 
@@ -464,6 +505,7 @@ mod tests {
                 ("windows-amd64".to_owned(), "win11".to_owned()),
             ],
             docs: Vec::new(),
+            setup: Vec::new(),
         }
     }
 
@@ -506,6 +548,8 @@ mod tests {
             runs_on: Vec::new(),
             placement: Vec::new(),
             body: String::new(),
+            onboard: None,
+            note: String::new(),
         };
         let mut view = zeughaus();
         view.docs = vec![
@@ -520,6 +564,59 @@ mod tests {
                  Plans: #1 approved Store plans, #4 saved Plans tab"
             ),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn the_setup_check_ends_the_description() {
+        let mut view = zeughaus();
+        view.setup = vec![
+            "bot: push access to tuco86/zeughaus".to_owned(),
+            "secrets: A ok, B missing".to_owned(),
+        ];
+        let text = describe(&view, Some(HEAD));
+        assert!(
+            text.ends_with(
+                "\nsetup:\n  bot: push access to tuco86/zeughaus\n  secrets: A ok, B missing"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_pending_origin_names_its_request_and_its_last_failure() {
+        let request = zeughaus_link::DocView {
+            repo: "scan-rs".to_owned(),
+            number: 2,
+            kind: DocKind::Onboarding,
+            title: "Join".to_owned(),
+            state: DocState::Approved,
+            source: "scan-rs".to_owned(),
+            created: 0,
+            changed: 0,
+            approved: None,
+            proposals: Vec::new(),
+            plan: None,
+            runs_on: Vec::new(),
+            placement: Vec::new(),
+            body: String::new(),
+            onboard: None,
+            note: String::new(),
+        };
+        assert_eq!(
+            pending_text("git@host:o/scan-rs.git", &request),
+            "git@host:o/scan-rs.git is not in the CI's ci.toml yet: onboarding request #2 for \
+             scan-rs is approved; the CI is onboarding it"
+        );
+        let failed = zeughaus_link::DocView {
+            state: DocState::Open,
+            note: "hook: HTTP 404".to_owned(),
+            ..request
+        };
+        assert_eq!(
+            pending_text("o", &failed),
+            "o is not in the CI's ci.toml yet: onboarding request #2 for scan-rs is open\n\
+             last attempt failed: hook: HTTP 404"
         );
     }
 

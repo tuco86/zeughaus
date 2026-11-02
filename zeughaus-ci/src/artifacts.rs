@@ -33,7 +33,7 @@ use zeughaus_link::enlist::{
     write_frame,
 };
 
-use crate::config::{CiConfig, valid_name};
+use crate::config::{Shared, valid_name};
 use crate::manual;
 use crate::runners::Runners;
 use crate::scheduler::{JobStatus, Pipeline, load_pipeline};
@@ -56,7 +56,7 @@ type Offered = (SetManifest, Vec<(Root, u64)>);
 
 pub struct ArtifactService {
     state_dir: PathBuf,
-    config: Arc<CiConfig>,
+    config: Arc<Shared>,
     runners: Arc<Runners>,
     next_transfer: AtomicU64,
     store: Arc<Store>,
@@ -101,7 +101,7 @@ impl Waiting {
 impl ArtifactService {
     pub fn new(
         state_dir: PathBuf,
-        config: Arc<CiConfig>,
+        config: Arc<Shared>,
         runners: Arc<Runners>,
     ) -> Result<ArtifactService, String> {
         let blobs = state_dir.join("ci/blobs");
@@ -111,7 +111,7 @@ impl ArtifactService {
         let state_store = Store::open(&state_blobs, true)
             .map_err(|e| format!("cannot open {}: {e}", state_blobs.display()))?;
         Ok(ArtifactService {
-            budget: config.artifact_store_gb << 30,
+            budget: config.get().artifact_store_gb << 30,
             state_store: Arc::new(state_store),
             state_sets: crate::state::sets_dir(&state_dir),
             sets: state_dir.join("ci/sets"),
@@ -181,6 +181,7 @@ impl ArtifactService {
     async fn exchange(&self, mut request: IncomingRequest) {
         let runner = principal_of(request.meta()).and_then(|principal| {
             self.config
+                .get()
                 .runner_of_fingerprint(&principal)
                 .map(str::to_owned)
         });
@@ -591,7 +592,7 @@ impl ArtifactService {
             let (repo, number, _) = self.state_run(requester, run, name, true)?;
             let (manifest, missing) = read_offer(&self.state_store, &what, &mut body).await?;
             let bytes = manifest.files();
-            let max_mb = self.config.state_max_mb;
+            let max_mb = self.config.get().state_max_mb;
             if bytes > max_mb << 20 {
                 return Err(format!(
                     "state {name} holds {bytes} bytes, more than state_max_mb = {max_mb} of ci.toml"
@@ -1194,12 +1195,12 @@ mod tests {
             std::fs::write(manual::bundle_path(&state, UPLOAD, 0), b"first").unwrap();
             std::fs::write(manual::bundle_path(&state, UPLOAD, 1), b"lib").unwrap();
             manual::write_upload(&state, UPLOAD, &upload).unwrap();
-            let config = CiConfig::parse(&format!(
+            let config = crate::config::CiConfig::parse(&format!(
                 "default_runner = \"x\"\n[runners.x]\nfingerprint = \"{FP}\"\n"
             ))
             .unwrap();
             let service =
-                ArtifactService::new(state.clone(), Arc::new(config), Arc::new(Runners::new()))
+                ArtifactService::new(state.clone(), Shared::new(config), Arc::new(Runners::new()))
                     .unwrap();
             (service, state)
         }

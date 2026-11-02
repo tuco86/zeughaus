@@ -325,7 +325,7 @@ function block(c: CiContext): string | undefined {
       );
     case "unknown":
       return wrap(
-        "This checkout has .zeughaus-ci/ but its origin is no repository of the CI's ci.toml: pushes start no pipeline and run_jobs is refused.",
+        "This checkout has .zeughaus-ci/ but its origin is no repository of the CI's ci.toml: pushes start no pipeline and run_jobs is refused. To join the CI, file an onboarding request with the zeughaus MCP tool onboard_request (skill://zeughaus-ci/reference/onboarding.md).",
       );
     case "unreachable":
       return wrap(

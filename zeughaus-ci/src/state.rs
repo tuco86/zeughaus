@@ -23,7 +23,7 @@ use zeughaus_link::enlist::{
 };
 use zeughaus_link::{StateVersionView, StateView};
 
-use crate::config::{CiConfig, valid_name};
+use crate::config::{Shared, valid_name};
 use crate::transport::editor_principal;
 
 /// The versions the CI keeps of each store.
@@ -210,7 +210,7 @@ pub fn delete(
 
 /// Answers `/state` downloads until the replier goes away, which for this
 /// process means never; each exchange has a task of its own.
-pub async fn serve(replier: Replier, state_dir: PathBuf, config: Arc<CiConfig>) {
+pub async fn serve(replier: Replier, state_dir: PathBuf, config: Arc<Shared>) {
     let blobs = blobs_dir(&state_dir);
     let store = match Store::open(&blobs, true) {
         Ok(store) => Arc::new(store),
@@ -243,13 +243,13 @@ pub async fn serve(replier: Replier, state_dir: PathBuf, config: Arc<CiConfig>) 
 
 struct StateService {
     state_dir: PathBuf,
-    config: Arc<CiConfig>,
+    config: Arc<Shared>,
     store: Arc<Store>,
 }
 
 impl StateService {
     async fn exchange(&self, mut request: IncomingRequest) {
-        if let Err(why) = editor_principal(&self.config, request.meta()) {
+        if let Err(why) = editor_principal(&self.config.get(), request.meta()) {
             eprintln!("[ci] refused a state download from a peer that {why}");
             request.refuse(weida::ErrorCode::Rejected).await;
             return;
@@ -291,7 +291,7 @@ impl StateService {
             name,
             version,
         } = asked;
-        if !self.config.repos.contains_key(repo) {
+        if !self.config.get().repos.contains_key(repo) {
             return Err(format!("no repository {repo}"));
         }
         read(&self.state_dir, repo, name, *version)?

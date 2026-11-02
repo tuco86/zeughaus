@@ -11,9 +11,11 @@ use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use crate::config::{CiConfig, RepoConfig};
+use serde::{Deserialize, Serialize};
+
+use crate::config::{RepoConfig, Shared};
 use crate::event::{CiEvent, EventKind, write_inbox};
-use crate::files::write_atomic;
+use crate::files::{read_json, write_atomic, write_json};
 use crate::secrets::{SecretError, Secrets};
 use crate::{ci_dir, now_secs};
 
@@ -23,6 +25,25 @@ const MAX_BODY: usize = 5 * 1024 * 1024;
 const KEEP_DELIVERIES: usize = 1000;
 
 type Response = (u16, &'static str, Option<CiEvent>);
+
+/// The answer to the newest delivery of a repository's hook, kept in
+/// `ci/hooks/<repo>.json` so the setup check can say whether hooks arrive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookRecord {
+    pub at: u64,
+    pub event: String,
+    pub code: u16,
+    pub text: String,
+}
+
+fn record_path(state_dir: &Path, repo: &str) -> PathBuf {
+    ci_dir(state_dir).join("hooks").join(format!("{repo}.json"))
+}
+
+/// The newest delivery recorded for `repo`, if any.
+pub fn last_delivery(state_dir: &Path, repo: &str) -> Option<HookRecord> {
+    read_json(&record_path(state_dir, repo)).ok()
+}
 
 /// Recently seen delivery ids, oldest first.
 #[derive(Debug, Default)]
@@ -240,11 +261,11 @@ fn handle(
 /// the process instead of a thread nobody reads.
 pub fn start(
     addr: SocketAddr,
-    config: Arc<CiConfig>,
+    config: Arc<Shared>,
     secrets: Arc<Secrets>,
     state_dir: PathBuf,
 ) -> Result<(), String> {
-    for (name, repo) in &config.repos {
+    for (name, repo) in &config.get().repos {
         if repo.webhook_secret.is_none() {
             eprintln!("[ci-hook] {name}: no webhook_secret; its hook answers 401");
         }
@@ -260,7 +281,7 @@ pub fn start(
     Ok(())
 }
 
-fn serve(server: &tiny_http::Server, config: &CiConfig, secrets: &Secrets, state_dir: &Path) {
+fn serve(server: &tiny_http::Server, config: &Shared, secrets: &Secrets, state_dir: &Path) {
     let mut deliveries = Deliveries::load(state_dir);
     for mut request in server.incoming_requests() {
         let method = request.method().to_string();
@@ -285,6 +306,7 @@ fn serve(server: &tiny_http::Server, config: &CiConfig, secrets: &Secrets, state
             read.is_err() || body.len() > MAX_BODY
         };
 
+        let config = config.get();
         let (code, text, event) = if too_large {
             (413, "payload too large", None)
         } else {
@@ -327,6 +349,17 @@ fn serve(server: &tiny_http::Server, config: &CiConfig, secrets: &Secrets, state
             .find(|(n, _)| n == "x-github-event" || n == "x-forgejo-event")
             .map_or("-", |(_, v)| v.as_str());
         eprintln!("[ci-hook] {repo} {event_name} {code} {text}");
+        if config.repos.contains_key(repo) {
+            let record = HookRecord {
+                at: now_secs(),
+                event: event_name.to_owned(),
+                code,
+                text: text.to_owned(),
+            };
+            if let Err(e) = write_json(&record_path(state_dir, repo), &record) {
+                eprintln!("[ci-hook] record: {e}");
+            }
+        }
 
         let response = tiny_http::Response::from_string(text).with_status_code(code);
         if let Err(e) = request.respond(response) {
@@ -357,7 +390,7 @@ slug = "Griasdi/Griasdi"
 api = "https://api.github.com"
 webhook_secret = "GRIASDI_WEBHOOK_SECRET"
 "#;
-        CiConfig::parse(toml).expect("config").repos
+        crate::config::CiConfig::parse(toml).expect("config").repos
     }
 
     fn secret(name: &str) -> Result<String, SecretError> {

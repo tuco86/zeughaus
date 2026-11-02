@@ -495,13 +495,18 @@ async fn ci_answer(client: &Arc<Client>, command: CiCommand) -> Result<String, F
             // Blocking, on the one thread this command has: nothing else
             // is waiting for it.
             let checkout = repo::checkout(&dir).map_err(Failure::bad_input)?;
-            let Some(view) = repo::ask(client, &checkout, true)
+            let answer = repo::ask_with(client, &checkout, true, false)
                 .await
-                .map_err(Failure::no_answer)?
-            else {
+                .map_err(Failure::no_answer)?;
+            let Some(view) = answer.repo else {
                 return Err(Failure {
                     code: EXIT_NOT_A_REPOSITORY,
-                    message: format!("{} is no repository of the CI's ci.toml", checkout.origin),
+                    message: match answer.pending {
+                        Some(doc) => repo::pending_text(&checkout.origin, &doc),
+                        None => {
+                            format!("{} is no repository of the CI's ci.toml", checkout.origin)
+                        }
+                    },
                 });
             };
             let text = repo::describe(&view, checkout.head.as_deref());
@@ -561,6 +566,7 @@ async fn ci_answer(client: &Arc<Client>, command: CiCommand) -> Result<String, F
                 body,
                 proposals,
                 runs_on,
+                onboard: None,
             };
             let number = match client.ci(request).await.map_err(Failure::no_answer)? {
                 CiReply::DocCreated { number } => number,
@@ -893,7 +899,7 @@ mod tests {
             };
 
             assert_eq!(by_id(1)["result"]["serverInfo"]["name"], "zeughaus");
-            assert_eq!(by_id(2)["result"]["tools"].as_array().unwrap().len(), 15);
+            assert_eq!(by_id(2)["result"]["tools"].as_array().unwrap().len(), 19);
             let status = &by_id(3)["result"];
             assert_eq!(status["isError"], true);
             let text = status["content"][0]["text"].as_str().unwrap();
