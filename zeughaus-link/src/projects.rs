@@ -1,6 +1,7 @@
 //! The projects a runner's user can open: every repository the forges of
 //! `[projects]` in the runner's `zeughaus.toml` give push access to, plus
-//! every checkout under its work root.
+//! every checkout under its work root; and on request what the runner can
+//! find out about one of them, for the CI's advice.
 //!
 //! An editor asks its local runner on [`PROJECTS_PATH`], which answers from
 //! a cache unless [`ProjectsRequest::refresh`] is set. JSON, so a field
@@ -22,6 +23,9 @@ pub struct ProjectsRequest {
     /// Ask the forges again instead of answering from the cache.
     #[serde(default)]
     pub refresh: bool,
+    /// An origin: answer [`ProjectsReply::facts`] about it and no listing.
+    #[serde(default)]
+    pub facts: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +36,12 @@ pub struct ProjectsReply {
     /// that could not be read. The rest is still listed.
     #[serde(default)]
     pub errors: Vec<String>,
+    /// What the runner found out about the asked origin, in Markdown: its
+    /// listing, its work checkout (files, manifests, README, remotes) or
+    /// else what its forge says. At most
+    /// [`crate::advice::MAX_FACTS_BYTES`].
+    #[serde(default)]
+    pub facts: Option<String>,
 }
 
 /// One repository the user can push to, or has checked out.

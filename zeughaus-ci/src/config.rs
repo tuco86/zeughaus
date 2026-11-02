@@ -54,6 +54,33 @@ pub struct CiConfig {
     /// How the CI onboards a repository; no onboarding requests without it.
     #[serde(default)]
     pub onboarding: Option<OnboardingConfig>,
+    /// The language model that advises on projects the CI does not build;
+    /// no advice without it.
+    #[serde(default)]
+    pub advice: Option<AdviceConfig>,
+}
+
+/// `[advice]`: the Anthropic Messages API the CI asks for advice on a
+/// project that has not joined, and the secret it asks with.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdviceConfig {
+    /// Secret name: an API key (`x-api-key`), or an OAuth access token
+    /// (`sk-ant-oat...`, sent as a bearer token).
+    pub key: String,
+    #[serde(default = "default_advice_model")]
+    pub model: String,
+    /// The API base; a trailing `/` is trimmed.
+    #[serde(default = "default_advice_api")]
+    pub api: String,
+}
+
+fn default_advice_model() -> String {
+    "claude-haiku-5-5".into()
+}
+
+fn default_advice_api() -> String {
+    "https://api.anthropic.com".into()
 }
 
 /// `[onboarding]`: the Forgejo the CI adds repositories of, and the names
@@ -511,6 +538,21 @@ impl CiConfig {
             }
             if self.secrets.is_none() {
                 return Err("[onboarding] names secrets but ci.toml has no [secrets]".into());
+            }
+        }
+        if let Some(advice) = &mut self.advice {
+            advice.api = advice.api.trim_end_matches('/').to_string();
+            if !valid_env_name(&advice.key) {
+                return Err(format!(
+                    "[advice]: `key` names secret `{}`, which must match [A-Z_][A-Z0-9_]*",
+                    advice.key
+                ));
+            }
+            if advice.model.is_empty() || advice.api.is_empty() {
+                return Err("[advice]: `model` and `api` must not be empty".into());
+            }
+            if self.secrets.is_none() {
+                return Err("[advice] names a secret but ci.toml has no [secrets]".into());
             }
         }
         let repo_names: BTreeSet<String> = self.repos.keys().cloned().collect();

@@ -146,14 +146,22 @@ ticket's actions, its proposal (`Edit` while open or ready), its plan in
 sections that are folded, deleted or annotated with an overall note for
 `Refine`, and a side column with its state, `Runs on`, links (`depends
 on`, `related`, added by `#n`), the tickets it includes, its sessions and
-who holds it. A project no CI builds offers
-`Onboard`. A channel lists its pipelines one
+who holds it. The Board of a project no CI builds
+shows what the first CI advises (its `[advice]` model's summary, status
+lines and ways to join, from the facts the local runner gathers about the
+project; `Ask again` asks past the CI's kept answer) and an onboarding
+form: name, default branch, events, a repository it follows, platforms,
+secrets (`NAME: event, event; ...`), host prerequisites and notes; picking
+one of the ways fills it, and `File onboarding request` files it. A channel
+lists its pipelines one
 row each, newest on top and open with its jobs, a cable animating while its
 artifact set moves, failures with their cause and log excerpt, `Rerun` and
-`Cancel`; pressing a job docks its transcript read-only beside the list,
-live while it runs. Up/Down or j/k and Enter walk and open a list, `r`,
-`Shift+C` and `l` rerun, cancel and open a pipeline's log; Escape closes a
-transcript, or the Overview. Channels come from
+`Cancel`; pressing a job opens its transcript read-only in a tab of its own
+(`#<n> <job>`) right after its channel's tab, live while it runs, or brings
+that tab to the front; closing the tab closes the transcript. Up/Down or
+j/k and Enter walk and open a list, `r`,
+`Shift+C` and `l` rerun, cancel and open a pipeline's log; Escape closes
+the Overview. Channels come from
 `.zeughaus-ci/channels.toml`. Closing a graph's tab
 deletes the graph. Double-clicking a
 tab or a group's name renames it; a tab that shows one graph renames the
@@ -312,7 +320,15 @@ generated `<NAME>_WEBHOOK_SECRET` in OpenBao, writes
 `ci/onboarded/<name>.toml`, reloads the configuration in place and queues
 the first push pipeline. The configuration is one swappable snapshot:
 SIGHUP (`systemctl --user reload zeughaus-ci`) re-reads `[repos]` and
-`ci/onboarded/`, and refuses any other change. Sessions run on the runners, dispatched by the CI
+`ci/onboarded/`, and refuses any other change. `[advice]` of `ci.toml`
+(`key`: the OpenBao secret with an Anthropic API key or an OAuth token
+`sk-ant-oat...`; `model`, by default `claude-haiku-5-5`; `api`) is the
+model the CI asks for a bare project's advice (`CiRequest::Advise` with
+the facts an editor's runner gathered on `/projects`): it adds its
+Forgejo, platforms, runners and repositories, keeps only settings it can
+file, and keeps the answer under `ci/advice/` until the facts or its
+configuration change; whether it can onboard the origin at all is its
+own answer, not the model's. Sessions run on the runners, dispatched by the CI
 (`<state-dir>/ci/sessions.json`, announced as `CiSessions`): every 2 s it
 opens a plan session for each ready ticket whose dependencies are done and
 that nobody holds (on the runner that wrote its plan after a Refine, else

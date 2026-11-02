@@ -1029,7 +1029,7 @@ impl App {
             #[cfg(not(target_arch = "wasm32"))]
             Message::ShowProject(origin) => return self.show_project(origin),
             #[cfg(not(target_arch = "wasm32"))]
-            Message::DismissProject(origin) => self.dismiss_project(origin),
+            Message::DismissProject(origin) => return self.dismiss_project(origin),
             #[cfg(not(target_arch = "wasm32"))]
             Message::OpenChannelView(origin, channel) => {
                 return self.open_channel_view(origin, channel);
@@ -1053,22 +1053,7 @@ impl App {
             #[cfg(not(target_arch = "wasm32"))]
             Message::ProjectsArrived(result) => self.projects_arrived(result),
             #[cfg(not(target_arch = "wasm32"))]
-            Message::OnboardProject(origin) => return self.onboard_project(origin),
-            #[cfg(not(target_arch = "wasm32"))]
-            Message::Onboarded(result) => {
-                if let Err(message) = result {
-                    self.notices.raise(
-                        None,
-                        crate::notices::Severity::Error,
-                        "Onboarding refused",
-                        message,
-                        false,
-                        None,
-                        std::time::SystemTime::now(),
-                    );
-                }
-                return self.poll_ci();
-            }
+            Message::Onboard(origin, message) => return self.apply_onboard(origin, message),
             #[cfg(not(target_arch = "wasm32"))]
             Message::Ticket(message) => return self.apply_ticket(message),
             Message::Workspace(message) => {
@@ -1077,8 +1062,7 @@ impl App {
                 if let workspace::Message::CloseTab(tab) = &message
                     && tab.runner.as_str() == RunnerKey::PROJECTS
                 {
-                    self.close_project_tab(tab.tab);
-                    return Task::none();
+                    return self.close_project_tab(tab.tab);
                 }
                 // A tab brought to the front is what the user wants to see:
                 // the page over it goes.

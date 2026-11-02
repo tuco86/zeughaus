@@ -414,18 +414,19 @@ pub async fn activity(endpoint: Endpoint, limit: u32) -> Result<Vec<ActivityEntr
         .ok_or_else(|| "activity: malformed".to_owned())
 }
 
-/// What the local runner lists as openable projects; `refresh` asks the
-/// forges again instead of the runner's cache.
+/// Asks the local runner which projects it lists as openable (`refresh`
+/// asks the forges again instead of the runner's cache), or with `facts`
+/// what it finds out about one of them.
 pub async fn projects(
     endpoint: Endpoint,
-    refresh: bool,
+    request: zeughaus_link::ProjectsRequest,
 ) -> Result<zeughaus_link::ProjectsReply, String> {
     let quic = QUIC.as_ref().ok_or("no QUIC runtime")?;
     let url = endpoint.path(zeughaus_link::PROJECTS_PATH)?;
     let requester = quic.requester(client_tls());
     first_dial(&url, || requester.connect(&url)).await?;
     let reply = requester
-        .request(&zeughaus_link::ProjectsRequest { refresh }.encode())
+        .request(&request.encode())
         .await
         .map_err(|e| format!("projects: {e}"))?;
     let encoded = reply

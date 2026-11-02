@@ -489,6 +489,7 @@ pub fn check(secrets: &Secrets, config: &CiConfig) -> Result<Vec<String>, String
                 .iter()
                 .flat_map(|onb| [&onb.bot_token, &onb.admin_token]),
         )
+        .chain(config.advice.iter().map(|advice| &advice.key))
         .collect();
     if names.is_empty() && secrets.config.is_none() {
         return Ok(Vec::new());

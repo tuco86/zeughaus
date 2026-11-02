@@ -1449,8 +1449,9 @@ and `Refine` sends that review (`DocRefine`) while `Approve` waits until
 the review is empty. Escape or a press on the scrim closes it; `New
 ticket` on the Board writes one in it. A card the CI moved to another
 column carries an accent ring that fades over 2 s. A project no CI builds
-gets an `Onboard` button that files an onboarding request with the first
-CI. A channel lists its pipelines in a scrollable, newest on top
+gets the Board of `ci/onboard.rs`: the first CI's advice on it
+(**Advice**), and an onboarding form an operation of the advice fills,
+which files the request with that CI. A channel lists its pipelines in a scrollable, newest on top
 and separated by rules, one row each: a status glyph (codicons from the
 bundled Nerd Font, so status never rests on colour alone), `#<n>` and the
 commit's subject (the CI reads it from its mirror when the pipeline starts,
@@ -1474,14 +1475,18 @@ with its queue key), which a channel shows as `Queued` rows above its
 pipelines. Up and Down (or `j` and `k`) move a cursor over the list in
 front, Enter opens or closes the pipeline under it, `r` reruns it, Shift+`C`
 cancels it and `l` opens the log of its first failed job (letters no widget
-took), and Escape closes the transcript (the Overview, on the Overview),
-when no palette or rename takes it first. The
+took), and Escape closes the Overview, when no palette or rename takes it
+first. The
 list is at most 1200 px wide. While the channel in front has something running, a
 one-second clock moves its elapsed times. The cables between the cards are one
 `iced_nodegraph_sdf` primitive under them; nothing pans, zooms, moves or
 takes the wheel, so the list scrolls like any other. Pressing a job
-docks its transcript beside the list, and its card is tinted with
-the accent while it is open: the CI creates a
+opens its transcript in a tab of its own in the project's group, right
+after the channel's tab (`ViewKey::Job`, a `JobRef` of channel view,
+pipeline and job), or brings that tab to the front; its card is tinted
+with the accent while the tab is open, and closing the tab closes the
+transcript. The tab shows the channel as a link back, the job's status
+and duration over the transcript. The CI creates a
 `Session::fed` (`zeughaus-terminal`), a screen that a follower task feeds
 from the stored `wal` every 200 ms and that ends with the `exit` file, and
 serves it on its own `/mux` through `zeughaus_terminal::serve::stream_terminal`,
@@ -1882,6 +1887,27 @@ each approved request: secrets present, bot collaborator, webhook secret
 `ci/onboarded/<name>.toml` written and the configuration reloaded, first
 push event queued. Every step may run again; a failure puts the request
 back to `open` with the step and the reason as its note.
+
+**Advice.** `[advice]` of `ci.toml` (a secret `key`, a `model`, by default
+`claude-haiku-5-5`, and the `api` base) is the language model the CI asks
+about a project that has not joined (`zeughaus-ci/src/advice.rs`). The
+editor asks its local runner on `/projects` for the facts
+(`ProjectsRequest::facts`, `zeughaus-runner/src/projects/facts.rs`: its
+listing, the work checkout at `HEAD` with its top level, CI folders,
+manifests, README, remotes and last commit, or else what the forge's API
+says, with push mirrors and a same-named repository on a Forgejo) and
+sends them in `CiRequest::Advise`. The CI adds what it knows of itself
+(its Forgejo, platforms, runners with labels, repositories), forces one
+tool call on the Messages API through curl with the key on stdin (`x-api-key`,
+or a bearer token with the OAuth beta header for `sk-ant-oat...`), and
+keeps of the operations only what it can file: platforms of its
+`[platforms]`, event patterns that parse and follow one of its
+repositories, a valid name and secret names. The answer is kept under
+`ci/advice/<sha256 of the origin>.json` with the SHA-256 of the request, so
+the same facts against the same configuration are answered from disk
+unless `refresh`. `AdviceView::refusal` (already in `ci.toml`, not on the
+Forgejo, no `[onboarding]`) is the CI's own and is filled even without
+`[advice]`.
 
 **Configuration reload.** Every service holds `config::Shared` and takes
 one snapshot of the configuration per request or loop turn (the scheduler

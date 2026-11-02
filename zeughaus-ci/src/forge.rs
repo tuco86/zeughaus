@@ -161,7 +161,7 @@ fn curl(args: &[&str], headers: &str, body: Option<&Path>, url: &str) -> Result<
 
 /// Runs `command` with `stdin` piped in; answers its stdout, or its errors
 /// with a hint on a 401.
-fn run(mut command: Command, stdin: &str) -> Result<String, String> {
+pub(crate) fn run(mut command: Command, stdin: &str) -> Result<String, String> {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

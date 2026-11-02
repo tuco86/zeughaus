@@ -11,7 +11,8 @@
 //! drawn with the node graph's renderer; nothing in it pans, zooms or moves.
 //! Pressing a job asks the CI for a transcript: a read-only terminal of its
 //! mux that replays the job's recorded output, live while the job runs,
-//! which the page shows beside the list.
+//! which a tab of its own in the project's group shows, right after the
+//! channel's tab.
 //!
 //! Native only: the browser editor reaches no runner.
 
@@ -41,6 +42,7 @@ use crate::transport::Endpoint;
 use crate::workspace::RunnerKey;
 
 mod cables;
+mod onboard;
 pub(super) mod page;
 mod plans;
 mod review;
@@ -188,6 +190,9 @@ pub(super) struct CiClient {
     next_id: u64,
     repos: BTreeMap<String, Repo>,
     views: BTreeMap<u64, ChannelState>,
+    /// The transcripts of the jobs with a tab, by channel view, pipeline
+    /// and job.
+    transcripts: BTreeMap<JobRef, Transcript>,
     /// The Plans tab of each repository, by its view id.
     plans: BTreeMap<u64, plans::PlansState>,
     /// Pipelines being fetched after a change event, and whether another
@@ -207,8 +212,7 @@ struct Repo {
     channels: BTreeMap<String, u64>,
 }
 
-/// One channel's view: the pipelines loaded so far and the transcript
-/// beside them.
+/// One channel's view: the pipelines loaded so far.
 struct ChannelState {
     repo: String,
     channel: String,
@@ -224,7 +228,6 @@ struct ChannelState {
     /// Whether the runner has nothing older than the last pipeline loaded.
     exhausted: bool,
     error: Option<String>,
-    transcript: Option<Transcript>,
     /// Pipelines the user opened or closed against their default: the
     /// newest one and the running ones are open, the rest closed.
     toggled: HashSet<u64>,
@@ -242,10 +245,18 @@ struct Notice {
     failed: bool,
 }
 
-/// The job whose output a view shows beside its list.
+/// A job of a channel view's pipeline: what a transcript and its tab are
+/// known by.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct JobRef {
+    pub(crate) view: u64,
+    pub(crate) number: u64,
+    pub(crate) job: String,
+}
+
+/// A job's transcript on the CI's mux.
+#[derive(Default)]
 struct Transcript {
-    number: u64,
-    job: String,
     /// The runner's terminal id, once it has answered.
     terminal: Option<u64>,
     /// Why it did not.
@@ -384,7 +395,6 @@ impl ChannelState {
             stale: false,
             exhausted: false,
             error: None,
-            transcript: None,
             toggled: HashSet::new(),
             acting: HashSet::new(),
             notice: None,
@@ -508,6 +518,7 @@ impl CiClient {
             next_id: 1,
             repos: BTreeMap::new(),
             views: BTreeMap::new(),
+            transcripts: BTreeMap::new(),
             plans: BTreeMap::new(),
             fetching: HashMap::new(),
             last_overview: None,
@@ -521,18 +532,28 @@ impl CiClient {
     }
 
     /// The terminals of the transcripts the runner has opened for this
-    /// client's views: what the runner's mux has to stream to this editor
+    /// client's job tabs: what the runner's mux has to stream to this editor
     /// besides the terminals of its workspace.
     pub(super) fn terminals(&self) -> impl Iterator<Item = TerminalId> + '_ {
-        self.views
+        self.transcripts
             .values()
-            .filter_map(|state| state.transcript.as_ref()?.terminal)
+            .filter_map(|transcript| transcript.terminal)
             .map(TerminalId)
     }
 
-    /// Whether a view shows `terminal` as a transcript.
+    /// Whether a job tab shows `terminal`.
     pub(super) fn shows(&self, terminal: TerminalId) -> bool {
         self.terminals().any(|shown| shown == terminal)
+    }
+
+    /// The terminal of a job's transcript once the runner has answered, or
+    /// why it did not; `None` without a tab.
+    pub(super) fn transcript_of(&self, job: &JobRef) -> Option<Result<Option<u64>, &str>> {
+        let transcript = self.transcripts.get(job)?;
+        Some(match &transcript.error {
+            Some(error) => Err(error),
+            None => Ok(transcript.terminal),
+        })
     }
 
     /// A repository, with an id minted for its Plans view the first time it
@@ -745,13 +766,18 @@ impl CiClient {
                 {
                     return true;
                 }
-                if let Some(terminal) = self
-                    .views
-                    .remove(view)
-                    .and_then(|state| state.transcript)
-                    .and_then(|transcript| transcript.terminal)
-                {
-                    tasks.push(close(self.endpoint.clone(), terminal));
+                self.views.remove(view);
+                let view = *view;
+                let gone: Vec<JobRef> = self
+                    .transcripts
+                    .keys()
+                    .filter(|job| job.view == view)
+                    .cloned()
+                    .collect();
+                for job in gone {
+                    if let Some(terminal) = self.transcripts.remove(&job).and_then(|t| t.terminal) {
+                        tasks.push(close(self.endpoint.clone(), terminal));
+                    }
                 }
                 false
             });
@@ -902,51 +928,34 @@ impl CiClient {
         }
     }
 
-    /// Opens the transcript of a job in a view, in place of the one it shows.
-    fn open_job(&mut self, key: &RunnerKey, view: u64, number: u64, job: String) -> Task<Message> {
-        let Some(state) = self.views.get_mut(&view) else {
+    /// Asks for the transcript of a job that has none yet, or whose last
+    /// request failed; one on its way or open is left as it is.
+    fn open_job(&mut self, key: &RunnerKey, job: JobRef) -> Task<Message> {
+        let Some(state) = self.views.get(&job.view) else {
             return Task::none();
         };
-        if state
-            .transcript
-            .as_ref()
-            .is_some_and(|t| t.number == number && t.job == job && t.error.is_none())
-        {
-            return Task::none();
-        }
-        let mut tasks = Vec::new();
-        if let Some(old) = state.transcript.take().and_then(|t| t.terminal) {
-            tasks.push(close(self.endpoint.clone(), old));
-        }
-        state.transcript = Some(Transcript {
-            number,
-            job: job.clone(),
-            terminal: None,
-            error: None,
-        });
         let repo = state.repo.clone();
-        tasks.push(self.ask_transcript(key, view, repo, number, job));
-        Task::batch(tasks)
+        match self.transcripts.get_mut(&job) {
+            Some(transcript) if transcript.error.is_none() => return Task::none(),
+            Some(transcript) => transcript.error = None,
+            None => {
+                self.transcripts.insert(job.clone(), Transcript::default());
+            }
+        }
+        self.ask_transcript(key, repo, job)
     }
 
-    fn ask_transcript(
-        &self,
-        key: &RunnerKey,
-        view: u64,
-        repo: String,
-        number: u64,
-        job: String,
-    ) -> Task<Message> {
+    fn ask_transcript(&self, key: &RunnerKey, repo: String, job: JobRef) -> Task<Message> {
         let key = key.clone();
         Task::perform(
-            transcript(self.endpoint.clone(), repo, number, job.clone()),
+            transcript(self.endpoint.clone(), repo, job.number, job.job.clone()),
             move |result| {
                 Message::Ci(
                     key,
                     CiMsg::Transcript {
-                        view,
-                        number,
-                        job,
+                        view: job.view,
+                        number: job.number,
+                        job: job.job,
                         result,
                     },
                 )
@@ -954,20 +963,13 @@ impl CiClient {
         )
     }
 
-    /// What the runner answered a request for a transcript. A job the view
-    /// has moved on from gets its terminal closed again.
-    fn transcript_arrived(
-        &mut self,
-        view: u64,
-        number: u64,
-        job: &str,
-        result: Result<u64, String>,
-    ) -> Task<Message> {
+    /// What the runner answered a request for a transcript. A job whose tab
+    /// was closed meanwhile gets its terminal closed again.
+    fn transcript_arrived(&mut self, job: &JobRef, result: Result<u64, String>) -> Task<Message> {
         let open = self
-            .views
-            .get_mut(&view)
-            .and_then(|state| state.transcript.as_mut())
-            .filter(|t| t.number == number && t.job == job && t.terminal.is_none());
+            .transcripts
+            .get_mut(job)
+            .filter(|t| t.terminal.is_none());
         if let Some(transcript) = open {
             match result {
                 Ok(terminal) => transcript.terminal = Some(terminal),
@@ -975,7 +977,6 @@ impl CiClient {
             }
             return Task::none();
         }
-        // The view has moved on while the runner answered.
         match result {
             Ok(terminal) if !self.shows(TerminalId(terminal)) => {
                 close(self.endpoint.clone(), terminal)
@@ -984,14 +985,9 @@ impl CiClient {
         }
     }
 
-    /// Takes a view's transcript away, closing its terminal on the runner.
-    fn close_job(&mut self, view: u64) -> Task<Message> {
-        let terminal = self
-            .views
-            .get_mut(&view)
-            .and_then(|state| state.transcript.take())
-            .and_then(|t| t.terminal);
-        match terminal {
+    /// Takes a job's transcript away, closing its terminal on the runner.
+    fn close_job(&mut self, job: &JobRef) -> Task<Message> {
+        match self.transcripts.remove(job).and_then(|t| t.terminal) {
             Some(terminal) => close(self.endpoint.clone(), terminal),
             None => Task::none(),
         }
@@ -1207,14 +1203,12 @@ impl App {
             } => client.pipeline_arrived(&key, repo, number, result),
             CiMsg::LoadOlder { view } => client.ask_pipelines(&key, view, true),
             CiMsg::OpenJob { view, number, job } => {
-                let asked = client.open_job(&key, view, number, job);
-                // A job opened from a runner is in its channel.
-                let shown = self.apply_page(Message::PageShow(page::PageView::Channel(
-                    key.clone(),
-                    view,
-                )));
-                // The transcript this one replaced is no longer wanted.
-                Task::batch([asked, shown, self.reconcile_terminals(&key)])
+                let job = JobRef { view, number, job };
+                let asked = client.open_job(&key, job.clone());
+                // The job's tab, after its channel's, in front.
+                let shown =
+                    self.apply_page(Message::PageShow(page::PageView::Job(key.clone(), job)));
+                Task::batch([asked, shown])
             }
             CiMsg::Transcript {
                 view,
@@ -1222,11 +1216,11 @@ impl App {
                 job,
                 result,
             } => {
-                let closed = client.transcript_arrived(view, number, &job, result);
+                let closed = client.transcript_arrived(&JobRef { view, number, job }, result);
                 Task::batch([closed, self.reconcile_terminals(&key)])
             }
-            CiMsg::CloseTranscript { view } => {
-                let closed = client.close_job(view);
+            CiMsg::CloseTranscript { view, number, job } => {
+                let closed = client.close_job(&JobRef { view, number, job });
                 Task::batch([closed, self.reconcile_terminals(&key)])
             }
             CiMsg::Toggle { view, number } => {
@@ -1291,14 +1285,18 @@ impl App {
     }
 
     /// Whether something on screen counts seconds: the page shows a channel
-    /// with a running pipeline or job. The one-second clock runs only while
-    /// this holds, since every tick redraws the window.
+    /// with a running pipeline or job, or a job of such a channel. The
+    /// one-second clock runs only while this holds, since every tick redraws
+    /// the window.
     pub(super) fn ci_clock_wanted(&self) -> bool {
-        let Some((key, view)) = self.front_view() else {
-            return false;
+        let (key, view) = match &self.page.view {
+            _ if !self.page.open => return false,
+            page::PageView::Channel(key, view) => (key, *view),
+            page::PageView::Job(key, job) => (key, job.view),
+            _ => return false,
         };
         self.ci
-            .get(&key)
+            .get(key)
             .and_then(|client| client.views.get(&view))
             .is_some_and(ChannelState::ticking)
     }
@@ -1415,21 +1413,6 @@ impl App {
         Task::none()
     }
 
-    /// What Escape does in front of a channel when nothing nearer took it:
-    /// closes the log beside it.
-    pub(super) fn close_front_ci_log(&mut self) -> Task<Message> {
-        let open = self.front_view().filter(|(runner, view)| {
-            self.ci
-                .get(runner)
-                .and_then(|client| client.views.get(view))
-                .is_some_and(|state| state.transcript.is_some())
-        });
-        match open {
-            Some((runner, view)) => self.apply_ci(runner, CiMsg::CloseTranscript { view }),
-            None => Task::none(),
-        }
-    }
-
     /// A pipeline of `repo`'s `channel` changed. The pipeline is asked for
     /// again when a view shows that channel, and the overview always: a
     /// change is how a new pipeline, channel or status shows up.
@@ -1490,29 +1473,23 @@ impl App {
         Task::batch(tasks)
     }
 
-    /// Asks again for every transcript a view shows. A restarted runner does
-    /// not keep transcripts, so their terminals are gone; one that kept
+    /// Asks again for every transcript a job tab shows. A restarted runner
+    /// does not keep transcripts, so their terminals are gone; one that kept
     /// running answers with the same terminal.
     pub(super) fn reopen_ci_transcripts(&mut self, key: &RunnerKey) -> Task<Message> {
         let Some(client) = self.ci.get_mut(key) else {
             return Task::none();
         };
         let mut asks = Vec::new();
-        for (view, state) in &mut client.views {
-            if let Some(transcript) = &mut state.transcript {
-                transcript.terminal = None;
-                transcript.error = None;
-                asks.push((
-                    *view,
-                    state.repo.clone(),
-                    transcript.number,
-                    transcript.job.clone(),
-                ));
+        for (job, transcript) in &mut client.transcripts {
+            *transcript = Transcript::default();
+            if let Some(state) = client.views.get(&job.view) {
+                asks.push((state.repo.clone(), job.clone()));
             }
         }
         let tasks: Vec<Task<Message>> = asks
             .into_iter()
-            .map(|(view, repo, number, job)| client.ask_transcript(key, view, repo, number, job))
+            .map(|(repo, job)| client.ask_transcript(key, repo, job))
             .collect();
         Task::batch(tasks)
     }
@@ -1691,9 +1668,9 @@ impl App {
         .into()
     }
 
-    /// `<repo> #<n> <job>`: pressing it brings its channel's tab to the
-    /// front with the job's transcript open. A channel this editor does not
-    /// show leaves plain text.
+    /// `<repo> #<n> <job>`: pressing it opens the job's transcript in its
+    /// tab, after its channel's. A channel this editor does not know leaves
+    /// plain text.
     fn machine_job<'a>(
         &'a self,
         runner: &'a RunnerKey,
@@ -1761,27 +1738,6 @@ impl App {
         {
             toolbar = toolbar.push(text(error.as_str()).size(TEXT_SM).color(self.theme.error()));
         }
-        if let Some(open) = &state.transcript {
-            let what = match &open.error {
-                Some(error) => text(format!("Log of #{} {}: {error}", open.number, open.job))
-                    .size(TEXT_SM)
-                    .color(self.theme.error()),
-                None if open.terminal.is_none() => {
-                    text(format!("Opening the log of #{} {}", open.number, open.job))
-                        .size(TEXT_SM)
-                        .color(muted)
-                }
-                None => text(format!("Log of #{} {}", open.number, open.job))
-                    .size(TEXT_SM)
-                    .color(muted),
-            };
-            toolbar = toolbar.push(what).push(tip(
-                icon_button(glyph::CLOSE, None).on_press_with(move || {
-                    Message::Ci(runner.clone(), CiMsg::CloseTranscript { view })
-                }),
-                "Close the log (Escape)".to_owned(),
-            ));
-        }
 
         let queued: Vec<&'a QueuedView> = client
             .overview
@@ -1798,6 +1754,76 @@ impl App {
             unavailable(&state.channel, why)
         } else {
             self.pipeline_list(runner, view, state, queued)
+        };
+        column![toolbar, rule::horizontal(1), body].into()
+    }
+
+    /// A job's tab: its toolbar (the channel it is in, a link back to it,
+    /// and how the job runs or ran) over its transcript, read-only.
+    pub(super) fn job_page<'a>(
+        &'a self,
+        runner: &'a RunnerKey,
+        job: &'a JobRef,
+    ) -> Element<'a, Message, Theme> {
+        let Some(client) = self.ci.get(runner) else {
+            return unavailable("CI", "This CI is not connected.");
+        };
+        let Some(state) = client.views.get(&job.view) else {
+            return unavailable("CI", "This channel is gone.");
+        };
+        let muted = self.theme.muted();
+        let view = job.view;
+        let channel = tip(
+            button(text(state.channel.as_str()).size(TEXT_MD))
+                .padding([SP_1, SP_2])
+                .style(link_style)
+                .on_press_with(move || {
+                    Message::PageShow(page::PageView::Channel(runner.clone(), view))
+                }),
+            "The channel's pipelines".to_owned(),
+        );
+        let mut toolbar = row![
+            text(state.repo.as_str()).size(TEXT_MD).color(muted),
+            icon(glyph::CHEVRON_RIGHT, TEXT_MD, muted),
+            channel,
+            icon(glyph::CHEVRON_RIGHT, TEXT_MD, muted),
+            text(format!("#{}", job.number)).size(TEXT_MD).color(muted),
+            text(job.job.as_str()).size(TEXT_MD),
+        ]
+        .spacing(SP_2)
+        .align_y(Alignment::Center)
+        .padding([SP_2, SP_4])
+        .height(TOOLBAR_HEIGHT);
+        let ran = state
+            .pipelines
+            .iter()
+            .find(|shown| shown.pipeline.number == job.number)
+            .and_then(|shown| shown.pipeline.jobs.iter().find(|j| j.name == job.job));
+        if let Some(ran) = ran {
+            let tone = Tone::of(&ran.status);
+            toolbar = toolbar
+                .push(Space::new().width(SP_2))
+                .push(icon(
+                    status_glyph(&ran.status),
+                    ICON_SIZE,
+                    tone.color(&self.theme),
+                ))
+                .push(
+                    text(job_detail(ran, now()))
+                        .size(TEXT_SM)
+                        .color(tone.text(&self.theme))
+                        .wrapping(Wrapping::None),
+                );
+        }
+        toolbar = toolbar.push(Space::new().width(Length::Fill));
+        if let Some(stale) = self.stale(client) {
+            toolbar = toolbar.push(stale);
+        }
+        let body: Element<'a, Message, Theme> = match client.transcript_of(job) {
+            Some(Ok(Some(terminal))) => self.page_terminal(runner, TerminalId(terminal)),
+            Some(Err(error)) => unavailable(&job.job, error),
+            Some(Ok(None)) => unavailable(&job.job, "Opening the log."),
+            None => unavailable(&job.job, "This log is closed."),
         };
         column![toolbar, rule::horizontal(1), body].into()
     }
@@ -2267,7 +2293,7 @@ impl App {
         let mut detail = column![actions].spacing(SP_3);
         if !shown.jobs.cards.is_empty() {
             detail = detail.push(
-                scrollable(self.job_graph(runner, view, state, shown, now))
+                scrollable(self.job_graph(runner, view, shown, now))
                     .direction(scrollable::Direction::Horizontal(
                         scrollable::Scrollbar::default().spacing(SP_1),
                     ))
@@ -2310,7 +2336,7 @@ impl App {
                         },
                     )
                 }),
-                "The whole log beside the list (L opens the first failed one)".to_owned(),
+                "The whole log in a tab of its own (L opens the first failed one)".to_owned(),
             ),
         ]
         .spacing(SP_2)
@@ -2349,12 +2375,11 @@ impl App {
     }
 
     /// A pipeline's jobs: the cables at the bottom, a card per job over
-    /// them. Only the cards take input.
+    /// them. Only the cards take input; a job with a tab is marked.
     fn job_graph<'a>(
         &'a self,
         runner: &'a RunnerKey,
         view: u64,
-        state: &'a ChannelState,
         shown: &'a Shown,
         now: u64,
     ) -> Element<'a, Message, Theme> {
@@ -2373,11 +2398,12 @@ impl App {
             )
             .into(),
         );
+        let tabs = self.ci.get(runner).map(|client| &client.transcripts);
         for (job, &at) in shown.pipeline.jobs.iter().zip(&graph.cards) {
-            let selected = state
-                .transcript
-                .as_ref()
-                .is_some_and(|open| open.number == number && open.job == job.name);
+            let selected = tabs.is_some_and(|tabs| {
+                tabs.keys()
+                    .any(|open| open.view == view && open.number == number && open.job == job.name)
+            });
             layers.push(
                 pin(self.job_card(runner, view, number, job, selected, now))
                     .position(at)
@@ -2392,7 +2418,7 @@ impl App {
 
     /// A job's card: how its run went and its name, and under them how long
     /// it took and where, or what it waits for. Pressing it opens the job's
-    /// log; the card whose log is open is marked.
+    /// log in its tab; a card whose log has a tab is marked.
     fn job_card<'a>(
         &'a self,
         runner: &'a RunnerKey,

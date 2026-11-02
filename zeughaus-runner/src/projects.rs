@@ -1,10 +1,13 @@
-//! `/projects`: the repositories this runner's user can open in an editor.
+//! `/projects`: the repositories this runner's user can open in an editor,
+//! and on request the facts about one of them ([`facts`]).
 //!
 //! Every forge of `[projects]` in `<state-dir>/zeughaus.toml` is asked for
 //! the repositories its token may push to; every checkout under the work
 //! root is added. A repository pushed from the primary forge to a mirror is
 //! listed once, at the primary. The forges are asked again after
 //! [`CACHE_FOR`] or when the editor asks for a refresh.
+
+mod facts;
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -324,19 +327,23 @@ fn local_checkouts(root: &Path) -> Vec<ProjectView> {
     found
 }
 
-/// The whole listing, from the configuration in `state_dir`.
-fn discover(state_dir: &Path) -> ProjectsReply {
-    let config = match std::fs::read_to_string(state_dir.join("zeughaus.toml")) {
+/// `[projects]` of `state_dir`'s `zeughaus.toml`; none without the file.
+fn read_config(state_dir: &Path) -> Result<ProjectsConfig, String> {
+    match std::fs::read_to_string(state_dir.join("zeughaus.toml")) {
         Ok(text) => parse_config(&text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ProjectsConfig::default()),
         Err(e) => Err(format!("cannot read zeughaus.toml: {e}")),
-    };
-    let config = match config {
+    }
+}
+
+/// The whole listing, from the configuration in `state_dir`.
+fn discover(state_dir: &Path) -> ProjectsReply {
+    let config = match read_config(state_dir) {
         Ok(config) => config,
         Err(e) => {
             return ProjectsReply {
-                projects: Vec::new(),
                 errors: vec![e],
+                ..ProjectsReply::default()
             };
         }
     };
@@ -360,6 +367,7 @@ fn discover(state_dir: &Path) -> ProjectsReply {
     ProjectsReply {
         projects: merge(listed, &config.primary, local),
         errors,
+        facts: None,
     }
 }
 
@@ -385,20 +393,43 @@ pub async fn serve(replier: Replier, state_dir: PathBuf) {
                 continue;
             }
         };
-        let refresh = ProjectsRequest::decode(&asked).is_some_and(|asked| asked.refresh);
-        let fresh = cache
-            .as_ref()
-            .filter(|(at, _)| !refresh && at.elapsed() < CACHE_FOR)
-            .map(|(_, reply)| reply.clone());
-        let answer = match fresh {
-            Some(reply) => reply,
+        let asked = ProjectsRequest::decode(&asked).unwrap_or_default();
+        let answer = match asked.facts {
+            // About one project, with the listing as far as it is cached.
+            Some(origin) => {
+                let (dir, listed) = (state_dir.clone(), cache.as_ref().map(|(_, r)| r.clone()));
+                let facts = tokio::task::spawn_blocking(move || {
+                    let config = read_config(&dir).unwrap_or_default();
+                    facts::gather(
+                        &origin,
+                        listed.as_ref(),
+                        &config,
+                        crate::agents::work_root().as_deref(),
+                    )
+                })
+                .await
+                .unwrap_or_default();
+                ProjectsReply {
+                    facts: Some(facts),
+                    ..ProjectsReply::default()
+                }
+            }
             None => {
-                let dir = state_dir.clone();
-                let reply = tokio::task::spawn_blocking(move || discover(&dir))
-                    .await
-                    .unwrap_or_default();
-                cache = Some((Instant::now(), reply.clone()));
-                reply
+                let fresh = cache
+                    .as_ref()
+                    .filter(|(at, _)| !asked.refresh && at.elapsed() < CACHE_FOR)
+                    .map(|(_, reply)| reply.clone());
+                match fresh {
+                    Some(reply) => reply,
+                    None => {
+                        let dir = state_dir.clone();
+                        let reply = tokio::task::spawn_blocking(move || discover(&dir))
+                            .await
+                            .unwrap_or_default();
+                        cache = Some((Instant::now(), reply.clone()));
+                        reply
+                    }
+                }
             }
         };
         let mut reply = match request.reply(TransferMeta::default()).await {

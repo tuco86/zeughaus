@@ -34,6 +34,7 @@
 //! the endpoint file through which a local editor finds its runner.
 
 pub mod activity;
+pub mod advice;
 pub mod ci;
 pub mod credentials;
 pub mod enlist;
@@ -48,6 +49,9 @@ pub mod selector;
 pub use activity::{
     ACTIVITY_PATH, AGENT_VAR, ActivityEntry, ActivityKind, ActivityReply, ActivityRequest,
     ActivityState, AgentRole, AgentState, AgentStatus, MAX_ACTIVITY_ENTRIES,
+};
+pub use advice::{
+    AdviceView, MAX_FACTS_BYTES, MAX_OPERATIONS, OnboardSettings, Operation, OperationKind,
 };
 pub use ci::{
     CLAIM_LEASE_SECS, ChannelView, CiOverview, CiReply, CiRequest, ClaimHolder, ClaimSubject,

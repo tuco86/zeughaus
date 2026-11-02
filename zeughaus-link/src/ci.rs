@@ -344,6 +344,16 @@ pub enum CiRequest {
     /// Who is responsible for pipeline `number` of `repo` (see
     /// [`responsible`]). Answers [`CiReply::Responsible`].
     Responsible { repo: String, number: u64 },
+    /// What the CI advises for `origin`, a project it does not build, from
+    /// `facts` (Markdown, at most [`crate::advice::MAX_FACTS_BYTES`]): an
+    /// answer kept for the same facts unless `refresh`. Answers
+    /// [`CiReply::Advice`].
+    Advise {
+        origin: String,
+        facts: String,
+        #[serde(default)]
+        refresh: bool,
+    },
 }
 
 /// The one frame of a download on [`crate::STATE_PATH`]: version `version`
@@ -497,6 +507,9 @@ pub enum CiReply {
     },
     Responsible {
         claim: Option<ClaimView>,
+    },
+    Advice {
+        advice: Box<crate::advice::AdviceView>,
     },
     Error {
         message: String,
@@ -1839,6 +1852,11 @@ mod tests {
                 repo: "griasdi".to_owned(),
                 number: 9,
             },
+            CiRequest::Advise {
+                origin: "git.doodleshnookie.net/tuco86/scan-rs".to_owned(),
+                facts: "- forge: forgejo\n".to_owned(),
+                refresh: true,
+            },
         ];
         for request in requests {
             assert_eq!(CiRequest::decode(&request.encode()), Some(request));
@@ -2000,6 +2018,30 @@ mod tests {
                 ours: false,
             },
             CiReply::Responsible { claim: None },
+            CiReply::Advice {
+                advice: Box::new(crate::advice::AdviceView {
+                    origin: "github.com/o/site".to_owned(),
+                    summary: "A site.".to_owned(),
+                    status: vec!["on GitHub only".to_owned()],
+                    operations: vec![crate::advice::Operation {
+                        kind: crate::advice::OperationKind::Migrate,
+                        title: "Move it".to_owned(),
+                        body: "Then follow weida.".to_owned(),
+                        settings: crate::advice::OnboardSettings {
+                            name: "site".to_owned(),
+                            default_branch: "main".to_owned(),
+                            events: vec!["push main of weida".to_owned()],
+                            platforms: Vec::new(),
+                            grants: [("DEPLOY".to_owned(), vec!["push main".to_owned()])].into(),
+                            prerequisites: vec!["a served directory".to_owned()],
+                        },
+                    }],
+                    refusal: Some("not on the Forgejo".to_owned()),
+                    model: "claude-haiku-5-5".to_owned(),
+                    created: 9,
+                    error: None,
+                }),
+            },
             CiReply::Error {
                 message: "no such job".to_owned(),
             },

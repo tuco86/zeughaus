@@ -393,14 +393,48 @@ pub enum Message {
     // A press on a card of a Board: its column and row.
     #[cfg(not(target_arch = "wasm32"))]
     BoardSelect(usize, usize),
-    // A Board's `Onboard` for a project no CI builds, and the CI's answer.
+    // The Board of a project no CI builds, by its origin: its advice and
+    // the onboarding request it files.
     #[cfg(not(target_arch = "wasm32"))]
-    OnboardProject(String),
-    #[cfg(not(target_arch = "wasm32"))]
-    Onboarded(Result<(), String>),
+    Onboard(String, OnboardMsg),
     // The ticket popout of a Board.
     #[cfg(not(target_arch = "wasm32"))]
     Ticket(TicketMsg),
+}
+
+/// What a Board of a project no CI builds says and is told.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone)]
+pub enum OnboardMsg {
+    /// What the local runner found out about the project.
+    Facts(Result<zeughaus_link::ProjectsReply, String>),
+    /// The CI's advice on it.
+    Advice(Result<Box<zeughaus_link::AdviceView>, String>),
+    /// Ask the runner and the CI again.
+    Refresh,
+    /// Take an operation's settings into the form.
+    Pick(usize),
+    Name(String),
+    Branch(String),
+    Event(OnboardEvent, bool),
+    /// The repository of the CI it follows; empty for none.
+    Follows(String),
+    Platform(String, bool),
+    Grants(String),
+    Prerequisites(String),
+    Notes(String),
+    /// File the onboarding request.
+    File,
+    Filed(Result<u64, String>),
+}
+
+/// The events of the form that are a checkbox each.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardEvent {
+    Push,
+    Tag,
+    Nightly,
 }
 
 /// What a letter asks of the CI page in front.
@@ -456,12 +490,8 @@ pub enum CiMsg {
         number: u64,
         result: Result<Option<Box<zeughaus_link::PipelineView>>, String>,
     },
-    /// The user pressed a job: show its transcript.
-    OpenJob {
-        view: u64,
-        number: u64,
-        job: String,
-    },
+    /// The user pressed a job: its transcript in a tab of its own.
+    OpenJob { view: u64, number: u64, job: String },
     /// The terminal the runner replays a job's output in.
     Transcript {
         view: u64,
@@ -469,28 +499,16 @@ pub enum CiMsg {
         job: String,
         result: Result<u64, String>,
     },
-    CloseTranscript {
-        view: u64,
-    },
+    /// The job's tab was closed.
+    CloseTranscript { view: u64, number: u64, job: String },
     /// The user asked for the pipelines older than those shown.
-    LoadOlder {
-        view: u64,
-    },
+    LoadOlder { view: u64 },
     /// The user opened or closed a pipeline's row.
-    Toggle {
-        view: u64,
-        number: u64,
-    },
+    Toggle { view: u64, number: u64 },
     /// The user asked the CI to run a pipeline's commit again.
-    Rerun {
-        view: u64,
-        number: u64,
-    },
+    Rerun { view: u64, number: u64 },
     /// The user asked the CI to stop a running pipeline.
-    Cancel {
-        view: u64,
-        number: u64,
-    },
+    Cancel { view: u64, number: u64 },
     /// What the CI answered a rerun or a cancel.
     Acted {
         view: u64,
@@ -529,9 +547,7 @@ pub enum CiMsg {
     },
     /// The user asked the CI for a plan session of the Board's repository
     /// without a ticket; its plan becomes a new ticket.
-    OpenSession {
-        view: u64,
-    },
+    OpenSession { view: u64 },
     /// What the CI answered.
     SessionOpened(Result<zeughaus_link::SessionView, String>),
     /// The user pressed a link in a document.

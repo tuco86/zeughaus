@@ -3,10 +3,11 @@
 //!
 //! A group holds the project's Board, its work shell (or a button that
 //! starts one), its masters, its plan sessions, the rest of its runner tabs
-//! and the channel views the user opened, in that order. The runner tabs
-//! come from the runners' project groups (`GroupSnapshot::project`); the
-//! Board, the button and the views are the editor's own and carry ids it
-//! mints, under [`RunnerKey::PROJECTS`].
+//! and the channel views the user opened, each followed by the jobs opened
+//! from it, in that order. The runner tabs come from the runners' project
+//! groups (`GroupSnapshot::project`); the Board, the button and the views
+//! are the editor's own and carry ids it mints, under
+//! [`RunnerKey::PROJECTS`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -17,6 +18,7 @@ use zeughaus_mux::{GroupId, GroupSnapshot, TabId, TerminalId, TopologyCommand};
 
 use super::App;
 use super::PageView;
+use super::ci::JobRef;
 use crate::message::Message;
 use crate::notices::Severity;
 use crate::workspace::{CollapseKey, RunnerKey, TabRef};
@@ -30,6 +32,47 @@ const ASK_AGAIN: Duration = Duration::from_secs(300);
 pub(crate) enum ViewKey {
     /// A CI channel, by the CI's key and the channel's view id.
     Channel(RunnerKey, u64),
+    /// A job's transcript, by the CI's key and the job.
+    Job(RunnerKey, JobRef),
+}
+
+impl ViewKey {
+    /// The channel a view is, or a job's view is in.
+    fn channel(&self) -> (&RunnerKey, u64) {
+        match self {
+            ViewKey::Channel(ci, view) => (ci, *view),
+            ViewKey::Job(ci, job) => (ci, job.view),
+        }
+    }
+}
+
+/// `origin`'s views in the order its group shows them: each channel in
+/// opening order, followed by the jobs opened from it, then the jobs whose
+/// channel has no tab.
+fn ordered_views<'a>(views: &'a [(String, ViewKey)], origin: &str) -> Vec<&'a ViewKey> {
+    let own: Vec<&ViewKey> = views
+        .iter()
+        .filter(|(o, _)| o == origin)
+        .map(|(_, view)| view)
+        .collect();
+    let mut ordered = Vec::with_capacity(own.len());
+    for view in &own {
+        if let ViewKey::Channel(..) = view {
+            ordered.push(*view);
+            ordered.extend(
+                own.iter().filter(|job| {
+                    matches!(job, ViewKey::Job(..)) && job.channel() == view.channel()
+                }),
+            );
+        }
+    }
+    ordered.extend(own.iter().filter(|job| {
+        matches!(job, ViewKey::Job(..))
+            && !own
+                .iter()
+                .any(|c| matches!(c, ViewKey::Channel(..)) && c.channel() == job.channel())
+    }));
+    ordered
 }
 
 /// What an editor-made tab or group of the section is.
@@ -152,11 +195,9 @@ where
             tabs.extend(of_kind(TabKind::Plan));
             tabs.extend(of_kind(TabKind::Other));
             tabs.extend(
-                input
-                    .views
-                    .iter()
-                    .filter(|(o, _)| o == origin)
-                    .map(|(_, view)| GroupTab::View(view.clone())),
+                ordered_views(input.views, origin)
+                    .into_iter()
+                    .map(|view| GroupTab::View(view.clone())),
             );
             ProjectGroup {
                 origin: origin.to_owned(),
@@ -393,14 +434,17 @@ impl App {
                 }
             }
         }
-        // A Board or channel view that just came to the front shows its tab:
-        // its group opens once, and the user may close it again.
+        // A Board, channel or job view that just came to the front shows its
+        // tab: its group opens once, and the user may close it again.
         let shown = match &self.page.view {
             PageView::Board(origin) if self.page.open => Some(origin.clone()),
-            PageView::Channel(ci, view) if self.page.open => self
-                .ci
-                .get(ci)
-                .and_then(|client| client.origin_of_view(*view)),
+            PageView::Channel(ci, view) | PageView::Job(ci, JobRef { view, .. })
+                if self.page.open =>
+            {
+                self.ci
+                    .get(ci)
+                    .and_then(|client| client.origin_of_view(*view))
+            }
             _ => None,
         };
         if shown != self.projects.shown {
@@ -417,19 +461,16 @@ impl App {
         self.projects.groups = groups;
     }
 
-    /// The tab the bar marks for what the page shows: a Board or a channel
-    /// view of a project's group.
+    /// The tab the bar marks for what the page shows: a Board, a channel or
+    /// a job view of a project's group.
     pub(super) fn shown_project_tab(&self) -> Option<TabRef> {
         if !self.page.open {
             return None;
         }
         let slot = match &self.page.view {
             PageView::Board(origin) => ViewSlot::Board(origin.clone()),
-            PageView::Channel(ci, view) => {
-                let key = ViewKey::Channel(ci.clone(), *view);
-                let (origin, _) = self.projects.views.iter().find(|(_, v)| *v == key)?;
-                ViewSlot::View(origin.clone(), key)
-            }
+            PageView::Channel(ci, view) => self.view_slot(ViewKey::Channel(ci.clone(), *view))?,
+            PageView::Job(ci, job) => self.view_slot(ViewKey::Job(ci.clone(), job.clone()))?,
             PageView::Overview => return None,
         };
         Some(TabRef {
@@ -511,14 +552,24 @@ impl App {
             Some(ViewSlot::View(_, ViewKey::Channel(ci, view))) => {
                 self.apply_page(Message::PageShow(PageView::Channel(ci, view)))
             }
+            Some(ViewSlot::View(_, ViewKey::Job(ci, job))) => {
+                self.apply_page(Message::PageShow(PageView::Job(ci, job)))
+            }
             None => Task::none(),
         }
     }
 
+    /// The slot of a view the user opened.
+    fn view_slot(&self, key: ViewKey) -> Option<ViewSlot> {
+        let (origin, _) = self.projects.views.iter().find(|(_, v)| *v == key)?;
+        Some(ViewSlot::View(origin.clone(), key))
+    }
+
     /// Closes a view of a project's group, and the page when it shows it.
-    pub(super) fn close_project_tab(&mut self, tab: TabId) {
+    /// A job's transcript goes with its tab.
+    pub(super) fn close_project_tab(&mut self, tab: TabId) -> Task<Message> {
         let Some(ViewSlot::View(origin, view)) = self.projects.slot(tab.0).cloned() else {
-            return;
+            return Task::none();
         };
         if self
             .shown_project_tab()
@@ -529,6 +580,22 @@ impl App {
         self.projects
             .views
             .retain(|(o, v)| !(*o == origin && *v == view));
+        self.close_transcripts([view])
+    }
+
+    /// Closes the transcripts of the job views among `views`.
+    fn close_transcripts(&mut self, views: impl IntoIterator<Item = ViewKey>) -> Task<Message> {
+        let tasks: Vec<Task<Message>> = views
+            .into_iter()
+            .filter_map(|view| match view {
+                ViewKey::Job(ci, JobRef { view, number, job }) => Some(self.apply_ci(
+                    ci,
+                    crate::message::CiMsg::CloseTranscript { view, number, job },
+                )),
+                ViewKey::Channel(..) => None,
+            })
+            .collect();
+        Task::batch(tasks)
     }
 
     /// Shows `origin`'s group in the bar from now on, saved.
@@ -581,8 +648,9 @@ impl App {
     }
 
     /// The close button of a project's group: it goes until it is opened
-    /// again or a runner tab of it shows up that is not there now.
-    pub(super) fn dismiss_project(&mut self, origin: String) {
+    /// again or a runner tab of it shows up that is not there now. Its job
+    /// tabs' transcripts are closed.
+    pub(super) fn dismiss_project(&mut self, origin: String) -> Task<Message> {
         let tabs: BTreeSet<(RunnerKey, TabId)> = self
             .projects
             .groups
@@ -599,7 +667,10 @@ impl App {
         {
             self.page.open = false;
         }
-        self.projects.views.retain(|(o, _)| *o != origin);
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.projects.views)
+            .into_iter()
+            .partition(|(o, _)| *o == origin);
+        self.projects.views = kept;
         // The tab in front goes with its group: another runner tab comes
         // to the front.
         let hidden = |tab: &TabRef| tabs.contains(&(tab.runner.clone(), tab.tab));
@@ -616,6 +687,7 @@ impl App {
         if self.projects.open.remove(&origin) {
             self.save_prefs();
         }
+        self.close_transcripts(gone.into_iter().map(|(_, view)| view))
     }
 
     /// A channel badge of a project's group: the channel's view as a tab of
@@ -649,6 +721,24 @@ impl App {
         self.projects.views.push((origin, key));
     }
 
+    /// Makes a job view a tab of its project's group the first time it is
+    /// shown.
+    pub(super) fn adopt_job_view(&mut self, ci: &RunnerKey, job: &JobRef) {
+        let key = ViewKey::Job(ci.clone(), job.clone());
+        if self.projects.views.iter().any(|(_, v)| *v == key) {
+            return;
+        }
+        let Some(origin) = self
+            .ci
+            .get(ci)
+            .and_then(|client| client.origin_of_view(job.view))
+        else {
+            return;
+        };
+        self.keep_project(&origin);
+        self.projects.views.push((origin, key));
+    }
+
     /// Asks the local runner which projects it can open, when it was not
     /// asked within `ASK_AGAIN` or `refresh` says to ask the forges again.
     pub(super) fn ask_projects(&mut self, refresh: bool) -> Task<Message> {
@@ -670,7 +760,13 @@ impl App {
         self.projects.asking = true;
         self.projects.asked = Some(Instant::now());
         Task::perform(
-            crate::feed::projects(endpoint, refresh),
+            crate::feed::projects(
+                endpoint,
+                zeughaus_link::ProjectsRequest {
+                    refresh,
+                    facts: None,
+                },
+            ),
             Message::ProjectsArrived,
         )
     }
@@ -753,12 +849,15 @@ impl App {
                             .closable(false)
                     }),
                     GroupTab::View(view) => {
-                        let ViewKey::Channel(ci, channel_view) = view;
-                        let label = self
-                            .ci
-                            .get(ci)
-                            .and_then(|client| client.channel_name(*channel_view))
-                            .unwrap_or("channel");
+                        let label = match view {
+                            ViewKey::Channel(ci, channel_view) => self
+                                .ci
+                                .get(ci)
+                                .and_then(|client| client.channel_name(*channel_view))
+                                .unwrap_or("channel")
+                                .to_owned(),
+                            ViewKey::Job(_, job) => format!("#{} {}", job.number, job.job),
+                        };
                         synthetic(ViewSlot::View(group.origin.clone(), view.clone()))
                             .map(|id| iced_tabs::Tab::new(id, label))
                     }
@@ -977,5 +1076,39 @@ mod tests {
         assert!(compose_with(&before).is_empty());
         let after = group("h/o/weida", &[10, 21]);
         assert_eq!(compose_with(&after).len(), 1);
+    }
+
+    #[test]
+    fn a_job_tab_follows_its_channel_and_one_without_its_channel_comes_last() {
+        let job = |view: u64, number: u64| {
+            ViewKey::Job(
+                key("ci"),
+                JobRef {
+                    view,
+                    number,
+                    job: "check".to_owned(),
+                },
+            )
+        };
+        let dev = ViewKey::Channel(key("ci"), 4);
+        let nightly = ViewKey::Channel(key("ci"), 5);
+        let origin = "h/o/zeughaus";
+        // In opening order: a job of a channel without a tab, two channels,
+        // a job of each opened after both, and another project's job.
+        let views: Vec<(String, ViewKey)> = [
+            (origin, job(6, 1)),
+            (origin, dev.clone()),
+            (origin, nightly.clone()),
+            (origin, job(5, 2)),
+            (origin, job(4, 3)),
+            ("h/o/weida", job(4, 9)),
+        ]
+        .into_iter()
+        .map(|(o, v)| (o.to_owned(), v))
+        .collect();
+        assert_eq!(
+            ordered_views(&views, origin),
+            [&dev, &job(4, 3), &nightly, &job(5, 2), &job(6, 1)]
+        );
     }
 }

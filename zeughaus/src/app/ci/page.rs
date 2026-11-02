@@ -1,7 +1,8 @@
-//! The CI views: the Overview the titlebar chip opens, a project's Board and
-//! a channel's pipelines, the last two as tabs of the project's group in the
-//! bar. Terminals a view shows -- an agent's, a master's, a job's transcript
-//! -- are docked read-only beside or under it.
+//! The CI views: the Overview the titlebar chip opens, a project's Board, a
+//! channel's pipelines and a job's transcript, the last three as tabs of the
+//! project's group in the bar (a job's right after its channel's). The
+//! terminal of an Overview row or of a Board's detail is docked read-only
+//! beside it.
 //!
 //! The Board is a project's lifecycle on one screen, read left to right:
 //! tickets are proposed, planned, reviewed, queued, run and finish, with the
@@ -22,14 +23,14 @@ use iced::widget::{
 };
 use iced::{Alignment, Border, Color, Element, Length, Task};
 use zeughaus_link::{
-    ActivityKind, ActivityState, AgentRole, AgentState, CiRequest, ClaimSubject, ClaimView,
-    DocGroup, DocKind, DocState, DocView, OnboardSpec, RepoDocsView, SessionKind, SessionState,
-    SessionView, blocked_by, doc_groups,
+    ActivityKind, ActivityState, AgentRole, AgentState, ClaimSubject, ClaimView, DocGroup,
+    DocState, DocView, RepoDocsView, SessionKind, SessionState, SessionView, blocked_by,
+    doc_groups,
 };
 use zeughaus_mux::TerminalId;
 use zeughaus_theme::Theme;
 
-use super::{CiClient, Tone, glyph, now, unavailable};
+use super::{CiClient, JobRef, Tone, glyph, now, unavailable};
 use crate::app::App;
 use crate::app::agents::{agent_color, attention_title, role_glyph, role_word, state_word};
 use crate::message::{CiShortcut, Message, TicketMsg};
@@ -41,9 +42,6 @@ use crate::workspace::RunnerKey;
 const LIST_WIDTH: f32 = 420.0;
 /// The column a row's glyph stands in, so the words after it align.
 const GLYPH_CELL: f32 = 18.0;
-/// The width of a job's transcript beside its channel: the list keeps room
-/// for a pipeline's job graph.
-const TRANSCRIPT_WIDTH: f32 = 480.0;
 /// Text of a row, and of a caption.
 const ROW_TEXT: f32 = 13.0;
 const CAPTION_TEXT: f32 = 12.0;
@@ -80,6 +78,8 @@ pub(crate) enum PageView {
     Board(String),
     /// A channel's pipelines, by the CI's view id.
     Channel(RunnerKey, u64),
+    /// A job's transcript, by its channel's view, pipeline and name.
+    Job(RunnerKey, JobRef),
 }
 
 /// What a row of the Overview opens.
@@ -101,6 +101,8 @@ pub(in crate::app) struct Page {
     /// machine's place in its overview.
     pub(in crate::app) machine: Option<(RunnerKey, usize)>,
     pub(in crate::app) board: Board,
+    /// The Boards of projects no CI builds, by origin.
+    pub(in crate::app) onboard: super::onboard::Drafts,
 }
 
 impl Default for Page {
@@ -111,6 +113,7 @@ impl Default for Page {
             cursor: 0,
             machine: None,
             board: Board::default(),
+            onboard: Default::default(),
         }
     }
 }
@@ -363,7 +366,7 @@ fn origin_of(client: &CiClient, repo: &str) -> String {
 
 impl App {
     /// The CI that builds `origin`, and its repository there.
-    fn ci_of(&self, origin: &str) -> Option<(&RunnerKey, &CiClient, &RepoDocsView)> {
+    pub(super) fn ci_of(&self, origin: &str) -> Option<(&RunnerKey, &CiClient, &RepoDocsView)> {
         self.ci.iter().find_map(|(ci, client)| {
             let repo = client.repo_docs_by_origin(origin)?;
             Some((ci, client, repo))
@@ -594,7 +597,7 @@ impl App {
                 Some(AttentionTarget::Terminal(runner, terminal)) => Some((runner, terminal)),
                 _ => None,
             },
-            PageView::Board(_) | PageView::Channel(..) => None,
+            PageView::Board(_) | PageView::Channel(..) | PageView::Job(..) => None,
         };
         docked
             .filter(|(runner, _)| runner == key)
@@ -638,10 +641,15 @@ impl App {
                             self.page.board.row = 0;
                             self.page.board.card = None;
                         }
-                        Task::none()
+                        // A project no CI builds: what the CI advises.
+                        self.ensure_advice(origin)
                     }
                     PageView::Channel(ci, channel) => {
                         self.adopt_channel_view(ci, *channel);
+                        Task::none()
+                    }
+                    PageView::Job(ci, job) => {
+                        self.adopt_job_view(ci, job);
                         Task::none()
                     }
                 };
@@ -670,6 +678,7 @@ impl App {
                     }
                 }
                 PageView::Channel(..) => return self.step_front_ci_cursor(step as isize),
+                PageView::Job(..) => {}
             },
             Message::PageEnter => match self.page.view.clone() {
                 PageView::Overview => {
@@ -685,6 +694,7 @@ impl App {
                 }
                 PageView::Board(origin) => return self.board_enter(&origin),
                 PageView::Channel(..) => return self.toggle_front_ci_cursor(),
+                PageView::Job(..) => {}
             },
             Message::PageOpen(AttentionTarget::Terminal(runner, terminal)) => {
                 self.page.open = false;
@@ -740,6 +750,7 @@ impl App {
             _ => None,
         };
         match self.page.view.clone() {
+            PageView::Job(..) => Some(Task::none()),
             PageView::Channel(..) => match (rows, shortcut) {
                 (Some(step), _) => Some(self.step_front_ci_cursor(step)),
                 (None, CiShortcut::Left | CiShortcut::Right) => Some(Task::none()),
@@ -768,7 +779,7 @@ impl App {
     }
 
     /// What Escape does on the page when nothing nearer took it: closes the
-    /// Overview, a channel's transcript.
+    /// Overview.
     pub(in crate::app) fn page_escape(&mut self) -> Task<Message> {
         if !self.page.open {
             return Task::none();
@@ -778,8 +789,7 @@ impl App {
                 self.page.open = false;
                 self.redock()
             }
-            PageView::Board(_) => Task::none(),
-            PageView::Channel(..) => self.close_front_ci_log(),
+            PageView::Board(_) | PageView::Channel(..) | PageView::Job(..) => Task::none(),
         }
     }
 
@@ -1009,6 +1019,7 @@ impl App {
                         .iter()
                         .any(|shown| shown.pipeline.status == "running")
                 }),
+            PageView::Job(..) => false,
         }
     }
 
@@ -1019,6 +1030,7 @@ impl App {
             PageView::Overview => self.overview_view(&t),
             PageView::Board(origin) => self.board_view(&t, origin),
             PageView::Channel(ci, view) => self.page_channel(ci, *view),
+            PageView::Job(ci, job) => self.job_page(ci, job),
         };
         container(main)
             .width(Length::Fill)
@@ -1314,8 +1326,7 @@ impl App {
         .into()
     }
 
-    /// A channel: its list, and its job's transcript beside it once one is
-    /// open.
+    /// A channel: its toolbar over its pipelines.
     fn page_channel<'a>(&'a self, ci: &RunnerKey, view: u64) -> Element<'a, Message, Theme> {
         let Some((ci, client)) = self.ci.get_key_value(ci) else {
             return unavailable("CI", "This CI is not connected.");
@@ -1323,18 +1334,7 @@ impl App {
         let Some(state) = client.views.get(&view) else {
             return unavailable("CI", "This channel is gone.");
         };
-        let list = self.channel_view(ci, client, view, state);
-        match state.transcript.as_ref().and_then(|t| t.terminal) {
-            Some(terminal) => row![
-                container(list).width(Length::Fill),
-                rule::vertical(1),
-                container(self.page_terminal(ci, TerminalId(terminal)))
-                    .width(TRANSCRIPT_WIDTH)
-                    .height(Length::Fill),
-            ]
-            .into(),
-            None => list,
-        }
+        self.channel_view(ci, client, view, state)
     }
 
     /// A project's Board: the toolbar, the channel rail and the columns
@@ -1860,60 +1860,6 @@ impl App {
         line.into()
     }
 
-    /// The Board of a project no CI builds: what it is, and the request
-    /// that asks the first CI to build it.
-    fn unbuilt_board<'a>(&'a self, t: &Tokens, origin: &'a str) -> Element<'a, Message, Theme> {
-        let muted = self.theme.muted();
-        let mut body = column![text(format!("{origin} is not built by a CI")).size(ROW_TEXT)]
-            .spacing(12)
-            .padding(24);
-        if self.ci.is_empty() {
-            body = body.push(text("No CI configured").size(CAPTION_TEXT).color(muted));
-        } else {
-            body = body.push(
-                button(text("Onboard").size(CAPTION_TEXT))
-                    .padding([4, 14])
-                    .style(style::pill_button(t))
-                    .on_press(Message::OnboardProject(origin.to_owned())),
-            );
-        }
-        body.into()
-    }
-
-    /// Asks the first CI to onboard `origin`: a minimal request without
-    /// grants or prerequisites, which the owner approves on the Board.
-    pub(in crate::app) fn onboard_project(&mut self, origin: String) -> Task<Message> {
-        let Some(client) = self.ci.values().next() else {
-            return Task::none();
-        };
-        let name = origin.rsplit('/').next().unwrap_or(&origin).to_owned();
-        let default_branch = self
-            .listed_projects()
-            .into_iter()
-            .find(|p| p.origin == origin)
-            .map_or_else(|| "main".to_owned(), |p| p.default_branch);
-        let request = CiRequest::DocCreate {
-            repo: name.clone(),
-            kind: DocKind::Onboarding,
-            title: format!("Onboard {name}"),
-            body: format!("Requested from the editor for {origin}."),
-            source: name,
-            links: Vec::new(),
-            runs_on: Vec::new(),
-            onboard: Some(OnboardSpec {
-                url: format!("https://{origin}"),
-                default_branch,
-                grants: Default::default(),
-                prerequisites: Vec::new(),
-            }),
-        };
-        let endpoint = client.endpoint.clone();
-        Task::perform(
-            async move { crate::feed::ci(endpoint, request).await.map(|_| ()) },
-            Message::Onboarded,
-        )
-    }
-
     /// What runner `name` runs and ran: its terminals as its `/activity`
     /// says, maintenance runs included, with the closed ones to reopen.
     fn runner_activity<'a>(
@@ -2054,7 +2000,7 @@ fn session_target(client: &CiClient, session: &SessionView) -> AttentionTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeughaus_link::ClaimHolder;
+    use zeughaus_link::{ClaimHolder, DocKind};
 
     fn doc(number: u64, state: DocState, changed: u64) -> DocView {
         DocView {

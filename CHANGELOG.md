@@ -306,9 +306,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waits on or fixes; a claimed proposal opens its holder's tab. A failed
   pipeline in a channel names who is responsible, and a click brings that
   tab to the front.
+- CI advice on a project it does not build: `[advice]` in `ci.toml` names
+  an Anthropic model (`claude-haiku-5-5` by default) and the OpenBao secret
+  with its API key or OAuth token. The editor's local runner gathers the
+  project's facts on `/projects` (its work checkout at HEAD, or what its
+  forge says); the CI answers `Advise` with a summary, status lines and up
+  to four ways to join (onboard, migrate, follow, deploy) whose settings it
+  can file, kept per origin until the facts change, and says by itself
+  why it cannot onboard an origin (not on its Forgejo, already in
+  `ci.toml`).
 
 ### Changed
 
+- The Board of a project no CI builds shows the CI's advice and an
+  onboarding form (name, default branch, events, a repository it follows,
+  platforms, secrets, host prerequisites, notes) that a way to join
+  fills, in place of a bare `Onboard` button.
+- A job's transcript opens in a tab of its own (`#<n> <job>`) right after
+  its channel's tab in the project's group, instead of beside the
+  pipeline list; pressing the job again brings the tab to the front, and
+  closing it closes the transcript.
 - CI: a planned proposal follows its plan: back to `open` when the plan is
   rejected, `done` when the plan is done.
 - CI: nightlies are one CI-wide round instead of per-repository cron

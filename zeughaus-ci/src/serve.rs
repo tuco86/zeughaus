@@ -330,6 +330,20 @@ impl CiServer {
                     Err(e) => error(&e),
                 }
             }
+            CiRequest::Advise {
+                origin,
+                facts,
+                refresh,
+            } => CiReply::Advice {
+                advice: Box::new(crate::advice::advise(
+                    &self.state_dir,
+                    &self.config.get(),
+                    &self.secrets,
+                    &origin,
+                    &facts,
+                    refresh,
+                )),
+            },
         }
     }
 

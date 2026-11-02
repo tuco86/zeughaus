@@ -84,6 +84,14 @@ timeout_seconds = 5
 # admin_token = "FORGEJO_ADMIN_TOKEN"
 # hook_url = "https://ci.doodleshnookie.net/hook"
 
+# The language model the CI asks about a project that has not joined, for
+# the editor's Board of it: `key` names the secret with an Anthropic API
+# key, or an OAuth token (sk-ant-oat...). Without it the Board still
+# offers the onboarding form. Adding it takes a restart.
+# [advice]
+# key = "ANTHROPIC_API_KEY"
+# model = "claude-haiku-5-5"
+
 [repos.griasdi]
 url = "https://github.com/Griasdi/Griasdi.git"
 forge = "github"                   # github | forgejo | none

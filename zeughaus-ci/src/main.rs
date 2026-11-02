@@ -1,6 +1,7 @@
 //! zeughaus-ci: pipelines a repository defines as scripts in its
 //! `.zeughaus-ci/` folder, run on the runners that enlist into this process.
 
+mod advice;
 mod artifacts;
 mod channels;
 mod claims;
