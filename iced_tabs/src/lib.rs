@@ -70,6 +70,8 @@ pub struct Tab<'a, Id> {
     pub id: Id,
     pub label: Cow<'a, str>,
     pub accent: Option<Color>,
+    /// A glyph in the tree's glyph font, in its colour, before the label.
+    pub badge: Option<(char, Color)>,
     pub closable: bool,
 }
 
@@ -79,6 +81,7 @@ impl<'a, Id> Tab<'a, Id> {
             id,
             label: label.into(),
             accent: None,
+            badge: None,
             closable: true,
         }
     }
@@ -86,6 +89,13 @@ impl<'a, Id> Tab<'a, Id> {
     /// A colour the tab carries as a dot before its label.
     pub fn accent(mut self, accent: Color) -> Self {
         self.accent = Some(accent);
+        self
+    }
+
+    /// A glyph the tab carries in `color` between its accent dot and its
+    /// label: a status of what it shows.
+    pub fn badge(mut self, glyph: char, color: Color) -> Self {
+        self.badge = Some((glyph, color));
         self
     }
 
@@ -1246,6 +1256,16 @@ where
                     ..container::Style::default()
                 },
             ));
+        }
+        if let Some((glyph, color)) = tab.badge {
+            // The text inherits the container's colour, which needs no text
+            // style of the generic theme.
+            content = content.push(container(self.glyph(glyph, 12.0)).style(move |_: &Theme| {
+                container::Style {
+                    text_color: Some(color),
+                    ..container::Style::default()
+                }
+            }));
         }
         let editor = {
             let mut renaming = self.renaming.borrow_mut();

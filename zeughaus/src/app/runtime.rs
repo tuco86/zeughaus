@@ -192,6 +192,21 @@ pub(super) struct RuntimeView {
     pub activity: BTreeMap<RunnerKey, Vec<zeughaus_link::ActivityEntry>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+impl RuntimeView {
+    /// Every live terminal of every runner whose omp agent reports a status.
+    pub(super) fn agents(
+        &self,
+    ) -> impl Iterator<Item = (&RunnerKey, &zeughaus_link::ActivityEntry)> {
+        self.activity.iter().flat_map(|(key, entries)| {
+            entries
+                .iter()
+                .filter(|e| e.state != zeughaus_link::ActivityState::Closed && e.agent.is_some())
+                .map(move |e| (key, e))
+        })
+    }
+}
+
 impl App {
     /// Applies what the runtime reported: values, their absence, and the edges
     /// a value crossed; a CI alert goes to the desktop.
@@ -403,10 +418,15 @@ impl App {
             // closed, so an older state never replaces a newer one.
             Traffic::Event(RuntimeEvent::Activity { entry, .. }) => {
                 let entries = self.runtime.activity.entry(key).or_default();
-                if let Some(held) = entries.iter().find(|e| e.terminal == entry.terminal)
-                    && activity_rank(held.state) > activity_rank(entry.state)
-                {
-                    return Task::none();
+                if let Some(held) = entries.iter().find(|e| e.terminal == entry.terminal) {
+                    let (held_rank, rank) = (activity_rank(held.state), activity_rank(entry.state));
+                    // An agent's statuses race each other the same way;
+                    // its own clock orders them.
+                    let older_agent = matches!((&held.agent, &entry.agent),
+                        (Some(held), Some(new)) if new.at < held.at);
+                    if held_rank > rank || (held_rank == rank && older_agent) {
+                        return Task::none();
+                    }
                 }
                 entries.retain(|e| e.terminal != entry.terminal);
                 entries.insert(0, entry);

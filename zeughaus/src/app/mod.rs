@@ -5,6 +5,10 @@
 //! each reaches those fields directly rather than through accessors it would
 //! be the only caller of.
 
+/// What the omp agents in the runners' terminals report, as glyphs, colours
+/// and attention items.
+#[cfg(not(target_arch = "wasm32"))]
+mod agents;
 /// The CI sections: the channels and pipelines of a runner's CI, and the
 /// transcripts of their jobs.
 #[cfg(not(target_arch = "wasm32"))]
@@ -1963,7 +1967,7 @@ impl App {
                 } else if key.as_str() == RunnerKey::LOCAL {
                     controls.push(header_control("graph", GLYPH_GRAPH, "New graph"));
                 }
-                let tab = |t| tab_entry(key, t);
+                let tab = |t| self.tab_entry(key, t);
                 let items = section
                     .snapshot
                     .items
@@ -2889,24 +2893,41 @@ fn header_control(
         .tooltip(tip)
 }
 
-/// One tab of a section as the tab tree shows it.
-fn tab_entry<'a>(
-    key: &RunnerKey,
-    tab: &'a zeughaus_mux::TabSnapshot,
-) -> iced_tabs::Tab<'a, TabRef> {
-    // A CI tab is a view this editor makes, not something to close.
-    let mut entry = iced_tabs::Tab::new(
-        TabRef {
-            runner: key.clone(),
-            tab: tab.id,
-        },
-        tab.title.as_str(),
-    )
-    .closable(key.ci_runner().is_none());
-    if let Some(accent) = workspace::accent(tab) {
-        entry = entry.accent(accent);
+impl App {
+    /// One tab of a section as the tab tree shows it, with the status of
+    /// an agent in one of its terminals.
+    fn tab_entry<'a>(
+        &'a self,
+        key: &RunnerKey,
+        tab: &'a zeughaus_mux::TabSnapshot,
+    ) -> iced_tabs::Tab<'a, TabRef> {
+        // A CI tab is a view this editor makes, not something to close.
+        let mut entry = iced_tabs::Tab::new(
+            TabRef {
+                runner: key.clone(),
+                tab: tab.id,
+            },
+            tab.title.as_str(),
+        )
+        .closable(key.ci_runner().is_none());
+        if let Some(accent) = workspace::accent(tab) {
+            entry = entry.accent(accent);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(agent) = self
+            .runtime
+            .agents()
+            .filter(|(runner, _)| *runner == key)
+            .find(|(_, e)| tab.root.terminals().any(|t| t.0 == e.terminal))
+            .and_then(|(_, e)| e.agent.as_ref())
+        {
+            entry = entry.badge(
+                agents::role_glyph(agent.role),
+                agents::agent_color(agent.state, &self.theme),
+            );
+        }
+        entry
     }
-    entry
 }
 
 /// The strip above a pane of a split tab: its title, and a grip that starts
