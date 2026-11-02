@@ -393,7 +393,15 @@ impl App {
             // Not state: nothing to keep, and the window being focused is
             // no reason to hold it back, since nothing on screen says it.
             Traffic::Event(RuntimeEvent::Alert { title, body, .. }) => {
-                return super::terminal::notify_desktop(title, body);
+                let notice = format!("alert:{}:{title}", key.as_str());
+                self.raise(
+                    Some(notice),
+                    crate::notices::Severity::Error,
+                    title,
+                    body,
+                    true,
+                    None,
+                );
             }
             // Not state either: the CI views ask the runner for the pipeline.
             Traffic::Event(RuntimeEvent::CiPipeline {
@@ -417,7 +425,8 @@ impl App {
             // order; a terminal only ever moves from running to exited to
             // closed, so an older state never replaces a newer one.
             Traffic::Event(RuntimeEvent::Activity { entry, .. }) => {
-                let entries = self.runtime.activity.entry(key).or_default();
+                let entries = self.runtime.activity.entry(key.clone()).or_default();
+                let mut held_agent = None;
                 if let Some(held) = entries.iter().find(|e| e.terminal == entry.terminal) {
                     let (held_rank, rank) = (activity_rank(held.state), activity_rank(entry.state));
                     // An agent's statuses race each other the same way;
@@ -427,10 +436,12 @@ impl App {
                     if held_rank > rank || (held_rank == rank && older_agent) {
                         return Task::none();
                     }
+                    held_agent = held.agent.as_ref().map(|a| a.state);
                 }
                 entries.retain(|e| e.terminal != entry.terminal);
-                entries.insert(0, entry);
+                entries.insert(0, entry.clone());
                 entries.truncate(ACTIVITY_KEPT);
+                self.agent_notice(&key, held_agent, &entry);
                 self.rebuild_palette();
             }
             Traffic::Lost => {

@@ -20,6 +20,8 @@ mod graph;
 mod layout;
 /// What one node draws.
 mod node_view;
+/// The notice center: the pull tab and the panel of notices.
+mod notices;
 /// What a restarting editor leaves for the process that replaces it.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod restore;
@@ -214,6 +216,10 @@ pub struct App {
     /// refused wire is worth one sentence and nothing more, and a notice that
     /// stays becomes furniture nobody reads.
     hint: Option<(String, iced::time::Instant)>,
+    /// What the notice center lists.
+    notices: crate::notices::Notices,
+    /// Whether the notice center is open, sliding in and out.
+    notice_center: iced::Animation<bool>,
 
     // Command palette state
     palette_open: bool,
@@ -392,6 +398,10 @@ impl App {
             titlebar_press: None,
             last_error: String::new(),
             hint: None,
+            notices: crate::notices::Notices::default(),
+            notice_center: iced::Animation::new(false)
+                .quick()
+                .easing(iced::animation::Easing::EaseOutCubic),
             palette_open: false,
             renaming: None,
             palette_input: String::new(),
@@ -734,6 +744,8 @@ impl App {
         let asked = Task::none();
         #[cfg(not(target_arch = "wasm32"))]
         self.reveal_opened_terminal();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.resolve_watched_agents();
         if let Some(graph) = self.pending_graph_focus
             && ((self.workspace.show_graph(graph) && !self.awaits_runner_tab(graph))
                 || !self.nodes.contains_key(&graph))
@@ -1407,6 +1419,11 @@ impl App {
                 }
             }
             Message::Escape => {
+                // An open notice center goes first: it lies over everything.
+                if self.notice_center.value() {
+                    self.notice_center.go_mut(false, iced::time::Instant::now());
+                    return Task::none();
+                }
                 // Escape takes back the innermost thing first: an open
                 // palette or rename, and only then the log beside a CI list.
                 let claimed = self.palette_open
@@ -1425,6 +1442,38 @@ impl App {
                 }
                 #[cfg(target_arch = "wasm32")]
                 let _ = claimed;
+            }
+            Message::ToggleNoticeCenter => {
+                let open = !self.notice_center.value();
+                self.notice_center.go_mut(open, iced::time::Instant::now());
+            }
+            Message::CloseNoticeCenter => {
+                self.notice_center.go_mut(false, iced::time::Instant::now());
+            }
+            Message::DismissNotice(id) => {
+                self.notices.dismiss(id);
+                self.close_empty_notice_center();
+            }
+            Message::DismissAllNotices => {
+                self.notices.dismiss_all();
+                self.close_empty_notice_center();
+            }
+            // The notice stays: what it is about is only looked at, not
+            // answered.
+            Message::OpenNotice(id) => {
+                let target = self.notices.get(id).and_then(|n| n.open.clone());
+                if let Some(crate::message::NoticeTarget::Terminal(key, terminal)) = target {
+                    self.notice_center.go_mut(false, iced::time::Instant::now());
+                    #[cfg(not(target_arch = "wasm32"))]
+                    return self.apply(Message::RevealTerminal(key, terminal));
+                    #[cfg(target_arch = "wasm32")]
+                    let _ = (key, terminal);
+                }
+            }
+            Message::NoticeTick => {
+                if self.notices.expire(std::time::SystemTime::now()) {
+                    self.close_empty_notice_center();
+                }
             }
             Message::NodeTriggered { node_id } => {
                 // The press has to reach the one process that executes this
@@ -1665,7 +1714,29 @@ impl App {
             #[cfg(not(target_arch = "wasm32"))]
             Message::Activity(key, result) => match result {
                 Ok(entries) => {
-                    self.runtime.activity.insert(key, entries);
+                    let old = self
+                        .runtime
+                        .activity
+                        .insert(key.clone(), entries.clone())
+                        .unwrap_or_default();
+                    for entry in &entries {
+                        let held = old
+                            .iter()
+                            .find(|e| e.terminal == entry.terminal)
+                            .and_then(|e| e.agent.as_ref().map(|a| a.state));
+                        self.agent_notice(&key, held, entry);
+                    }
+                    // A terminal the answer no longer lists is gone.
+                    for gone in old
+                        .into_iter()
+                        .filter(|o| !entries.iter().any(|e| e.terminal == o.terminal))
+                    {
+                        let closed = zeughaus_link::ActivityEntry {
+                            state: zeughaus_link::ActivityState::Closed,
+                            ..gone
+                        };
+                        self.agent_notice(&key, None, &closed);
+                    }
                     self.rebuild_palette();
                 }
                 Err(e) => eprintln!("[activity] {e}"),
@@ -1854,10 +1925,21 @@ impl App {
                 background: Some(theme.extended().background.base.color.into()),
                 ..Default::default()
             });
-        let body: Element<'_, Message, Theme> = if self.palette_open {
-            stack![body, self.palette_overlay()].into()
+        // The notice center lies over the workspace and under the palette.
+        let mut layers = vec![body.into()];
+        if let Some(center) = notices::center(self) {
+            layers.push(center);
+        }
+        if self.palette_open {
+            layers.push(self.palette_overlay());
+        }
+        let body: Element<'_, Message, Theme> = if layers.len() == 1 {
+            layers.pop().expect("the body")
         } else {
-            body.into()
+            iced::widget::Stack::with_children(layers)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
         };
 
         let window =
@@ -2730,6 +2812,18 @@ impl App {
         if self.hint.is_some() {
             subs.push(
                 iced::time::every(std::time::Duration::from_millis(250)).map(|_| Message::Tick),
+            );
+        }
+
+        // The notice center slides frame by frame; the notices age, and the
+        // transient ones expire, on a clock of their own.
+        if self.notice_center.is_animating(iced::time::Instant::now()) {
+            subs.push(iced::window::frames().map(|_| Message::NoticeTick));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.notices.is_empty() {
+            subs.push(
+                iced::time::every(std::time::Duration::from_secs(1)).map(|_| Message::NoticeTick),
             );
         }
 

@@ -298,6 +298,17 @@ pub enum Message {
     // Hold a runner, which starts no new run and lets the live ones finish,
     // or release it again.
     HoldRunner(crate::workspace::RunnerKey, bool),
+    // The notice center: the pull tab opens or closes it, a click outside or
+    // Escape closes it, a notice's x or Clear all dismisses, a click on a
+    // notice's title opens what it is about.
+    ToggleNoticeCenter,
+    CloseNoticeCenter,
+    DismissNotice(u64),
+    DismissAllNotices,
+    OpenNotice(u64),
+    // The center's animation frame or its clock, which expires transient
+    // notices.
+    NoticeTick,
     // What the runner answered: the state it is in now and how many runs are
     // still alive.
     #[cfg(not(target_arch = "wasm32"))]
@@ -332,6 +343,13 @@ pub enum CiShortcut {
     Cancel,
     /// The log of the first failed job, else of the first job.
     OpenLog,
+}
+
+/// What a click on a notice opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoticeTarget {
+    /// The tab that shows a runner's terminal, attached when none does.
+    Terminal(crate::workspace::RunnerKey, zeughaus_mux::TerminalId),
 }
 
 /// What one runner's CI views say.
@@ -437,10 +455,7 @@ pub enum CiMsg {
         proposal: Option<u64>,
     },
     /// What the CI answered.
-    SessionOpened {
-        view: u64,
-        result: Result<zeughaus_link::SessionView, String>,
-    },
+    SessionOpened(Result<zeughaus_link::SessionView, String>),
     /// The user pressed a link in a document.
     OpenLink(String),
 }

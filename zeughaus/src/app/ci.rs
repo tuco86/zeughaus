@@ -1181,8 +1181,8 @@ impl App {
             CiMsg::OpenSession { view, proposal } => {
                 return self.open_session(&key, view, proposal);
             }
-            CiMsg::SessionOpened { view, result } => {
-                return self.session_opened(&key, view, result);
+            CiMsg::SessionOpened(result) => {
+                return self.session_opened(&key, result);
             }
             CiMsg::OpenLink(url) => return self.open_doc_link(&url),
             _ => {}
@@ -1280,7 +1280,7 @@ impl App {
                 Task::none()
             }
             // Answered above: they need more of the editor than this client.
-            CiMsg::OpenSession { .. } | CiMsg::SessionOpened { .. } | CiMsg::OpenLink(_) => {
+            CiMsg::OpenSession { .. } | CiMsg::SessionOpened(_) | CiMsg::OpenLink(_) => {
                 Task::none()
             }
         }

@@ -10,6 +10,8 @@ mod graph_link;
 // The editor's bundled face, which is also its icon set.
 mod font;
 mod message;
+// The notice center's model: severities, keys, stickiness, ages.
+mod notices;
 // The terminal path: the runner's mux, its shared workspace and one stream
 // per terminal. Native-only, for the same reason as `feed`.
 #[cfg(not(target_arch = "wasm32"))]
@@ -35,6 +37,8 @@ mod transport;
 // Runners by the names the CIs announce, and the resolver that dials them.
 #[cfg(not(target_arch = "wasm32"))]
 mod directory;
+// The chrome's surface colours and style closures, ported from griasdi.
+mod style;
 mod workspace;
 
 use app::App;

@@ -26,6 +26,7 @@ use super::{
 use crate::app::App;
 use crate::feed;
 use crate::message::{CiMsg, Message};
+use crate::notices::Severity;
 use crate::transport::Endpoint;
 use crate::workspace::{RunnerKey, TabRef};
 
@@ -499,16 +500,15 @@ impl App {
         }
         let key = key.clone();
         Task::perform(open(endpoint, request), move |result| {
-            Message::Ci(key, CiMsg::SessionOpened { view, result })
+            Message::Ci(key, CiMsg::SessionOpened(result))
         })
     }
 
     /// The CI took the session: its tab comes to the front once its runner
-    /// runs it. A refusal is said in the toolbar.
+    /// runs it. A refusal is a notice.
     pub(super) fn session_opened(
         &mut self,
         key: &RunnerKey,
-        view: u64,
         result: Result<SessionView, String>,
     ) -> Task<Message> {
         match result {
@@ -517,12 +517,7 @@ impl App {
                 self.apply_ci_sessions_event(key)
             }
             Err(e) => {
-                if let Some(state) = self.ci.get_mut(key).and_then(|c| c.plans.get_mut(&view)) {
-                    state.notice = Some(Notice {
-                        text: e,
-                        failed: true,
-                    });
-                }
+                self.raise(None, Severity::Error, "Session failed", e, false, None);
                 Task::none()
             }
         }
@@ -546,10 +541,15 @@ impl App {
             match session {
                 Some((session, _)) if session.state == SessionState::Failed => {
                     self.reveal_session = None;
-                    self.hint = Some((
-                        format!("session {id}: {}", session.message),
-                        iced::time::Instant::now(),
-                    ));
+                    let message = format!("session {id}: {}", session.message);
+                    self.raise(
+                        None,
+                        Severity::Error,
+                        "Session failed",
+                        message,
+                        false,
+                        None,
+                    );
                 }
                 Some((session, Some(runner))) if session.terminal.is_some() => {
                     self.reveal_session = None;

@@ -105,6 +105,16 @@ impl LiveTerminal {
 }
 
 impl App {
+    /// Whether the user is looking at `terminal` of runner `key`: the
+    /// window has the keyboard and the focused pane shows it.
+    pub(super) fn watched(&self, key: &RunnerKey, terminal: zeughaus_mux::TerminalId) -> bool {
+        self.window_focused
+            && self.workspace.focused_pane().is_some_and(|pane| {
+                pane.runner == *key
+                    && self.workspace.surface_of(pane) == Some(Surface::Terminal(terminal))
+            })
+    }
+
     /// Replaces `key`'s control task with one for its current endpoint.
     ///
     /// Terminal views are dropped with the old one -- a terminal id is the
@@ -365,6 +375,15 @@ impl App {
             // is fetching the pixels of images it newly shows.
             TerminalEvent::Changed => return self.fetch_images(&key, terminal),
             TerminalEvent::Notification { title, body } => {
+                let summary = title
+                    .or_else(|| {
+                        let guard = live.view.lock().unwrap_or_else(|e| e.into_inner());
+                        guard
+                            .as_ref()
+                            .map(|view| view.title.clone())
+                            .filter(|t| !t.is_empty())
+                    })
+                    .unwrap_or_else(|| "Zeughaus".to_owned());
                 // A replay says what the job said when it ran, which is not
                 // news.
                 if self
@@ -374,24 +393,24 @@ impl App {
                 {
                     return Task::none();
                 }
-                // The user is looking at it: the terminal already shows
+                // An agent's own "waiting for input" says what its status
+                // already does, as a notice of its own.
+                let agent = self.runtime.activity.get(&key).is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|e| e.terminal == terminal.0 && e.agent.is_some())
+                });
+                // When the user is looking at it, the terminal already shows
                 // whatever the child wanted to say.
-                let watched = self.window_focused
-                    && self.workspace.focused_pane().is_some_and(|pane| {
-                        pane.runner == key
-                            && self.workspace.surface_of(pane) == Some(Surface::Terminal(terminal))
-                    });
-                if !watched {
-                    let summary = title
-                        .or_else(|| {
-                            let guard = live.view.lock().unwrap_or_else(|e| e.into_inner());
-                            guard
-                                .as_ref()
-                                .map(|view| view.title.clone())
-                                .filter(|t| !t.is_empty())
-                        })
-                        .unwrap_or_else(|| "Zeughaus".to_owned());
-                    return notify_desktop(summary, body);
+                if !agent && !self.watched(&key, terminal) {
+                    self.raise(
+                        None,
+                        crate::notices::Severity::Info,
+                        summary,
+                        body,
+                        false,
+                        Some(crate::message::NoticeTarget::Terminal(key, terminal)),
+                    );
                 }
             }
             // The task cleared the view and ended; attaching again asks for
@@ -795,46 +814,5 @@ pub(super) fn open_link(url: &str) -> Result<(), String> {
     match scheme.map(str::to_ascii_lowercase).as_deref() {
         Some("http" | "https" | "file") => open::that_detached(url).map_err(|e| e.to_string()),
         _ => Err("only http, https and file links are opened".to_owned()),
-    }
-}
-
-/// A terminal's notification on the desktop, off the UI thread: the call is
-/// a round trip to the notification service, and one that hangs must not
-/// freeze the window. Normal urgency, so the desktop expires it like any
-/// other.
-pub(super) fn notify_desktop(summary: String, body: String) -> Task<Message> {
-    let mut notification = notify_rust::Notification::new();
-    notification
-        .appname("Zeughaus")
-        .summary(&summary)
-        .body(&body);
-    // The freedesktop service over zbus, whose blocking API does not run
-    // outside a tokio runtime in this build: the async call runs on iced's.
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        #[cfg(target_os = "linux")]
-        notification
-            .hint(notify_rust::Hint::DesktopEntry(crate::APP_ID.to_owned()))
-            .urgency(notify_rust::Urgency::Normal);
-        Task::future(async move {
-            if let Err(e) = notification.show_async().await {
-                eprintln!("[mux] notification not shown: {e}");
-            }
-        })
-        .discard()
-    }
-    #[cfg(not(all(unix, not(target_os = "macos"))))]
-    {
-        let spawned = std::thread::Builder::new()
-            .name("zh-notify".into())
-            .spawn(move || {
-                if let Err(e) = notification.show() {
-                    eprintln!("[mux] notification not shown: {e}");
-                }
-            });
-        if let Err(e) = spawned {
-            eprintln!("[mux] notification not shown: {e}");
-        }
-        Task::none()
     }
 }
