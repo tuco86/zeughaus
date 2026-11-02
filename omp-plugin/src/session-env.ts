@@ -7,12 +7,12 @@ export function masterPlan(): { repo: string; number: number } | undefined {
   return m ? { repo: m[1] as string, number: Number(m[2]) } : undefined;
 }
 
-/** `ZEUGHAUS_PLAN_SESSION=<repo>`, `ZEUGHAUS_PROPOSAL=<n>`: a planning session `zeughaus-runner plan` started. */
-export function planSession(): { repo: string; proposal?: number } | undefined {
+/** `ZEUGHAUS_PLAN_SESSION=<repo>`, `ZEUGHAUS_TICKET=<n>`: a planning session `zeughaus-runner plan` started. */
+export function planSession(): { repo: string; ticket?: number } | undefined {
   const repo = process.env.ZEUGHAUS_PLAN_SESSION ?? "";
   if (!/^[a-z0-9][a-z0-9-]*$/.test(repo)) return undefined;
-  const proposal = process.env.ZEUGHAUS_PROPOSAL ?? "";
-  return /^[1-9][0-9]*$/.test(proposal) ? { repo, proposal: Number(proposal) } : { repo };
+  const ticket = process.env.ZEUGHAUS_TICKET ?? "";
+  return /^[1-9][0-9]*$/.test(ticket) ? { repo, ticket: Number(ticket) } : { repo };
 }
 
 /** `ZEUGHAUS_SESSION=<id>`: a session the CI opened on a runner. */
