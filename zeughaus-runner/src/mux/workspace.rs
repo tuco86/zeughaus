@@ -36,6 +36,27 @@ const LOCKED_SPLIT: &str = "a locked group takes no new panes";
 const TRIGGERED_NAME: &str = "Triggered";
 const TRIGGERED_COLOR: [u8; 4] = [128, 128, 128, 64];
 
+/// Tints of runner-made project groups, picked by the name's hash so a
+/// project keeps its colour.
+const PROJECT_COLORS: [[u8; 4]; 8] = [
+    [0x4c, 0x9a, 0xff, 64],
+    [0x3f, 0xb9, 0x50, 64],
+    [0xd2, 0x99, 0x22, 64],
+    [0xbc, 0x8c, 0xff, 64],
+    [0xff, 0x7b, 0x72, 64],
+    [0x39, 0xc5, 0xcf, 64],
+    [0xf7, 0x78, 0xba, 64],
+    [0xa5, 0xd6, 0xff, 64],
+];
+
+/// The tint of the project group named `name`: FNV-1a over its bytes.
+fn project_color(name: &str) -> [u8; 4] {
+    let hash = name.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    });
+    PROJECT_COLORS[(hash % PROJECT_COLORS.len() as u32) as usize]
+}
+
 /// What a tree holds while it is taken apart and put back together.
 const PLACEHOLDER: PaneNode = PaneNode::Leaf {
     pane_id: PaneId(0),
@@ -59,6 +80,9 @@ struct Group {
     color: [u8; 4],
     /// See [`GroupSnapshot::locked`].
     locked: bool,
+    /// The repository of a runner-made project group. `None` is a user
+    /// group, or the `Triggered` group when `locked`.
+    project: Option<String>,
     tabs: Vec<Tab>,
 }
 
@@ -124,19 +148,28 @@ impl Workspace {
     /// `placement` says.
     pub fn add_owned(&mut self, terminal: TerminalId, placement: OwnedPlacement) {
         self.owned.insert(terminal);
-        match placement {
-            OwnedPlacement::Detached => {
-                self.detached.insert(terminal);
-            }
-            // A run the snapshot has no room for waits detached, where a
-            // client can attach it once other tabs are gone.
-            OwnedPlacement::Triggered if self.room_for(1, 1).is_ok() => {
+        let project = match &placement {
+            OwnedPlacement::Detached => None,
+            OwnedPlacement::Triggered => Some(None),
+            OwnedPlacement::Project(project) => Some(Some(project.as_str())),
+        };
+        // A run the snapshot has no room for waits detached, where a client
+        // can attach it once other tabs are gone.
+        let placed = match project {
+            Some(project) if self.room_for(1, 1).is_ok() => {
                 let tab = self.new_tab(SurfaceRef::Terminal(terminal));
-                self.locked_group().tabs.push(tab);
+                match self.owned_group(project) {
+                    Some(group) => {
+                        group.tabs.push(tab);
+                        true
+                    }
+                    None => false,
+                }
             }
-            OwnedPlacement::Triggered => {
-                self.detached.insert(terminal);
-            }
+            _ => false,
+        };
+        if !placed {
+            self.detached.insert(terminal);
         }
         self.revision += 1;
     }
@@ -157,31 +190,47 @@ impl Workspace {
         Ok(())
     }
 
-    /// The runner's locked group, created at the end of the top level the
-    /// first time a run needs it.
-    fn locked_group(&mut self) -> &mut Group {
-        let exists = self
-            .items
-            .iter()
-            .any(|item| matches!(item, Item::Group(group) if group.locked));
-        if !exists {
-            let id = GroupId(self.next_group);
-            self.next_group += 1;
-            self.items.push(Item::Group(Group {
-                id,
-                name: TRIGGERED_NAME.to_owned(),
-                color: TRIGGERED_COLOR,
-                locked: true,
-                tabs: Vec::new(),
-            }));
+    /// The runner's locked group of `project`, or its `Triggered` group for
+    /// `None`, created at the end of the top level the first time a run
+    /// needs it. A project group never takes the last group slot, which is
+    /// kept for `Triggered`; without a slot a project run goes there. `None`
+    /// when not even `Triggered` fits.
+    fn owned_group(&mut self, project: Option<&str>) -> Option<&mut Group> {
+        let position = self.items.iter().position(|item| {
+            matches!(item, Item::Group(group)
+                if group.locked && group.project.as_deref() == project)
+        });
+        let position = match position {
+            Some(position) => position,
+            None => {
+                let groups = self
+                    .items
+                    .iter()
+                    .filter(|item| matches!(item, Item::Group(_)))
+                    .count();
+                let (name, color) = match project {
+                    Some(_) if groups >= MAX_GROUPS - 1 => return self.owned_group(None),
+                    None if groups >= MAX_GROUPS => return None,
+                    Some(project) => (project.to_owned(), project_color(project)),
+                    None => (TRIGGERED_NAME.to_owned(), TRIGGERED_COLOR),
+                };
+                let id = GroupId(self.next_group);
+                self.next_group += 1;
+                self.items.push(Item::Group(Group {
+                    id,
+                    name,
+                    color,
+                    locked: true,
+                    project: project.map(str::to_owned),
+                    tabs: Vec::new(),
+                }));
+                self.items.len() - 1
+            }
+        };
+        match &mut self.items[position] {
+            Item::Group(group) => Some(group),
+            Item::Tab(_) => unreachable!("the position is a group's"),
         }
-        self.items
-            .iter_mut()
-            .find_map(|item| match item {
-                Item::Group(group) if group.locked => Some(group),
-                _ => None,
-            })
-            .expect("the locked group exists")
     }
 
     /// The structure as a restarted runner reads it back. The terminal
@@ -205,6 +254,7 @@ impl Workspace {
                         name: group.name.clone(),
                         color_rgba: group.color,
                         locked: group.locked,
+                        project: group.project.clone(),
                         tabs: group.tabs.iter().map(tab).collect(),
                     }),
                 })
@@ -283,6 +333,7 @@ impl Workspace {
                         name: group.name.clone(),
                         color: group.color_rgba,
                         locked: group.locked,
+                        project: group.project.clone(),
                         tabs,
                     }));
                 }
@@ -579,13 +630,13 @@ impl Workspace {
                 Applied::default()
             }
             TopologyCommand::NewGroup { name, color_rgba } => {
-                // One place in the snapshot's bound stays free for the
-                // locked group, which the runner creates whenever a
+                // The last place in the snapshot's bound stays free for the
+                // runner's `Triggered` group, which it creates whenever a
                 // triggered run needs it.
                 let groups = self
                     .items
                     .iter()
-                    .filter(|item| matches!(item, Item::Group(group) if !group.locked))
+                    .filter(|item| matches!(item, Item::Group(_)))
                     .count();
                 if groups >= MAX_GROUPS - 1 {
                     return Err(format!("at most {} groups", MAX_GROUPS - 1));
@@ -597,6 +648,7 @@ impl Workspace {
                     name: name.clone(),
                     color: *color_rgba,
                     locked: false,
+                    project: None,
                     tabs: Vec::new(),
                 }));
                 Applied::default()
@@ -714,7 +766,7 @@ impl Workspace {
                 Applied::default()
             }
         };
-        self.drop_empty_locked();
+        self.drop_empty_owned();
         self.revision += 1;
         Ok(applied)
     }
@@ -787,7 +839,7 @@ impl Workspace {
     }
 
     /// Takes the tab at `pos` out of its container. A group it leaves
-    /// empty stays until the caller ends with [`Workspace::drop_empty_locked`]
+    /// empty stays until the caller ends with [`Workspace::drop_empty_owned`]
     /// (a locked one) or the user dissolves it (an unlocked one): removing
     /// an unlocked group is its own command.
     fn take_tab(&mut self, pos: TabPos) -> Tab {
@@ -800,11 +852,11 @@ impl Workspace {
         }
     }
 
-    /// A locked group exists only while it holds a tab: the runner creates
-    /// it with the next run that needs it. Every operation that can remove
-    /// a tab ends here, before the revision moves, so no snapshot shows one
-    /// empty.
-    fn drop_empty_locked(&mut self) {
+    /// A locked group (`Triggered` or a project's) exists only while it
+    /// holds a tab: the runner creates it with the next run that needs it.
+    /// Every operation that can remove a tab ends here, before the revision
+    /// moves, so no snapshot shows one empty.
+    fn drop_empty_owned(&mut self) {
         self.items.retain(
             |item| !matches!(item, Item::Group(group) if group.locked && group.tabs.is_empty()),
         );
@@ -1858,6 +1910,65 @@ mod tests {
         ws.add_owned(TerminalId(501), OwnedPlacement::Triggered);
         assert_eq!(layout(&ws), ["T101", "G[T501]"]);
         assert!(snap(&ws).groups().next().unwrap().locked);
+    }
+
+    #[test]
+    fn project_runs_get_a_locked_group_per_repository() {
+        let (mut ws, mut spawn) = with_tabs(1);
+        let project = |name: &str| OwnedPlacement::Project(name.to_owned());
+        ws.add_owned(TerminalId(500), project("zeughaus"));
+        ws.add_owned(TerminalId(501), project("zeughaus"));
+        ws.add_owned(TerminalId(502), project("weida"));
+        ws.add_owned(TerminalId(503), OwnedPlacement::Triggered);
+        assert_eq!(layout(&ws), ["T101", "G[T500 T501]", "G[T502]", "G[T503]"]);
+        let groups: Vec<(String, bool)> = snap(&ws)
+            .groups()
+            .map(|g| (g.name.clone(), g.locked))
+            .collect();
+        assert_eq!(
+            groups,
+            [
+                ("zeughaus".to_owned(), true),
+                ("weida".to_owned(), true),
+                ("Triggered".to_owned(), true)
+            ]
+        );
+
+        let weida_tab = tab_showing(&ws, TerminalId(502));
+        apply(
+            &mut ws,
+            &mut spawn,
+            TopologyCommand::CloseTab { tab: weida_tab },
+        );
+        assert_eq!(layout(&ws), ["T101", "G[T500 T501]", "G[T503]"]);
+
+        let saved = ws.to_saved(600, Vec::new());
+        let alive = [101, 500, 501, 503].map(TerminalId);
+        let mut ws = Workspace::restore(RunnerIncarnation::from_bytes([1; 16]), &saved, |t| {
+            alive.contains(&t)
+        });
+        ws.add_owned(TerminalId(504), project("zeughaus"));
+        assert_eq!(layout(&ws), ["T101", "G[T500 T501 T504]", "G[T503]"]);
+    }
+
+    #[test]
+    fn a_project_run_without_a_group_slot_lands_in_triggered() {
+        let (mut ws, mut spawn) = with_tabs(1);
+        for _ in 0..MAX_GROUPS - 1 {
+            apply(
+                &mut ws,
+                &mut spawn,
+                TopologyCommand::NewGroup {
+                    name: "g".into(),
+                    color_rgba: [1, 2, 3, 4],
+                },
+            );
+        }
+        ws.add_owned(TerminalId(500), OwnedPlacement::Project("zeughaus".into()));
+        let last = snap(&ws).groups().last().unwrap().clone();
+        assert_eq!((last.name.as_str(), last.locked), ("Triggered", true));
+        assert_eq!(layout(&ws).last().unwrap(), "G[T500]");
+        assert!(detached_ids(&ws).is_empty());
     }
 
     #[test]

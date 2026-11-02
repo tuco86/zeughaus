@@ -43,6 +43,10 @@ pub struct SavedGroup {
     pub name: String,
     pub color_rgba: [u8; 4],
     pub locked: bool,
+    /// The repository of a runner-made project group; `None` for a user
+    /// group and the `Triggered` group.
+    #[serde(default)]
+    pub project: Option<String>,
     pub tabs: Vec<SavedTab>,
 }
 

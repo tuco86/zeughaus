@@ -326,12 +326,10 @@ mod unix {
                 env,
                 scrollback_rows: 20_000,
             };
-            // A plan session is someone's conversation: it opens as a tab. A
-            // master works alone and is attached by whoever wants to look.
-            let placement = match spec.kind {
-                SessionKind::Plan => OwnedPlacement::Triggered,
-                SessionKind::Master => OwnedPlacement::Detached,
-            };
+            // Plan sessions and masters open as tabs in their repository's
+            // locked group, where they are seen working; closing the tab
+            // stops the session.
+            let placement = OwnedPlacement::Project(spec.repo.clone());
             let TerminalId(terminal) = self.mux.spawn_owned(
                 profile,
                 Wal::Capped,

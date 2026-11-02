@@ -537,6 +537,7 @@ impl Executor {
             started,
             artifacts: Vec::new(),
             kind: RunKind::CiJob,
+            group: Some(a.repo.clone()),
         };
         let handle = match self.host.spawn(spec) {
             Ok(handle) => handle,

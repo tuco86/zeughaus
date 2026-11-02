@@ -16,7 +16,7 @@ pub use persist::SavedRun;
 pub use service::MuxService;
 
 /// Where a terminal the runner starts for itself appears.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnedPlacement {
     /// In no pane: listed as detached until a client attaches it.
     Detached,
@@ -24,6 +24,9 @@ pub enum OwnedPlacement {
     /// press from outside any editor, which nobody asked to see and so
     /// nobody would find among the detached terminals.
     Triggered,
+    /// In a tab of its own inside the runner's locked group of this
+    /// repository, made when the first run of it needs one.
+    Project(String),
 }
 
 /// What the document says about the graphs a pane may show, as the runner

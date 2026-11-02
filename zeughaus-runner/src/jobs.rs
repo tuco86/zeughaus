@@ -192,10 +192,15 @@ impl ProcessHost for JobHost {
             artifacts: spec.artifacts.clone(),
         };
         // A run nobody in an editor started would otherwise sit unseen among
-        // the detached terminals; one an editor pressed is attached from
+        // the detached terminals, so it gets a tab in a locked group: its
+        // repository's for a CI job. One an editor pressed is attached from
         // there by whoever wants to look, and maintenance runs unseen.
         let placement = match spec.kind {
-            RunKind::Trigger | RunKind::CiJob => OwnedPlacement::Triggered,
+            RunKind::Trigger => OwnedPlacement::Triggered,
+            RunKind::CiJob => spec
+                .group
+                .clone()
+                .map_or(OwnedPlacement::Triggered, OwnedPlacement::Project),
             RunKind::Job | RunKind::Maintenance => OwnedPlacement::Detached,
         };
 

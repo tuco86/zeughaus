@@ -146,6 +146,7 @@ impl ExecutableNode for JobNode {
                 } else {
                     RunKind::Job
                 },
+                group: None,
             })
             .map_err(ZeughausError::ExecutionFailed)?;
 
