@@ -370,13 +370,24 @@ master at a time, so several plans run at once on different runners. The
 runner opens `zeughaus-runner master <repo> --ticket <n>` in a tab of its
 repository's group (the ticket's `Open` brings it to the front), in the session's own clone
 under `<state-dir>/agent-work/`, never in the user's checkouts (a missing
-one is cloned over ssh from the origin in that terminal first): it
-fast-forwards the master clone `agent-work/master/<origin>` to the default
-branch, waiting while it is dirty or has unpushed commits, and runs `omp
-@<plan> <instruction>` with `ZEUGHAUS_PLAN=<repo>#<n>`, then exits with
-omp's code; the ticket stays `in_progress` until `plan_done`, Requeue or
-Mark done. A session that fails to start puts its ticket back in the queue
-and keeps its runner from masters for 5 minutes. A plan session opens
+one is cloned over ssh from the origin in that terminal first): it runs
+`omp` with `ZEUGHAUS_PLAN=<repo>#<n>` and the ticket's own session
+directory `<state-dir>/agents/<repo>/master-<n>`, resuming the newest
+session there whenever there is one, else on `@<plan> <instruction>` in
+the master clone `agent-work/master/<origin>`, which it fast-forwards to the
+default branch while it holds nothing. `.git/zeughaus-master` in the clone
+names the ticket whose master last started omp there; a clone holding
+changes or unpushed commits of another ticket, or of none recorded, refuses
+the session with the reason, which becomes the ticket's note (also on its
+Board card) and a notice. Each time omp exits while the ticket is still
+`in_progress` the master starts it again, resuming (three exits within a
+minute of the start end it); the ticket stays `in_progress` until
+`plan_done`, Requeue or Mark done. A master killed or lost with its runner
+puts its ticket back in the queue for that runner to resume; the popout's
+Stop ends it for good, and a master that exits by itself leaves its ticket
+in RUNNING with a note and a notice. A session that fails to start puts its
+ticket back in the queue and keeps its runner from other masters for 5
+minutes. A plan session opens
 `zeughaus-runner plan <repo> [--ticket <n> [--resume <file>]]` in the
 runner's group of the repository: it brings the plan clone
 `agent-work/plan/<origin>`, which borrows the objects of the master clone,

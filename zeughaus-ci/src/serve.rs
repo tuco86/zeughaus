@@ -1746,6 +1746,7 @@ mod tests {
             Arc::clone(&lock),
             docs.clone(),
             std::sync::mpsc::channel().0,
+            std::sync::mpsc::channel().0,
         ));
         CiServer::new(
             state.to_path_buf(),

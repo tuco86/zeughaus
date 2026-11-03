@@ -271,6 +271,7 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
     let seq = Arc::new(AtomicU64::new(0));
     let listener = &bound.listener;
     let (sessions_tx, sessions_rx) = std::sync::mpsc::channel::<()>();
+    let (session_alerts_tx, session_alerts) = std::sync::mpsc::channel::<scheduler::Alert>();
     let sessions = Arc::new(Sessions::new(
         state_dir.to_path_buf(),
         Arc::clone(&config),
@@ -278,6 +279,7 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
         Arc::clone(&docs_lock),
         docs_tx.clone(),
         sessions_tx,
+        session_alerts_tx,
     ));
     {
         let sessions = Arc::clone(&sessions);
@@ -425,6 +427,9 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
     };
     loop {
         while let Ok(alert) = alerts.try_recv() {
+            events.alert(alert);
+        }
+        while let Ok(alert) = session_alerts.try_recv() {
             events.alert(alert);
         }
         while let Ok(change) = changes.try_recv() {

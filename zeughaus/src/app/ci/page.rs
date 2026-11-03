@@ -1745,6 +1745,15 @@ impl App {
             }
         }
         let mut lines = column![first, second].spacing(4);
+        // Why a master could not start, or that it ended with its ticket in
+        // progress.
+        if let Some(doc) = doc.filter(|doc| !doc.note.is_empty()) {
+            lines = lines.push(
+                text(doc.note.as_str())
+                    .size(CAPTION_TEXT)
+                    .color(self.theme.error()),
+            );
+        }
         if active(column) {
             let opening = card == Card::Opening;
             lines = lines.push(match self.card_holder(ci, &repo.repo, card) {

@@ -2062,7 +2062,9 @@ tickets of every repository whose queue is not paused, by approval and
 again only once their dependencies are finished: a ticket's `Runs on` is
 one label selector per machine (`zeughaus-link::selector`), the first
 placed on a connected runner with `sessions = true` that hosts no live master
-and is not cooling down after a failed start, the others on distinct
+and is not cooling down after a failed start (the runner the ticket's master
+last ran on, `placement[0]`, comes first and may take it back while cooling
+down: it holds the ticket's clone and omp session), the others on distinct
 connected runners with `ssh`, reserved for that master. A runner's labels are
 `ci.toml`'s plus `runner=`, `os=` and `arch=` from its offer. The CI sends
 the host `ToRunner::OpenSession` with a `SessionSpec`; the runner's agents
@@ -2075,6 +2077,25 @@ settles sessions that ended meanwhile. A plan session without a ticket is
 opened on request (`CiRequest::OpenSession`); plan sessions never count as
 busy. The registry is `<state-dir>/ci/sessions.json`, every change
 announced as `CiSessions`.
+
+**Masters resume.** A master runs omp with the ticket's own session
+directory (`<state-dir>/agents/<repo>/master-<n>`) and records the ticket
+in the clone's `.git/zeughaus-master` before each start. It resumes the
+newest session there whenever there is one (`start_of`): in a clean clone
+after a fast-forward to the default branch, in a clone that holds changes
+or unpushed commits only when the record names its own ticket. Work of
+another ticket, work nobody recorded, or work of this ticket whose session
+is gone refuses the master before its terminal opens (`SessionFailed`
+with the reason). Inside one session the `master` process starts omp again,
+resuming, while the ticket is still `in_progress`; three ends within a
+minute of the start end the master. The CI settles every end of a master
+in `docs::master_ended`: a refusal puts the ticket back into the queue
+without its placement and with the reason as its note, and alerts every
+editor; a master killed or lost with its runner goes back into the queue
+with its placement, so its runner takes it again and resumes; a master the
+user stopped (`close`) or that exited by itself leaves the ticket in
+progress with a note, and the latter alerts. The Board shows a ticket's
+note on its card.
 
 **Runners by name.** A runner's `Hello` carries its endpoint and the
 addresses it answers at; the overview lists each runner's fingerprint,

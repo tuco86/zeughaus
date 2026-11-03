@@ -8,8 +8,12 @@
 //!   that ticket of the CI at once; after a Refine it resumes the omp
 //!   session that wrote the ticket's plan with the user's review attached.
 //! - `master <repo> --ticket <n>`: omp executing the plan of ticket `n`,
-//!   which the CI put in progress on this runner, in the master clone,
-//!   fast-forwarded to the default branch first.
+//!   which the CI put in progress on this runner, in the master clone. A
+//!   clean clone is fast-forwarded to the default branch first; the
+//!   ticket's earlier omp session is resumed whenever there is one, and
+//!   after every exit of omp while the ticket is still in progress. A clone
+//!   that holds work of another ticket, or work no master recorded, refuses
+//!   the session.
 //!
 //! Both clones live in the runner's state directory, never among the user's
 //! own checkouts: `<state-dir>/agent-work/{master,plan}/<host>/<owner>/<repo>`.
@@ -97,6 +101,131 @@ pub fn plan_clone_dir(state_dir: &Path, origin: &str) -> Result<PathBuf, String>
 #[cfg(unix)]
 pub const SESSION_LOCK: &str = "zeughaus-session.lock";
 
+/// The file in the master clone's `.git/` that names the ticket whose
+/// master last started omp there. Its content is the ticket number and a
+/// newline.
+#[cfg(unix)]
+pub const MASTER_RECORD: &str = "zeughaus-master";
+
+/// An omp that ends within `QUICK_OMP` of its start `MAX_QUICK` times in a
+/// row ends the master.
+#[cfg(unix)]
+const QUICK_OMP: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(unix)]
+const MAX_QUICK: u32 = 3;
+
+/// The omp session directory (`--session-dir`) of ticket `number`'s
+/// masters.
+#[cfg(unix)]
+fn master_sessions(state_dir: &Path, repo: &str, number: u64) -> PathBuf {
+    state_dir
+        .join("agents")
+        .join(repo)
+        .join(format!("master-{number}"))
+}
+
+/// What the master clone holds that `origin/<branch>` does not.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Holds {
+    changed: usize,
+    ahead: u64,
+}
+
+#[cfg(unix)]
+impl Holds {
+    fn is_empty(self) -> bool {
+        self.changed == 0 && self.ahead == 0
+    }
+
+    /// `3 changed files and 1 unpushed commit`, `1 changed file`, `2
+    /// unpushed commits`, `no changes`.
+    fn text(self) -> String {
+        let plural =
+            |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+        let mut parts = Vec::new();
+        if self.changed > 0 {
+            parts.push(plural(self.changed as u64, "changed file", "changed files"));
+        }
+        if self.ahead > 0 {
+            parts.push(plural(self.ahead, "unpushed commit", "unpushed commits"));
+        }
+        if parts.is_empty() {
+            "no changes".to_owned()
+        } else {
+            parts.join(" and ")
+        }
+    }
+}
+
+/// Why a master cannot start in its clone.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// The clone holds work no master recorded.
+    Unrecorded,
+    /// The clone holds work of another ticket.
+    Other(u64),
+    /// The clone holds work of this ticket, but its omp session is gone.
+    SessionGone,
+}
+
+/// How a master starts omp in its clone.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum Start {
+    Fresh,
+    Resume(PathBuf),
+    Refuse(Refusal),
+}
+
+/// How the master of `ticket` starts in a clone that holds `holds`, whose
+/// record names `recorded`, with `earlier` the newest omp session of the
+/// ticket's masters. A ticket with a session resumes it, also in a clean
+/// clone; work in the clone is only ever resumed by its own ticket.
+#[cfg(unix)]
+fn start_of(holds: Holds, recorded: Option<u64>, ticket: u64, earlier: Option<PathBuf>) -> Start {
+    if holds.is_empty() {
+        return earlier.map_or(Start::Fresh, Start::Resume);
+    }
+    match recorded {
+        None => Start::Refuse(Refusal::Unrecorded),
+        Some(m) if m != ticket => Start::Refuse(Refusal::Other(m)),
+        Some(_) => earlier.map_or(Start::Refuse(Refusal::SessionGone), Start::Resume),
+    }
+}
+
+/// Why the master cannot start in `root`, for the session's failure, the
+/// ticket's note and the notice; `age` is the seconds since the newest
+/// change in the clone.
+#[cfg(unix)]
+fn refusal_text(
+    root: &Path,
+    sessions: &Path,
+    refusal: Refusal,
+    holds: Holds,
+    age: Option<u64>,
+) -> String {
+    let held = format!("{} holds {}", root.display(), holds.text());
+    let changed = age
+        .map(|age| format!(", last changed {} ago", crate::mcp::docs::age(age)))
+        .unwrap_or_default();
+    match refusal {
+        Refusal::Unrecorded => format!(
+            "{held}, which no master recorded{changed}; commit and push, or stash them, to start"
+        ),
+        Refusal::Other(m) => format!(
+            "{held} of ticket #{m}{changed}; Requeue #{m} to resume it there, or commit and \
+             push, or stash them"
+        ),
+        Refusal::SessionGone => format!(
+            "{held} of this ticket{changed}, but no omp session is left under {}; commit and \
+             push, or stash them",
+            sessions.display()
+        ),
+    }
+}
+
 /// Whether `value` is an omp session id rather than a session file: omp
 /// finds a session by id prefix in its session directory.
 pub fn is_session_id(value: &Path) -> bool {
@@ -166,10 +295,6 @@ fn parse_args(args: &[String]) -> Result<SessionArgs, String> {
     })
 }
 
-/// How often the master looks again at a clone it cannot start in.
-#[cfg(unix)]
-const MASTER_RETRY: std::time::Duration = std::time::Duration::from_secs(15);
-
 /// The omp the sessions run: `$ZEUGHAUS_OMP`, else `omp` on the PATH.
 #[cfg(unix)]
 fn omp_program() -> std::ffi::OsString {
@@ -221,6 +346,20 @@ fn instruction(
         ));
     }
     text
+}
+
+/// What a master tells the omp session of its ticket it resumes, with
+/// `holds` what the clone keeps of it.
+#[cfg(unix)]
+fn resume_instruction(repo: &str, number: u64, branch: &str, holds: Holds) -> String {
+    format!(
+        "This omp session executes zeughaus ticket #{number} of {repo} and was interrupted; the \
+         master clone keeps what it had ({}). Look at git status and git log \
+         origin/{branch}..HEAD, then go on with the plan where it stopped. Fetch and rebase onto \
+         origin/{branch} right before every push, and call the zeughaus MCP tool plan_done with \
+         repo {repo} and number {number} once its work is complete.",
+        holds.text()
+    )
 }
 
 /// What `plan` tells omp to do with an attached ticket.
@@ -343,9 +482,11 @@ mod unix {
     use zeughaus_terminal::wal::Wal;
 
     use super::{
-        MASTER_RETRY, SESSION_LOCK, SessionArgs, agent_root, checkout_of, clone_url, instruction,
-        master_dir, omp_program, parse_args, parse_work_args, plan_clone_dir, refine_instruction,
-        refine_text, replan_instruction, ticket_brief, ticket_instruction, work_root,
+        Holds, MASTER_RECORD, MAX_QUICK, QUICK_OMP, SESSION_LOCK, SessionArgs, Start, agent_root,
+        checkout_of, clone_url, instruction, master_dir, master_sessions, omp_program, parse_args,
+        parse_work_args, plan_clone_dir, refine_instruction, refine_text, refusal_text,
+        replan_instruction, resume_instruction, start_of, ticket_brief, ticket_instruction,
+        work_root,
     };
     use crate::enlist::SessionHost;
     use crate::mcp::client::{Client, Link};
@@ -401,6 +542,15 @@ mod unix {
                     return Err("a master session needs its ticket".to_owned());
                 }
             };
+            // A master that cannot use its clone is refused here, before a
+            // terminal opens, so the CI sees why at once. A missing clone is
+            // cloned by the session, which then starts fresh.
+            if let (SessionKind::Master, Some(n)) = (spec.kind, spec.doc)
+                && master.is_dir()
+            {
+                let sessions = master_sessions(&self.state_dir, &spec.repo, n);
+                master_start(&master, &spec.default_branch, n, &sessions)?;
+            }
             // A missing clone is made by the session itself, in the
             // terminal, so the terminal starts in the agent root.
             let cwd = if dir.is_dir() {
@@ -771,10 +921,10 @@ mod unix {
     }
 
     /// `zeughaus-runner master <repo> --ticket <n> --branch <b> --origin
-    /// <o>` in the master clone: brings the clone to the default branch,
-    /// waiting while it is dirty or ahead, and runs omp on the plan of ticket
-    /// `n`, which the CI put in progress on this runner. Exits with omp's
-    /// code.
+    /// <o>` in the master clone: runs omp on the plan of ticket `n`, which
+    /// the CI put in progress on this runner, until the ticket is no longer
+    /// in progress, resuming the ticket's omp session after each exit. It
+    /// exits at once when the clone holds work it cannot resume.
     pub fn master(args: &[String], state_dir: &Path) -> ExitCode {
         let fail = |message: String| {
             eprintln!("[master] {message}");
@@ -810,59 +960,161 @@ mod unix {
             Ok(lock) => lock,
             Err(e) => return fail(e),
         };
-        let mut said: Option<String> = None;
-        while let Err(reason) = bring_up_to_date(&cwd, &branch) {
-            if said.as_deref() != Some(reason.as_str()) {
-                println!("[master] {reason}; trying again every 15 s");
-                said = Some(reason);
+        let sessions = master_sessions(state_dir, &repo, number);
+        let mut quick = 0;
+        loop {
+            let plan = match fetch_doc(&repo, number, state_dir) {
+                Ok(doc) => doc,
+                Err(e) => return fail(e),
+            };
+            if plan.kind != DocKind::Ticket || plan.state != DocState::InProgress {
+                println!(
+                    "[master] ticket #{number} is {}; nothing to do",
+                    plan.state.name()
+                );
+                return ExitCode::SUCCESS;
             }
-            std::thread::sleep(MASTER_RETRY);
+            let (start, holds) = match master_start(&cwd, &branch, number, &sessions) {
+                Ok(start) => start,
+                Err(reason) => return fail(reason),
+            };
+            if holds.is_empty()
+                && let Err(e) = fast_forward(&cwd, &branch)
+            {
+                return fail(e);
+            }
+            if let Err(e) = record_ticket(&cwd, number) {
+                return fail(e);
+            }
+            let launch = match &start {
+                Start::Fresh => Launch::Fresh,
+                Start::Resume(file) => Launch::Resume(file, holds),
+                Start::Refuse(_) => unreachable!("master_start answers a refusal as Err"),
+            };
+            let started = std::time::Instant::now();
+            let status = match run_omp(&plan, &cwd, &branch, state_dir, &sessions, launch) {
+                Ok(status) => status,
+                Err(e) => return fail(e),
+            };
+            println!("[master] omp ended ({status})");
+            quick = if started.elapsed() < QUICK_OMP {
+                quick + 1
+            } else {
+                0
+            };
+            if quick >= MAX_QUICK {
+                return fail(format!(
+                    "omp ended {MAX_QUICK} times within a minute of its start; the ticket stays \
+                     in progress"
+                ));
+            }
         }
-        let plan = match fetch_doc(&repo, number, state_dir) {
-            Ok(doc) => doc,
-            Err(e) => return fail(e),
-        };
-        if plan.kind != DocKind::Ticket || plan.state != DocState::InProgress {
-            println!(
-                "[master] ticket #{number} is {}; nothing to do",
-                plan.state.name()
-            );
-            return ExitCode::SUCCESS;
-        }
-        run_plan(&plan, &cwd, &branch, state_dir)
     }
 
-    /// Puts the master clone on `branch` at `origin/<branch>`, so a claimed
-    /// plan starts on the current default branch. `Err` is why it cannot,
-    /// which the master waits out.
-    fn bring_up_to_date(root: &Path, branch: &str) -> Result<(), String> {
-        let status =
-            git(root, &["status", "--porcelain"]).map_err(|e| format!("git status failed: {e}"))?;
-        if !status.trim().is_empty() {
-            return Err(format!("{} has uncommitted changes", root.display()));
+    /// What the master clone holds that `origin/<branch>` does not, and the
+    /// seconds since its newest changed file was modified.
+    fn probe(root: &Path, branch: &str) -> Result<(Holds, Option<u64>), String> {
+        let inspect = |e: String| format!("cannot inspect {}: {e}", root.display());
+        let status = git(root, &["status", "--porcelain"]).map_err(inspect)?;
+        let lines: Vec<&str> = status.lines().filter(|line| !line.is_empty()).collect();
+        let now = std::time::SystemTime::now();
+        let age = lines
+            .iter()
+            .filter_map(|line| line.get(3..))
+            .map(|path| path.split_once(" -> ").map_or(path, |(_, to)| to))
+            .filter(|path| !path.starts_with('"'))
+            .filter_map(|path| {
+                std::fs::symlink_metadata(root.join(path))
+                    .ok()?
+                    .modified()
+                    .ok()
+            })
+            .max()
+            .and_then(|newest| now.duration_since(newest).ok())
+            .map(|age| age.as_secs());
+        let range = format!("origin/{branch}..HEAD");
+        let counted = git(root, &["rev-list", "--count", &range]).map_err(inspect)?;
+        let ahead = counted
+            .trim()
+            .parse()
+            .map_err(|_| inspect(format!("git rev-list --count {range} answered {counted:?}")))?;
+        Ok((
+            Holds {
+                changed: lines.len(),
+                ahead,
+            },
+            age,
+        ))
+    }
+
+    /// The ticket whose master last started omp in the clone, if it says.
+    fn recorded_ticket(root: &Path) -> Option<u64> {
+        std::fs::read_to_string(root.join(".git").join(MASTER_RECORD))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// Records ticket `number` as the one whose master runs omp in the clone.
+    fn record_ticket(root: &Path, number: u64) -> Result<(), String> {
+        crate::files::write_atomic(
+            &root.join(".git").join(MASTER_RECORD),
+            format!("{number}\n").as_bytes(),
+        )
+    }
+
+    /// The newest non-empty omp session file directly in `dir`.
+    fn earlier_session(dir: &Path) -> Option<PathBuf> {
+        std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+            .filter_map(|entry| {
+                let meta = entry.metadata().ok()?;
+                (meta.is_file() && meta.len() > 0).then_some((meta.modified().ok()?, entry.path()))
+            })
+            .max_by_key(|(modified, _)| *modified)
+            .map(|(_, path)| path)
+    }
+
+    /// How the master of `ticket` starts in `root`; `Ok` is `Fresh` or
+    /// `Resume`, a refusal is `Err` with its reason.
+    fn master_start(
+        root: &Path,
+        branch: &str,
+        ticket: u64,
+        sessions: &Path,
+    ) -> Result<(Start, Holds), String> {
+        let (holds, age) = probe(root, branch)?;
+        match start_of(
+            holds,
+            recorded_ticket(root),
+            ticket,
+            earlier_session(sessions),
+        ) {
+            Start::Refuse(refusal) => Err(refusal_text(root, sessions, refusal, holds, age)),
+            start => Ok((start, holds)),
         }
-        git(root, &["fetch", "-q", "--prune", "origin", branch])
-            .map_err(|e| format!("fetch failed: {e}"))?;
+    }
+
+    /// Puts a master clone that holds nothing on `branch` at
+    /// `origin/<branch>`, so a plan starts on the current default branch.
+    fn fast_forward(root: &Path, branch: &str) -> Result<(), String> {
+        let tracking = format!("origin/{branch}");
+        if let Err(e) = git(root, &["fetch", "-q", "--prune", "origin", branch]) {
+            println!("[master] fetch failed: {e}; using the last fetched {tracking}");
+        }
         let head = git(root, &["symbolic-ref", "-q", "HEAD"]).unwrap_or_default();
         if head.trim() != format!("refs/heads/{branch}") {
             git(root, &["checkout", "-q", branch])?;
         }
-        let tracking = format!("origin/{branch}");
-        let count = |range: String| -> Result<u64, String> {
-            let counted = git(root, &["rev-list", "--count", &range])?;
-            counted
-                .trim()
-                .parse()
-                .map_err(|_| format!("git rev-list --count {range} answered {counted:?}"))
-        };
-        let ahead = count(format!("{tracking}..HEAD"))?;
-        if ahead > 0 {
-            return Err(format!(
-                "{} has {ahead} unpushed commits on {branch}; push or reset them",
-                root.display()
-            ));
-        }
-        let behind = count(format!("HEAD..{tracking}"))?;
+        let range = format!("HEAD..{tracking}");
+        let counted = git(root, &["rev-list", "--count", &range])?;
+        let behind: u64 = counted
+            .trim()
+            .parse()
+            .map_err(|_| format!("git rev-list --count {range} answered {counted:?}"))?;
         if behind > 0 {
             git(root, &["merge", "--ff-only", "-q", &tracking])?;
             println!("[master] fast-forwarded {behind} commits");
@@ -870,46 +1122,60 @@ mod unix {
         Ok(())
     }
 
-    /// Runs omp on `plan` in the checkout, with the terminal's stdio, and
-    /// answers with omp's exit.
-    fn run_plan(plan: &DocView, root: &Path, branch: &str, state_dir: &Path) -> ExitCode {
-        let file = state_dir
-            .join("agents")
-            .join(&plan.repo)
-            .join(format!("plan-{}.md", plan.number));
-        let text = zeughaus_link::without_sections(&plan.plan_text, &plan.filed);
-        if let Err(e) = crate::files::write_atomic(&file, text.as_bytes()) {
-            eprintln!("[master] {e}");
-            return ExitCode::FAILURE;
-        }
+    /// How `run_omp` starts omp: on the plan, or resuming the ticket's
+    /// session file in a clone that holds `Holds`.
+    enum Launch<'a> {
+        Fresh,
+        Resume(&'a Path, Holds),
+    }
+
+    /// Runs omp on `plan` in the checkout with the terminal's stdio and its
+    /// sessions in `sessions`, and answers with omp's exit.
+    fn run_omp(
+        plan: &DocView,
+        root: &Path,
+        branch: &str,
+        state_dir: &Path,
+        sessions: &Path,
+        launch: Launch<'_>,
+    ) -> Result<std::process::ExitStatus, String> {
+        std::fs::create_dir_all(sessions)
+            .map_err(|e| format!("cannot create {}: {e}", sessions.display()))?;
+        let mut command = Command::new(omp_program());
+        command.arg("--session-dir").arg(sessions);
         println!("[master] ticket #{} {}", plan.number, plan.title);
-        let machines = std::env::var_os("ZEUGHAUS_MACHINES").is_some_and(|m| !m.is_empty());
-        let status = Command::new(omp_program())
-            .arg(format!("@{}", file.display()))
-            .arg(instruction(
-                &plan.repo,
-                plan.number,
-                branch,
-                machines,
-                &plan.filed,
-            ))
+        match launch {
+            Launch::Fresh => {
+                let file = state_dir
+                    .join("agents")
+                    .join(&plan.repo)
+                    .join(format!("plan-{}.md", plan.number));
+                let text = zeughaus_link::without_sections(&plan.plan_text, &plan.filed);
+                crate::files::write_atomic(&file, text.as_bytes())?;
+                let machines = std::env::var_os("ZEUGHAUS_MACHINES").is_some_and(|m| !m.is_empty());
+                command.arg(format!("@{}", file.display())).arg(instruction(
+                    &plan.repo,
+                    plan.number,
+                    branch,
+                    machines,
+                    &plan.filed,
+                ));
+            }
+            Launch::Resume(file, holds) => {
+                println!("[master] resuming {}", file.display());
+                command.arg("--resume").arg(file).arg(resume_instruction(
+                    &plan.repo,
+                    plan.number,
+                    branch,
+                    holds,
+                ));
+            }
+        }
+        command
             .env("ZEUGHAUS_PLAN", format!("{}#{}", plan.repo, plan.number))
             .current_dir(root)
-            .status();
-        match status {
-            Ok(status) => {
-                println!("[master] omp ended ({status})");
-                status
-                    .code()
-                    .map_or(ExitCode::FAILURE, |code| ExitCode::from(code as u8))
-            }
-            // The plan stays in progress; the user requeues it or marks it
-            // done.
-            Err(e) => {
-                eprintln!("[master] cannot start omp: {e}");
-                ExitCode::FAILURE
-            }
-        }
+            .status()
+            .map_err(|e| format!("cannot start omp: {e}"))
     }
 
     /// The profile of a shell in the work checkout of `origin`: the
@@ -1146,6 +1412,43 @@ mod tests {
                 Err("--ticket needs a ticket number".to_owned()),
                 "{bad:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_master_resumes_its_own_session_and_refuses_work_of_others() {
+        let f = PathBuf::from("/s/a.jsonl");
+        let clean = Holds::default();
+        let dirty = Holds {
+            changed: 2,
+            ahead: 0,
+        };
+        let ahead = Holds {
+            changed: 0,
+            ahead: 1,
+        };
+        let rows = [
+            (clean, None, None, Start::Fresh),
+            (clean, None, Some(f.clone()), Start::Resume(f.clone())),
+            (dirty, Some(44), Some(f.clone()), Start::Resume(f.clone())),
+            (ahead, Some(44), Some(f.clone()), Start::Resume(f.clone())),
+            (dirty, Some(44), None, Start::Refuse(Refusal::SessionGone)),
+            (
+                dirty,
+                Some(50),
+                Some(f.clone()),
+                Start::Refuse(Refusal::Other(50)),
+            ),
+            (
+                dirty,
+                None,
+                Some(f.clone()),
+                Start::Refuse(Refusal::Unrecorded),
+            ),
+        ];
+        for (holds, recorded, earlier, expected) in rows {
+            let row = format!("{holds:?} {recorded:?} {earlier:?}");
+            assert_eq!(start_of(holds, recorded, 44, earlier), expected, "{row}");
         }
     }
 

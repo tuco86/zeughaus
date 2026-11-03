@@ -509,7 +509,8 @@ pub(super) fn actions(doc: &DocView) -> Vec<(char, &'static str, &'static str, O
             (
                 glyph::RERUN,
                 "Requeue",
-                "Back into the queue, at its place",
+                "Back into the queue, at its place; its next master resumes its omp session on \
+                 the runner it ran on",
                 Some(DocState::Approved),
             ),
         ],

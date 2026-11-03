@@ -67,6 +67,12 @@ pub struct Sessions {
     book: Mutex<Book>,
     /// Runner -> the time before which it gets no master.
     cooldown: Mutex<BTreeMap<String, u64>>,
+    /// Alerts the main loop publishes to editors: a master that could not
+    /// start or ended by itself.
+    alerts_tx: Sender<crate::scheduler::Alert>,
+    /// Live sessions the user stopped with `close`; their end restarts
+    /// nothing.
+    stopping: Mutex<BTreeSet<u64>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -110,6 +116,7 @@ impl Sessions {
         docs_lock: Arc<Mutex<()>>,
         docs_tx: Sender<String>,
         events_tx: Sender<()>,
+        alerts_tx: Sender<crate::scheduler::Alert>,
     ) -> Sessions {
         let book = read_json::<Book>(&book_path(&state_dir)).unwrap_or_default();
         Sessions {
@@ -121,6 +128,8 @@ impl Sessions {
             events_tx,
             book: Mutex::new(book),
             cooldown: Mutex::new(BTreeMap::new()),
+            alerts_tx,
+            stopping: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -268,11 +277,19 @@ impl Sessions {
             let busy = Self::busy(&book);
             let cooldown = lock(&self.cooldown).clone();
             let free = |name: &String| !busy.contains(name);
-            let hosts: Vec<(String, Vec<String>)> = self
+            // The runner the ticket's master last ran on holds its clone
+            // and omp session: it may take the ticket back while cooling
+            // down, and it comes first.
+            let previous = plan.placement.first();
+            let mut hosts: Vec<(String, Vec<String>)> = self
                 .session_hosts(&views)
                 .into_iter()
-                .filter(|(name, _)| free(name) && cooldown.get(name).is_none_or(|&t| t <= now))
+                .filter(|(name, _)| {
+                    free(name)
+                        && (Some(name) == previous || cooldown.get(name).is_none_or(|&t| t <= now))
+                })
                 .collect();
+            hosts.sort_by_key(|(name, _)| Some(name) != previous);
             let extras: Vec<(String, Vec<String>)> = config
                 .runners
                 .iter()
@@ -468,6 +485,47 @@ impl Sessions {
         }
     }
 
+    /// The master of `session` ended: `lost` when it ended without an exit
+    /// code (the runner or a signal killed it) or went away with its runner,
+    /// which requeues its ticket for that runner to resume; a master stopped
+    /// with `close` or exiting by itself leaves the ticket in progress with
+    /// a note. The caller holds the book.
+    fn master_gone(&self, session: &SessionView, lost: bool, now: u64) {
+        let stopped = lock(&self.stopping).remove(&session.id);
+        let (SessionKind::Master, Some(number)) = (session.kind, session.doc) else {
+            return;
+        };
+        let end = if stopped {
+            docs::MasterEnd::Stopped("it was stopped")
+        } else if lost {
+            docs::MasterEnd::Lost
+        } else {
+            docs::MasterEnd::Stopped(&session.message)
+        };
+        let alert = matches!(end, docs::MasterEnd::Stopped(_)) && !stopped;
+        let config = self.config.get();
+        let ended = {
+            let _held = lock(&self.docs_lock);
+            docs::master_ended(&self.state_dir, &config, &session.repo, number, end, now)
+        };
+        match ended {
+            Ok(true) => {
+                let _ = self.docs_tx.send(session.repo.clone());
+                if alert {
+                    let note = docs::load(&self.state_dir, &config, &session.repo, number)
+                        .map(|doc| doc.note)
+                        .unwrap_or_default();
+                    let _ = self.alerts_tx.send(crate::scheduler::Alert {
+                        title: format!("{} #{number}: the master ended", session.repo),
+                        body: note,
+                    });
+                }
+            }
+            Ok(false) => {}
+            Err(e) => eprintln!("[ci] sessions: {}#{number}: {e}", session.repo),
+        }
+    }
+
     /// Marks session `id` failed with `message`; a master's ticket goes back
     /// to the queue and its host gets no other master for a while, a plan
     /// session's ticket back to where it was.
@@ -492,19 +550,27 @@ impl Sessions {
             if let Some(number) = session.doc {
                 let requeued = {
                     let _held = lock(&self.docs_lock);
-                    docs::set_state(
+                    docs::master_ended(
                         &self.state_dir,
                         &self.config.get(),
                         &session.repo,
                         number,
-                        DocState::Approved,
+                        docs::MasterEnd::Refused(message),
                         now,
                     )
                 };
                 match requeued {
-                    Ok(()) => {
+                    Ok(true) => {
                         let _ = self.docs_tx.send(session.repo.clone());
+                        let _ = self.alerts_tx.send(crate::scheduler::Alert {
+                            title: format!(
+                                "{} #{number}: the master could not start",
+                                session.repo
+                            ),
+                            body: message.to_owned(),
+                        });
                     }
+                    Ok(false) => {}
                     Err(e) => eprintln!("[ci] sessions: {}#{number}: {e}", session.repo),
                 }
             }
@@ -547,6 +613,8 @@ impl Sessions {
                     );
                     let session = session.clone();
                     self.plan_ended(&session, "the plan session ended without a plan", now);
+                    // No exit code: the runner or a signal killed it.
+                    self.master_gone(&session, killed || code.is_none(), now);
                 }
             }
             _ => {}
@@ -571,14 +639,14 @@ impl Sessions {
                 None => {
                     end(session, None, true, now);
                     session.message = "the runner no longer holds it".to_owned();
-                    ended.push(session.clone());
+                    ended.push((session.clone(), true));
                 }
                 Some(SessionReport {
                     end: Some((code, killed)),
                     ..
                 }) => {
                     end(session, *code, *killed, now);
-                    ended.push(session.clone());
+                    ended.push((session.clone(), *killed || code.is_none()));
                 }
                 Some(report) => {
                     session.state = SessionState::Running;
@@ -586,9 +654,10 @@ impl Sessions {
                 }
             }
         }
-        for session in ended {
+        for (session, lost) in ended {
             claims::release_session(&mut book.claims, session.id, name, session.terminal);
             self.plan_ended(&session, "the plan session ended with its runner", now);
+            self.master_gone(&session, lost, now);
         }
         if touched {
             self.changed(book);
@@ -673,6 +742,7 @@ impl Sessions {
             .runners
             .send(&session.runner, ToRunner::CloseSession { id })
         {
+            lock(&self.stopping).insert(id);
             Ok(())
         } else {
             Err(format!("session {id} is not running"))
@@ -972,6 +1042,7 @@ mod tests {
             config: Arc<CiConfig>,
             runners: Arc<Runners>,
             sessions: Sessions,
+            alerts: Receiver<crate::scheduler::Alert>,
             _docs: Receiver<String>,
             _events: Receiver<()>,
         }
@@ -982,6 +1053,7 @@ mod tests {
             let runners = Arc::new(Runners::new());
             let (docs_tx, docs) = channel();
             let (events_tx, events) = channel();
+            let (alerts_tx, alerts) = channel();
             let sessions = Sessions::new(
                 state.clone(),
                 Shared::new(CiConfig::clone(&config)),
@@ -989,12 +1061,14 @@ mod tests {
                 Arc::new(Mutex::new(())),
                 docs_tx,
                 events_tx,
+                alerts_tx,
             );
             Fixture {
                 state,
                 config,
                 runners,
                 sessions,
+                alerts,
                 _docs: docs,
                 _events: events,
             }
@@ -1130,6 +1204,104 @@ mod tests {
             assert_eq!(lost.state, SessionState::Ended);
             assert!(f.sessions.close(master).is_err());
             assert!(f.sessions.close(kept.id).is_ok());
+        }
+
+        #[test]
+        fn a_killed_master_is_started_again_on_its_runner() {
+            let f = fixture("restart");
+            let mut a = connect(&f.runners, "a", "linux");
+            let number = approved_plan(&f, &[]);
+            f.sessions.dispatch(10);
+            let Ok(ToRunner::OpenSession { spec }) = a.try_recv() else {
+                panic!("the master was sent");
+            };
+            let report = |message: FromRunner, at: u64| f.sessions.on_runner("a", message, at);
+            report(
+                FromRunner::SessionOpened {
+                    id: spec.id,
+                    terminal: 4,
+                },
+                11,
+            );
+            // `kill -9` from outside: the runner did not kill it, and it
+            // ended without a code.
+            report(
+                FromRunner::SessionEnded {
+                    id: spec.id,
+                    code: None,
+                    killed: false,
+                },
+                20,
+            );
+            assert_eq!(state_of(&f, number), DocState::Approved);
+
+            // Its runner takes it back even while cooling down.
+            lock(&f.sessions.cooldown).insert("a".into(), 1000);
+            f.sessions.dispatch(21);
+            let Ok(ToRunner::OpenSession { spec }) = a.try_recv() else {
+                panic!("the master was started again on its runner");
+            };
+            assert_eq!(spec.doc, Some(number));
+            let doc = docs::load(&f.state, &f.config, "demo", number).unwrap();
+            assert_eq!((doc.state, doc.note.as_str()), (DocState::InProgress, ""));
+
+            // Stopped by the user: it stays in progress and is not restarted.
+            report(
+                FromRunner::SessionOpened {
+                    id: spec.id,
+                    terminal: 5,
+                },
+                22,
+            );
+            f.sessions.close(spec.id).unwrap();
+            assert!(matches!(
+                a.try_recv(),
+                Ok(ToRunner::CloseSession { id }) if id == spec.id
+            ));
+            report(
+                FromRunner::SessionEnded {
+                    id: spec.id,
+                    code: None,
+                    killed: true,
+                },
+                23,
+            );
+            let doc = docs::load(&f.state, &f.config, "demo", number).unwrap();
+            assert_eq!(doc.state, DocState::InProgress);
+            assert!(doc.note.ends_with("Requeue resumes it"), "{}", doc.note);
+            f.sessions.dispatch(30);
+            assert!(a.try_recv().is_err());
+        }
+
+        #[test]
+        fn a_refused_master_requeues_its_ticket_with_the_reason() {
+            let f = fixture("refused");
+            let mut a = connect(&f.runners, "a", "linux");
+            let number = approved_plan(&f, &[]);
+            f.sessions.dispatch(10);
+            let Ok(ToRunner::OpenSession { spec }) = a.try_recv() else {
+                panic!("the master was sent");
+            };
+            f.sessions.on_runner(
+                "a",
+                FromRunner::SessionFailed {
+                    id: spec.id,
+                    message: "holds 2 changed files of ticket #9".to_owned(),
+                },
+                11,
+            );
+            let doc = docs::load(&f.state, &f.config, "demo", number).unwrap();
+            assert_eq!(doc.state, DocState::Approved);
+            assert!(doc.placement.is_empty());
+            assert_eq!(
+                doc.note,
+                "the master could not start: holds 2 changed files of ticket #9"
+            );
+            let alert = f.alerts.try_recv().unwrap();
+            assert_eq!(
+                alert.title,
+                format!("demo #{number}: the master could not start")
+            );
         }
 
         fn open_ticket(f: &Fixture, depends: &[u64]) -> u64 {

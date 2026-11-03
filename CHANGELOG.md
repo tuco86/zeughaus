@@ -33,6 +33,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assignment; the enlist protocol is major 13. The omp plugin's skill
   (0.12.1) documents it.
 
+- Masters resume their own interrupted omp session: each runs omp with the
+  ticket's session directory (`<state-dir>/agents/<repo>/master-<n>`),
+  records its ticket in the clone's `.git/zeughaus-master`, and resumes
+  the ticket's newest session whenever one exists. omp exiting while the
+  ticket is in progress is started again inside the session; a master
+  killed or lost with its runner is requeued and taken back by the runner
+  it ran on, past its cooldown. A clone holding work of another ticket, or
+  work nobody recorded, refuses the master at once with the reason as a
+  failed session, the ticket's note (shown on its Board card) and a notice,
+  instead of waiting in a loop. The popout's Stop ends a master for good; a
+  master that exits by itself leaves its ticket in progress with a note and
+  a notice.
+
 - Tickets: a proposal and its plan are one ticket with one number from
   proposal through planning, review and execution to done (`open`,
   `ready`, `planning`, `review`, `approved`, `in_progress`, `done`, or

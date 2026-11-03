@@ -1000,6 +1000,9 @@ pub fn set_state(
     }
     doc.state = to;
     doc.suggestion = None;
+    if to == DocState::Done {
+        doc.note.clear();
+    }
     doc.changed = now;
     write_json(&path, &doc)?;
     if reopen || close {
@@ -1434,9 +1437,60 @@ pub fn start(
     }
     doc.state = DocState::InProgress;
     doc.placement = placement;
+    doc.note.clear();
     doc.changed = now;
     write_json(&path, &doc)?;
     Ok(doc)
+}
+
+/// What became of the master of an in-progress ticket.
+pub enum MasterEnd<'a> {
+    /// It never ran: the runner refused it with this message.
+    Refused(&'a str),
+    /// Its process was killed or went away with its runner.
+    Lost,
+    /// It ended by itself or was stopped; `why` says how.
+    Stopped(&'a str),
+}
+
+/// The master of ticket `number` ended. Answers whether the ticket changed;
+/// a ticket that is not in progress any more is left alone. A refused
+/// master puts the ticket back into the queue with the reason and without
+/// its placement; a lost one puts it back with its placement, so its runner
+/// takes it again and resumes; a stopped one leaves it in progress with a
+/// note. `approved` is kept, so a requeued ticket keeps its place.
+pub fn master_ended(
+    state_dir: &Path,
+    config: &CiConfig,
+    repo: &str,
+    number: u64,
+    end: MasterEnd<'_>,
+    now: u64,
+) -> Result<bool, String> {
+    let dir = dir(state_dir, config, repo)?;
+    let path = path_of(&dir, number);
+    let mut doc = read_ticket(&path, repo, number)?;
+    if doc.state != DocState::InProgress {
+        return Ok(false);
+    }
+    match end {
+        MasterEnd::Refused(message) => {
+            doc.state = DocState::Approved;
+            doc.placement.clear();
+            doc.note = format!("the master could not start: {message}");
+        }
+        MasterEnd::Lost => {
+            doc.state = DocState::Approved;
+            doc.note.clear();
+        }
+        MasterEnd::Stopped(why) => {
+            doc.note =
+                format!("the master ended ({why}) with the ticket in progress; Requeue resumes it");
+        }
+    }
+    doc.changed = now;
+    write_json(&path, &doc)?;
+    Ok(true)
 }
 
 /// Every repository's approved tickets, without their texts, in the order
