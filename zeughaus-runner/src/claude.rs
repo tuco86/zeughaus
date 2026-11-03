@@ -164,7 +164,7 @@ fn status(ci: Option<String>, state_dir: &Path) -> Result<String, String> {
 
 fn token(ci: Option<String>, state_dir: &Path) -> Result<String, String> {
     match ask(ci, state_dir, CiRequest::ClaudeToken)? {
-        CiReply::ClaudeToken { token, .. } => Ok(token),
+        CiReply::ClaudeToken { token, .. } => Ok(token.into_inner()),
         other => Err(crate::mcp::unexpected(&other)),
     }
 }

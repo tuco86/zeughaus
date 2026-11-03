@@ -397,7 +397,10 @@ impl CiServer {
                 .as_deref()
                 .map(|claude| claude.current(crate::now_secs()))
             {
-                Some(Ok((token, expires))) => CiReply::ClaudeToken { token, expires },
+                Some(Ok((token, expires))) => CiReply::ClaudeToken {
+                    token: zeughaus_link::ClaudeAccessToken::new(token),
+                    expires,
+                },
                 Some(Err(e)) => error(&e),
                 None => error("the CI has no [claude] in ci.toml"),
             },

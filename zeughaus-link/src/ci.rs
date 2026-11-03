@@ -503,6 +503,29 @@ impl LineSpan {
         })
     }
 }
+/// An access token sent to an authenticated CI client. Debug output never
+/// carries the token; the wire representation is still a JSON string.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ClaudeAccessToken(String);
+
+impl ClaudeAccessToken {
+    /// Holds the access token returned by the CI's Claude client.
+    pub fn new(token: String) -> ClaudeAccessToken {
+        ClaudeAccessToken(token)
+    }
+
+    /// Gives the token to the caller that will use it as a credential.
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for ClaudeAccessToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClaudeAccessToken(<redacted>)")
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -580,7 +603,7 @@ pub enum CiReply {
     /// The current access token and when it expires (seconds since the
     /// UNIX epoch).
     ClaudeToken {
-        token: String,
+        token: ClaudeAccessToken,
         expires: u64,
     },
     /// The onboarding request's number and its tickets', in their order.
@@ -2154,7 +2177,7 @@ mod tests {
                 account: "me@example.org".to_owned(),
             },
             CiReply::ClaudeToken {
-                token: "t".to_owned(),
+                token: ClaudeAccessToken::new("t".to_owned()),
                 expires: 9,
             },
             CiReply::Onboarded {
@@ -2184,6 +2207,25 @@ mod tests {
         for reply in replies {
             assert_eq!(CiReply::decode(&reply.encode()), Some(reply));
         }
+    }
+
+    #[test]
+    fn a_claude_token_reply_is_wire_visible_but_debug_redacted() {
+        let token = "access-token-secret";
+        let reply = CiReply::ClaudeToken {
+            token: ClaudeAccessToken::new(token.to_owned()),
+            expires: 123,
+        };
+        let debug = format!("{reply:?}");
+        assert!(!debug.contains(token), "{debug}");
+        let encoded = reply.encode();
+        assert!(
+            encoded
+                .windows(token.len())
+                .any(|window| window == token.as_bytes()),
+            "{encoded:?}"
+        );
+        assert_eq!(CiReply::decode(&encoded), Some(reply));
     }
 
     #[test]
