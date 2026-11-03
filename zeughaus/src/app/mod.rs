@@ -16,6 +16,9 @@ mod ci;
 /// The graph as the editor holds it: nodes, edges, node instances, and the
 /// rules a wire has to pass.
 mod graph;
+/// The places Back and Forward walk, and the tree view of them.
+#[cfg(not(target_arch = "wasm32"))]
+mod history;
 /// Which machine a tab or a card runs on, as a glyph.
 #[cfg(not(target_arch = "wasm32"))]
 mod hosts;
@@ -23,7 +26,7 @@ mod hosts;
 mod layout;
 /// What one node draws.
 mod node_view;
-/// The notice center: the pull tab and the panel of notices.
+/// The notices: the popout over the status bar's attention chip.
 mod notices;
 /// The Projects section of the tab bar and the project listing.
 #[cfg(not(target_arch = "wasm32"))]
@@ -224,10 +227,23 @@ pub struct App {
     /// refused wire is worth one sentence and nothing more, and a notice that
     /// stays becomes furniture nobody reads.
     hint: Option<(String, iced::time::Instant)>,
-    /// What the notice center lists.
+    /// What the notice popout lists.
     notices: crate::notices::Notices,
-    /// Whether the notice center is open, sliding in and out.
-    notice_center: iced::Animation<bool>,
+    /// Whether the notice popout is open.
+    #[cfg(not(target_arch = "wasm32"))]
+    notice_popout: bool,
+    /// Where the pointer is over the chip and the popout, and whether the
+    /// palette pinned it.
+    #[cfg(not(target_arch = "wasm32"))]
+    notice_hover: notices::NoticeHover,
+    /// The places the window showed, for Back and Forward.
+    #[cfg(not(target_arch = "wasm32"))]
+    history: crate::history::History<history::Place>,
+    /// Whether the history tree is open, and the row under its keyboard.
+    #[cfg(not(target_arch = "wasm32"))]
+    history_open: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    history_cursor: usize,
 
     // Command palette state
     palette_open: bool,
@@ -432,9 +448,16 @@ impl App {
             last_error: String::new(),
             hint: None,
             notices: crate::notices::Notices::default(),
-            notice_center: iced::Animation::new(false)
-                .quick()
-                .easing(iced::animation::Easing::EaseOutCubic),
+            #[cfg(not(target_arch = "wasm32"))]
+            notice_popout: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            notice_hover: notices::NoticeHover::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            history: crate::history::History::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            history_open: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            history_cursor: 0,
             palette_open: false,
             renaming: None,
             palette_input: String::new(),
@@ -753,6 +776,9 @@ impl App {
         } else {
             None
         };
+        // After the restore: a restored place is shown there, not recorded.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.record_place();
         // The bar scrolls only when the front tab or the bar's edge changed,
         // never per frame; it runs after the view that holds the new front
         // tab has been laid out.
@@ -1397,6 +1423,10 @@ impl App {
                 #[cfg(not(target_arch = "wasm32"))]
                 self.rebuild_palette();
                 self.palette_open = !self.palette_open;
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.history_open = false;
+                }
                 if self.palette_open {
                     self.palette_input.clear();
                     self.palette_selected = 0;
@@ -1420,6 +1450,11 @@ impl App {
             }
             Message::PaletteConfirm => {
                 if !self.palette_open {
+                    // Enter in the history tree jumps to its row.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if self.history_open {
+                        return self.history_confirm();
+                    }
                     // Enter outside the palette acts on the row under the
                     // CI page's cursor, unless the ticket popout lies over
                     // it: its editors take Enter themselves.
@@ -1441,7 +1476,8 @@ impl App {
             }
             #[cfg(not(target_arch = "wasm32"))]
             Message::CiShortcut(shortcut) => {
-                if !self.palette_open {
+                // The page behind the history tree does not move.
+                if !self.palette_open && !self.history_open {
                     return self.ci_shortcut(shortcut);
                 }
             }
@@ -1453,9 +1489,17 @@ impl App {
                     if count > 0 {
                         let at = (self.palette_selected as isize + step).rem_euclid(count as isize);
                         self.palette_selected = at as usize;
-                        return crate::palette::reveal(self.palette_selected, count);
+                        return crate::palette::reveal(
+                            crate::palette::LIST_ID,
+                            self.palette_selected,
+                            count,
+                        );
                     }
                     return Task::none();
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                if self.history_open {
+                    return self.history_step(step);
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 if self.page.open && !matches!(self.page.view, PageView::Channel(..)) {
@@ -1566,10 +1610,18 @@ impl App {
                 }
             }
             Message::Escape => {
-                // An open notice center goes first: it lies over everything.
-                if self.notice_center.value() {
-                    self.notice_center.go_mut(false, iced::time::Instant::now());
-                    return Task::none();
+                // The open notices go first: they lie over everything. The
+                // history tree next: it lies over the page and the popout.
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if self.notice_popout {
+                        self.close_notices();
+                        return Task::none();
+                    }
+                    if self.history_open {
+                        self.history_open = false;
+                        return Task::none();
+                    }
                 }
                 // Escape takes back the innermost thing first: an open
                 // palette or rename, and only then the log beside a CI list.
@@ -1594,26 +1646,30 @@ impl App {
                 #[cfg(target_arch = "wasm32")]
                 let _ = claimed;
             }
-            Message::ToggleNoticeCenter => {
-                let open = !self.notice_center.value();
-                self.notice_center.go_mut(open, iced::time::Instant::now());
+            #[cfg(not(target_arch = "wasm32"))]
+            message @ (Message::NoticeHover(..)
+            | Message::NoticeHoverEnd(_)
+            | Message::ToggleNotices
+            | Message::CloseNotices
+            | Message::AttentionChip) => {
+                return self.apply_notices(message);
             }
-            Message::CloseNoticeCenter => {
-                self.notice_center.go_mut(false, iced::time::Instant::now());
-            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::Nav(msg) => return self.apply_nav(msg),
             Message::DismissNotice(id) => {
                 self.notices.dismiss(id);
-                self.close_empty_notice_center();
+                self.close_empty_notices();
             }
             Message::DismissAllNotices => {
                 self.notices.dismiss_all();
-                self.close_empty_notice_center();
+                self.close_empty_notices();
             }
             // The notice stays: what it is about is only looked at, not
             // answered.
             Message::OpenNotice(id) => {
                 let target = self.notices.get(id).and_then(|n| n.open.clone());
-                self.notice_center.go_mut(false, iced::time::Instant::now());
+                #[cfg(not(target_arch = "wasm32"))]
+                self.close_notices();
                 match target {
                     Some(crate::message::NoticeTarget::Terminal(key, terminal)) => {
                         #[cfg(not(target_arch = "wasm32"))]
@@ -1630,7 +1686,7 @@ impl App {
             }
             Message::NoticeTick => {
                 if self.notices.expire(std::time::SystemTime::now()) {
-                    self.close_empty_notice_center();
+                    self.close_empty_notices();
                 }
             }
             Message::NodeTriggered { node_id } => {
@@ -2095,15 +2151,20 @@ impl App {
                 background: Some(theme.extended().background.base.color.into()),
                 ..Default::default()
             });
-        // The ticket popout lies over the workspace, the notice center over
-        // it, and the palette over both.
+        // The ticket popout lies over the workspace, the history tree and
+        // the notices over it, and the palette over all of them.
         let mut layers = vec![body.into()];
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(popout) = self.ticket_view() {
-            layers.push(popout);
-        }
-        if let Some(center) = notices::center(self) {
-            layers.push(center);
+        {
+            if let Some(popout) = self.ticket_view() {
+                layers.push(popout);
+            }
+            if let Some(tree) = self.history_view() {
+                layers.push(tree);
+            }
+            if let Some(popout) = notices::popout(self) {
+                layers.push(popout);
+            }
         }
         if self.palette_open {
             layers.push(self.palette_overlay());
@@ -2572,22 +2633,7 @@ impl App {
             .padding([2, 8])
             .style(|theme: &Theme, status| button::text(theme.base(), status))
             .on_press(Message::Workspace(workspace::Message::TogglePlacement));
-        let toggle = iced::widget::tooltip(
-            toggle,
-            container(text(tip).size(12))
-                .padding([3, 6])
-                .style(|theme: &Theme| {
-                    let style = iced_tabs::Catalog::tooltip(theme);
-                    container::Style {
-                        background: style.background,
-                        text_color: Some(style.text),
-                        border: style.border,
-                        ..container::Style::default()
-                    }
-                }),
-            iced::widget::tooltip::Position::Bottom,
-        )
-        .gap(4);
+        let toggle = titlebar_tip(toggle, tip);
         let mut controls = row![toggle]
             .spacing(4)
             .align_y(iced::Alignment::Center)
@@ -2602,9 +2648,28 @@ impl App {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let corner = self.window_radius();
-            if let Some(chip) = self.page_chip() {
-                controls = controls.push(container(chip).padding([0, 8]));
-            }
+            let available = |place: &history::Place| self.place_available(place);
+            controls = controls
+                .push(nav_button(
+                    history::GLYPH_BACK,
+                    self.history
+                        .can_back(available)
+                        .then_some(Message::Nav(crate::message::NavMsg::Back)),
+                    "Back",
+                ))
+                .push(nav_button(
+                    history::GLYPH_FORWARD,
+                    self.history
+                        .can_forward(available)
+                        .then_some(Message::Nav(crate::message::NavMsg::Forward)),
+                    "Forward",
+                ))
+                .push(nav_button(
+                    history::GLYPH_HISTORY,
+                    (self.history.len() > 1)
+                        .then_some(Message::Nav(crate::message::NavMsg::ToggleTree)),
+                    "History",
+                ));
             controls = controls
                 .push(window_button(
                     GLYPH_MINIMIZE,
@@ -2795,6 +2860,12 @@ impl App {
                 &error,
                 self.theme.readable(self.theme.error()),
             ));
+        }
+        // The attention chip at the right end: what needs the user, what
+        // works, and the notices.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(chip) = self.page_chip() {
+            line = line.push(space().width(Length::Fill)).push(chip);
         }
 
         container(line)
@@ -3088,6 +3159,16 @@ impl App {
                 Event::Window(iced::window::Event::Rescaled(scale_factor)) => {
                     return Some(Message::WindowRescaled(scale_factor));
                 }
+                // The mouse's thumb buttons walk the history, wherever the
+                // pointer is: no widget uses them.
+                #[cfg(not(target_arch = "wasm32"))]
+                Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Back)) => {
+                    return Some(Message::Nav(crate::message::NavMsg::Back));
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Forward)) => {
+                    return Some(Message::Nav(crate::message::NavMsg::Forward));
+                }
                 #[cfg(not(target_arch = "wasm32"))]
                 Event::Window(iced::window::Event::Focused) => {
                     return Some(Message::WindowFocused(true));
@@ -3216,11 +3297,8 @@ impl App {
             );
         }
 
-        // The notice center slides frame by frame; the notices age, and the
-        // transient ones expire, on a clock of their own.
-        if self.notice_center.is_animating(iced::time::Instant::now()) {
-            subs.push(iced::window::frames().map(|_| Message::NoticeTick));
-        }
+        // The notices age, and the transient ones expire, on a clock of
+        // their own.
         #[cfg(not(target_arch = "wasm32"))]
         if !self.notices.is_empty() {
             subs.push(
@@ -3562,6 +3640,54 @@ fn window_button(
     .padding(0)
     .style(style)
     .on_press(message)
+    .into()
+}
+
+/// A titlebar button of the history: shaped as the window's buttons, with a
+/// tooltip below; without a message it is disabled and dims.
+#[cfg(not(target_arch = "wasm32"))]
+fn nav_button(
+    glyph: char,
+    message: Option<Message>,
+    tip: &'static str,
+) -> Element<'static, Message, Theme> {
+    let button = button(
+        text(glyph.to_string())
+            .size(WINDOW_GLYPH_SIZE)
+            .center()
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .width(TITLEBAR_HEIGHT)
+    .height(Length::Fill)
+    .padding(0)
+    .style(|theme: &Theme, status| button::text(theme.base(), status))
+    .on_press_maybe(message);
+    titlebar_tip(button, tip)
+}
+
+/// `content` with `words` in a bubble below it, styled as the tab bar's
+/// tooltips are.
+fn titlebar_tip<'a>(
+    content: impl Into<Element<'a, Message, Theme>>,
+    words: &'a str,
+) -> Element<'a, Message, Theme> {
+    iced::widget::tooltip(
+        content,
+        container(text(words).size(12))
+            .padding([3, 6])
+            .style(|theme: &Theme| {
+                let style = iced_tabs::Catalog::tooltip(theme);
+                container::Style {
+                    background: style.background,
+                    text_color: Some(style.text),
+                    border: style.border,
+                    ..container::Style::default()
+                }
+            }),
+        iced::widget::tooltip::Position::Bottom,
+    )
+    .gap(4)
     .into()
 }
 

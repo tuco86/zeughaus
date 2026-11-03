@@ -9,8 +9,11 @@ mod feed;
 mod graph_link;
 // The editor's bundled face, which is also its icon set.
 mod font;
+// Back and Forward: the places the window showed, as an undo tree.
+#[cfg(not(target_arch = "wasm32"))]
+mod history;
 mod message;
-// The notice center's model: severities, keys, stickiness, ages.
+// The notices' model: severities, keys, stickiness, ages.
 mod notices;
 // The terminal path: the runner's mux, its shared workspace and one stream
 // per terminal. Native-only, for the same reason as `feed`.

@@ -204,6 +204,30 @@ fn runner_commands(state: &RunnerState<'_>) -> Vec<Command<Message>> {
             .action(Message::TogglePage),
     );
     #[cfg(not(target_arch = "wasm32"))]
+    {
+        use crate::message::NavMsg;
+        commands.push(
+            command("nav.back", "Navigate / Back".to_string())
+                .description("The place before this one")
+                .action(Message::Nav(NavMsg::Back)),
+        );
+        commands.push(
+            command("nav.forward", "Navigate / Forward".to_string())
+                .description("The place Back left")
+                .action(Message::Nav(NavMsg::Forward)),
+        );
+        commands.push(
+            command("nav.history", "Navigate / History".to_string())
+                .description("Every place visited, as a tree")
+                .action(Message::Nav(NavMsg::ToggleTree)),
+        );
+        commands.push(
+            command("notices.show", "Notices / Show".to_string())
+                .description("The notices, until Escape")
+                .action(Message::ToggleNotices),
+        );
+    }
+    #[cfg(not(target_arch = "wasm32"))]
     for (name, origin) in &state.projects {
         commands.push(
             command(PROJECT_COMMAND_ID, format!("Project / Open {name}"))
@@ -342,19 +366,19 @@ fn close_button<'a>() -> Element<'a, Message, Theme> {
 }
 
 /// The palette's list, which [`reveal`] scrolls.
-const LIST_ID: &str = "palette-list";
+pub(crate) const LIST_ID: &str = "palette-list";
 
-/// Scrolls the palette's list so that entry `at` of `count` is in view: the
-/// list moves in step with the selection, which keeps the selected row near
-/// where the eye already is.
-pub fn reveal<T: Send + 'static>(at: usize, count: usize) -> iced::Task<T> {
+/// Scrolls `list` so that entry `at` of `count` is in view: the list moves
+/// in step with the selection, which keeps the selected row near where the
+/// eye already is.
+pub fn reveal<T: Send + 'static>(list: &'static str, at: usize, count: usize) -> iced::Task<T> {
     let y = if count > 1 {
         at as f32 / (count - 1) as f32
     } else {
         0.0
     };
     iced::widget::operation::snap_to(
-        LIST_ID,
+        list,
         iced::widget::scrollable::RelativeOffset {
             x: None,
             y: Some(y),

@@ -1,4 +1,4 @@
-//! The CI views: the Overview the titlebar chip opens, a project's Board, a
+//! The CI views: the Overview the status bar's chip opens, a project's Board, a
 //! channel's pipelines and a job's transcript, the last three as tabs of the
 //! project's group in the bar (a job's right after its channel's). The
 //! terminal of an Overview row or of a Board's detail is docked read-only
@@ -33,7 +33,7 @@ use zeughaus_theme::Theme;
 use super::{CiClient, JobRef, Tone, glyph, now, unavailable};
 use crate::app::App;
 use crate::app::agents::{agent_color, attention_title, role_glyph, role_word, state_word};
-use crate::message::{CiShortcut, Message, TicketMsg};
+use crate::message::{CiShortcut, Message, NoticeZone, TicketMsg};
 use crate::notices::{self, Severity};
 use crate::style::{self, Tokens};
 use crate::workspace::RunnerKey;
@@ -671,7 +671,7 @@ impl App {
     /// What the page's messages do.
     pub(in crate::app) fn apply_page(&mut self, message: Message) -> Task<Message> {
         match message {
-            // The titlebar chip and the palette: the Overview.
+            // The status bar's chip and the palette: the Overview.
             Message::TogglePage => {
                 if self.page.open && self.page.view == PageView::Overview {
                     self.page.open = false;
@@ -2142,11 +2142,13 @@ impl App {
         scroll::vertical(list).height(Length::Fill).into()
     }
 
-    /// The titlebar's chip: a dot in the colour of the worst that needs the
-    /// user (else the accent while something works), and the counts. `None`
-    /// without a CI and without an agent.
+    /// The status bar's chip: a dot in the colour of the worst that needs the
+    /// user (else the accent while something works), the counts, and the
+    /// number of notices in the colour of the most severe. A press opens the
+    /// Overview, the pointer on it the notices. `None` without a CI, an
+    /// agent or a notice.
     pub(in crate::app) fn page_chip(&self) -> Option<Element<'_, Message, Theme>> {
-        if self.ci.is_empty() && self.runtime.agents().next().is_none() {
+        if self.ci.is_empty() && self.runtime.agents().next().is_none() && self.notices.is_empty() {
             return None;
         }
         let t = Tokens::of(&self.theme);
@@ -2166,10 +2168,12 @@ impl App {
         if working > 0 {
             words.push(format!("{working} working"));
         }
-        let words = if words.is_empty() {
-            "CI".to_owned()
-        } else {
+        let words = if !words.is_empty() {
             words.join(" · ")
+        } else if self.ci.is_empty() && self.runtime.agents().next().is_none() {
+            "Notices".to_owned()
+        } else {
+            "CI".to_owned()
         };
         let dot = container(Space::new())
             .width(8)
@@ -2179,19 +2183,35 @@ impl App {
                 border: iced::border::rounded(4),
                 ..container::Style::default()
             });
-        let content = row![dot, text(words).size(CAPTION_TEXT)]
+        let mut content = row![dot, text(words).size(CAPTION_TEXT)]
             .spacing(6)
             .align_y(Alignment::Center);
+        if let Some(worst) = self.notices.worst() {
+            content = content.push(
+                container(
+                    text(self.notices.len().to_string())
+                        .size(10)
+                        .font(style::BOLD),
+                )
+                .padding([0, 5])
+                .style(style::notice_count(worst)),
+            );
+        }
         let chip = button(content)
-            .padding([2, 10])
-            .on_press(Message::TogglePage);
+            .padding([1, 8])
+            .on_press(Message::AttentionChip);
         let open = self.page.open && self.page.view == PageView::Overview;
         let chip = if open {
             chip.style(style::pill_button(&t))
         } else {
             chip.style(style::secondary_button(&t))
         };
-        Some(chip.into())
+        Some(
+            mouse_area(chip)
+                .on_enter(Message::NoticeHover(NoticeZone::Chip, true))
+                .on_exit(Message::NoticeHover(NoticeZone::Chip, false))
+                .into(),
+        )
     }
 }
 

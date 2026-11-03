@@ -1,4 +1,4 @@
-//! The notices the notice center lists: what ended without anyone watching,
+//! The notices the notice popout lists: what ended without anyone watching,
 //! an agent waiting for its user, a CI alert, a terminal's own notification.
 //! Oldest first; the view lists the newest on top.
 //!

@@ -127,8 +127,9 @@ new tab of it appears. A runner lists the projects (`/projects`): what the
 forges of `[projects]` in its `zeughaus.toml` let the user push to
 (`primary`, `[[projects.forge]]` with `kind = "forgejo"`/`"github"`, `url`
 for Forgejo and `token` as an argv such as `["get-secret", "..."]`) and the
-checkouts under its work root. A chip in the titlebar (`N need you`,
-`M working`, or `CI`; also "CI / Open page" in the palette) opens the
+checkouts under its work root. A chip at the right end of the status bar
+(`N need you`, `M working`, `CI`, or `Notices`, with the number of notices;
+also "CI / Open page" in the palette) opens the
 Overview: `Needs you` and `Working` (agents that wait or work, tickets
 awaiting review, failed channels and sessions, running channels and
 sessions; a row's terminal docks read-only beside the list and Enter or a
@@ -217,13 +218,23 @@ on); picking one sets the user variable `zeughaus_show`, which the runner
 passes on as an ordered terminal event, and the editor that drives the
 terminal (or, without a driver, looks at it) opens that ticket's popout.
 Commits of a session working on a ticket get `Ticket: <repo>#<n>` and
-`Omp-Session: <id>` trailers. Notices replace desktop notifications: the pull tab at the
-window's bottom right counts them in the colour of the worst and opens the
-notice center (severity, title, body, age; a pinned one stays until
-dismissed or resolved, the others go after 60 s). An agent that waits for
-its user and is not looked at, a CI alert, a failed session and a
-terminal's own notification (OSC 9/777) raise one; a click on its title
-opens what it is about.
+`Omp-Session: <id>` trailers. Notices replace desktop notifications: the
+status bar's chip counts them in the colour of the worst, and the pointer
+on it opens them in a popout above it ("Notices / Show" in the palette pins
+it until Escape or a click outside; severity, title, body, age; a pinned
+one stays until dismissed or resolved, the others go after 60 s). An agent
+that waits for its user and is not looked at, a CI alert, a failed session
+and a terminal's own notification (OSC 9/777) raise one; a click on its
+title opens what it is about.
+
+Back and Forward walk the places the window showed (a tab, a CI view, the
+ticket popout over either) with the mouse's thumb buttons, the arrows left
+of the minimize button or "Navigate / Back|Forward" in the palette. The
+places form an undo tree (`zeughaus/src/history.rs`, at most 100): a new
+place after a Back branches off and keeps the old way forward, and the
+History button beside the arrows ("Navigate / History") draws the tree as
+a git-style graph whose rows jump there. A place passed within 750 ms is
+not kept, and the tree survives the editor's SIGUSR1 restart.
 
 `zeughaus-runner [--state-dir <dir>] mcp [--ci <url>]` is an MCP server on
 stdio, for an agent that starts it as a tool server. It dials the CI that

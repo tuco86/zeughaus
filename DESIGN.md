@@ -391,6 +391,19 @@ user sees. It is also the icon set: codicons and the Material circles are
 glyphs of that face at their own width. Terminals keep the Mono variant of
 `iced_terminal`, whose cell grid needs one advance for every glyph.
 
+**Back and Forward** (`zeughaus/src/history.rs`, `app/history.rs`). After
+every message the editor compares what the window shows with the current
+place of an undo tree and records a change as a visit: back to the parent
+is a Back step, to a child a Forward step, anything else a new child, so a
+place reached after a Back branches off and the old way forward stays. A
+place is a runner's tab or a CI view (by CI, repository, channel, pipeline
+and job, since the views' ids are per process) with the ticket popout over
+it; a place left within 750 ms of an automatic visit was passed through
+and is taken out. Back and Forward skip places that are gone, the tree
+keeps 100 places (the oldest branch goes first) and travels in the restore
+file of a restart. The thumb buttons, the titlebar's arrows and the palette
+walk it; the History button draws it as a git-style graph.
+
 ## 7. Plugins
 
 | plugin | nodes | notes |
@@ -1415,7 +1428,7 @@ but also for jobs that hold secrets: editors are trusted peers and can
 open the transcript anyway) and the stored `excerpt`. Every saved record is announced as
 `RuntimeEvent::CiPipeline` on the `ci` topic. In the editor
 (`zeughaus/src/app/ci.rs`, the views in `ci/page.rs`) each URL of `ci` is a
-link of its own. A titlebar chip opens the Overview over the workspace
+link of its own. The status bar's chip opens the Overview over the workspace
 (the chip says how many things need the user and how many work, coloured
 by the worst; the palette's "CI / Open page" does the same): `Needs you`
 and `Working` (agents that wait or work, as their terminals' activity
@@ -1453,7 +1466,7 @@ Enter on a card of the lanes or a running one brings its session's (else
 its claim holder's) tab to the front and on any other opens the ticket's
 popout, and `a`, `r` and `p` approve, dismiss and release for planning
 where the ticket offers it. The popout (`ci/ticket.rs`) lies over the
-workspace under the notice center and the palette: the ticket's number,
+workspace under the history tree, the notices and the palette: the ticket's number,
 title and state, its actions (`Edit` of an open or ready ticket, what it
 waits for, the note of a session that ended without a plan), the tabs
 `Proposal` and `Plan v<n>`, and a side column with its state, source,

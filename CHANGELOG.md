@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Back and Forward in the editor. Every change of what the window shows
+  (a tab, the Overview, a Board, a channel, a job's transcript, the ticket
+  popout over any of them) is a place in an undo tree: the mouse's thumb
+  buttons, the arrows at the titlebar's right and "Navigate / Back" and
+  "Navigate / Forward" in the palette walk it, a new place after a Back
+  branches off without losing the old way forward, and the History button
+  beside them draws the tree as a git-style graph whose rows jump there.
+  Closed tabs and views are skipped and shown as closed; the tree survives
+  the editor's restart. `zeughaus ctl S click X Y back|forward` presses the
+  thumb buttons of a headless editor.
+
 - Ticket references in omp. The MCP server of `zeughaus-runner mcp` serves
   every ticket as the resource `ticket://<repo>/<number>`, so `read
   ticket://zeughaus/44` shows what `doc_read` does and an unknown ticket
@@ -107,7 +118,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (0.12.0) tells plan sessions about such sections; `proposal_write` and
   `onboard_request` take the title from the body's first line.
 
-- The CI page: the CI leaves the tab bar for a chip in the titlebar
+- The CI page: the CI leaves the tab bar for a chip in the status bar
   (`N need you`, `M working`) and a full-window page over the workspace.
   Its Overview lists what needs the user (agents that wait, plans to
   approve, failed channels and sessions) and what works, with the row's
@@ -117,10 +128,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminal docked under an in-progress plan; `a`, `r`, `p` and `j`/`k` on
   the keyboard), its Sessions and its Runners with each runner's activity.
   "CI / Open page" in the palette opens it too.
-- A notice center after griasdi's replaces desktop notifications: a pull
-  tab at the window's bottom right counts the notices in the colour of the
-  worst and opens the panel; each notice shows its age, a pinned one stays
-  until it is dismissed or its cause resolves, the others go after 60 s.
+- A notice center after griasdi's replaces desktop notifications: the
+  notices count in the colour of the worst on the status bar's attention
+  chip, which opens them in a popout while the pointer is on it; each
+  notice shows its age, a pinned one stays until it is dismissed or its
+  cause resolves, the others go after 60 s.
   CI alerts, failed sessions, agents waiting for their user and terminal
   notifications (OSC 9/777) raise one, and a click on its title opens what
   it is about.

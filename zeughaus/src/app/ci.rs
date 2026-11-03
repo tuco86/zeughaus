@@ -658,6 +658,12 @@ impl CiClient {
         Some(self.views.get(&view)?.channel.as_str())
     }
 
+    /// The repository and channel that channel view `view` shows.
+    pub(super) fn view_channel(&self, view: u64) -> Option<(&str, &str)> {
+        let state = self.views.get(&view)?;
+        Some((state.repo.as_str(), state.channel.as_str()))
+    }
+
     /// `repo`'s channels as the CI's overview lists them: dev, nightly and
     /// release first, then the rest by name.
     pub(super) fn channels_of(&self, repo: &str) -> Vec<&zeughaus_link::ChannelView> {
@@ -2507,7 +2513,7 @@ impl App {
 }
 
 /// Codicons of the bundled Nerd Font, the chrome's one icon set.
-mod glyph {
+pub(super) mod glyph {
     pub const PASS: char = '\u{ebb3}';
     pub const ERROR: char = '\u{ea87}';
     pub const RUNNING: char = '\u{ea77}';

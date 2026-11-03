@@ -1,8 +1,8 @@
 //! The ticket popout: one ticket of a Board laid over the workspace, with
 //! its proposal, its plan under review, its links, its sessions and what
-//! its state lets the user do; or a new ticket being written. The palette
-//! and the notice center lie over it; Escape or a press on the scrim closes
-//! it.
+//! its state lets the user do; or a new ticket being written. The palette,
+//! the notices and the history tree lie over it; Escape or a press on the
+//! scrim closes it.
 
 use iced::widget::{
     Space, button, column, container, markdown, mouse_area, opaque, row, rule, text, text_editor,
@@ -189,6 +189,48 @@ impl App {
             return Task::none();
         };
         self.apply_ticket(TicketMsg::Open { ci, view, number })
+    }
+
+    /// The CI, repository and number of the ticket the popout shows; `None`
+    /// while a new ticket is written.
+    pub(in crate::app) fn popout_ticket(&self) -> Option<(&RunnerKey, &str, u64)> {
+        let popout = self.ticket.as_ref()?;
+        let number = popout.number?;
+        let state = self.ci.get(&popout.ci)?.plans.get(&popout.view)?;
+        Some((&popout.ci, state.repo.as_str(), number))
+    }
+
+    /// The title of ticket `number` of `repo` on CI `ci`, once it is listed.
+    pub(in crate::app) fn ticket_title(
+        &self,
+        ci: &RunnerKey,
+        repo: &str,
+        number: u64,
+    ) -> Option<&str> {
+        let client = self.ci.get(ci)?;
+        let view = client.plans_view_of(repo)?;
+        Some(client.plans.get(&view)?.doc(number)?.title.as_str())
+    }
+
+    /// Opens ticket `number` of `repo` on CI `ci` in the popout.
+    pub(in crate::app) fn open_ticket(
+        &mut self,
+        ci: &RunnerKey,
+        repo: &str,
+        number: u64,
+    ) -> Task<Message> {
+        let Some(view) = self
+            .ci
+            .get(ci)
+            .and_then(|client| client.plans_view_of(repo))
+        else {
+            return Task::none();
+        };
+        self.apply_ticket(TicketMsg::Open {
+            ci: ci.clone(),
+            view,
+            number,
+        })
     }
 
     /// What the popout's messages do.

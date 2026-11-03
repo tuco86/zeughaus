@@ -298,16 +298,32 @@ pub enum Message {
     // Hold a runner, which starts no new run and lets the live ones finish,
     // or release it again.
     HoldRunner(crate::workspace::RunnerKey, bool),
-    // The notice center: the pull tab opens or closes it, a click outside or
-    // Escape closes it, a notice's x or Clear all dismisses, a click on a
-    // notice's title opens what it is about.
-    ToggleNoticeCenter,
-    CloseNoticeCenter,
+    // The notices: a popout over the status bar's attention chip that opens
+    // while the pointer is on the chip or on the popout and closes a moment
+    // after it left both; the palette pins it open until a click outside or
+    // Escape. A press on the chip opens the Overview. A notice's x or Clear
+    // all dismisses, a click on a notice's title opens what it is about.
+    #[cfg(not(target_arch = "wasm32"))]
+    NoticeHover(NoticeZone, bool),
+    #[cfg(not(target_arch = "wasm32"))]
+    NoticeHoverEnd(u64),
+    #[cfg(not(target_arch = "wasm32"))]
+    ToggleNotices,
+    #[cfg(not(target_arch = "wasm32"))]
+    CloseNotices,
+    #[cfg(not(target_arch = "wasm32"))]
+    AttentionChip,
+    // The thumb buttons, the titlebar's buttons and the palette walk the
+    // history of places the window showed.
+    #[cfg(not(target_arch = "wasm32"))]
+    Nav(NavMsg),
     DismissNotice(u64),
+    // The browser editor raises no notices: nothing clears or ages them there.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     DismissAllNotices,
     OpenNotice(u64),
-    // The center's animation frame or its clock, which expires transient
-    // notices.
+    // The notices' clock, which ages them and expires the transient ones.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     NoticeTick,
     // What the runner answered: the state it is in now and how many runs are
     // still alive.
@@ -333,7 +349,7 @@ pub enum Message {
     // does; a subscription's map cannot capture a runner, so it names none.
     #[cfg(not(target_arch = "wasm32"))]
     CiPoll,
-    // The CI page: the titlebar chip or the palette opens and closes it, the
+    // The CI page: the status bar's chip or the palette opens and closes it, the
     // sidebar shows a view, the arrow keys and j/k move its cursor, Enter
     // acts on the row under it, a click on a row acts on that row, a click
     // on a row of Sessions or Runners puts the cursor on it.
@@ -445,6 +461,27 @@ pub enum CiShortcut {
     /// `h` and Left, Right: a Board's column.
     Left,
     Right,
+}
+
+/// Where the pointer is over the notices: the status bar's chip or the
+/// popout above it.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeZone {
+    Chip,
+    Popout,
+}
+
+/// Back, Forward and the history tree.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavMsg {
+    Back,
+    Forward,
+    ToggleTree,
+    CloseTree,
+    /// To a node of the tree, by its id.
+    Jump(u64),
 }
 
 /// What a click on a notice opens.

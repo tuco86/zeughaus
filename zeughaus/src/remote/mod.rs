@@ -296,6 +296,8 @@ fn button(name: Option<&str>) -> Result<mouse::Button, String> {
         None | Some("left") => Ok(mouse::Button::Left),
         Some("right") => Ok(mouse::Button::Right),
         Some("middle") => Ok(mouse::Button::Middle),
+        Some("back") => Ok(mouse::Button::Back),
+        Some("forward") => Ok(mouse::Button::Forward),
         Some(other) => Err(format!("unknown button {other:?}")),
     }
 }

@@ -82,6 +82,9 @@ pub struct RestoreState {
     /// `(runner key, tab)` the group held then.
     #[serde(default)]
     pub dismissed: Vec<(String, Vec<(String, u64)>)>,
+    /// Back and Forward's places, oldest first.
+    #[serde(default)]
+    pub history: Option<crate::history::Saved<super::history::Place>>,
 }
 
 /// The parts of a restore still waiting for what they apply to.
@@ -94,6 +97,8 @@ pub(super) struct PendingRestore {
     scrolls: Vec<(RunnerKey, TerminalId, i64)>,
     /// Nested views still waiting for their container to load.
     views: Vec<NodeId>,
+    /// Whether the history's current place still has to be shown.
+    place: bool,
     since: Instant,
 }
 
@@ -197,6 +202,9 @@ impl App {
             node: NodeId(node),
             draft,
         });
+        if let Some(saved) = state.history {
+            app.history = crate::history::History::load(saved, Instant::now());
+        }
         app.pending_restore = Some(PendingRestore {
             active: state.active.map(|(runner, tab)| TabRef {
                 runner: RunnerKey::new(&runner),
@@ -216,6 +224,7 @@ impl App {
                 })
                 .collect(),
             views: state.views.iter().copied().map(NodeId).collect(),
+            place: app.history.current().is_some(),
             since: Instant::now(),
         });
         if let Some(document) = state.document {
@@ -300,6 +309,7 @@ impl App {
                     (origin.clone(), tabs)
                 })
                 .collect(),
+            history: Some(self.history.save(Instant::now())),
         }
     }
 
@@ -370,11 +380,32 @@ impl App {
             pending.rename_focus = false;
             tasks.push(iced::widget::operation::focus(RENAME_INPUT));
         }
+        // After the tab: the place in front, when it was a CI view or had a
+        // ticket over it, once what it names has arrived.
+        let place_due = pending.place && pending.active.is_none();
+        if place_due {
+            let place = self.history.current().cloned();
+            if place
+                .as_ref()
+                .is_none_or(|place| self.place_available(place))
+            {
+                if let Some(place) = place {
+                    tasks.push(self.show_place(&place));
+                }
+                if let Some(pending) = self.pending_restore.as_mut() {
+                    pending.place = false;
+                }
+            }
+        }
+        let Some(pending) = self.pending_restore.as_mut() else {
+            return Task::batch(tasks);
+        };
         let done = pending.active.is_none()
             && pending.focus.is_none()
             && pending.selected.is_empty()
             && pending.views.is_empty()
-            && !pending.rename_focus;
+            && !pending.rename_focus
+            && !pending.place;
         let expired = pending.since.elapsed() >= RESTORE_WINDOW;
         let scrolls = std::mem::take(&mut pending.scrolls);
         let mut waiting = Vec::new();
@@ -392,6 +423,14 @@ impl App {
             _ => self.pending_restore = None,
         }
         Task::batch(tasks)
+    }
+
+    /// Whether a restored place is still to be shown: until it is, what the
+    /// window shows is not a place the user went to.
+    pub(super) fn restoring_place(&self) -> bool {
+        self.pending_restore
+            .as_ref()
+            .is_some_and(|pending| pending.place)
     }
 }
 
@@ -421,6 +460,7 @@ mod tests {
             scrolls: vec![("sha256:aa".into(), 9, 12)],
             views: vec![5, 6],
             dismissed: Vec::new(),
+            history: None,
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: RestoreState = serde_json::from_str(&json).unwrap();

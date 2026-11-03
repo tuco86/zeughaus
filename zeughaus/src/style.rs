@@ -1,5 +1,5 @@
 //! Surface colours and style closures for the editor's chrome lists, panels and
-//! buttons, ported from griasdi's desktop so the notice center and the CI page
+//! buttons, ported from griasdi's desktop so the notices and the CI page
 //! look like it. [`Tokens`] derives the surfaces from the theme's palette; the
 //! style functions are built from them.
 
@@ -20,7 +20,7 @@ pub const BOLD: Font = Font {
 /// Surface colours derived from a theme.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tokens {
-    /// The sidebar of a page and the notice center's panel.
+    /// The sidebar of a page and the popovers' panels.
     pub sidebar: Color,
     /// A page's main surface.
     pub surface: Color,
@@ -289,7 +289,7 @@ pub fn badge(t: &Tokens, accent: bool) -> impl Fn(&Theme) -> container::Style + 
     }
 }
 
-/// Card background with a border: one notice of the notice center.
+/// Card background with a border: one notice of the notice popout.
 pub fn card(t: &Tokens) -> impl Fn(&Theme) -> container::Style + use<> {
     let (bg, border) = (t.sidebar, t.border);
     move |_| container::Style {
@@ -303,9 +303,9 @@ pub fn card(t: &Tokens) -> impl Fn(&Theme) -> container::Style + use<> {
     }
 }
 
-/// The notice center's panel along the window's right edge; `corner` rounds
-/// the window's bottom-right corner.
-pub fn notice_center(t: &Tokens, corner: f32) -> impl Fn(&Theme) -> container::Style + use<> {
+/// A panel that floats over the workspace: the notices over the attention
+/// chip, the history under its titlebar button.
+pub fn popover(t: &Tokens) -> impl Fn(&Theme) -> container::Style + use<> {
     let t = *t;
     move |theme| container::Style {
         background: Some(Background::Color(t.sidebar)),
@@ -313,43 +313,38 @@ pub fn notice_center(t: &Tokens, corner: f32) -> impl Fn(&Theme) -> container::S
         border: Border {
             color: t.border,
             width: 1.0,
-            radius: iced::border::left(8.0).bottom_right(corner),
+            radius: 8.0.into(),
         },
         shadow: Shadow {
             color: Color::from_rgba(0.0, 0.0, 0.0, 0.35),
-            offset: Vector::new(-4.0, 0.0),
+            offset: Vector::new(0.0, 4.0),
             blur_radius: 16.0,
         },
         ..container::Style::default()
     }
 }
 
-/// The notice center's pull tab, filled in the colour of its most severe
-/// notice.
-pub fn notice_tab(
+/// The attention chip's count of notices, filled in the colour of the most
+/// severe.
+pub fn notice_count(
     severity: crate::notices::Severity,
-) -> impl Fn(&Theme, button::Status) -> button::Style + use<> {
+) -> impl Fn(&Theme) -> container::Style + use<> {
     use crate::notices::Severity;
-    move |theme, status| {
+    move |theme| {
         let p = theme.extended();
-        let (base, strong) = match severity {
-            Severity::Error => (p.danger.base, p.danger.strong),
-            Severity::Warning => (p.warning.base, p.warning.strong),
-            Severity::Info => (p.primary.base, p.primary.strong),
+        let base = match severity {
+            Severity::Error => p.danger.base,
+            Severity::Warning => p.warning.base,
+            Severity::Info => p.primary.base,
         };
-        let pair = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-            strong
-        } else {
-            base
-        };
-        button::Style {
-            background: Some(Background::Color(pair.color)),
-            text_color: pair.text,
+        container::Style {
+            background: Some(Background::Color(base.color)),
+            text_color: Some(base.text),
             border: Border {
-                radius: iced::border::left(6.0),
+                radius: 6.0.into(),
                 ..Border::default()
             },
-            ..button::Style::default()
+            ..container::Style::default()
         }
     }
 }

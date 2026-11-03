@@ -1,36 +1,59 @@
-//! The notice center, after griasdi's: one box per notice, newest on top, in a
-//! panel that slides in from the right. A slim pull tab at the bottom right
-//! opens it and counts the notices in the colour of the most severe; a click
-//! outside the panel, the tab or Escape closes it. Each box shows its
-//! severity, title, body, age and, when it stays until resolved, a pin.
+//! The notices, after griasdi's: one box per notice, newest on top, in a
+//! popout over the status bar's attention chip. It opens while the pointer
+//! is on the chip or on the popout itself and closes a moment after it
+//! left both; "Notices / Show" in the palette pins it open until a click
+//! outside or Escape. Each box shows its severity, title, body, age and,
+//! when it stays until resolved, a pin.
+
+// The browser editor raises no notices and draws no popout.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 use std::time::SystemTime;
 
-use iced::widget::{
-    Space, Stack, button, column, container, float, mouse_area, opaque, row, text, tooltip,
-};
-use iced::{Alignment, Background, Border, Element, Length, Padding, Vector};
+use iced::widget::{Space, button, column, container, row, text, tooltip};
+#[cfg(not(target_arch = "wasm32"))]
+use iced::widget::{Stack, mouse_area, opaque};
+use iced::{Alignment, Background, Border, Element, Length};
+#[cfg(not(target_arch = "wasm32"))]
+use iced::{Padding, Task};
+#[cfg(not(target_arch = "wasm32"))]
 use iced_tabs::scroll;
 use zeughaus_theme::Theme;
 
 use super::App;
 use crate::message::Message;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::message::NoticeZone;
 use crate::notices::{self, Notice, Severity};
 use crate::style::{self, Tokens};
 
-/// Width of the open center.
-const CENTER_WIDTH: f32 = 340.0;
-/// Width of the pull tab at the window's right edge.
-const TAB_WIDTH: f32 = 14.0;
-const TAB_HEIGHT: f32 = 40.0;
-/// Distance of the tab from the window's bottom edge, clear of the corner
-/// resize grip.
-const TAB_BOTTOM: f32 = 20.0;
+/// Width of the popout.
+#[cfg(not(target_arch = "wasm32"))]
+const POPOUT_WIDTH: f32 = 360.0;
+/// The tallest the popout's list grows before it scrolls.
+#[cfg(not(target_arch = "wasm32"))]
+const POPOUT_MAX_HEIGHT: f32 = 420.0;
+/// How long the popout stays after the pointer left the chip and the
+/// popout: long enough to cross the gap between them.
+#[cfg(not(target_arch = "wasm32"))]
+const NOTICE_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The pin of a notice that stays until it is dismissed or resolved.
 const PIN: char = '\u{eba0}';
 /// The dismiss button's cross.
 const CLOSE: char = '\u{ea76}';
+
+/// Where the pointer is, and whether the palette pinned the popout open.
+/// Each change bumps `generation`, so a grace period that ended after the
+/// pointer came back closes nothing.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Default)]
+pub(super) struct NoticeHover {
+    chip: bool,
+    popout: bool,
+    pinned: bool,
+    generation: u64,
+}
 
 impl App {
     /// Raises a notice now; see [`notices::Notices::raise`].
@@ -48,11 +71,64 @@ impl App {
             .raise(key, severity, title, body, sticky, open, SystemTime::now())
     }
 
-    /// Closes the notice center once nothing is left in it.
-    pub(super) fn close_empty_notice_center(&mut self) {
+    /// Closes the notices once nothing is left in them.
+    pub(super) fn close_empty_notices(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
         if self.notices.is_empty() {
-            self.notice_center.go_mut(false, iced::time::Instant::now());
+            self.notice_popout = false;
+            self.notice_hover.pinned = false;
         }
+    }
+
+    /// Shuts the popout, pinned or not.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn close_notices(&mut self) {
+        self.notice_hover.pinned = false;
+        self.notice_popout = false;
+    }
+
+    /// What the pointer, the chip and the palette do to the popout.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn apply_notices(&mut self, message: Message) -> Task<Message> {
+        let hover = &mut self.notice_hover;
+        match message {
+            Message::NoticeHover(zone, inside) => {
+                match zone {
+                    NoticeZone::Chip => hover.chip = inside,
+                    NoticeZone::Popout => hover.popout = inside,
+                }
+                hover.generation += 1;
+                if hover.chip || hover.popout || hover.pinned {
+                    self.notice_popout = !self.notices.is_empty() || hover.pinned;
+                } else {
+                    let generation = hover.generation;
+                    return Task::perform(tokio::time::sleep(NOTICE_GRACE), move |()| {
+                        Message::NoticeHoverEnd(generation)
+                    });
+                }
+            }
+            Message::NoticeHoverEnd(generation) => {
+                if generation == hover.generation && !(hover.chip || hover.popout || hover.pinned) {
+                    self.notice_popout = false;
+                }
+            }
+            Message::ToggleNotices => {
+                hover.pinned = !self.notice_popout;
+                self.notice_popout = hover.pinned;
+            }
+            Message::CloseNotices => self.close_notices(),
+            // The popout stays shut until the pointer enters the chip again.
+            Message::AttentionChip => {
+                *hover = NoticeHover {
+                    generation: hover.generation + 1,
+                    ..NoticeHover::default()
+                };
+                self.notice_popout = false;
+                return self.apply_page(Message::TogglePage);
+            }
+            _ => {}
+        }
+        Task::none()
     }
 }
 
@@ -78,34 +154,19 @@ fn tip<'a>(
         .into()
 }
 
-/// The pull tab: the number of notices, filled in the colour of the most
-/// severe.
-fn tab<'a>(app: &'a App, open: bool) -> Element<'a, Message, Theme> {
-    let worst = app.notices.worst().unwrap_or(Severity::Info);
-    let count = container(
-        text(app.notices.len().to_string())
-            .size(10)
-            .font(style::BOLD),
-    )
-    .center_x(Length::Fill)
-    .center_y(Length::Fill);
-    let tab = button(count)
-        .width(TAB_WIDTH)
-        .height(TAB_HEIGHT)
-        .padding(0)
-        .style(style::notice_tab(worst))
-        .on_press(Message::ToggleNoticeCenter);
-    tip(tab, if open { "Hide notices" } else { "Notices" })
-}
-
-/// The open panel: the header with "Clear all", then the boxes, newest on
-/// top.
-fn panel<'a>(app: &'a App, t: &Tokens) -> Element<'a, Message, Theme> {
+/// The popout: the header with "Clear all", then the boxes, newest on top,
+/// right above the chip. `None` while it is shut.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn popout(app: &App) -> Option<Element<'_, Message, Theme>> {
+    if !app.notice_popout {
+        return None;
+    }
+    let t = Tokens::of(&app.theme);
     let now = SystemTime::now();
     let clear = button(text("Clear all").size(12))
         .padding([3, 10])
-        .style(style::secondary_button(t))
-        .on_press(Message::DismissAllNotices);
+        .style(style::secondary_button(&t))
+        .on_press_maybe((!app.notices.is_empty()).then_some(Message::DismissAllNotices));
     let header = row![
         text("Notices").size(14).font(style::BOLD),
         Space::new().width(Length::Fill),
@@ -113,75 +174,43 @@ fn panel<'a>(app: &'a App, t: &Tokens) -> Element<'a, Message, Theme> {
     ]
     .spacing(8)
     .align_y(Alignment::Center);
-    let boxes = column(
-        app.notices
-            .iter()
-            .rev()
-            .map(|notice| notice_box(app, t, notice, now)),
-    )
-    .spacing(6);
-    opaque(
-        container(column![header, scroll::vertical(boxes).height(Length::Fill)].spacing(10))
-            .padding(12)
-            .width(CENTER_WIDTH)
-            .height(Length::Fill)
-            .style(style::notice_center(t, app.window_radius())),
-    )
-}
-
-/// The notice center layer: only the pull tab while closed, the tab glued
-/// to the sliding panel while open or animating; `None` with nothing to show.
-pub(super) fn center(app: &App) -> Option<Element<'_, Message, Theme>> {
-    let now = iced::time::Instant::now();
-    let animating = app.notice_center.is_animating(now);
-    let open = app.notice_center.value();
-    if app.notices.is_empty() && !animating {
-        return None;
-    }
-    let t = Tokens::of(&app.theme);
-    let lift = Padding {
-        bottom: TAB_BOTTOM,
-        ..Padding::ZERO
-    };
-    if !open && !animating {
-        return Some(
-            container(tab(app, false))
-                .padding(lift)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_right(Length::Fill)
-                .align_bottom(Length::Fill)
-                .into(),
-        );
-    }
-    let p: f32 = app.notice_center.interpolate(0.0, 1.0, now);
-    let slot: Element<'_, Message, Theme> = if app.notices.is_empty() {
-        // The last notice is gone while the panel slides out.
-        Space::new().width(TAB_WIDTH).into()
+    let body: Element<'_, Message, Theme> = if app.notices.is_empty() {
+        text("No notices").size(12).color(app.theme.muted()).into()
     } else {
-        tab(app, open)
+        let boxes = column(
+            app.notices
+                .iter()
+                .rev()
+                .map(|notice| notice_box(app, &t, notice, now)),
+        )
+        .spacing(6);
+        container(scroll::vertical(boxes))
+            .max_height(POPOUT_MAX_HEIGHT)
+            .into()
     };
-    let unit = row![
-        container(slot)
-            .padding(lift)
-            .height(Length::Fill)
-            .align_bottom(Length::Fill),
-        panel(app, &t),
-    ]
-    .height(Length::Fill);
-    let placed =
-        container(float(unit).translate(move |_, _| Vector::new((1.0 - p) * CENTER_WIDTH, 0.0)))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_right(Length::Fill);
-    if !open {
-        // Sliding out: nothing to dismiss any more.
+    let panel = container(column![header, body].spacing(10))
+        .padding(12)
+        .width(POPOUT_WIDTH)
+        .style(style::popover(&t));
+    let panel = mouse_area(opaque(panel))
+        .on_enter(Message::NoticeHover(NoticeZone::Popout, true))
+        .on_exit(Message::NoticeHover(NoticeZone::Popout, false));
+    let placed = container(panel)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_right(Length::Fill)
+        .align_bottom(Length::Fill)
+        .padding(Padding {
+            right: super::STATUS_GAP,
+            bottom: 4.0,
+            ..Padding::ZERO
+        });
+    if !app.notice_hover.pinned {
         return Some(placed.into());
     }
-    // A click anywhere outside the panel and the tab (both capture their
-    // own) closes it.
+    // Pinned: a click anywhere outside the popout closes it.
     let backdrop = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
-        .on_press(Message::CloseNoticeCenter);
+        .on_press(Message::CloseNotices);
     Some(Stack::with_children([backdrop.into(), placed.into()]).into())
 }
 
