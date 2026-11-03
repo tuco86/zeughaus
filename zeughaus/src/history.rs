@@ -342,6 +342,9 @@ impl<P: Clone + PartialEq> History<P> {
             .map_or(0, |lane| lane + 1)
     }
 
+    /// The tree as a restart hands it on; only a unix restart (SIGUSR1)
+    /// writes a restore file.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn save(&self, now: Instant) -> Saved<P> {
         Saved {
             nodes: self
