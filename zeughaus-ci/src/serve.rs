@@ -75,6 +75,8 @@ pub struct CiServer {
     /// on `/events`.
     docs_changed: std::sync::mpsc::Sender<String>,
     sessions: Arc<Sessions>,
+    /// The Claude sign-in of `[claude]`.
+    claude: Option<Arc<crate::claude::Claude>>,
 }
 
 impl CiServer {
@@ -98,7 +100,14 @@ impl CiServer {
             docs,
             docs_changed,
             sessions,
+            claude: None,
         }
+    }
+
+    /// The server with the Claude sign-in it reports and advises with.
+    pub fn with_claude(mut self, claude: Option<Arc<crate::claude::Claude>>) -> CiServer {
+        self.claude = claude;
+        self
     }
 
     /// Blocking: reads records from disk, and for a `Repo` runs git on the
@@ -338,7 +347,7 @@ impl CiServer {
                 advice: Box::new(crate::advice::advise(
                     &self.state_dir,
                     &self.config.get(),
-                    &self.secrets,
+                    self.claude.as_deref(),
                     &origin,
                     &facts,
                     refresh,
@@ -399,6 +408,7 @@ impl CiServer {
             build: zeughaus_update::manifest::own_build(),
             sessions: self.sessions.listed(),
             claims: self.sessions.claims(),
+            claude: self.claude.as_ref().map(|claude| claude.status()),
         }
     }
 

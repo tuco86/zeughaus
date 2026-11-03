@@ -84,13 +84,21 @@ timeout_seconds = 5
 # admin_token = "FORGEJO_ADMIN_TOKEN"
 # hook_url = "https://ci.doodleshnookie.net/hook"
 
-# The language model the CI asks about a project that has not joined, for
-# the editor's Board of it: `key` names the secret with a Claude
-# subscription's OAuth token (sk-ant-oat..., made by `claude setup-token`,
-# valid a year). Without it the Board still offers the onboarding form.
+# The Claude subscription the CI signs in to (Claude Code's OAuth client) at
+# <public_url>/claude, served from the --hook listener behind Caddy's basic
+# auth. It keeps the refresh token in [secrets]' document and patches the
+# renewed access token into every `publish` document as
+# CLAUDE_ACCESS_TOKEN (the AppRole needs patch there: deploy/ci/openbao.sh).
 # Adding it takes a restart.
+# [claude]
+# account = "owner@example.org"
+# public_url = "https://zeughaus.doodleshnookie.net"
+# publish = ["hannes/omp"]
+
+# The language model the CI asks with that sign-in about a project that
+# has not joined, for the editor's Board of it. Without it the Board still
+# offers the onboarding form.
 # [advice]
-# key = "CLAUDE_CODE_OAUTH_TOKEN"
 # model = "claude-haiku-5-5"
 
 [repos.griasdi]

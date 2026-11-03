@@ -255,7 +255,8 @@ fn handle(
     )
 }
 
-/// Binds `addr` and serves the intake on its own thread, `zeughaus-ci-hook`.
+/// Binds `addr` and serves the intake (and, with `claude`, the Claude
+/// sign-in pages under `/claude`) on its own thread, `zeughaus-ci-hook`.
 ///
 /// The bind is synchronous so that a port that is taken fails the start of
 /// the process instead of a thread nobody reads.
@@ -263,6 +264,7 @@ pub fn start(
     addr: SocketAddr,
     config: Arc<Shared>,
     secrets: Arc<Secrets>,
+    claude: Option<Arc<crate::claude::Claude>>,
     state_dir: PathBuf,
 ) -> Result<(), String> {
     for (name, repo) in &config.get().repos {
@@ -276,12 +278,18 @@ pub fn start(
     eprintln!("[ci-hook] listening on {bound}");
     std::thread::Builder::new()
         .name("zeughaus-ci-hook".to_owned())
-        .spawn(move || serve(&server, &config, &secrets, &state_dir))
+        .spawn(move || serve(&server, &config, &secrets, claude.as_deref(), &state_dir))
         .map_err(|e| format!("cannot start the hook thread: {e}"))?;
     Ok(())
 }
 
-fn serve(server: &tiny_http::Server, config: &Shared, secrets: &Secrets, state_dir: &Path) {
+fn serve(
+    server: &tiny_http::Server,
+    config: &Shared,
+    secrets: &Secrets,
+    claude: Option<&crate::claude::Claude>,
+    state_dir: &Path,
+) {
     let mut deliveries = Deliveries::load(state_dir);
     for mut request in server.incoming_requests() {
         let method = request.method().to_string();
@@ -305,6 +313,25 @@ fn serve(server: &tiny_http::Server, config: &Shared, secrets: &Secrets, state_d
                 .read_to_end(&mut body);
             read.is_err() || body.len() > MAX_BODY
         };
+
+        if !too_large
+            && let Some(reply) =
+                claude.and_then(|claude| claude.respond(&method, &url, &body, now_secs()))
+        {
+            let mut response =
+                tiny_http::Response::from_string(reply.body).with_status_code(reply.code);
+            let header = match reply.location {
+                Some(location) => tiny_http::Header::from_bytes("Location", location),
+                None => tiny_http::Header::from_bytes("Content-Type", "text/html; charset=utf-8"),
+            };
+            if let Ok(header) = header {
+                response.add_header(header);
+            }
+            if let Err(e) = request.respond(response) {
+                eprintln!("[ci-hook] respond: {e}");
+            }
+            continue;
+        }
 
         let config = config.get();
         let (code, text, event) = if too_large {

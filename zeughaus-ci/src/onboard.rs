@@ -286,7 +286,7 @@ impl Onboarder {
                 .map_err(|e| step("webhook secret")(format!("no random bytes: {e}")))?;
             let value = hex::encode(bytes);
             self.secrets
-                .add(&secret_name, &value)
+                .patch(None, &[(&secret_name, &value)])
                 .map_err(|e| step("webhook secret")(e.to_string()))?;
             value
         };

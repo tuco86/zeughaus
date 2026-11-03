@@ -47,6 +47,9 @@ const ROW_TEXT: f32 = 13.0;
 const CAPTION_TEXT: f32 = 12.0;
 /// A session that failed longer ago than this needs nobody any more.
 const FAILED_SESSION_RECENT: Duration = Duration::from_secs(24 * 3600);
+/// How long before a CI's Claude sign-in ends the Overview asks for a new
+/// one.
+const CLAUDE_WARN: Duration = Duration::from_secs(3 * 24 * 3600);
 /// The Board's rail: a row per channel and the pipelines each shows.
 const RAIL_ROW: f32 = 28.0;
 const RAIL_PIPELINES: usize = 12;
@@ -89,6 +92,8 @@ pub(crate) enum AttentionTarget {
     Terminal(RunnerKey, TerminalId),
     /// A view of the page.
     Page(PageView),
+    /// A web page, opened in the browser.
+    Link(String),
 }
 
 /// The page's state.
@@ -424,6 +429,9 @@ impl App {
             let Some(overview) = &client.overview else {
                 continue;
             };
+            if let Some(item) = claude_item(overview.claude.as_ref(), now) {
+                items.push(item);
+            }
             for summary in overview.repos.iter().filter(|r| r.awaiting > 0) {
                 let Some(repo) = client.repos.get(&summary.repo) else {
                     continue;
@@ -704,6 +712,7 @@ impl App {
             Message::PageOpen(AttentionTarget::Page(view)) => {
                 return self.apply_page(Message::PageShow(view));
             }
+            Message::PageOpen(AttentionTarget::Link(url)) => return self.open_doc_link(&url),
             Message::PageTerminal(key, terminal, action) => {
                 return self.apply_page_terminal_action(key, terminal, action);
             }
@@ -1995,6 +2004,38 @@ fn session_target(client: &CiClient, session: &SessionView) -> AttentionTarget {
         (Some(runner), Some(terminal)) => AttentionTarget::Terminal(runner, TerminalId(terminal)),
         _ => AttentionTarget::Page(PageView::Board(origin_of(client, &session.repo))),
     }
+}
+
+/// The Overview's row for a CI's Claude sign-in: while it is signed out,
+/// ends within [`CLAUDE_WARN`], or could not renew. A press opens its
+/// sign-in page.
+fn claude_item(claude: Option<&zeughaus_link::ClaudeView>, now: u64) -> Option<AttentionItem> {
+    let claude = claude?;
+    let (severity, title) = match &claude.account {
+        None => (Severity::Error, "Claude: the CI is signed out".to_owned()),
+        Some(_) if now + CLAUDE_WARN.as_secs() >= claude.ends => {
+            let days = claude.ends.saturating_sub(now) / 86_400;
+            (
+                Severity::Warning,
+                format!("Claude: the CI's sign-in ends in {days} days"),
+            )
+        }
+        Some(_) if claude.error.is_some() => {
+            (Severity::Warning, "Claude: the CI cannot renew".to_owned())
+        }
+        Some(_) => return None,
+    };
+    Some(AttentionItem {
+        severity,
+        glyph: glyph::WARNING,
+        title,
+        detail: claude
+            .error
+            .clone()
+            .unwrap_or_else(|| format!("Sign in at {}", claude.url)),
+        since: (claude.signed_in > 0).then_some(claude.signed_in),
+        target: AttentionTarget::Link(claude.url.clone()),
+    })
 }
 
 #[cfg(test)]

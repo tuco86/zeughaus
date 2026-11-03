@@ -3132,6 +3132,7 @@ mod tests {
             build: 0,
             sessions: Vec::new(),
             claims: Vec::new(),
+            claude: None,
         };
         let key = RunnerKey::new("sha256:ci");
         let mut client = CiClient::new(Endpoint("weida://ci/".to_owned()), "ci".to_owned());

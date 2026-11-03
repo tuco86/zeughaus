@@ -54,20 +54,37 @@ pub struct CiConfig {
     /// How the CI onboards a repository; no onboarding requests without it.
     #[serde(default)]
     pub onboarding: Option<OnboardingConfig>,
+    /// The Claude subscription the CI signs in to, keeps renewed and hands
+    /// out through OpenBao; no Claude without it.
+    #[serde(default)]
+    pub claude: Option<ClaudeConfig>,
     /// The language model that advises on projects the CI does not build;
-    /// no advice without it.
+    /// no advice without it. It asks with the `[claude]` sign-in.
     #[serde(default)]
     pub advice: Option<AdviceConfig>,
 }
 
+/// `[claude]`: who may sign in, where the sign-in page is reached, and
+/// which OpenBao documents receive the current access token.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeConfig {
+    /// The only Claude account the sign-in accepts, by its email address.
+    pub account: String,
+    /// Where the hook listener's `/claude` is reached from a browser, e.g.
+    /// `https://zeughaus.doodleshnookie.net`; a trailing `/` is trimmed.
+    pub public_url: String,
+    /// Documents below the `[secrets]` mount (`hannes/omp`) the access token
+    /// is patched into as `CLAUDE_ACCESS_TOKEN` each time it is renewed.
+    #[serde(default)]
+    pub publish: Vec<String>,
+}
+
 /// `[advice]`: the Anthropic Messages API the CI asks for advice on a
-/// project that has not joined, and the secret it asks with.
+/// project that has not joined.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdviceConfig {
-    /// Secret name: a Claude subscription's OAuth token (`sk-ant-oat...`,
-    /// from `claude setup-token`), sent as a bearer token.
-    pub key: String,
     #[serde(default = "default_advice_model")]
     pub model: String,
     /// The API base; a trailing `/` is trimmed.
@@ -540,19 +557,41 @@ impl CiConfig {
                 return Err("[onboarding] names secrets but ci.toml has no [secrets]".into());
             }
         }
-        if let Some(advice) = &mut self.advice {
-            advice.api = advice.api.trim_end_matches('/').to_string();
-            if !valid_env_name(&advice.key) {
+        if let Some(claude) = &mut self.claude {
+            claude.public_url = claude.public_url.trim_end_matches('/').to_string();
+            if !claude.account.contains('@') {
+                return Err(
+                    "[claude]: `account` is the email address of the Claude account".into(),
+                );
+            }
+            if !claude.public_url.starts_with("https://") {
+                return Err("[claude]: `public_url` is an https:// address".into());
+            }
+            if let Some(bad) = claude.publish.iter().find(|path| {
+                path.is_empty()
+                    || path.starts_with('/')
+                    || path.ends_with('/')
+                    || path.contains("..")
+            }) {
                 return Err(format!(
-                    "[advice]: `key` names secret `{}`, which must match [A-Z_][A-Z0-9_]*",
-                    advice.key
+                    "[claude]: `publish` holds `{bad}`, which is no document path like hannes/omp"
                 ));
             }
+            if self.secrets.is_none() {
+                return Err(
+                    "[claude] keeps its sign-in in OpenBao but ci.toml has no [secrets]".into(),
+                );
+            }
+        }
+        if let Some(advice) = &mut self.advice {
+            advice.api = advice.api.trim_end_matches('/').to_string();
             if advice.model.is_empty() || advice.api.is_empty() {
                 return Err("[advice]: `model` and `api` must not be empty".into());
             }
-            if self.secrets.is_none() {
-                return Err("[advice] names a secret but ci.toml has no [secrets]".into());
+            if self.claude.is_none() {
+                return Err(
+                    "[advice] asks with the Claude sign-in, but ci.toml has no [claude]".into(),
+                );
             }
         }
         let repo_names: BTreeSet<String> = self.repos.keys().cloned().collect();

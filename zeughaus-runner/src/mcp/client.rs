@@ -760,6 +760,7 @@ mod tests {
                             build: 0,
                             sessions: Vec::new(),
                             claims: Vec::new(),
+                            claude: None,
                         },
                     },
                     _ => CiReply::Error {

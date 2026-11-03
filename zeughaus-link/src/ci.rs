@@ -539,6 +539,26 @@ pub struct CiOverview {
     /// Every live claim.
     #[serde(default)]
     pub claims: Vec<ClaimView>,
+    /// The CI's Claude sign-in; `None` without `[claude]`.
+    #[serde(default)]
+    pub claude: Option<ClaudeView>,
+}
+
+/// Where the CI's Claude sign-in stands. Seconds since the UNIX epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeView {
+    /// The page that signs in.
+    pub url: String,
+    /// The account signed in; `None` while signed out.
+    pub account: Option<String>,
+    pub signed_in: u64,
+    /// When the sign-in stops working and has to be made again; 0 while
+    /// signed out.
+    pub ends: u64,
+    /// When the current access token expires; 0 without one.
+    pub expires: u64,
+    /// The last thing that went wrong, until it goes right again.
+    pub error: Option<String>,
 }
 
 /// What an agent session does.
@@ -1924,6 +1944,14 @@ mod tests {
                     build: 116,
                     sessions: vec![session()],
                     claims: vec![pipeline_claim("griasdi", "dev", 7, 2)],
+                    claude: Some(ClaudeView {
+                        url: "https://zeughaus.example/claude".to_owned(),
+                        account: Some("me@example.org".to_owned()),
+                        signed_in: 1,
+                        ends: 2,
+                        expires: 3,
+                        error: None,
+                    }),
                 },
             },
             CiReply::Pipelines {

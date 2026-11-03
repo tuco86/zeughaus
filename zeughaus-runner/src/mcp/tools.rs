@@ -2606,6 +2606,7 @@ mod tests {
             build: 116,
             sessions: Vec::new(),
             claims: Vec::new(),
+            claude: None,
         };
         assert_eq!(
             status_text(&overview, 1_000),
@@ -2625,6 +2626,7 @@ mod tests {
             build: 0,
             sessions: Vec::new(),
             claims: Vec::new(),
+            claude: None,
         };
         assert_eq!(
             status_text(&empty, 0),

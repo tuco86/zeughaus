@@ -1888,9 +1888,35 @@ each approved request: secrets present, bot collaborator, webhook secret
 push event queued. Every step may run again; a failure puts the request
 back to `open` with the step and the reason as its note.
 
-**Advice.** `[advice]` of `ci.toml` (a secret `key`, a `model`, by default
+**Claude sign-in.** `[claude]` of `ci.toml` (`zeughaus-ci/src/claude.rs`)
+makes the CI the one holder of the owner's Claude subscription: omp on the
+workstations and the CI's own requests use the access token it hands out
+through OpenBao, and nothing signs in per machine. It is Claude Code's
+public OAuth client (authorization code with PKCE S256, the scopes Claude
+Code asks for), whose only redirect is `localhost`: `GET /claude/start` of
+the hook listener keeps a state and verifier for 10 minutes and redirects
+to claude.ai, the browser ends on a `localhost` page that does not load,
+and its address (or `code#state`) posted to `/claude/code` is exchanged at
+`api.anthropic.com/v1/oauth/token`. The account of the answer (or of the
+`claude_cli/bootstrap` lookup) must be `account`; then the refresh token,
+the account and the time go into the CI's own document by merge patch. A
+thread looks every minute: two hours before the access token expires it
+refreshes (one at a time, under the state's lock), writes the rotated
+refresh token back at once, and patches the access token into every
+`publish` document as `CLAUDE_ACCESS_TOKEN`; a write that fails is kept in
+memory and retried the next minute. An `invalid_grant` ends the sign-in
+(the stored refresh token is emptied), which happens about 30 days after
+it was made. `ClaudeView` in the overview carries the account, when the
+sign-in ends, the token's expiry and the last error; the editor's Overview
+lists it under Needs you while the CI is signed out, three days before
+the sign-in ends, or while renewing fails, and a press opens `/claude` in
+the browser. Caddy serves `/claude*` of `zeughaus.doodleshnookie.net`
+behind basic auth; the CI's AppRole may patch `secret/hannes/omp`.
+
+**Advice.** `[advice]` of `ci.toml` (a `model`, by default
 `claude-haiku-5-5`, and the `api` base) is the language model the CI asks
-about a project that has not joined (`zeughaus-ci/src/advice.rs`). The
+with the Claude sign-in about a project that has not joined
+(`zeughaus-ci/src/advice.rs`). The
 editor asks its local runner on `/projects` for the facts
 (`ProjectsRequest::facts`, `zeughaus-runner/src/projects/facts.rs`: its
 listing, the work checkout at `HEAD` with its top level, CI folders,
@@ -1908,7 +1934,7 @@ repositories, a valid name and secret names. The answer is kept under
 the same facts against the same configuration are answered from disk
 unless `refresh`. `AdviceView::refusal` (already in `ci.toml`, not on the
 Forgejo, no `[onboarding]`) is the CI's own and is filled even without
-`[advice]`.
+`[advice]` and `[claude]`.
 
 **Configuration reload.** Every service holds `config::Shared` and takes
 one snapshot of the configuration per request or loop turn (the scheduler

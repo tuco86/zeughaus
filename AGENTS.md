@@ -320,10 +320,25 @@ generated `<NAME>_WEBHOOK_SECRET` in OpenBao, writes
 `ci/onboarded/<name>.toml`, reloads the configuration in place and queues
 the first push pipeline. The configuration is one swappable snapshot:
 SIGHUP (`systemctl --user reload zeughaus-ci`) re-reads `[repos]` and
-`ci/onboarded/`, and refuses any other change. `[advice]` of `ci.toml`
-(`key`: the OpenBao secret with a Claude subscription's OAuth token
-`sk-ant-oat...` from `claude setup-token`; `model`, by default `claude-haiku-5-5`; `api`) is the
-model the CI asks for a bare project's advice (`CiRequest::Advise` with
+`ci/onboarded/`, and refuses any other change. `[claude]` of `ci.toml`
+(`account`, the only email that may sign in; `public_url`, where the hook
+listener's `/claude` is reached, `https://zeughaus.doodleshnookie.net`
+behind Caddy's basic auth; `publish`, OpenBao documents such as
+`hannes/omp`) is the Claude subscription the CI signs in to with Claude
+Code's OAuth client, in place of omp's `/login anthropic` on every
+machine: `/claude/start` goes to claude.ai, the browser ends on a
+`localhost` page that does not load, and its address pasted into `/claude`
+finishes the sign-in. The CI keeps the refresh token in its own document
+(`CLAUDE_REFRESH_TOKEN`, `CLAUDE_ACCOUNT`, `CLAUDE_SIGNED_IN`, written
+back at every renewal because each refresh rotates it), renews the access
+token two hours before it expires and patches it into every `publish`
+document as `CLAUDE_ACCESS_TOKEN`, where omp reads it
+(`providers.anthropic.apiKey: "!get-secret
+secret/hannes/omp/CLAUDE_ACCESS_TOKEN"` in `models.yml`). A sign-in ends
+about 30 days after it was made; the Overview asks for a new one three
+days before, and while the CI is signed out. `[advice]` (`model`, by
+default `claude-haiku-5-5`; `api`) is the
+model the CI asks with that sign-in for a bare project's advice (`CiRequest::Advise` with
 the facts an editor's runner gathered on `/projects`): it adds its
 Forgejo, platforms, runners and repositories, keeps only settings it can
 file, and keeps the answer under `ci/advice/` until the facts or its

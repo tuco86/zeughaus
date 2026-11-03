@@ -42,6 +42,9 @@ const DRAIN_INTERVAL: Duration = Duration::from_millis(100);
 /// How often the session dispatcher looks for approved plans to start.
 const DISPATCH_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How often the Claude sign-in looks whether its token wants renewing.
+const CLAUDE_INTERVAL: Duration = Duration::from_secs(60);
+
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
     listen: SocketAddr,
@@ -185,11 +188,32 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
         }
         Err(e) => eprintln!("[ci] secrets: {e}"),
     }
+    let claude = config
+        .get()
+        .claude
+        .clone()
+        .map(|claude| crate::claude::Claude::new(claude, Arc::clone(&secrets)));
+    if let Some(claude) = &claude {
+        if args.hook.is_none() {
+            eprintln!("[ci] claude: no --hook listener, so no sign-in page");
+        }
+        let claude = Arc::clone(claude);
+        std::thread::Builder::new()
+            .name("zeughaus-ci-claude".to_owned())
+            .spawn(move || {
+                loop {
+                    claude.tick(crate::now_secs());
+                    std::thread::sleep(CLAUDE_INTERVAL);
+                }
+            })
+            .map_err(|e| format!("cannot start the claude thread: {e}"))?;
+    }
     if let Some(addr) = args.hook {
         hook::start(
             addr,
             Arc::clone(&config),
             Arc::clone(&secrets),
+            claude.clone(),
             state_dir.to_path_buf(),
         )?;
     }
@@ -344,7 +368,8 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
                 docs_lock,
                 docs_tx,
                 Arc::clone(&sessions),
-            );
+            )
+            .with_claude(claude.clone());
             rt.spawn(serve::serve(replier, Arc::new(server)));
         }
         Err(e) => return Err(format!("no ci service: {e}")),

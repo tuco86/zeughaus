@@ -133,19 +133,30 @@ impl Secrets {
         }
     }
 
-    /// Adds field `name` with `value` to the document by a KV v2 merge
-    /// patch, which leaves every other field as it is. The cached document
-    /// is dropped, so the next read sees the field.
-    pub fn add(&self, name: &str, value: &str) -> Result<(), SecretError> {
-        let what = format!("{name} not stored");
+    /// Patches `fields` into `document` (a path below the `[secrets]` mount,
+    /// the CI's own document without one) by a KV v2 merge patch, which
+    /// leaves every other field as it is. The cached document is dropped,
+    /// so the next read sees the fields.
+    pub fn patch(
+        &self,
+        document: Option<&str>,
+        fields: &[(&str, &str)],
+    ) -> Result<(), SecretError> {
+        let names: Vec<&str> = fields.iter().map(|(name, _)| *name).collect();
+        let what = format!("{} not stored", names.join(", "));
         let Some(config) = &self.config else {
             return Err(SecretError::Absent(format!(
                 "no [secrets] in ci.toml; {what}"
             )));
         };
+        let path = document.unwrap_or(&config.path);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let url = format!("{}/v1/{}/data/{}", config.addr, config.mount, config.path);
-        let body = json!({ "data": { name: value } }).to_string();
+        let url = format!("{}/v1/{}/data/{path}", config.addr, config.mount);
+        let data: Map<String, Value> = fields
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), Value::from(*value)))
+            .collect();
+        let body = json!({ "data": data }).to_string();
         let mut retried = false;
         loop {
             let token = match &state.token {
@@ -180,16 +191,16 @@ impl Secrets {
                     state.token = None;
                     if retried {
                         return Err(SecretError::Unavailable(format!(
-                            "openbao: {}/{} denied the patch (policy zeughaus-ci needs patch; rerun deploy/ci/openbao.sh)",
-                            config.mount, config.path
+                            "openbao: {}/{path} denied the patch (policy zeughaus-ci needs patch; rerun deploy/ci/openbao.sh)",
+                            config.mount
                         )));
                     }
                     retried = true;
                 }
                 404 => {
                     return Err(SecretError::Absent(format!(
-                        "openbao: no document {}/{}",
-                        config.mount, config.path
+                        "openbao: no document {}/{path}",
+                        config.mount
                     )));
                 }
                 503 => return Err(sealed_error(config)),
@@ -489,7 +500,6 @@ pub fn check(secrets: &Secrets, config: &CiConfig) -> Result<Vec<String>, String
                 .iter()
                 .flat_map(|onb| [&onb.bot_token, &onb.admin_token]),
         )
-        .chain(config.advice.iter().map(|advice| &advice.key))
         .collect();
     if names.is_empty() && secrets.config.is_none() {
         return Ok(Vec::new());
@@ -505,9 +515,11 @@ pub fn check(secrets: &Secrets, config: &CiConfig) -> Result<Vec<String>, String
             missing.push(name.as_str());
         }
     }
+    // The fields the CI writes itself are kept, not named.
+    let kept = |field: &str| config.claude.is_some() && crate::claude::OWN_FIELDS.contains(&field);
     let unreferenced: Vec<&str> = fields
         .iter()
-        .filter(|field| !names.contains(field))
+        .filter(|field| !names.contains(field) && !kept(field))
         .map(String::as_str)
         .collect();
     if !unreferenced.is_empty() {
@@ -553,10 +565,10 @@ mod tests {
     }
 
     #[test]
-    fn adding_without_a_config_is_absent() {
+    fn patching_without_a_config_is_absent() {
         let secrets = Secrets::new(None, Path::new("/nonexistent"));
         assert_eq!(
-            secrets.add("X", "v").unwrap_err(),
+            secrets.patch(None, &[("X", "v")]).unwrap_err(),
             SecretError::Absent("no [secrets] in ci.toml; X not stored".to_owned())
         );
     }
@@ -879,7 +891,7 @@ mod tests {
             let stub = Stub::start(|_| document(json!({ "A": "alpha" })));
             let secrets = stub.secrets(30);
             assert_eq!(secrets.get("A").unwrap(), "alpha");
-            secrets.add("X_WEBHOOK_SECRET", "v").unwrap();
+            secrets.patch(None, &[("X_WEBHOOK_SECRET", "v")]).unwrap();
             let patches = stub.patches.lock().unwrap().clone();
             let body: Value = serde_json::from_str(&patches[0]).unwrap();
             assert_eq!(body, json!({ "data": { "X_WEBHOOK_SECRET": "v" } }));

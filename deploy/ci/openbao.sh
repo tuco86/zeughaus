@@ -14,11 +14,16 @@ BAO_TOKEN=$(sed -n 's/^Initial Root Token: //p' /root/openbao-init.txt)
 export BAO_TOKEN
 role=auth/approle/role/zeughaus-ci
 
-# `patch` is for the webhook secrets onboarding generates: the CI adds the
-# field to its document and touches no other.
+# `patch` is for the webhook secrets onboarding generates and the Claude
+# sign-in the CI keeps: the CI adds fields to its document and touches no
+# other. On hannes/omp, where every workstation's omp reads it, the CI
+# patches the current Claude access token (`publish` of [claude]).
 bao policy write zeughaus-ci - >/dev/null <<'POLICY'
 path "secret/data/zeughaus/ci" {
   capabilities = ["read", "patch"]
+}
+path "secret/data/hannes/omp" {
+  capabilities = ["patch"]
 }
 POLICY
 # The CI reaches OpenBao over WireGuard or loopback from this host only.

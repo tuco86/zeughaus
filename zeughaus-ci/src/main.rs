@@ -5,6 +5,7 @@ mod advice;
 mod artifacts;
 mod channels;
 mod claims;
+mod claude;
 mod cleanup;
 mod cli;
 mod config;
