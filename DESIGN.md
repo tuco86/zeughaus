@@ -1432,22 +1432,25 @@ screen: the channel rail (glyph in the tone of the newest pipeline, name,
 the queued events as hollow pulsing dots, then the newest 12 pipelines as
 dots that open the channel at that pipeline; a running one pulses, a held
 one wears a ring in its holder's agent colour), then the columns
-PROPOSALS, REVIEW, QUEUE, RUNNING and DONE (the newest 12) with two lanes
+PROPOSALS, REVIEW, RUNNING and DONE (the newest 12) with two lanes
 between them that are drawn only while a card passes through: PLANNING (an
 open ticket a session holds the claim on, a ready or planning ticket, and
 plan sessions without a ticket) and STARTING (a ticket whose master has not
-started yet). A ready ticket that waits for a ticket it depends on stays in
+started yet). RUNNING lists the tickets in progress, then a `queued N`
+separator (`queued N, paused` while the repository's queue is paused) and
+the approved tickets in the order masters take them; its count is the
+running ones. A ready ticket that waits for a ticket it depends on stays in
 PROPOSALS with an `after #n` chip; a ticket merged into one that is not
 finished is left out, the including ticket's card names it. Cards show
 number, title, age, `Runs on`, the tickets it includes and `plan v<n>`; a
-card in a lane or RUNNING adds its holder's host glyph and its agent's role
-and state, a running ticket the pipelines its master holds (`waits on`,
-`fixing`, `holds`), a queued one `queue paused`, and an action on its way
+card in a lane or a running one adds its holder's host glyph and its
+agent's role and state, a running ticket the pipelines its master holds
+(`waits on`, `fixing`, `holds`), and an action on its way
 its verb. A lane card has a flowing bar and a breathing border, as has a
 card an action is on; the page ticks every 50 ms while anything pulses.
 `h`/`l` and Left/Right change the column, `j`/`k` and Up/Down the card,
-Enter on a card of the lanes or RUNNING brings its session's (else its
-claim holder's) tab to the front and on any other opens the ticket's
+Enter on a card of the lanes or a running one brings its session's (else
+its claim holder's) tab to the front and on any other opens the ticket's
 popout, and `a`, `r` and `p` approve, dismiss and release for planning
 where the ticket offers it. The popout (`ci/ticket.rs`) lies over the
 workspace under the notice center and the palette: the ticket's number,

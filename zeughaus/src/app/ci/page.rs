@@ -25,7 +25,7 @@ use iced::{Alignment, Border, Color, Element, Length, Task};
 use iced_tabs::scroll;
 use zeughaus_link::{
     ActivityKind, ActivityState, AgentRole, AgentState, AskView, ClaimSubject, ClaimView, DocGroup,
-    DocState, DocView, RepoDocsView, SessionKind, SessionState, SessionView, doc_groups,
+    DocKind, DocState, DocView, RepoDocsView, SessionKind, SessionState, SessionView, doc_groups,
 };
 use zeughaus_mux::TerminalId;
 use zeughaus_theme::Theme;
@@ -168,11 +168,10 @@ enum Card {
 
 /// The slots of the Board, left to right: a title, and whether it is a
 /// lane, drawn narrow and only while a card passes through it.
-const SLOTS: [(&str, bool); 7] = [
+const SLOTS: [(&str, bool); 6] = [
     ("Proposals", false),
     ("Planning", true),
     ("Review", false),
-    ("Queue", false),
     ("Starting", true),
     ("Running", false),
     ("Done", false),
@@ -180,18 +179,23 @@ const SLOTS: [(&str, bool); 7] = [
 const PROPOSALS: usize = 0;
 const PLANNING: usize = 1;
 const PLANS: usize = 2;
-const QUEUE: usize = 3;
-const STARTING: usize = 4;
-const RUNNING: usize = 5;
-const DONE: usize = 6;
+const STARTING: usize = 3;
+const RUNNING: usize = 4;
+const DONE: usize = 5;
 
 /// A repository's cards in their slots.
-type Slots = [Vec<Card>; 7];
+type Slots = [Vec<Card>; 6];
 
 /// Whether a card in slot `at` is work a session does: it opens that
-/// session's tab.
+/// session's tab. The queued tickets RUNNING also lists have no session.
 fn active(at: usize) -> bool {
     matches!(at, PLANNING | STARTING | RUNNING)
+}
+
+/// Whether `doc` waits in the queue for a master: RUNNING lists it below
+/// the tickets that run.
+fn queued(doc: &DocView) -> bool {
+    doc.kind == DocKind::Ticket && doc.state == DocState::Approved
 }
 
 /// Seconds since the first frame that asked: the clock every pulse and
@@ -221,9 +225,10 @@ pub(super) fn faded(color: Color, a: f32) -> Color {
 /// session holds the claim on, and a ready or planning ticket, is in the
 /// PLANNING lane, except a ready one that waits for its dependencies, which
 /// stays with the proposals; a ticket whose master starts is in the
-/// STARTING lane. A ticket merged into one that is not finished is left
-/// out: the including ticket's card names it. `sessions` and `claims` are
-/// the repository's.
+/// STARTING lane; the queue follows the running tickets in RUNNING, in the
+/// order masters take it. A ticket merged into one that is not finished is
+/// left out: the including ticket's card names it. `sessions` and `claims`
+/// are the repository's.
 fn board_columns(
     docs: &[DocView],
     sessions: &[&SessionView],
@@ -247,6 +252,7 @@ fn board_columns(
             .is_none_or(|doc| matches!(doc.state, DocState::Done | DocState::Dismissed))
     };
     let mut done = 0;
+    let mut queue = Vec::new();
     for (group, members) in doc_groups(docs) {
         for doc in members {
             let number = doc.number;
@@ -258,7 +264,10 @@ fn board_columns(
                 }
                 DocGroup::Planning => PLANNING,
                 DocGroup::Review => PLANS,
-                DocGroup::Queue => QUEUE,
+                DocGroup::Queue => {
+                    queue.push(Card::Doc(number));
+                    continue;
+                }
                 DocGroup::InProgress => match live(SessionKind::Master, number) {
                     Some(master) if master.state == SessionState::Starting => STARTING,
                     _ => RUNNING,
@@ -279,6 +288,7 @@ fn board_columns(
             slots[slot].push(Card::Doc(number));
         }
     }
+    slots[RUNNING].extend(queue);
     // A plan session whose proposal has no card in the lane has one of its
     // own there.
     for session in sessions
@@ -1529,7 +1539,16 @@ impl App {
                 } else {
                     Length::FillPortion(1)
                 };
-                let count = container(text(slot.len().to_string()).size(11))
+                // Queued tickets close RUNNING, below a separator; the
+                // count is the column's own cards.
+                let queue_at = slot
+                    .iter()
+                    .position(|card| {
+                        matches!(card, Card::Doc(n)
+                            if state.docs().iter().any(|d| d.number == *n && queued(d)))
+                    })
+                    .unwrap_or(slot.len());
+                let count = container(text(queue_at.to_string()).size(11))
                     .padding([0, 6])
                     .style(style::badge(&t, false));
                 let mut head = row![].spacing(6).align_y(Alignment::Center);
@@ -1540,10 +1559,25 @@ impl App {
                     .push(text(title.to_uppercase()).size(CAPTION_TEXT).color(muted))
                     .push(count);
                 let mut list = column![].spacing(6);
-                if slot.is_empty() {
+                if queue_at == 0 {
                     list = list.push(text("Nothing here").size(CAPTION_TEXT).color(muted));
                 }
                 for (row_at, card) in slot.iter().enumerate() {
+                    if row_at == queue_at {
+                        let mut label = format!("queued {}", slot.len() - queue_at);
+                        if repo.paused {
+                            label.push_str(", paused");
+                        }
+                        list = list.push(
+                            row![
+                                rule::horizontal(1),
+                                text(label).size(CAPTION_TEXT).color(muted),
+                                rule::horizontal(1),
+                            ]
+                            .spacing(8)
+                            .align_y(Alignment::Center),
+                        );
+                    }
                     list = list.push(self.board_card(
                         &t,
                         ci,
@@ -1761,6 +1795,7 @@ impl App {
             Card::Doc(number) => state.docs().iter().find(|d| d.number == number),
             Card::Session(_) | Card::Opening => None,
         };
+        let working = active(column) && !doc.is_some_and(queued);
         let session = self.card_session(ci, &repo.repo, card);
         let head = match card {
             Card::Doc(_) => doc.map(|d| d.title.clone()).unwrap_or_default(),
@@ -1784,7 +1819,7 @@ impl App {
         // Work a session does counts from the session's start, the rest
         // from their last change.
         let since = match session {
-            Some(session) if active(column) => Some(session.started),
+            Some(session) if working => Some(session.started),
             _ => changed,
         };
         if let Some(since) = since {
@@ -1842,7 +1877,7 @@ impl App {
                     .color(self.theme.error()),
             );
         }
-        if active(column) {
+        if working {
             let opening = card == Card::Opening;
             lines = lines.push(match self.card_holder(ci, &repo.repo, card) {
                 Some((runner, terminal)) => self.running_line(runner, terminal),
@@ -1866,9 +1901,6 @@ impl App {
                     .size(CAPTION_TEXT)
                     .color(accent),
             );
-        }
-        if column == QUEUE && repo.paused {
-            lines = lines.push(text("queue paused").size(CAPTION_TEXT).color(muted));
         }
         if column == RUNNING
             && let Some(master) = session.filter(|s| s.kind == SessionKind::Master)
@@ -2211,7 +2243,7 @@ fn claude_item(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeughaus_link::{ClaimHolder, DocKind};
+    use zeughaus_link::ClaimHolder;
 
     fn doc(number: u64, state: DocState, changed: u64) -> DocView {
         DocView {
@@ -2270,12 +2302,17 @@ mod tests {
             number: 1,
             repo: None,
         }];
+        let mut later = doc(5, DocState::Approved, 1);
+        later.approved = Some(2);
+        let mut sooner = doc(31, DocState::Approved, 1);
+        sooner.approved = Some(1);
         let mut docs = vec![
             doc(1, DocState::Open, 1),
             blocked,
             doc(3, DocState::Ready, 1),
             doc(4, DocState::Review, 1),
-            doc(5, DocState::Approved, 1),
+            later,
+            sooner,
             doc(6, DocState::InProgress, 1),
         ];
         docs.extend((10..30).map(|n| doc(n, DocState::Done, n)));
@@ -2286,9 +2323,9 @@ mod tests {
         assert_eq!(slots[PROPOSALS], [Card::Doc(2), Card::Doc(1)]);
         assert_eq!(slots[PLANNING], [Card::Doc(3), Card::Session(7)]);
         assert_eq!(slots[PLANS], [Card::Doc(4)]);
-        assert_eq!(slots[QUEUE], [Card::Doc(5)]);
         assert!(slots[STARTING].is_empty());
-        assert_eq!(slots[RUNNING], [Card::Doc(6)]);
+        // The queue follows the running ticket, in the order masters take it.
+        assert_eq!(slots[RUNNING], [Card::Doc(6), Card::Doc(31), Card::Doc(5)]);
         assert_eq!(slots[DONE].len(), DONE_SHOWN);
         assert_eq!(slots[DONE][0], Card::Doc(29));
     }

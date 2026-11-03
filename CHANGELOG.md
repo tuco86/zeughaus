@@ -412,6 +412,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The Board has no QUEUE column any more: RUNNING lists the running
+  tickets, then a `queued N` separator (`queued N, paused` while the queue
+  is paused) and the approved tickets below it in the order masters take
+  them. The column's count is its running tickets.
+
 - The omp plugin (0.15.0) asks the CI itself, over its weida API with
   `@tuco86/weida`, instead of running `zeughaus-runner ci` for every
   question; only `claude login|status` still runs the runner. The texts

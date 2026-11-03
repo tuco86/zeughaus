@@ -135,11 +135,12 @@ sessions; a row's terminal docks read-only beside the list and Enter or a
 click brings its tab to the front), the projects with a search and
 `Refresh`, and each CI's runners (a runner's activity with `Reopen` for
 closed runs). A project's Board shows its channels as a rail of pipeline
-dots over the columns PROPOSALS, REVIEW, QUEUE, RUNNING and DONE, with the
+dots over the columns PROPOSALS, REVIEW, RUNNING (the queue below a
+`queued` separator) and DONE, with the
 lanes PLANNING and STARTING between them while a ticket is planned or a
 master starts: `h`/`l`
 and `j`/`k` (or the arrows) move between cards, Enter opens a ticket's
-popout (or the agent tab of a card in a lane or RUNNING), `a`, `r` and `p`
+popout (or the agent tab of a card in a lane or a running one), `a`, `r` and `p`
 approve, dismiss and release for planning; `New ticket` writes one. The
 popout lies over the workspace (Escape or the scrim closes it): the
 ticket's actions, its proposal (`Edit` while open or ready), its plan in
