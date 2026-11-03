@@ -619,6 +619,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the CI tab animated the cable and `ci_timing` said `receiving` for good.
   Such transfers now end with the job, and the CI closes them in stored
   records when it starts.
+- CI: a runner's image cleanup no longer removes the blobs of an image
+  another job is building. A container job builds its image under
+  `zeughaus-runner image-lock <state-dir>/ci/images.lock -- ..`, which holds
+  the lock shared, and the cleanup after a container run takes it
+  exclusively: while a build holds it, the cleanup is skipped
+  (`images not pruned while an image builds` in the runner log) and the end
+  of the next container run prunes; a build that finds the cleanup running
+  waits for it (`image build waits for the runner's image cleanup` in the
+  job's log). Apple's `container image delete` and `prune` collect blobs no
+  tag references yet, which made a parallel `container build` fail with
+  exit 71.
 
 ## [0.2.1] - 2026-10-16
 

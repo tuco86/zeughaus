@@ -35,7 +35,9 @@ pub enum Target<'a> {
     /// Directly on this machine, in `workspace`.
     Host { workspace: &'a Path },
     /// In a rootless container of `engine` built for `image` and tagged
-    /// `tag`; `workspace` is bind-mounted at /work.
+    /// `tag`; `workspace` is bind-mounted at /work. The image is built by
+    /// `runner image-lock images_lock -- ..`, holding the runner's images
+    /// lock shared.
     Container {
         engine: Engine,
         workspace: &'a Path,
@@ -43,6 +45,8 @@ pub enum Target<'a> {
         tag: &'a str,
         cpus: u32,
         memory: &'a str,
+        runner: &'a Path,
+        images_lock: &'a Path,
     },
     /// In a Windows VM reached as `ssh_host`; the workspace lives in the
     /// guest.
@@ -234,6 +238,8 @@ pub fn launch_sh(launch: &Launch<'_>) -> String {
             tag,
             cpus,
             memory,
+            runner,
+            images_lock,
             ..
         } => {
             let tag = sh_quote(tag);
@@ -243,11 +249,13 @@ pub fn launch_sh(launch: &Launch<'_>) -> String {
             let memory = sh_quote(memory);
             let run = sh_path(launch.run_dir);
             let inputs = sh_path(&launch.run_dir.join("inputs"));
+            let runner = sh_path(runner);
+            let lock = sh_path(images_lock);
             match engine {
                 Engine::Podman => {
                     let _ = write!(
                         out,
-                        "podman image exists {tag} || podman build -t {tag} -f {file} {ctx} || exit 71\n\
+                        "podman image exists {tag} || {runner} image-lock {lock} -- podman build -t {tag} -f {file} {ctx} || exit 71\n\
                          podman run --rm -it --init --name {name} --cpus {cpus} --memory {memory} \
                          --env-file \"$secret_dir/env\" -v \"$ws:/work\" -v {run}:/ci/run \
                          -v {inputs}:/ci/inputs:ro -w /work {tag} /bin/sh /ci/run/inner.sh\n\
@@ -258,12 +266,15 @@ pub fn launch_sh(launch: &Launch<'_>) -> String {
                 // The system is started on demand and left running; every
                 // container is a VM of its own that `--rm` removes. That VM's
                 // clock can run behind the host's, so the job starts through
-                // `clock.sh` ([`clock_sh`]), which needs `CAP_SYS_TIME`.
+                // `clock.sh` ([`clock_sh`]), which needs `CAP_SYS_TIME`. The
+                // build holds the runner's images lock shared, so the runner's
+                // image cleanup, whose delete and prune collect unreferenced
+                // blobs, never runs while a built image loads.
                 Engine::Apple => {
                     let _ = write!(
                         out,
                         "container system status >/dev/null 2>&1 || container system start --enable-kernel-install || exit 71\n\
-                         container image inspect {tag} >/dev/null 2>&1 || container build -t {tag} -f {file} --cpus {cpus} --memory {memory} {ctx} || exit 71\n\
+                         container image inspect {tag} >/dev/null 2>&1 || {runner} image-lock {lock} -- container build -t {tag} -f {file} --cpus {cpus} --memory {memory} {ctx} || exit 71\n\
                          container run --rm -it --init --name {name} --cpus {cpus} --memory {memory} \
                          --cap-add CAP_SYS_TIME --env-file \"$secret_dir/env\" -v \"$ws:/work\" -v {run}:/ci/run \
                          -v {inputs}:/ci/inputs -w /work {tag} /bin/sh /ci/run/clock.sh\n\
@@ -642,6 +653,8 @@ mod tests {
                 tag: "localhost/zci-demo-arch:0123456789abcdef",
                 cpus: 12,
                 memory: "24g",
+                runner: Path::new("/s/bin/zeughaus-runner"),
+                images_lock: Path::new("/s/ci/images.lock"),
             },
         })
     }
@@ -658,6 +671,9 @@ mod tests {
         assert!(script.contains("-v \"$ws:/work\" -v '/s/runs/4':/ci/run"));
         assert!(script.contains("podman run --rm -it --init"));
         assert!(script.contains("/ci/inputs:ro"));
+        assert!(script.contains(
+            "podman image exists 'localhost/zci-demo-arch:0123456789abcdef' || '/s/bin/zeughaus-runner' image-lock '/s/ci/images.lock' -- podman build -t 'localhost/zci-demo-arch:0123456789abcdef' "
+        ));
     }
 
     /// Apple's `container` starts its system on demand and has no read-only
@@ -669,10 +685,9 @@ mod tests {
         assert!(script.contains(
             "container system status >/dev/null 2>&1 || container system start --enable-kernel-install || exit 71"
         ));
-        assert!(
-            script.contains("container image inspect 'localhost/zci-demo-arch:0123456789abcdef'")
-        );
-        assert!(script.contains("container build -t 'localhost/zci-demo-arch:0123456789abcdef' -f '.zeughaus-ci/arch.Containerfile' --cpus 12 --memory '24g' '.zeughaus-ci'"));
+        assert!(script.contains(
+            "container image inspect 'localhost/zci-demo-arch:0123456789abcdef' >/dev/null 2>&1 || '/s/bin/zeughaus-runner' image-lock '/s/ci/images.lock' -- container build -t 'localhost/zci-demo-arch:0123456789abcdef' -f '.zeughaus-ci/arch.Containerfile' --cpus 12 --memory '24g' '.zeughaus-ci' || exit 71\n"
+        ));
         assert!(script.contains("container run --rm -it --init --name 'zci-demo.7.build'"));
         assert!(script.contains("-v '/s/runs/4/inputs':/ci/inputs -w /work"));
         assert!(!script.contains("podman"));
@@ -887,6 +902,8 @@ mod tests {
                     tag: "localhost/zci-demo-trixie:0123456789abcdef",
                     cpus: 4,
                     memory: "8g",
+                    runner: Path::new("/s/bin/zeughaus-runner"),
+                    images_lock: Path::new("/s/ci/images.lock"),
                 },
             );
             assert!(

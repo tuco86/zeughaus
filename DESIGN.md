@@ -1636,7 +1636,12 @@ through `podman unshare rm` because podman containers leave subordinate-uid
 files (plain removal under Apple's `container`, whose virtiofs writes files
 the user owns), removes image tags no pipeline uses (`podman rmi`,
 `container image delete` on macOS), deletes an artifact set when the CI
-drops it, and a run's `inputs/` when the run ends.
+drops it, and a run's `inputs/` when the run ends. Image removal and the
+engine's prune collect blobs no tag references yet, which includes an image
+that a `build` is loading, so a container job builds its image under
+`zeughaus-runner image-lock <state-dir>/ci/images.lock -- <build>` (a shared
+`flock`) and the removal takes that file exclusively; it skips while a build
+holds it, and the end of the next container run prunes instead.
 
 **Secrets** live in OpenBao (KV v2), by user, then by reader:
 `zeughaus/zeughaus` is the CI's own document (`[secrets] path` in

@@ -19,6 +19,7 @@ mod enlist;
 mod feed;
 mod files;
 mod graphs;
+mod image_lock;
 mod install;
 mod jobs;
 mod maintain;
@@ -107,6 +108,10 @@ fn main() -> ExitCode {
     // it must not read the serving flags, which the program after `--` may
     // have too.
     if let Some(code) = cli::timeout(&std::env::args().skip(1).collect::<Vec<_>>()) {
+        return code;
+    }
+    // The lock a container job's image build holds: a subcommand for the same reason as timeout.
+    if let Some(code) = cli::image_lock(&std::env::args().skip(1).collect::<Vec<_>>()) {
         return code;
     }
     // Making and checking release bundles: a subcommand for the same reason,

@@ -39,6 +39,7 @@
 //! zeughaus-runner tidy [--dry-run] [--list]
 //! zeughaus-runner claude login [--ci <url>] [--no-browser] | status [--ci <url>] | token [--ci <url>]
 //! zeughaus-runner timeout <seconds> -- <program> [args..]
+//! zeughaus-runner image-lock <file> -- <program> [args..]
 //! zeughaus-runner release keygen <file>
 //! zeughaus-runner release bundle --channel <c> --build <n> --sha <sha> --version <v> --out <dir> <file>...
 //! zeughaus-runner release verify <dir>
@@ -84,6 +85,7 @@ usage: zeughaus-runner [--state-dir <dir>] [--feed-addr <host:port>] [--keep-run
        zeughaus-runner tidy [--dry-run] [--list]
        zeughaus-runner claude login [--ci <url>] [--no-browser] | status [--ci <url>] | token [--ci <url>]
        zeughaus-runner timeout <seconds> -- <program> [args..]
+       zeughaus-runner image-lock <file> -- <program> [args..]
        zeughaus-runner release keygen <file>
        zeughaus-runner release bundle --channel <c> --build <n> --sha <sha> --version <v> --out <dir> <file>...
        zeughaus-runner release verify <dir>
@@ -102,6 +104,22 @@ pub fn timeout(args: &[String]) -> Option<ExitCode> {
         Ok(request) => ExitCode::from(crate::timeout::run(&request) as u8),
         Err(e) => {
             eprintln!("[timeout] {e}");
+            ExitCode::from(125)
+        }
+    };
+    Some(code)
+}
+
+/// Runs `image-lock` if the first argument names it. Checked early, like
+/// `timeout`: everything after the `--` belongs to the program.
+pub fn image_lock(args: &[String]) -> Option<ExitCode> {
+    if args.first().map(String::as_str) != Some("image-lock") {
+        return None;
+    }
+    let code = match crate::image_lock::parse(&args[1..]) {
+        Ok(request) => ExitCode::from(crate::image_lock::run(&request) as u8),
+        Err(e) => {
+            eprintln!("[image-lock] {e}");
             ExitCode::from(125)
         }
     };

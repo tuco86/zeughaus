@@ -526,6 +526,7 @@ impl Executor {
         let write = |path: &Path, text: &str| write_atomic(path, text.as_bytes());
         // Owned here because the launcher's target borrows them.
         let containers = self.config.containers.clone().unwrap_or_default();
+        let images_lock = cleanup::images_lock_path(&self.state_dir);
         let vm = match &a.place {
             Place::Machine { name } => Some(self.machine(name)?),
             _ => None,
@@ -545,6 +546,8 @@ impl Executor {
                     tag,
                     cpus: containers.cpus,
                     memory: &containers.memory,
+                    runner: &self.exe,
+                    images_lock: &images_lock,
                 }
             }
             Place::Machine { .. } => {
@@ -935,7 +938,9 @@ impl Executor {
     }
 
     /// Disk housekeeping after a run: workspaces over budget and container
-    /// images superseded or unused for two weeks.
+    /// images superseded or unused for two weeks. Image removal is skipped
+    /// while an image build holds the images lock; the end of the next
+    /// container run prunes instead.
     fn housekeeping(&self, finished: &Assignment) {
         let live: Vec<Arc<RunCtl>> = lock(&self.runs).values().cloned().collect();
         let active: Vec<&Arc<RunCtl>> = live
@@ -954,8 +959,28 @@ impl Executor {
             .collect();
         cleanup::enforce_budget(&self.state_dir, self.config.budget_gb, &in_use);
         if self.containers && matches!(finished.place, Place::Container { .. }) {
-            let used: HashSet<String> = live
-                .iter()
+            // Serializes `images.json` between threads, so a busy lock below
+            // is a build and never another housekeeping.
+            let _held = lock(&self.images_lock);
+            let _images =
+                match cleanup::try_lock_images(&cleanup::images_lock_path(&self.state_dir)) {
+                    Ok(Some(file)) => file,
+                    Ok(None) => {
+                        eprintln!(
+                            "[enlist] {}: images not pruned while an image builds",
+                            finished.run
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("[enlist] images not pruned: {e}");
+                        return;
+                    }
+                };
+            // A run assigned since `live` was taken is in `runs` before its
+            // launcher inspects or builds its image, so its tag is kept.
+            let used: HashSet<String> = lock(&self.runs)
+                .values()
                 .filter_map(|ctl| match &ctl.assignment.place {
                     Place::Container { tag, .. } => Some(tag.clone()),
                     _ => None,
@@ -965,7 +990,6 @@ impl Executor {
                     _ => None,
                 })
                 .collect();
-            let _held = lock(&self.images_lock);
             cleanup::prune_images(&used, &super::ci_dir(&self.state_dir).join("images.json"));
         }
     }

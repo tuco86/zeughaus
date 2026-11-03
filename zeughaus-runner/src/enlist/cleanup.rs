@@ -3,6 +3,7 @@
 //! job may have left files in.
 
 use std::collections::{BTreeMap, HashSet};
+use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
@@ -118,6 +119,28 @@ pub fn remove_tree(ws: &Path) -> Result<(), String> {
 /// The name prefix of every image the CI's container jobs build
 /// (`localhost/zci-<repo>-<image>:<digest>`, set in zeughaus-ci's scheduler).
 const IMAGE_PREFIX: &str = "localhost/zci-";
+
+/// The images lock: image builds (`zeughaus-runner image-lock`) hold it
+/// shared, image removal holds it exclusively.
+pub fn images_lock_path(state_dir: &Path) -> PathBuf {
+    super::ci_dir(state_dir).join("images.lock")
+}
+
+/// Takes the images lock at `path` exclusively without waiting. The lock is
+/// held until the returned file drops; `None` means an image build holds it.
+pub fn try_lock_images(path: &Path) -> Result<Option<File>, String> {
+    let file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(e)) => Err(format!("cannot lock {}: {e}", path.display())),
+    }
+}
 
 /// How long an image whose name no live run uses is kept after its last use.
 const IMAGE_IDLE_SECS: u64 = 14 * 24 * 60 * 60;
@@ -321,6 +344,36 @@ mod tests {
             assert_eq!(secs("beside"), 0);
             assert_eq!(secs("never"), 0);
             let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// Housekeeping does not prune while a build holds the lock shared,
+        /// and a build waits while housekeeping holds it.
+        #[test]
+        fn a_build_holding_the_images_lock_defers_the_prune() {
+            let dir = std::env::temp_dir().join(format!("zci-images-lock-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("images.lock");
+            let open = || {
+                File::options()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+            };
+            let build = open();
+            build.lock_shared().unwrap();
+            assert!(matches!(try_lock_images(&path), Ok(None)));
+            drop(build);
+            let held = try_lock_images(&path);
+            assert!(matches!(held, Ok(Some(_))));
+            assert!(matches!(
+                open().try_lock_shared(),
+                Err(TryLockError::WouldBlock)
+            ));
+            drop(held);
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }
