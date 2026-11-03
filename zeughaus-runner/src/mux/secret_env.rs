@@ -20,6 +20,14 @@ const MOUNT: &str = "secret";
 /// How long `get-secret` may take for all documents together.
 const FETCH_WAIT: Duration = Duration::from_secs(10);
 
+/// The secret reader on the PATH. On Windows a bare name finds only `.exe`
+/// files, and get-secret there is a `.cmd` shim.
+const GET_SECRET: &str = if cfg!(windows) {
+    "get-secret.cmd"
+} else {
+    "get-secret"
+};
+
 /// The documents a terminal of `kind` reads, the first one winning; `origin`
 /// is the project of a work shell or a session.
 pub fn documents(kind: ActivityKind, origin: Option<&str>) -> Vec<String> {
@@ -68,7 +76,7 @@ pub fn merge(
 /// Every field of `documents`, as `"<document>/<FIELD>"` to its value. A
 /// document that does not exist has none.
 pub fn fetch(documents: &[String]) -> Result<BTreeMap<String, String>, String> {
-    let mut command = Command::new("get-secret");
+    let mut command = Command::new(GET_SECRET);
     command.arg("--json");
     command.args(documents.iter().map(|doc| format!("{MOUNT}/{doc}")));
     let text = crate::proc::output_within(command, FETCH_WAIT)

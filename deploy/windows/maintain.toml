@@ -1,9 +1,28 @@
 # Maintenance tasks of the wohnzimmer runner; `zeughaus-runner install windows`
 # writes this from the release to C:\zeughaus\state\maintain.toml, and every
-# update rewrites it. See zeughaus-runner/src/maintain.rs.
+# update rewrites it. See zeughaus-runner/src/maintain.rs. omp, its config and
+# the zeughaus omp plugin serve the agent sessions this runner hosts.
 
 [[task]]
 name = "rust"
 command = ['C:\zeughaus\cargo\bin\rustup.exe', 'update']
 every_minutes = 60
 timeout_minutes = 60
+
+[[task]]
+name = "dotfiles"
+command = ['C:\Program Files\Git\cmd\git.exe', '-C', 'C:\Users\zeughaus\work\git.doodleshnookie.net\tuco86\sync', 'pull', '--ff-only', '-q']
+every_minutes = 60
+timeout_minutes = 10
+
+[[task]]
+name = "omp"
+command = ['omp', 'update']
+every_minutes = 60
+timeout_minutes = 15
+
+[[task]]
+name = "zeughaus-omp"
+command = ['omp', 'plugin', 'install', '@tuco86/zeughaus-omp@latest']
+every_minutes = 60
+timeout_minutes = 10

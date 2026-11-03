@@ -22,7 +22,6 @@
 //! the clone's `.git/zeughaus-session.lock`, so `tidy` leaves the clone alone.
 
 use std::path::Path;
-#[cfg(unix)]
 use std::path::PathBuf;
 #[cfg(not(unix))]
 use std::process::ExitCode;
@@ -41,7 +40,6 @@ pub fn work_root() -> Option<PathBuf> {
 /// The checkout of `origin` (`host/owner/name`, as `normalize_origin` gives
 /// it) under `root`. The origin comes from a peer, so it must be a relative
 /// path of at least three plain segments.
-#[cfg(unix)]
 pub fn checkout_of(root: &Path, origin: &str) -> Result<PathBuf, String> {
     let refused = || format!("{origin:?} names no checkout under the work root");
     if origin.is_empty()
@@ -51,6 +49,7 @@ pub fn checkout_of(root: &Path, origin: &str) -> Result<PathBuf, String> {
                 || b.is_ascii_digit()
                 || matches!(b, b'.' | b'_' | b':' | b'/' | b'-')
         })
+        || (cfg!(windows) && origin.contains(':'))
     {
         return Err(refused());
     }
@@ -67,7 +66,6 @@ pub fn checkout_of(root: &Path, origin: &str) -> Result<PathBuf, String> {
 
 /// The ssh URL `origin` (`host/owner/name`, as `checkout_of` accepts it) is
 /// cloned from: scp form, or an `ssh://` URL when the host names a port.
-#[cfg(unix)]
 fn clone_url(origin: &str) -> String {
     let (host, rest) = origin.split_once('/').unwrap_or((origin, ""));
     if host.contains(':') {
@@ -78,45 +76,37 @@ fn clone_url(origin: &str) -> String {
 }
 
 /// The directory the agent sessions' clones live under.
-#[cfg(unix)]
 pub fn agent_root(state_dir: &Path) -> PathBuf {
     state_dir.join("agent-work")
 }
 
 /// The clone the master session executes the plans of `origin` in.
-#[cfg(unix)]
 pub fn master_dir(state_dir: &Path, origin: &str) -> Result<PathBuf, String> {
     checkout_of(&agent_root(state_dir).join("master"), origin)
 }
 
 /// The clone plans of `origin` are made in; it borrows the master clone's
 /// objects.
-#[cfg(unix)]
 pub fn plan_clone_dir(state_dir: &Path, origin: &str) -> Result<PathBuf, String> {
     checkout_of(&agent_root(state_dir).join("plan"), origin)
 }
 
 /// The file in a clone's git directory a session holds a shared lock on
 /// while it runs, and `tidy` an exclusive one while it works on the clone.
-#[cfg(unix)]
 pub const SESSION_LOCK: &str = "zeughaus-session.lock";
 
 /// The file in the master clone's `.git/` that names the ticket whose
 /// master last started omp there. Its content is the ticket number and a
 /// newline.
-#[cfg(unix)]
 pub const MASTER_RECORD: &str = "zeughaus-master";
 
 /// An omp that ends within `QUICK_OMP` of its start `MAX_QUICK` times in a
 /// row ends the master.
-#[cfg(unix)]
 const QUICK_OMP: std::time::Duration = std::time::Duration::from_secs(60);
-#[cfg(unix)]
 const MAX_QUICK: u32 = 3;
 
 /// The omp session directory (`--session-dir`) of ticket `number`'s
 /// masters.
-#[cfg(unix)]
 fn master_sessions(state_dir: &Path, repo: &str, number: u64) -> PathBuf {
     state_dir
         .join("agents")
@@ -125,14 +115,12 @@ fn master_sessions(state_dir: &Path, repo: &str, number: u64) -> PathBuf {
 }
 
 /// What the master clone holds that `origin/<branch>` does not.
-#[cfg(unix)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Holds {
     changed: usize,
     ahead: u64,
 }
 
-#[cfg(unix)]
 impl Holds {
     fn is_empty(self) -> bool {
         self.changed == 0 && self.ahead == 0
@@ -159,7 +147,6 @@ impl Holds {
 }
 
 /// Why a master cannot start in its clone.
-#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Refusal {
     /// The clone holds work no master recorded.
@@ -171,7 +158,6 @@ enum Refusal {
 }
 
 /// How a master starts omp in its clone.
-#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 enum Start {
     Fresh,
@@ -183,7 +169,6 @@ enum Start {
 /// record names `recorded`, with `earlier` the newest omp session of the
 /// ticket's masters. A ticket with a session resumes it, also in a clean
 /// clone; work in the clone is only ever resumed by its own ticket.
-#[cfg(unix)]
 fn start_of(holds: Holds, recorded: Option<u64>, ticket: u64, earlier: Option<PathBuf>) -> Start {
     if holds.is_empty() {
         return earlier.map_or(Start::Fresh, Start::Resume);
@@ -198,7 +183,6 @@ fn start_of(holds: Holds, recorded: Option<u64>, ticket: u64, earlier: Option<Pa
 /// Why the master cannot start in `root`, for the session's failure, the
 /// ticket's note and the notice; `age` is the seconds since the newest
 /// change in the clone.
-#[cfg(unix)]
 fn refusal_text(
     root: &Path,
     sessions: &Path,
@@ -238,7 +222,6 @@ pub fn is_session_id(value: &Path) -> bool {
 }
 
 /// What both sessions are started with.
-#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 struct SessionArgs {
     repo: String,
@@ -251,7 +234,6 @@ struct SessionArgs {
 
 /// `<repo> [--branch <branch>] [--ticket <n>] [--resume <file>] [--origin
 /// <origin>]`, the arguments both sessions take.
-#[cfg(unix)]
 fn parse_args(args: &[String]) -> Result<SessionArgs, String> {
     let mut repo = None;
     let mut branch = None;
@@ -296,7 +278,6 @@ fn parse_args(args: &[String]) -> Result<SessionArgs, String> {
 }
 
 /// The omp the sessions run: `$ZEUGHAUS_OMP`, else `omp` on the PATH.
-#[cfg(unix)]
 fn omp_program() -> std::ffi::OsString {
     std::env::var_os("ZEUGHAUS_OMP")
         .filter(|program| !program.is_empty())
@@ -306,7 +287,6 @@ fn omp_program() -> std::ffi::OsString {
 /// What the master tells omp to do with its ticket's plan; `machines` is
 /// whether `ZEUGHAUS_MACHINES` names other hosts, `filed` the tickets the
 /// plan's sections became, which the attached plan leaves out.
-#[cfg(unix)]
 fn instruction(
     repo: &str,
     number: u64,
@@ -350,7 +330,6 @@ fn instruction(
 
 /// What a master tells the omp session of its ticket it resumes, with
 /// `holds` what the clone keeps of it.
-#[cfg(unix)]
 fn resume_instruction(repo: &str, number: u64, branch: &str, holds: Holds) -> String {
     format!(
         "This omp session executes zeughaus ticket #{number} of {repo} and was interrupted; the \
@@ -363,7 +342,6 @@ fn resume_instruction(repo: &str, number: u64, branch: &str, holds: Holds) -> St
 }
 
 /// What `plan` tells omp to do with an attached ticket.
-#[cfg(unix)]
 fn ticket_instruction(repo: &str, number: u64, source: &str) -> String {
     format!(
         "Make a plan for the attached zeughaus ticket #{number} of {repo}, written by {source}. \
@@ -374,7 +352,6 @@ fn ticket_instruction(repo: &str, number: u64, source: &str) -> String {
 }
 
 /// What a resumed plan session is told with the user's review attached.
-#[cfg(unix)]
 fn refine_instruction(repo: &str, number: u64) -> String {
     format!(
         "The user reviewed your plan for zeughaus ticket #{number} of {repo}; the review is \
@@ -384,7 +361,6 @@ fn refine_instruction(repo: &str, number: u64) -> String {
 }
 
 /// What a plan session is told that revises a plan it cannot resume.
-#[cfg(unix)]
 fn replan_instruction(repo: &str, number: u64) -> String {
     format!(
         "The attached plan for zeughaus ticket #{number} of {repo} was reviewed by the user; \
@@ -396,7 +372,6 @@ fn replan_instruction(repo: &str, number: u64) -> String {
 /// The ticket a plan session is given: its title, what it asks for, its
 /// links both ways, each with the linked ticket's title and state when
 /// `docs` (its repository's tickets) has it, and its comments.
-#[cfg(unix)]
 fn ticket_brief(doc: &zeughaus_link::DocView, docs: &[zeughaus_link::DocView], now: u64) -> String {
     use zeughaus_link::LinkKind;
     let mut text = format!("# #{} {}\n\n", doc.number, doc.title);
@@ -445,7 +420,6 @@ fn ticket_brief(doc: &zeughaus_link::DocView, docs: &[zeughaus_link::DocView], n
 }
 
 /// What a resumed Refine is given: the review, then the ticket's comments.
-#[cfg(unix)]
 fn refine_text(doc: &zeughaus_link::DocView, now: u64) -> String {
     let mut text = doc.feedback.clone();
     if !doc.comments.is_empty() {
@@ -455,23 +429,11 @@ fn refine_text(doc: &zeughaus_link::DocView, now: u64) -> String {
     text
 }
 
-#[cfg(not(unix))]
-pub fn plan(_args: &[String], _state_dir: &Path) -> ExitCode {
-    eprintln!("[agent] not supported on this platform");
-    ExitCode::FAILURE
-}
-
-#[cfg(not(unix))]
-pub fn master(_args: &[String], _state_dir: &Path) -> ExitCode {
-    eprintln!("[agent] not supported on this platform");
-    ExitCode::FAILURE
-}
-
+pub use self::host::{Agents, master, plan};
 #[cfg(unix)]
-pub use self::unix::{Agents, master, plan, work, work_profile};
+pub use self::host::{work, work_profile};
 
-#[cfg(unix)]
-mod unix {
+mod host {
     use std::path::{Path, PathBuf};
     use std::process::{Command, ExitCode, Stdio};
 
@@ -483,11 +445,12 @@ mod unix {
 
     use super::{
         Holds, MASTER_RECORD, MAX_QUICK, QUICK_OMP, SESSION_LOCK, SessionArgs, Start, agent_root,
-        checkout_of, clone_url, instruction, master_dir, master_sessions, omp_program, parse_args,
-        parse_work_args, plan_clone_dir, refine_instruction, refine_text, refusal_text,
-        replan_instruction, resume_instruction, start_of, ticket_brief, ticket_instruction,
-        work_root,
+        clone_url, instruction, master_dir, master_sessions, omp_program, parse_args,
+        plan_clone_dir, refine_instruction, refine_text, refusal_text, replan_instruction,
+        resume_instruction, start_of, ticket_brief, ticket_instruction,
     };
+    #[cfg(unix)]
+    use super::{checkout_of, parse_work_args, work_root};
     use crate::enlist::SessionHost;
     use crate::mcp::client::{Client, Link};
     use crate::mux::{MuxService, OwnedPlacement};
@@ -615,6 +578,10 @@ mod unix {
         fn state(&self, terminal: u64) -> Option<Option<zeughaus_mux::ExitState>> {
             self.mux.terminal_state(TerminalId(terminal))
         }
+
+        fn keeps_terminals(&self) -> bool {
+            self.mux.keeps_terminals()
+        }
     }
 
     /// Runs git in `dir`; `Err` is its last line of stderr. It never asks
@@ -702,6 +669,20 @@ mod unix {
         Ok(file)
     }
 
+    /// On Windows nothing ends a process's children with it: closing the
+    /// session's tab ends this process, and the job then ends omp and
+    /// everything it started.
+    #[cfg(windows)]
+    fn own_tree(word: &str) -> Option<crate::winjob::Job> {
+        match crate::winjob::Job::kill_on_close().and_then(|job| job.assign_self().map(|()| job)) {
+            Ok(job) => Some(job),
+            Err(e) => {
+                eprintln!("[{word}] omp will outlive a closed tab: {e}");
+                None
+            }
+        }
+    }
+
     /// `zeughaus-runner plan <repo> --branch <b> --origin <o> [--ticket <n>
     /// [--resume <file>]]`: brings the plan clone to the default branch and
     /// runs omp in plan mode there, planning ticket `n` of the CI when one is
@@ -725,6 +706,8 @@ mod unix {
             Ok(SessionArgs { origin: None, .. }) => return fail("--origin is needed".to_owned()),
             Err(e) => return fail(e),
         };
+        #[cfg(windows)]
+        let _tree = own_tree("plan");
         let ticket = match ticket {
             Some(n) => match fetch_ticket(&repo, n, state_dir) {
                 Ok(ticket) => Some(ticket),
@@ -946,6 +929,8 @@ mod unix {
             }) => (repo, branch, origin, number),
             Err(e) => return fail(e),
         };
+        #[cfg(windows)]
+        let _tree = own_tree("master");
         let cwd = match master_dir(state_dir, &origin) {
             Ok(dir) => dir,
             Err(e) => return fail(e),
@@ -1181,6 +1166,7 @@ mod unix {
     /// The profile of a shell in the work checkout of `origin`: the
     /// runner's own `work` subcommand, which clones the checkout first when
     /// it is missing and then becomes the user's shell there.
+    #[cfg(unix)]
     pub fn work_profile(
         state_dir: &Path,
         exe: &Path,
@@ -1218,6 +1204,7 @@ mod unix {
     /// the work checkout of the origin when it is missing, then replaces
     /// itself with the user's shell in it (in the work root when the clone
     /// failed).
+    #[cfg(unix)]
     pub fn work(args: &[String], _state_dir: &Path) -> ExitCode {
         use std::os::unix::process::CommandExt;
 

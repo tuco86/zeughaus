@@ -52,8 +52,9 @@ use zeughaus_core::{NodeId, Value, ZeughausError};
 #[cfg(unix)]
 use zeughaus_link::PROJECTS_PATH;
 use zeughaus_link::{
-    ACTIVITY_PATH, ActivityEntry, EVENTS_PATH, FEED_PATH, GRAPH_PATH, GraphChange, HOLD_PATH,
-    MUX_PATH, RUNS_PATH, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, TriggerRequest, credentials,
+    ACTIVITY_PATH, ActivityEntry, ActivityKind, EVENTS_PATH, FEED_PATH, GRAPH_PATH, GraphChange,
+    HOLD_PATH, MUX_PATH, RUNS_PATH, SNAPSHOT_PATH, Snapshot, TRIGGERS_PATH, TriggerRequest,
+    credentials,
 };
 use zeughaus_runtime::DeferredWork;
 
@@ -366,17 +367,19 @@ fn main() -> ExitCode {
                 Err(e) => eprintln!("[runner] no hold service: {e}"),
             }
         }
-        // Agent sessions the CI opens run in terminals of the mux; the
-        // sessions drive omp through a Unix exec and a Unix shell's PATH.
-        // Work shells of a project are started the same way.
-        #[cfg(unix)]
+        // Agent sessions the CI opens run in terminals of the mux. Work
+        // shells of a project are a Unix exec of the user's shell, so only a
+        // unix runner opens projects.
         let session_host: Option<Arc<dyn enlist::SessionHost>> = match (&mux_service, exe.as_ref())
         {
             (Some(service), Ok(exe)) => {
-                let (dir, program) = (state_dir.clone(), exe.clone());
-                service.set_project_profile(Arc::new(move |origin, branch| {
-                    agents::work_profile(&dir, &program, origin, branch)
-                }));
+                #[cfg(unix)]
+                {
+                    let (dir, program) = (state_dir.clone(), exe.clone());
+                    service.set_project_profile(Arc::new(move |origin, branch| {
+                        agents::work_profile(&dir, &program, origin, branch)
+                    }));
+                }
                 Some(Arc::new(agents::Agents::new(
                     service.clone(),
                     state_dir.clone(),
@@ -385,8 +388,6 @@ fn main() -> ExitCode {
             }
             _ => None,
         };
-        #[cfg(not(unix))]
-        let session_host: Option<Arc<dyn enlist::SessionHost>> = None;
         // Enlisting makes this runner execute the CI's jobs as its own; without
         // an `enlist.toml` it does not dial anyone.
         if let Some(config) = enlist_config {
@@ -417,14 +418,20 @@ fn main() -> ExitCode {
         // The updater has no use for the mux or for enlisting: it replaces
         // files and asks the loop below for the restart. Only an
         // `update.toml` makes it follow a channel. On Windows a restart ends
-        // every terminal and run, so an update waits for an idle runner.
+        // every terminal, run and agent session, so an update waits for an
+        // idle runner.
         if let Ok(exe) = exe.as_ref() {
             let may_restart: Box<dyn Fn() -> bool + Send> = match &job_host {
                 Some(host) if cfg!(windows) => {
                     let host = Arc::clone(host);
+                    let mux = mux_service.clone();
                     Box::new(move || {
                         use zeughaus_job::ProcessHost;
-                        !host.held() && host.live_runs() == 0
+                        !host.held()
+                            && host.live_runs() == 0
+                            && mux
+                                .as_ref()
+                                .is_none_or(|mux| mux.running(ActivityKind::Session) == 0)
                     })
                 }
                 _ => Box::new(|| true),

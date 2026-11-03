@@ -29,7 +29,7 @@ wait_minutes = 15                  # a job waits this long for the runner, then 
 # `labels` are free `key` or `key=value` labels a plan's `Runs on` selects
 # runners by; the CI adds `runner=<name>`, `os=` and `arch=` itself.
 # `sessions = true`: the runner hosts agent sessions (plan sessions and the
-# masters the CI dispatches approved plans to; it needs omp and a unix mux).
+# masters the CI dispatches approved plans to; it needs omp and a terminal mux).
 # `ssh`: the destination a session on another runner reaches this one by,
 # which makes it a machine a plan's further `Runs on` selectors can name.
 [runners.tuco-pc-hannes]
@@ -51,6 +51,7 @@ fingerprint = "<fingerprint>"
 fingerprint = "<fingerprint>"
 os = "windows"
 ssh = "zeughaus@10.8.0.12"
+sessions = true
 
 # Which runner or machine builds a platform: a job with `platform = "<p>"`
 # runs there, in a container when it also names an `image`.

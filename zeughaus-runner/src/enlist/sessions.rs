@@ -21,7 +21,7 @@ use super::{Executor, lock};
 const WATCH_EVERY: Duration = Duration::from_secs(1);
 
 /// What opens and closes a session's terminal: the runner's agents, on a
-/// unix runner with a mux.
+/// runner with a terminal mux.
 pub trait SessionHost: Send + Sync {
     /// The terminal the session runs in.
     fn open(&self, spec: &SessionSpec) -> Result<u64, String>;
@@ -29,6 +29,9 @@ pub trait SessionHost: Send + Sync {
     /// The terminal runs (`Some(None)`), its child ended (`Some(Some(exit))`),
     /// or it is gone without an exit (`None`).
     fn state(&self, terminal: u64) -> Option<Option<ExitState>>;
+    /// Whether a session's terminal outlives this process (unix shims); a
+    /// terminal without one ends with the runner.
+    fn keeps_terminals(&self) -> bool;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,7 +87,7 @@ impl Executor {
             let Some(host) = exec.agents.clone() else {
                 exec.send(FromRunner::SessionFailed {
                     id,
-                    message: "agent sessions need a unix runner with terminals".to_owned(),
+                    message: "agent sessions need a runner with a terminal mux".to_owned(),
                 });
                 return;
             };
@@ -154,6 +157,19 @@ impl Executor {
 
     /// Watches the sessions a previous process recorded and did not see end.
     pub(super) fn recover_sessions(self: &Arc<Self>) {
+        let Some(host) = self.agents.as_ref() else {
+            return;
+        };
+        // Terminals without shims ended with the process that recorded them;
+        // the ids are handed out again from 1, so they must not be watched.
+        if !host.keeps_terminals() {
+            self.change_sessions(|records| {
+                for record in records.iter_mut().filter(|r| r.end.is_none()) {
+                    record.end = Some((None, true));
+                }
+            });
+            return;
+        }
         for record in load(&self.state_dir) {
             if record.end.is_none() {
                 let exec = Arc::clone(self);

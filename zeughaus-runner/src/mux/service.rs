@@ -15,7 +15,6 @@
 //! from the sequence number it last sent -- a slow client gets fewer,
 //! larger deltas, never a queue of them.
 
-#[cfg(unix)]
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -60,7 +59,6 @@ const REAP_EVERY: Duration = Duration::from_millis(250);
 const AGENT_CHECK_SWEEPS: u64 = 8;
 
 /// Closed terminals whose end [`MuxService::terminal_state`] remembers.
-#[cfg(unix)]
 const CLOSED_KEPT: usize = 256;
 
 /// How long after a client vanishes its leases are held for it, so a network
@@ -153,7 +151,6 @@ struct Inner {
     activity: OnceLock<Sender<ActivityEntry>>,
     /// The newest [`CLOSED_KEPT`] terminals that were closed, with how their
     /// child had ended: what an owner that looks after the close learns.
-    #[cfg(unix)]
     closed: Mutex<VecDeque<(TerminalId, Option<ExitState>)>>,
     /// Agent statuses whose process is gone, by terminal and the status's
     /// `at`: reported as no status until the agent reports a new one.
@@ -225,7 +222,6 @@ impl MuxService {
                 revision,
                 run_dirs,
                 activity: OnceLock::new(),
-                #[cfg(unix)]
                 closed: Mutex::new(VecDeque::new()),
                 gone_agents: Mutex::new(HashSet::new()),
                 project_profile: OnceLock::new(),
@@ -251,7 +247,7 @@ impl MuxService {
     }
 
     /// How [`TopologyCommand::OpenProject`] builds its shell. A second call
-    /// is ignored. Work shells are a Unix exec, like agent sessions.
+    /// is ignored. Work shells are a Unix exec.
     #[cfg(unix)]
     pub fn set_project_profile(&self, f: ProjectProfile) {
         let _ = self.inner.project_profile.set(f);
@@ -475,8 +471,7 @@ impl MuxService {
 
     /// Whether terminal `id` still runs (`Some(None)`), how its child ended
     /// (`Some(Some(exit))`), or that it is gone without an exit, or too long
-    /// ago to remember (`None`). Only agent sessions ask, on Unix.
-    #[cfg(unix)]
+    /// ago to remember (`None`). Only agent sessions ask.
     pub fn terminal_state(&self, id: TerminalId) -> Option<Option<ExitState>> {
         if let Some(session) = self.session(id) {
             return Some(session.exit());
@@ -488,6 +483,36 @@ impl MuxService {
             .find(|(t, _)| *t == id)
             .and_then(|(_, exit)| exit.clone())
             .map(Some)
+    }
+
+    /// Whether terminals outlive this process: shims keep them for the next
+    /// runner, local terminals end with it.
+    pub fn keeps_terminals(&self) -> bool {
+        match &self.inner.host {
+            TerminalHost::Local => false,
+            #[cfg(unix)]
+            TerminalHost::Shim(_) => true,
+        }
+    }
+
+    /// How many terminals of `kind` still run their child.
+    pub fn running(&self, kind: ActivityKind) -> usize {
+        let live: Vec<TerminalId> = {
+            let sessions = self
+                .inner
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            sessions
+                .iter()
+                .filter(|(_, session)| session.exit().is_none())
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        let meta = self.inner.meta.lock().unwrap_or_else(|e| e.into_inner());
+        live.iter()
+            .filter(|id| meta.get(id).is_some_and(|meta| meta.kind == kind))
+            .count()
     }
 
     /// Starts a terminal the runner owns: a job's process, not a pane's
@@ -1679,14 +1704,12 @@ impl MuxService {
     fn forgotten(&self, id: TerminalId, session: Option<Session>, meta: Option<TerminalMeta>) {
         if let Some(meta) = meta.filter(|meta| !meta.replay) {
             let exit = session.as_ref().and_then(Session::exit);
-            #[cfg(unix)]
-            {
-                let mut closed = self.inner.closed.lock().unwrap_or_else(|e| e.into_inner());
-                closed.push_back((id, exit.clone()));
-                while closed.len() > CLOSED_KEPT {
-                    closed.pop_front();
-                }
+            let mut closed = self.inner.closed.lock().unwrap_or_else(|e| e.into_inner());
+            closed.push_back((id, exit.clone()));
+            while closed.len() > CLOSED_KEPT {
+                closed.pop_front();
             }
+            drop(closed);
             self.inner
                 .gone_agents
                 .lock()
