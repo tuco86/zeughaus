@@ -24,7 +24,7 @@ A project outside the CI gets an onboarding request, never a `PROPOSAL-*.md`. As
 | `name` | The repository's name in ci.toml, `[a-z0-9][a-z0-9-]*`, unique. |
 | `title`, `body` | One line; the request in Markdown. |
 | `default_branch` | Default `main`. |
-| `grants` | Secret name to the event patterns it is released to, as ci.toml's grants: `{"DEPLOY_KEY": ["push main"]}`. A secret named here must already be in the CI's OpenBao document; the request fails with the name otherwise. |
+| `grants` | Secret name to the event patterns it is released to, as ci.toml's grants: `{"DEPLOY_KEY": ["push main"]}`. The values belong in OpenBao `secret/zeughaus/<origin>/shell` (or `secret/zeughaus/shell`); after the onboarding the owner runs `deploy/ci/openbao.sh` on sadala, which writes the job policy that reads them. |
 | `prerequisites` | Host prerequisites the owner sets up by hand, one line each (a sudo rule, a served directory). |
 
 The body covers:
@@ -39,7 +39,7 @@ The body covers:
 
 The owner approves the request in the editor's Plans tab of the pending repository. The CI then, in order:
 
-1. Checks that the admin token, the bot token and every granted secret are in its OpenBao document.
+1. Checks that the admin token and the bot token are in its own OpenBao document.
 2. Adds its bot user as a collaborator with write access.
 3. Generates a webhook secret (`<NAME>_WEBHOOK_SECRET`) and stores it in OpenBao, or reuses the stored one.
 4. Creates the push webhook `<hook_url>/<name>`, or updates the one that is there.

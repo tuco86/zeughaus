@@ -584,7 +584,7 @@ mod tests {
             interpreter: "/bin/sh".to_owned(),
             place,
             env: Vec::new(),
-            secrets: Vec::new(),
+            handoff: None,
             timeout_minutes: 2,
             inputs: Vec::new(),
             checkout: Checkout::Clean,

@@ -245,14 +245,14 @@ impl Onboarder {
             )));
         }
 
+        // Granted secrets live in the project's documents, which only a job
+        // token reads; its policy follows the onboarding (deploy/ci/openbao.sh),
+        // and secrets-check reports them from then on.
         let fields = self
             .secrets
             .fields()
             .map_err(|e| step("secrets")(e.to_string()))?;
-        for name in [&onb.admin_token, &onb.bot_token]
-            .into_iter()
-            .chain(spec.grants.keys())
-        {
+        for name in [&onb.admin_token, &onb.bot_token] {
             if !fields.contains(name) {
                 return Err(step("secrets")(format!(
                     "{name} is not in {}; store it there, then approve #{} again",

@@ -1,22 +1,27 @@
-//! The values of the secrets `ci.toml` names, read from OpenBao (KV v2) when
-//! they are used.
+//! The CI's OpenBao access: its own document (forge tokens, webhook secrets,
+//! the Claude sign-in) read when the values are used, and the secret
+//! hand-off of a job.
 //!
-//! The runner holds the only OpenBao token: it logs in with its own AppRole,
-//! whose secret_id is sealed with `systemd-creds` to this machine and the CI
-//! user, and keeps the token in memory. A job is handed the values its
-//! `grants` release and never a token. The runner, the hook and the CLI each
-//! build their own [`Secrets`] against the same role.
+//! The CI logs in with its own AppRole, whose secret_id is sealed with
+//! `systemd-creds` to this machine and the CI user, and keeps the token in
+//! memory. A job is never handed a value or the CI's token: the CI mints a
+//! job token through the token role `[secrets] job_role` that reads only the
+//! job's project document and the global one, wraps it (single use, short
+//! TTL) and hands the wrapping token to the runner, which redeems it, reads
+//! the granted names and revokes it. The CI revokes it by its accessor once
+//! the runner started, failed to start or finished the run. The runner, the
+//! hook and the CLI each build their own [`Secrets`] against the same role.
 //!
-//! One document holds every secret. It is read as a whole and answered from
-//! memory for `cache_ttl_seconds`, so a rotation in OpenBao takes effect within
-//! that time without a restart. A failed read drops the cached document: a
-//! value that OpenBao no longer vouches for is never served. Nothing is renewed;
-//! a token the server no longer accepts is replaced by one new login.
+//! The own document is read as a whole and answered from memory for
+//! `cache_ttl_seconds`, so a rotation in OpenBao takes effect within that
+//! time without a restart. A failed read drops the cached document: a value
+//! that OpenBao no longer vouches for is never served. Nothing is renewed; a
+//! token the server no longer accepts is replaced by one new login.
 //!
 //! No error text and no `Debug` output carries a secret value, token or
 //! secret_id.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -26,7 +31,20 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
+use zeughaus_link::enlist::SecretHandoff;
+
 use crate::config::{CiConfig, SecretsConfig};
+
+/// How long a job's wrapping token can be redeemed.
+const WRAP_TTL: &str = "120s";
+
+/// How long a job token lives; its token role caps it too.
+const JOB_TOKEN_TTL: &str = "10m";
+
+/// The policy of the job tokens of repository `repo`.
+pub fn job_policy_name(repo: &str) -> String {
+    format!("zeughaus-job-{repo}")
+}
 
 /// The sealed secret_id, relative to the state directory.
 pub const CRED_FILE: &str = "bao-secret-id.cred";
@@ -191,7 +209,7 @@ impl Secrets {
                     state.token = None;
                     if retried {
                         return Err(SecretError::Unavailable(format!(
-                            "openbao: {}/{path} denied the patch (policy zeughaus-ci needs patch; rerun deploy/ci/openbao.sh)",
+                            "openbao: {}/{path} denied the patch (policy zeughaus needs patch; rerun deploy/ci/openbao.sh)",
                             config.mount
                         )));
                     }
@@ -276,7 +294,7 @@ impl Secrets {
                     state.token = None;
                     if retried {
                         return Err(SecretError::Unavailable(format!(
-                            "openbao: {}/{} denied (policy zeughaus-ci)",
+                            "openbao: {}/{} denied (policy zeughaus)",
                             config.mount, config.path
                         )));
                     }
@@ -353,6 +371,340 @@ impl Secrets {
             SecretId::Sealed(path) => unseal(path),
         }
     }
+
+    /// Mints a job token for `repo` (`origin` its [`normalize_origin`]) that
+    /// reads the project document and the global one, wrapped for the
+    /// runner of `run`. Answers the hand-off and the accessor of the job
+    /// token, which [`Secrets::revoke_accessor`] takes.
+    ///
+    /// [`normalize_origin`]: zeughaus_link::normalize_origin
+    pub fn job_handoff(
+        &self,
+        repo: &str,
+        origin: &str,
+        names: &[String],
+        run: &str,
+    ) -> Result<(SecretHandoff, String), SecretError> {
+        let what = format!("{} not handed to {run}", names.join(", "));
+        let Some(config) = &self.config else {
+            return Err(SecretError::Absent(format!(
+                "no [secrets] in ci.toml; {what}"
+            )));
+        };
+        let url = format!("{}/v1/auth/token/create/{}", config.addr, config.job_role);
+        let body = json!({
+            "policies": [job_policy_name(repo)],
+            "meta": { "run": run, "repo": repo },
+            "display_name": "job",
+            "ttl": JOB_TOKEN_TTL,
+        })
+        .to_string();
+        let wrap = format!("X-Vault-Wrap-TTL: {WRAP_TTL}");
+        let (code, answer) = self.authed(
+            config,
+            "POST",
+            &url,
+            &[&wrap, "Content-Type: application/json"],
+            Some(&body),
+            &what,
+        )?;
+        match code {
+            200 => {}
+            403 => {
+                return Err(SecretError::Unavailable(format!(
+                    "openbao: the CI may not mint job tokens (policy zeughaus needs update on auth/token/create/{}; rerun deploy/ci/openbao.sh)",
+                    config.job_role
+                )));
+            }
+            400 => {
+                return Err(SecretError::Unavailable(format!(
+                    "openbao: job token for {repo} refused: {}",
+                    api_errors(&answer)
+                )));
+            }
+            503 => return Err(sealed_error(config)),
+            other => {
+                return Err(SecretError::Unavailable(format!(
+                    "openbao {}: HTTP {other} on the job token",
+                    config.addr
+                )));
+            }
+        }
+        let answer: Value = serde_json::from_str(&answer).unwrap_or(Value::Null);
+        let field = |pointer: &str| {
+            answer
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    SecretError::Unavailable(format!(
+                        "openbao {}: the job token answer has no {pointer}",
+                        config.addr
+                    ))
+                })
+        };
+        let wrapping_token = field("/wrap_info/token")?;
+        let accessor = field("/wrap_info/wrapped_accessor")?;
+        let handoff = SecretHandoff {
+            addr: config.addr.clone(),
+            mount: config.mount.clone(),
+            project: config.project_shell(origin),
+            global: config.global_shell(),
+            names: names.to_vec(),
+            wrapping_token,
+        };
+        Ok((handoff, accessor))
+    }
+
+    /// Revokes the token behind `accessor`; one that is already gone counts
+    /// as revoked.
+    pub fn revoke_accessor(&self, accessor: &str) -> Result<(), SecretError> {
+        let what = "job token not revoked";
+        let Some(config) = &self.config else {
+            return Err(SecretError::Absent(format!(
+                "no [secrets] in ci.toml; {what}"
+            )));
+        };
+        let url = format!("{}/v1/auth/token/revoke-accessor", config.addr);
+        let body = json!({ "accessor": accessor }).to_string();
+        let (code, answer) = self.authed(
+            config,
+            "POST",
+            &url,
+            &["Content-Type: application/json"],
+            Some(&body),
+            what,
+        )?;
+        match code {
+            200 | 204 | 400 => Ok(()),
+            503 => Err(sealed_error(config)),
+            other => Err(SecretError::Unavailable(format!(
+                "openbao {}: HTTP {other} on revoke-accessor: {}",
+                config.addr,
+                api_errors(&answer)
+            ))),
+        }
+    }
+
+    /// Whether each of `names` is a field of `repo`'s project document or
+    /// the global one, read the way a job reads them: through a job token,
+    /// which is revoked again. Values are never kept.
+    pub fn project_fields(
+        &self,
+        repo: &str,
+        origin: &str,
+        names: &[String],
+    ) -> Result<BTreeMap<String, bool>, SecretError> {
+        let Some(config) = &self.config else {
+            return Err(SecretError::Absent(format!(
+                "no [secrets] in ci.toml; {} not checked",
+                names.join(", ")
+            )));
+        };
+        let (handoff, accessor) = self.job_handoff(repo, origin, names, "secrets-check")?;
+        let result = read_with_handoff(config, &handoff, repo);
+        // revoke-self ran unless the read failed early; the accessor covers
+        // that case and is harmless after it.
+        let _ = self.revoke_accessor(&accessor);
+        let present = result?;
+        Ok(names
+            .iter()
+            .map(|name| (name.clone(), present.contains(name)))
+            .collect())
+    }
+
+    /// A request with the CI's own token, logging in first without one. A
+    /// 403 means the token is gone or too old: one new login and one retry,
+    /// then the answer stands and is returned as it is.
+    fn authed(
+        &self,
+        config: &SecretsConfig,
+        method: &str,
+        url: &str,
+        headers: &[&str],
+        body: Option<&str>,
+        what: &str,
+    ) -> Result<(u16, String), SecretError> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut retried = false;
+        loop {
+            let token = match &state.token {
+                Some(token) => token.clone(),
+                None => {
+                    let token = self.login(config, what)?;
+                    state.token = Some(token.clone());
+                    token
+                }
+            };
+            let (code, answer) = bao_call(config, method, url, &token, headers, body, what)?;
+            if code == 403 {
+                state.token = None;
+                if !retried {
+                    retried = true;
+                    continue;
+                }
+            }
+            return Ok((code, answer));
+        }
+    }
+}
+
+/// One request with `token` and `headers`, which go over stdin as curl
+/// config together with the body, never in argv.
+fn bao_call(
+    config: &SecretsConfig,
+    method: &str,
+    url: &str,
+    token: &str,
+    headers: &[&str],
+    body: Option<&str>,
+    what: &str,
+) -> Result<(u16, String), SecretError> {
+    let auth = format!("X-Vault-Token: {token}");
+    let mut all = Vec::with_capacity(headers.len() + 1);
+    all.push(auth.as_str());
+    all.extend_from_slice(headers);
+    let stdin = crate::forge::curl_config(&all, body);
+    bao_curl(
+        &["-X", method, "-K", "-"],
+        &stdin,
+        url,
+        config.timeout_seconds,
+    )
+    .map_err(|e| unreachable_error(config, &e, what))
+}
+
+/// Redeems `handoff` of `repo`, reads the field names of both documents with
+/// the job token and revokes it. A document that does not exist has no fields.
+fn read_with_handoff(
+    config: &SecretsConfig,
+    handoff: &SecretHandoff,
+    repo: &str,
+) -> Result<BTreeSet<String>, SecretError> {
+    let what = "project secrets not checked";
+    let json = ["Content-Type: application/json"];
+    let unwrap = format!("{}/v1/sys/wrapping/unwrap", config.addr);
+    let (code, answer) = bao_call(
+        config,
+        "POST",
+        &unwrap,
+        &handoff.wrapping_token,
+        &json,
+        Some("{}"),
+        what,
+    )?;
+    if code != 200 {
+        return Err(SecretError::Unavailable(format!(
+            "openbao {}: HTTP {code} on unwrap: {}",
+            config.addr,
+            api_errors(&answer)
+        )));
+    }
+    let token = serde_json::from_str::<Value>(&answer)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/auth/client_token")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| {
+            SecretError::Unavailable(format!(
+                "openbao {}: the unwrapped answer has no client_token",
+                config.addr
+            ))
+        })?;
+    let mut fields = BTreeSet::new();
+    let mut failure = None;
+    for document in [&handoff.project, &handoff.global] {
+        let url = format!("{}/v1/{}/data/{document}", config.addr, config.mount);
+        match bao_call(config, "GET", &url, &token, &[], None, what) {
+            Ok((200, body)) => {
+                let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                if let Some(Value::Object(data)) = value.pointer("/data/data") {
+                    fields.extend(data.keys().cloned());
+                }
+            }
+            Ok((404, _)) => {}
+            Ok((403, _)) => {
+                failure = Some(SecretError::Unavailable(format!(
+                    "openbao: the job token may not read {}/{document} (policy {} missing? run deploy/ci/openbao.sh on sadala)",
+                    config.mount,
+                    job_policy_name(repo)
+                )));
+                break;
+            }
+            Ok((code, body)) => {
+                failure = Some(SecretError::Unavailable(format!(
+                    "openbao {}: HTTP {code} on {}/{document}: {}",
+                    config.addr,
+                    config.mount,
+                    api_errors(&body)
+                )));
+                break;
+            }
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        }
+    }
+    let revoke = format!("{}/v1/auth/token/revoke-self", config.addr);
+    let _ = bao_call(config, "POST", &revoke, &token, &json, Some("{}"), what);
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(fields),
+    }
+}
+
+/// OpenBao's `errors` of an error answer, joined; never a value.
+fn api_errors(body: &str) -> String {
+    let errors: Vec<String> = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value.get("errors").and_then(Value::as_array).map(|errors| {
+                errors
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    if errors.is_empty() {
+        "no reason given".to_owned()
+    } else {
+        errors.join("; ")
+    }
+}
+
+/// `zeughaus-ci job-policies`: the policy of each repository's job tokens,
+/// for every repository with at least one grant. Each reads the repository's
+/// project document and the global one.
+pub fn job_policies(config: &CiConfig) -> Result<BTreeMap<String, String>, String> {
+    let Some(secrets) = &config.secrets else {
+        return Err("no [secrets] in ci.toml".to_owned());
+    };
+    Ok(config
+        .repos
+        .iter()
+        .filter(|(_, repo)| !repo.grants.is_empty())
+        .map(|(name, repo)| {
+            let origin = zeughaus_link::normalize_origin(&repo.url);
+            let rule = |document: String| {
+                format!(
+                    "path \"{}/data/{document}\" {{\n  capabilities = [\"read\"]\n}}\n",
+                    secrets.mount
+                )
+            };
+            let policy = format!(
+                "{}\n{}",
+                rule(secrets.project_shell(&origin)),
+                rule(secrets.global_shell())
+            );
+            (job_policy_name(name), policy)
+        })
+        .collect())
 }
 
 /// `systemd-creds decrypt` of the sealed secret_id; only the user it was
@@ -428,17 +780,13 @@ fn value_of(
             "openbao: {name} in {document} is not a string"
         )));
     };
-    let text = text
-        .strip_suffix("\r\n")
-        .or_else(|| text.strip_suffix('\n'))
-        .unwrap_or(text);
     // A header or a URL built from a value with a line break would be
     // injected into; refuse it where it enters.
-    if text.contains('\n') {
+    let Some(text) = zeughaus_link::enlist::secret_line(text) else {
         return Err(SecretError::Absent(format!(
             "openbao: {name} in {document} spans several lines"
         )));
-    }
+    };
     Ok(text.to_owned())
 }
 
@@ -483,17 +831,20 @@ fn bao_curl(args: &[&str], stdin: &str, url: &str, timeout: u64) -> Result<(u16,
     Ok((code, body.to_owned()))
 }
 
-/// `ci secrets-check`: whether every secret `config` names is a field of the
-/// document. The lines are `NAME ok` or `NAME missing` in name order, then
-/// `unreferenced: A, B` when the document holds fields nothing names. `Err`
-/// when the document cannot be read or a name is missing; a missing name's
-/// error carries the lines too, so a caller that prints only the error loses
-/// nothing.
+/// `ci secrets-check`: whether every secret `config` names can be had. The
+/// CI's own names (fetch and status tokens, webhook secrets, the onboarding
+/// tokens) are checked against its document as `NAME ok|missing` in name
+/// order; each repository's grants against its project documents, read
+/// through a job token as a job reads them, as `<repo>: NAME ok|missing`.
+/// Then `unreferenced: A, B` when the own document holds fields nothing
+/// names. `Err` when a document cannot be read or a name is missing; a
+/// missing name's error carries the lines too, so a caller that prints only
+/// the error loses nothing.
 pub fn check(secrets: &Secrets, config: &CiConfig) -> Result<Vec<String>, String> {
     let names: BTreeSet<&String> = config
         .repos
         .values()
-        .flat_map(|repo| repo.secret_names())
+        .flat_map(|repo| repo.own_secret_names())
         .chain(
             config
                 .onboarding
@@ -501,7 +852,12 @@ pub fn check(secrets: &Secrets, config: &CiConfig) -> Result<Vec<String>, String
                 .flat_map(|onb| [&onb.bot_token, &onb.admin_token]),
         )
         .collect();
-    if names.is_empty() && secrets.config.is_none() {
+    let granting: Vec<(&String, &crate::config::RepoConfig)> = config
+        .repos
+        .iter()
+        .filter(|(_, repo)| !repo.grants.is_empty())
+        .collect();
+    if names.is_empty() && granting.is_empty() && secrets.config.is_none() {
         return Ok(Vec::new());
     }
     let fields = secrets.fields().map_err(|e| e.to_string())?;
@@ -512,7 +868,22 @@ pub fn check(secrets: &Secrets, config: &CiConfig) -> Result<Vec<String>, String
             lines.push(format!("{name} ok"));
         } else {
             lines.push(format!("{name} missing"));
-            missing.push(name.as_str());
+            missing.push(name.to_string());
+        }
+    }
+    for (repo_name, repo) in granting {
+        let granted: Vec<String> = repo.grants.keys().cloned().collect();
+        let origin = zeughaus_link::normalize_origin(&repo.url);
+        let present = secrets
+            .project_fields(repo_name, &origin, &granted)
+            .map_err(|e| format!("{repo_name}: {e}"))?;
+        for (name, ok) in present {
+            if ok {
+                lines.push(format!("{repo_name}: {name} ok"));
+            } else {
+                lines.push(format!("{repo_name}: {name} missing"));
+                missing.push(format!("{repo_name}/{name}"));
+            }
         }
     }
     // The fields the CI writes itself are kept, not named.
@@ -528,11 +899,7 @@ pub fn check(secrets: &Secrets, config: &CiConfig) -> Result<Vec<String>, String
     if missing.is_empty() {
         return Ok(lines);
     }
-    lines.push(format!(
-        "missing in {}: {}",
-        secrets.document(),
-        missing.join(", ")
-    ));
+    lines.push(format!("missing: {}", missing.join(", ")));
     Err(lines.join("\n"))
 }
 
@@ -573,6 +940,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn job_policies_read_the_project_and_the_global_shell_of_granting_repos() {
+        let config = CiConfig::parse(&format!(
+            "{RUNNERS}[secrets]\naddr = \"http://bao\"\npath = \"zeughaus/zeughaus\"\nrole_id = \"r\"\n\
+             [repos.a]\nurl = \"https://git.example.org/o/a.git\"\n\
+             [repos.a.grants]\nT = [\"push main\"]\n\
+             [repos.b]\nurl = \"https://git.example.org/o/b.git\"\n"
+        ))
+        .unwrap();
+        let policies = job_policies(&config).unwrap();
+        assert_eq!(
+            policies.keys().collect::<Vec<_>>(),
+            ["zeughaus-job-a"],
+            "a repository without grants gets no policy"
+        );
+        assert_eq!(
+            policies["zeughaus-job-a"],
+            "path \"secret/data/zeughaus/git.example.org/o/a/shell\" {\n  capabilities = [\"read\"]\n}\n\n\
+             path \"secret/data/zeughaus/shell\" {\n  capabilities = [\"read\"]\n}\n"
+        );
+        let bare = CiConfig::parse(RUNNERS).unwrap();
+        assert_eq!(job_policies(&bare).unwrap_err(), "no [secrets] in ci.toml");
+    }
+
     /// Tests that touch the filesystem, network, processes or real time: the
     /// integration tier (`.config/nextest.toml`).
     mod io {
@@ -587,6 +978,7 @@ mod tests {
 
         /// An OpenBao that answers logins and counts them, and answers the reads of
         /// `zeughaus/ci` as its script says; the script gets the 0-based read number.
+        /// Every other request is answered from `answers` (`METHOD url`) and logged.
         struct Stub {
             addr: String,
             logins: Arc<AtomicUsize>,
@@ -594,8 +986,20 @@ mod tests {
             login_body: Arc<Mutex<String>>,
             /// The bodies of the PATCHes of the document, which answer 204.
             patches: Arc<Mutex<Vec<String>>>,
+            answers: Arc<Mutex<BTreeMap<String, (u16, String)>>>,
+            requests: Arc<Mutex<Vec<Request>>>,
             stop: Arc<AtomicBool>,
             thread: Option<JoinHandle<()>>,
+        }
+
+        /// A request the stub answered from `answers`.
+        #[derive(Debug, Clone)]
+        struct Request {
+            /// `METHOD url`.
+            line: String,
+            token: String,
+            wrap_ttl: Option<String>,
+            body: String,
         }
 
         impl Stub {
@@ -609,6 +1013,8 @@ mod tests {
                 let reads = Arc::new(AtomicUsize::new(0));
                 let login_body = Arc::new(Mutex::new(String::new()));
                 let patches = Arc::new(Mutex::new(Vec::new()));
+                let answers = Arc::new(Mutex::new(BTreeMap::new()));
+                let requests = Arc::new(Mutex::new(Vec::new()));
                 let stop = Arc::new(AtomicBool::new(false));
                 let thread = {
                     let (logins, reads, login_body, patches, stop) = (
@@ -618,6 +1024,7 @@ mod tests {
                         Arc::clone(&patches),
                         Arc::clone(&stop),
                     );
+                    let (answers, requests) = (Arc::clone(&answers), Arc::clone(&requests));
                     std::thread::spawn(move || {
                         while !stop.load(Ordering::SeqCst) {
                             let Ok(Some(mut request)) =
@@ -642,7 +1049,32 @@ mod tests {
                                     (204, String::new())
                                 }
                                 READ_URL => script(reads.fetch_add(1, Ordering::SeqCst)),
-                                _ => (500, String::new()),
+                                _ => {
+                                    let line = format!("{} {url}", request.method());
+                                    let header = |name: &'static str| {
+                                        request
+                                            .headers()
+                                            .iter()
+                                            .find(|h| h.field.equiv(name))
+                                            .map(|h| h.value.as_str().to_owned())
+                                    };
+                                    let token = header("X-Vault-Token").unwrap_or_default();
+                                    let wrap_ttl = header("X-Vault-Wrap-TTL");
+                                    let mut body = String::new();
+                                    let _ = request.as_reader().read_to_string(&mut body);
+                                    requests.lock().unwrap().push(Request {
+                                        line: line.clone(),
+                                        token,
+                                        wrap_ttl,
+                                        body,
+                                    });
+                                    answers
+                                        .lock()
+                                        .unwrap()
+                                        .get(&line)
+                                        .cloned()
+                                        .unwrap_or((500, String::new()))
+                                }
                             };
                             let _ = request.respond(
                                 tiny_http::Response::from_string(body).with_status_code(code),
@@ -656,6 +1088,8 @@ mod tests {
                     reads,
                     login_body,
                     patches,
+                    answers,
+                    requests,
                     stop,
                     thread: Some(thread),
                 }
@@ -672,7 +1106,52 @@ mod tests {
             fn reads(&self) -> usize {
                 self.reads.load(Ordering::SeqCst)
             }
+
+            /// `Value::Null` answers an empty body.
+            fn answer(&self, line: &str, code: u16, body: Value) {
+                let text = if body.is_null() {
+                    String::new()
+                } else {
+                    body.to_string()
+                };
+                self.answers
+                    .lock()
+                    .unwrap()
+                    .insert(line.to_owned(), (code, text));
+            }
+
+            fn requests(&self) -> Vec<Request> {
+                self.requests.lock().unwrap().clone()
+            }
+
+            /// A token role that mints, an unwrap that answers `job-tok`, and
+            /// the project and global documents of repo `a` as given (`None`:
+            /// the document does not exist).
+            fn job_token_answers(&self, project: Option<Value>, global: Option<Value>) {
+                self.answer(
+                    TOKEN_CREATE,
+                    200,
+                    json!({ "wrap_info": { "token": "wrap-1", "wrapped_accessor": "acc-1" } }),
+                );
+                self.answer(
+                    "POST /v1/sys/wrapping/unwrap",
+                    200,
+                    json!({ "auth": { "client_token": "job-tok" } }),
+                );
+                for (line, document) in [(PROJECT_READ, project), (GLOBAL_READ, global)] {
+                    match document {
+                        Some(data) => self.answer(line, 200, json!({ "data": { "data": data } })),
+                        None => self.answer(line, 404, json!({ "errors": [] })),
+                    }
+                }
+                self.answer("POST /v1/auth/token/revoke-self", 204, json!(null));
+                self.answer("POST /v1/auth/token/revoke-accessor", 204, json!(null));
+            }
         }
+
+        const TOKEN_CREATE: &str = "POST /v1/auth/token/create/zeughaus-job";
+        const PROJECT_READ: &str = "GET /v1/secret/data/zeughaus/git.example.org/o/a/shell";
+        const GLOBAL_READ: &str = "GET /v1/secret/data/zeughaus/shell";
 
         impl Drop for Stub {
             fn drop(&mut self) {
@@ -691,6 +1170,8 @@ mod tests {
                 role_id: "role-1".to_owned(),
                 cache_ttl_seconds: ttl,
                 timeout_seconds: 5,
+                projects: "zeughaus".to_owned(),
+                job_role: "zeughaus-job".to_owned(),
             }
         }
 
@@ -731,7 +1212,7 @@ mod tests {
             assert_eq!(
                 secrets.get("A").unwrap_err(),
                 SecretError::Unavailable(
-                    "openbao: secret/zeughaus/ci denied (policy zeughaus-ci)".to_owned()
+                    "openbao: secret/zeughaus/ci denied (policy zeughaus)".to_owned()
                 )
             );
             assert_eq!(stub.logins(), 2);
@@ -904,26 +1385,49 @@ mod tests {
         fn ci_config(addr: &str) -> CiConfig {
             CiConfig::parse(&format!(
                 "{RUNNERS}[secrets]\naddr = \"{addr}\"\npath = \"zeughaus/ci\"\nrole_id = \"role-1\"\n\
-                 [repos.a]\nurl = \"x\"\nfetch_token = \"A\"\nstatus_token = \"B\"\n\
-                 [repos.a.grants]\nC = [\"tag v*\"]\nA = [\"tag v*\"]\n"
+                 [repos.a]\nurl = \"https://git.example.org/o/a.git\"\nfetch_token = \"A\"\nstatus_token = \"B\"\n\
+                 [repos.a.grants]\nD = [\"tag v*\"]\nC = [\"tag v*\"]\n"
             ))
             .unwrap()
         }
 
         #[test]
-        fn check_lists_every_name_and_the_unreferenced_fields() {
-            let stub = Stub::start(|_| document(json!({ "A": "1", "B": "2", "C": "3", "Z": "4" })));
+        fn check_lists_own_and_project_names_and_the_unreferenced_fields() {
+            let stub = Stub::start(|_| document(json!({ "A": "1", "B": "2", "Z": "4" })));
+            stub.job_token_answers(Some(json!({ "C": "3" })), Some(json!({ "D": "5" })));
             let lines = check(&stub.secrets(30), &ci_config(&stub.addr)).unwrap();
-            assert_eq!(lines, ["A ok", "B ok", "C ok", "unreferenced: Z"]);
+            assert_eq!(
+                lines,
+                ["A ok", "B ok", "a: C ok", "a: D ok", "unreferenced: Z"]
+            );
+            // The project documents are read as a job reads them: with the
+            // unwrapped job token, which is revoked afterwards.
+            let requests = stub.requests();
+            let lines: Vec<(&str, &str)> = requests
+                .iter()
+                .map(|r| (r.line.as_str(), r.token.as_str()))
+                .collect();
+            assert_eq!(
+                lines,
+                [
+                    (TOKEN_CREATE, "tok"),
+                    ("POST /v1/sys/wrapping/unwrap", "wrap-1"),
+                    (PROJECT_READ, "job-tok"),
+                    (GLOBAL_READ, "job-tok"),
+                    ("POST /v1/auth/token/revoke-self", "job-tok"),
+                    ("POST /v1/auth/token/revoke-accessor", "tok"),
+                ]
+            );
         }
 
         #[test]
-        fn check_fails_on_a_missing_name() {
+        fn check_fails_on_a_missing_own_or_project_name() {
             let stub = Stub::start(|_| document(json!({ "A": "1" })));
+            stub.job_token_answers(None, Some(json!({ "C": "3" })));
             let error = check(&stub.secrets(30), &ci_config(&stub.addr)).unwrap_err();
             assert_eq!(
                 error,
-                "A ok\nB missing\nC missing\nmissing in secret/zeughaus/ci: B, C"
+                "A ok\nB missing\na: C ok\na: D missing\nmissing: B, a/D"
             );
         }
 
@@ -932,6 +1436,91 @@ mod tests {
             let stub = Stub::start(|_| (404, "{}".to_owned()));
             let error = check(&stub.secrets(30), &ci_config(&stub.addr)).unwrap_err();
             assert_eq!(error, "openbao: no document secret/zeughaus/ci");
+        }
+
+        #[test]
+        fn a_job_handoff_is_a_wrapped_token_of_the_repos_policy() {
+            let stub = Stub::start(|_| document(json!({})));
+            stub.job_token_answers(None, None);
+            let names = vec!["C".to_owned(), "D".to_owned()];
+            let (handoff, accessor) = stub
+                .secrets(30)
+                .job_handoff("a", "git.example.org/o/a", &names, "a.7.build")
+                .unwrap();
+            assert_eq!(accessor, "acc-1");
+            assert_eq!(
+                handoff,
+                SecretHandoff {
+                    addr: stub.addr.clone(),
+                    mount: "secret".to_owned(),
+                    project: "zeughaus/git.example.org/o/a/shell".to_owned(),
+                    global: "zeughaus/shell".to_owned(),
+                    names,
+                    wrapping_token: "wrap-1".to_owned(),
+                }
+            );
+            let request = &stub.requests()[0];
+            assert_eq!(request.wrap_ttl.as_deref(), Some("120s"));
+            let body: Value = serde_json::from_str(&request.body).unwrap();
+            assert_eq!(
+                body,
+                json!({
+                    "policies": ["zeughaus-job-a"],
+                    "meta": { "run": "a.7.build", "repo": "a" },
+                    "display_name": "job",
+                    "ttl": "10m",
+                })
+            );
+        }
+
+        #[test]
+        fn a_job_token_forbidden_after_the_second_login_names_the_policy() {
+            let stub = Stub::start(|_| document(json!({})));
+            stub.answer(
+                TOKEN_CREATE,
+                403,
+                json!({ "errors": ["permission denied"] }),
+            );
+            let error = stub
+                .secrets(30)
+                .job_handoff("a", "o", &["C".to_owned()], "a.1.j")
+                .unwrap_err();
+            assert_eq!(
+                error,
+                SecretError::Unavailable(
+                    "openbao: the CI may not mint job tokens (policy zeughaus needs update on auth/token/create/zeughaus-job; rerun deploy/ci/openbao.sh)".to_owned()
+                )
+            );
+            assert_eq!(stub.logins(), 2);
+        }
+
+        #[test]
+        fn a_refused_job_token_carries_openbaos_reason() {
+            let stub = Stub::start(|_| document(json!({})));
+            stub.answer(TOKEN_CREATE, 400, json!({ "errors": ["unknown role"] }));
+            let error = stub
+                .secrets(30)
+                .job_handoff("a", "o", &["C".to_owned()], "a.1.j")
+                .unwrap_err();
+            assert_eq!(
+                error,
+                SecretError::Unavailable(
+                    "openbao: job token for a refused: unknown role".to_owned()
+                )
+            );
+        }
+
+        #[test]
+        fn revoking_a_token_that_is_gone_succeeds() {
+            let stub = Stub::start(|_| document(json!({})));
+            stub.answer(
+                "POST /v1/auth/token/revoke-accessor",
+                400,
+                json!({ "errors": ["invalid accessor"] }),
+            );
+            stub.secrets(30).revoke_accessor("acc-1").unwrap();
+            let body: Value = serde_json::from_str(&stub.requests()[0].body).unwrap();
+            assert_eq!(body, json!({ "accessor": "acc-1" }));
         }
     }
 }

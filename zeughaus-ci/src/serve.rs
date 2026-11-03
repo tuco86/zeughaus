@@ -792,26 +792,31 @@ impl CiServer {
                 }
             });
         }
-        let names: std::collections::BTreeSet<&String> = repo.secret_names().collect();
-        lines.push(if names.is_empty() {
+        // The CI's own names come from its document, a job's grants from the
+        // project documents a job token reads.
+        let own: std::collections::BTreeSet<&String> = repo.own_secret_names().collect();
+        let granted: Vec<String> = repo.grants.keys().cloned().collect();
+        lines.push(if own.is_empty() && granted.is_empty() {
             "secrets: none named".to_owned()
         } else {
-            match self.secrets.fields() {
-                Ok(fields) => format!(
-                    "secrets: {}",
-                    names
-                        .iter()
-                        .map(|name| {
-                            let state = if fields.contains(*name) {
-                                "ok"
-                            } else {
-                                "missing"
-                            };
-                            format!("{name} {state}")
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
+            let state = |name: &str, present: bool| {
+                format!("{name} {}", if present { "ok" } else { "missing" })
+            };
+            let mut states = Vec::new();
+            let read = (|| {
+                if !own.is_empty() {
+                    let fields = self.secrets.fields()?;
+                    states.extend(own.iter().map(|name| state(name, fields.contains(*name))));
+                }
+                if !granted.is_empty() {
+                    let origin = zeughaus_link::normalize_origin(&repo.url);
+                    let present = self.secrets.project_fields(name, &origin, &granted)?;
+                    states.extend(present.iter().map(|(name, ok)| state(name, *ok)));
+                }
+                Ok::<_, crate::secrets::SecretError>(())
+            })();
+            match read {
+                Ok(()) => format!("secrets: {}", states.join(", ")),
                 Err(e) => format!("secrets: {e}"),
             }
         });

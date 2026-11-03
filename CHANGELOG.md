@@ -332,6 +332,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Secrets in OpenBao are organised by user, then by reader: the CI's own
+  document is `zeughaus/zeughaus`, a job's granted secrets come from
+  `zeughaus/<origin>/shell`, then `zeughaus/shell`, and omp reads the
+  Claude token from `zeughaus/omp`. The CI no longer reads job secrets
+  itself: it mints a wrapped, single-use job token per run (token role
+  `zeughaus-job`, policy `zeughaus-job-<repo>`, from the new
+  `zeughaus-ci job-policies`), and the runner redeems it, reads the
+  granted names, revokes it, and masks their values as `*` in the log the
+  CI keeps. A wrapping token redeemed by someone else stops the job with an
+  alarm. `Assign` carries a `SecretHandoff` instead of values; CI and
+  runners of different builds cannot run jobs with secrets together.
+  `deploy/ci/openbao.sh` writes the AppRole and policy `zeughaus` (it
+  replaces `zeughaus-ci`, which reached `hannes/omp`), the token role and
+  the job policies. `secrets-check` reports granted names per repository
+  as `<repo>: NAME ok|missing`. Onboarding no longer checks granted
+  secrets; the owner runs `openbao.sh` after it for the job policy.
+- A runner's work shells, agent sessions and pane shells start with the
+  zeughaus secrets of their project and kind (`zeughaus/<origin>/shell`,
+  `zeughaus/shell`, and for sessions the `omp` documents first), read with
+  `get-secret --json`; the terminal's own environment wins.
+- The omp plugin (0.11.0) resolves `${secret:hannes/omp/<doc...>/<FIELD>}`
+  in bash commands when they run and adds the `secrets` tool, which lists
+  documents and field names.
+
 - The Board of a project no CI builds shows the CI's plan for it: its
   summary, then its sections as cards to choose, and a preview of what
   `Onboard with N tickets` files (one ticket per chosen section, each after

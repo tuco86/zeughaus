@@ -7,6 +7,7 @@
 
 mod close;
 mod persist;
+mod secret_env;
 mod service;
 mod workspace;
 

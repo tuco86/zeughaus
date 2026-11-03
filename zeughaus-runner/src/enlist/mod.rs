@@ -27,6 +27,8 @@
 //! * `control`: the clock of this runner: machine status and the VM timeout.
 //! * `artifacts`: the artifact sets that cross to and from the CI, by content.
 //! * `prefetch`: the sets fetched before their job is assigned.
+//! * `handoff`: the redemption of a job's secret hand-off; `mask`: those
+//!   secrets masked in the log the CI stores.
 //! * `launch`, `machine`, `git`, `cleanup`, `stage`: what a run is rendered
 //!   from and housekeeping.
 
@@ -36,9 +38,11 @@ pub mod config;
 mod cleanup;
 mod control;
 mod git;
+mod handoff;
 mod launch;
 mod link;
 mod machine;
+mod mask;
 mod prefetch;
 mod run;
 mod sessions;
@@ -49,7 +53,7 @@ pub use self::sessions::SessionHost;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use tokio::sync::mpsc;
 use weida::{ClientTls, ReconnectPolicy, Runtime, RuntimeConfig, Trust};
@@ -142,6 +146,10 @@ pub struct RunCtl {
     pub live: Mutex<Option<PathBuf>>,
     /// How it ended, once it did and its artifacts are kept.
     pub end: Mutex<Option<RunEnd>>,
+    /// The granted secret values, longest first, masked in the log the CI
+    /// stores. Set once the hand-off is redeemed; never persisted, so a run
+    /// recovered by a restarted runner is delivered unmasked.
+    pub masks: OnceLock<Vec<Vec<u8>>>,
 }
 
 impl RunCtl {
@@ -153,6 +161,7 @@ impl RunCtl {
             active_millis: Default::default(),
             live: Mutex::new(None),
             end: Mutex::new(None),
+            masks: OnceLock::new(),
         }
     }
 

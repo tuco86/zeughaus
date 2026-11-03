@@ -515,6 +515,9 @@ struct Scheduler {
     alerts: Sender<Alert>,
     /// Every record written, for the host loop to announce to editors.
     changes: Sender<CiChange>,
+    /// The accessor of each assigned run's job token (run -> accessor),
+    /// revoked once the runner started the run, failed to, or it ended.
+    handoffs: HashMap<String, String>,
 }
 
 /// A default branch that turned red, or stays red: for the editors'
@@ -614,6 +617,7 @@ impl Scheduler {
             ready_since: HashMap::new(),
             alerts,
             changes,
+            handoffs: HashMap::new(),
         }
     }
 
@@ -1613,11 +1617,14 @@ impl Scheduler {
             return;
         }
 
-        let assignment = match self.build_assignment(&pipeline, ji, &place, inputs) {
-            Ok(assignment) => assignment,
+        let (assignment, accessor) = match self.build_assignment(&pipeline, ji, &place, inputs) {
+            Ok(built) => built,
             Err(e) => return self.fail_job(pi, ji, e, State::Error),
         };
         let run = assignment.run.clone();
+        if let Some(accessor) = accessor {
+            self.handoffs.insert(run.clone(), accessor);
+        }
         self.runners.assign(&run, &runner);
         if !self.runners.send(
             &runner,
@@ -1627,6 +1634,7 @@ impl Scheduler {
         ) {
             // The runner dropped between the check and the send.
             self.runners.unassign(&run);
+            self.revoke_handoff(&run);
             return;
         }
         self.ready_since.remove(&key);
@@ -1662,16 +1670,17 @@ impl Scheduler {
     }
 
     /// What a runner needs to execute job `ji`: the forge access, the
-    /// environment and the secrets granted for the event. A manual run has
-    /// the working trees of its upload instead of a commit to fetch, and
-    /// neither forge access nor secrets.
+    /// environment and the hand-off of the secrets granted for the event,
+    /// with the accessor of the job token it wraps. A manual run has the
+    /// working trees of its upload instead of a commit to fetch, and neither
+    /// forge access nor secrets.
     fn build_assignment(
         &self,
         pipeline: &Pipeline,
         ji: usize,
         place: &Place,
         inputs: Vec<Input>,
-    ) -> Result<Assignment, String> {
+    ) -> Result<(Assignment, Option<String>), String> {
         let job = &pipeline.jobs[ji].def;
         let repo = self.config.repos.get(&pipeline.repo);
         let sha = pipeline.sha.clone().unwrap_or_default();
@@ -1684,12 +1693,15 @@ impl Scheduler {
             None => None,
         };
 
-        let mut secrets = Vec::new();
+        // The granted names and the repository's origin; the hand-off is
+        // minted last, once nothing else can fail.
+        let mut granted = None;
         let mut fetch_token = None;
         let (url, fetch_user) = match (repo, &upload) {
             (_, Some(_)) => (String::new(), String::new()),
             (Some(repo), None) => {
                 // Secrets: only those granted for this event.
+                let mut names = Vec::with_capacity(job.secrets.len());
                 for name in &job.secrets {
                     if !repo.grants(name, &pipeline.event) {
                         return Err(format!(
@@ -1697,10 +1709,10 @@ impl Scheduler {
                             pipeline.event.kind, pipeline.event.git_ref
                         ));
                     }
-                    secrets.push((
-                        name.clone(),
-                        self.secrets.get(name).map_err(|e| e.to_string())?,
-                    ));
+                    names.push(name.clone());
+                }
+                if !names.is_empty() {
+                    granted = Some((names, zeughaus_link::normalize_origin(&repo.url)));
                 }
                 fetch_token = repo
                     .fetch_token
@@ -1754,8 +1766,19 @@ impl Scheduler {
             });
         }
 
-        Ok(Assignment {
-            run: run_id(&pipeline.repo, pipeline.number, &job.name),
+        let run = run_id(&pipeline.repo, pipeline.number, &job.name);
+        let (handoff, accessor) = match granted {
+            Some((names, origin)) => {
+                let (handoff, accessor) = self
+                    .secrets
+                    .job_handoff(&pipeline.repo, &origin, &names, &run)
+                    .map_err(|e| e.to_string())?;
+                (Some(handoff), Some(accessor))
+            }
+            None => (None, None),
+        };
+        let assignment = Assignment {
+            run,
             repo: pipeline.repo.clone(),
             number: pipeline.number,
             job: job.name.clone(),
@@ -1767,13 +1790,30 @@ impl Scheduler {
             interpreter: job.interpreter.clone(),
             place: place.clone(),
             env,
-            secrets,
+            handoff,
             timeout_minutes: job.timeout_minutes,
             inputs,
             checkout: checkout_of(pipeline, ji),
             upload,
             state,
-        })
+        };
+        Ok((assignment, accessor))
+    }
+
+    /// Revokes the job token of `run`'s secret hand-off, if one is still
+    /// outstanding: once the runner started the job (it has read what it
+    /// needs), failed to start it, or the job ended.
+    fn revoke_handoff(&mut self, run: &str) {
+        let Some(accessor) = self.handoffs.remove(run) else {
+            return;
+        };
+        let secrets = Arc::clone(&self.secrets);
+        let run = run.to_owned();
+        std::thread::spawn(move || {
+            if let Err(e) = secrets.revoke_accessor(&accessor) {
+                eprintln!("[ci] {run}: revoke of the secret hand-off failed: {e}");
+            }
+        });
     }
 
     // ------------------------------------------------------------ runner messages
@@ -1908,6 +1948,7 @@ impl Scheduler {
                 status,
             } => self.runners.set_machine(name, &machine, &status),
             FromRunner::Started { run } => {
+                self.revoke_handoff(&run);
                 let Some((pi, ji)) = self.active_on(name, &run) else {
                     return;
                 };
@@ -1936,6 +1977,7 @@ impl Scheduler {
                 );
             }
             FromRunner::StartFailed { run, message } => {
+                self.revoke_handoff(&run);
                 let Some((pi, ji)) = self.active_on(name, &run) else {
                     return;
                 };
@@ -2022,6 +2064,7 @@ impl Scheduler {
         let elapsed = now.saturating_sub(record.started.unwrap_or(now));
         let timeout_minutes = record.def.timeout_minutes;
         let record_runner = record.runner.clone();
+        self.revoke_handoff(&run);
         let dir = transcript_dir(&self.state_dir, &repo, number, &job);
         let state_failed = end
             .state
@@ -4279,7 +4322,7 @@ mod tests {
                 ),
                 ("", "", None)
             );
-            assert!(a.secrets.is_empty() && a.inputs.is_empty());
+            assert!(a.handoff.is_none() && a.inputs.is_empty());
             assert_eq!(
                 (a.file.as_str(), a.interpreter.as_str(), &a.place),
                 ("a.sh", "sh", &Place::Host)

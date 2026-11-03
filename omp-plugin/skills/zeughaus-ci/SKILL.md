@@ -84,5 +84,11 @@ zeughaus-ci is the user's own CI. Its runners are the machines they own, one per
 
 ## 9. The Claude sign-in
 
-- omp's Anthropic token comes from the CI, not from a `/login anthropic` per machine: the CI holds the Claude subscription's refresh token, renews the access token and patches it into OpenBao (`secret/hannes/omp/CLAUDE_ACCESS_TOKEN`, read by `models.yml`'s `providers.anthropic.apiKey`).
+- omp's Anthropic token comes from the CI, not from a `/login anthropic` per machine: the CI holds the Claude subscription's refresh token, renews the access token and patches it into OpenBao (`secret/zeughaus/omp/CLAUDE_ACCESS_TOKEN`, read by `models.yml`'s `providers.anthropic.apiKey`).
+
+## 10. Secrets in sessions and jobs
+
+- A zeughaus work shell and agent session already have their project's zeughaus secrets in the environment (`secret/zeughaus/<origin>/{omp,shell}`, then `secret/zeughaus/{omp,shell}`); a pane shell has `secret/zeughaus/shell`. What the terminal's own environment sets wins.
+- The owner's omp secrets are not in the environment: the `secrets` tool lists documents and field names below `secret/hannes/omp` (or another path), and `${secret:hannes/omp/<doc...>/<FIELD>}` in a bash command is replaced by the value when the command runs, in a subshell (not inside single quotes). Other paths are refused.
+- A job's `secrets` come from `secret/zeughaus/<origin>/shell`, then `secret/zeughaus/shell`, through a single-use job token the CI hands the runner; its values show as `*` in the job's log. Store a new one there (`bao kv patch -mount=secret zeughaus/<origin>/shell NAME=-`) and grant it in ci.toml.
 - `/zeughaus claude` shows where the sign-in stands; `/zeughaus claude login` (or `zeughaus-runner claude login`, or the Overview's row in the editor) signs in again through this machine's browser. A sign-in lasts about 30 days. Never run omp's own `/login anthropic`.

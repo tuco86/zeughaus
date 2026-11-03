@@ -19,7 +19,7 @@
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -43,6 +43,7 @@ use zeughaus_terminal::{Profile, Session, TerminalHost};
 
 use super::close;
 use super::persist::{self, SavedRun, SavedTerminal};
+use super::secret_env;
 use super::workspace::Workspace;
 use super::{GraphSync, OwnedPlacement};
 use crate::runs::{RunActivity, RunDirs, read_activity, write_activity};
@@ -161,6 +162,9 @@ struct Inner {
     /// The runner's enlist name, given to every terminal as
     /// `ZEUGHAUS_RUNNER`; unset on a runner that enlists nowhere.
     runner_name: OnceLock<String>,
+    /// Terminals get the zeughaus secrets of their kind
+    /// ([`MuxService::merge_secrets`]); off until the runner turns it on.
+    merge_secrets: AtomicBool,
 }
 
 /// The profile of a shell in the work checkout of `origin`, checked out at
@@ -224,6 +228,7 @@ impl MuxService {
                 gone_agents: Mutex::new(HashSet::new()),
                 project_profile: OnceLock::new(),
                 runner_name: OnceLock::new(),
+                merge_secrets: AtomicBool::new(false),
             }),
         };
         #[cfg(unix)]
@@ -255,8 +260,21 @@ impl MuxService {
         let _ = self.inner.runner_name.set(name);
     }
 
-    /// The variables every terminal of this runner starts with.
-    fn terminal_env(&self, profile: &mut Profile, id: TerminalId) {
+    /// From now on, shells and sessions start with the zeughaus secrets of
+    /// their kind and project, read through `get-secret`.
+    pub fn merge_secrets(&self) {
+        self.inner.merge_secrets.store(true, Ordering::Relaxed);
+    }
+
+    /// The variables every terminal of this runner starts with, and the
+    /// zeughaus secrets of its kind and project (`origin`).
+    fn terminal_env(
+        &self,
+        profile: &mut Profile,
+        id: TerminalId,
+        kind: ActivityKind,
+        origin: Option<&str>,
+    ) {
         profile
             .env
             .push(("ZEUGHAUS_TERMINAL".to_owned(), id.0.to_string()));
@@ -264,6 +282,35 @@ impl MuxService {
             profile
                 .env
                 .push(("ZEUGHAUS_RUNNER".to_owned(), name.clone()));
+        }
+        let documents = secret_env::documents(kind, origin);
+        if documents.is_empty() || !self.inner.merge_secrets.load(Ordering::Relaxed) {
+            return;
+        }
+        let fetch = || secret_env::fetch(&documents);
+        // The mux's tasks run on a multi-threaded runtime; anywhere else the
+        // fetch blocks the caller's thread directly.
+        let fetched = match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(fetch)
+            }
+            _ => fetch(),
+        };
+        match fetched {
+            Ok(fetched) => secret_env::merge(&mut profile.env, &documents, &fetched, |name| {
+                std::env::var_os(name).is_some()
+            }),
+            Err(e) => {
+                // Once per process: a runner without the credentials would
+                // say so for every terminal.
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[mux] zeughaus secrets not merged into {}: {e}",
+                        profile.label
+                    );
+                }
+            }
         }
     }
 
@@ -462,7 +509,11 @@ impl MuxService {
         kind: ActivityKind,
     ) -> Result<TerminalId, String> {
         let id = TerminalId(self.inner.next_terminal.fetch_add(1, Ordering::Relaxed));
-        self.terminal_env(&mut profile, id);
+        let origin = match &placement {
+            OwnedPlacement::Project(origin) => Some(origin.clone()),
+            _ => None,
+        };
+        self.terminal_env(&mut profile, id, kind, origin.as_deref());
         let session = Session::spawn(id, &profile, size, wal, &self.inner.host)
             .map_err(|e| format!("cannot start {}: {e}", profile.label))?;
         self.follow_title(&session);
@@ -1517,7 +1568,7 @@ impl MuxService {
                 .ok_or_else(|| format!("no profile {}", profile.0))?;
             let id = TerminalId(self.inner.next_terminal.fetch_add(1, Ordering::Relaxed));
             let mut profile = profile.clone();
-            self.terminal_env(&mut profile, id);
+            self.terminal_env(&mut profile, id, ActivityKind::Shell, None);
             let session = Session::spawn(
                 id,
                 &profile,

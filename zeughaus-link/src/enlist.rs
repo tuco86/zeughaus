@@ -271,7 +271,10 @@ pub struct Assignment {
     pub interpreter: String,
     pub place: Place,
     pub env: Vec<(String, String)>,
-    pub secrets: Vec<(String, String)>,
+    /// How the runner reads the job's granted secrets; never persisted with
+    /// the run.
+    #[serde(default)]
+    pub handoff: Option<SecretHandoff>,
     pub timeout_minutes: u32,
     pub inputs: Vec<Input>,
     #[serde(default)]
@@ -282,6 +285,50 @@ pub struct Assignment {
     /// The job state stores the run starts from and may save.
     #[serde(default)]
     pub state: Vec<StateMount>,
+}
+
+/// The CI's hand-off of a job's secrets: a single-use wrapping token of a
+/// short-lived OpenBao token that reads the job's two documents. The runner
+/// redeems it, reads the granted names and revokes the token; a wrapping
+/// token someone else redeemed first is an alarm.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct SecretHandoff {
+    /// OpenBao base, `http://10.8.0.1:8200`.
+    pub addr: String,
+    /// KV v2 mount, `secret`.
+    pub mount: String,
+    /// Below the mount: `zeughaus/<origin>/shell`.
+    pub project: String,
+    /// Below the mount: `zeughaus/shell`.
+    pub global: String,
+    /// The granted names, in the job header's order.
+    pub names: Vec<String>,
+    /// Single-use wrapping token of a job token that reads both documents.
+    pub wrapping_token: String,
+}
+
+impl std::fmt::Debug for SecretHandoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretHandoff")
+            .field("addr", &self.addr)
+            .field("mount", &self.mount)
+            .field("project", &self.project)
+            .field("global", &self.global)
+            .field("names", &self.names)
+            .field("wrapping_token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// A secret value as it may enter a header, a URL or an environment: one
+/// trailing line end is stripped, and a value that still holds a line break
+/// is `None`.
+pub fn secret_line(text: &str) -> Option<&str> {
+    let text = text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .unwrap_or(text);
+    (!text.contains('\n')).then_some(text)
 }
 
 /// What the launcher does to the workspace before the job runs.
@@ -794,7 +841,14 @@ fn sample_assignment() -> Assignment {
         interpreter: "sh".to_owned(),
         place: Place::Host,
         env: Vec::new(),
-        secrets: Vec::new(),
+        handoff: Some(SecretHandoff {
+            addr: "http://10.8.0.1:8200".to_owned(),
+            mount: "secret".to_owned(),
+            project: "zeughaus/git.example.org/o/r/shell".to_owned(),
+            global: "zeughaus/shell".to_owned(),
+            names: vec!["TOKEN".to_owned()],
+            wrapping_token: "s.wrapped-secret".to_owned(),
+        }),
         timeout_minutes: 1,
         inputs: Vec::new(),
         checkout: Checkout::Wipe,
@@ -867,6 +921,22 @@ mod tests {
             read_frame::<_, ArtifactRequest>(&mut r).await.unwrap(),
             Some(request)
         );
+    }
+
+    #[test]
+    fn debug_of_an_assignment_hides_the_wrapping_token() {
+        let text = format!("{:?}", sample_assignment());
+        assert!(text.contains("SecretHandoff"), "{text}");
+        assert!(!text.contains("s.wrapped-secret"), "{text}");
+    }
+
+    #[test]
+    fn a_secret_line_loses_one_line_end_and_refuses_more() {
+        assert_eq!(secret_line("x"), Some("x"));
+        assert_eq!(secret_line("x\n"), Some("x"));
+        assert_eq!(secret_line("x\r\n"), Some("x"));
+        assert_eq!(secret_line("x\n\n"), None);
+        assert_eq!(secret_line("a\nb"), None);
     }
 
     #[tokio::test]

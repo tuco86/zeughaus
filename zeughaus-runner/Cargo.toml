@@ -33,6 +33,8 @@ zeughaus-job.workspace = true
 # The link's transport: the graph document, frames and events leave this
 # process over QUIC.
 weida.workspace = true
+# redeems the CI's secret hand-off (weida's hand-off, decisions/0032)
+weida-openbao.workspace = true
 # The terminal multiplexer: `zeughaus-mux` is the wire model every editor
 # shares, `zeughaus-terminal` the PTYs and screens only this process holds.
 zeughaus-mux.workspace = true

@@ -1612,20 +1612,48 @@ the user owns), removes image tags no pipeline uses (`podman rmi`,
 `container image delete` on macOS), deletes an artifact set when the CI
 drops it, and a run's `inputs/` when the run ends.
 
-**Secrets** (`secrets.rs`) live in one OpenBao KV v2 document
-(`[secrets]` in `ci.toml`, `secret/zeughaus/ci`); `ci.toml` only names
-them. The CI, its hook and the CLI log in with the AppRole
-`zeughaus-ci`, whose secret_id is sealed with `systemd-creds` to the host
-and the CI user (`deploy/ci/openbao.sh`, run on sadala, creates and rotates
-it). The token stays in the process; a document is read at use time and kept
-for `cache_ttl_seconds`, never served stale, so a value rotated in OpenBao
-takes effect without a restart. When OpenBao cannot be reached, fetches,
-job starts and statuses fail with its message and the hook answers 503,
-which the forge redelivers. `zeughaus-ci secrets-check`, and every start of
-`serve`, list each named secret as present or missing. A job gets only
-those its repository's `grants` release to the event. They travel in
-`Assign` to the runner the job is placed on and reach the job through files
-there.
+**Secrets** live in OpenBao (KV v2), by user, then by reader:
+`zeughaus/zeughaus` is the CI's own document (`[secrets] path` in
+`ci.toml`: forge tokens, webhook secrets, the Claude sign-in),
+`zeughaus/<origin>/shell` and `zeughaus/shell` hold what a project's shells
+and jobs get, `zeughaus/<origin>/omp` and `zeughaus/omp` what its omp
+sessions get; `ci.toml` only names them. The CI, its hook and the CLI log in
+with the AppRole `zeughaus` (`secrets.rs`), whose secret_id is sealed with
+`systemd-creds` to the host and the CI user (`deploy/ci/openbao.sh`, run on
+sadala, creates and rotates it); its policy reaches no document of the
+owner's `hannes/`. The token stays in the process; the own document is read
+at use time and kept for `cache_ttl_seconds`, never served stale, so a
+value rotated in OpenBao takes effect without a restart. When OpenBao cannot
+be reached, fetches, job starts and statuses fail with its message and the
+hook answers 503, which the forge redelivers.
+
+A job gets only the names its repository's `grants` release to the event,
+through a hand-off (weida's, its decision 0032): the CI mints a job token
+through the token role `zeughaus-job` with the policy `zeughaus-job-<repo>`
+(read `zeughaus/<origin>/shell` and `zeughaus/shell`, written by
+`openbao.sh` from `zeughaus-ci job-policies`), wrapped for 120 s, and sends
+the wrapping token in `Assign` (`SecretHandoff`). The runner redeems it
+before anything else of the run (a token already redeemed is an alarm and
+the job does not start), reads the names, the project's value before the
+global one, revokes the job token and hands the values to the job through
+files; the CI revokes it by its accessor once the run started, failed to
+start or ended. The persisted assignment never holds the wrapping token.
+The runner masks each value of at least 4 bytes as `*` in the log it sends
+the CI, which keeps every byte offset: records are held back until no
+occurrence can still reach into them (`enlist/mask.rs`). Its own WAL keeps
+the output unmasked, and a run a restarted runner recovers is delivered
+unmasked. `zeughaus-ci secrets-check`, the repository setup lines and every
+start of `serve` list each own secret and, read through a job token as a
+job reads them, each granted one as present or missing.
+
+A runner's shells and agent sessions get the zeughaus secrets of their
+kind (`mux/secret_env.rs`, through `get-secret --json` with the runner
+user's own OpenBao credentials): a project's work shell
+`zeughaus/<origin>/shell`, then `zeughaus/shell`; an agent session
+`zeughaus/<origin>/omp`, `zeughaus/omp`, then the two `shell` documents; a
+pane's shell `zeughaus/shell`. What the terminal's profile or the runner's
+own environment sets wins. A runner without credentials opens its
+terminals without them and says so once.
 
 **Releases and the updater.** zeughaus's own `.zeughaus-ci/` produces the
 releases its hosts follow. Per platform one build job,
@@ -1926,7 +1954,7 @@ Overview lists it under Needs you while the CI is signed out, three days
 before the sign-in ends, or while renewing fails, and a press runs
 `zeughaus-runner claude login` beside the editor and reports the result as
 a notice; omp's plugin offers `/zeughaus claude [login]`. The CI's AppRole
-may patch `secret/hannes/omp`.
+may patch `secret/zeughaus/omp`.
 
 **Advice.** `[advice]` of `ci.toml` (a `model`, by default
 `claude-haiku-5-5`, and the `api` base) is the language model the CI asks

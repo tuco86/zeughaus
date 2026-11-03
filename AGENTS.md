@@ -327,7 +327,7 @@ the first push pipeline. The configuration is one swappable snapshot:
 SIGHUP (`systemctl --user reload zeughaus-ci`) re-reads `[repos]` and
 `ci/onboarded/`, and refuses any other change. `[claude]` of `ci.toml`
 (`account`, the only email that may sign in; `publish`, OpenBao documents
-such as `hannes/omp`) is the Claude subscription the CI holds, in place of
+such as `zeughaus/omp`) is the Claude subscription the CI holds, in place of
 omp's `/login anthropic` on every machine. A sign-in is the normal OAuth
 flow of Claude Code's client on the owner's machine: `zeughaus-runner
 claude login` (also `/zeughaus claude login` in omp, and the Overview's
@@ -340,7 +340,7 @@ refresh token in its own document (`CLAUDE_REFRESH_TOKEN`,
 because each refresh rotates it), renews the access token two hours before
 it expires and patches it into every `publish` document as
 `CLAUDE_ACCESS_TOKEN`, where omp reads it (`providers.anthropic.apiKey:
-"!get-secret secret/hannes/omp/CLAUDE_ACCESS_TOKEN"` in `models.yml`). A
+"!get-secret secret/zeughaus/omp/CLAUDE_ACCESS_TOKEN"` in `models.yml`). A
 sign-in ends about 30 days after it was made; the Overview asks for a new
 one three days before, and while the CI is signed out; `zeughaus-runner
 claude status` says where it stands. `[advice]` (`model`, by
@@ -445,8 +445,14 @@ nothing itself. On sadala (aarch64 Ubuntu) it runs as the Unix user
 `sudo journalctl _UID=$(id -u zeughaus-ci)` on sadala. Repositories, the
 runners it accepts and the forge tokens are in
 `/var/lib/zeughaus-ci/state/ci.toml` (`deploy/ci/ci.toml.example`);
-secrets live in OpenBao (`secret/zeughaus/ci`, read with the AppRole that
-`deploy/ci/openbao.sh`, run on sadala, seals to the CI user). Its binary is
+secrets live in OpenBao (the CI's own in `secret/zeughaus/zeughaus`, read
+with the AppRole `zeughaus` that `deploy/ci/openbao.sh`, run on sadala,
+seals to the CI user; a job's in `secret/zeughaus/<origin>/shell`, then
+`secret/zeughaus/shell`, which the job's runner reads through a wrapped,
+single-use job token the CI hands it, and masks in the log the CI keeps).
+A runner's work shells and agent sessions start with the `shell` (and, for
+sessions, `omp`) documents of their project and the global ones in their
+environment, read with the runner user's own credentials. Its binary is
 `/var/lib/zeughaus-ci/bin/zeughaus-ci`, owned by that user, and it updates
 itself (see Updates). The wrapper
 `/usr/local/bin/zeughaus-ci` on sadala runs the binary as that user
@@ -682,12 +688,12 @@ follows the event: a push to `main` is `dev`, the nightly `nightly`, a tag
 `release`; the last two also become a GitHub release (`nightly-<date>` as a
 prerelease, the seven newest kept; a tag `v<version>` with the CHANGELOG
 section as its body, and it must equal the workspace version). Two secrets
-in OpenBao `secret/zeughaus/ci` back it, granted to `push main`, `nightly`
+in OpenBao `secret/zeughaus/git.doodleshnookie.net/tuco86/zeughaus/shell` back it, granted to `push main`, `nightly`
 and `tag v*`: `ZEUGHAUS_UPDATE_KEY` (the signing seed) and
 `ZEUGHAUS_GITHUB_TOKEN` (contents write on `tuco86/zeughaus`).
 Forgejo reaches the CI as the bot user `zeughaus`
 (write on zeughaus, read on weida); its tokens and the webhook secret are
-in OpenBao under `secret/zeughaus/ci`. A change to `.zeughaus-ci/` is checked with
+in OpenBao under `secret/zeughaus/zeughaus`. A change to `.zeughaus-ci/` is checked with
 `zeughaus-ci check` before it is pushed. `DESIGN.md` section 14 describes how it
 works.
 

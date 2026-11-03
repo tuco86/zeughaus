@@ -25,6 +25,7 @@ mod maintain;
 mod mcp;
 mod mux;
 mod names;
+mod proc;
 #[cfg(unix)]
 mod projects;
 mod release;
@@ -327,6 +328,7 @@ fn main() -> ExitCode {
                 if let Some(config) = enlist_config.as_ref() {
                     service.set_runner_name(config.name.clone());
                 }
+                service.merge_secrets();
                 rt.spawn(service.clone().accept(replier));
                 // A run is a terminal this process owns, so the job host is
                 // the mux service plus the run directories its logs go in.

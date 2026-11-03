@@ -23,17 +23,20 @@
 //   watch claims the pipeline it watches; a heartbeat (`ci renew`) keeps them, and the
 //   session's end releases them. A failure the watch reports names who is responsible for it
 //   when that is another session.
+// - resolves `${secret:hannes/omp/<doc...>/<FIELD>}` placeholders in bash commands when they run
+//   (secrets.ts), and offers the `secrets` tool, which lists secret documents and field names.
 //
 // The factory only registers: `omp plugin install` runs it against a throwaway API, so it must
 // do no work at load. Every handler skips subagents, which have prompts of their own, except the
-// read-only guard of a plan session. Nothing here may reject out of a detached promise or a
-// timer: omp ends the whole session on it.
+// read-only guard of a plan session and the secret placeholders. Nothing here may reject out of a
+// detached promise or a timer: omp ends the whole session on it.
 
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { agentReporter } from "./agent-status.ts";
 import { planModePrompt } from "./plan-mode.ts";
+import { rewrite } from "./secrets.ts";
 import { claimHolder, masterPlan, planSession, sessionId } from "./session-env.ts";
 
 // The parts of omp's extension API this plugin uses; omp ships no type package to import.
@@ -97,7 +100,11 @@ interface Events {
   tool_call: (
     event: { toolName: string; input: Record<string, unknown> },
     ctx: Ctx,
-  ) => Promise<{ block: true; reason: string } | undefined>;
+  ) => Promise<
+    | { block: true; reason: string }
+    | { input: Record<string, unknown>; additionalContext?: string }
+    | undefined
+  >;
   plan_review_requested: (
     event: { planFilePath: string; planContent: string; title: string },
     ctx: Ctx,
@@ -120,7 +127,10 @@ interface Pi {
     command: { description: string; handler: (args: string, ctx: CommandCtx) => Promise<void> },
   ): void;
   registerTool(tool: ToolDefinition): void;
-  zod: { object(shape: Record<string, unknown>): unknown; string(): { describe(text: string): unknown } };
+  zod: {
+    object(shape: Record<string, unknown>): unknown;
+    string(): { describe(text: string): unknown; optional(): { describe(text: string): unknown } };
+  };
 }
 interface ToolDefinition {
   name: string;
@@ -131,7 +141,7 @@ interface ToolDefinition {
   loadMode: "essential";
   execute(
     id: string,
-    params: { slug?: unknown },
+    params: Record<string, unknown>,
     signal: AbortSignal | undefined,
     onUpdate: unknown,
     ctx: Ctx,
@@ -948,6 +958,61 @@ export default function zeughausCi(pi: Pi): void {
     if (writesTree(event.toolName, event.input)) return { block: true, reason: READ_ONLY };
     if (isMain(ctx) && (event.toolName === "ask" || event.toolName === "submit_plan")) decided = true;
     return undefined;
+  });
+
+  // Secret placeholders, for every agent: the value is read when the command runs.
+  pi.on("tool_call", async (event) => {
+    if (event.toolName !== "bash" || typeof event.input.command !== "string") return undefined;
+    const rewritten = rewrite(event.input.command);
+    if (!rewritten) return undefined;
+    if ("refused" in rewritten) return { block: true, reason: rewritten.refused };
+    if (process.platform === "win32") {
+      return { block: true, reason: "secret placeholders need a POSIX shell" };
+    }
+    return {
+      input: { ...event.input, command: rewritten.command },
+      additionalContext:
+        "The zeughaus plugin resolved the ${secret:...} placeholders of that bash command: the command shown is its rewritten form, which reads each value with get-secret when it runs. It is the command as you asked for it.",
+    };
+  });
+
+  pi.registerTool({
+    name: "secrets",
+    label: "Secrets",
+    description:
+      "Lists secret documents below secret/<path> (default hannes/omp) with their field names, never values. In a bash command, ${secret:hannes/omp/<doc...>/<FIELD>} is replaced by the value when the command runs (not inside single quotes); only hannes/omp resolves in omp sessions. zeughaus shells already have their project's zeughaus secrets in the environment.",
+    parameters: pi.zod.object({
+      path: pi.zod
+        .string()
+        .optional()
+        .describe("A document or prefix below secret/, e.g. hannes/omp or zeughaus; default hannes/omp"),
+    }),
+    approval: "read",
+    loadMode: "essential",
+    execute: async (_id, params, _signal, _onUpdate, ctx) => {
+      const path = String(params.path ?? "hannes/omp")
+        .trim()
+        .replace(/^secret\//, "")
+        .replace(/\/+$/, "");
+      if (path === "" || path.split("/").includes("..")) throw new Error(`Not a secret path: ${path}`);
+      const listed = await exec(pi, "get-secret", ["--list", `secret/${path}`], ctx.cwd, GIT_TIMEOUT_MS);
+      if (listed.code === 127) throw new Error("get-secret is not installed here");
+      const below =
+        listed.code === 0 ? listed.stdout.split("\n").filter((line) => line.trim() !== "") : [];
+      const lines: string[] = [];
+      // The path itself may be a document too, beside the ones below it.
+      for (const doc of [`secret/${path}`, ...below]) {
+        const fields = await exec(pi, "get-secret", ["--fields", doc], ctx.cwd, GIT_TIMEOUT_MS);
+        if (fields.code !== 0) continue;
+        const names = fields.stdout.split("\n").filter((line) => line.trim() !== "");
+        lines.push(`${doc}: ${names.join(", ")}`);
+      }
+      if (lines.length === 0) {
+        const why = [listed.stderr.trim()].filter(Boolean).join("; ");
+        throw new Error(`No secret documents at secret/${path}${why ? `: ${why}` : ""}`);
+      }
+      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+    },
   });
 
   pi.on("agent_start", (_event, ctx) => {

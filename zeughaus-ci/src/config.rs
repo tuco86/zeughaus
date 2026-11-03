@@ -71,7 +71,7 @@ pub struct CiConfig {
 pub struct ClaudeConfig {
     /// The only Claude account the sign-in accepts, by its email address.
     pub account: String,
-    /// Documents below the `[secrets]` mount (`hannes/omp`) the access token
+    /// Documents below the `[secrets]` mount (`zeughaus/omp`) the access token
     /// is patched into as `CLAUDE_ACCESS_TOKEN` each time it is renewed.
     #[serde(default)]
     pub publish: Vec<String>,
@@ -160,6 +160,14 @@ fn default_bao_timeout() -> u64 {
     5
 }
 
+fn default_projects() -> String {
+    "zeughaus".into()
+}
+
+fn default_job_role() -> String {
+    "zeughaus-job".into()
+}
+
 /// One KV v2 document in OpenBao, read with the runner's own AppRole.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -169,7 +177,7 @@ pub struct SecretsConfig {
     /// KV v2 mount.
     #[serde(default = "default_mount")]
     pub mount: String,
-    /// Document path below the mount, e.g. `zeughaus/ci`.
+    /// The CI's own document below the mount, e.g. `zeughaus/zeughaus`.
     pub path: String,
     /// The AppRole's role_id; not secret, the secret_id is sealed apart.
     pub role_id: String,
@@ -179,6 +187,26 @@ pub struct SecretsConfig {
     /// curl's `--max-time` per request.
     #[serde(default = "default_bao_timeout")]
     pub timeout_seconds: u64,
+    /// The prefix of the project documents a job's grants resolve in:
+    /// `<projects>/<origin>/shell`, then `<projects>/shell`.
+    #[serde(default = "default_projects")]
+    pub projects: String,
+    /// The token role the CI mints job tokens through.
+    #[serde(default = "default_job_role")]
+    pub job_role: String,
+}
+
+impl SecretsConfig {
+    /// The project document of the repository at `origin`
+    /// ([`zeughaus_link::normalize_origin`]).
+    pub fn project_shell(&self, origin: &str) -> String {
+        format!("{}/{origin}/shell", self.projects)
+    }
+
+    /// The document every project's jobs fall back to.
+    pub fn global_shell(&self) -> String {
+        format!("{}/shell", self.projects)
+    }
 }
 
 fn default_wait_minutes() -> u32 {
@@ -276,11 +304,16 @@ impl RepoConfig {
 
     /// Every secret this repo names: its tokens and the keys of `grants`.
     pub fn secret_names(&self) -> impl Iterator<Item = &String> {
+        self.own_secret_names().chain(self.grants.keys())
+    }
+
+    /// The secrets the CI itself uses for this repo, read from its own
+    /// document: fetch and status tokens and the webhook secret.
+    pub fn own_secret_names(&self) -> impl Iterator<Item = &String> {
         self.fetch_token
             .iter()
             .chain(&self.status_token)
             .chain(&self.webhook_secret)
-            .chain(self.grants.keys())
     }
 }
 
@@ -567,7 +600,7 @@ impl CiConfig {
                     || path.contains("..")
             }) {
                 return Err(format!(
-                    "[claude]: `publish` holds `{bad}`, which is no document path like hannes/omp"
+                    "[claude]: `publish` holds `{bad}`, which is no document path like zeughaus/omp"
                 ));
             }
             if self.secrets.is_none() {

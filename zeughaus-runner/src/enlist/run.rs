@@ -33,6 +33,7 @@ use zeughaus_link::manual::{MAX_MANUAL_DIRS, valid_dir_name};
 
 use super::cleanup;
 use super::launch::{self, Launch, Target};
+use super::mask::Masker;
 use super::stage;
 use super::{
     Executor, RunCtl, artifacts_dir, assigned_dir, git, lock, mirror_dir, now_secs, work_dir,
@@ -52,6 +53,9 @@ const RECOVERY_POLL: Duration = Duration::from_secs(2);
 
 /// How often an assignment waits for the runner to stop being held.
 const HELD_POLL: Duration = Duration::from_secs(1);
+
+/// Shorter secret values are not masked: they would blank ordinary output.
+const MIN_MASK_BYTES: usize = 4;
 
 /// What `<state>/ci/assigned/<run>.json` holds. Secrets and the fetch token
 /// are not in it: they are not needed once the run started, and a file that
@@ -246,7 +250,9 @@ impl Executor {
     /// a run id that is already known is ignored, which is what a CI that
     /// assigned again after a reconnect gets.
     pub fn assign(self: &Arc<Self>, mut assignment: Assignment) {
-        let secrets = std::mem::take(&mut assignment.secrets);
+        // Taken before the assignment is kept: the persisted one never holds
+        // the wrapping token.
+        let handoff = assignment.handoff.take();
         let token = assignment.fetch_token.take();
         let run = assignment.run.clone();
         let ctl = Arc::new(RunCtl::new(assignment));
@@ -264,7 +270,23 @@ impl Executor {
             .name("zeughaus-enlist-job".into())
             .spawn(move || {
                 let run = thread_run;
-                match exec.prepare(&ctl, &secrets, token.as_deref()) {
+                // The hand-off is redeemed first: a wrapping token is good
+                // for one use within minutes, and a stolen one stops the run.
+                let secrets = match handoff.as_ref().map(super::handoff::redeem) {
+                    None => Ok(Vec::new()),
+                    Some(redeemed) => redeemed,
+                };
+                let prepared = secrets.map_err(Prep::Failed).and_then(|secrets| {
+                    let mut masks: Vec<Vec<u8>> = secrets
+                        .iter()
+                        .map(|(_, value)| value.as_bytes().to_vec())
+                        .filter(|value| value.len() >= MIN_MASK_BYTES)
+                        .collect();
+                    masks.sort_by_key(|value| std::cmp::Reverse(value.len()));
+                    let _ = ctl.masks.set(masks);
+                    exec.prepare(&ctl, &secrets, token.as_deref())
+                });
+                match prepared {
                     Ok(started) => exec.supervise(&ctl, started),
                     Err(prep) => {
                         let message = match prep {
@@ -1007,6 +1029,10 @@ impl Executor {
             .name("zeughaus-enlist-log".into())
             .spawn(move || {
                 let run = ctl.assignment.run.clone();
+                // A run with secrets is delivered through a masker, which
+                // reads the file from its start after every new connection.
+                let masks = ctl.masks.get().filter(|masks| !masks.is_empty()).cloned();
+                let mut masked = masks.as_deref().map(Masked::new);
                 let mut generation = 0u64;
                 let mut sent = 0u64;
                 let mut idle = 0u32;
@@ -1022,13 +1048,20 @@ impl Executor {
                         sent = offset;
                         idle = 0;
                         finished = false;
+                        if let Some(masks) = &masks {
+                            masked = Some(Masked::new(masks));
+                        }
                     }
                     let end = lock(&ctl.end).clone();
                     if end.is_some() && !was_ended {
                         was_ended = true;
                         idle = 0;
                     }
-                    match pump(&wal, &run, &tx, &mut sent) {
+                    let pumped = match &mut masked {
+                        Some(masked) => pump_masked(&wal, &run, &tx, masked, &mut sent),
+                        None => pump(&wal, &run, &tx, &mut sent),
+                    };
+                    match pumped {
                         Ok(0) => idle += 1,
                         Ok(_) => idle = 0,
                         // The connection went away under the send; the next
@@ -1042,15 +1075,26 @@ impl Executor {
                             continue;
                         }
                     }
-                    if let Some(end) = end
-                        && idle >= SETTLE_PASSES
-                        && !finished
-                        && tx
-                            .blocking_send(FromRunner::Finished {
-                                run: run.clone(),
-                                end,
-                            })
-                            .is_ok()
+                    let Some(end) = end else {
+                        continue;
+                    };
+                    if idle < SETTLE_PASSES || finished {
+                        continue;
+                    }
+                    // What the masker still holds goes before the end.
+                    if let Some(masked) = &mut masked {
+                        let rest = masked.masker.flush();
+                        if send_released(&run, &tx, masked, rest, &mut sent).is_err() {
+                            generation = 0;
+                            continue;
+                        }
+                    }
+                    if tx
+                        .blocking_send(FromRunner::Finished {
+                            run: run.clone(),
+                            end,
+                        })
+                        .is_ok()
                     {
                         finished = true;
                     }
@@ -1103,6 +1147,83 @@ fn pump(
     }
 }
 
+/// A run's log as the CI gets it when the run has secrets: the file read
+/// from its start through a [`Masker`], which keeps every offset.
+struct Masked {
+    masker: Masker,
+    /// File bytes fed into the masker.
+    fed: u64,
+    /// Masked bytes released so far: the log offset of the next one.
+    released: u64,
+}
+
+impl Masked {
+    fn new(masks: &[Vec<u8>]) -> Masked {
+        Masked {
+            masker: Masker::new(masks.to_vec()),
+            fed: 0,
+            released: 0,
+        }
+    }
+}
+
+/// Feeds what the log grew by into the masker and sends what it releases,
+/// from `*sent` on. Returns the bytes the log grew by: a pass that only
+/// releases held bytes is not growth.
+fn pump_masked(
+    wal: &Path,
+    run: &str,
+    tx: &tokio::sync::mpsc::Sender<FromRunner>,
+    masked: &mut Masked,
+    sent: &mut u64,
+) -> Result<u64, Pump> {
+    let mut file = match std::fs::File::open(wal) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(Pump::Read(e)),
+    };
+    file.seek(SeekFrom::Start(masked.fed)).map_err(Pump::Read)?;
+    let mut total = 0;
+    let mut buf = vec![0u8; MAX_OUTPUT_CHUNK];
+    loop {
+        let n = file.read(&mut buf).map_err(Pump::Read)?;
+        if n == 0 {
+            return Ok(total);
+        }
+        masked.masker.feed(&buf[..n]);
+        masked.fed += n as u64;
+        total += n as u64;
+        let ready = masked.masker.take_ready();
+        send_released(run, tx, masked, ready, sent)?;
+    }
+}
+
+/// Sends the masked `bytes` the masker just released, skipping what the CI
+/// already holds (`*sent` is past them after a reconnect).
+fn send_released(
+    run: &str,
+    tx: &tokio::sync::mpsc::Sender<FromRunner>,
+    masked: &mut Masked,
+    bytes: Vec<u8>,
+    sent: &mut u64,
+) -> Result<(), Pump> {
+    let from = masked.released;
+    masked.released += bytes.len() as u64;
+    let skip = sent.saturating_sub(from).min(bytes.len() as u64) as usize;
+    for chunk in bytes[skip..].chunks(MAX_OUTPUT_CHUNK) {
+        let message = FromRunner::Output {
+            run: run.to_owned(),
+            offset: *sent,
+            bytes: chunk.to_vec(),
+        };
+        if tx.blocking_send(message).is_err() {
+            return Err(Pump::Closed);
+        }
+        *sent += chunk.len() as u64;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use zeughaus_link::enlist::{Checkout, UploadDir};
@@ -1130,7 +1251,7 @@ mod tests {
             interpreter: interpreter.to_owned(),
             place: Place::Host,
             env: Vec::new(),
-            secrets: Vec::new(),
+            handoff: None,
             timeout_minutes: 1,
             inputs: Vec::new(),
             checkout: Checkout::Clean,

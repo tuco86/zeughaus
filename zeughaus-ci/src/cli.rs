@@ -15,6 +15,7 @@
 //! forget <repo> <pipeline>
 //! forge-check <repo>
 //! secrets-check
+//! job-policies
 //! version
 //! update status|rollback
 //! install ci [--channel C] [--from DIR] [--no-service]
@@ -50,7 +51,7 @@ const USAGE: &str = "usage: zeughaus-ci [--state-dir DIR] serve --listen <host:p
 plan [DIR] nightly | \
 run <repo> <push|tag> <ref> [<sha>] | run <repo> nightly | status [N] | \
 log <repo> <pipeline> <job> [--tail N] | forget <repo> <pipeline> | forge-check <repo> | \
-secrets-check | version | \
+secrets-check | job-policies | version | \
 update status|rollback | install ci [--channel C] [--from DIR] [--no-service]";
 
 pub fn main() -> ExitCode {
@@ -89,6 +90,7 @@ fn run(args: &[String], state_dir: &Path) -> ExitCode {
         Some("forget") => forget(state_dir, &args[1..]),
         Some("forge-check") => forge_check(state_dir, &args[1..]),
         Some("secrets-check") => secrets_check(state_dir, &args[1..]),
+        Some("job-policies") => job_policies(state_dir, &args[1..]),
         // What the updater runs a new binary with before it trusts it.
         Some("version") if args.len() == 1 => {
             println!(
@@ -525,6 +527,21 @@ fn secrets_check(state_dir: &Path, args: &[String]) -> Result<(), String> {
     for line in secrets::check(&secrets, &config)? {
         println!("{line}");
     }
+    Ok(())
+}
+
+/// The OpenBao policy of each repository's job tokens, as a JSON object of
+/// policy name to HCL, for `deploy/ci/openbao.sh`.
+fn job_policies(state_dir: &Path, args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err("usage: zeughaus-ci job-policies".to_owned());
+    }
+    let config = load_config(state_dir)?;
+    let policies = secrets::job_policies(&config)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&policies).map_err(|e| e.to_string())?
+    );
     Ok(())
 }
 
