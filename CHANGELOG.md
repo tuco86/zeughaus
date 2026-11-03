@@ -20,6 +20,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   master's, or a plan executed from omp's own review that includes
   tickets) get `Ticket: <repo>#<n>` and `Omp-Session: <id>` trailers.
 
+- Agents' questions and plan reviews in the editor. In a zeughaus terminal
+  the omp plugin (0.14.0) shadows omp's `ask`: the dialog stays open in the
+  terminal while `zeughaus-runner ci ask <file>` posts the same questions
+  to the CI, which keeps them in memory while the asking process polls them
+  within 30 s. The editor shows an open ask in Needs you (beside the
+  agent's terminal when it has a row) and in the popout of the ticket the
+  session works on, with its options, an answer of the user's own and
+  `Send`; the first answer, from the terminal or an editor, goes to the
+  agent and closes the other (`ci ask-close`). omp's plan review in a
+  user's session whose checkout the CI builds stores the plan as a ticket
+  in review and ends the session, as `submit_plan` does in plan sessions;
+  the review happens in the popout and Refine resumes the session.
+
 - Comments and a re-evaluation on tickets. Any ticket, done and dismissed
   ones too, takes comments (`<user>@<host>` and time, written in the
   popout, at most 100 of 8 KiB each); the next plan session's brief and a

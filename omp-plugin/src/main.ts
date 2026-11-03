@@ -29,16 +29,23 @@
 //   picking one shows the ticket in the editor that drives it (tickets.ts).
 // - adds `Ticket: <repo>#<n>` and `Omp-Session: <id>` trailers to the `git commit`s of a session
 //   that works on a ticket (shell.ts).
+// - in a zeughaus terminal, shadows omp's `ask`: the native dialog stays open in the terminal while
+//   the same questions are posted to the CI (`zeughaus-runner ci ask`), where the editor shows them
+//   in Needs you and the ticket's popout; the first answer wins (ask.ts).
+// - in a zeughaus terminal whose checkout the CI builds (masters aside), hands omp's plan review to
+//   zeughaus: the plan is stored as a ticket in review, as `submit_plan` does, and the session ends;
+//   the review happens in the ticket's popout, and its Refine resumes this session.
 //
 // The factory only registers: `omp plugin install` runs it against a throwaway API, so it must
 // do no work at load. Every handler skips subagents, which have prompts of their own, except the
 // read-only guard of a plan session, the secret placeholders and the commit trailers. Nothing here
 // may reject out of a detached promise or a timer: omp ends the whole session on it.
 
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { agentReporter } from "./agent-status.ts";
+import { type AskReply, askQuestions, askResult, parseReplies } from "./ask.ts";
 import { planModePrompt } from "./plan-mode.ts";
 import { rewrite } from "./secrets.ts";
 import { claimHolder, masterPlan, planSession, sessionId } from "./session-env.ts";
@@ -67,6 +74,12 @@ interface Ctx {
   isIdle(): boolean;
   abort(): void;
   shutdown(): void | Promise<void>;
+  /** In a tool that shadows a native one: runs the native tool. */
+  invokeTool?(params: Record<string, unknown>, options?: { signal?: AbortSignal }): Promise<ToolResult>;
+}
+interface ToolResult {
+  content: Array<{ type: string; text?: string }>;
+  details?: unknown;
 }
 /** A command handler's context has what changes the session too. */
 interface CommandCtx extends Ctx {
@@ -139,10 +152,18 @@ interface Pi {
   registerAssistantTextRenderer?(
     renderer: (c: { text: string; streaming: boolean }) => string | undefined,
   ): void;
+  getAllTools(): Array<{ name?: unknown; description?: unknown }>;
   zod: {
     object(shape: Record<string, unknown>): unknown;
-    string(): { describe(text: string): unknown; optional(): { describe(text: string): unknown } };
+    string(): ZodType;
+    array(item: unknown): ZodType;
+    boolean(): ZodType;
+    number(): ZodType;
   };
+}
+interface ZodType {
+  describe(text: string): unknown;
+  optional(): { describe(text: string): unknown };
 }
 interface ToolDefinition {
   name: string;
@@ -157,7 +178,7 @@ interface ToolDefinition {
     signal: AbortSignal | undefined,
     onUpdate: unknown,
     ctx: Ctx,
-  ): Promise<{ content: Array<{ type: "text"; text: string }> }>;
+  ): Promise<ToolResult>;
 }
 
 // What `zeughaus-runner ci` prints (zeughaus-link/src/ci.rs); only the fields used here.
@@ -231,6 +252,14 @@ const READ_ONLY =
   "Plan session: the working tree is read-only. Write the plan to local://<slug>-plan.md; every other change waits for the plan's execution.";
 const PLAN_TURN_REMINDER =
   "Plan session: this turn ended without ask or submit_plan. End it with exactly one of them: ask for a decision only the user can make, or submit_plan with the plan's slug once the plan is complete. Do not answer in plain text alone.";
+// The shadowed ask's description when omp's own cannot be read.
+const ASK_DESCRIPTION =
+  "Prompts the user for one or more option-picker or free-form answers: questions[] of { id, question, options[{ label, description?, preview? }], header?, multi?, recommended? (0-based index) }.";
+const NOT_INTERACTIVE = "Ask tool requires interactive mode";
+
+// Whether `ask` is shadowed in this process, and the number of the last ask file written.
+let askShadowed = false;
+let askSeq = 0;
 
 /** Runs a program; one that cannot start (not installed) answers like a shell, with 127. */
 async function exec(
@@ -762,6 +791,155 @@ export default function zeughausCi(pi: Pi): void {
     }, POLL_MS);
   };
 
+  /**
+   * Stores the plan at `path` as a ticket in review (`ticket` when a plan session works on
+   * one), with this session's file for a Refine to resume; its number. Throws why it failed.
+   */
+  const storePlan = async (
+    ctx: Ctx,
+    repo: string,
+    path: string,
+    ticket: number | undefined,
+    cwd: string,
+  ): Promise<number> => {
+    const session = ompSession(ctx);
+    const args = [
+      "ci",
+      "plan-write",
+      "--json",
+      ...(ticket !== undefined ? ["--ticket", String(ticket)] : []),
+      ...(session ? ["--omp-session", session] : []),
+      repo,
+      path,
+    ];
+    const r = await exec(pi, RUNNER, args, cwd, CONTEXT_TIMEOUT_MS);
+    const number = r.code === 0 ? jsonField(r.stdout, "number") : undefined;
+    if (typeof number !== "number") {
+      throw new Error(r.code === 0 ? "unreadable answer" : failure(r, "ci plan-write"));
+    }
+    return number;
+  };
+
+  /** Ends the session once the current tool call or event handler has returned. */
+  const endSession = (ctx: Ctx): void => {
+    ctx.setTimeout(() => {
+      ctx.abort();
+      void Promise.resolve(ctx.shutdown()).catch(() => undefined);
+    }, 0);
+  };
+
+  /** The repository and ticket an ask is about: the master's or plan session's, else the checkout's. */
+  const askTarget = async (ctx: Ctx): Promise<{ repo: string; doc: number | null }> => {
+    const plan = masterPlan();
+    if (plan) return { repo: plan.repo, doc: plan.number };
+    const session = planSession();
+    if (session) return { repo: session.repo, doc: session.ticket ?? null };
+    const c = await contextFor(ctx.cwd);
+    return c.kind === "repo" ? { repo: c.view.name, doc: null } : { repo: "", doc: null };
+  };
+
+  /**
+   * omp's ask in the terminal and the same questions in zeughaus at once; the first answer wins
+   * and closes the other. Without the CI it is omp's ask alone.
+   */
+  const forwardAsk = async (
+    params: Record<string, unknown>,
+    signal: AbortSignal | undefined,
+    ctx: Ctx,
+  ): Promise<ToolResult> => {
+    const questions = isMain(ctx) ? askQuestions(params) : undefined;
+    if (!questions) {
+      if (!ctx.invokeTool) throw new Error(NOT_INTERACTIVE);
+      return ctx.invokeTool(params);
+    }
+    const file = join(tmpdir(), `zeughaus-ask-${process.pid}-${++askSeq}.json`);
+    try {
+      const { repo, doc } = await askTarget(ctx);
+      writeFileSync(file, JSON.stringify({ repo, doc, questions }), { mode: 0o600 });
+      const remoteStop = new AbortController();
+      const localStop = new AbortController();
+      const outer = signal ? [signal] : [];
+      const remote: Promise<AskReply[] | undefined> = pi
+        .exec(RUNNER, ["ci", "ask", file], {
+          cwd: ctx.cwd,
+          signal: AbortSignal.any([remoteStop.signal, ...outer]),
+        })
+        .then(
+          (r) => (r.code === 0 ? parseReplies(r.stdout) : undefined),
+          () => undefined,
+        );
+      const local = ctx.invokeTool?.(params, { signal: AbortSignal.any([localStop.signal, ...outer]) });
+      if (!local) {
+        const replies = await remote;
+        if (!replies) throw new Error(NOT_INTERACTIVE);
+        return askResult(questions, replies);
+      }
+      type Outcome =
+        | { from: "remote"; replies: AskReply[] }
+        | { from: "local"; result: ToolResult }
+        | { from: "local"; error: unknown };
+      // A remote without an answer leaves the race to the terminal.
+      const fromRemote = remote.then((replies) =>
+        replies ? ({ from: "remote", replies } as const) : new Promise<never>(() => undefined),
+      );
+      const fromLocal = local.then(
+        (result) => ({ from: "local", result }) as const,
+        (error: unknown) => ({ from: "local", error }) as const,
+      );
+      const first: Outcome = await Promise.race([fromRemote, fromLocal]);
+      if (first.from === "remote") {
+        localStop.abort();
+        await local.catch(() => undefined);
+        ctx.ui.notify("answered in zeughaus", "info");
+        return askResult(questions, first.replies);
+      }
+      remoteStop.abort();
+      void exec(pi, RUNNER, ["ci", "ask-close"], ctx.cwd, FIND_TIMEOUT_MS);
+      if ("error" in first) throw first.error;
+      return first.result;
+    } finally {
+      try {
+        unlinkSync(file);
+      } catch {
+        // Never written, or gone already.
+      }
+    }
+  };
+
+  /** Shadows omp's ask with the forwarding one, once per process; without a native ask, none. */
+  const shadowAsk = (): void => {
+    const native = pi.getAllTools().find((t) => t.name === "ask");
+    if (!native) return;
+    askShadowed = true;
+    const z = pi.zod;
+    pi.registerTool({
+      name: "ask",
+      label: "Ask",
+      description: typeof native.description === "string" ? native.description : ASK_DESCRIPTION,
+      parameters: z.object({
+        questions: z.array(
+          z.object({
+            id: z.string(),
+            question: z.string(),
+            options: z.array(
+              z.object({
+                label: z.string(),
+                description: z.string().optional(),
+                preview: z.string().optional(),
+              }),
+            ),
+            header: z.string().optional(),
+            multi: z.boolean().optional(),
+            recommended: z.number().optional(),
+          }),
+        ),
+      }),
+      approval: "read",
+      loadMode: "essential",
+      execute: (_id, params, signal, _onUpdate, ctx) => forwardAsk(params, signal, ctx),
+    });
+  };
+
   pi.on("session_start", (_event, ctx) => {
     if (!isMain(ctx)) return;
     mainSession = ctx.sessionManager.getSessionId();
@@ -792,6 +970,7 @@ export default function zeughausCi(pi: Pi): void {
         })().catch(() => undefined);
       }
     }
+    if (claimHolder() && !askShadowed) shadowAsk();
     void contextFor(ctx.cwd)
       .then((c) => {
         if (c.kind === "repo") agent.setRepo(c.view.name, doc);
@@ -804,6 +983,30 @@ export default function zeughausCi(pi: Pi): void {
     agent.report(ctx, "review", typeof event.title === "string" ? event.title : "");
     if (typeof event.planFilePath !== "string") return;
     planFile = resolvePlan(event.planFilePath, ctx);
+    // The review happens in zeughaus: the plan becomes a ticket in review and the session ends.
+    // A master reviews nothing; a checkout the CI does not build keeps omp's own review.
+    const path = planFile;
+    if (!claimHolder() || masterPlan() || !path) return;
+    void (async () => {
+      const session = planSession();
+      let target: { repo: string; ticket: number | undefined; cwd: string };
+      if (session) {
+        target = { repo: session.repo, ticket: session.ticket, cwd: ctx.cwd };
+      } else {
+        const c = await contextFor(ctx.cwd);
+        if (c.kind !== "repo") return;
+        target = { repo: c.view.name, ticket: undefined, cwd: c.root };
+      }
+      try {
+        const n = await storePlan(ctx, target.repo, path, target.ticket, target.cwd);
+        decided = true;
+        planFile = undefined;
+        ctx.ui.notify(`stored plan as ticket #${n} for review in zeughaus; ending this session`, "info");
+        endSession(ctx);
+      } catch (e) {
+        ctx.ui.notify(`zeughaus: ${e instanceof Error ? e.message : String(e)}; review it here`, "error");
+      }
+    })().catch(() => undefined);
   });
 
   // A plan executed straight from omp's own review claims the tickets it includes for this
@@ -1005,29 +1208,17 @@ export default function zeughausCi(pi: Pi): void {
         const body = readFileSync(path, "utf8");
         if (body.trim() === "") throw new Error(`${name} is empty.`);
         planFile = path;
-        const session = ompSession(ctx);
-        const args = [
-          "ci",
-          "plan-write",
-          "--json",
-          ...(planned.ticket !== undefined ? ["--ticket", String(planned.ticket)] : []),
-          ...(session ? ["--omp-session", session] : []),
-          planned.repo,
-          path,
-        ];
-        const r = await exec(pi, RUNNER, args, ctx.cwd, CONTEXT_TIMEOUT_MS);
-        const number = r.code === 0 ? jsonField(r.stdout, "number") : undefined;
-        if (typeof number !== "number") {
-          const why = r.code === 0 ? "unreadable answer" : failure(r, "ci plan-write");
+        let number: number;
+        try {
+          number = await storePlan(ctx, planned.repo, path, planned.ticket, ctx.cwd);
+        } catch (e) {
+          const why = e instanceof Error ? e.message : String(e);
           throw new Error(`Storing the plan failed: ${why}. Fix what it names and call submit_plan again.`);
         }
         ctx.ui.notify(`stored plan of ticket #${number} for review in zeughaus`, "info");
         planFile = undefined;
         // After the result is in: the session ends once this call has returned.
-        ctx.setTimeout(() => {
-          ctx.abort();
-          void Promise.resolve(ctx.shutdown()).catch(() => undefined);
-        }, 0);
+        endSession(ctx);
         return say(`Stored on ticket #${number} for review in zeughaus. The session ends now.`);
       },
     });

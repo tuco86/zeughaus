@@ -274,13 +274,30 @@ find [--json] <repo> <sha>`, `ci doc [--json] <repo> <n>`, `ci reevaluate
 [--json] [--ticket <n>] [--omp-session <file>] <repo> <file>`, `ci
 overdue <repo> <number> <job>`, `ci session [--json] <id>`, `ci claim
 [--json] <repo> ticket|pipeline <n>`, `ci renew`, `ci release [<repo>
-ticket|pipeline <n>]` and `ci responsible [--json] <repo> <n>` answer
+ticket|pipeline <n>]`, `ci responsible [--json] <repo> <n>`, `ci ask
+<file>` and `ci ask-close` answer
 the same for a script (exit 3: the origin is no repository of `ci.toml`;
 2: no CI, no answer or a refusal); the
 `zeughaus-ci` omp plugin in `omp-plugin/` uses them for its session
 context, its push watch, `submit_plan` and `/zeughaus save` (`ci overdue`
 prints the late report of one running job, which the push watch sends at
 each multiple of the job's expected time).
+
+Asks: in a zeughaus terminal the omp plugin shadows omp's `ask`. The
+native dialog stays open while `ci ask <file>` (`{"repo", "doc",
+"questions"}`) posts the same questions for the terminal (`AskPost`) and
+polls them every 2 s (`AskPoll`, which renews them); the CI keeps open asks
+in memory only (`Book.asks`) and drops one not polled for 30 s, and a
+restarted CI is answered by posting again. An editor shows an open ask in
+Needs you (beside the agent's docked terminal when the agent has a row)
+and in the popout of the ticket the asking session works on; its `Send`
+answers it (`AskAnswer`), and `ci ask` prints `{"replies": [..]}` for the
+plugin, which closes the terminal's dialog and returns what omp's own ask
+would have. An answer in the terminal first kills `ci ask` and drops the
+ask (`ci ask-close`). omp's plan review in a zeughaus terminal whose
+checkout the CI builds (not in a master) stores the plan as a ticket in
+review, as `submit_plan` does, and ends the session; a failure to store it
+leaves omp's own review open.
 
 Claims: the CI keeps who is responsible for a ticket or a pipeline as
 leased claims in `<state-dir>/ci/sessions.json` (`Book.claims`). A claim
