@@ -3,14 +3,15 @@
 //! stdout.
 //!
 //! Only what a tool server needs is here: `initialize`, `ping`,
-//! `tools/list` and `tools/call`. A notification is read and ignored, a
-//! method nobody serves is answered with `-32601`, and a batch is refused:
-//! the newest protocol revision has none.
+//! `tools/list`, `tools/call`, and for resources `resources/list`,
+//! `resources/templates/list` and `resources/read`. A notification is read
+//! and ignored, a method nobody serves is answered with `-32601`, and a batch
+//! is refused: the newest protocol revision has none.
 //!
-//! Every `tools/call` is a task of its own and answers through the one
-//! writer, which a lock holds for the length of a message so that two
-//! answers never interleave: an agent's subagents share this process and
-//! call in parallel, and a tool may wait minutes. At the end of the input
+//! Every `tools/call` and `resources/read` is a task of its own and answers
+//! through the one writer, which a lock holds for the length of a message so
+//! that two answers never interleave: an agent's subagents share this process
+//! and call in parallel, and a tool may wait minutes. At the end of the input
 //! the calls still running finish and answer before [`serve`] returns, so a
 //! fixed script piped in gets every answer.
 
@@ -33,6 +34,18 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
+const RESOURCE_NOT_FOUND: i64 = -32002;
+
+/// Why a resource could not be read.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResourceError {
+    /// The URI is none of the server's templates: -32602.
+    Invalid(String),
+    /// The template matches, nothing is there: -32002.
+    NotFound(String),
+    /// Reading it failed: -32603.
+    Failed(String),
+}
 
 /// What the transport serves.
 pub trait Tools: Send + Sync + 'static {
@@ -49,6 +62,15 @@ pub trait Tools: Send + Sync + 'static {
         name: &str,
         arguments: Value,
     ) -> impl Future<Output = Result<String, String>> + Send;
+
+    /// The `resourceTemplates` array of `resources/templates/list`.
+    fn resource_templates(&self) -> Vec<Value>;
+
+    /// Reads the resource at `uri` as text.
+    fn read_resource(
+        &self,
+        uri: &str,
+    ) -> impl Future<Output = Result<String, ResourceError>> + Send;
 }
 
 /// What one line of input asks of the server.
@@ -63,6 +85,8 @@ enum Step {
         name: String,
         arguments: Value,
     },
+    /// A `resources/read`, which runs as a task like a call.
+    Read { id: Value, uri: String },
 }
 
 /// Reads messages from `input` until it ends and writes the answers to
@@ -112,6 +136,34 @@ where
                             });
                             asked.insert(handle.id(), id);
                         }
+                        Step::Read { id, uri } => {
+                            let tools = Arc::clone(&tools);
+                            let output = Arc::clone(&output);
+                            let answer_id = id.clone();
+                            let handle = calls.spawn(async move {
+                                let answer = match tools.read_resource(&uri).await {
+                                    Ok(text) => success(
+                                        &answer_id,
+                                        json!({ "contents": [{
+                                            "uri": uri,
+                                            "mimeType": "text/plain",
+                                            "text": text,
+                                        }] }),
+                                    ),
+                                    Err(ResourceError::Invalid(m)) => {
+                                        failure(&answer_id, INVALID_PARAMS, m)
+                                    }
+                                    Err(ResourceError::NotFound(m)) => {
+                                        failure(&answer_id, RESOURCE_NOT_FOUND, m)
+                                    }
+                                    Err(ResourceError::Failed(m)) => {
+                                        failure(&answer_id, INTERNAL_ERROR, m)
+                                    }
+                                };
+                                output.send(&answer).await;
+                            });
+                            asked.insert(handle.id(), id);
+                        }
                     }
                 }
                 Ok(None) => break,
@@ -143,10 +195,10 @@ async fn reap<W: AsyncWrite + Unpin>(
             asked.remove(&task);
         }
         Err(e) => {
-            eprintln!("[mcp] a tool call failed: {e}");
+            eprintln!("[mcp] a call failed: {e}");
             if let Some(id) = asked.remove(&e.id()) {
                 output
-                    .send(&failure(&id, INTERNAL_ERROR, "the tool call failed"))
+                    .send(&failure(&id, INTERNAL_ERROR, "the call failed"))
                     .await;
             }
         }
@@ -205,6 +257,18 @@ fn step<T: Tools>(tools: &T, line: &str) -> Step {
             },
             Err(message) => Step::Answer(failure(&id, INVALID_PARAMS, message)),
         },
+        "resources/list" => Step::Answer(success(&id, json!({ "resources": [] }))),
+        "resources/templates/list" => Step::Answer(success(
+            &id,
+            json!({ "resourceTemplates": tools.resource_templates() }),
+        )),
+        "resources/read" => match params.get("uri").and_then(Value::as_str) {
+            Some(uri) => Step::Read {
+                id,
+                uri: uri.to_owned(),
+            },
+            None => Step::Answer(failure(&id, INVALID_PARAMS, "resources/read names no uri")),
+        },
         other => Step::Answer(failure(
             &id,
             METHOD_NOT_FOUND,
@@ -221,7 +285,7 @@ fn initialize<T: Tools>(tools: &T, params: &Value) -> Value {
         .unwrap_or(LATEST);
     json!({
         "protocolVersion": version,
-        "capabilities": { "tools": {} },
+        "capabilities": { "tools": {}, "resources": {} },
         "serverInfo": { "name": "zeughaus", "version": env!("CARGO_PKG_VERSION") },
         "instructions": tools.instructions(),
     })
@@ -318,6 +382,19 @@ mod tests {
                 other => Err(format!("unknown tool {other}")),
             }
         }
+
+        fn resource_templates(&self) -> Vec<Value> {
+            vec![json!({ "uriTemplate": "stub://{n}" })]
+        }
+
+        async fn read_resource(&self, uri: &str) -> Result<String, ResourceError> {
+            match uri {
+                "stub://1" => Ok("one".to_owned()),
+                "stub://9" => Err(ResourceError::NotFound("no stub 9".to_owned())),
+                "stub://boom" => Err(ResourceError::Failed("broke".to_owned())),
+                other => Err(ResourceError::Invalid(format!("not a stub: {other}"))),
+            }
+        }
     }
 
     /// Feeds `script` to a server and returns every line it wrote, parsed.
@@ -342,7 +419,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialize_offers_the_tools_capability_and_the_clients_revision() {
+    async fn initialize_offers_tools_and_resources_and_the_clients_revision() {
         let answers = run(concat!(
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
             "\n",
@@ -352,7 +429,10 @@ mod tests {
         .await;
         let first = &by_id(&answers, 1)["result"];
         assert_eq!(first["protocolVersion"], "2025-03-26");
-        assert_eq!(first["capabilities"], json!({ "tools": {} }));
+        assert_eq!(
+            first["capabilities"],
+            json!({ "tools": {}, "resources": {} })
+        );
         assert_eq!(first["serverInfo"]["name"], "zeughaus");
         assert_eq!(first["instructions"], "stub");
         // A revision it does not know is answered with the newest it does.
@@ -375,8 +455,43 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_method_is_32601() {
-        let answers = run(r#"{"jsonrpc":"2.0","id":3,"method":"resources/list"}"#).await;
+        let answers = run(r#"{"jsonrpc":"2.0","id":3,"method":"prompts/list"}"#).await;
         assert_eq!(by_id(&answers, 3)["error"]["code"], -32601);
+    }
+
+    #[tokio::test]
+    async fn resources_are_listed_and_read() {
+        let answers = run(concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"resources/list"}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"resources/templates/list"}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"stub://1"}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"stub://9"}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"stub://boom"}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"http://x"}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":7,"method":"resources/read"}"#,
+            "\n",
+        ))
+        .await;
+        assert_eq!(by_id(&answers, 1)["result"]["resources"], json!([]));
+        assert_eq!(
+            by_id(&answers, 2)["result"]["resourceTemplates"][0]["uriTemplate"],
+            "stub://{n}"
+        );
+        let read = &by_id(&answers, 3)["result"]["contents"][0];
+        assert_eq!(read["text"], "one");
+        assert_eq!(read["uri"], "stub://1");
+        let missing = &by_id(&answers, 4)["error"];
+        assert_eq!(missing["code"], -32002);
+        assert_eq!(missing["message"], "no stub 9");
+        assert_eq!(by_id(&answers, 5)["error"]["code"], -32603);
+        assert_eq!(by_id(&answers, 6)["error"]["code"], -32602);
+        assert_eq!(by_id(&answers, 7)["error"]["code"], -32602);
     }
 
     #[tokio::test]

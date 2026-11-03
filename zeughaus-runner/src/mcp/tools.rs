@@ -24,7 +24,7 @@ use zeughaus_link::{
 use super::client::Client;
 use super::docs;
 use super::repo;
-use super::rpc::Tools;
+use super::rpc::{ResourceError, Tools};
 use super::snapshot;
 use crate::names::valid_name;
 
@@ -43,7 +43,9 @@ execution: docs lists them, doc_read reads one with its proposal, plan and links
 proposal_write stores an open ticket for another repository of the CI (instead of a \
 PROPOSAL-*.md in its root), onboard_request asks for a project the CI does not build yet to \
 join it, and a session executing a ticket's plan from zeughaus calls plan_done once its \
-work is committed and pushed. A job that names `state = [..]` in its header keeps data from one \
+work is committed and pushed. A ticket is also the resource ticket://<repo>/<number>, which read \
+shows like a file: #12 in a text names ticket 12 of the repository at hand, #weida-12 ticket 12 \
+of weida. A job that names `state = [..]` in its header keeps data from one \
 pipeline to the next: ci_state lists those stores and their versions, ci_state_get downloads one \
 version into a directory and ci_state_delete removes a version or a whole store. The session \
 that starts or waits on a pipeline holds it: its failures, and a later pipeline's failure of the \
@@ -1043,15 +1045,42 @@ pub(super) async fn find(
 
 /// Document `number` of `repo` with its body.
 pub(super) async fn read_doc(client: &Client, repo: &str, number: u64) -> Result<DocView, String> {
+    find_doc(client, repo, number)
+        .await?
+        .ok_or_else(|| format!("no document #{number} in {repo}"))
+}
+
+/// Document `number` of `repo` with its body, `None` when the CI has none.
+pub(super) async fn find_doc(
+    client: &Client,
+    repo: &str,
+    number: u64,
+) -> Result<Option<DocView>, String> {
     let request = CiRequest::Doc {
         repo: repo.to_owned(),
         number,
     };
     match client.ci(request).await? {
-        CiReply::Doc { doc: Some(doc) } => Ok(*doc),
-        CiReply::Doc { doc: None } => Err(format!("no document #{number} in {repo}")),
+        CiReply::Doc { doc: Some(doc) } => Ok(Some(*doc)),
+        CiReply::Doc { doc: None } => Ok(None),
         other => Err(unexpected(&other)),
     }
+}
+
+const TICKET_TEMPLATE: &str = "ticket://{repo}/{number}";
+
+/// The repository and number of a `ticket://<repo>/<number>` URI, exactly
+/// that and nothing appended.
+fn ticket_uri(uri: &str) -> Option<(&str, u64)> {
+    let (repo, number) = uri.strip_prefix("ticket://")?.split_once('/')?;
+    if !valid_name(repo) || repo.len() > 100 {
+        return None;
+    }
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let number: u64 = number.parse().ok()?;
+    (number > 0).then_some((repo, number))
 }
 
 /// Every ticket of `repo`, without their texts.
@@ -1106,6 +1135,36 @@ impl Tools for Toolbox {
                     .collect::<Vec<_>>()
                     .join(", ")
             )),
+        }
+    }
+
+    fn resource_templates(&self) -> Vec<Value> {
+        vec![json!({
+            "uriTemplate": TICKET_TEMPLATE,
+            "name": "ticket",
+            "title": "Ticket",
+            "description": "One ticket of a repository of the CI with its whole text, as \
+                            doc_read tells it. #12 in a text is ticket://<the repository at \
+                            hand>/12, #weida-12 is ticket://weida/12.",
+            "mimeType": "text/plain",
+        })]
+    }
+
+    async fn read_resource(&self, uri: &str) -> Result<String, ResourceError> {
+        let Some((repo, number)) = ticket_uri(uri) else {
+            return Err(ResourceError::Invalid(format!(
+                "not a ticket: {uri}; a ticket is ticket://<repo>/<number>"
+            )));
+        };
+        match find_doc(&self.client, repo, number).await {
+            Ok(Some(doc)) => {
+                let all = read_docs(&self.client, repo).await.unwrap_or_default();
+                Ok(docs::doc_text(&doc, &all, now()))
+            }
+            Ok(None) => Err(ResourceError::NotFound(format!(
+                "no document #{number} in {repo}"
+            ))),
+            Err(e) => Err(ResourceError::Failed(e)),
         }
     }
 }
@@ -3486,6 +3545,40 @@ mod tests {
             .await
             .expect_err("no such document");
         assert_eq!(err, "no document #9 in demo");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ticket_reads_as_a_resource() {
+        let ci = fake_ci(0, None).await;
+        let tools = toolbox_for(&ci);
+
+        let read = tools
+            .read_resource("ticket://demo/2")
+            .await
+            .expect("a ticket");
+        assert!(
+            read.starts_with("#2 ticket review: Smoke plan\nfrom demo\n"),
+            "{read}"
+        );
+        assert_eq!(
+            tools.read_resource("ticket://demo/9").await,
+            Err(ResourceError::NotFound("no document #9 in demo".into()))
+        );
+        for uri in [
+            "ticket://demo/x",
+            "ticket://Demo/2",
+            "ticket://demo/0",
+            "ticket://demo/2/x",
+            "issue://demo/2",
+        ] {
+            assert!(
+                matches!(
+                    tools.read_resource(uri).await,
+                    Err(ResourceError::Invalid(_))
+                ),
+                "{uri}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
