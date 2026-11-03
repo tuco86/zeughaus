@@ -1459,7 +1459,12 @@ includes, its sessions and its claim's holder. A plan in review is drawn
 in the sections `ci/review.rs` splits it into at its headings; each is
 folded, deleted with its subsections or annotated, beside an overall note,
 and `Refine` sends that review (`DocRefine`) while `Approve` waits until
-the review is empty. Escape or a press on the scrim closes it; `New
+the review is empty. Under the text every ticket, finished ones too, lists
+its comments and a box for a new one (`DocComment`, its author the
+editor's `<user>@<host>`). `Re-evaluate` of an open, ready, reviewed or
+approved ticket asks the CI (`Reevaluate`, one at a time, the other
+buttons free meanwhile); the stored suggestion shows under the actions,
+a rewrite with `Edit with this text`. Escape or a press on the scrim closes it; `New
 ticket` on the Board writes one in it. A card the CI moved to another
 column carries an accent ring that fades over 2 s. A project no CI builds
 gets the Board of `ci/onboard.rs`: the first CI's advice on it
@@ -1898,6 +1903,20 @@ it; they close with it, and go back to `open` when it is dismissed or its
 plan discarded. A link that would close a dependency cycle is refused. At
 start the CI rewrites documents stored before tickets, and texts from
 before Markdown tickets (`docs::migrate`).
+
+A ticket in any state takes comments (`comments`, at most 100 of 8 KiB,
+each with its author and time); they go into its next plan session's
+brief and a resumed Refine, and lists leave them out. `Reevaluate`
+(`reevaluate.rs`) asks the `[advice]` model, with the CI's Claude
+sign-in and outside the documents' lock, what to do with an open, ready,
+reviewed or approved ticket: from its text, plan, comments and links, the
+repository's other unfinished tickets and the newest 30 commits of its
+default branch in the CI's mirror, it answers keep, dismiss, merge (into
+another unfinished ticket), plan or rewrite (a whole new ticket text),
+with a reason. The answer is the ticket's `suggestion` until its state,
+text or plan changes; one that arrives after the ticket moved on is
+dropped. `/ci` requests are answered each in a task of their own, so a
+model call, which may take 90 s, holds up no other question.
 
 A ticket's text is Markdown (`zeughaus_link::ticket_text`): its first line
 is `# <title>` and its link lines (`Depends on:`, alias `Blocked by:`, and

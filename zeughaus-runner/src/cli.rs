@@ -22,6 +22,7 @@
 //! zeughaus-runner ci repo [--json] [<path>]
 //! zeughaus-runner ci find [--json] <repo> <sha>
 //! zeughaus-runner ci doc [--json] <repo> <number>
+//! zeughaus-runner ci reevaluate [--json] <repo> <number>
 //! zeughaus-runner ci plan-write [--json] [--ticket <n>] [--omp-session <file>] <repo> <file>
 //! zeughaus-runner ci wait <repo> <number|sha> [<job>]
 //! zeughaus-runner ci overdue <repo> <number> <job>
@@ -64,6 +65,7 @@ usage: zeughaus-runner [--state-dir <dir>] [--feed-addr <host:port>] [--keep-run
        zeughaus-runner ci repo [--json] [<path>]
        zeughaus-runner ci find [--json] <repo> <sha>
        zeughaus-runner ci doc [--json] <repo> <number>
+       zeughaus-runner ci reevaluate [--json] <repo> <number>
        zeughaus-runner ci plan-write [--json] [--ticket <n>] [--omp-session <file>] <repo> <file>
        zeughaus-runner ci wait <repo> <number|sha> [<job>]
        zeughaus-runner ci overdue <repo> <number> <job>

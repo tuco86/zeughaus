@@ -15,8 +15,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use zeughaus_link::ci::{
-    DocKind, DocLink, DocState, DocView, LinkKind, MAX_DOC_BYTES, MAX_DOC_TITLE_BYTES, OnboardSpec,
-    Planner, RepoDocsView, normalize_origin, plan_title, runs_on_named,
+    DocKind, DocLink, DocState, DocView, LinkKind, MAX_COMMENT_BYTES, MAX_COMMENTS, MAX_DOC_BYTES,
+    MAX_DOC_TITLE_BYTES, OnboardSpec, Planner, RepoDocsView, TicketComment, TicketSuggestion,
+    normalize_origin, plan_title, runs_on_named,
 };
 use zeughaus_link::selector::parse_runs_on;
 use zeughaus_link::{
@@ -201,9 +202,9 @@ fn read_all(dir: &Path) -> Vec<DocView> {
     docs
 }
 
-/// Every document of `repo` without its proposal, plan and review, in
-/// number order, `waits_for` filled; nothing for a repository that is not
-/// in `ci.toml`.
+/// Every document of `repo` without its proposal, plan, review, comments
+/// and suggestion, in number order, `waits_for` filled; nothing for a
+/// repository that is not in `ci.toml`.
 pub fn list(state_dir: &Path, config: &CiConfig, repo: &str) -> Vec<DocView> {
     let Ok(dir) = dir(state_dir, config, repo) else {
         return Vec::new();
@@ -213,6 +214,8 @@ pub fn list(state_dir: &Path, config: &CiConfig, repo: &str) -> Vec<DocView> {
         doc.body.clear();
         doc.plan_text.clear();
         doc.feedback.clear();
+        doc.comments.clear();
+        doc.suggestion = None;
     }
     fill_waits(state_dir, &mut docs);
     docs
@@ -224,6 +227,34 @@ pub fn load(state_dir: &Path, config: &CiConfig, repo: &str, number: u64) -> Opt
     let mut doc: DocView = read_json(&path_of(&dir, number)).ok()?;
     fill_waits(state_dir, std::slice::from_mut(&mut doc));
     Some(doc)
+}
+
+/// The tickets of `repo` that are not finished, with their proposals but
+/// without plan, review, comments and suggestion, in number order.
+pub fn unfinished(state_dir: &Path, config: &CiConfig, repo: &str) -> Vec<DocView> {
+    let Ok(dir) = dir(state_dir, config, repo) else {
+        return Vec::new();
+    };
+    let mut docs = read_all(&dir);
+    docs.retain(|doc| {
+        doc.kind == DocKind::Ticket
+            && matches!(
+                doc.state,
+                DocState::Open
+                    | DocState::Ready
+                    | DocState::Planning
+                    | DocState::Review
+                    | DocState::Approved
+                    | DocState::InProgress
+            )
+    });
+    for doc in &mut docs {
+        doc.plan_text.clear();
+        doc.feedback.clear();
+        doc.comments.clear();
+        doc.suggestion = None;
+    }
+    docs
 }
 
 fn missing(repo: &str, number: u64) -> String {
@@ -534,6 +565,8 @@ pub fn create(
         note: String::new(),
         waits_for: Vec::new(),
         filed: Vec::new(),
+        comments: Vec::new(),
+        suggestion: None,
     };
     write_json(&path_of(&dir, number), &doc)?;
     write_atomic(&dir.join("last"), number.to_string().as_bytes())?;
@@ -637,6 +670,8 @@ pub fn onboard(
         note: String::new(),
         waits_for: Vec::new(),
         filed: Vec::new(),
+        comments: Vec::new(),
+        suggestion: None,
     };
     let mut written = vec![DocView {
         approved: Some(now),
@@ -721,6 +756,69 @@ pub fn edit(
     doc.links = check_links(state_dir, config, repo, number, &text.links)?;
     doc.title = text.title;
     doc.body = body.to_owned();
+    doc.suggestion = None;
+    doc.changed = now;
+    write_json(&path, &doc)
+}
+
+/// Adds a comment by `author` to a ticket in any state.
+pub fn comment(
+    state_dir: &Path,
+    config: &CiConfig,
+    repo: &str,
+    number: u64,
+    author: &str,
+    text: &str,
+    now: u64,
+) -> Result<(), String> {
+    let dir = dir(state_dir, config, repo)?;
+    let path = path_of(&dir, number);
+    let mut doc = read_ticket(&path, repo, number)?;
+    let author = author.trim();
+    if author.is_empty() || author.len() > MAX_SOURCE_BYTES || author.contains(['\n', '\r']) {
+        return Err(format!(
+            "an author is one line of 1 to {MAX_SOURCE_BYTES} bytes"
+        ));
+    }
+    let text = text.trim();
+    if text.is_empty() || text.len() > MAX_COMMENT_BYTES {
+        return Err(format!("a comment is 1 to {MAX_COMMENT_BYTES} bytes"));
+    }
+    if doc.comments.len() >= MAX_COMMENTS {
+        return Err(format!(
+            "#{number} has {MAX_COMMENTS} comments; it takes no more"
+        ));
+    }
+    doc.comments.push(TicketComment {
+        author: author.to_owned(),
+        at: now,
+        text: text.to_owned(),
+    });
+    // The editor reloads a shown ticket when `changed` moves.
+    doc.changed = now;
+    write_json(&path, &doc)
+}
+
+/// Keeps the advice model's answer on a ticket that may still be
+/// re-evaluated; one that moved on while the model thought drops it.
+pub fn set_suggestion(
+    state_dir: &Path,
+    config: &CiConfig,
+    repo: &str,
+    number: u64,
+    suggestion: TicketSuggestion,
+    now: u64,
+) -> Result<(), String> {
+    let dir = dir(state_dir, config, repo)?;
+    let path = path_of(&dir, number);
+    let mut doc = read_ticket(&path, repo, number)?;
+    if !doc.state.reevaluable() {
+        return Err(format!(
+            "#{number} is {} now; the suggestion is dropped",
+            doc.state.name()
+        ));
+    }
+    doc.suggestion = Some(suggestion);
     doc.changed = now;
     write_json(&path, &doc)
 }
@@ -901,6 +999,7 @@ pub fn set_state(
         doc.merged.clear();
     }
     doc.state = to;
+    doc.suggestion = None;
     doc.changed = now;
     write_json(&path, &doc)?;
     if reopen || close {
@@ -983,6 +1082,8 @@ pub fn write_plan(
                 note: String::new(),
                 waits_for: Vec::new(),
                 filed: Vec::new(),
+                comments: Vec::new(),
+                suggestion: None,
             };
             (n, doc)
         }
@@ -1019,6 +1120,7 @@ pub fn write_plan(
     doc.revision += 1;
     doc.planner = plan.planner;
     doc.feedback.clear();
+    doc.suggestion = None;
     doc.note.clear();
     if !plan.runs_on.is_empty() {
         doc.runs_on = plan.runs_on.to_vec();
@@ -1704,6 +1806,8 @@ mod tests {
             note: String::new(),
             waits_for: Vec::new(),
             filed: Vec::new(),
+            comments: Vec::new(),
+            suggestion: None,
         }
     }
 
@@ -1888,6 +1992,85 @@ mod tests {
             assert_eq!(
                 load(&state, &config, "demo", 3).expect("stored").body,
                 "# c\n\nbody\n"
+            );
+        }
+
+        #[test]
+        fn a_comment_is_kept_on_a_dismissed_ticket_and_left_out_of_lists() {
+            let state = scratch("comment");
+            let config = config();
+            create(&state, &config, "demo", new(&text("a", &[])), 1).unwrap();
+            set_state(&state, &config, "demo", 1, Dismissed, 2).unwrap();
+            let said = comment(
+                &state,
+                &config,
+                "demo",
+                1,
+                " hannes@tuco-pc ",
+                "  still relevant?  ",
+                3,
+            );
+            assert_eq!(said, Ok(()));
+            let doc = load(&state, &config, "demo", 1).expect("stored");
+            assert_eq!(
+                doc.comments,
+                vec![TicketComment {
+                    author: "hannes@tuco-pc".to_owned(),
+                    at: 3,
+                    text: "still relevant?".to_owned(),
+                }]
+            );
+            assert_eq!(doc.changed, 3);
+            assert!(list(&state, &config, "demo")[0].comments.is_empty());
+            assert_eq!(
+                comment(&state, &config, "demo", 1, "hannes@tuco-pc", "  ", 4),
+                Err("a comment is 1 to 8192 bytes".to_owned())
+            );
+            for at in 4..103 {
+                comment(&state, &config, "demo", 1, "hannes@tuco-pc", "more", at).unwrap();
+            }
+            assert_eq!(
+                comment(
+                    &state,
+                    &config,
+                    "demo",
+                    1,
+                    "hannes@tuco-pc",
+                    "one more",
+                    103
+                ),
+                Err("#1 has 100 comments; it takes no more".to_owned())
+            );
+        }
+
+        #[test]
+        fn a_suggestion_is_kept_until_the_ticket_moves() {
+            let state = scratch("suggestion");
+            let config = config();
+            create(&state, &config, "demo", new(&text("a", &[])), 1).unwrap();
+            let suggestion = TicketSuggestion {
+                verdict: zeughaus_link::Verdict::Dismiss,
+                into: None,
+                reason: "Done by abc1234.".to_owned(),
+                text: String::new(),
+                model: "m".to_owned(),
+                created: 2,
+            };
+            set_suggestion(&state, &config, "demo", 1, suggestion.clone(), 2).unwrap();
+            assert_eq!(
+                load(&state, &config, "demo", 1).expect("stored").suggestion,
+                Some(suggestion.clone())
+            );
+            set_state(&state, &config, "demo", 1, Ready, 3).unwrap();
+            assert_eq!(
+                load(&state, &config, "demo", 1).expect("stored").suggestion,
+                None
+            );
+            set_state(&state, &config, "demo", 1, Open, 4).unwrap();
+            set_state(&state, &config, "demo", 1, Dismissed, 5).unwrap();
+            assert_eq!(
+                set_suggestion(&state, &config, "demo", 1, suggestion, 6),
+                Err("#1 is dismissed now; the suggestion is dropped".to_owned())
             );
         }
 

@@ -26,7 +26,7 @@
 //! - [`snapshot`]: a working tree and its path dependencies as git bundles.
 
 pub(crate) mod client;
-mod docs;
+pub(crate) mod docs;
 pub(crate) mod repo;
 mod rpc;
 mod snapshot;
@@ -138,6 +138,9 @@ const EXIT_LATE: u8 = 4;
 ///   `null` when there is none.
 /// - `ci doc [--json] <repo> <number>`: one ticket, as `doc_read` tells
 ///   it; `--json` prints its record with its texts.
+/// - `ci reevaluate [--json] <repo> <number>`: asks the CI's advice model
+///   what to do with the ticket now and prints its suggestion; `--json`
+///   prints the suggestion record.
 /// - `ci plan-write [--json] [--ticket <n>] [--omp-session <file>] <repo>
 ///   <file>`: stores the plan in `file`, titled by its first heading and
 ///   including the tickets its `Includes:` line names, on ticket `n` (which
@@ -231,6 +234,11 @@ enum CiCommand {
         repo: String,
         number: u64,
     },
+    Reevaluate {
+        json: bool,
+        repo: String,
+        number: u64,
+    },
     PlanWrite {
         json: bool,
         repo: String,
@@ -315,8 +323,8 @@ const CLI_WAIT_LIMIT: Duration = Duration::from_secs(4 * 3600);
 
 /// The arguments that follow `ci`.
 fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
-    const SUBCOMMANDS: &str = "repo, find, doc, plan-write, wait, overdue, session, claim, \
-                               renew, release or responsible";
+    const SUBCOMMANDS: &str = "repo, find, doc, reevaluate, plan-write, wait, overdue, session, \
+                               claim, renew, release or responsible";
     let Some((subcommand, rest)) = args.split_first() else {
         return Err(format!("ci needs a subcommand: {SUBCOMMANDS}"));
     };
@@ -374,6 +382,17 @@ fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
             _ => Err(format!("{number:?} is no document number")),
         },
         ("doc", _) => Err("ci doc takes a repository name and a number".to_owned()),
+        ("reevaluate", [repo, number]) => match number.parse::<u64>() {
+            Ok(number) if number >= 1 => Ok(CiCommand::Reevaluate {
+                json,
+                repo: (*repo).clone(),
+                number,
+            }),
+            _ => Err(format!("{number:?} is no document number")),
+        },
+        ("reevaluate", _) => {
+            Err("ci reevaluate takes a repository name and a ticket number".to_owned())
+        }
         ("plan-write", [repo, file]) => Ok(CiCommand::PlanWrite {
             json,
             repo: (*repo).clone(),
@@ -679,6 +698,33 @@ async fn ci_answer(client: &Arc<Client>, command: CiCommand) -> Result<String, F
                 ))
             }
         }
+        CiCommand::Reevaluate { json, repo, number } => {
+            match client
+                .ci(CiRequest::Reevaluate {
+                    repo: repo.clone(),
+                    number,
+                })
+                .await
+                .map_err(Failure::no_answer)?
+            {
+                CiReply::Accepted => {}
+                other => return Err(Failure::no_answer(unexpected(&other))),
+            }
+            let doc = read_doc(client, &repo, number)
+                .await
+                .map_err(Failure::no_answer)?;
+            if json {
+                encoded(&doc.suggestion)
+            } else {
+                match &doc.suggestion {
+                    Some(suggestion) => Ok(format!(
+                        "#{number} {}",
+                        docs::suggestion_text(suggestion, crate::enlist::now_secs())
+                    )),
+                    None => Err(Failure::no_answer("the CI kept no suggestion".to_owned())),
+                }
+            }
+        }
         CiCommand::PlanWrite {
             json,
             repo,
@@ -937,6 +983,14 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_ci(&args(&["reevaluate", "--json", "demo", "3"])),
+            Ok(CiCommand::Reevaluate {
+                json: true,
+                repo: "demo".to_owned(),
+                number: 3
+            })
+        );
+        assert_eq!(
             parse_ci(&args(&["plan-write", "demo", "/tmp/p.md", "--json"])),
             Ok(CiCommand::PlanWrite {
                 json: true,
@@ -1004,6 +1058,7 @@ mod tests {
             ),
             (&["doc", "demo", "0"][..], "\"0\" is no document number"),
             (&["doc", "demo"][..], "ci doc takes"),
+            (&["reevaluate", "demo"][..], "ci reevaluate takes"),
             (&["plan-write", "demo"][..], "ci plan-write takes"),
             (
                 &["plan-write", "demo", "f", "--ticket"][..],

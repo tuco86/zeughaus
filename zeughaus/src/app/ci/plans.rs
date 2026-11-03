@@ -75,6 +75,9 @@ pub(super) struct PlansState {
     pub(super) notice: Option<Notice>,
     /// The `Runs on` being edited: the document and the text so far.
     pub(super) runs_on_input: Option<(u64, String)>,
+    /// The ticket a re-evaluation is on its way for: one at a time, without
+    /// holding the other buttons.
+    pub(super) reevaluating: Option<u64>,
 }
 
 impl PlansState {
@@ -93,6 +96,7 @@ impl PlansState {
             acting_on: None,
             notice: None,
             runs_on_input: None,
+            reevaluating: None,
         }
     }
 
@@ -323,6 +327,57 @@ impl CiClient {
         };
         Task::batch([self.ask_docs(key, view), overview])
     }
+
+    /// Asks the CI's advice model about ticket `number`; one at a time.
+    pub(super) fn reevaluate(&mut self, key: &RunnerKey, view: u64, number: u64) -> Task<Message> {
+        let Some(state) = self.plans.get_mut(&view) else {
+            return Task::none();
+        };
+        if state.reevaluating.is_some() {
+            return Task::none();
+        }
+        state.reevaluating = Some(number);
+        state.notice = None;
+        let request = CiRequest::Reevaluate {
+            repo: state.repo.clone(),
+            number,
+        };
+        let key = key.clone();
+        Task::perform(act(self.endpoint.clone(), request), move |result| {
+            Message::Ci(
+                key,
+                CiMsg::Reevaluated {
+                    view,
+                    number,
+                    result,
+                },
+            )
+        })
+    }
+
+    /// The CI answered a re-evaluation: the ticket, asked for again, brings
+    /// the suggestion; a refusal is a notice.
+    pub(super) fn reevaluated(
+        &mut self,
+        key: &RunnerKey,
+        view: u64,
+        number: u64,
+        result: Result<(), String>,
+    ) -> Task<Message> {
+        let Some(state) = self.plans.get_mut(&view) else {
+            return Task::none();
+        };
+        if state.reevaluating == Some(number) {
+            state.reevaluating = None;
+        }
+        if let Err(e) = result {
+            state.notice = Some(Notice {
+                text: e,
+                failed: true,
+            });
+        }
+        self.ask_docs(key, view)
+    }
 }
 
 /// The document a request acts on and the word for what it does.
@@ -343,6 +398,7 @@ fn acting_on(request: &CiRequest) -> Option<(u64, &'static str)> {
         }
         CiRequest::DocDelete { number, .. } => Some((*number, "deleting")),
         CiRequest::DocRefine { number, .. } => Some((*number, "refining")),
+        CiRequest::DocComment { number, .. } => Some((*number, "commenting")),
         CiRequest::DocRunsOn { number, .. }
         | CiRequest::DocEdit { number, .. }
         | CiRequest::DocAutoApprove { number, .. } => Some((*number, "saving")),
@@ -941,6 +997,25 @@ impl App {
             bar = bar.push(tip(
                 edit,
                 "Change its text, title and links included".to_owned(),
+            ));
+        }
+        if ticket && doc.state.reevaluable() {
+            let words = if state.reevaluating == Some(doc.number) {
+                "Re-evaluating"
+            } else {
+                "Re-evaluate"
+            };
+            let mut pressed = pill(words, false);
+            if state.reevaluating.is_none() {
+                let number = doc.number;
+                pressed = pressed.on_press_with(move || {
+                    Message::Ci(runner.clone(), CiMsg::Reevaluate { view, number })
+                });
+            }
+            bar = bar.push(tip(
+                pressed,
+                "Ask the CI's advice model whether to keep, dismiss, merge, plan or rewrite it"
+                    .to_owned(),
             ));
         }
         let mut waits = Vec::new();

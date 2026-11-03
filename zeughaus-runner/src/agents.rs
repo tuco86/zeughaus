@@ -254,11 +254,11 @@ fn replan_instruction(repo: &str, number: u64) -> String {
     )
 }
 
-/// The ticket a plan session is given: its title, what it asks for and its
+/// The ticket a plan session is given: its title, what it asks for, its
 /// links both ways, each with the linked ticket's title and state when
-/// `docs` (its repository's tickets) has it.
+/// `docs` (its repository's tickets) has it, and its comments.
 #[cfg(unix)]
-fn ticket_brief(doc: &zeughaus_link::DocView, docs: &[zeughaus_link::DocView]) -> String {
+fn ticket_brief(doc: &zeughaus_link::DocView, docs: &[zeughaus_link::DocView], now: u64) -> String {
     use zeughaus_link::LinkKind;
     let mut text = format!("# #{} {}\n\n", doc.number, doc.title);
     let proposal = zeughaus_link::text_without_title(&doc.body);
@@ -298,6 +298,21 @@ fn ticket_brief(doc: &zeughaus_link::DocView, docs: &[zeughaus_link::DocView]) -
         text.push_str("\n## Links\n\n");
         text.push_str(&links);
     }
+    if !doc.comments.is_empty() {
+        text.push('\n');
+        text.push_str(&crate::mcp::docs::comments_text(&doc.comments, now));
+    }
+    text
+}
+
+/// What a resumed Refine is given: the review, then the ticket's comments.
+#[cfg(unix)]
+fn refine_text(doc: &zeughaus_link::DocView, now: u64) -> String {
+    let mut text = doc.feedback.clone();
+    if !doc.comments.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(&crate::mcp::docs::comments_text(&doc.comments, now));
+    }
     text
 }
 
@@ -330,7 +345,7 @@ mod unix {
     use super::{
         MASTER_RETRY, SESSION_LOCK, SessionArgs, agent_root, checkout_of, clone_url, instruction,
         master_dir, omp_program, parse_args, parse_work_args, plan_clone_dir, refine_instruction,
-        replan_instruction, ticket_brief, ticket_instruction, work_root,
+        refine_text, replan_instruction, ticket_brief, ticket_instruction, work_root,
     };
     use crate::enlist::SessionHost;
     use crate::mcp::client::{Client, Link};
@@ -648,31 +663,39 @@ mod unix {
                 }
                 there
             });
+            let now = crate::enlist::now_secs();
             let written = match resumable {
-                Some(session) => write(format!("refine-{n}.md"), &doc.feedback).map(|refine| {
-                    command
-                        .arg("--resume")
-                        .arg(session)
-                        .arg(at(&refine))
-                        .arg(refine_instruction(&repo, n));
-                }),
-                None if !doc.feedback.is_empty() => {
-                    write(format!("ticket-{n}.md"), &ticket_brief(doc, docs)).and_then(|brief| {
-                        let plan = write(format!("plan-{n}.md"), &doc.plan_text)?;
-                        let refine = write(format!("refine-{n}.md"), &doc.feedback)?;
+                Some(session) => {
+                    write(format!("refine-{n}.md"), &refine_text(doc, now)).map(|refine| {
                         command
-                            .arg(at(&brief))
-                            .arg(at(&plan))
+                            .arg("--resume")
+                            .arg(session)
                             .arg(at(&refine))
-                            .arg(replan_instruction(&repo, n));
-                        Ok(())
+                            .arg(refine_instruction(&repo, n));
                     })
                 }
-                None => write(format!("ticket-{n}.md"), &ticket_brief(doc, docs)).map(|brief| {
-                    command
-                        .arg(at(&brief))
-                        .arg(ticket_instruction(&repo, n, &doc.source));
-                }),
+                None if !doc.feedback.is_empty() => {
+                    write(format!("ticket-{n}.md"), &ticket_brief(doc, docs, now)).and_then(
+                        |brief| {
+                            let plan = write(format!("plan-{n}.md"), &doc.plan_text)?;
+                            // The brief carries the comments here.
+                            let refine = write(format!("refine-{n}.md"), &doc.feedback)?;
+                            command
+                                .arg(at(&brief))
+                                .arg(at(&plan))
+                                .arg(at(&refine))
+                                .arg(replan_instruction(&repo, n));
+                            Ok(())
+                        },
+                    )
+                }
+                None => {
+                    write(format!("ticket-{n}.md"), &ticket_brief(doc, docs, now)).map(|brief| {
+                        command
+                            .arg(at(&brief))
+                            .arg(ticket_instruction(&repo, n, &doc.source));
+                    })
+                }
             };
             if let Err(e) = written {
                 return fail(e);
@@ -985,7 +1008,9 @@ pub fn work(_args: &[String], _state_dir: &Path) -> ExitCode {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use zeughaus_link::{DocKind, DocLink, DocState, DocView, FiledTicket, LinkKind};
+    use zeughaus_link::{
+        DocKind, DocLink, DocState, DocView, FiledTicket, LinkKind, TicketComment,
+    };
 
     #[test]
     fn work_takes_one_origin_and_an_optional_branch() {
@@ -1151,6 +1176,8 @@ mod tests {
             note: String::new(),
             waits_for: Vec::new(),
             filed: Vec::new(),
+            comments: Vec::new(),
+            suggestion: None,
         }
     }
 
@@ -1184,18 +1211,26 @@ mod tests {
             ),
         ];
         assert_eq!(
-            ticket_brief(&planned, &docs),
+            ticket_brief(&planned, &docs, 1),
             "# #3 Tickets\n\nDo it.\n\n## Links\n\n\
              - depends on #1 Claims (done)\n\
              - related to #9\n\
              - depends on #weida-5\n\
              - blocks #5 Popout (open)\n"
         );
-        let bare = ticket(4, "Plan only", DocState::Planning, Vec::new());
+        let mut bare = ticket(4, "Plan only", DocState::Planning, Vec::new());
         assert_eq!(
-            ticket_brief(&bare, &[]),
+            ticket_brief(&bare, &[], 1),
             "# #4 Plan only\n\n(no proposal text: this ticket started as a plan)\n"
         );
+        bare.comments = vec![TicketComment {
+            author: "hannes@tuco-pc".to_owned(),
+            at: 1,
+            text: "Still needed.\nAlso on Windows.".to_owned(),
+        }];
+        assert!(ticket_brief(&bare, &[], 7_201).ends_with(
+            "\n## Comments\n\n- hannes@tuco-pc, 2h ago:\n  Still needed.\n  Also on Windows.\n"
+        ));
     }
 
     #[test]

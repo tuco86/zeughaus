@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Comments and a re-evaluation on tickets. Any ticket, done and dismissed
+  ones too, takes comments (`<user>@<host>` and time, written in the
+  popout, at most 100 of 8 KiB each); the next plan session's brief and a
+  resumed Refine carry them, and `doc_read` / `ci doc` show them.
+  `Re-evaluate` in the popout of an open, ready, reviewed or approved
+  ticket asks the CI's `[advice]` model with its Claude sign-in what to do
+  with it now (keep, dismiss, merge into #n, plan now, or rewrite, with a
+  reason), from its text, comments and links, the repository's other
+  unfinished tickets and the recent commits of its default branch. The
+  answer stays on the ticket until its state, text or plan changes; a
+  rewrite offers `Edit with this text`. `zeughaus-runner ci reevaluate
+  [--json] <repo> <n>` asks from a script. The CI answers `/ci` requests
+  concurrently, so a model call holds up no other question.
+
 - Following an upstream pipeline's end: a job header's `on = ["done main
   of weida"]` runs once a push pipeline of weida's `main` has ended
   (succeeded, failed or cancelled) while its commit is still the branch's

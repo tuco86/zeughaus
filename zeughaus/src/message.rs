@@ -518,7 +518,7 @@ pub enum CiMsg {
     },
     /// The user asked the CI something its answer to is `Accepted`: a
     /// `DocState`, `DocDelete`, `DocRunsOn`, `DocEdit`, `DocAutoApprove`,
-    /// `DocRefine`, `QueuePaused` or `CloseSession`.
+    /// `DocRefine`, `DocComment`, `QueuePaused` or `CloseSession`.
     DocAct {
         view: u64,
         request: zeughaus_link::CiRequest,
@@ -526,6 +526,14 @@ pub enum CiMsg {
     /// What the CI answered it.
     DocActed {
         view: u64,
+        result: Result<(), String>,
+    },
+    /// The user asked the advice model about ticket `number`.
+    Reevaluate { view: u64, number: u64 },
+    /// What the CI answered; the suggestion itself comes with the ticket.
+    Reevaluated {
+        view: u64,
+        number: u64,
         result: Result<(), String>,
     },
     /// The user edits the `Runs on` of a document.
@@ -586,6 +594,11 @@ pub enum TicketMsg {
     Note(usize, iced::widget::text_editor::Action),
     Overall(iced::widget::text_editor::Action),
     Refine,
+    /// The comment being written, and its sending.
+    CommentBody(iced::widget::text_editor::Action),
+    Comment,
+    /// Edits the ticket starting from the text a rewrite suggestion wrote.
+    EditSuggested,
 }
 
 #[cfg(test)]

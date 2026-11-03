@@ -144,7 +144,10 @@ approve, dismiss and release for planning; `New ticket` writes one. The
 popout lies over the workspace (Escape or the scrim closes it): the
 ticket's actions, its proposal (`Edit` while open or ready), its plan in
 sections that are folded, deleted or annotated with an overall note for
-`Refine`, and a side column with its state, `Runs on`, links (`depends
+`Refine`, its comments (any state; the next plan session and a Refine read
+them) with a box for a new one, `Re-evaluate` (the CI's `[advice]` model
+suggests keep, dismiss, merge, plan or rewrite with a reason, kept on the
+ticket until it changes), and a side column with its state, `Runs on`, links (`depends
 on`, `related`, added by `#n`), the tickets it includes, its sessions and
 who holds it. The Board of a project no CI builds
 shows the plan the first CI's `[advice]` model writes for it from the
@@ -258,7 +261,8 @@ also checks the repository's setup (hook deliveries, the bot's push access,
 its secrets and grants). Nothing but
 protocol messages is written to its stdout.
 `zeughaus-runner [--state-dir <dir>] ci repo [--json] [<path>]`, `ci
-find [--json] <repo> <sha>`, `ci doc [--json] <repo> <n>`, `ci plan-write
+find [--json] <repo> <sha>`, `ci doc [--json] <repo> <n>`, `ci reevaluate
+[--json] <repo> <n>`, `ci plan-write
 [--json] [--ticket <n>] [--omp-session <file>] <repo> <file>`, `ci
 overdue <repo> <number> <job>`, `ci session [--json] <id>`, `ci claim
 [--json] <repo> ticket|pipeline <n>`, `ci renew`, `ci release [<repo>
@@ -378,7 +382,7 @@ runner's group of the repository: it brings the plan clone
 `agent-work/plan/<origin>`, which borrows the objects of the master clone,
 detached to `origin/<default branch>` and runs omp there on the `plan`
 model role (`--model @plan`) with `ZEUGHAUS_TICKET=<n>`: the ticket's brief
-(its text and links) attached to its first prompt, or after a Refine `omp
+(its text, links and comments) attached to its first prompt, or after a Refine `omp
 --resume <file>` with the review attached (the plan, the review and the
 brief when that file is gone). The Board's `Plan session` asks the CI for
 a plan session without a ticket (on the editor's own runner when it hosts

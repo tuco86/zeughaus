@@ -65,7 +65,11 @@ pub fn advise(
         view.error = Some(format!("the facts exceed {MAX_FACTS_BYTES} bytes"));
         return view;
     }
-    let body = request_body(advice, &system_prompt(config), facts);
+    let body = request_body(
+        advice,
+        &system_prompt(config),
+        &format!("Facts about the project, gathered by the owner's machine:\n\n{facts}"),
+    );
     let asked = hex::encode(Sha256::digest(body.as_bytes()));
     let path = kept_path(state_dir, &origin);
     if !refresh
@@ -80,7 +84,7 @@ pub fn advise(
     let answer = claude
         .access_token(crate::now_secs())
         .and_then(|token| call(advice, &token, &body))
-        .and_then(|reply| parse_reply(&reply));
+        .and_then(|reply| reply_text(&reply));
     match answer {
         Ok(plan) => {
             let (title, summary, cards) = parse_plan(&plan);
@@ -198,8 +202,8 @@ fn system_prompt(config: &CiConfig) -> String {
     prompt
 }
 
-/// The Messages API request: the system prompt and the facts.
-fn request_body(advice: &AdviceConfig, system: &str, facts: &str) -> String {
+/// The Messages API request: the system prompt and the user's message.
+pub(crate) fn request_body(advice: &AdviceConfig, system: &str, message: &str) -> String {
     serde_json::json!({
         "model": advice.model,
         "max_tokens": MAX_TOKENS,
@@ -211,7 +215,7 @@ fn request_body(advice: &AdviceConfig, system: &str, facts: &str) -> String {
         ],
         "messages": [{
             "role": "user",
-            "content": format!("Facts about the project, gathered by the owner's machine:\n\n{facts}"),
+            "content": message,
         }],
     })
     .to_string()
@@ -219,7 +223,7 @@ fn request_body(advice: &AdviceConfig, system: &str, facts: &str) -> String {
 
 /// POSTs `body` to the Messages API with `token`, the Claude sign-in's
 /// access token, which travels in curl's config on stdin, never in argv.
-fn call(advice: &AdviceConfig, token: &str, body: &str) -> Result<String, String> {
+pub(crate) fn call(advice: &AdviceConfig, token: &str, body: &str) -> Result<String, String> {
     let authorization = format!("Authorization: Bearer {token}");
     let beta = format!("anthropic-beta: {}", claude::MESSAGES_BETA);
     let headers = [
@@ -238,9 +242,9 @@ fn call(advice: &AdviceConfig, token: &str, body: &str) -> Result<String, String
         .map_err(|e| format!("the model did not answer: {e}"))
 }
 
-/// The plan document of a Messages API reply: its text blocks, without a
-/// code fence the model may have put around the whole of it.
-fn parse_reply(reply: &str) -> Result<String, String> {
+/// The text of a Messages API reply: its text blocks, without a code fence
+/// the model may have put around the whole of it.
+pub(crate) fn reply_text(reply: &str) -> Result<String, String> {
     #[derive(Deserialize)]
     struct Reply {
         content: Vec<Block>,
@@ -271,13 +275,13 @@ fn parse_reply(reply: &str) -> Result<String, String> {
         None => text,
     };
     if text.trim().is_empty() {
-        return Err("the model wrote no plan".to_owned());
+        return Err("the model wrote nothing".to_owned());
     }
     Ok(text.trim().to_owned())
 }
 
 /// `text` trimmed and cut after `limit` characters.
-fn clip(text: &str, limit: usize) -> String {
+pub(crate) fn clip(text: &str, limit: usize) -> String {
     text.trim().chars().take(limit).collect()
 }
 
@@ -289,14 +293,14 @@ mod tests {
     fn the_plan_is_the_reply_text_without_a_fence_around_it() {
         let reply = r#"{"content":[{"type":"text","text":"```markdown\n# Site\n\nA site.\n\n## Jobs\nBuild it.\n```\n"}]}"#;
         assert_eq!(
-            parse_reply(reply).unwrap(),
+            reply_text(reply).unwrap(),
             "# Site\n\nA site.\n\n## Jobs\nBuild it."
         );
         let plain = r###"{"content":[{"type":"text","text":"# Site\n"},{"type":"text","text":"## Jobs\n"}]}"###;
-        assert_eq!(parse_reply(plain).unwrap(), "# Site\n## Jobs");
+        assert_eq!(reply_text(plain).unwrap(), "# Site\n## Jobs");
         assert_eq!(
-            parse_reply(r#"{"content":[]}"#).unwrap_err(),
-            "the model wrote no plan"
+            reply_text(r#"{"content":[]}"#).unwrap_err(),
+            "the model wrote nothing"
         );
     }
 }

@@ -131,7 +131,7 @@ pub fn take(path: &Path) -> Result<Snapshot, String> {
     }
     Ok(Snapshot {
         origin,
-        actor: actor(),
+        actor: zeughaus_link::manual::actor(),
         summary: summary(&root),
         dirs,
         bundles,
@@ -345,45 +345,6 @@ fn summary(root: &Path) -> String {
         Some(text) => text,
         None => "working tree".to_owned(),
     }
-}
-
-/// `<user>@<host>`, with only the characters a name can hold.
-pub(super) fn actor() -> String {
-    let user = ["USER", "USERNAME", "LOGNAME"]
-        .iter()
-        .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
-        .unwrap_or_else(|| "unknown".to_owned());
-    let name = format!("{user}@{}", hostname());
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-fn hostname() -> String {
-    let named = |text: String| Some(text.trim().to_owned()).filter(|name| !name.is_empty());
-    Command::new("hostname")
-        .stdin(Stdio::null())
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| named(String::from_utf8_lossy(&output.stdout).into_owned()))
-        .or_else(|| {
-            std::fs::read_to_string("/proc/sys/kernel/hostname")
-                .ok()
-                .and_then(named)
-        })
-        .or_else(|| {
-            ["HOSTNAME", "COMPUTERNAME"]
-                .iter()
-                .find_map(|key| std::env::var(key).ok().and_then(named))
-        })
-        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// A directory of this process's own under the system's temporary one,

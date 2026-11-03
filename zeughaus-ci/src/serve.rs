@@ -279,6 +279,35 @@ impl CiServer {
             } => accepted(self.change_docs(&repo, |dir, config, now| {
                 docs::refine(dir, config, &repo, number, &feedback, now).map(|()| ((), true))
             })),
+            CiRequest::DocComment {
+                repo,
+                number,
+                author,
+                text,
+            } => accepted(self.change_docs(&repo, |dir, config, now| {
+                docs::comment(dir, config, &repo, number, &author, &text, now).map(|()| ((), true))
+            })),
+            CiRequest::Reevaluate { repo, number } => {
+                // The model is asked without the documents' lock; a ticket
+                // that moved meanwhile drops the answer when it is stored.
+                match crate::reevaluate::reevaluate(
+                    &self.state_dir,
+                    &self.config.get(),
+                    self.claude.as_deref(),
+                    &repo,
+                    number,
+                    crate::now_secs(),
+                ) {
+                    Ok(suggestion) => accepted(self.change_docs(&repo, |dir, config, now| {
+                        docs::set_suggestion(dir, config, &repo, number, suggestion, now)
+                            .map(|()| ((), true))
+                    })),
+                    Err(e) => {
+                        eprintln!("[ci] re-evaluating #{number} of {repo}: {e}");
+                        error(&e)
+                    }
+                }
+            }
             CiRequest::PlanWrite {
                 repo,
                 number,
@@ -1527,56 +1556,63 @@ fn encode(reply: CiReply) -> Vec<u8> {
 }
 
 /// Answers `/ci` requests until the replier goes away, which for this
-/// process means never.
+/// process means never. Each request is answered in a task of its own: a
+/// re-evaluation or an advice waits up to 90 s on the model, and every other
+/// editor's and agent's question must not wait behind it.
 pub async fn serve(replier: Replier, server: Arc<CiServer>) {
     loop {
-        let mut request = match replier.accept().await {
+        let request = match replier.accept().await {
             Ok(request) => request,
             Err(e) => {
                 eprintln!("[ci] stopped serving /ci: {e}");
                 return;
             }
         };
-        if let Err(why) = editor_principal(&server.config.get(), request.meta()) {
-            eprintln!("[ci] refused a ci request from a peer that {why}");
-            request.refuse(weida::ErrorCode::Rejected).await;
-            continue;
+        tokio::spawn(answer_one(request, Arc::clone(&server)));
+    }
+}
+
+/// Checks, reads, answers and replies to one `/ci` request.
+async fn answer_one(mut request: weida::IncomingRequest, server: Arc<CiServer>) {
+    if let Err(why) = editor_principal(&server.config.get(), request.meta()) {
+        eprintln!("[ci] refused a ci request from a peer that {why}");
+        request.refuse(weida::ErrorCode::Rejected).await;
+        return;
+    }
+    let payload = match request.take_body().collect(MAX_CI_REQUEST_BYTES).await {
+        Ok(payload) => payload,
+        Err(e) => {
+            eprintln!("[ci] unreadable ci request: {e}");
+            return;
         }
-        let payload = match request.take_body().collect(MAX_CI_REQUEST_BYTES).await {
-            Ok(payload) => payload,
-            Err(e) => {
-                eprintln!("[ci] unreadable ci request: {e}");
-                continue;
-            }
-        };
-        let answer = match CiRequest::decode(&payload) {
-            Some(asked) => {
-                let server = Arc::clone(&server);
-                // On the blocking pool: the records are on disk and a
-                // transcript starts a process, while the task this runs on
-                // is also weida's, which must keep draining the connection.
-                tokio::task::spawn_blocking(move || server.answer(asked))
-                    .await
-                    .unwrap_or_else(|e| CiReply::Error {
-                        message: format!("the request failed: {e}"),
-                    })
-            }
-            None => error("malformed request"),
-        };
-        let mut reply = match request.reply(TransferMeta::default()).await {
-            Ok(reply) => reply,
-            Err(e) => {
-                eprintln!("[ci] cannot reply to a ci request: {e}");
-                continue;
-            }
-        };
-        if let Err(e) = reply.write_all(&encode(answer)).await {
-            eprintln!("[ci] cannot write a ci reply: {e}");
-            continue;
+    };
+    let answer = match CiRequest::decode(&payload) {
+        Some(asked) => {
+            let server = Arc::clone(&server);
+            // On the blocking pool: the records are on disk and a
+            // transcript starts a process, while the task this runs on
+            // is also weida's, which must keep draining the connection.
+            tokio::task::spawn_blocking(move || server.answer(asked))
+                .await
+                .unwrap_or_else(|e| CiReply::Error {
+                    message: format!("the request failed: {e}"),
+                })
         }
-        if let Err(e) = reply.finish() {
-            eprintln!("[ci] cannot finish a ci reply: {e}");
+        None => error("malformed request"),
+    };
+    let mut reply = match request.reply(TransferMeta::default()).await {
+        Ok(reply) => reply,
+        Err(e) => {
+            eprintln!("[ci] cannot reply to a ci request: {e}");
+            return;
         }
+    };
+    if let Err(e) = reply.write_all(&encode(answer)).await {
+        eprintln!("[ci] cannot write a ci reply: {e}");
+        return;
+    }
+    if let Err(e) = reply.finish() {
+        eprintln!("[ci] cannot finish a ci reply: {e}");
     }
 }
 

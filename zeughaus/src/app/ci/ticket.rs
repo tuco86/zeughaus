@@ -10,8 +10,9 @@ use iced::widget::{
 use iced::{Alignment, Border, Element, Font, Length, Shadow, Task, Vector};
 use iced_tabs::scroll;
 use zeughaus_link::{
-    AgentRole, CiRequest, ClaimSubject, DocKind, DocState, DocView, LinkKind, SessionKind,
-    compose_text, linked_from, proposal_heading, ticket_text,
+    AgentRole, CiRequest, ClaimSubject, DocKind, DocState, DocView, LinkKind, MAX_COMMENT_BYTES,
+    MAX_COMMENTS, SessionKind, TicketSuggestion, Verdict, compose_text, linked_from,
+    proposal_heading, ticket_text,
 };
 use zeughaus_mux::TerminalId;
 use zeughaus_theme::Theme;
@@ -57,6 +58,10 @@ pub(in crate::app) struct TicketPopout {
     /// What an editor shows before its review exists: the first action on
     /// it makes the review.
     blank: text_editor::Content,
+    /// The comment being written.
+    pub(super) comment: text_editor::Content,
+    /// A comment is on its way: the CI's answer empties the box.
+    pub(super) comment_sent: bool,
 }
 
 impl TicketPopout {
@@ -69,6 +74,8 @@ impl TicketPopout {
             editing: None,
             creating: None,
             blank: text_editor::Content::new(),
+            comment: text_editor::Content::new(),
+            comment_sent: false,
         }
     }
 }
@@ -382,6 +389,48 @@ impl App {
                 };
                 self.ticket_act(request)
             }
+            TicketMsg::CommentBody(action) => {
+                if let Some(popout) = &mut self.ticket {
+                    popout.comment.perform(action);
+                }
+                Task::none()
+            }
+            TicketMsg::Comment => {
+                let Some((popout, shown)) = self.popout_shown() else {
+                    return Task::none();
+                };
+                let text = popout.comment.text();
+                if text.trim().is_empty() {
+                    return Task::none();
+                }
+                let request = CiRequest::DocComment {
+                    repo: shown.doc.repo.clone(),
+                    number: shown.number,
+                    author: zeughaus_link::manual::actor(),
+                    text,
+                };
+                if let Some(popout) = &mut self.ticket {
+                    popout.comment_sent = true;
+                }
+                self.ticket_act(request)
+            }
+            TicketMsg::EditSuggested => {
+                let editing = self.popout_shown().and_then(|(_, shown)| {
+                    shown
+                        .doc
+                        .suggestion
+                        .as_ref()
+                        .filter(|s| s.verdict == Verdict::Rewrite)
+                        .map(|s| Editing {
+                            body: text_editor::Content::with_text(&s.text),
+                        })
+                });
+                if let (Some(popout), Some(editing)) = (&mut self.ticket, editing) {
+                    popout.tab = TicketTab::Proposal;
+                    popout.editing = Some(editing);
+                }
+                Task::none()
+            }
         }
     }
 
@@ -642,6 +691,11 @@ impl App {
         if popout.editing.is_none() {
             top = top.push(self.action_bar(&popout.ci, client, popout.view, state, doc));
         }
+        if let Some(suggestion) = shown.and_then(|shown| shown.doc.suggestion.as_ref())
+            && doc.state.reevaluable()
+        {
+            top = top.push(self.suggestion_part(popout, client, state, doc, suggestion));
+        }
         if let Some(notice) = &state.notice {
             let color = if notice.failed {
                 self.theme.error()
@@ -671,6 +725,14 @@ impl App {
             (TicketTab::Proposal, Some(shown)) => self.proposal_part(popout, client, state, shown),
             (TicketTab::Plan, Some(shown)) => self.plan_part(popout, client, state, doc, shown),
         };
+        let main = match shown {
+            Some(shown) if doc.kind == DocKind::Ticket => {
+                column![main, self.comments_part(popout, state, shown)]
+                    .spacing(SP_4)
+                    .into()
+            }
+            _ => main,
+        };
         let main = scroll::vertical(
             container(main)
                 .padding([0.0, SP_3])
@@ -690,6 +752,100 @@ impl App {
         ]
         .spacing(SP_3)
         .height(Length::Fill)
+        .into()
+    }
+
+    /// What the advice model last suggested: its verdict, the ticket a
+    /// merge goes into, who said it and when, and why.
+    fn suggestion_part<'a>(
+        &'a self,
+        popout: &'a TicketPopout,
+        client: &'a CiClient,
+        state: &'a PlansState,
+        doc: &'a DocView,
+        suggestion: &'a TicketSuggestion,
+    ) -> Element<'a, Message, Theme> {
+        let muted = self.theme.muted();
+        let mut line = row![
+            text(format!("Suggested: {}", suggestion.headline()))
+                .size(TEXT_SM)
+                .color(self.theme.accent())
+        ]
+        .spacing(SP_2)
+        .align_y(Alignment::Center);
+        if suggestion.verdict == Verdict::Merge
+            && let Some(into) = suggestion.into
+        {
+            line = line.push(self.ref_chip(popout, client, state, &doc.repo, &doc.repo, into));
+        }
+        line = line.push(
+            text(format!(
+                "{} \u{b7} {}",
+                suggestion.model,
+                ago(suggestion.created, now())
+            ))
+            .size(TEXT_SM)
+            .color(muted),
+        );
+        if suggestion.verdict == Verdict::Rewrite && popout.editing.is_none() {
+            line = line.push(
+                self.ticket_pill("Edit with this text", false)
+                    .on_press(Message::Ticket(TicketMsg::EditSuggested)),
+            );
+        }
+        column![line.wrap(), text(suggestion.reason.as_str()).size(TEXT_SM)]
+            .spacing(SP_1)
+            .into()
+    }
+
+    /// The ticket's comments, oldest first, and the box a new one is
+    /// written in.
+    fn comments_part<'a>(
+        &'a self,
+        popout: &'a TicketPopout,
+        state: &'a PlansState,
+        shown: &'a Shown,
+    ) -> Element<'a, Message, Theme> {
+        let muted = self.theme.muted();
+        let comments = &shown.doc.comments;
+        let mut part = column![
+            rule::horizontal(1),
+            text(format!("Comments ({})", comments.len())).size(TEXT_MD),
+        ]
+        .spacing(SP_3);
+        let at = now();
+        for comment in comments {
+            part = part.push(
+                column![
+                    text(format!("{} \u{b7} {}", comment.author, ago(comment.at, at)))
+                        .size(TEXT_SM)
+                        .color(muted),
+                    text(comment.text.as_str()).size(TEXT_SM),
+                ]
+                .spacing(SP_1),
+            );
+        }
+        if comments.len() >= MAX_COMMENTS {
+            return part
+                .push(
+                    text(format!("{MAX_COMMENTS} comments: it takes no more"))
+                        .size(TEXT_SM)
+                        .color(muted),
+                )
+                .into();
+        }
+        let typed = popout.comment.text();
+        let mut send = self.ticket_pill("Comment", false);
+        if !typed.trim().is_empty() && typed.len() <= MAX_COMMENT_BYTES && !state.acting {
+            send = send.on_press(Message::Ticket(TicketMsg::Comment));
+        }
+        part.push(
+            text_editor(&popout.comment)
+                .placeholder("A comment: the next plan session and a Refine read it")
+                .height(OVERALL_HEIGHT)
+                .on_action(|action| Message::Ticket(TicketMsg::CommentBody(action))),
+        )
+        .push(send)
         .into()
     }
 

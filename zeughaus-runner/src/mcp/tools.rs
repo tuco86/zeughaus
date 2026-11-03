@@ -336,7 +336,7 @@ impl Toolbox {
         };
         let repo = self.repo_or_checkout(args.repo).await?;
         let above = self.newest(&repo).await?;
-        let actor = snapshot::actor();
+        let actor = zeughaus_link::manual::actor();
         let request = CiRequest::Queue {
             repo: repo.clone(),
             nightly,
@@ -3449,6 +3449,8 @@ mod tests {
             note: String::new(),
             waits_for: Vec::new(),
             filed: Vec::new(),
+            comments: Vec::new(),
+            suggestion: None,
         }
     }
 

@@ -1171,12 +1171,19 @@ impl App {
             } => {
                 self.refining = Some((key.clone(), repo.clone(), number));
             }
-            // A Refine the CI took leaves nothing to keep of its review.
+            // A Refine the CI took leaves nothing to keep of its review; a
+            // comment it took leaves an empty box, a refused one its text.
             CiMsg::DocActed { ref result, .. } => {
                 if let Some(refined) = self.refining.take()
                     && result.is_ok()
                 {
                     self.reviews.remove(&refined);
+                }
+                if let Some(popout) = &mut self.ticket
+                    && std::mem::take(&mut popout.comment_sent)
+                    && result.is_ok()
+                {
+                    popout.comment = iced::widget::text_editor::Content::new();
                 }
             }
             _ => {}
@@ -1261,6 +1268,12 @@ impl App {
             }
             CiMsg::DocAct { view, request } => client.doc_act(&key, view, request),
             CiMsg::DocActed { view, result } => client.doc_acted(&key, view, result),
+            CiMsg::Reevaluate { view, number } => client.reevaluate(&key, view, number),
+            CiMsg::Reevaluated {
+                view,
+                number,
+                result,
+            } => client.reevaluated(&key, view, number, result),
             CiMsg::RunsOnEdited { view, number, text } => {
                 if let Some(state) = client.plans.get_mut(&view) {
                     state.runs_on_input = Some((number, text));

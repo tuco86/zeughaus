@@ -7,6 +7,9 @@
 //! Frames are those of [`crate::enlist`]: a 4-byte little-endian length and a
 //! postcard body.
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::process::{Command, Stdio};
+
 use serde::{Deserialize, Serialize};
 
 use crate::enlist::UploadDir;
@@ -61,6 +64,47 @@ pub fn valid_dir_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// `<user>@<host>`, with only the characters a name can hold.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn actor() -> String {
+    let user = ["USER", "USERNAME", "LOGNAME"]
+        .iter()
+        .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let name = format!("{user}@{}", hostname());
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn hostname() -> String {
+    let named = |text: String| Some(text.trim().to_owned()).filter(|name| !name.is_empty());
+    Command::new("hostname")
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| named(String::from_utf8_lossy(&output.stdout).into_owned()))
+        .or_else(|| {
+            std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .ok()
+                .and_then(named)
+        })
+        .or_else(|| {
+            ["HOSTNAME", "COMPUTERNAME"]
+                .iter()
+                .find_map(|key| std::env::var(key).ok().and_then(named))
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 #[cfg(test)]

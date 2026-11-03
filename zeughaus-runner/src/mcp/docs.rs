@@ -1,7 +1,9 @@
 //! Tickets as an agent and a script read them. Pure: the clock is an
 //! argument.
 
-use zeughaus_link::{DocState, DocView, LinkKind, doc_groups, linked_from};
+use zeughaus_link::{
+    DocState, DocView, LinkKind, TicketComment, TicketSuggestion, doc_groups, linked_from,
+};
 
 /// `5m`, `3h`, `2d`: whole minutes below an hour, whole hours below a day,
 /// else whole days.
@@ -13,6 +15,54 @@ pub fn age(seconds: u64) -> String {
     }
 }
 
+/// The comments of a ticket as a Markdown section, or nothing without
+/// any:
+///
+/// ```text
+/// ## Comments
+///
+/// - hannes@tuco-pc, 2h ago:
+///   <text, each line indented>
+/// ```
+pub fn comments_text(comments: &[TicketComment], now: u64) -> String {
+    if comments.is_empty() {
+        return String::new();
+    }
+    let mut text = "## Comments\n\n".to_owned();
+    for comment in comments {
+        text.push_str(&format!(
+            "- {}, {} ago:\n",
+            comment.author,
+            age(now.saturating_sub(comment.at))
+        ));
+        for line in comment.text.lines() {
+            if line.is_empty() {
+                text.push('\n');
+            } else {
+                text.push_str(&format!("  {line}\n"));
+            }
+        }
+    }
+    text
+}
+
+/// `<headline> (<model>, <age> ago): <reason>`, and for a rewrite the new
+/// text after a blank line.
+pub fn suggestion_text(suggestion: &TicketSuggestion, now: u64) -> String {
+    let mut text = format!(
+        "{} ({}, {} ago): {}\n",
+        suggestion.headline(),
+        suggestion.model,
+        age(now.saturating_sub(suggestion.created)),
+        suggestion.reason
+    );
+    if !suggestion.text.is_empty() {
+        text.push('\n');
+        text.push_str(&suggestion.text);
+    }
+    text
+}
+
 /// One ticket with its texts; `docs` (the repository's tickets) give the
 /// links that point at it:
 ///
@@ -22,8 +72,14 @@ pub fn age(seconds: u64) -> String {
 /// created 3h ago
 /// links: depends on #2, related #weida-3; blocks #9
 /// filed: #weida-7 (Keep the corpus)
+/// suggestion: dismiss it (claude-haiku-5-5, 2m ago): <reason>
 ///
 /// <body>
+///
+/// ## Comments
+///
+/// - hannes@tuco-pc, 1h ago:
+///   <comment>
 ///
 /// ## Plan (revision 1)
 ///
@@ -74,18 +130,24 @@ pub fn doc_text(doc: &DocView, docs: &[DocView], now: u64) -> String {
             .collect();
         text.push_str(&format!("filed: {}\n", filed.join(", ")));
     }
-    text.push('\n');
-    let shown = doc.shown_text();
-    text.push_str(&shown);
-    if !doc.plan_text.is_empty() {
-        if !shown.is_empty() {
-            text.push_str("\n\n");
-        }
+    if let Some(suggestion) = &doc.suggestion {
+        let line = suggestion_text(suggestion, now);
         text.push_str(&format!(
+            "suggestion: {}\n",
+            line.lines().next().unwrap_or_default()
+        ));
+    }
+    text.push('\n');
+    let mut parts = vec![doc.shown_text().trim_end().to_owned()];
+    parts.push(comments_text(&doc.comments, now).trim_end().to_owned());
+    if !doc.plan_text.is_empty() {
+        parts.push(format!(
             "## Plan (revision {})\n\n{}",
             doc.revision, doc.plan_text
         ));
     }
+    parts.retain(|part| !part.is_empty());
+    text.push_str(&parts.join("\n\n"));
     text
 }
 
@@ -158,6 +220,8 @@ mod tests {
             note: String::new(),
             waits_for: Vec::new(),
             filed: Vec::new(),
+            comments: Vec::new(),
+            suggestion: None,
         }
     }
 

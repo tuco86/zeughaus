@@ -56,10 +56,11 @@ pub use ci::{
     CLAIM_LEASE_SECS, CLAUDE_CALLBACK, ChannelView, CiOverview, CiReply, CiRequest, ClaimHolder,
     ClaimSubject, ClaimView, ClaudeAccessToken, ClaudeView, DocGroup, DocKind, DocLink, DocState,
     DocView, JobDefView, JobTiming, JobView, LinkKind, MAX_CI_REPLY_BYTES, MAX_CI_REQUEST_BYTES,
-    MAX_DOC_BYTES, MAX_DOC_TITLE_BYTES, MachineJob, MachineView, OnboardSpec, PipelineView,
-    Planner, QueuedView, RepoDocsView, RepoView, SessionKind, SessionMachine, SessionState,
-    SessionView, StateVersionView, StateView, TimedLine, TransferView, doc_groups, linked_from,
-    normalize_origin, pipeline_load, query_param, responsible,
+    MAX_COMMENT_BYTES, MAX_COMMENTS, MAX_DOC_BYTES, MAX_DOC_TITLE_BYTES, MachineJob, MachineView,
+    OnboardSpec, PipelineView, Planner, QueuedView, RepoDocsView, RepoView, SessionKind,
+    SessionMachine, SessionState, SessionView, StateVersionView, StateView, TicketComment,
+    TicketSuggestion, TimedLine, TransferView, Verdict, doc_groups, linked_from, normalize_origin,
+    pipeline_load, query_param, responsible,
 };
 pub use events::{
     ErrorRow, MAX_EVENT_BYTES, MAX_SNAPSHOT_BYTES, MAX_TRIGGER_BYTES, OutputRow, RejectionRow,

@@ -22,6 +22,7 @@ mod install;
 mod manual;
 mod onboard;
 mod pipeline;
+mod reevaluate;
 mod runners;
 mod scheduler;
 mod secrets;

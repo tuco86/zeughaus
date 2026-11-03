@@ -20,6 +20,13 @@ use crate::ticket_text::{FiledTicket, text_without_title};
 /// The largest body of one ticket's proposal or plan, in bytes.
 pub const MAX_DOC_BYTES: usize = 256 << 10;
 
+/// The longest comment on a ticket, in bytes.
+pub const MAX_COMMENT_BYTES: usize = 8 << 10;
+
+/// The most comments one ticket takes; with [`MAX_COMMENT_BYTES`] a ticket
+/// with its texts still fits [`MAX_CI_REPLY_BYTES`].
+pub const MAX_COMMENTS: usize = 100;
+
 /// The longest title of one ticket, in bytes.
 pub const MAX_DOC_TITLE_BYTES: usize = 200;
 
@@ -302,6 +309,19 @@ pub enum CiRequest {
         number: u64,
         feedback: String,
     },
+    /// Adds a comment to a ticket in any state. Answers
+    /// [`CiReply::Accepted`].
+    DocComment {
+        repo: String,
+        number: u64,
+        author: String,
+        text: String,
+    },
+    /// Asks the `[advice]` model what to do with a ticket that is open,
+    /// ready, in review or approved, and keeps its answer as the ticket's
+    /// `suggestion`. Answers [`CiReply::Accepted`] once it is stored; takes
+    /// as long as the model does (up to 90 s).
+    Reevaluate { repo: String, number: u64 },
     /// Stores a plan on ticket `number`, which is in planning, or as a new
     /// ticket without one; either is then in review. Answers
     /// [`CiReply::DocCreated`].
@@ -930,6 +950,15 @@ impl DocState {
             DocState::Rejected => "rejected",
         }
     }
+
+    /// Whether the advice model may be asked about a ticket in this state:
+    /// open, ready, in review or approved.
+    pub fn reevaluable(self) -> bool {
+        matches!(
+            self,
+            DocState::Open | DocState::Ready | DocState::Review | DocState::Approved
+        )
+    }
 }
 
 impl DocKind {
@@ -980,6 +1009,58 @@ impl DocLink {
         match &self.repo {
             Some(repo) if repo != own_repo => format!("#{repo}-{}", self.number),
             _ => format!("#{}", self.number),
+        }
+    }
+}
+
+/// One comment on a ticket; the oldest comes first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketComment {
+    /// `<user>@<host>` of whoever wrote it.
+    pub author: String,
+    /// Seconds since the UNIX epoch.
+    pub at: u64,
+    pub text: String,
+}
+
+/// What the advice model suggests doing with a ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Keep,
+    Dismiss,
+    Merge,
+    Plan,
+    Rewrite,
+}
+
+/// The advice model's answer to a re-evaluation, kept on the ticket until
+/// the user moves it to another state, edits its text or a plan arrives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketSuggestion {
+    pub verdict: Verdict,
+    /// `Merge`: the ticket of the same repository it goes into.
+    #[serde(default)]
+    pub into: Option<u64>,
+    pub reason: String,
+    /// `Rewrite`: the whole new Markdown text, its `# ` title first.
+    #[serde(default)]
+    pub text: String,
+    pub model: String,
+    /// Seconds since the UNIX epoch.
+    pub created: u64,
+}
+
+impl TicketSuggestion {
+    /// What it suggests, as a phrase: `keep it`, `merge it into #3`, ...
+    pub fn headline(&self) -> String {
+        match (self.verdict, self.into) {
+            (Verdict::Keep, _) => "keep it".to_owned(),
+            (Verdict::Dismiss, _) => "dismiss it".to_owned(),
+            (Verdict::Merge, Some(into)) => format!("merge it into #{into}"),
+            (Verdict::Merge, None) => "merge it".to_owned(),
+            (Verdict::Plan, _) => "plan it now".to_owned(),
+            (Verdict::Rewrite, _) => "rewrite it".to_owned(),
         }
     }
 }
@@ -1086,6 +1167,12 @@ pub struct DocView {
     /// The tickets its plan's sections were filed as.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filed: Vec<FiledTicket>,
+    /// Its comments, oldest first; empty in lists.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comments: Vec<TicketComment>,
+    /// The last re-evaluation's answer; `None` in lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<TicketSuggestion>,
 }
 
 impl DocView {
@@ -1907,6 +1994,16 @@ mod tests {
                 number: 3,
                 feedback: "Overall:\nshorter".to_owned(),
             },
+            CiRequest::DocComment {
+                repo: "griasdi".to_owned(),
+                number: 3,
+                author: "hannes@tuco-pc".to_owned(),
+                text: "still wanted?".to_owned(),
+            },
+            CiRequest::Reevaluate {
+                repo: "griasdi".to_owned(),
+                number: 3,
+            },
             CiRequest::PlanWrite {
                 repo: "griasdi".to_owned(),
                 number: Some(3),
@@ -2370,6 +2467,19 @@ mod tests {
                 number: 13,
                 title: "Keep the corpus".to_owned(),
             }],
+            comments: vec![TicketComment {
+                author: "hannes@tuco-pc".to_owned(),
+                at: 7,
+                text: "Still wanted?".to_owned(),
+            }],
+            suggestion: Some(TicketSuggestion {
+                verdict: Verdict::Merge,
+                into: Some(2),
+                reason: "Same work as #2.".to_owned(),
+                text: String::new(),
+                model: "claude-haiku-5-5".to_owned(),
+                created: 8,
+            }),
         }
     }
 

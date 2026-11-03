@@ -39,6 +39,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a question on `/ci` may take.
 const CI_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a question that waits on the CI's model may take.
+const MODEL_TIMEOUT: Duration = Duration::from_secs(150);
+
 /// The QUIC idle timeout of this client's connections, and the keep-alive
 /// that holds a healthy one open. A CI that was killed sends no close, and
 /// the one started in its place cannot reset the old connection, so only
@@ -209,7 +212,11 @@ impl Client {
                 .await
                 .map_err(|e| format!("ci: {e}"))
         };
-        match tokio::time::timeout(CI_TIMEOUT, exchange).await {
+        let limit = match request {
+            CiRequest::Reevaluate { .. } | CiRequest::Advise { .. } => MODEL_TIMEOUT,
+            _ => CI_TIMEOUT,
+        };
+        match tokio::time::timeout(limit, exchange).await {
             Ok(Ok(encoded)) => Ok(encoded),
             Ok(Err(e)) => {
                 self.forget(CI_PATH).await;
@@ -219,7 +226,7 @@ impl Client {
                 self.forget(CI_PATH).await;
                 Err(Asked::Timeout(format!(
                     "ci: no answer within {} s",
-                    CI_TIMEOUT.as_secs()
+                    limit.as_secs()
                 )))
             }
         }
@@ -362,6 +369,7 @@ fn retries(request: &CiRequest) -> bool {
         | CiRequest::DocEdit { .. }
         | CiRequest::DocAutoApprove { .. }
         | CiRequest::DocRefine { .. }
+        | CiRequest::DocComment { .. }
         | CiRequest::PlanWrite { .. }
         | CiRequest::QueuePaused { .. }
         | CiRequest::OpenSession { .. }
@@ -374,7 +382,8 @@ fn retries(request: &CiRequest) -> bool {
         | CiRequest::ClaudeFinish { .. }
         | CiRequest::Onboard { .. }
         // Each answer that is not kept costs a model call.
-        | CiRequest::Advise { .. } => false,
+        | CiRequest::Advise { .. }
+        | CiRequest::Reevaluate { .. } => false,
     }
 }
 
