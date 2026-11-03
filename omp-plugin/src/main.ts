@@ -191,6 +191,8 @@ interface Watch {
 
 const RUNNER = "zeughaus-runner";
 const CONTEXT_TIMEOUT_MS = 15_000;
+// The runner waits up to ten minutes for the browser to come back.
+const CLAUDE_LOGIN_TIMEOUT_MS = 11 * 60_000;
 const FIND_TIMEOUT_MS = 10_000;
 const GIT_TIMEOUT_MS = 10_000;
 const POLL_MS = 15_000;
@@ -1094,15 +1096,20 @@ export default function zeughausCi(pi: Pi): void {
   });
 
   pi.registerCommand("zeughaus", {
-    description: "zeughaus-ci state of this checkout; `save` stores the session's plan in the CI",
+    description:
+      "zeughaus-ci state of this checkout; `save` stores the session's plan in the CI; `claude` shows and `claude login` renews the CI's Claude sign-in",
     handler: async (args, ctx) => {
       const sub = args.trim();
       if (sub === "save") {
         await savePlan(ctx);
         return;
       }
+      if (sub === "claude" || sub === "claude login") {
+        await claude(ctx, sub === "claude login");
+        return;
+      }
       if (sub !== "") {
-        ctx.ui.notify("usage: /zeughaus [save]", "warning");
+        ctx.ui.notify("usage: /zeughaus [save | claude [login]]", "warning");
         return;
       }
       // Only the status line and this answer are fresh; the prompt block stays as it was.
@@ -1112,6 +1119,25 @@ export default function zeughausCi(pi: Pi): void {
       ctx.ui.notify(explain(latest), "info");
     },
   });
+
+  /**
+   * The CI's Claude sign-in, which every omp's Anthropic token comes from:
+   * its state, or with `login` a sign-in through this machine's browser
+   * (`zeughaus-runner claude login` takes claude.ai's redirect on
+   * localhost:54545 and hands it to the CI).
+   */
+  const claude = async (ctx: CommandCtx, login: boolean): Promise<void> => {
+    if (login) ctx.ui.notify("signing the CI in to Claude: finish in the browser", "info");
+    const r = await exec(
+      pi,
+      RUNNER,
+      ["claude", login ? "login" : "status"],
+      ctx.cwd,
+      login ? CLAUDE_LOGIN_TIMEOUT_MS : CONTEXT_TIMEOUT_MS,
+    );
+    if (r.code === 0) ctx.ui.notify(r.stdout.trim(), "info");
+    else ctx.ui.notify(failure(r, `claude ${login ? "login" : "status"}`), "error");
+  };
 
   /** Stores the session's plan in the CI and starts a fresh session for what comes next. */
   const savePlan = async (ctx: CommandCtx): Promise<void> => {

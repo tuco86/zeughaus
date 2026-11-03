@@ -194,9 +194,6 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
         .clone()
         .map(|claude| crate::claude::Claude::new(claude, Arc::clone(&secrets)));
     if let Some(claude) = &claude {
-        if args.hook.is_none() {
-            eprintln!("[ci] claude: no --hook listener, so no sign-in page");
-        }
         let claude = Arc::clone(claude);
         std::thread::Builder::new()
             .name("zeughaus-ci-claude".to_owned())
@@ -213,7 +210,6 @@ fn serve(args: &[String], state_dir: &Path) -> Result<std::convert::Infallible, 
             addr,
             Arc::clone(&config),
             Arc::clone(&secrets),
-            claude.clone(),
             state_dir.to_path_buf(),
         )?;
     }

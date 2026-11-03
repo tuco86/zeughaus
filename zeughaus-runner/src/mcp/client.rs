@@ -368,6 +368,8 @@ fn retries(request: &CiRequest) -> bool {
         | CiRequest::ClaimRenew { .. }
         | CiRequest::ClaimRelease { .. }
         | CiRequest::StateDelete { .. }
+        | CiRequest::ClaudeStart
+        | CiRequest::ClaudeFinish { .. }
         // Each answer that is not kept costs a model call.
         | CiRequest::Advise { .. } => false,
     }

@@ -1473,6 +1473,7 @@ impl App {
             | Message::PageMachine(..)
             | Message::PagePipeline(..)
             | Message::BoardSelect(..)
+            | Message::ClaudeSignedIn(_)
             | Message::PageTerminal(..)) => {
                 return self.apply_page(message);
             }

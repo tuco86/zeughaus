@@ -123,6 +123,38 @@ pub const MAX_LOG_PATTERN_BYTES: usize = 1024;
 /// match, on either side.
 pub const MAX_LOG_CONTEXT: u32 = 20;
 
+/// Where claude.ai sends the browser back after a sign-in of the CI's
+/// Claude subscription: the only redirect Claude Code's OAuth client takes,
+/// served by `zeughaus-runner claude login` on the machine the browser runs
+/// on.
+pub const CLAUDE_CALLBACK: &str = "http://localhost:54545/callback";
+
+/// The value of `name` in a URL query (`a=1&b=x%20y`), percent-decoded with
+/// `+` as a space; `None` without it or for a broken escape.
+pub fn query_param(query: &str, name: &str) -> Option<String> {
+    let value = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == name)?
+        .1;
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'+' => out.push(b' '),
+            b'%' => {
+                let hex = value.get(at + 1..at + 3)?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                at += 2;
+            }
+            byte => out.push(byte),
+        }
+        at += 1;
+    }
+    String::from_utf8(out).ok()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CiRequest {
@@ -303,6 +335,14 @@ pub enum CiRequest {
     Session { id: u64 },
     /// Ends a live session's terminal. Answers [`CiReply::Accepted`].
     CloseSession { id: u64 },
+    /// Starts a sign-in of the CI's Claude subscription: the CI keeps a
+    /// state and PKCE verifier and answers [`CiReply::ClaudeStart`] with
+    /// the claude.ai address, which redirects to [`CLAUDE_CALLBACK`] on the
+    /// asker's machine.
+    ClaudeStart,
+    /// Finishes it with what came to the callback. Answers
+    /// [`CiReply::ClaudeSignedIn`].
+    ClaudeFinish { code: String, state: String },
     /// Queues an event of `repo` on its default branch: a push, or with
     /// `nightly` the repository's nightly, which waits for any other
     /// nightly that runs. The commit is the branch's head when the
@@ -511,6 +551,14 @@ pub enum CiReply {
     Advice {
         advice: Box<crate::advice::AdviceView>,
     },
+    /// The claude.ai address that starts a sign-in.
+    ClaudeStart {
+        url: String,
+    },
+    /// The account the CI is signed in to now.
+    ClaudeSignedIn {
+        account: String,
+    },
     Error {
         message: String,
     },
@@ -547,8 +595,6 @@ pub struct CiOverview {
 /// Where the CI's Claude sign-in stands. Seconds since the UNIX epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeView {
-    /// The page that signs in.
-    pub url: String,
     /// The account signed in; `None` while signed out.
     pub account: Option<String>,
     pub signed_in: u64,
@@ -1872,6 +1918,11 @@ mod tests {
                 repo: "griasdi".to_owned(),
                 number: 9,
             },
+            CiRequest::ClaudeStart,
+            CiRequest::ClaudeFinish {
+                code: "c".to_owned(),
+                state: "s".to_owned(),
+            },
             CiRequest::Advise {
                 origin: "git.doodleshnookie.net/tuco86/scan-rs".to_owned(),
                 facts: "- forge: forgejo\n".to_owned(),
@@ -1945,7 +1996,6 @@ mod tests {
                     sessions: vec![session()],
                     claims: vec![pipeline_claim("griasdi", "dev", 7, 2)],
                     claude: Some(ClaudeView {
-                        url: "https://zeughaus.example/claude".to_owned(),
                         account: Some("me@example.org".to_owned()),
                         signed_in: 1,
                         ends: 2,
@@ -2046,6 +2096,12 @@ mod tests {
                 ours: false,
             },
             CiReply::Responsible { claim: None },
+            CiReply::ClaudeStart {
+                url: "https://claude.ai/oauth/authorize?state=s".to_owned(),
+            },
+            CiReply::ClaudeSignedIn {
+                account: "me@example.org".to_owned(),
+            },
             CiReply::Advice {
                 advice: Box::new(crate::advice::AdviceView {
                     origin: "github.com/o/site".to_owned(),

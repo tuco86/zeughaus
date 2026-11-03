@@ -307,13 +307,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pipeline in a channel names who is responsible, and a click brings that
   tab to the front.
 - CI: the Claude sign-in. `[claude]` in `ci.toml` makes the CI the one
-  holder of the owner's Claude subscription: `/claude` on
-  zeughaus.doodleshnookie.net signs in with Claude Code's OAuth client
-  (paste the address the browser ends on), the refresh token stays in the
-  CI's OpenBao document and is written back at every renewal, and the
-  access token, renewed two hours before it expires, is patched into the
-  `publish` documents as `CLAUDE_ACCESS_TOKEN`, where omp reads it instead
-  of a `/login anthropic` per machine. The Overview asks for a new sign-in
+  holder of the owner's Claude subscription. `zeughaus-runner claude
+  login` (also `/zeughaus claude login` in omp and the Overview's Claude
+  row) runs Claude Code's normal OAuth flow on the owner's machine: the
+  browser comes back to `localhost:54545`, and the runner hands the code
+  to the CI over `/ci`. The refresh token stays in the CI's OpenBao
+  document and is written back at every renewal; the access token,
+  renewed two hours before it expires, is patched into the `publish`
+  documents as `CLAUDE_ACCESS_TOKEN`, where omp reads it instead of a
+  `/login anthropic` per machine. The Overview asks for a new sign-in
   three days before the 30-day grant ends, and while the CI is signed out.
 - CI advice on a project it does not build: `[advice]` in `ci.toml` names
   an Anthropic model (`claude-haiku-5-5` by default), asked with the

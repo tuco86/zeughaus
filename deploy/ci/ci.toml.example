@@ -84,15 +84,14 @@ timeout_seconds = 5
 # admin_token = "FORGEJO_ADMIN_TOKEN"
 # hook_url = "https://ci.doodleshnookie.net/hook"
 
-# The Claude subscription the CI signs in to (Claude Code's OAuth client) at
-# <public_url>/claude, served from the --hook listener behind Caddy's basic
-# auth. It keeps the refresh token in [secrets]' document and patches the
-# renewed access token into every `publish` document as
-# CLAUDE_ACCESS_TOKEN (the AppRole needs patch there: deploy/ci/openbao.sh).
-# Adding it takes a restart.
+# The Claude subscription the CI holds (Claude Code's OAuth client), signed
+# in with `zeughaus-runner claude login` on a machine with a browser. It
+# keeps the refresh token in [secrets]' document and patches the renewed
+# access token into every `publish` document as CLAUDE_ACCESS_TOKEN (the
+# AppRole needs patch there: deploy/ci/openbao.sh). Adding it takes a
+# restart.
 # [claude]
 # account = "owner@example.org"
-# public_url = "https://zeughaus.doodleshnookie.net"
 # publish = ["hannes/omp"]
 
 # The language model the CI asks with that sign-in about a project that

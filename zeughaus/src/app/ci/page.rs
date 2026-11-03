@@ -92,8 +92,8 @@ pub(crate) enum AttentionTarget {
     Terminal(RunnerKey, TerminalId),
     /// A view of the page.
     Page(PageView),
-    /// A web page, opened in the browser.
-    Link(String),
+    /// The local sign-in of a CI's Claude subscription.
+    ClaudeSignIn(RunnerKey),
 }
 
 /// The page's state.
@@ -429,7 +429,7 @@ impl App {
             let Some(overview) = &client.overview else {
                 continue;
             };
-            if let Some(item) = claude_item(overview.claude.as_ref(), now) {
+            if let Some(item) = claude_item(ci, overview.claude.as_ref(), now) {
                 items.push(item);
             }
             for summary in overview.repos.iter().filter(|r| r.awaiting > 0) {
@@ -712,7 +712,18 @@ impl App {
             Message::PageOpen(AttentionTarget::Page(view)) => {
                 return self.apply_page(Message::PageShow(view));
             }
-            Message::PageOpen(AttentionTarget::Link(url)) => return self.open_doc_link(&url),
+            Message::PageOpen(AttentionTarget::ClaudeSignIn(ci)) => {
+                return self.claude_sign_in(&ci);
+            }
+            Message::ClaudeSignedIn(result) => {
+                let (severity, title, body) = match result {
+                    Ok(line) => (Severity::Info, "Claude signed in", line),
+                    Err(e) => (Severity::Error, "Claude sign-in failed", e),
+                };
+                self.notices
+                    .raise(None, severity, title, body, false, None, SystemTime::now());
+                return self.poll_ci();
+            }
             Message::PageTerminal(key, terminal, action) => {
                 return self.apply_page_terminal_action(key, terminal, action);
             }
@@ -785,6 +796,53 @@ impl App {
                 CiShortcut::Cancel => Task::none(),
             }),
         }
+    }
+
+    /// Signs CI `ci` in to Claude through this machine's browser: runs
+    /// `zeughaus-runner claude login` (the one beside this editor, else the
+    /// one on `PATH`) against that CI, and says how it went as a notice.
+    fn claude_sign_in(&mut self, ci: &RunnerKey) -> Task<Message> {
+        let Some(client) = self.ci.get(ci) else {
+            return Task::none();
+        };
+        let url = client.endpoint.0.clone();
+        let runner = std::env::current_exe()
+            .ok()
+            .map(|exe| {
+                exe.with_file_name(if cfg!(windows) {
+                    "zeughaus-runner.exe"
+                } else {
+                    "zeughaus-runner"
+                })
+            })
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| "zeughaus-runner".into());
+        let state_dir = zeughaus_link::credentials::state_dir();
+        let (sender, answer) = iced::futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            let output = std::process::Command::new(&runner)
+                .arg("--state-dir")
+                .arg(&state_dir)
+                .args(["claude", "login", "--ci", &url])
+                .stdin(std::process::Stdio::null())
+                .output();
+            let result = match output {
+                Ok(output) if output.status.success() => {
+                    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                }
+                Ok(output) => Err(String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .rfind(|line| !line.trim().is_empty())
+                    .unwrap_or("zeughaus-runner claude login failed")
+                    .trim_start_matches("[claude] ")
+                    .to_owned()),
+                Err(e) => Err(format!("cannot run {}: {e}", runner.display())),
+            };
+            let _ = sender.send(result);
+        });
+        Task::perform(answer, |result| {
+            Message::ClaudeSignedIn(result.unwrap_or_else(|_| Err("the sign-in ended".to_owned())))
+        })
     }
 
     /// What Escape does on the page when nothing nearer took it: closes the
@@ -2007,9 +2065,13 @@ fn session_target(client: &CiClient, session: &SessionView) -> AttentionTarget {
 }
 
 /// The Overview's row for a CI's Claude sign-in: while it is signed out,
-/// ends within [`CLAUDE_WARN`], or could not renew. A press opens its
-/// sign-in page.
-fn claude_item(claude: Option<&zeughaus_link::ClaudeView>, now: u64) -> Option<AttentionItem> {
+/// ends within [`CLAUDE_WARN`], or could not renew. A press signs in
+/// through this machine's browser.
+fn claude_item(
+    ci: &RunnerKey,
+    claude: Option<&zeughaus_link::ClaudeView>,
+    now: u64,
+) -> Option<AttentionItem> {
     let claude = claude?;
     let (severity, title) = match &claude.account {
         None => (Severity::Error, "Claude: the CI is signed out".to_owned()),
@@ -2032,9 +2094,9 @@ fn claude_item(claude: Option<&zeughaus_link::ClaudeView>, now: u64) -> Option<A
         detail: claude
             .error
             .clone()
-            .unwrap_or_else(|| format!("Sign in at {}", claude.url)),
+            .unwrap_or_else(|| "Enter signs in through the browser".to_owned()),
         since: (claude.signed_in > 0).then_some(claude.signed_in),
-        target: AttentionTarget::Link(claude.url.clone()),
+        target: AttentionTarget::ClaudeSignIn(ci.clone()),
     })
 }
 

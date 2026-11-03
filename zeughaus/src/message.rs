@@ -393,6 +393,9 @@ pub enum Message {
     // A press on a card of a Board: its column and row.
     #[cfg(not(target_arch = "wasm32"))]
     BoardSelect(usize, usize),
+    // What `zeughaus-runner claude login` said: the account line, or why not.
+    #[cfg(not(target_arch = "wasm32"))]
+    ClaudeSignedIn(Result<String, String>),
     // The Board of a project no CI builds, by its origin: its advice and
     // the onboarding request it files.
     #[cfg(not(target_arch = "wasm32"))]

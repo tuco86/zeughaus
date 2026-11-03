@@ -13,6 +13,7 @@
 
 mod activity;
 mod agents;
+mod claude;
 mod cli;
 mod enlist;
 mod feed;

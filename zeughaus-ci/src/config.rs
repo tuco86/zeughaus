@@ -64,16 +64,13 @@ pub struct CiConfig {
     pub advice: Option<AdviceConfig>,
 }
 
-/// `[claude]`: who may sign in, where the sign-in page is reached, and
-/// which OpenBao documents receive the current access token.
+/// `[claude]`: who may sign in, and which OpenBao documents receive the
+/// current access token.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaudeConfig {
     /// The only Claude account the sign-in accepts, by its email address.
     pub account: String,
-    /// Where the hook listener's `/claude` is reached from a browser, e.g.
-    /// `https://zeughaus.doodleshnookie.net`; a trailing `/` is trimmed.
-    pub public_url: String,
     /// Documents below the `[secrets]` mount (`hannes/omp`) the access token
     /// is patched into as `CLAUDE_ACCESS_TOKEN` each time it is renewed.
     #[serde(default)]
@@ -557,15 +554,11 @@ impl CiConfig {
                 return Err("[onboarding] names secrets but ci.toml has no [secrets]".into());
             }
         }
-        if let Some(claude) = &mut self.claude {
-            claude.public_url = claude.public_url.trim_end_matches('/').to_string();
+        if let Some(claude) = &self.claude {
             if !claude.account.contains('@') {
                 return Err(
                     "[claude]: `account` is the email address of the Claude account".into(),
                 );
-            }
-            if !claude.public_url.starts_with("https://") {
-                return Err("[claude]: `public_url` is an https:// address".into());
             }
             if let Some(bad) = claude.publish.iter().find(|path| {
                 path.is_empty()

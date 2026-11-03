@@ -34,6 +34,7 @@
 //! zeughaus-runner master <repo> --ticket <n> --branch <branch> --origin <origin>
 //! zeughaus-runner maintain
 //! zeughaus-runner tidy [--dry-run] [--list]
+//! zeughaus-runner claude login [--ci <url>] [--no-browser] | status [--ci <url>]
 //! zeughaus-runner timeout <seconds> -- <program> [args..]
 //! zeughaus-runner release keygen <file>
 //! zeughaus-runner release bundle --channel <c> --build <n> --sha <sha> --version <v> --out <dir> <file>...
@@ -75,6 +76,7 @@ usage: zeughaus-runner [--state-dir <dir>] [--feed-addr <host:port>] [--keep-run
        zeughaus-runner master <repo> --ticket <n> --branch <branch> --origin <origin>
        zeughaus-runner maintain
        zeughaus-runner tidy [--dry-run] [--list]
+       zeughaus-runner claude login [--ci <url>] [--no-browser] | status [--ci <url>]
        zeughaus-runner timeout <seconds> -- <program> [args..]
        zeughaus-runner release keygen <file>
        zeughaus-runner release bundle --channel <c> --build <n> --sha <sha> --version <v> --out <dir> <file>...
@@ -149,6 +151,8 @@ pub fn run(args: &[String], state_dir: &Path) -> Option<ExitCode> {
         // A question to the CI that is answered on stdout: it starts no
         // server and takes no lock, so a script can ask beside a runner.
         Some("ci") => return Some(crate::mcp::cli(&positional[1..], state_dir)),
+        // The CI's Claude sign-in through this machine's browser.
+        Some("claude") => return Some(crate::claude::run(&positional[1..], state_dir)),
         // An agent session in the terminal it was started in: it runs until
         // the session ends, beside the runner that started it.
         Some("plan") => return Some(crate::agents::plan(&positional[1..], state_dir)),

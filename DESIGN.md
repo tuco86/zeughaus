@@ -1893,25 +1893,31 @@ makes the CI the one holder of the owner's Claude subscription: omp on the
 workstations and the CI's own requests use the access token it hands out
 through OpenBao, and nothing signs in per machine. It is Claude Code's
 public OAuth client (authorization code with PKCE S256, the scopes Claude
-Code asks for), whose only redirect is `localhost`: `GET /claude/start` of
-the hook listener keeps a state and verifier for 10 minutes and redirects
-to claude.ai, the browser ends on a `localhost` page that does not load,
-and its address (or `code#state`) posted to `/claude/code` is exchanged at
-`api.anthropic.com/v1/oauth/token`. The account of the answer (or of the
-`claude_cli/bootstrap` lookup) must be `account`; then the refresh token,
-the account and the time go into the CI's own document by merge patch. A
-thread looks every minute: two hours before the access token expires it
-refreshes (one at a time, under the state's lock), writes the rotated
-refresh token back at once, and patches the access token into every
-`publish` document as `CLAUDE_ACCESS_TOKEN`; a write that fails is kept in
-memory and retried the next minute. An `invalid_grant` ends the sign-in
-(the stored refresh token is emptied), which happens about 30 days after
-it was made. `ClaudeView` in the overview carries the account, when the
-sign-in ends, the token's expiry and the last error; the editor's Overview
-lists it under Needs you while the CI is signed out, three days before
-the sign-in ends, or while renewing fails, and a press opens `/claude` in
-the browser. Caddy serves `/claude*` of `zeughaus.doodleshnookie.net`
-behind basic auth; the CI's AppRole may patch `secret/hannes/omp`.
+Code asks for), whose only redirect is `http://localhost:54545/callback`
+(`zeughaus_link::CLAUDE_CALLBACK`), so the sign-in runs where the browser
+is: `zeughaus-runner claude login` (`zeughaus-runner/src/claude.rs`) binds
+that port on IPv4 and IPv6, asks the CI over `/ci` for `ClaudeStart` (the
+CI keeps a state and verifier for 10 minutes and answers the claude.ai
+address), opens the browser, takes the first `GET /callback` and sends its
+code and state as `ClaudeFinish`, which the CI exchanges at
+`api.anthropic.com/v1/oauth/token`; the browser tab then says how it went.
+The request is an editor's (the state directory's `client.pem`), so only
+the owner's machines can sign the CI in. The account of the answer (or of
+the `claude_cli/bootstrap` lookup) must be `account`; then the refresh
+token, the account and the time go into the CI's own document by merge
+patch. A thread looks every minute: two hours before the access token
+expires it refreshes (one at a time, under the state's lock), writes the
+rotated refresh token back at once, and patches the access token into
+every `publish` document as `CLAUDE_ACCESS_TOKEN`; a write that fails is
+kept in memory and retried the next minute. An `invalid_grant` ends the
+sign-in (the stored refresh token is emptied), which happens about 30
+days after it was made. `ClaudeView` in the overview carries the account,
+when the sign-in ends, the token's expiry and the last error; the editor's
+Overview lists it under Needs you while the CI is signed out, three days
+before the sign-in ends, or while renewing fails, and a press runs
+`zeughaus-runner claude login` beside the editor and reports the result as
+a notice; omp's plugin offers `/zeughaus claude [login]`. The CI's AppRole
+may patch `secret/hannes/omp`.
 
 **Advice.** `[advice]` of `ci.toml` (a `model`, by default
 `claude-haiku-5-5`, and the `api` base) is the language model the CI asks

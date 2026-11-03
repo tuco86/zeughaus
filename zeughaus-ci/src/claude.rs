@@ -3,14 +3,16 @@
 //! `ci.toml`).
 //!
 //! The sign-in is Claude Code's own OAuth client (authorization code with
-//! PKCE). That client redirects only to `localhost`, so the browser ends on
-//! a page that does not load: the owner pastes its address (or the code
-//! Anthropic shows) into the CI's page at `/claude` of the hook listener,
-//! which Caddy serves behind basic auth. The CI exchanges it, checks the
-//! account, and keeps the refresh token in its own OpenBao document. Every
-//! refresh hands out a new refresh token, which is written back at once;
-//! the grant itself ends about 30 days after the sign-in, after which the
-//! owner signs in again.
+//! PKCE), whose only redirect is `localhost`: `zeughaus-runner claude
+//! login` on the owner's machine asks the CI to start one
+//! (`CiRequest::ClaudeStart`; the CI keeps state and verifier), opens the
+//! browser at claude.ai, takes the redirect on `localhost:54545` and hands
+//! code and state back (`CiRequest::ClaudeFinish`) over the same `/ci`
+//! link editors use. The CI exchanges them, checks the account, and keeps
+//! the refresh token in its own OpenBao document. Every refresh hands out
+//! a new refresh token, which is written back at once; the grant itself
+//! ends about 30 days after the sign-in, after which the owner signs in
+//! again.
 //!
 //! A thread renews the access token well before it expires and patches it
 //! into the `publish` documents as `CLAUDE_ACCESS_TOKEN`, where omp on every
@@ -25,7 +27,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use zeughaus_link::ClaudeView;
+use zeughaus_link::{CLAUDE_CALLBACK, ClaudeView};
 
 use crate::config::ClaudeConfig;
 use crate::secrets::{SecretError, Secrets};
@@ -36,8 +38,6 @@ const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 const TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token";
 /// Where the token answer names no account: the account of a token.
 const BOOTSTRAP_URL: &str = "https://api.anthropic.com/api/claude_cli/bootstrap?entrypoint=cli";
-/// The only redirect the client accepts besides Anthropic's own pages.
-const REDIRECT_URI: &str = "http://localhost:54545/callback";
 const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code \
                       user:mcp_servers user:file_upload";
 /// The beta a token request and an account lookup announce.
@@ -68,7 +68,9 @@ const RENEW_BEFORE: u64 = 2 * 3600;
 /// How long a sign-in lasts: the last refresh token stops working then.
 pub const GRANT_SECS: u64 = 30 * 24 * 3600;
 /// How long a token request may take, in seconds.
-const TIMEOUT_SECS: u32 = 30;
+/// How long a token request may take, in seconds: a sign-in's exchange and
+/// account lookup fit in the editor's 30 s for one question.
+const TIMEOUT_SECS: u32 = 12;
 
 /// The sign-in and its tokens.
 pub struct Claude {
@@ -123,11 +125,6 @@ impl Claude {
         })
     }
 
-    /// The page that signs in.
-    pub fn page_url(&self) -> String {
-        format!("{}/claude", self.config.public_url)
-    }
-
     /// Starts a sign-in: the address at claude.ai the browser goes to.
     pub fn start(&self) -> Result<String, String> {
         let verifier = random_token()?;
@@ -139,29 +136,22 @@ impl Claude {
         Ok(url)
     }
 
-    /// Finishes a sign-in from what the owner pasted: the address the
-    /// browser ended on, `code#state`, or the code alone while one sign-in
-    /// is pending. Answers the account.
-    pub fn sign_in(&self, pasted: &str, now: u64) -> Result<String, String> {
-        let (code, state) = pasted_code(pasted)?;
-        let (state, verifier) = {
+    /// Finishes a sign-in with the code and state the callback received.
+    /// Answers the account.
+    pub fn sign_in(&self, code: &str, state: &str, now: u64) -> Result<String, String> {
+        let verifier = {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             pending.retain(|_, (_, at)| at.elapsed() < PENDING_FOR);
-            let state = match state {
-                Some(state) => state,
-                None if pending.len() == 1 => pending.keys().next().cloned().unwrap_or_default(),
-                None => return Err("paste the whole address the browser ended on".to_owned()),
-            };
             let (verifier, _) = pending
-                .remove(&state)
+                .remove(state)
                 .ok_or("this sign-in expired or was used; start again")?;
-            (state, verifier)
+            verifier
         };
         let body = serde_json::json!({
             "grant_type": "authorization_code",
             "client_id": CLIENT_ID,
             "code": code,
-            "redirect_uri": REDIRECT_URI,
+            "redirect_uri": CLAUDE_CALLBACK,
             "code_verifier": verifier,
             "state": state,
         });
@@ -239,7 +229,6 @@ impl Claude {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let signed_in = state.refresh.is_some();
         ClaudeView {
-            url: self.page_url(),
             account: signed_in.then(|| state.account.clone()),
             signed_in: state.signed_in,
             ends: if signed_in {
@@ -360,7 +349,7 @@ impl Claude {
 
     fn signed_out(&self, state: &State) -> String {
         let why = state.error.as_deref().unwrap_or("not signed in");
-        format!("Claude: {why}; sign in at {}", self.page_url())
+        format!("Claude: {why}; sign in with `zeughaus-runner claude login`")
     }
 }
 
@@ -369,100 +358,6 @@ fn random_token() -> Result<String, String> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).map_err(|e| format!("no random bytes: {e}"))?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
-}
-
-/// One answer of the sign-in pages.
-pub struct Reply {
-    pub code: u16,
-    /// `text/html` unless it redirects.
-    pub body: String,
-    /// Where a redirect goes.
-    pub location: Option<String>,
-}
-
-impl Claude {
-    /// Answers a request for the sign-in pages, `None` for another path.
-    /// `GET /claude` shows where the sign-in stands with the form that
-    /// finishes one, `GET /claude/start` goes to claude.ai, `POST
-    /// /claude/code` takes the pasted address.
-    pub fn respond(&self, method: &str, url: &str, body: &[u8], now: u64) -> Option<Reply> {
-        let path = url.split('?').next().unwrap_or(url);
-        let html = |code: u16, body: String| Reply {
-            code,
-            body,
-            location: None,
-        };
-        Some(match (method, path) {
-            ("GET", "/claude") => html(200, self.page(None, now)),
-            ("GET", "/claude/start") => match self.start() {
-                Ok(url) => Reply {
-                    code: 302,
-                    body: String::new(),
-                    location: Some(url),
-                },
-                Err(e) => html(500, self.page(Some(Err(e)), now)),
-            },
-            ("POST", "/claude/code") => {
-                let form = String::from_utf8_lossy(body);
-                let pasted = query_param(&form, "code").unwrap_or_default();
-                let result = self
-                    .sign_in(&pasted, now)
-                    .map(|account| format!("Signed in as {account}."));
-                let code = if result.is_ok() { 200 } else { 400 };
-                html(code, self.page(Some(result), now))
-            }
-            _ if path == "/claude" || path.starts_with("/claude/") => {
-                html(404, self.page(Some(Err("no such page".to_owned())), now))
-            }
-            _ => return None,
-        })
-    }
-
-    /// The page: where the sign-in stands, what just happened, the link
-    /// that starts a sign-in and the form that finishes it.
-    fn page(&self, outcome: Option<Result<String, String>>, now: u64) -> String {
-        let status = self.status();
-        let mut lines = Vec::new();
-        match &status.account {
-            Some(account) => {
-                let days = status.ends.saturating_sub(now) / 86_400;
-                lines.push(format!(
-                    "Signed in as {}; the sign-in ends in {days} days.",
-                    escape(account)
-                ));
-            }
-            None => lines.push("Not signed in.".to_owned()),
-        }
-        if let Some(error) = &status.error {
-            lines.push(format!("Last problem: {}", escape(error)));
-        }
-        let outcome = match outcome {
-            Some(Ok(text)) => format!("<p class=ok>{}</p>", escape(&text)),
-            Some(Err(text)) => format!("<p class=err>{}</p>", escape(&text)),
-            None => String::new(),
-        };
-        let lines: String = lines.iter().map(|l| format!("<p>{l}</p>")).collect();
-        format!(
-            "<!doctype html><meta charset=utf-8><title>Claude sign-in</title>\
-             <style>body{{font:15px sans-serif;max-width:40em;margin:3em auto}}\
-             .ok{{color:#2a7}}.err{{color:#c33}}input{{width:100%}}</style>\
-             <h1>Claude sign-in of the CI</h1>{outcome}{lines}\
-             <ol><li><a href=\"/claude/start\" target=\"_blank\">Sign in at claude.ai</a> as {}.</li>\
-             <li>The browser then ends on a <code>localhost</code> page that does not load: \
-             copy its whole address (or the code claude.ai shows) here.</li></ol>\
-             <form method=post action=\"/claude/code\"><input name=code autocomplete=off \
-             placeholder=\"http://localhost:54545/callback?code=...\"> <button>Sign in</button></form>",
-            escape(&self.config.account)
-        )
-    }
-}
-
-/// `text` safe inside HTML.
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 /// The PKCE S256 challenge of `verifier`.
@@ -476,7 +371,7 @@ fn authorize_url(state: &str, challenge: &str) -> String {
         ("code", "true"),
         ("client_id", CLIENT_ID),
         ("response_type", "code"),
-        ("redirect_uri", REDIRECT_URI),
+        ("redirect_uri", CLAUDE_CALLBACK),
         ("scope", SCOPES),
         ("code_challenge", challenge),
         ("code_challenge_method", "S256"),
@@ -490,7 +385,7 @@ fn authorize_url(state: &str, challenge: &str) -> String {
 }
 
 /// `text` percent-encoded for a query: unreserved characters stay.
-pub fn encode(text: &str) -> String {
+fn encode(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for byte in text.bytes() {
         match byte {
@@ -501,59 +396,6 @@ pub fn encode(text: &str) -> String {
         }
     }
     out
-}
-
-/// `text` percent-decoded, `+` read as a space; `None` for a broken escape.
-pub fn decode(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut at = 0;
-    while at < bytes.len() {
-        match bytes[at] {
-            b'+' => out.push(b' '),
-            b'%' => {
-                let hex = text.get(at + 1..at + 3)?;
-                out.push(u8::from_str_radix(hex, 16).ok()?);
-                at += 2;
-            }
-            byte => out.push(byte),
-        }
-        at += 1;
-    }
-    String::from_utf8(out).ok()
-}
-
-/// The value of `name` in a query or form body.
-pub fn query_param(query: &str, name: &str) -> Option<String> {
-    query
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .find(|(key, _)| *key == name)
-        .and_then(|(_, value)| decode(value))
-}
-
-/// The code and state of what the owner pasted: an address with `code`
-/// and `state` in its query, `code#state`, or a code alone.
-fn pasted_code(pasted: &str) -> Result<(String, Option<String>), String> {
-    let pasted = pasted.trim();
-    if pasted.is_empty() {
-        return Err("paste the address the browser ended on".to_owned());
-    }
-    if let Some((_, query)) = pasted.split_once('?') {
-        let query = query.split('#').next().unwrap_or(query);
-        if let Some(error) = query_param(query, "error") {
-            return Err(format!("claude.ai refused: {error}"));
-        }
-        let code = query_param(query, "code").ok_or("the address carries no code")?;
-        return Ok((code, query_param(query, "state")));
-    }
-    match pasted.split_once('#') {
-        Some((code, state)) if !code.is_empty() && !state.is_empty() => {
-            Ok((code.to_owned(), Some(state.to_owned())))
-        }
-        Some(_) => Err("a pasted code is `code#state`".to_owned()),
-        None => Ok((pasted.to_owned(), None)),
-    }
 }
 
 /// POSTs a JSON `body` to the token endpoint.
@@ -598,24 +440,7 @@ fn account_of(access: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_address_the_browser_ends_on_gives_code_and_state() {
-        assert_eq!(
-            pasted_code(" http://localhost:54545/callback?code=ab%2Bc&state=s1 "),
-            Ok(("ab+c".to_owned(), Some("s1".to_owned())))
-        );
-        assert_eq!(
-            pasted_code("abc#s1"),
-            Ok(("abc".to_owned(), Some("s1".to_owned())))
-        );
-        assert_eq!(pasted_code("abc"), Ok(("abc".to_owned(), None)));
-        assert_eq!(
-            pasted_code("http://localhost:54545/callback?error=access_denied&state=s1"),
-            Err("claude.ai refused: access_denied".to_owned())
-        );
-        assert!(pasted_code("abc#").is_err());
-    }
+    use zeughaus_link::query_param;
 
     #[test]
     fn the_sign_in_asks_for_inference_with_a_s256_challenge() {
@@ -628,7 +453,7 @@ mod tests {
         assert_eq!(query_param(query, "scope").as_deref(), Some(SCOPES));
         assert_eq!(
             query_param(query, "redirect_uri").as_deref(),
-            Some(REDIRECT_URI)
+            Some(CLAUDE_CALLBACK)
         );
         assert_eq!(
             query_param(query, "code_challenge_method").as_deref(),

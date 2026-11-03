@@ -321,22 +321,24 @@ generated `<NAME>_WEBHOOK_SECRET` in OpenBao, writes
 the first push pipeline. The configuration is one swappable snapshot:
 SIGHUP (`systemctl --user reload zeughaus-ci`) re-reads `[repos]` and
 `ci/onboarded/`, and refuses any other change. `[claude]` of `ci.toml`
-(`account`, the only email that may sign in; `public_url`, where the hook
-listener's `/claude` is reached, `https://zeughaus.doodleshnookie.net`
-behind Caddy's basic auth; `publish`, OpenBao documents such as
-`hannes/omp`) is the Claude subscription the CI signs in to with Claude
-Code's OAuth client, in place of omp's `/login anthropic` on every
-machine: `/claude/start` goes to claude.ai, the browser ends on a
-`localhost` page that does not load, and its address pasted into `/claude`
-finishes the sign-in. The CI keeps the refresh token in its own document
-(`CLAUDE_REFRESH_TOKEN`, `CLAUDE_ACCOUNT`, `CLAUDE_SIGNED_IN`, written
-back at every renewal because each refresh rotates it), renews the access
-token two hours before it expires and patches it into every `publish`
-document as `CLAUDE_ACCESS_TOKEN`, where omp reads it
-(`providers.anthropic.apiKey: "!get-secret
-secret/hannes/omp/CLAUDE_ACCESS_TOKEN"` in `models.yml`). A sign-in ends
-about 30 days after it was made; the Overview asks for a new one three
-days before, and while the CI is signed out. `[advice]` (`model`, by
+(`account`, the only email that may sign in; `publish`, OpenBao documents
+such as `hannes/omp`) is the Claude subscription the CI holds, in place of
+omp's `/login anthropic` on every machine. A sign-in is the normal OAuth
+flow of Claude Code's client on the owner's machine: `zeughaus-runner
+claude login` (also `/zeughaus claude login` in omp, and the Overview's
+Claude row in the editor) asks the CI to start one (`ClaudeStart`; the CI
+keeps state and PKCE verifier), opens the browser at claude.ai, takes the
+redirect on `localhost:54545` and hands code and state to the CI
+(`ClaudeFinish`) over `/ci`, which exchanges them. The CI keeps the
+refresh token in its own document (`CLAUDE_REFRESH_TOKEN`,
+`CLAUDE_ACCOUNT`, `CLAUDE_SIGNED_IN`, written back at every renewal
+because each refresh rotates it), renews the access token two hours before
+it expires and patches it into every `publish` document as
+`CLAUDE_ACCESS_TOKEN`, where omp reads it (`providers.anthropic.apiKey:
+"!get-secret secret/hannes/omp/CLAUDE_ACCESS_TOKEN"` in `models.yml`). A
+sign-in ends about 30 days after it was made; the Overview asks for a new
+one three days before, and while the CI is signed out; `zeughaus-runner
+claude status` says where it stands. `[advice]` (`model`, by
 default `claude-haiku-5-5`; `api`) is the
 model the CI asks with that sign-in for a bare project's advice (`CiRequest::Advise` with
 the facts an editor's runner gathered on `/projects`): it adds its

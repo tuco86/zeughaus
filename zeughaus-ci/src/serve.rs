@@ -353,6 +353,20 @@ impl CiServer {
                     refresh,
                 )),
             },
+            CiRequest::ClaudeStart => match self.claude.as_deref().map(|claude| claude.start()) {
+                Some(Ok(url)) => CiReply::ClaudeStart { url },
+                Some(Err(e)) => error(&e),
+                None => error("the CI has no [claude] in ci.toml"),
+            },
+            CiRequest::ClaudeFinish { code, state } => match self
+                .claude
+                .as_deref()
+                .map(|claude| claude.sign_in(&code, &state, crate::now_secs()))
+            {
+                Some(Ok(account)) => CiReply::ClaudeSignedIn { account },
+                Some(Err(e)) => error(&e),
+                None => error("the CI has no [claude] in ci.toml"),
+            },
         }
     }
 
