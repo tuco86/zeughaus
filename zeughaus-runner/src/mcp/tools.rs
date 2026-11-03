@@ -2653,6 +2653,7 @@ mod tests {
             sessions: Vec::new(),
             claims: Vec::new(),
             claude: None,
+            asks: Vec::new(),
         };
         assert_eq!(
             status_text(&overview, 1_000),
@@ -2673,6 +2674,7 @@ mod tests {
             sessions: Vec::new(),
             claims: Vec::new(),
             claude: None,
+            asks: Vec::new(),
         };
         assert_eq!(
             status_text(&empty, 0),

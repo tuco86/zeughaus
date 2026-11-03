@@ -37,12 +37,12 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::BufReader;
 use zeughaus_link::ci::{includes_named, plan_title, runs_on_named};
 use zeughaus_link::{
-    CiReply, CiRequest, ClaimHolder, ClaimSubject, ClaimView, MachineView, Planner, RepoView,
-    SessionView,
+    AskQuestion, AskReply, CiReply, CiRequest, ClaimHolder, ClaimSubject, ClaimView, MachineView,
+    Planner, RepoView, SessionView,
 };
 
 use self::client::{Client, Link};
@@ -165,6 +165,11 @@ const EXIT_LATE: u8 = 4;
 /// - `ci responsible [--json] <repo> <n>`: who is responsible for a
 ///   pipeline's failure. `--json` prints `{"ours": .., "claim": ..|null,
 ///   "text": ..}`, `ours` when this terminal holds it.
+/// - `ci ask <file>`: posts the ask in `file` (`{"repo", "doc",
+///   "questions"}`, omp's `ask` parameters) for this terminal and waits,
+///   without a limit, until an editor answers it; prints `{"replies":
+///   [..]}`. The caller kills it when the terminal answers first.
+/// - `ci ask-close`: drops this terminal's ask.
 ///
 /// Exit 0: answered (for `ci wait`: settled, whatever its status). 1: the
 /// arguments, the directory or the file were wrong.
@@ -274,6 +279,10 @@ enum CiCommand {
         repo: String,
         number: u64,
     },
+    Ask {
+        file: PathBuf,
+    },
+    AskClose,
 }
 
 /// The holder a terminal names: a valid runner name and a terminal id, and
@@ -324,7 +333,7 @@ const CLI_WAIT_LIMIT: Duration = Duration::from_secs(4 * 3600);
 /// The arguments that follow `ci`.
 fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
     const SUBCOMMANDS: &str = "repo, find, doc, reevaluate, plan-write, wait, overdue, session, \
-                               claim, renew, release or responsible";
+                               claim, renew, release, responsible, ask or ask-close";
     let Some((subcommand, rest)) = args.split_first() else {
         return Err(format!("ci needs a subcommand: {SUBCOMMANDS}"));
     };
@@ -338,7 +347,7 @@ fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
             "--json"
                 if !matches!(
                     subcommand.as_str(),
-                    "wait" | "overdue" | "renew" | "release"
+                    "wait" | "overdue" | "renew" | "release" | "ask" | "ask-close"
                 ) =>
             {
                 json = true
@@ -481,6 +490,12 @@ fn parse_ci(args: &[String]) -> Result<CiCommand, String> {
         ("responsible", _) => {
             Err("ci responsible takes a repository name and a pipeline number".to_owned())
         }
+        ("ask", [file]) => Ok(CiCommand::Ask {
+            file: PathBuf::from(file),
+        }),
+        ("ask", _) => Err("ci ask takes a file".to_owned()),
+        ("ask-close", []) => Ok(CiCommand::AskClose),
+        ("ask-close", _) => Err("ci ask-close takes nothing".to_owned()),
         (other, _) => Err(format!("unknown ci subcommand {other:?}: {SUBCOMMANDS}")),
     }
 }
@@ -537,6 +552,34 @@ struct ClaimAnswer<'a> {
     ours: bool,
     claim: Option<&'a ClaimView>,
     text: &'a str,
+}
+
+/// The file `ci ask` posts: omp's `ask` parameters and what the session
+/// works on.
+#[derive(Deserialize)]
+struct AskFile {
+    #[serde(default)]
+    repo: String,
+    #[serde(default)]
+    doc: Option<u64>,
+    questions: Vec<AskQuestion>,
+}
+
+/// The line `ci ask` prints.
+#[derive(Serialize)]
+struct AskAnswered<'a> {
+    replies: &'a [AskReply],
+}
+
+/// How often `ci ask` polls its ask, which also renews its lease.
+const ASK_POLL: Duration = Duration::from_secs(2);
+
+/// Posts an ask; the id the CI gave it.
+async fn post_ask(client: &Client, request: &CiRequest) -> Result<u64, String> {
+    match client.ci(request.clone()).await? {
+        CiReply::Ask { ask } => Ok(ask.id),
+        other => Err(unexpected(&other)),
+    }
 }
 
 const NOT_IN_A_TERMINAL: &str =
@@ -891,6 +934,57 @@ async fn ci_answer(client: &Arc<Client>, command: CiCommand) -> Result<String, F
                 other => Err(Failure::no_answer(unexpected(&other))),
             }
         }
+        CiCommand::Ask { file } => {
+            let holder =
+                env_holder().ok_or_else(|| Failure::bad_input(NOT_IN_A_TERMINAL.to_owned()))?;
+            let cannot_read =
+                |e: String| Failure::bad_input(format!("cannot read {}: {e}", file.display()));
+            let body = std::fs::read_to_string(&file).map_err(|e| cannot_read(e.to_string()))?;
+            let ask: AskFile =
+                serde_json::from_str(&body).map_err(|e| cannot_read(e.to_string()))?;
+            let post = CiRequest::AskPost {
+                holder: holder.clone(),
+                repo: ask.repo,
+                doc: ask.doc,
+                questions: ask.questions,
+            };
+            let mut id = post_ask(client, &post).await.map_err(Failure::no_answer)?;
+            loop {
+                tokio::time::sleep(ASK_POLL).await;
+                let poll = CiRequest::AskPoll {
+                    id,
+                    holder: holder.clone(),
+                };
+                match client.ci(poll).await {
+                    Ok(CiReply::Ask { ask }) => {
+                        if let Some(replies) = ask.answer {
+                            let _ = client.ci(CiRequest::AskClose { holder }).await;
+                            return encoded(&AskAnswered { replies: &replies });
+                        }
+                    }
+                    // The CI restarted or let the ask expire: ask again.
+                    Err(e) if e.starts_with("no ask ") => {
+                        if let Ok(new) = post_ask(client, &post).await {
+                            id = new;
+                        }
+                    }
+                    // The next poll tries a fresh connection.
+                    Ok(_) | Err(_) => {}
+                }
+            }
+        }
+        CiCommand::AskClose => {
+            let holder =
+                env_holder().ok_or_else(|| Failure::bad_input(NOT_IN_A_TERMINAL.to_owned()))?;
+            match client
+                .ci(CiRequest::AskClose { holder })
+                .await
+                .map_err(Failure::no_answer)?
+            {
+                CiReply::Accepted => Ok("closed\n".to_owned()),
+                other => Err(Failure::no_answer(unexpected(&other))),
+            }
+        }
         CiCommand::Responsible { json, repo, number } => {
             let request = CiRequest::Responsible {
                 repo: repo.clone(),
@@ -1163,6 +1257,25 @@ mod tests {
                 number: 12
             })
         );
+    }
+
+    #[test]
+    fn ci_ask_takes_a_file_and_no_json() {
+        assert_eq!(
+            parse_ci(&args(&["ask", "f"])),
+            Ok(CiCommand::Ask {
+                file: PathBuf::from("f")
+            })
+        );
+        assert_eq!(parse_ci(&args(&["ask-close"])), Ok(CiCommand::AskClose));
+        for (given, reason) in [
+            (&["ask", "--json", "f"][..], "unknown flag \"--json\""),
+            (&["ask"][..], "ci ask takes a file"),
+            (&["ask-close", "x"][..], "ci ask-close takes nothing"),
+        ] {
+            let err = parse_ci(&args(given)).expect_err(&format!("{given:?}"));
+            assert!(err.contains(reason), "{given:?}: {err}");
+        }
     }
 
     #[test]

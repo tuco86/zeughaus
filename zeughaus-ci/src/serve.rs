@@ -413,6 +413,29 @@ impl CiServer {
                     refresh,
                 )),
             },
+            CiRequest::AskPost {
+                holder,
+                repo,
+                doc,
+                questions,
+            } => match self
+                .sessions
+                .ask(holder, repo, doc, questions, crate::now_secs())
+            {
+                Ok(ask) => CiReply::Ask { ask },
+                Err(e) => error(&e),
+            },
+            CiRequest::AskPoll { id, holder } => {
+                match self.sessions.ask_poll(id, &holder, crate::now_secs()) {
+                    Ok(ask) => CiReply::Ask { ask },
+                    Err(e) => error(&e),
+                }
+            }
+            CiRequest::AskAnswer { id, replies } => accepted(self.sessions.ask_answer(id, replies)),
+            CiRequest::AskClose { holder } => {
+                self.sessions.ask_close(&holder);
+                accepted(Ok(()))
+            }
             CiRequest::ClaudeStart => match self.claude.as_deref().map(|claude| claude.start()) {
                 Some(Ok(url)) => CiReply::ClaudeStart { url },
                 Some(Err(e)) => error(&e),
@@ -510,6 +533,7 @@ impl CiServer {
             sessions: self.sessions.listed(),
             claims: self.sessions.claims(),
             claude: self.claude.as_ref().map(|claude| claude.status()),
+            asks: self.sessions.asks(),
         }
     }
 

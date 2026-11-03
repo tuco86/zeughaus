@@ -424,7 +424,7 @@ async fn doc(
     }
 }
 
-async fn act(endpoint: Endpoint, request: CiRequest) -> Result<(), String> {
+pub(super) async fn act(endpoint: Endpoint, request: CiRequest) -> Result<(), String> {
     match feed::ci(endpoint, request).await? {
         CiReply::Accepted => Ok(()),
         _ => Err(UNEXPECTED.to_owned()),
@@ -1199,6 +1199,7 @@ mod tests {
             sessions: Vec::new(),
             claims: Vec::new(),
             claude: None,
+            asks: Vec::new(),
         }
     }
 

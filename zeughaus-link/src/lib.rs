@@ -35,6 +35,7 @@
 
 pub mod activity;
 pub mod advice;
+pub mod ask;
 pub mod ci;
 pub mod credentials;
 pub mod enlist;
@@ -52,6 +53,9 @@ pub use activity::{
     ActivityState, AgentRole, AgentState, AgentStatus, MAX_ACTIVITY_ENTRIES, SHOW_VAR, ShowTicket,
 };
 pub use advice::{AdviceView, Card, MAX_CARDS, MAX_FACTS_BYTES, NewTicket, parse_plan};
+pub use ask::{
+    ASK_LEASE_SECS, AskOption, AskQuestion, AskReply, AskView, check_questions, check_replies,
+};
 pub use ci::{
     CLAIM_LEASE_SECS, CLAUDE_CALLBACK, ChannelView, CiOverview, CiReply, CiRequest, ClaimHolder,
     ClaimSubject, ClaimView, ClaudeAccessToken, ClaudeView, DocGroup, DocKind, DocLink, DocState,

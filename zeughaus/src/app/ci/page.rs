@@ -24,7 +24,7 @@ use iced::widget::{
 use iced::{Alignment, Border, Color, Element, Length, Task};
 use iced_tabs::scroll;
 use zeughaus_link::{
-    ActivityKind, ActivityState, AgentRole, AgentState, ClaimSubject, ClaimView, DocGroup,
+    ActivityKind, ActivityState, AgentRole, AgentState, AskView, ClaimSubject, ClaimView, DocGroup,
     DocState, DocView, RepoDocsView, SessionKind, SessionState, SessionView, doc_groups,
 };
 use zeughaus_mux::TerminalId;
@@ -94,6 +94,8 @@ pub(crate) enum AttentionTarget {
     Page(PageView),
     /// The local sign-in of a CI's Claude subscription.
     ClaudeSignIn(RunnerKey),
+    /// An agent's open ask: the CI and the ask's id.
+    Ask(RunnerKey, u64),
 }
 
 /// The page's state.
@@ -422,6 +424,40 @@ impl App {
                 target: AttentionTarget::Terminal(key.clone(), TerminalId(entry.terminal)),
             });
         }
+        // An ask whose agent has a row above is answered beside that row's
+        // terminal.
+        for (ci, client) in &self.ci {
+            for ask in client.asks() {
+                let runner = client.runner_key(&ask.holder.runner);
+                let has_row = self.runtime.agents().any(|(key, entry)| {
+                    runner.as_ref() == Some(key)
+                        && entry.terminal == ask.holder.terminal
+                        && entry.agent.as_ref().is_some_and(|a| a.needs_attention())
+                });
+                if has_row {
+                    continue;
+                }
+                items.push(AttentionItem {
+                    severity: Severity::Warning,
+                    glyph: role_glyph(AgentRole::Work),
+                    title: format!(
+                        "{} asks",
+                        if ask.label.is_empty() {
+                            "An agent"
+                        } else {
+                            ask.label.as_str()
+                        }
+                    ),
+                    detail: ask
+                        .questions
+                        .first()
+                        .map(|q| q.question.clone())
+                        .unwrap_or_default(),
+                    since: Some(ask.asked),
+                    target: AttentionTarget::Ask(ci.clone(), ask.id),
+                });
+            }
+        }
         let now = now();
         for (ci, client) in &self.ci {
             let Some(overview) = &client.overview else {
@@ -712,6 +748,18 @@ impl App {
             }
             Message::PageOpen(AttentionTarget::ClaudeSignIn(ci)) => {
                 return self.claude_sign_in(&ci);
+            }
+            // An ask about a ticket opens the ticket, where it is answered
+            // too; any other is answered in the detail pane.
+            Message::PageOpen(AttentionTarget::Ask(ci, id)) => {
+                let target = self.ci.get(&ci).and_then(|client| {
+                    let ask = client.asks().find(|ask| ask.id == id)?;
+                    Some((client.plans_view_of(&ask.repo)?, ask.doc?))
+                });
+                return match target {
+                    Some((view, number)) => self.apply_ticket(TicketMsg::Open { ci, view, number }),
+                    None => Task::none(),
+                };
             }
             Message::ClaudeSignedIn(result) => {
                 let (severity, title, body) = match result {
@@ -1148,7 +1196,30 @@ impl App {
 
         let detail: Element<'_, Message, Theme> = match (&self.page.machine, selected) {
             (None, Some(AttentionTarget::Terminal(runner, terminal))) => {
-                self.docked(t, &runner, terminal, "Bring its tab to the front")
+                match self.ask_at(&runner, terminal) {
+                    Some((ci, client, ask)) => column![
+                        container(scroll::vertical(self.ask_form(ci, client, ask)))
+                            .padding([12, 16])
+                            .max_height(360.0),
+                        rule::horizontal(1),
+                        self.docked(t, &runner, terminal, "Bring its tab to the front"),
+                    ]
+                    .into(),
+                    None => self.docked(t, &runner, terminal, "Bring its tab to the front"),
+                }
+            }
+            (None, Some(AttentionTarget::Ask(ci, id))) => {
+                let found = self.ci.get_key_value(&ci).and_then(|(ci, client)| {
+                    let ask = client.asks().find(|ask| ask.id == id)?;
+                    Some((ci, client, ask))
+                });
+                match found {
+                    Some((ci, client, ask)) => scroll::vertical(
+                        container(self.ask_form(ci, client, ask)).padding([12, 16]),
+                    )
+                    .into(),
+                    None => self.overview_runners(t),
+                }
             }
             _ => self.overview_runners(t),
         };
@@ -1354,6 +1425,23 @@ impl App {
         )
         .style(style::row_highlight(t, active))
         .into()
+    }
+
+    /// The open ask of an agent's terminal, with its CI.
+    fn ask_at(
+        &self,
+        runner: &RunnerKey,
+        terminal: TerminalId,
+    ) -> Option<(&RunnerKey, &CiClient, &AskView)> {
+        self.ci.iter().find_map(|(ci, client)| {
+            client
+                .asks()
+                .find(|ask| {
+                    client.runner_key(&ask.holder.runner).as_ref() == Some(runner)
+                        && ask.holder.terminal == terminal.0
+                })
+                .map(|ask| (ci, client, ask))
+        })
     }
 
     /// A runner's terminal docked read-only under a bar with its title and

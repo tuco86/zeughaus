@@ -549,6 +549,22 @@ pub enum CiMsg {
     SessionOpened(Result<zeughaus_link::SessionView, String>),
     /// The user pressed a link in a document.
     OpenLink(String),
+    /// The user picked or unpicked an option of an open ask.
+    AskPick {
+        id: u64,
+        question: usize,
+        option: usize,
+    },
+    /// The user typed the custom answer of a question.
+    AskCustom {
+        id: u64,
+        question: usize,
+        text: String,
+    },
+    /// The user sent the answer.
+    AskSend { id: u64 },
+    /// What the CI answered it.
+    AskSent { id: u64, result: Result<(), String> },
 }
 
 /// Which part of a ticket its popout shows.

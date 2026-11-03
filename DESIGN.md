@@ -1464,7 +1464,14 @@ its comments and a box for a new one (`DocComment`, its author the
 editor's `<user>@<host>`). `Re-evaluate` of an open, ready, reviewed or
 approved ticket asks the CI (`Reevaluate`, one at a time, the other
 buttons free meanwhile); the stored suggestion shows under the actions,
-a rewrite with `Edit with this text`. Escape or a press on the scrim closes it; `New
+a rewrite with `Edit with this text`. An agent's open ask about the
+ticket (`ci/ask.rs`) is answered under the actions: its questions with
+their options as pills, a box for an answer of the user's own and `Send`
+(`AskAnswer`); the same form stands over the docked terminal of the
+agent's row in Needs you, or alone for an ask whose agent has no row.
+The CI keeps asks in memory under a 30 s lease that `zeughaus-runner ci
+ask`, which posted the ask for the omp plugin, renews by polling it; the
+first answer, an editor's or the terminal's, wins. Escape or a press on the scrim closes it; `New
 ticket` on the Board writes one in it. A card the CI moved to another
 column carries an accent ring that fades over 2 s. A project no CI builds
 gets the Board of `ci/onboard.rs`: the first CI's advice on it

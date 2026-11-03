@@ -42,6 +42,7 @@ use crate::message::{CiMsg, CiShortcut, Message};
 use crate::transport::Endpoint;
 use crate::workspace::RunnerKey;
 
+mod ask;
 mod cables;
 mod onboard;
 pub(super) mod page;
@@ -203,6 +204,8 @@ pub(super) struct CiClient {
     /// When the last overview arrived: a CI that went away leaves its
     /// request waiting, not failing, so the age is what tells.
     last_overview: Option<std::time::Instant>,
+    /// What the user has picked and typed for each open ask, by its id.
+    ask_drafts: BTreeMap<u64, ask::AskDraft>,
 }
 
 /// A repository: its Plans view and the views of its channels.
@@ -523,6 +526,7 @@ impl CiClient {
             plans: BTreeMap::new(),
             fetching: HashMap::new(),
             last_overview: None,
+            ask_drafts: BTreeMap::new(),
         }
     }
 
@@ -721,6 +725,8 @@ impl CiClient {
                     self.view_of(repo, channel);
                 }
                 tasks.extend(self.forget_unlisted(&repos, &channels));
+                self.ask_drafts
+                    .retain(|id, _| overview.asks.iter().any(|ask| ask.id == *id));
                 self.overview = Some(overview);
                 // The first page of a channel no view has loaded yet, and of
                 // one whose last attempt failed.
@@ -1278,6 +1284,23 @@ impl App {
                 if let Some(state) = client.plans.get_mut(&view) {
                     state.runs_on_input = Some((number, text));
                 }
+                Task::none()
+            }
+            CiMsg::AskPick {
+                id,
+                question,
+                option,
+            } => {
+                client.pick(id, question, option);
+                Task::none()
+            }
+            CiMsg::AskCustom { id, question, text } => {
+                client.type_custom(id, question, text);
+                Task::none()
+            }
+            CiMsg::AskSend { id } => client.send(&key, id),
+            CiMsg::AskSent { id, result } => {
+                client.sent(id, result);
                 Task::none()
             }
             // Answered above: they need more of the editor than this client.
@@ -3145,6 +3168,7 @@ mod tests {
             sessions: Vec::new(),
             claims: Vec::new(),
             claude: None,
+            asks: Vec::new(),
         };
         let key = RunnerKey::new("sha256:ci");
         let mut client = CiClient::new(Endpoint("weida://ci/".to_owned()), "ci".to_owned());

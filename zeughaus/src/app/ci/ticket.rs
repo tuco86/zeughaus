@@ -38,6 +38,8 @@ const SIDE_WIDTH: f32 = 280.0;
 const EDITOR_HEIGHT: f32 = 400.0;
 /// The overall feedback of a review.
 const OVERALL_HEIGHT: f32 = 80.0;
+/// An agent's open ask over the tabs, past which it scrolls.
+const ASK_MAX_HEIGHT: f32 = 320.0;
 /// The most sessions the side column lists.
 const SESSIONS_SHOWN: usize = 5;
 /// The longest linked title a chip shows, in characters.
@@ -539,7 +541,7 @@ impl App {
     }
 
     /// A pill: the primary one filled.
-    fn ticket_pill<'a>(
+    pub(super) fn ticket_pill<'a>(
         &self,
         words: impl iced::widget::text::IntoFragment<'a>,
         primary: bool,
@@ -720,6 +722,18 @@ impl App {
                 muted
             };
             top = top.push(text(notice.text.as_str()).size(TEXT_SM).color(color));
+        }
+        if let Some(ask) = client
+            .asks()
+            .find(|ask| ask.repo == doc.repo && ask.doc == Some(number))
+        {
+            top = top.push(
+                container(scroll::vertical(
+                    container(self.ask_form(&popout.ci, client, ask)).padding(SP_3),
+                ))
+                .max_height(ASK_MAX_HEIGHT)
+                .style(style::card(&t)),
+            );
         }
         let mut tabs = row![].spacing(SP_2);
         let proposal = popout.tab == TicketTab::Proposal;

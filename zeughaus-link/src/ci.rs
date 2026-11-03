@@ -431,6 +431,28 @@ pub enum CiRequest {
         #[serde(default)]
         refresh: bool,
     },
+    /// Posts an agent's ask for `holder`, replacing an earlier one of the
+    /// same terminal. Answers [`CiReply::Ask`].
+    AskPost {
+        holder: ClaimHolder,
+        #[serde(default)]
+        repo: String,
+        #[serde(default)]
+        doc: Option<u64>,
+        questions: Vec<crate::ask::AskQuestion>,
+    },
+    /// Renews ask `id` of `holder` and returns it, with its answer once
+    /// there is one. Answers [`CiReply::Ask`]; an error `no ask <id>` when
+    /// it is gone.
+    AskPoll { id: u64, holder: ClaimHolder },
+    /// The user's answer from an editor. Answers [`CiReply::Accepted`].
+    AskAnswer {
+        id: u64,
+        replies: Vec<crate::ask::AskReply>,
+    },
+    /// Drops the ask of `holder`: answered in its terminal, or no longer
+    /// wanted. Answers [`CiReply::Accepted`].
+    AskClose { holder: ClaimHolder },
 }
 
 /// The one frame of a download on [`crate::STATE_PATH`]: version `version`
@@ -630,6 +652,9 @@ pub enum CiReply {
         request: u64,
         tickets: Vec<u64>,
     },
+    Ask {
+        ask: crate::ask::AskView,
+    },
     Error {
         message: String,
     },
@@ -661,6 +686,9 @@ pub struct CiOverview {
     /// The CI's Claude sign-in; `None` without `[claude]`.
     #[serde(default)]
     pub claude: Option<ClaudeView>,
+    /// The open asks of agents, unanswered ones only.
+    #[serde(default)]
+    pub asks: Vec<crate::ask::AskView>,
 }
 
 /// Where the CI's Claude sign-in stands. Seconds since the UNIX epoch.
@@ -2081,9 +2109,59 @@ mod tests {
                 facts: "- forge: forgejo\n".to_owned(),
                 refresh: true,
             },
+            CiRequest::AskPost {
+                holder: ask_view().holder,
+                repo: "zeughaus".to_owned(),
+                doc: Some(49),
+                questions: ask_view().questions,
+            },
+            CiRequest::AskPoll {
+                id: 3,
+                holder: ask_view().holder,
+            },
+            CiRequest::AskAnswer {
+                id: 3,
+                replies: ask_view().answer.unwrap_or_default(),
+            },
+            CiRequest::AskClose {
+                holder: ask_view().holder,
+            },
         ];
         for request in requests {
             assert_eq!(CiRequest::decode(&request.encode()), Some(request));
+        }
+    }
+
+    fn ask_view() -> crate::ask::AskView {
+        crate::ask::AskView {
+            id: 3,
+            holder: ClaimHolder {
+                runner: "atik".to_owned(),
+                terminal: 12,
+                session: Some(57),
+            },
+            repo: "zeughaus".to_owned(),
+            doc: Some(49),
+            label: "plan zeughaus #49".to_owned(),
+            questions: vec![crate::ask::AskQuestion {
+                id: "db".to_owned(),
+                question: "Database?".to_owned(),
+                options: vec![crate::ask::AskOption {
+                    label: "SQLite".to_owned(),
+                    description: Some("a file".to_owned()),
+                    preview: None,
+                }],
+                multi: false,
+                recommended: Some(0),
+                header: Some("Storage".to_owned()),
+            }],
+            asked: 1,
+            polled: 2,
+            answer: Some(vec![crate::ask::AskReply {
+                id: "db".to_owned(),
+                selected: vec!["SQLite".to_owned()],
+                custom: Some("with WAL".to_owned()),
+            }]),
         }
     }
 
@@ -2155,6 +2233,7 @@ mod tests {
                         expires: 3,
                         error: None,
                     }),
+                    asks: vec![ask_view()],
                 },
             },
             CiReply::Pipelines {
@@ -2263,6 +2342,7 @@ mod tests {
                 request: 4,
                 tickets: vec![5, 6],
             },
+            CiReply::Ask { ask: ask_view() },
             CiReply::Advice {
                 advice: Box::new(crate::advice::AdviceView {
                     origin: "github.com/o/site".to_owned(),

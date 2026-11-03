@@ -25,10 +25,11 @@ use serde::{Deserialize, Serialize};
 use zeughaus_link::enlist::{FromRunner, SessionReport, SessionSpec, ToRunner};
 use zeughaus_link::selector::{Selector, parse_runs_on};
 use zeughaus_link::{
-    ClaimHolder, ClaimSubject, ClaimView, DocKind, DocState, DocView, SessionKind, SessionMachine,
-    SessionState, SessionView, normalize_origin,
+    AskQuestion, AskReply, AskView, ClaimHolder, ClaimSubject, ClaimView, DocKind, DocState,
+    DocView, SessionKind, SessionMachine, SessionState, SessionView, normalize_origin,
 };
 
+use crate::asks;
 use crate::claims;
 use crate::config::{CiConfig, Shared};
 use crate::docs;
@@ -52,6 +53,13 @@ struct Book {
     /// The live claims; renewals write them without an announcement.
     #[serde(default)]
     claims: Vec<ClaimView>,
+    /// The open asks; they live in memory only and go with a restart, which
+    /// the waiting process answers by posting again.
+    #[serde(skip)]
+    asks: Vec<AskView>,
+    /// Persisted so that ask ids are not reused after a restart.
+    #[serde(default)]
+    next_ask: u64,
 }
 
 pub struct Sessions {
@@ -252,7 +260,7 @@ impl Sessions {
     pub fn dispatch(&self, now: u64) {
         {
             let mut book = lock(&self.book);
-            if claims::expire(&mut book.claims, now) {
+            if claims::expire(&mut book.claims, now) | asks::expire(&mut book.asks, now) {
                 self.changed(&mut book);
             }
         }
@@ -787,11 +795,7 @@ impl Sessions {
             }
         };
         let mut book = lock(&self.book);
-        let session = book.list.iter().find(|s| {
-            s.state.is_live()
-                && s.runner == holder.runner
-                && (holder.session == Some(s.id) || s.terminal == Some(holder.terminal))
-        });
+        let session = holder_session(&book, &holder);
         holder.session = session.map(|s| s.id);
         let label = session.map(session_label).unwrap_or_default();
         let before = book.claims.len();
@@ -818,6 +822,76 @@ impl Sessions {
         if claims::release(&mut book.claims, holder, subject) {
             self.changed(&mut book);
         }
+    }
+
+    /// Posts an ask for `holder` (see [`asks::post`]). The holder's live CI
+    /// session, when there is one, names the repository, ticket and label.
+    pub fn ask(
+        &self,
+        mut holder: ClaimHolder,
+        mut repo: String,
+        mut doc: Option<u64>,
+        questions: Vec<AskQuestion>,
+        now: u64,
+    ) -> Result<AskView, String> {
+        if !crate::config::valid_name(&holder.runner) {
+            return Err(format!("runner name {:?} is not valid", holder.runner));
+        }
+        let mut book = lock(&self.book);
+        let mut label = String::new();
+        if let Some(session) = holder_session(&book, &holder) {
+            repo.clone_from(&session.repo);
+            doc = session.doc;
+            label = session_label(session);
+            holder.session = Some(session.id);
+        }
+        let book = &mut *book;
+        let ask = asks::post(
+            &mut book.asks,
+            &mut book.next_ask,
+            holder,
+            repo,
+            doc,
+            label,
+            questions,
+            now,
+        )?;
+        self.changed(book);
+        Ok(ask)
+    }
+
+    /// Renews ask `id` of `holder` and returns it; a renewal is neither
+    /// written nor announced.
+    pub fn ask_poll(&self, id: u64, holder: &ClaimHolder, now: u64) -> Result<AskView, String> {
+        asks::poll(&mut lock(&self.book).asks, id, holder, now)
+    }
+
+    /// Stores the user's answer to ask `id`.
+    pub fn ask_answer(&self, id: u64, replies: Vec<AskReply>) -> Result<(), String> {
+        let mut book = lock(&self.book);
+        asks::answer(&mut book.asks, id, replies)?;
+        self.changed(&mut book);
+        Ok(())
+    }
+
+    /// Drops the ask of `holder`.
+    pub fn ask_close(&self, holder: &ClaimHolder) {
+        let mut book = lock(&self.book);
+        if asks::close(&mut book.asks, holder) {
+            self.changed(&mut book);
+        }
+    }
+
+    /// The unanswered asks, in id order.
+    pub fn asks(&self) -> Vec<AskView> {
+        let mut asks: Vec<AskView> = lock(&self.book)
+            .asks
+            .iter()
+            .filter(|a| a.answer.is_none())
+            .cloned()
+            .collect();
+        asks.sort_by_key(|a| a.id);
+        asks
     }
 
     /// Who is responsible for pipeline `number` of `repo` (see
@@ -910,6 +984,15 @@ fn end(session: &mut SessionView, code: Option<i32>, killed: bool, now: u64) {
         (Some(code), false) => format!("exit {code}"),
         (None, false) => "ended without a code".to_owned(),
     };
+}
+
+/// The live session of `holder`, by its id or by its terminal.
+fn holder_session<'a>(book: &'a Book, holder: &ClaimHolder) -> Option<&'a SessionView> {
+    book.list.iter().find(|s| {
+        s.state.is_live()
+            && s.runner == holder.runner
+            && (holder.session == Some(s.id) || s.terminal == Some(holder.terminal))
+    })
 }
 
 /// `master zeughaus #38`, `plan zeughaus`: a session as the editor names it.

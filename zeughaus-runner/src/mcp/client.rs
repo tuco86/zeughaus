@@ -355,6 +355,8 @@ fn retries(request: &CiRequest) -> bool {
         | CiRequest::Session { .. }
         | CiRequest::Responsible { .. }
         | CiRequest::States { .. }
+        // A renewal repeated is harmless.
+        | CiRequest::AskPoll { .. }
         // The token in memory: a renewal it may trigger is not repeated.
         | CiRequest::ClaudeToken => true,
         CiRequest::OpenTranscript { .. }
@@ -381,6 +383,9 @@ fn retries(request: &CiRequest) -> bool {
         | CiRequest::ClaudeStart
         | CiRequest::ClaudeFinish { .. }
         | CiRequest::Onboard { .. }
+        | CiRequest::AskPost { .. }
+        | CiRequest::AskAnswer { .. }
+        | CiRequest::AskClose { .. }
         // Each answer that is not kept costs a model call.
         | CiRequest::Advise { .. }
         | CiRequest::Reevaluate { .. } => false,
@@ -775,6 +780,7 @@ mod tests {
                             sessions: Vec::new(),
                             claims: Vec::new(),
                             claude: None,
+                            asks: Vec::new(),
                         },
                     },
                     _ => CiReply::Error {

@@ -31,6 +31,8 @@
 //! zeughaus-runner ci renew
 //! zeughaus-runner ci release [<repo> ticket|pipeline <n>]
 //! zeughaus-runner ci responsible [--json] <repo> <n>
+//! zeughaus-runner ci ask <file>
+//! zeughaus-runner ci ask-close
 //! zeughaus-runner plan <repo> --branch <branch> --origin <origin> [--ticket <n> [--resume <file>]]
 //! zeughaus-runner master <repo> --ticket <n> --branch <branch> --origin <origin>
 //! zeughaus-runner maintain
@@ -74,6 +76,8 @@ usage: zeughaus-runner [--state-dir <dir>] [--feed-addr <host:port>] [--keep-run
        zeughaus-runner ci renew
        zeughaus-runner ci release [<repo> ticket|pipeline <n>]
        zeughaus-runner ci responsible [--json] <repo> <n>
+       zeughaus-runner ci ask <file>
+       zeughaus-runner ci ask-close
        zeughaus-runner plan <repo> --branch <branch> --origin <origin> [--ticket <n> [--resume <file>]]
        zeughaus-runner master <repo> --ticket <n> --branch <branch> --origin <origin>
        zeughaus-runner maintain
