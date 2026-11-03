@@ -10,7 +10,6 @@
 //! Whether the CI can onboard the origin at all is the CI's own answer
 //! ([`AdviceView::refusal`]), never the model's.
 
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -18,15 +17,16 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeughaus_link::{
-    AdviceView, MAX_FACTS_BYTES, MAX_OPERATIONS, OnboardSettings, Operation, normalize_origin,
+    AdviceView, Card, CardTicket, MAX_CARD_TICKETS, MAX_CARDS, MAX_FACTS_BYTES, OnboardSettings,
+    normalize_origin,
 };
 
 use crate::claude::{self, Claude};
 use crate::config::{AdviceConfig, CiConfig, valid_env_name, valid_name};
 use crate::pipeline::Pattern;
 
-/// The longest the model may write.
-const MAX_TOKENS: u32 = 2048;
+/// The longest the model may write: cards of tickets with proposals.
+const MAX_TOKENS: u32 = 8192;
 
 /// How long one call may take, in seconds.
 const TIMEOUT_SECS: u32 = 90;
@@ -38,6 +38,12 @@ const BODY_CHARS: usize = 2000;
 
 /// The most status lines kept.
 const MAX_STATUS: usize = 8;
+
+/// The longest ticket key and skill name kept, in characters.
+const KEY_CHARS: usize = 40;
+
+/// The most skills one ticket names.
+const MAX_SKILLS: usize = 6;
 
 /// The tool the model must call.
 const TOOL: &str = "advise";
@@ -101,12 +107,8 @@ pub fn advise(
                 .take(MAX_STATUS)
                 .map(|line| clip(line, LINE_CHARS))
                 .collect();
-            view.operations = advised
-                .operations
-                .into_iter()
-                .take(MAX_OPERATIONS)
-                .map(|operation| fit(operation, config, &origin))
-                .collect();
+            view.onboard = fit_settings(advised.onboard, config, &origin);
+            view.cards = fit_cards(advised.cards);
             view.model.clone_from(&advice.model);
             view.created = crate::now_secs();
             if let Err(e) = crate::files::write_json(
@@ -192,17 +194,26 @@ fn system_prompt(config: &CiConfig) -> String {
     prompt.push_str(
         "\nStatus: the facts that matter for joining (where the repository lives and what \
          mirrors it, what it builds with, any CI it has).\n\
-         Operations: 1 to 4, the most useful first. Kinds: `onboard` (join as it is, with build \
-         and check jobs), `migrate` (move to the Forgejo first, then join), `follow` (rebuild \
-         when another repository of the CI changes, named in an event `push main of <repo>`), \
-         `deploy` (deploy to a host the runners reach, with the secrets and host prerequisites \
-         that needs), `other`. Each operation's settings are what its onboarding request \
-         would file: platforms only from the list above, events only in the forms above, the \
-         name lowercase letters, digits and dashes. The body says what the operation does and \
-         which jobs it would add.\n\
+         Onboard: the onboarding request's settings: the name (lowercase letters, digits and \
+         dashes), the default branch, the secrets a job will need by the events they are \
+         released to, and host prerequisites the owner sets up by hand.\n\
+         Cards: 2 to 6 pieces of work the owner picks from, the most useful first, `chosen` \
+         for those you would do in any case. Kinds: `build` (build and check jobs in \
+         `.zeughaus-ci/`), `migrate` (move the repository to the Forgejo), `follow` (rebuild \
+         when another repository of the CI changes, an event `push main of <repo>`), `deploy` \
+         (deploy to a host the runners reach), `other` (fixes the project needs before its \
+         pipeline can be green, documentation, tests). A card files 1 to 4 tickets. A ticket \
+         is one task a plan session plans and an agent then carries out in the repository: \
+         its `proposal` says what to do and why, concretely enough to plan from (which jobs, \
+         which events and platforms from the lists above, which files). `key` is a short \
+         unique word; `depends_on` names the keys of tickets, of any card, it has to wait for \
+         (the jobs before the deploy that uses their output). `skills` names installed skills \
+         from the facts its agents should read first. `auto` is true for a ticket whose plan \
+         may run without the owner reviewing it (routine work), false where the owner should \
+         look at the plan first (anything that deploys, deletes, moves or spends).\n\
          Base everything on the facts and say what you do not know rather than guess. Be \
-         brief: titles under 60 characters, status lines under 12 words, bodies under 120 \
-         words.\n",
+         brief: titles under 60 characters, status lines under 12 words, card bodies under 60 \
+         words, proposals under 150 words.\n",
     );
     prompt
 }
@@ -211,13 +222,11 @@ fn system_prompt(config: &CiConfig) -> String {
 /// the model must call.
 fn request_body(advice: &AdviceConfig, system: &str, facts: &str) -> String {
     let strings = serde_json::json!({ "type": "array", "items": { "type": "string" } });
-    let settings = serde_json::json!({
+    let onboard = serde_json::json!({
         "type": "object",
         "properties": {
             "name": { "type": "string" },
             "default_branch": { "type": "string" },
-            "events": strings,
-            "platforms": strings,
             "grants": {
                 "type": "object",
                 "description": "secret name to the event patterns it is released to",
@@ -225,28 +234,42 @@ fn request_body(advice: &AdviceConfig, system: &str, facts: &str) -> String {
             },
             "prerequisites": strings,
         },
-        "required": ["name", "default_branch", "events", "platforms"],
+        "required": ["name", "default_branch"],
+    });
+    let ticket = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "key": { "type": "string" },
+            "title": { "type": "string" },
+            "proposal": { "type": "string", "description": "Markdown" },
+            "skills": strings,
+            "depends_on": strings,
+            "auto": { "type": "boolean" },
+        },
+        "required": ["key", "title", "proposal", "depends_on", "auto"],
     });
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
             "summary": { "type": "string", "description": "what the project is, 2 or 3 sentences" },
             "status": strings,
-            "operations": {
+            "onboard": onboard,
+            "cards": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "kind": { "type": "string", "enum": ["onboard", "migrate", "follow", "deploy", "other"] },
+                        "kind": { "type": "string", "enum": ["build", "migrate", "follow", "deploy", "other"] },
                         "title": { "type": "string" },
                         "body": { "type": "string", "description": "Markdown" },
-                        "settings": settings,
+                        "chosen": { "type": "boolean" },
+                        "tickets": { "type": "array", "items": ticket },
                     },
-                    "required": ["kind", "title", "body", "settings"],
+                    "required": ["kind", "title", "body", "chosen", "tickets"],
                 },
             },
         },
-        "required": ["summary", "status", "operations"],
+        "required": ["summary", "status", "onboard", "cards"],
     });
     serde_json::json!({
         "model": advice.model,
@@ -300,7 +323,9 @@ struct Advised {
     #[serde(default)]
     status: Vec<String>,
     #[serde(default)]
-    operations: Vec<Operation>,
+    onboard: OnboardSettings,
+    #[serde(default)]
+    cards: Vec<Card>,
 }
 
 /// The input of the `advise` tool call in a Messages API reply.
@@ -320,18 +345,16 @@ fn parse_reply(reply: &str) -> Result<Advised, String> {
     serde_json::from_value(input).map_err(|e| format!("the model's advice: {e}"))
 }
 
-/// `operation` cut to what the CI can file: its platforms, readable event
-/// patterns, a valid name and secret names, short texts.
-fn fit(operation: Operation, config: &CiConfig, origin: &str) -> Operation {
+/// The onboarding settings cut to what the CI can file: a valid name
+/// (else the origin's), a branch, secret names with event patterns that
+/// parse and follow one of its repositories, short prerequisites.
+fn fit_settings(settings: OnboardSettings, config: &CiConfig, origin: &str) -> OnboardSettings {
     let OnboardSettings {
         name,
         default_branch,
-        events,
-        platforms,
         grants,
         prerequisites,
-    } = operation.settings;
-    // A followed repository must be one of the CI's.
+    } = settings;
     let readable = |event: &String| match Pattern::parse(event) {
         Ok(Pattern::Upstream { repo, .. }) => config.repos.contains_key(&repo),
         Ok(_) => true,
@@ -351,31 +374,112 @@ fn fit(operation: Operation, config: &CiConfig, origin: &str) -> Operation {
         "" => "main".to_owned(),
         branch => branch.to_owned(),
     };
-    let grants: BTreeMap<String, Vec<String>> = grants
-        .into_iter()
-        .filter(|(secret, _)| valid_env_name(secret))
-        .map(|(secret, events)| (secret, events.into_iter().filter(readable).collect()))
-        .collect();
-    Operation {
-        kind: operation.kind,
-        title: clip(&operation.title, TITLE_CHARS),
-        body: clip(&operation.body, BODY_CHARS),
-        settings: OnboardSettings {
-            name,
-            default_branch,
-            events: events.into_iter().filter(readable).collect(),
-            platforms: platforms
-                .into_iter()
-                .filter(|p| config.platforms.contains_key(p))
-                .collect(),
-            grants,
-            prerequisites: prerequisites
-                .iter()
-                .map(|line| clip(line, LINE_CHARS))
-                .filter(|line| !line.is_empty())
-                .collect(),
-        },
+    OnboardSettings {
+        name,
+        default_branch,
+        grants: grants
+            .into_iter()
+            .filter(|(secret, _)| valid_env_name(secret))
+            .map(|(secret, events)| (secret, events.into_iter().filter(readable).collect()))
+            .collect(),
+        prerequisites: prerequisites
+            .iter()
+            .map(|line| clip(line, LINE_CHARS))
+            .filter(|line| !line.is_empty())
+            .collect(),
     }
+}
+
+/// The cards cut to what can be filed: at most [`MAX_CARDS`] of at most
+/// [`MAX_CARD_TICKETS`] tickets with unique keys, dependencies only on
+/// tickets that exist and never in a circle (a dependency that would
+/// close one is dropped), short texts; a card without tickets goes.
+fn fit_cards(cards: Vec<Card>) -> Vec<Card> {
+    let mut keys: Vec<String> = Vec::new();
+    let mut cards: Vec<Card> = cards
+        .into_iter()
+        .take(MAX_CARDS)
+        .map(|card| {
+            let tickets = card
+                .tickets
+                .into_iter()
+                .take(MAX_CARD_TICKETS)
+                .filter_map(|ticket| {
+                    let key = clip(&ticket.key, KEY_CHARS);
+                    if key.is_empty() || keys.contains(&key) || ticket.title.trim().is_empty() {
+                        return None;
+                    }
+                    keys.push(key.clone());
+                    Some(CardTicket {
+                        key,
+                        title: clip(&ticket.title, TITLE_CHARS),
+                        proposal: clip(&ticket.proposal, BODY_CHARS),
+                        skills: ticket
+                            .skills
+                            .iter()
+                            .map(|skill| clip(skill, KEY_CHARS))
+                            .filter(|skill| !skill.is_empty())
+                            .take(MAX_SKILLS)
+                            .collect(),
+                        depends_on: ticket.depends_on,
+                        auto: ticket.auto,
+                    })
+                })
+                .collect();
+            Card {
+                kind: card.kind,
+                title: clip(&card.title, TITLE_CHARS),
+                body: clip(&card.body, BODY_CHARS),
+                chosen: card.chosen,
+                tickets,
+            }
+        })
+        .filter(|card| !card.tickets.is_empty())
+        .collect();
+    // Dependencies in reading order, each kept only when it closes no
+    // circle with those kept before it.
+    let mut kept: Vec<(String, String)> = Vec::new();
+    for card in &mut cards {
+        for ticket in &mut card.tickets {
+            let wanted = std::mem::take(&mut ticket.depends_on);
+            for on in wanted {
+                let on = on.trim().to_owned();
+                if on == ticket.key
+                    || !keys.contains(&on)
+                    || ticket.depends_on.contains(&on)
+                    || reaches(&kept, &on, &ticket.key)
+                {
+                    continue;
+                }
+                kept.push((ticket.key.clone(), on.clone()));
+                ticket.depends_on.push(on);
+            }
+        }
+    }
+    cards
+}
+
+/// Whether `from` depends on `to` through `edges` (ticket, what it waits
+/// for).
+fn reaches(edges: &[(String, String)], from: &str, to: &str) -> bool {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut open = vec![from];
+    while let Some(at) = open.pop() {
+        if at == to {
+            return true;
+        }
+        if seen.contains(&at) {
+            continue;
+        }
+        seen.push(at);
+        open.extend(
+            edges
+                .iter()
+                .filter(|(ticket, _)| ticket == at)
+                .map(|(_, on)| on.as_str()),
+        );
+    }
+    false
 }
 
 /// `text` trimmed and cut after `limit` characters.
@@ -386,7 +490,7 @@ fn clip(text: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeughaus_link::OperationKind;
+    use zeughaus_link::CardKind;
 
     fn config() -> CiConfig {
         CiConfig::parse(
@@ -399,58 +503,94 @@ mod tests {
     }
 
     #[test]
-    fn an_operation_keeps_only_what_the_ci_can_file() {
-        let operation = Operation {
-            kind: OperationKind::Follow,
-            title: "Follow weida".to_owned(),
-            body: "Rebuild.".to_owned(),
-            settings: OnboardSettings {
-                name: "Weida_Site".to_owned(),
-                default_branch: " ".to_owned(),
-                events: vec![
-                    "push main of weida".to_owned(),
-                    "on every commit".to_owned(),
-                ],
-                platforms: vec!["linux-amd64".to_owned(), "plan9".to_owned()],
-                grants: [
-                    (
-                        "DEPLOY_KEY".to_owned(),
-                        vec!["push main".to_owned(), "always".to_owned()],
-                    ),
-                    ("deploy key".to_owned(), vec!["push main".to_owned()]),
-                ]
-                .into(),
-                prerequisites: vec!["  a served directory ".to_owned(), " ".to_owned()],
-            },
+    fn the_settings_keep_only_what_the_ci_can_file() {
+        let settings = OnboardSettings {
+            name: "Weida_Site".to_owned(),
+            default_branch: " ".to_owned(),
+            grants: [
+                (
+                    "DEPLOY_KEY".to_owned(),
+                    vec![
+                        "push main".to_owned(),
+                        "push main of nowhere".to_owned(),
+                        "always".to_owned(),
+                    ],
+                ),
+                ("deploy key".to_owned(), vec!["push main".to_owned()]),
+            ]
+            .into(),
+            prerequisites: vec!["  a served directory ".to_owned(), " ".to_owned()],
         };
-        let fitted = fit(
-            operation,
-            &config(),
-            "git.doodleshnookie.net/tuco86/weida_site",
-        );
         assert_eq!(
-            fitted.settings,
+            fit_settings(
+                settings,
+                &config(),
+                "git.doodleshnookie.net/tuco86/weida_site"
+            ),
             OnboardSettings {
                 name: "weida-site".to_owned(),
                 default_branch: "main".to_owned(),
-                events: vec!["push main of weida".to_owned()],
-                platforms: vec!["linux-amd64".to_owned()],
                 grants: [("DEPLOY_KEY".to_owned(), vec!["push main".to_owned()])].into(),
                 prerequisites: vec!["a served directory".to_owned()],
             }
         );
     }
 
+    fn ticket(key: &str, depends_on: &[&str]) -> CardTicket {
+        CardTicket {
+            key: key.to_owned(),
+            title: format!("Do {key}"),
+            proposal: "p".to_owned(),
+            skills: Vec::new(),
+            depends_on: depends_on.iter().map(|on| (*on).to_owned()).collect(),
+            auto: false,
+        }
+    }
+
+    #[test]
+    fn cards_keep_unique_keys_and_no_circles_or_strangers_among_dependencies() {
+        let card = |tickets| Card {
+            kind: CardKind::Build,
+            title: "c".to_owned(),
+            body: String::new(),
+            chosen: true,
+            tickets,
+        };
+        let fitted = fit_cards(vec![
+            card(vec![
+                ticket("jobs", &["deploy", "nobody", "jobs"]),
+                ticket("jobs", &[]),
+            ]),
+            card(vec![ticket("deploy", &["jobs", "jobs"])]),
+            card(Vec::new()),
+        ]);
+        let edges: Vec<(&str, Vec<&str>)> = fitted
+            .iter()
+            .flat_map(|card| &card.tickets)
+            .map(|t| {
+                (
+                    t.key.as_str(),
+                    t.depends_on.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        // The first dependency read stands; the one that would close the
+        // circle goes, as do the unknown one, the self link, the duplicate
+        // key and the empty card.
+        assert_eq!(edges, [("jobs", vec!["deploy"]), ("deploy", vec![])]);
+    }
+
     #[test]
     fn the_advice_is_the_input_of_the_tool_call() {
         let reply = r#"{"content":[{"type":"text","text":"Here."},
             {"type":"tool_use","name":"advise","input":{"summary":"A site.",
-            "status":["on GitHub"],"operations":[{"kind":"migrate","title":"Move",
-            "body":"b","settings":{"name":"site","default_branch":"main","events":[],
-            "platforms":[]}}]}}]}"#;
+            "status":["on GitHub"],"onboard":{"name":"site","default_branch":"main"},
+            "cards":[{"kind":"migrate","title":"Move","body":"b","chosen":true,
+            "tickets":[{"key":"move","title":"Move it","proposal":"p","depends_on":[],"auto":false}]}]}}]}"#;
         let advised = parse_reply(reply).unwrap();
         assert_eq!(advised.summary, "A site.");
-        assert_eq!(advised.operations[0].kind, OperationKind::Migrate);
+        assert_eq!(advised.cards[0].kind, CardKind::Migrate);
+        assert_eq!(advised.cards[0].tickets[0].key, "move");
         assert_eq!(
             parse_reply(r#"{"content":[{"type":"text","text":"no"}]}"#).unwrap_err(),
             "the model called no tool"

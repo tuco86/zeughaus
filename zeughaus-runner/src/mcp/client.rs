@@ -370,6 +370,7 @@ fn retries(request: &CiRequest) -> bool {
         | CiRequest::StateDelete { .. }
         | CiRequest::ClaudeStart
         | CiRequest::ClaudeFinish { .. }
+        | CiRequest::Onboard { .. }
         // Each answer that is not kept costs a model call.
         | CiRequest::Advise { .. } => false,
     }

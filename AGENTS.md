@@ -148,11 +148,15 @@ sections that are folded, deleted or annotated with an overall note for
 on`, `related`, added by `#n`), the tickets it includes, its sessions and
 who holds it. The Board of a project no CI builds
 shows what the first CI advises (its `[advice]` model's summary, status
-lines and ways to join, from the facts the local runner gathers about the
-project; `Ask again` asks past the CI's kept answer) and an onboarding
-form: name, default branch, events, a repository it follows, platforms,
-secrets (`NAME: event, event; ...`), host prerequisites and notes; picking
-one of the ways fills it, and `File onboarding request` files it. A channel
+lines and cards of work, from the facts the local runner gathers about the
+project, the skills installed there among them; `Ask again` asks past the
+CI's kept answer). A card files one to four tickets with proposals, the
+skills to read first and links to tickets of other cards; a press chooses
+it, a ticket's chip switches it between `runs through` (its plan is
+approved as it arrives) and `review`. Below them the preview lists what
+`Onboard with N tickets` files in one step: the onboarding request,
+already approved, and the chosen tickets, ready and linked, which wait
+for the join and then run in the order their links allow. A channel
 lists its pipelines one
 row each, newest on top and open with its jobs, a cable animating while its
 artifact set moves, failures with their cause and log excerpt, `Rerun` and

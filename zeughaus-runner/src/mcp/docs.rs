@@ -137,6 +137,7 @@ mod tests {
             plan_text: String::new(),
             revision: 0,
             planner: None,
+            auto_approve: false,
             feedback: String::new(),
             onboard: None,
             note: String::new(),

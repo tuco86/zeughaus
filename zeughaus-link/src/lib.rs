@@ -51,7 +51,8 @@ pub use activity::{
     ActivityState, AgentRole, AgentState, AgentStatus, MAX_ACTIVITY_ENTRIES,
 };
 pub use advice::{
-    AdviceView, MAX_FACTS_BYTES, MAX_OPERATIONS, OnboardSettings, Operation, OperationKind,
+    AdviceView, Card, CardKind, CardTicket, MAX_CARD_TICKETS, MAX_CARDS, MAX_FACTS_BYTES,
+    NewTicket, OnboardSettings,
 };
 pub use ci::{
     CLAIM_LEASE_SECS, CLAUDE_CALLBACK, ChannelView, CiOverview, CiReply, CiRequest, ClaimHolder,

@@ -210,6 +210,31 @@ impl CiServer {
                     Err(e) => error(&e),
                 }
             }
+            CiRequest::Onboard {
+                repo,
+                title,
+                body,
+                spec,
+                tickets,
+            } => {
+                let request = docs::NewDoc {
+                    kind: zeughaus_link::DocKind::Onboarding,
+                    title: &title,
+                    body: &body,
+                    source: "user",
+                    links: &[],
+                    runs_on: &[],
+                    onboard: Some(&spec),
+                };
+                let made = self.change_docs(&repo, |state, config, now| {
+                    docs::onboard(state, config, &repo, request, &tickets, now)
+                        .map(|made| (made, true))
+                });
+                match made {
+                    Ok((request, tickets)) => CiReply::Onboarded { request, tickets },
+                    Err(e) => error(&e),
+                }
+            }
             CiRequest::DocState {
                 repo,
                 number,

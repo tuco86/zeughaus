@@ -13,6 +13,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use zeughaus_link::NewTicket;
 use zeughaus_link::ci::{
     DocKind, DocLink, DocState, DocView, LinkKind, MAX_DOC_BYTES, MAX_DOC_TITLE_BYTES, OnboardSpec,
     Planner, RepoDocsView, normalize_origin, plan_title, runs_on_named,
@@ -25,6 +26,9 @@ use crate::files::{read_json, write_atomic, write_json};
 /// The most links one ticket carries, and the most tickets one plan
 /// includes.
 const MAX_LINKS: usize = 32;
+
+/// The most tickets one onboarding files.
+const MAX_ONBOARD_TICKETS: usize = 24;
 
 /// The longest `source` a document may carry.
 const MAX_SOURCE_BYTES: usize = 100;
@@ -419,6 +423,7 @@ pub fn create(
         plan_text: String::new(),
         revision: 0,
         planner: None,
+        auto_approve: false,
         feedback: String::new(),
         onboard,
         note: String::new(),
@@ -426,6 +431,143 @@ pub fn create(
     write_json(&path_of(&dir, number), &doc)?;
     write_atomic(&dir.join("last"), number.to_string().as_bytes())?;
     Ok(number)
+}
+
+/// Onboards `repo` in one step for its owner: stores its onboarding
+/// request already `approved` (the onboarding worker takes it from there)
+/// and `tickets` behind it, `ready` and in their order, each linked to the
+/// tickets it depends on by their index. The tickets wait in the planning
+/// queue until the repository has joined `ci.toml`. Answers the request's
+/// number and the tickets'. A refusal writes nothing.
+pub fn onboard(
+    state_dir: &Path,
+    config: &CiConfig,
+    repo: &str,
+    request: NewDoc<'_>,
+    tickets: &[NewTicket],
+    now: u64,
+) -> Result<(u64, Vec<u64>), String> {
+    let Some(spec) = request.onboard else {
+        return Err("an onboarding request names the repository it asks for".to_owned());
+    };
+    let spec = crate::onboard::check_request(state_dir, config, repo, spec)?;
+    let title = checked_title(request.title)?;
+    check_body(request.body)?;
+    if !valid_source(request.source) {
+        return Err(format!(
+            "a source is 1 to {MAX_SOURCE_BYTES} of A-Z a-z 0-9 . _ -"
+        ));
+    }
+    if tickets.len() > MAX_ONBOARD_TICKETS {
+        return Err(format!(
+            "an onboarding files at most {MAX_ONBOARD_TICKETS} tickets"
+        ));
+    }
+    for (at, ticket) in tickets.iter().enumerate() {
+        checked_title(&ticket.title)?;
+        check_body(&ticket.body)?;
+        if ticket.depends_on.len() > MAX_LINKS {
+            return Err(format!("a ticket has at most {MAX_LINKS} links"));
+        }
+        if let Some(bad) = ticket
+            .depends_on
+            .iter()
+            .find(|&&on| on >= tickets.len() || on == at)
+        {
+            return Err(format!(
+                "ticket {} depends on {bad}, which is no other ticket of the onboarding",
+                at + 1
+            ));
+        }
+    }
+    let depends = |of: u64| -> Vec<u64> {
+        tickets
+            .get(of as usize)
+            .map(|t| t.depends_on.iter().map(|&on| on as u64).collect())
+            .unwrap_or_default()
+    };
+    for (at, ticket) in tickets.iter().enumerate() {
+        for &on in &ticket.depends_on {
+            if path_to(on as u64, at as u64, &depends).is_some() {
+                return Err(format!(
+                    "the onboarding's tickets {} and {} depend on each other",
+                    at + 1,
+                    on + 1
+                ));
+            }
+        }
+    }
+    let dir = docs_root(state_dir).join(repo);
+    let first = last_number(&dir) + 1;
+    let numbers: Vec<u64> = (0..tickets.len() as u64).map(|at| first + 1 + at).collect();
+    let doc = |number: u64, kind: DocKind, state: DocState, title: &str, body: &str| DocView {
+        repo: repo.to_owned(),
+        number,
+        kind,
+        title: title.to_owned(),
+        state,
+        source: request.source.to_owned(),
+        created: now,
+        changed: now,
+        approved: None,
+        released: None,
+        links: Vec::new(),
+        merged: Vec::new(),
+        into: None,
+        runs_on: Vec::new(),
+        placement: Vec::new(),
+        body: body.to_owned(),
+        plan_text: String::new(),
+        revision: 0,
+        planner: None,
+        auto_approve: false,
+        feedback: String::new(),
+        onboard: None,
+        note: String::new(),
+    };
+    let mut written = vec![DocView {
+        approved: Some(now),
+        onboard: Some(spec),
+        ..doc(
+            first,
+            DocKind::Onboarding,
+            DocState::Approved,
+            title,
+            request.body,
+        )
+    }];
+    for (ticket, &number) in tickets.iter().zip(&numbers) {
+        let mut links: Vec<DocLink> = Vec::new();
+        for &on in &ticket.depends_on {
+            let link = DocLink {
+                kind: LinkKind::DependsOn,
+                number: numbers[on],
+            };
+            if !links.contains(&link) {
+                links.push(link);
+            }
+        }
+        written.push(DocView {
+            released: Some(now),
+            links,
+            auto_approve: ticket.auto_approve,
+            ..doc(
+                number,
+                DocKind::Ticket,
+                DocState::Ready,
+                ticket.title.trim(),
+                &ticket.body,
+            )
+        });
+    }
+    // The tickets first, the request last: the onboarding worker acts on
+    // an approved request, and its tickets are to be there when it does.
+    for written in written.iter().skip(1).chain(written.first()) {
+        write_json(&path_of(&dir, written.number), written)?;
+    }
+    let last = numbers.last().copied().unwrap_or(first);
+    write_atomic(&dir.join("last"), last.to_string().as_bytes())?;
+    Ok((first, numbers))
 }
 
 /// The ticket at `path`, or that it is none.
@@ -708,6 +850,7 @@ pub fn write_plan(
                 plan_text: String::new(),
                 revision: 0,
                 planner: None,
+                auto_approve: false,
                 feedback: String::new(),
                 onboard: None,
                 note: String::new(),
@@ -752,7 +895,14 @@ pub fn write_plan(
         doc.runs_on = plan.runs_on.to_vec();
     }
     doc.merged = includes;
-    doc.state = DocState::Review;
+    // A ticket that runs through needs no review: its plan is approved as
+    // it arrives, and its master is queued.
+    if doc.auto_approve {
+        doc.state = DocState::Approved;
+        doc.approved = Some(now);
+    } else {
+        doc.state = DocState::Review;
+    }
     doc.changed = now;
     write_json(&path_of(&dir, number), &doc)?;
     if fresh {
@@ -1636,6 +1786,65 @@ mod tests {
                 grants: Default::default(),
                 prerequisites: Vec::new(),
             }
+        }
+
+        fn new_ticket(title: &str, depends_on: &[usize], auto_approve: bool) -> NewTicket {
+            NewTicket {
+                title: title.to_owned(),
+                body: "proposal".to_owned(),
+                depends_on: depends_on.to_vec(),
+                auto_approve,
+            }
+        }
+
+        #[test]
+        fn an_onboarding_files_its_request_approved_and_its_tickets_ready_and_linked() {
+            let state = scratch("onboard");
+            let config = onboarding_config();
+            let asked = spec("https://git.example.org/o/site");
+            let tickets = [
+                new_ticket("Jobs", &[], true),
+                new_ticket("Deploy", &[0, 0], false),
+            ];
+            let made = onboard(&state, &config, "site", request(&asked), &tickets, 7);
+            assert_eq!(made, Ok((1, vec![2, 3])));
+            let doc = |n| load(&state, &config, "site", n).unwrap();
+            assert_eq!((doc(1).kind, doc(1).state), (DocKind::Onboarding, Approved));
+            assert_eq!((doc(2).state, doc(2).auto_approve), (Ready, true));
+            assert_eq!(doc(3).links, depends(&[2]));
+            assert!(!doc(3).auto_approve);
+            // Pending: nothing is planned before the repository joins.
+            assert!(ready(&state, &config).iter().all(|t| t.repo != "site"));
+            assert_eq!(approved_onboardings(&state).len(), 1);
+
+            let circle = [new_ticket("a", &[1], false), new_ticket("b", &[0], false)];
+            assert_eq!(
+                onboard(
+                    &state,
+                    &config,
+                    "loop",
+                    request(&spec("https://git.example.org/o/loop")),
+                    &circle,
+                    8
+                ),
+                Err("the onboarding's tickets 1 and 2 depend on each other".to_owned())
+            );
+            assert!(load(&state, &config, "loop", 1).is_none());
+        }
+
+        #[test]
+        fn a_ticket_that_runs_through_is_approved_as_its_plan_arrives() {
+            let state = scratch("auto");
+            let config = config();
+            create(&state, &config, "demo", new("routine", &[]), 1).unwrap();
+            let path = path_of(&docs_root(&state).join("demo"), 1);
+            let mut doc: DocView = read_json(&path).unwrap();
+            doc.auto_approve = true;
+            write_json(&path, &doc).unwrap();
+            planned(&state, &config, 1, &[], 5);
+            let doc = load(&state, &config, "demo", 1).unwrap();
+            assert_eq!((doc.state, doc.approved), (Approved, Some(5)));
+            assert_eq!(queue(&state, &config).len(), 1);
         }
 
         #[test]

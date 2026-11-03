@@ -96,7 +96,7 @@ timeout_seconds = 5
 
 # The language model the CI asks with that sign-in about a project that
 # has not joined, for the editor's Board of it. Without it the Board still
-# offers the onboarding form.
+# offers `Onboard` with the default settings and no tickets.
 # [advice]
 # model = "claude-haiku-5-5"
 

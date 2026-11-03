@@ -343,6 +343,19 @@ pub enum CiRequest {
     /// Finishes it with what came to the callback. Answers
     /// [`CiReply::ClaudeSignedIn`].
     ClaudeFinish { code: String, state: String },
+    /// Onboards a repository from the editor in one step: files the
+    /// onboarding request of `repo` already approved (the owner asks), and
+    /// with it `tickets`, released for planning; they wait until the
+    /// repository has joined, then for the tickets they depend on. Answers
+    /// [`CiReply::Onboarded`].
+    Onboard {
+        repo: String,
+        title: String,
+        body: String,
+        spec: OnboardSpec,
+        #[serde(default)]
+        tickets: Vec<crate::advice::NewTicket>,
+    },
     /// Queues an event of `repo` on its default branch: a push, or with
     /// `nightly` the repository's nightly, which waits for any other
     /// nightly that runs. The commit is the branch's head when the
@@ -558,6 +571,11 @@ pub enum CiReply {
     /// The account the CI is signed in to now.
     ClaudeSignedIn {
         account: String,
+    },
+    /// The onboarding request's number and its tickets', in their order.
+    Onboarded {
+        request: u64,
+        tickets: Vec<u64>,
     },
     Error {
         message: String,
@@ -1000,6 +1018,10 @@ pub struct DocView {
     /// The plan session that wrote the plan.
     #[serde(default)]
     pub planner: Option<Planner>,
+    /// Its plan is approved as soon as a plan session writes it: a ticket
+    /// that runs through from planning to its master without a review.
+    #[serde(default)]
+    pub auto_approve: bool,
     /// The review a Refine sends; empty in lists.
     #[serde(default)]
     pub feedback: String,
@@ -1919,6 +1941,23 @@ mod tests {
                 number: 9,
             },
             CiRequest::ClaudeStart,
+            CiRequest::Onboard {
+                repo: "site".to_owned(),
+                title: "Onboard site".to_owned(),
+                body: "b".to_owned(),
+                spec: OnboardSpec {
+                    url: "https://git.example.org/o/site.git".to_owned(),
+                    default_branch: "main".to_owned(),
+                    grants: BTreeMap::new(),
+                    prerequisites: Vec::new(),
+                },
+                tickets: vec![crate::advice::NewTicket {
+                    title: "Jobs".to_owned(),
+                    body: "p".to_owned(),
+                    depends_on: vec![0],
+                    auto_approve: true,
+                }],
+            },
             CiRequest::ClaudeFinish {
                 code: "c".to_owned(),
                 state: "s".to_owned(),
@@ -2102,23 +2141,34 @@ mod tests {
             CiReply::ClaudeSignedIn {
                 account: "me@example.org".to_owned(),
             },
+            CiReply::Onboarded {
+                request: 4,
+                tickets: vec![5, 6],
+            },
             CiReply::Advice {
                 advice: Box::new(crate::advice::AdviceView {
                     origin: "github.com/o/site".to_owned(),
                     summary: "A site.".to_owned(),
                     status: vec!["on GitHub only".to_owned()],
-                    operations: vec![crate::advice::Operation {
-                        kind: crate::advice::OperationKind::Migrate,
-                        title: "Move it".to_owned(),
-                        body: "Then follow weida.".to_owned(),
-                        settings: crate::advice::OnboardSettings {
-                            name: "site".to_owned(),
-                            default_branch: "main".to_owned(),
-                            events: vec!["push main of weida".to_owned()],
-                            platforms: Vec::new(),
-                            grants: [("DEPLOY".to_owned(), vec!["push main".to_owned()])].into(),
-                            prerequisites: vec!["a served directory".to_owned()],
-                        },
+                    onboard: crate::advice::OnboardSettings {
+                        name: "site".to_owned(),
+                        default_branch: "main".to_owned(),
+                        grants: [("DEPLOY".to_owned(), vec!["push main".to_owned()])].into(),
+                        prerequisites: vec!["a served directory".to_owned()],
+                    },
+                    cards: vec![crate::advice::Card {
+                        kind: crate::advice::CardKind::Follow,
+                        title: "Follow weida".to_owned(),
+                        body: "Rebuild with it.".to_owned(),
+                        chosen: true,
+                        tickets: vec![crate::advice::CardTicket {
+                            key: "jobs".to_owned(),
+                            title: "Build jobs".to_owned(),
+                            proposal: "Write .zeughaus-ci/.".to_owned(),
+                            skills: vec!["zeughaus-ci".to_owned()],
+                            depends_on: Vec::new(),
+                            auto: true,
+                        }],
                     }],
                     refusal: Some("not on the Forgejo".to_owned()),
                     model: "claude-haiku-5-5".to_owned(),
@@ -2273,6 +2323,7 @@ mod tests {
             plan_text: String::new(),
             revision: 0,
             planner: None,
+            auto_approve: true,
             feedback: String::new(),
             onboard: None,
             note: String::new(),

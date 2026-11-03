@@ -1,11 +1,13 @@
 //! What the CI advises for a project it does not build yet: what the
-//! project is, where it stands, and the ways it could join, each with the
-//! onboarding settings it would file.
+//! project is, where it stands, how it would join, and cards of work to
+//! choose from, each the tickets it files.
 //!
 //! The editor gathers the facts from its local runner (`ProjectsRequest`
-//! with `facts`) and hands them to the CI ([`crate::CiRequest::Advise`]),
-//! which asks a language model and answers [`AdviceView`]. JSON with
-//! defaults throughout: a field added later keeps older peers reading.
+//! with `facts`: the project and the skills installed there) and hands them
+//! to the CI ([`crate::CiRequest::Advise`]), which asks a language model and
+//! answers [`AdviceView`]. The cards the owner keeps are filed with the
+//! onboarding in one [`crate::CiRequest::Onboard`]. JSON with defaults
+//! throughout: a field added later keeps older peers reading.
 
 use std::collections::BTreeMap;
 
@@ -14,8 +16,11 @@ use serde::{Deserialize, Serialize};
 /// The most facts about one project an editor sends, in bytes.
 pub const MAX_FACTS_BYTES: usize = 24 << 10;
 
-/// The most operations one [`AdviceView`] carries.
-pub const MAX_OPERATIONS: usize = 4;
+/// The most cards one [`AdviceView`] carries.
+pub const MAX_CARDS: usize = 6;
+
+/// The most tickets one card files.
+pub const MAX_CARD_TICKETS: usize = 4;
 
 /// The advice for one project.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,9 +34,12 @@ pub struct AdviceView {
     /// mirrors, its build, any CI it has.
     #[serde(default)]
     pub status: Vec<String>,
-    /// The ways it could join, the best first.
+    /// How it joins: the onboarding request's settings.
     #[serde(default)]
-    pub operations: Vec<Operation>,
+    pub onboard: OnboardSettings,
+    /// Work to choose from, the most useful first.
+    #[serde(default)]
+    pub cards: Vec<Card>,
     /// Why the CI cannot onboard this origin as it is (a repository outside
     /// its Forgejo, no `[onboarding]`); worked out by the CI, not the model.
     #[serde(default)]
@@ -47,14 +55,14 @@ pub struct AdviceView {
     pub error: Option<String>,
 }
 
-/// What an operation does.
+/// What a card is about.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperationKind {
-    /// Join the CI as it is: build and check jobs.
+pub enum CardKind {
+    /// Build and check jobs.
     #[default]
-    Onboard,
-    /// Move the repository to the CI's Forgejo first.
+    Build,
+    /// Move the repository to the CI's Forgejo.
     Migrate,
     /// Rebuild when another repository of the CI changes.
     Follow,
@@ -64,35 +72,57 @@ pub enum OperationKind {
     Other,
 }
 
-impl OperationKind {
+impl CardKind {
     pub fn name(self) -> &'static str {
         match self {
-            OperationKind::Onboard => "onboard",
-            OperationKind::Migrate => "migrate",
-            OperationKind::Follow => "follow",
-            OperationKind::Deploy => "deploy",
-            OperationKind::Other => "other",
+            CardKind::Build => "build",
+            CardKind::Migrate => "migrate",
+            CardKind::Follow => "follow",
+            CardKind::Deploy => "deploy",
+            CardKind::Other => "other",
         }
     }
 }
 
-/// One way a project could join.
+/// One piece of work the project could get with its onboarding.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Operation {
+pub struct Card {
     #[serde(default)]
-    pub kind: OperationKind,
+    pub kind: CardKind,
     /// One line.
     pub title: String,
-    /// What it does and why, in Markdown.
+    /// What it brings and why, in Markdown.
     #[serde(default)]
     pub body: String,
-    /// The onboarding settings it would file.
+    /// Whether the card is chosen until the owner says otherwise.
     #[serde(default)]
-    pub settings: OnboardSettings,
+    pub chosen: bool,
+    #[serde(default)]
+    pub tickets: Vec<CardTicket>,
 }
 
-/// What an onboarding request asks for: the request's `OnboardSpec` and
-/// what its body says the pipeline should do.
+/// One ticket a card files.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardTicket {
+    /// Unique among the advice's tickets; what `depends_on` names.
+    pub key: String,
+    pub title: String,
+    /// The proposal: what its plan session is to plan, in Markdown.
+    #[serde(default)]
+    pub proposal: String,
+    /// Installed skills its sessions should read first.
+    #[serde(default)]
+    pub skills: Vec<String>,
+    /// Keys of the tickets it waits for, of any card.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// Its plan is approved as soon as it is written (it runs through to
+    /// its master); else the plan waits for the owner's review.
+    #[serde(default)]
+    pub auto: bool,
+}
+
+/// What an onboarding request asks for.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OnboardSettings {
     /// The repository's name in `ci.toml`, `[a-z0-9][a-z0-9-]*`.
@@ -100,13 +130,6 @@ pub struct OnboardSettings {
     pub name: String,
     #[serde(default)]
     pub default_branch: String,
-    /// Event patterns: `push main`, `tag v*`, `nightly`, `push main of
-    /// <repo>`.
-    #[serde(default)]
-    pub events: Vec<String>,
-    /// Platforms of the CI's `[platforms]` to build for.
-    #[serde(default)]
-    pub platforms: Vec<String>,
     /// Secret name to the event patterns it is released to.
     #[serde(default)]
     pub grants: BTreeMap<String, Vec<String>>,
@@ -115,15 +138,27 @@ pub struct OnboardSettings {
     pub prerequisites: Vec<String>,
 }
 
+/// One ticket an onboarding files with the request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewTicket {
+    pub title: String,
+    /// The proposal.
+    pub body: String,
+    /// Indexes of the tickets of the same request it depends on.
+    #[serde(default)]
+    pub depends_on: Vec<usize>,
+    #[serde(default)]
+    pub auto_approve: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn an_unknown_operation_kind_reads_as_other() {
-        let operation: Operation =
-            serde_json::from_str(r#"{"kind":"rewrite","title":"t"}"#).unwrap();
-        assert_eq!(operation.kind, OperationKind::Other);
-        assert_eq!(operation.settings, OnboardSettings::default());
+    fn an_unknown_card_kind_reads_as_other() {
+        let card: Card = serde_json::from_str(r#"{"kind":"rewrite","title":"t"}"#).unwrap();
+        assert_eq!(card.kind, CardKind::Other);
+        assert!(card.tickets.is_empty());
     }
 }

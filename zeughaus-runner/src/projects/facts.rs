@@ -1,11 +1,12 @@
 //! What the runner can find out about one project for the CI's advice:
-//! its listing, its work checkout at `HEAD` (top-level entries, CI
-//! folders, manifests and README, remotes, the last commit), and what the
-//! forges of `[projects]` say about it. Markdown, cut to
-//! [`MAX_FACTS_BYTES`]. Nothing here fails: what cannot be read is said.
+//! the skills omp has here, its listing, its work checkout at `HEAD`
+//! (top-level entries, CI folders, manifests and README, remotes, the last
+//! commit), and what the forges of `[projects]` say about it. Markdown, cut
+//! to [`MAX_FACTS_BYTES`]. Nothing here fails: what cannot be read is said.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use zeughaus_link::{MAX_FACTS_BYTES, ProjectsReply, normalize_origin};
@@ -17,6 +18,12 @@ const EXCERPT_BYTES: usize = 3 << 10;
 
 /// The most top-level entries the facts name.
 const MAX_ENTRIES: usize = 80;
+
+/// How long omp may take to list its skills.
+const SKILLS_WAIT: Duration = Duration::from_secs(20);
+
+/// The most of one skill's description the facts quote.
+const SKILL_DESCRIPTION_BYTES: usize = 240;
 
 /// Files whose head says what a project is and builds, in the order quoted.
 const MANIFESTS: [&str; 15] = [
@@ -46,9 +53,9 @@ const CI_DIRS: [&str; 5] = [
     ".woodpecker",
 ];
 
-/// The facts about `origin`: the listing of `listed` (the runner's cached
-/// listing, if it has one), the checkout under `work_root`, and its forge
-/// when there is no checkout.
+/// The facts about `origin`: the skills installed here, the listing of
+/// `listed` (the runner's cached listing, if it has one), the checkout
+/// under `work_root`, and its forge when there is no checkout.
 pub fn gather(
     origin: &str,
     listed: Option<&ProjectsReply>,
@@ -67,6 +74,8 @@ pub fn gather(
     let checkout = work_root
         .map(|root| root.join(&origin))
         .filter(|dir| dir.join(".git").exists());
+    // First, so a long checkout does not cut them off.
+    out.push_str(&skills_facts(checkout.as_deref()));
     match checkout {
         Some(dir) => checkout_facts(&dir, &mut out),
         None => {
@@ -76,6 +85,76 @@ pub fn gather(
     }
     cut(&mut out, MAX_FACTS_BYTES);
     out
+}
+
+/// The skills omp finds here (`omp skill list --json`, in the checkout
+/// when there is one), each with the head of its description.
+fn skills_facts(dir: Option<&Path>) -> String {
+    #[derive(Deserialize)]
+    struct Listed {
+        skills: Vec<Skill>,
+    }
+    #[derive(Deserialize)]
+    struct Skill {
+        name: String,
+        #[serde(default)]
+        description: String,
+    }
+    let program = std::env::var_os("ZEUGHAUS_OMP")
+        .filter(|program| !program.is_empty())
+        .unwrap_or_else(|| "omp".into());
+    let mut command = Command::new(program);
+    command.args(["skill", "list", "--json"]);
+    if let Some(dir) = dir {
+        command.current_dir(dir);
+    }
+    let listed = output_within(command, SKILLS_WAIT)
+        .and_then(|json| serde_json::from_str::<Listed>(&json).map_err(|e| e.to_string()));
+    match listed {
+        Ok(listed) => {
+            let mut out = String::from("\n## Skills installed for the agents\n\n");
+            for skill in listed.skills {
+                let mut description = skill.description.replace('\n', " ");
+                cut(&mut description, SKILL_DESCRIPTION_BYTES);
+                out.push_str(&format!("- `{}`: {description}\n", skill.name));
+            }
+            out
+        }
+        Err(e) => format!("- the installed skills could not be listed: {e}\n"),
+    }
+}
+
+/// The stdout of `command`, killed after `wait`.
+fn output_within(mut command: Command, wait: Duration) -> Result<String, String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let stdout = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut stdout) = stdout {
+            let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+        }
+        text
+    });
+    let deadline = Instant::now() + wait;
+    loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(status) if status.success() => {
+                return reader.join().map_err(|_| "the reader panicked".to_owned());
+            }
+            Some(status) => return Err(format!("exited with {status}")),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("no answer within {} s", wait.as_secs()));
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
 }
 
 /// The work checkout at `HEAD`.

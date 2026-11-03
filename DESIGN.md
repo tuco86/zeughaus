@@ -1450,8 +1450,8 @@ the review is empty. Escape or a press on the scrim closes it; `New
 ticket` on the Board writes one in it. A card the CI moved to another
 column carries an accent ring that fades over 2 s. A project no CI builds
 gets the Board of `ci/onboard.rs`: the first CI's advice on it
-(**Advice**), and an onboarding form an operation of the advice fills,
-which files the request with that CI. A channel lists its pipelines in a scrollable, newest on top
+(**Advice**): cards of work to choose and the onboarding they file in one
+step with that CI. A channel lists its pipelines in a scrollable, newest on top
 and separated by rules, one row each: a status glyph (codicons from the
 bundled Nerd Font, so status never rests on colour alone), `#<n>` and the
 commit's subject (the CI reads it from its mirror when the pipeline starts,
@@ -1887,6 +1887,15 @@ each approved request: secrets present, bot collaborator, webhook secret
 `ci/onboarded/<name>.toml` written and the configuration reloaded, first
 push event queued. Every step may run again; a failure puts the request
 back to `open` with the step and the reason as its note.
+`CiRequest::Onboard` (`docs::onboard`) files a request already approved
+together with its tickets in one step, as the owner's Board does: the
+tickets `ready` and released, linked `depends on` by their places in the
+request (a cycle or a place out of range refuses the whole request), the
+request last, so the worker never takes one whose tickets are missing.
+`ready()` and `queue()` see only repositories of `ci.toml`, so those
+tickets wait for the join and then go through planning and the queue in
+the order their links allow. A ticket's `auto_approve` makes `write_plan`
+approve its plan as it arrives instead of putting it up for review.
 
 **Claude sign-in.** `[claude]` of `ci.toml` (`zeughaus-ci/src/claude.rs`)
 makes the CI the one holder of the owner's Claude subscription: omp on the
@@ -1924,18 +1933,25 @@ may patch `secret/hannes/omp`.
 with the Claude sign-in about a project that has not joined
 (`zeughaus-ci/src/advice.rs`). The
 editor asks its local runner on `/projects` for the facts
-(`ProjectsRequest::facts`, `zeughaus-runner/src/projects/facts.rs`: its
-listing, the work checkout at `HEAD` with its top level, CI folders,
-manifests, README, remotes and last commit, or else what the forge's API
-says, with push mirrors and a same-named repository on a Forgejo) and
-sends them in `CiRequest::Advise`. The CI adds what it knows of itself
-(its Forgejo, platforms, runners with labels, repositories), forces one
-tool call on the Messages API through curl with the token on stdin (a
-bearer token, the Claude Code and OAuth betas, and Claude Code's identity
-as the first system block, without which a subscription token is refused), and
-keeps of the operations only what it can file: platforms of its
-`[platforms]`, event patterns that parse and follow one of its
-repositories, a valid name and secret names. The answer is kept under
+(`ProjectsRequest::facts`, `zeughaus-runner/src/projects/facts.rs`: the
+skills `omp skill list --json` finds there, its listing, the work checkout
+at `HEAD` with its top level, CI folders, manifests, README, remotes and
+last commit, or else what the forge's API says, with push mirrors and a
+same-named repository on a Forgejo) and sends them in `CiRequest::Advise`.
+The CI adds what it knows of itself (its Forgejo, platforms, runners with
+labels, repositories), forces one tool call on the Messages API through
+curl with the token on stdin (a bearer token, the Claude Code and OAuth
+betas, and Claude Code's identity as the first system block, without
+which a subscription token is refused). The answer is a summary, status
+lines, the onboarding's settings (name, default branch, grants, host
+prerequisites; the CI keeps a valid name and secret names, granted to
+event patterns that parse) and up to six cards (`Card`: a kind, title,
+body, whether it is advised, and up to four tickets with a key, title,
+proposal, the skills to read first, the keys of tickets of any card it
+waits for, and whether it runs through); the CI drops duplicate keys and
+dependencies on unknown keys or that close a cycle. The Board shows the
+cards to choose, a ticket's mode to switch, and the request and tickets
+`Onboard` files with their numbers in filing order. The answer is kept under
 `ci/advice/<sha256 of the origin>.json` with the SHA-256 of the request, so
 the same facts against the same configuration are answered from disk
 unless `refresh`. `AdviceView::refusal` (already in `ci.toml`, not on the

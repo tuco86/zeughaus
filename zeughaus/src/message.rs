@@ -415,29 +415,15 @@ pub enum OnboardMsg {
     Advice(Result<Box<zeughaus_link::AdviceView>, String>),
     /// Ask the runner and the CI again.
     Refresh,
-    /// Take an operation's settings into the form.
-    Pick(usize),
-    Name(String),
-    Branch(String),
-    Event(OnboardEvent, bool),
-    /// The repository of the CI it follows; empty for none.
-    Follows(String),
-    Platform(String, bool),
-    Grants(String),
-    Prerequisites(String),
-    Notes(String),
-    /// File the onboarding request.
-    File,
-    Filed(Result<u64, String>),
-}
-
-/// The events of the form that are a checkbox each.
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OnboardEvent {
-    Push,
-    Tag,
-    Nightly,
+    /// Choose or drop a card, by its place.
+    Card(usize),
+    /// Switch a card's ticket between running through and waiting for
+    /// review, by the card's and the ticket's place.
+    Mode(usize, usize),
+    /// File the onboarding with the chosen cards' tickets.
+    Onboard,
+    /// The request's number and the tickets', or why not.
+    Onboarded(Result<(u64, Vec<u64>), String>),
 }
 
 /// What a letter asks of the CI page in front.

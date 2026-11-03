@@ -1526,7 +1526,9 @@ impl App {
         let channels = client.channels_of(&repo.repo);
         if channels.is_empty() {
             let line = match repo.onboarding {
-                Some(n) => format!("Onboarding requested (#{n}): the CI builds it once approved."),
+                Some(n) => {
+                    format!("Onboarding #{n}: the CI joins the repository, then its tickets start.")
+                }
                 None => "No channels yet: the first push starts one.".to_owned(),
             };
             rail = rail.push(
@@ -1731,6 +1733,16 @@ impl App {
                         .size(11)
                         .color(muted),
                 );
+            }
+            // A ticket whose plan needs no review, while it still has one
+            // to skip.
+            if doc.auto_approve
+                && matches!(
+                    doc.state,
+                    DocState::Open | DocState::Ready | DocState::Planning
+                )
+            {
+                second = second.push(chip("runs through".to_owned()));
             }
         }
         let mut lines = column![first, second].spacing(4);
@@ -2126,6 +2138,7 @@ mod tests {
             plan_text: String::new(),
             revision: 0,
             planner: None,
+            auto_approve: false,
             feedback: String::new(),
             onboard: None,
             note: String::new(),
