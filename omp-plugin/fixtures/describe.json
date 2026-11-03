@@ -1,0 +1,424 @@
+[
+  {
+    "name": "a full view",
+    "view": {
+      "name": "zeughaus",
+      "forge": "forgejo tuco86/zeughaus",
+      "default_branch": "main",
+      "branch": "red since dev #12\n  (alice)",
+      "channels": [
+        {
+          "repo": "zeughaus",
+          "channel": "dev",
+          "latest": 12,
+          "status": "failed",
+          "responsible": {
+            "subject": {
+              "on": "pipeline",
+              "repo": "zeughaus",
+              "number": 12
+            },
+            "holder": {
+              "runner": "atik",
+              "terminal": 7
+            },
+            "label": "master zeughaus #38",
+            "channel": "dev",
+            "since": 100,
+            "renewed": 160
+          }
+        },
+        {
+          "repo": "zeughaus",
+          "channel": "nightly",
+          "latest": 9,
+          "status": "succeeded"
+        }
+      ],
+      "head": {
+        "repo": "zeughaus",
+        "number": 12,
+        "channel": "dev",
+        "event": "push",
+        "git_ref": "refs/heads/main",
+        "sha": "3635dad0123456789abcdef0123456789abcdef0",
+        "status": "failed",
+        "note": "",
+        "created": 1000,
+        "finished": null,
+        "jobs": [
+          {
+            "name": "build-linux-amd64",
+            "needs": [],
+            "place": "tuco-pc image:trixie",
+            "status": "succeeded",
+            "note": "",
+            "started": 1010,
+            "finished": 1100,
+            "code": 0
+          },
+          {
+            "name": "chëck",
+            "needs": [
+              "build-linux-amd64"
+            ],
+            "place": "tuco-pc image:trixie",
+            "status": "failed",
+            "note": "",
+            "started": 1100,
+            "finished": 1200,
+            "code": 101,
+            "cause": "error[E0308]: mismatched types\n  --> src/lib.rs:3:5",
+            "excerpt": "tail"
+          }
+        ]
+      },
+      "jobs_sha": "3635dad0123456789abcdef0123456789abcdef0",
+      "jobs": [
+        {
+          "name": "build-linux-amd64",
+          "file": "build-linux-amd64.sh",
+          "on": [
+            "push main",
+            "tag v*"
+          ],
+          "needs": [],
+          "channels": [],
+          "place": "image:trixie",
+          "runner": "tuco-pc",
+          "at": "image:trixie",
+          "placement": "",
+          "secrets": [
+            "ZEUGHAUS_UPDATE_KEY"
+          ],
+          "manual": true,
+          "state": [
+            "cache"
+          ]
+        },
+        {
+          "name": "chëck",
+          "file": "chëck.sh",
+          "on": [],
+          "needs": [
+            "build-linux-amd64"
+          ],
+          "channels": [],
+          "place": "machine:win11",
+          "runner": "tuco-pc",
+          "at": "machine:win11",
+          "placement": "",
+          "secrets": [],
+          "manual": false
+        },
+        {
+          "name": "publish-darwin",
+          "file": "publish-darwin.sh",
+          "on": [],
+          "needs": [],
+          "channels": [
+            "release"
+          ],
+          "place": "",
+          "runner": "",
+          "at": "",
+          "placement": "no runner offers the platform darwin-amd64\n  with the image trixie",
+          "secrets": [],
+          "manual": false
+        },
+        {
+          "name": "fmt",
+          "file": "fmt.sh",
+          "on": [
+            "push *"
+          ],
+          "needs": [],
+          "channels": [],
+          "place": "host",
+          "runner": "tuco-pc",
+          "at": "host",
+          "placement": "",
+          "secrets": [],
+          "manual": true
+        }
+      ],
+      "jobs_note": "",
+      "machines": [
+        {
+          "name": "tuco-pc",
+          "kind": "runner",
+          "status": "online",
+          "jobs": []
+        },
+        {
+          "name": "atik",
+          "kind": "runner",
+          "status": "offline",
+          "jobs": []
+        },
+        {
+          "name": "win11",
+          "kind": "windows-vm",
+          "status": "off",
+          "jobs": []
+        }
+      ],
+      "platforms": [
+        [
+          "linux-amd64",
+          "tuco-pc"
+        ],
+        [
+          "windows-amd64",
+          "win11"
+        ]
+      ],
+      "docs": [
+        {
+          "repo": "zeughaus",
+          "number": 3,
+          "kind": "ticket",
+          "title": "Add a thing",
+          "state": "open",
+          "source": "weida",
+          "created": 100,
+          "changed": 200
+        },
+        {
+          "repo": "zeughaus",
+          "number": 4,
+          "kind": "ticket",
+          "title": "Do it",
+          "state": "in_progress",
+          "source": "zeughaus",
+          "created": 100,
+          "changed": 200
+        },
+        {
+          "repo": "zeughaus",
+          "number": 2,
+          "kind": "ticket",
+          "title": "Old",
+          "state": "done",
+          "source": "zeughaus",
+          "created": 100,
+          "changed": 200
+        },
+        {
+          "repo": "zeughaus",
+          "number": 5,
+          "kind": "onboarding",
+          "title": "Join",
+          "state": "open",
+          "source": "zeughaus",
+          "created": 100,
+          "changed": 200
+        },
+        {
+          "repo": "zeughaus",
+          "number": 6,
+          "kind": "ticket",
+          "title": "Next",
+          "state": "approved",
+          "source": "zeughaus",
+          "created": 100,
+          "changed": 200
+        }
+      ],
+      "setup": [
+        "hook deliveries: ok",
+        "secrets: KEY missing\nin OpenBao"
+      ]
+    },
+    "head": "3635dad0123456789abcdef0123456789abcdef0",
+    "text": "zeughaus (forgejo tuco86/zeughaus): main red since dev #12 (alice)\nHEAD 3635dad: dev #12 failed: chëck failed: error[E0308]: mismatched types --> src/lib.rs:3:5\nchannels: dev #12 failed (responsible: master zeughaus #38 on atik, terminal 7), nightly #9 succeeded\njobs at 3635dad (run_jobs takes these names):\n  build-linux-amd64  tuco-pc image:trixie   on push main, tag v*; state cache; secrets ZEUGHAUS_UPDATE_KEY (none in run_jobs)\n  chëck              tuco-pc machine:win11  needs build-linux-amd64; run_jobs cannot run it (Windows VM)\n  publish-darwin     cannot be placed: no runner offers the platform darwin-amd64 with the image trixie  channels release\n  fmt                tuco-pc host           on push *\nrunners: tuco-pc online, atik offline; machines: win11 off\nplatforms: linux-amd64 -> tuco-pc, windows-amd64 -> win11\nOpen tickets: #3 Add a thing (from weida)\nTickets: #4 in_progress Do it, #6 approved Next\nsetup:\n  hook deliveries: ok\n  secrets: KEY missing in OpenBao"
+  },
+  {
+    "name": "no commit",
+    "view": {
+      "name": "zeughaus",
+      "forge": "forgejo tuco86/zeughaus",
+      "default_branch": "main",
+      "branch": "green",
+      "channels": [
+        {
+          "repo": "zeughaus",
+          "channel": "dev",
+          "latest": 3,
+          "status": "succeeded"
+        }
+      ],
+      "head": {
+        "repo": "zeughaus",
+        "number": 3,
+        "channel": "dev",
+        "event": "push",
+        "git_ref": "refs/heads/main",
+        "sha": "3635dad0123456789abcdef0123456789abcdef0",
+        "status": "succeeded",
+        "note": "",
+        "created": 1000,
+        "finished": null,
+        "jobs": [
+          {
+            "name": "build",
+            "needs": [],
+            "place": "tuco-pc image:trixie",
+            "status": "succeeded",
+            "note": "",
+            "started": 1,
+            "finished": 2,
+            "code": 0
+          }
+        ]
+      },
+      "jobs_sha": "3635dad0123456789abcdef0123456789abcdef0",
+      "jobs": [
+        {
+          "name": "build",
+          "file": "build.sh",
+          "on": [
+            "push main"
+          ],
+          "needs": [],
+          "channels": [],
+          "place": "host",
+          "runner": "tuco-pc",
+          "at": "host",
+          "placement": "",
+          "secrets": [],
+          "manual": true
+        }
+      ],
+      "jobs_note": "",
+      "machines": [
+        {
+          "name": "tuco-pc",
+          "kind": "runner",
+          "status": "online",
+          "jobs": []
+        }
+      ],
+      "platforms": [
+        [
+          "linux-amd64",
+          "tuco-pc"
+        ]
+      ]
+    },
+    "head": null,
+    "text": "zeughaus (forgejo tuco86/zeughaus): main green\nHEAD: no commit\nchannels: dev #3 succeeded\njobs at 3635dad (run_jobs takes these names):\n  build  tuco-pc host  on push main\nrunners: tuco-pc online\nplatforms: linux-amd64 -> tuco-pc"
+  },
+  {
+    "name": "a head without pipeline and nothing listed",
+    "view": {
+      "name": "zeughaus",
+      "forge": "forgejo tuco86/zeughaus",
+      "default_branch": "main",
+      "branch": "green",
+      "channels": [],
+      "head": null,
+      "jobs_sha": null,
+      "jobs": [],
+      "jobs_note": "",
+      "machines": [],
+      "platforms": []
+    },
+    "head": "3635dad0123456789abcdef0123456789abcdef0",
+    "text": "zeughaus (forgejo tuco86/zeughaus): main green\nHEAD 3635dad: no pipeline (not pushed, or no job selected)\nchannels: none\njobs: none\nrunners: none\nplatforms: none"
+  },
+  {
+    "name": "an error pipeline and a jobs note",
+    "view": {
+      "name": "zeughaus",
+      "forge": "forgejo tuco86/zeughaus",
+      "default_branch": "main",
+      "branch": "green",
+      "channels": [],
+      "head": {
+        "repo": "zeughaus",
+        "number": 12,
+        "channel": "dev",
+        "event": "push",
+        "git_ref": "refs/heads/main",
+        "sha": "3635dad0123456789abcdef0123456789abcdef0",
+        "status": "error",
+        "note": "the checkout failed:\n  fatal: no such ref",
+        "created": 1000,
+        "finished": null,
+        "jobs": []
+      },
+      "jobs_sha": null,
+      "jobs": [],
+      "jobs_note": "no .zeughaus-ci/ at\n3635dad",
+      "machines": [
+        {
+          "name": "atik",
+          "kind": "runner",
+          "status": "online",
+          "jobs": []
+        }
+      ],
+      "platforms": []
+    },
+    "head": "3635dad0123456789abcdef0123456789abcdef0",
+    "text": "zeughaus (forgejo tuco86/zeughaus): main green\nHEAD 3635dad: dev #12 error: the checkout failed: fatal: no such ref\nchannels: none\njobs: no .zeughaus-ci/ at 3635dad\nrunners: atik online\nplatforms: none"
+  },
+  {
+    "name": "a running pipeline without a jobs sha",
+    "view": {
+      "name": "zeughaus",
+      "forge": "forgejo tuco86/zeughaus",
+      "default_branch": "main",
+      "branch": "green",
+      "channels": [],
+      "head": {
+        "repo": "zeughaus",
+        "number": 12,
+        "channel": "dev",
+        "event": "push",
+        "git_ref": "refs/heads/main",
+        "sha": "3635dad0123456789abcdef0123456789abcdef0",
+        "status": "running",
+        "note": "",
+        "created": 1000,
+        "finished": null,
+        "jobs": [
+          {
+            "name": "build",
+            "needs": [],
+            "place": "tuco-pc image:trixie",
+            "status": "running",
+            "note": "",
+            "started": 1010,
+            "finished": null,
+            "code": null
+          }
+        ]
+      },
+      "jobs_sha": null,
+      "jobs": [
+        {
+          "name": "build",
+          "file": "build.sh",
+          "on": [
+            "push main"
+          ],
+          "needs": [],
+          "channels": [],
+          "place": "host",
+          "runner": "tuco-pc",
+          "at": "host",
+          "placement": "",
+          "secrets": [],
+          "manual": true
+        }
+      ],
+      "jobs_note": "",
+      "machines": [],
+      "platforms": []
+    },
+    "head": "3635dad",
+    "text": "zeughaus (forgejo tuco86/zeughaus): main green\nHEAD 3635dad: dev #12 running\nchannels: none\njobs (run_jobs takes these names):\n  build  tuco-pc host  on push main\nrunners: none\nplatforms: none"
+  }
+]

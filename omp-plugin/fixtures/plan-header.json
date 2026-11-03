@@ -1,0 +1,108 @@
+[
+  {
+    "name": "a normal title",
+    "body": "intro\n## Sub\n#  Real title  \n# Second\n",
+    "includes": [],
+    "runs_on": [],
+    "title": "Real title"
+  },
+  {
+    "name": "an empty title",
+    "body": "#   \nIncludes: #3, #5\n",
+    "includes": [
+      3,
+      5
+    ],
+    "runs_on": [],
+    "title": "Untitled plan"
+  },
+  {
+    "name": "no title",
+    "body": "## Only a section\n\nbody\n",
+    "includes": [],
+    "runs_on": [],
+    "title": "Untitled plan"
+  },
+  {
+    "name": "a long title cut on a character boundary",
+    "body": "# aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaüb\n",
+    "includes": [],
+    "runs_on": [],
+    "title": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  {
+    "name": "includes and runs on",
+    "body": "# T\n\nIncludes: #3, #5\nRuns on: os=macos; os=windows,arch=amd64\n",
+    "includes": [
+      3,
+      5
+    ],
+    "runs_on": [
+      "os=macos",
+      "os=windows,arch=amd64"
+    ],
+    "title": "T"
+  },
+  {
+    "name": "an empty Includes line",
+    "body": "# T\nIncludes:\n",
+    "includes_error": "malformed Includes line: Includes:",
+    "runs_on": [],
+    "title": "T"
+  },
+  {
+    "name": "an Includes item without a hash",
+    "body": "# T\nIncludes: 3\n",
+    "includes_error": "malformed Includes line: Includes: 3",
+    "runs_on": [],
+    "title": "T"
+  },
+  {
+    "name": "an Includes line past the header lines",
+    "body": "# T\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nIncludes: #3\n",
+    "includes": [],
+    "runs_on": [],
+    "title": "T"
+  },
+  {
+    "name": "an Includes line on the last header line",
+    "body": "# T\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nIncludes: #4\n",
+    "includes": [
+      4
+    ],
+    "runs_on": [],
+    "title": "T"
+  },
+  {
+    "name": "a selector with a space",
+    "body": "# T\nRuns on: os=Mac OS\n",
+    "includes": [],
+    "runs_on_error": "malformed Runs on line: Runs on: os=Mac OS",
+    "title": "T"
+  },
+  {
+    "name": "an empty selector",
+    "body": "# T\nRuns on: a;;b\n",
+    "includes": [],
+    "runs_on_error": "malformed Runs on line: Runs on: a;;b",
+    "title": "T"
+  },
+  {
+    "name": "CRLF line endings",
+    "body": "# Title\r\n\r\nIncludes: #3\r\nRuns on: os=linux\r\n",
+    "includes": [
+      3
+    ],
+    "runs_on": [
+      "os=linux"
+    ],
+    "title": "Title"
+  },
+  {
+    "name": "an Includes number too large for u64",
+    "body": "# T\nIncludes: #18446744073709551616\n",
+    "includes_error": "malformed Includes line: Includes: #18446744073709551616",
+    "runs_on": [],
+    "title": "T"
+  }
+]

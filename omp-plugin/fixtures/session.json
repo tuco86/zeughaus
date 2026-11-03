@@ -1,0 +1,138 @@
+[
+  {
+    "name": "a plan session with machines and peers",
+    "session": {
+      "id": 3,
+      "repo": "zeughaus",
+      "kind": "plan",
+      "doc": 45,
+      "runner": "atik",
+      "machines": [
+        {
+          "name": "tuco-pc",
+          "ssh": "zeughaus@10.8.0.10",
+          "labels": [
+            "arch=amd64",
+            "os=linux"
+          ],
+          "addresses": [
+            "10.8.0.10:7444"
+          ]
+        },
+        {
+          "name": "sadala",
+          "ssh": null,
+          "labels": []
+        }
+      ],
+      "state": "running",
+      "started": 100
+    },
+    "machines": [
+      {
+        "name": "atik",
+        "kind": "runner",
+        "status": "online",
+        "jobs": [],
+        "labels": [
+          "arch=arm64",
+          "os=macos"
+        ],
+        "addresses": [
+          "10.8.0.7:7443",
+          "192.168.1.5:7443"
+        ],
+        "sessions": true
+      },
+      {
+        "name": "tuco-pc",
+        "kind": "runner",
+        "status": "online",
+        "jobs": [],
+        "labels": [
+          "os=linux"
+        ]
+      },
+      {
+        "name": "win11",
+        "kind": "windows-vm",
+        "status": "off",
+        "jobs": []
+      }
+    ],
+    "sessions": [
+      {
+        "id": 3,
+        "repo": "zeughaus",
+        "kind": "plan",
+        "doc": 45,
+        "runner": "atik",
+        "machines": [
+          {
+            "name": "tuco-pc",
+            "ssh": "zeughaus@10.8.0.10",
+            "labels": [
+              "arch=amd64",
+              "os=linux"
+            ],
+            "addresses": [
+              "10.8.0.10:7444"
+            ]
+          },
+          {
+            "name": "sadala",
+            "ssh": null,
+            "labels": []
+          }
+        ],
+        "state": "running",
+        "started": 100
+      },
+      {
+        "id": 4,
+        "repo": "weida",
+        "kind": "master",
+        "doc": 28,
+        "runner": "tuco-pc-hannes",
+        "machines": [],
+        "state": "starting",
+        "started": 100
+      },
+      {
+        "id": 2,
+        "repo": "zeughaus",
+        "kind": "master",
+        "doc": 1,
+        "runner": "atik",
+        "machines": [],
+        "state": "ended",
+        "started": 100
+      }
+    ],
+    "text": "session 3 plan zeughaus #45 (running)\nruns on atik: labels arch=arm64,os=macos; addresses 10.8.0.7:7443, 192.168.1.5:7443\nmachines:\n  tuco-pc ssh zeughaus@10.8.0.10 labels arch=amd64,os=linux\n  sadala ssh - labels \nother live sessions:\n  #4 master weida #28 on tuco-pc-hannes\nrunners:\n  atik online sessions arch=arm64,os=macos\n  tuco-pc online os=linux\n"
+  },
+  {
+    "name": "a master on a runner the CI does not list",
+    "session": {
+      "id": 9,
+      "repo": "zeughaus",
+      "kind": "master",
+      "doc": null,
+      "runner": "gone",
+      "machines": [],
+      "state": "starting",
+      "started": 100
+    },
+    "machines": [
+      {
+        "name": "atik",
+        "kind": "runner",
+        "status": "online",
+        "jobs": [],
+        "sessions": true
+      }
+    ],
+    "sessions": [],
+    "text": "session 9 master zeughaus (starting)\nruns on gone: labels ; addresses \nrunners:\n  atik online sessions \n"
+  }
+]

@@ -842,6 +842,25 @@ mod tests {
         assert!(describe(&zeughaus(), Some(HEAD)).is_ascii());
     }
 
+    /// The omp plugin ports [`describe`]; both are held to the same cases.
+    #[test]
+    fn describe_matches_the_shared_plugin_fixtures() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            view: RepoView,
+            head: Option<String>,
+            text: String,
+        }
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../../../omp-plugin/fixtures/describe.json"))
+                .expect("describe.json");
+        for case in cases {
+            let actual = describe(&case.view, case.head.as_deref());
+            assert_eq!(actual, case.text, "{}", case.name);
+        }
+    }
+
     /// Tests that touch the filesystem, network, processes or real time: the
     /// integration tier (`.config/nextest.toml`).
     mod io {

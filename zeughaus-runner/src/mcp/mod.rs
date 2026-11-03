@@ -601,6 +601,33 @@ fn responsible_text(repo: &str, number: u64, claim: Option<&ClaimView>) -> Strin
     }
 }
 
+/// What `ci claim` says: the subject is ours now, or who holds it.
+fn claim_text(subject: &ClaimSubject, claim: &ClaimView, ours: bool) -> String {
+    if ours {
+        format!("claimed {}", subject.text())
+    } else {
+        format!("{} is held by {}", subject.text(), claim.holder_text())
+    }
+}
+
+/// The runners among the CI's machines, and the live sessions other than
+/// session `id`: what [`session_text`] tells a session about its peers.
+fn session_peers(
+    id: u64,
+    machines: Vec<MachineView>,
+    sessions: Vec<SessionView>,
+) -> (Vec<MachineView>, Vec<SessionView>) {
+    let runners = machines
+        .into_iter()
+        .filter(|m| m.kind == "runner")
+        .collect();
+    let others = sessions
+        .into_iter()
+        .filter(|s| s.id != id && s.state.is_live())
+        .collect();
+    (runners, others)
+}
+
 /// What an agent session is told about itself and the runners around it.
 fn session_text(session: &SessionView, runners: &[MachineView], others: &[SessionView]) -> String {
     let doc = |s: &SessionView| s.doc.map(|n| format!(" #{n}")).unwrap_or_default();
@@ -864,16 +891,7 @@ async fn ci_answer(client: &Arc<Client>, command: CiCommand) -> Result<String, F
                 CiReply::Overview { overview } => overview,
                 other => return Err(Failure::no_answer(unexpected(&other))),
             };
-            let runners: Vec<MachineView> = overview
-                .machines
-                .into_iter()
-                .filter(|m| m.kind == "runner")
-                .collect();
-            let others: Vec<SessionView> = overview
-                .sessions
-                .into_iter()
-                .filter(|s| s.id != id && s.state.is_live())
-                .collect();
+            let (runners, others) = session_peers(id, overview.machines, overview.sessions);
             if json {
                 encoded(&SessionAnswer {
                     session: &session,
@@ -895,11 +913,7 @@ async fn ci_answer(client: &Arc<Client>, command: CiCommand) -> Result<String, F
                 CiReply::Claim { claim, ours } => (claim, ours),
                 other => return Err(Failure::no_answer(unexpected(&other))),
             };
-            let text = if ours {
-                format!("claimed {}", subject.text())
-            } else {
-                format!("{} is held by {}", subject.text(), claim.holder_text())
-            };
+            let text = claim_text(&subject, &claim, ours);
             if json {
                 encoded(&ClaimAnswer {
                     ours,
@@ -1296,6 +1310,65 @@ mod tests {
         assert_eq!(holder_of(Some("atik"), Some("seven"), None), None);
         assert_eq!(holder_of(Some("Atik PC"), Some("7"), None), None);
         assert_eq!(holder_of(None, Some("7"), None), None);
+    }
+
+    /// The omp plugin ports `ci session`; both are held to the same cases.
+    #[test]
+    fn the_session_text_matches_the_shared_plugin_fixtures() {
+        #[derive(Deserialize)]
+        struct Case {
+            name: String,
+            session: SessionView,
+            machines: Vec<MachineView>,
+            sessions: Vec<SessionView>,
+            text: String,
+        }
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../../../omp-plugin/fixtures/session.json"))
+                .expect("session.json");
+        for case in cases {
+            let (runners, others) = session_peers(case.session.id, case.machines, case.sessions);
+            let actual = session_text(&case.session, &runners, &others);
+            assert_eq!(actual, case.text, "{}", case.name);
+        }
+    }
+
+    /// The omp plugin ports `ci claim` and `ci responsible`; both are held to
+    /// the same cases.
+    #[test]
+    fn the_claim_texts_match_the_shared_plugin_fixtures() {
+        #[derive(Deserialize)]
+        struct ClaimCase {
+            name: String,
+            subject: ClaimSubject,
+            claim: ClaimView,
+            ours: bool,
+            text: String,
+        }
+        #[derive(Deserialize)]
+        struct ResponsibleCase {
+            name: String,
+            repo: String,
+            number: u64,
+            claim: Option<ClaimView>,
+            text: String,
+        }
+        #[derive(Deserialize)]
+        struct Cases {
+            claim: Vec<ClaimCase>,
+            responsible: Vec<ResponsibleCase>,
+        }
+        let cases: Cases =
+            serde_json::from_str(include_str!("../../../omp-plugin/fixtures/claims.json"))
+                .expect("claims.json");
+        for case in cases.claim {
+            let actual = claim_text(&case.subject, &case.claim, case.ours);
+            assert_eq!(actual, case.text, "{}", case.name);
+        }
+        for case in cases.responsible {
+            let actual = responsible_text(&case.repo, case.number, case.claim.as_ref());
+            assert_eq!(actual, case.text, "{}", case.name);
+        }
     }
 
     /// Tests that touch the filesystem, network, processes or real time: the

@@ -1816,6 +1816,33 @@ mod tests {
         }
     }
 
+    /// The omp plugin ports the plan header readers; both are held to the
+    /// same cases.
+    #[test]
+    fn the_plan_header_matches_the_shared_plugin_fixtures() {
+        #[derive(Deserialize)]
+        struct Case {
+            name: String,
+            body: String,
+            title: String,
+            includes: Option<Vec<u64>>,
+            includes_error: Option<String>,
+            runs_on: Option<Vec<String>>,
+            runs_on_error: Option<String>,
+        }
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../../omp-plugin/fixtures/plan-header.json"))
+                .expect("plan-header.json");
+        for case in cases {
+            let name = &case.name;
+            assert_eq!(plan_title(&case.body), case.title, "{name}");
+            let includes = case.includes.ok_or(case.includes_error.unwrap_or_default());
+            assert_eq!(includes_named(&case.body), includes, "{name}");
+            let runs_on = case.runs_on.ok_or(case.runs_on_error.unwrap_or_default());
+            assert_eq!(runs_on_named(&case.body), runs_on, "{name}");
+        }
+    }
+
     fn pipeline() -> PipelineView {
         PipelineView {
             repo: "griasdi".to_owned(),

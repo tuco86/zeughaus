@@ -1,0 +1,131 @@
+{
+  "claim": [
+    {
+      "name": "ours",
+      "subject": {
+        "on": "ticket",
+        "repo": "zeughaus",
+        "number": 45
+      },
+      "claim": {
+        "subject": {
+          "on": "ticket",
+          "repo": "zeughaus",
+          "number": 45
+        },
+        "holder": {
+          "runner": "atik",
+          "terminal": 7,
+          "session": 68
+        },
+        "label": "",
+        "channel": "",
+        "since": 100,
+        "renewed": 160
+      },
+      "ours": true,
+      "text": "claimed ticket #45 of zeughaus"
+    },
+    {
+      "name": "held by a labelled session",
+      "subject": {
+        "on": "pipeline",
+        "repo": "zeughaus",
+        "number": 12
+      },
+      "claim": {
+        "subject": {
+          "on": "pipeline",
+          "repo": "zeughaus",
+          "number": 12
+        },
+        "holder": {
+          "runner": "tuco-pc-hannes",
+          "terminal": 3
+        },
+        "label": "master weida #28",
+        "channel": "dev",
+        "since": 100,
+        "renewed": 160
+      },
+      "ours": false,
+      "text": "pipeline #12 of zeughaus is held by master weida #28 on tuco-pc-hannes, terminal 3"
+    },
+    {
+      "name": "held by a session without a label",
+      "subject": {
+        "on": "ticket",
+        "repo": "weida",
+        "number": 2
+      },
+      "claim": {
+        "subject": {
+          "on": "ticket",
+          "repo": "weida",
+          "number": 2
+        },
+        "holder": {
+          "runner": "sadala",
+          "terminal": 11
+        },
+        "label": "",
+        "channel": "",
+        "since": 100,
+        "renewed": 160
+      },
+      "ours": false,
+      "text": "ticket #2 of weida is held by a session on sadala, terminal 11"
+    }
+  ],
+  "responsible": [
+    {
+      "name": "the holder of the pipeline itself",
+      "repo": "zeughaus",
+      "number": 12,
+      "claim": {
+        "subject": {
+          "on": "pipeline",
+          "repo": "zeughaus",
+          "number": 12
+        },
+        "holder": {
+          "runner": "atik",
+          "terminal": 7
+        },
+        "label": "master zeughaus #45",
+        "channel": "dev",
+        "since": 100,
+        "renewed": 160
+      },
+      "text": "responsible for zeughaus #12: master zeughaus #45 on atik, terminal 7"
+    },
+    {
+      "name": "the holder of an earlier failure",
+      "repo": "zeughaus",
+      "number": 12,
+      "claim": {
+        "subject": {
+          "on": "pipeline",
+          "repo": "zeughaus",
+          "number": 10
+        },
+        "holder": {
+          "runner": "atik",
+          "terminal": 7
+        },
+        "label": "",
+        "channel": "dev",
+        "since": 100,
+        "renewed": 160
+      },
+      "text": "responsible for zeughaus #12: a session on atik, terminal 7 (holds #10)"
+    },
+    {
+      "name": "nobody",
+      "repo": "zeughaus",
+      "number": 12,
+      "claim": null,
+      "text": "nobody holds zeughaus #12 or an earlier failure of its jobs"
+    }
+  ]
+}

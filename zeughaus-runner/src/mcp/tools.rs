@@ -883,26 +883,7 @@ impl Toolbox {
         job: &str,
     ) -> Result<String, String> {
         let view = self.view(repo, number).await?;
-        let found = view
-            .jobs
-            .iter()
-            .find(|j| j.name == job)
-            .ok_or_else(|| format!("no job {job} in {repo} #{number}"))?;
-        if found.status != "running" {
-            return Err(format!(
-                "{job} of {repo} #{number} is {}, not running",
-                found.status
-            ));
-        }
-        let late = lateness(&view, Some(job), None, now())
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                format!(
-                    "{job} of {repo} #{number} has no expected time: no succeeded run at its \
-                     place yet"
-                )
-            })?;
+        let late = late_job(&view, job, now())?;
         let machines = self.machines().await;
         let log = self.last_lines(repo, number, job).await;
         let mut text = late_block(
@@ -1589,6 +1570,31 @@ fn lateness(view: &PipelineView, job: Option<&str>, given: Option<u64>, now: u64
             })
         })
         .collect()
+}
+
+/// How far `job` of `view`, which must be running and have an expected time,
+/// is into that time at `now`. The error says why there is no measure.
+fn late_job(view: &PipelineView, job: &str, now: u64) -> Result<Lateness, String> {
+    let (repo, number) = (&view.repo, view.number);
+    let found = view
+        .jobs
+        .iter()
+        .find(|j| j.name == job)
+        .ok_or_else(|| format!("no job {job} in {repo} #{number}"))?;
+    if found.status != "running" {
+        return Err(format!(
+            "{job} of {repo} #{number} is {}, not running",
+            found.status
+        ));
+    }
+    lateness(view, Some(job), None, now)
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            format!(
+                "{job} of {repo} #{number} has no expected time: no succeeded run at its place yet"
+            )
+        })
 }
 
 /// Those of `late` that reached a multiple of at least 1 above the one
@@ -2382,6 +2388,46 @@ mod tests {
     use crate::mcp::client::Link;
     use crate::mcp::{CiCommand, ci_answer};
     use crate::transport::Transport;
+
+    /// The omp plugin ports the late report of `ci overdue`; both are held
+    /// to the same cases.
+    #[test]
+    fn the_late_report_matches_the_shared_plugin_fixtures() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            view: PipelineView,
+            job: String,
+            now: u64,
+            machines: Option<Vec<MachineView>>,
+            machines_error: Option<String>,
+            log: Option<String>,
+            log_error: Option<String>,
+            text: Option<String>,
+            error: Option<String>,
+        }
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../../../omp-plugin/fixtures/late.json"))
+                .expect("late.json");
+        for case in cases {
+            let actual = late_job(&case.view, &case.job, case.now).map(|late| {
+                let machines = case
+                    .machines
+                    .as_deref()
+                    .ok_or(case.machines_error.as_deref().unwrap_or_default());
+                let log = case
+                    .log
+                    .as_deref()
+                    .ok_or(case.log_error.as_deref().unwrap_or_default());
+                late_block(&case.view, &late, machines, log) + &late_advice(&case.view, None, None)
+            });
+            match (actual, &case.text, &case.error) {
+                (Ok(text), Some(expected), None) => assert_eq!(&text, expected, "{}", case.name),
+                (Err(error), None, Some(expected)) => assert_eq!(&error, expected, "{}", case.name),
+                (actual, _, _) => panic!("{}: {actual:?}", case.name),
+            }
+        }
+    }
 
     fn job(name: &str, status: &str, place: &str, note: &str) -> JobView {
         JobView {

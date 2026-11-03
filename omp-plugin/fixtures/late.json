@@ -1,0 +1,442 @@
+[
+  {
+    "name": "the machine runs another job too",
+    "view": {
+      "repo": "demo",
+      "number": 7,
+      "channel": "dev",
+      "event": "push",
+      "git_ref": "refs/heads/main",
+      "sha": "3635dad0123456789abcdef0123456789abcdef0",
+      "status": "running",
+      "note": "",
+      "created": 1000,
+      "finished": null,
+      "jobs": [
+        {
+          "name": "build",
+          "needs": [],
+          "place": "tuco-pc image:trixie",
+          "status": "running",
+          "note": "",
+          "started": 1000,
+          "finished": null,
+          "code": null,
+          "expected_secs": 60
+        },
+        {
+          "name": "test",
+          "needs": [
+            "build"
+          ],
+          "place": "tuco-pc image:trixie",
+          "status": "queued",
+          "note": "",
+          "started": null,
+          "finished": null,
+          "code": null
+        },
+        {
+          "name": "lint",
+          "needs": [],
+          "place": "tuco-pc image:trixie",
+          "status": "running",
+          "note": "",
+          "started": 1000,
+          "finished": null,
+          "code": null,
+          "expected_secs": null
+        }
+      ]
+    },
+    "job": "build",
+    "now": 1150,
+    "machines": [
+      {
+        "name": "atik",
+        "kind": "runner",
+        "status": "online",
+        "jobs": [
+          {
+            "repo": "weida",
+            "channel": "dev",
+            "number": 3,
+            "job": "check"
+          }
+        ]
+      },
+      {
+        "name": "tuco-pc",
+        "kind": "runner",
+        "status": "online",
+        "jobs": [
+          {
+            "repo": "demo",
+            "channel": "dev",
+            "number": 7,
+            "job": "build"
+          },
+          {
+            "repo": "demo",
+            "channel": "dev",
+            "number": 6,
+            "job": "build"
+          }
+        ]
+      }
+    ],
+    "log": "a\nb\r\n",
+    "text": "late: build on tuco-pc image:trixie: running 150 s, 2x its expected 60 s (measured from its last successful runs)\n  tuco-pc: also runs demo#6/build\n  last lines:\n    a\n    b\nthe CI stops it only at its timeout_minutes; to wait on call ci_wait repo=demo number=7 (it answers again at the next multiple) or run `zeughaus-runner ci wait demo 7` in the background; to stop it call ci_cancel repo=demo number=7\n"
+  },
+  {
+    "name": "the machine runs only this job",
+    "view": {
+      "repo": "demo",
+      "number": 7,
+      "channel": "dev",
+      "event": "push",
+      "git_ref": "refs/heads/main",
+      "sha": "3635dad0123456789abcdef0123456789abcdef0",
+      "status": "running",
+      "note": "",
+      "created": 1000,
+      "finished": null,
+      "jobs": [
+        {
+          "name": "build",
+          "needs": [],
+          "place": "tuco-pc image:trixie",
+          "status": "running",
+          "note": "",
+          "started": 1000,
+          "finished": null,
+          "code": null,
+          "expected_secs": 60
+        },
+        {
+          "name": "test",
+          "needs": [
+            "build"
+          ],
+          "place": "tuco-pc image:trixie",
+          "status": "queued",
+          "note": "",
+          "started": null,
+          "finished": null,
+          "code": null
+        },
+        {
+          "name": "lint",
+          "needs": [],
+          "place": "tuco-pc image:trixie",
+          "status": "running",
+          "note": "",
+          "started": 1000,
+          "finished": null,
+          "code": null,
+          "expected_secs": null
+        }
+      ]
+    },
+    "job": "build",
+    "now": 1060,
+    "machines": [
+      {
+        "name": "tuco-pc",
+        "kind": "runner",
+        "status": "online",
+        "jobs": [
+          {
+            "repo": "demo",
+            "channel": "dev",
+            "number": 7,
+            "job": "build"
+          }
+        ]
+      }
+    ],
+    "log": "",
+    "text": "late: build on tuco-pc image:trixie: running 60 s, 1x its expected 60 s (measured from its last successful runs)\n  tuco-pc: runs no other job\n  last lines:\nthe CI stops it only at its timeout_minutes; to wait on call ci_wait repo=demo number=7 (it answers again at the next multiple) or run `zeughaus-runner ci wait demo 7` in the background; to stop it call ci_cancel repo=demo number=7\n"
+  },
+  {
+    "name": "no machine lists the job",
+    "view": {
+      "repo": "demo",
+      "number": 7,
+      "channel": "dev",
+      "event": "push",
+      "git_ref": "refs/heads/main",
+      "sha": "3635dad0123456789abcdef0123456789abcdef0",
+      "status": "running",
+      "note": "",
+      "created": 1000,
+      "finished": null,
+      "jobs": [
+        {
+          "name": "build",
+          "needs": [],
+          "place": "tuco-pc image:trixie",
+          "status": "running",
+          "note": "",
+          "started": 1000,
+          "finished": null,
+          "code": null,
+          "expected_secs": 60
+        },
+        {
+          "name": "test",
+          "needs": [
+            "build"
+          ],
+          "place": "tuco-pc image:trixie",
+          "status": "queued",
+          "note": "",
+          "started": null,
+          "finished": null,
+          "code": null
+        },
+        {
+          "name": "lint",
+          "needs": [],
+          "place": "tuco-pc image:trixie",
+          "status": "running",
+          "note": "",
+          "started": 1000,
+          "finished": null,
+          "code": null,
+          "expected_secs": null
+        }
+      ]
+    },
+    "job": "build",
+    "now": 1000,
+    "machines": [
+      {
+        "name": "tuco-pc",
+        "kind": "runner",
+        "status": "online",
+        "jobs": []
+      }
+    ],
+    "log_error": "ci: no output of build",
+    "text": "late: build on tuco-pc image:trixie: running 0 s, 0x its expected 60 s (measured from its last successful runs)\n  machine: not known (the CI lists no machine for it)\n  last lines: not available (ci: no output of build)\nthe CI stops it only at its timeout_minutes; to wait on call ci_wait repo=demo number=7 (it answers again at the next multiple) or run `zeughaus-runner ci wait demo 7` in the background; to stop it call ci_cancel repo=demo number=7\n"
+  },
+  {
+    "name": "the machines are not known",
+    "view": {
+      "repo": "demo",
+      "number": 7,
+      "channel": "dev",
+      "event": "push",
+      "git_ref": "refs/heads/main",
+      "sha": "3635dad0123456789abcdef0123456789abcdef0",
+      "status": "running",
+      "note": "",
+      "created": 1000,
+      "finished": null,
+      "jobs": [
+        {
+          "name": "build",
+          "needs": [],
+          "place": "tuco-pc image:trixie",
+          "status": "running",
+          "note": "",
+          "started": 1000,
+          "finished": null,
+          "code": null,
+          "expected_secs": 60
+        },
+        {
+          "name": "test",
+          "needs": [
+            "build"
+          ],
+          "place": "tuco-pc image:trixie",
+          "status": "queued",
+          "note": "",
+          "started": null,
+          "finished": null,
+          "code": null
+        },
+        {
+          "name": "lint",
+          "needs": [],
+          "place": "tuco-pc image:trixie",
+          "status": "running",
+          "note": "",
+          "started": 1000,
+          "finished": null,
+          "code": null,
+          "expected_secs": null
+        }
+      ]
+    },
+    "job": "build",
+    "now": 1299,
+    "machines_error": "ci: no answer within 30 s",
+    "log": "x  \n  y\n\nz",
+    "text": "late: build on tuco-pc image:trixie: running 299 s, 4x its expected 60 s (measured from its last successful runs)\n  machine: not known (ci: no answer within 30 s)\n  last lines:\n    x\n      y\n    \n    z\nthe CI stops it only at its timeout_minutes; to wait on call ci_wait repo=demo number=7 (it answers again at the next multiple) or run `zeughaus-runner ci wait demo 7` in the background; to stop it call ci_cancel repo=demo number=7\n"
+  },
+  {
+    "name": "no such job",
+    "view": {
+      "repo": "demo",
+      "number": 7,
+      "channel": "dev",
+      "event": "push",
+      "git_ref": "refs/heads/main",
+      "sha": "3635dad0123456789abcdef0123456789abcdef0",
+      "status": "running",
+      "note": "",
+      "created": 1000,
+      "finished": null,
+      "jobs": [
+        {
+          "name": "build",
+          "needs": [],
+          "place": "tuco-pc image:trixie",
+          "status": "running",
+          "note": "",
+          "started": 1000,
+          "finished": null,
+          "code": null,
+          "expected_secs": 60
+        },
+        {
+          "name": "test",
+          "needs": [
+            "build"
+          ],
+          "place": "tuco-pc image:trixie",
+          "status": "queued",
+          "note": "",
+          "started": null,
+          "finished": null,
+          "code": null
+        },
+        {
+          "name": "lint",
+          "needs": [],
+          "place": "tuco-pc image:trixie",
+          "status": "running",
+          "note": "",
+          "started": 1000,
+          "finished": null,
+          "code": null,
+          "expected_secs": null
+        }
+      ]
+    },
+    "job": "deploy",
+    "now": 1150,
+    "error": "no job deploy in demo #7"
+  },
+  {
+    "name": "a job that is not running",
+    "view": {
+      "repo": "demo",
+      "number": 7,
+      "channel": "dev",
+      "event": "push",
+      "git_ref": "refs/heads/main",
+      "sha": "3635dad0123456789abcdef0123456789abcdef0",
+      "status": "running",
+      "note": "",
+      "created": 1000,
+      "finished": null,
+      "jobs": [
+        {
+          "name": "build",
+          "needs": [],
+          "place": "tuco-pc image:trixie",
+          "status": "running",
+          "note": "",
+          "started": 1000,
+          "finished": null,
+          "code": null,
+          "expected_secs": 60
+        },
+        {
+          "name": "test",
+          "needs": [
+            "build"
+          ],
+          "place": "tuco-pc image:trixie",
+          "status": "queued",
+          "note": "",
+          "started": null,
+          "finished": null,
+          "code": null
+        },
+        {
+          "name": "lint",
+          "needs": [],
+          "place": "tuco-pc image:trixie",
+          "status": "running",
+          "note": "",
+          "started": 1000,
+          "finished": null,
+          "code": null,
+          "expected_secs": null
+        }
+      ]
+    },
+    "job": "test",
+    "now": 1150,
+    "error": "test of demo #7 is queued, not running"
+  },
+  {
+    "name": "a job without an expected time",
+    "view": {
+      "repo": "demo",
+      "number": 7,
+      "channel": "dev",
+      "event": "push",
+      "git_ref": "refs/heads/main",
+      "sha": "3635dad0123456789abcdef0123456789abcdef0",
+      "status": "running",
+      "note": "",
+      "created": 1000,
+      "finished": null,
+      "jobs": [
+        {
+          "name": "build",
+          "needs": [],
+          "place": "tuco-pc image:trixie",
+          "status": "running",
+          "note": "",
+          "started": 1000,
+          "finished": null,
+          "code": null,
+          "expected_secs": 60
+        },
+        {
+          "name": "test",
+          "needs": [
+            "build"
+          ],
+          "place": "tuco-pc image:trixie",
+          "status": "queued",
+          "note": "",
+          "started": null,
+          "finished": null,
+          "code": null
+        },
+        {
+          "name": "lint",
+          "needs": [],
+          "place": "tuco-pc image:trixie",
+          "status": "running",
+          "note": "",
+          "started": 1000,
+          "finished": null,
+          "code": null,
+          "expected_secs": null
+        }
+      ]
+    },
+    "job": "lint",
+    "now": 1150,
+    "error": "lint of demo #7 has no expected time: no succeeded run at its place yet"
+  }
+]
