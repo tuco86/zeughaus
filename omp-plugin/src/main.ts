@@ -25,11 +25,15 @@
 //   when that is another session.
 // - resolves `${secret:hannes/omp/<doc...>/<FIELD>}` placeholders in bash commands when they run
 //   (secrets.ts), and offers the `secrets` tool, which lists secret documents and field names.
+// - draws `#12` and `#weida-12` in replies as links of `zeughaus-ticket:`; in a zeughaus terminal
+//   picking one shows the ticket in the editor that drives it (tickets.ts).
+// - adds `Ticket: <repo>#<n>` and `Omp-Session: <id>` trailers to the `git commit`s of a session
+//   that works on a ticket (shell.ts).
 //
 // The factory only registers: `omp plugin install` runs it against a throwaway API, so it must
 // do no work at load. Every handler skips subagents, which have prompts of their own, except the
-// read-only guard of a plan session and the secret placeholders. Nothing here may reject out of a
-// detached promise or a timer: omp ends the whole session on it.
+// read-only guard of a plan session, the secret placeholders and the commit trailers. Nothing here
+// may reject out of a detached promise or a timer: omp ends the whole session on it.
 
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -38,6 +42,8 @@ import { agentReporter } from "./agent-status.ts";
 import { planModePrompt } from "./plan-mode.ts";
 import { rewrite } from "./secrets.ts";
 import { claimHolder, masterPlan, planSession, sessionId } from "./session-env.ts";
+import { branchPushes, withTrailers } from "./shell.ts";
+import { LINK_SCHEME, type TicketRef, linkTickets, parseTicketLink, showSequence } from "./tickets.ts";
 
 // The parts of omp's extension API this plugin uses; omp ships no type package to import.
 interface Exec {
@@ -110,6 +116,7 @@ interface Events {
     ctx: Ctx,
   ) => void;
   plan_review_resolved: (event: { choice?: string }, ctx: Ctx) => void;
+  link_activate: (event: { url: string; scheme: string }, ctx: Ctx) => void | Promise<void>;
 }
 interface Pi {
   on<E extends keyof Events>(event: E, handler: Events[E]): void;
@@ -127,6 +134,11 @@ interface Pi {
     command: { description: string; handler: (args: string, ctx: CommandCtx) => Promise<void> },
   ): void;
   registerTool(tool: ToolDefinition): void;
+  // Optional: `omp plugin install` runs the factory against a throwaway API without them.
+  registerLinkScheme?(scheme: string): void;
+  registerAssistantTextRenderer?(
+    renderer: (c: { text: string; streaming: boolean }) => string | undefined,
+  ): void;
   zod: {
     object(shape: Record<string, unknown>): unknown;
     string(): { describe(text: string): unknown; optional(): { describe(text: string): unknown } };
@@ -301,7 +313,7 @@ function block(c: CiContext): string | undefined {
         c.text,
         "Tests before a push: only the unit tier of the crates or packages the change touches (Rust: cargo nextest run -p <crate>; Python: uv run pytest tests/unit). Never the whole suite, the integration or the end-to-end tier locally: the push pipeline runs what its jobs select right after the push, and integration and end-to-end tests belong to the nightly and release pipelines.",
         "Builds and tests on another platform go through run_jobs, never by hand over ssh; skill://zeughaus-ci says how to debug a job or platform with it and how jobs are written.",
-        'Tickets of this repository live in the CI, one number from proposal through plan to execution: read them with the zeughaus MCP tools docs and doc_read. A plan that also does the work of other tickets names them in a line "Includes: #3, #5" directly under its title. The user stores a finished plan as a ticket in review with /zeughaus save. Work for another repository goes in a "## <repo> - <title>" section of the plan; it becomes a ticket there when the plan is approved.',
+        `Tickets of this repository live in the CI, one number from proposal through plan to execution: read them with the zeughaus MCP tools docs and doc_read. A plan that also does the work of other tickets names them in a line "Includes: #3, #5" directly under its title. The user stores a finished plan as a ticket in review with /zeughaus save. Work for another repository goes in a "## <repo> - <title>" section of the plan; it becomes a ticket there when the plan is approved. #12 names ticket 12 of ${c.view.name} and #weida-12 ticket 12 of weida; read ticket://${c.view.name}/12 shows one.`,
       );
     case "unknown":
       return wrap(
@@ -381,193 +393,6 @@ function endedMessage(name: string, sha7: string, p: PipelineView): string {
 function succeededMessage(name: string, sha7: string, p: PipelineView): string {
   const jobs = p.jobs.length;
   return `zeughaus-ci: ${name} #${p.number} (${sha7}, ${p.channel}) succeeded: ${jobs} job${jobs === 1 ? "" : "s"}.`;
-}
-
-// ---- Which bash commands push this checkout --------------------------------------------------
-
-interface Heredoc {
-  tag: string;
-  indent: boolean;
-}
-
-/**
- * The simple commands of a shell line, as lists of words with quotes and escapes resolved. It is
- * no shell: it knows quoting, comments, here-documents and the separators `; & | ( )` and
- * newline, which is what it takes to tell what a line runs, as opposed to what it only mentions
- * in a commit message or an echo.
- */
-function simpleCommands(line: string): string[][] {
-  const commands: string[][] = [];
-  const heredocs: Heredoc[] = [];
-  let words: string[] = [];
-  let word: string | undefined;
-  let heredoc: Heredoc | undefined; // `<<` seen: the next word is its delimiter
-  let i = 0;
-
-  const endWord = (): void => {
-    if (word === undefined) return;
-    if (heredoc) {
-      heredocs.push({ tag: word, indent: heredoc.indent });
-      heredoc = undefined;
-    } else {
-      words.push(word);
-    }
-    word = undefined;
-  };
-  const endCommand = (): void => {
-    endWord();
-    if (words.length > 0) commands.push(words);
-    words = [];
-  };
-
-  while (i < line.length) {
-    const ch = line.charAt(i);
-    if (ch === "'") {
-      const close = line.indexOf("'", i + 1);
-      const end = close === -1 ? line.length : close;
-      word = (word ?? "") + line.slice(i + 1, end);
-      i = end + 1;
-    } else if (ch === '"') {
-      let text = "";
-      i += 1;
-      while (i < line.length && line.charAt(i) !== '"') {
-        if (
-          line.charAt(i) === "\\" &&
-          i + 1 < line.length &&
-          '"\\$`\n'.includes(line.charAt(i + 1))
-        ) {
-          i += 1;
-        }
-        text += line.charAt(i);
-        i += 1;
-      }
-      word = (word ?? "") + text;
-      i += 1;
-    } else if (ch === "\\") {
-      if (line.charAt(i + 1) !== "\n") word = (word ?? "") + line.charAt(i + 1);
-      i += 2;
-    } else if (ch === "\n") {
-      endCommand();
-      i += 1;
-      for (const h of heredocs) {
-        while (i < line.length) {
-          const end = line.indexOf("\n", i);
-          const text = line.slice(i, end === -1 ? line.length : end);
-          i = end === -1 ? line.length : end + 1;
-          if ((h.indent ? text.replace(/^\t+/, "") : text) === h.tag) break;
-        }
-      }
-      heredocs.length = 0;
-    } else if (ch === " " || ch === "\t" || ch === "\r") {
-      endWord();
-      i += 1;
-    } else if (ch === "#" && word === undefined) {
-      const end = line.indexOf("\n", i);
-      i = end === -1 ? line.length : end;
-    } else if (ch === "<" && line.startsWith("<<", i) && line.charAt(i + 2) !== "<") {
-      endWord();
-      heredoc = { tag: "", indent: line.charAt(i + 2) === "-" };
-      i += heredoc.indent ? 3 : 2;
-    } else if (
-      ch === "&" &&
-      (word?.endsWith(">") || word?.endsWith("<") || line.charAt(i + 1) === ">")
-    ) {
-      word = (word ?? "") + ch; // `2>&1`, `&>file`: a redirection, not a separator
-      i += 1;
-    } else if (";|&()`".includes(ch)) {
-      endCommand();
-      i += 1;
-    } else {
-      word = (word ?? "") + ch;
-      i += 1;
-    }
-  }
-  endCommand();
-  return commands;
-}
-
-// Words that may stand before a command without being it.
-const PREFIX =
-  /^(?:if|then|else|elif|do|while|until|!|\{|\}|time|command|exec|nohup|sudo|env|builtin)$/;
-const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
-const REDIRECT = /^(?:\d*|&)(?:>>?|<)/;
-const REDIRECT_ONLY = /^(?:\d*|&)(?:>>?|<)$/;
-const TAKES_VALUE = /^(?:-o|--push-option|--repo|--receive-pack|--exec)$/;
-
-/** The `-C` directories and the arguments of a command that is `git push`. */
-function gitPush(words: string[]): { dirs: string[]; args: string[] } | undefined {
-  let k = 0;
-  while (k < words.length) {
-    const w = words[k] ?? "";
-    if (ASSIGNMENT.test(w) || PREFIX.test(w)) k += 1;
-    else if (w === "timeout" && k + 1 < words.length) k += 2;
-    else break;
-  }
-  const program = words[k];
-  if (program !== "git" && !program?.endsWith("/git")) return undefined;
-  k += 1;
-  const dirs: string[] = [];
-  while (k < words.length && words[k] !== "push") {
-    const w = words[k] ?? "";
-    if (w === "-C" && k + 1 < words.length) {
-      dirs.push(words[k + 1] ?? "");
-      k += 2;
-    } else if (w === "-c" && k + 1 < words.length) {
-      k += 2;
-    } else if (w.startsWith("-")) {
-      k += 1;
-    } else {
-      return undefined; // another subcommand
-    }
-  }
-  if (words[k] !== "push") return undefined;
-  return { dirs, args: words.slice(k + 1) };
-}
-
-/**
- * Whether the arguments of a `git push` can start a pipeline of the checked-out commit. Not so
- * for a dry run, a deletion, and a push of tags only (`--tags` without a refspec).
- */
-function pushesBranch(args: string[]): boolean {
-  const flags: string[] = [];
-  const positional: string[] = [];
-  let rest = false; // after `--`
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i] ?? "";
-    if (!rest && REDIRECT.test(a)) {
-      if (REDIRECT_ONLY.test(a)) i += 1; // its target is the next word
-    } else if (!rest && a === "--") {
-      rest = true;
-    } else if (!rest && a.startsWith("-")) {
-      flags.push(a);
-      if (TAKES_VALUE.test(a)) i += 1;
-    } else {
-      positional.push(a);
-    }
-  }
-  const has = (pattern: RegExp): boolean => flags.some((f) => pattern.test(f));
-  if (has(/^--dry-run$/) || has(/^-[A-Za-z]*n[A-Za-z]*$/)) return false;
-  if (has(/^--delete$/) || has(/^-[A-Za-z]*d[A-Za-z]*$/)) return false;
-  if (has(/^--tags$/) && positional.length <= 1) return false;
-  return true;
-}
-
-/**
- * For every `git push` of a bash command that can start a pipeline, the directories it runs in
- * relative to the command's own: the `cd` targets before it, then its `-C` options.
- */
-function branchPushes(command: string): string[][] {
-  const found: string[][] = [];
-  const cds: string[] = [];
-  for (const words of simpleCommands(command)) {
-    if (words[0] === "cd" && words[1] !== undefined) {
-      cds.push(words[1]);
-      continue;
-    }
-    const push = gitPush(words);
-    if (push && pushesBranch(push.args)) found.push([...cds, ...push.dirs]);
-  }
-  return found;
 }
 
 /** HEAD of the checkout at `root` when one of the pushes ran in it, else `undefined`. */
@@ -699,6 +524,10 @@ export default function zeughausCi(pi: Pi): void {
   const agent = agentReporter();
   // The heartbeat that keeps this terminal's claims, started once per process.
   let renewing = false;
+  // The main agent's omp session id, which commits name.
+  let mainSession: string | undefined;
+  // The tickets a plan executed from omp's own review includes; the next such plan replaces them.
+  let includedTickets: TicketRef[] = [];
 
   /** Releases every claim of this terminal; nothing to do outside a zeughaus terminal. */
   const releaseClaims = (cwd: string): void => {
@@ -706,6 +535,53 @@ export default function zeughausCi(pi: Pi): void {
   };
 
   const isMain = (ctx: Ctx): boolean => !ctx.agent || ctx.agent.kind === "main";
+
+  /** Whether this omp runs in a zeughaus terminal it can write escape sequences to. */
+  const inTerminal = (): boolean =>
+    /^[0-9]+$/.test(process.env.ZEUGHAUS_TERMINAL ?? "") && process.stdout.isTTY === true;
+
+  /** The repository `#12` refers to: the checkout's, else the session's. */
+  const ownRepo = (): string | undefined =>
+    latest.kind === "repo" ? latest.view.name : (masterPlan()?.repo ?? planSession()?.repo);
+
+  /** The trailers of a commit of this session; none without a ticket it works on. */
+  const commitTrailers = (): string[] => {
+    const tickets: TicketRef[] = [];
+    const plan = masterPlan();
+    for (const t of plan ? [plan, ...includedTickets] : includedTickets) {
+      if (!tickets.some((s) => s.repo === t.repo && s.number === t.number)) tickets.push(t);
+    }
+    if (tickets.length === 0) return [];
+    const trailers = tickets.map((t) => `Ticket: ${t.repo}#${t.number}`);
+    if (mainSession && /^[A-Za-z0-9._:-]{1,128}$/.test(mainSession)) {
+      trailers.push(`Omp-Session: ${mainSession}`);
+    }
+    return trailers;
+  };
+
+  pi.registerLinkScheme?.(LINK_SCHEME);
+  pi.registerAssistantTextRenderer?.(({ text }) =>
+    inTerminal() ? linkTickets(text, ownRepo()) : undefined,
+  );
+  pi.on("link_activate", (event, ctx) => {
+    const t = parseTicketLink(event.url);
+    if (!t) {
+      ctx.ui.notify(`not a ticket link: ${event.url}`, "warning");
+      return;
+    }
+    if (inTerminal()) {
+      try {
+        process.stdout.write(showSequence(t, Date.now()));
+      } catch {
+        // A link that opens nothing is no reason to disturb the session.
+      }
+      return;
+    }
+    ctx.ui.notify(
+      `#${t.repo}-${t.number} opens in the editor only from a zeughaus terminal; read ticket://${t.repo}/${t.number} shows it here`,
+      "info",
+    );
+  });
 
   const contextFor = (cwd: string): Promise<CiContext> => {
     if (!loaded || loaded.cwd !== cwd) loaded = { cwd, context: loadContext(pi, cwd) };
@@ -888,6 +764,7 @@ export default function zeughausCi(pi: Pi): void {
 
   pi.on("session_start", (_event, ctx) => {
     if (!isMain(ctx)) return;
+    mainSession = ctx.sessionManager.getSessionId();
     const session = planSession();
     if (session && ctx.hasUI) ctx.ui.setStatus("zeughaus-plan", `plan ${session.repo}`);
     // Not awaited: a slow CI must not hold up the session; before_agent_start waits for it.
@@ -930,17 +807,20 @@ export default function zeughausCi(pi: Pi): void {
   });
 
   // A plan executed straight from omp's own review claims the tickets it includes for this
-  // terminal; they close with the work only through a ticket's plan in zeughaus.
+  // terminal, and its commits name them; they close with the work only through a ticket's plan in
+  // zeughaus.
   pi.on("plan_review_resolved", (event, ctx) => {
     if (isMain(ctx)) agent.report(ctx, "working");
     if (!isMain(ctx) || !["execute", "compact", "keep"].includes(event.choice ?? "")) return;
-    if (!claimHolder()) return;
     const path = planFile ?? newestPlan(ctx);
     if (!path) return;
     void (async () => {
       const c = await contextFor(ctx.cwd);
       if (c.kind !== "repo") return;
-      for (const n of includesNamed(readFileSync(path, "utf8"))) {
+      const included = includesNamed(readFileSync(path, "utf8"));
+      includedTickets = included.map((n) => ({ repo: c.view.name, number: n }));
+      if (!claimHolder()) return;
+      for (const n of included) {
         await exec(pi, RUNNER, ["ci", "claim", c.view.name, "ticket", String(n)], c.root, FIND_TIMEOUT_MS);
       }
     })().catch(() => undefined);
@@ -960,19 +840,33 @@ export default function zeughausCi(pi: Pi): void {
     return undefined;
   });
 
-  // Secret placeholders, for every agent: the value is read when the command runs.
+  // For every agent: commits name their ticket and session, and secret placeholders are read
+  // when the command runs. The one handler that rewrites a bash command.
   pi.on("tool_call", async (event) => {
-    if (event.toolName !== "bash" || typeof event.input.command !== "string") return undefined;
-    const rewritten = rewrite(event.input.command);
-    if (!rewritten) return undefined;
-    if ("refused" in rewritten) return { block: true, reason: rewritten.refused };
-    if (process.platform === "win32") {
+    const command = event.input.command;
+    if (event.toolName !== "bash" || typeof command !== "string") return undefined;
+    const trailers = commitTrailers();
+    const trailed = process.platform === "win32" ? undefined : withTrailers(command, trailers);
+    const rewritten = rewrite(trailed ?? command);
+    if (rewritten && "refused" in rewritten) return { block: true, reason: rewritten.refused };
+    if (rewritten && process.platform === "win32") {
       return { block: true, reason: "secret placeholders need a POSIX shell" };
     }
-    return {
-      input: { ...event.input, command: rewritten.command },
-      additionalContext:
+    if (!trailed && !rewritten) return undefined;
+    const notes: string[] = [];
+    if (trailed) {
+      notes.push(
+        `The zeughaus plugin added --trailer options to that git commit so the commit names its ticket and this omp session (${trailers.join(", ")}); it is the commit as you asked for it.`,
+      );
+    }
+    if (rewritten) {
+      notes.push(
         "The zeughaus plugin resolved the ${secret:...} placeholders of that bash command: the command shown is its rewritten form, which reads each value with get-secret when it runs. It is the command as you asked for it.",
+      );
+    }
+    return {
+      input: { ...event.input, command: rewritten?.command ?? trailed },
+      additionalContext: notes.join(" "),
     };
   });
 
@@ -1052,6 +946,7 @@ export default function zeughausCi(pi: Pi): void {
   // watch of the previous one must not report into it.
   pi.on("session_switch", (_event, ctx) => {
     if (!isMain(ctx)) return;
+    mainSession = ctx.sessionManager.getSessionId();
     agent.report(ctx, "idle");
     releaseClaims(ctx.cwd);
     if (watch) endWatch(watch, false);

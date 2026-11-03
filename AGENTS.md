@@ -210,7 +210,13 @@ its state through the zeughaus omp plugin as the terminal user variable
 runner reports it with the terminal's activity and drops it once the omp
 process is gone. The tab shows it as a glyph of its role (person: the
 user's own session, lightbulb: plan session, rocket: master) in the
-state's colour. Notices replace desktop notifications: the pull tab at the
+state's colour. The plugin also draws `#12` and `#weida-12` in an agent's
+replies as `zeughaus-ticket:` links (with omp's extension reply renderers
+on); picking one sets the user variable `zeughaus_show`, which the runner
+passes on as an ordered terminal event, and the editor that drives the
+terminal (or, without a driver, looks at it) opens that ticket's popout.
+Commits of a session working on a ticket get `Ticket: <repo>#<n>` and
+`Omp-Session: <id>` trailers. Notices replace desktop notifications: the pull tab at the
 window's bottom right counts them in the colour of the worst and opens the
 notice center (severity, title, body, age; a pinned one stays until
 dismissed or resolved, the others go after 60 s). An agent that waits for
@@ -256,7 +262,9 @@ each, under `<state-dir>/ci/state/`), `ci_state_get` downloads one version
 into a directory and `ci_state_delete` removes a version or a store.
 `docs`, `doc_read`,
 `proposal_write`, `onboard_request` and `plan_done` read and write the
-repository's tickets and onboarding requests (below); `ci_repo`
+repository's tickets and onboarding requests (below); every ticket is
+also the resource `ticket://<repo>/<number>`, which omp's `read` shows as
+`doc_read` does. `ci_repo`
 also checks the repository's setup (hook deliveries, the bot's push access,
 its secrets and grants). Nothing but
 protocol messages is written to its stdout.

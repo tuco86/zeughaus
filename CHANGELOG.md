@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Ticket references in omp. The MCP server of `zeughaus-runner mcp` serves
+  every ticket as the resource `ticket://<repo>/<number>`, so `read
+  ticket://zeughaus/44` shows what `doc_read` does and an unknown ticket
+  fails with `no document #n in repo`. The omp plugin (0.13.0) draws `#12`
+  and `#weida-12` in replies as `zeughaus-ticket:` links once omp's
+  extension reply renderers are on; picking one in a zeughaus terminal
+  sets the user variable `zeughaus_show`, which the runner passes on as an
+  ordered terminal event, and the editor that drives the terminal opens
+  the ticket's popout. Commits of a session that works on a ticket (a
+  master's, or a plan executed from omp's own review that includes
+  tickets) get `Ticket: <repo>#<n>` and `Omp-Session: <id>` trailers.
+
 - Comments and a re-evaluation on tickets. Any ticket, done and dismissed
   ones too, takes comments (`<user>@<host>` and time, written in the
   popout, at most 100 of 8 KiB each); the next plan session's brief and a
