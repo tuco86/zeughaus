@@ -555,10 +555,8 @@ mod tests {
                 "scan-rs",
                 docs::NewDoc {
                     kind: DocKind::Onboarding,
-                    title: "Join",
-                    body: "Scans.",
+                    body: "# Join\n\nScans.",
                     source: "scan-rs",
-                    links: &[],
                     runs_on: &[],
                     onboard: Some(&spec),
                 },

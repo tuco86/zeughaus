@@ -26,7 +26,7 @@ use zeughaus_link::enlist::{FromRunner, SessionReport, SessionSpec, ToRunner};
 use zeughaus_link::selector::{Selector, parse_runs_on};
 use zeughaus_link::{
     ClaimHolder, ClaimSubject, ClaimView, DocKind, DocState, DocView, SessionKind, SessionMachine,
-    SessionState, SessionView, blocked_by, normalize_origin,
+    SessionState, SessionView, normalize_origin,
 };
 
 use crate::claims;
@@ -230,18 +230,10 @@ impl Sessions {
         })
     }
 
-    /// Whether ticket `doc` waits for a `depends on` ticket; `lists` caches
-    /// each repository's tickets for one dispatch round.
-    fn blocked(
-        &self,
-        config: &CiConfig,
-        lists: &mut BTreeMap<String, Vec<DocView>>,
-        doc: &DocView,
-    ) -> bool {
-        let list = lists
-            .entry(doc.repo.clone())
-            .or_insert_with(|| docs::list(&self.state_dir, config, &doc.repo));
-        !blocked_by(doc, list).is_empty()
+    /// Whether ticket `doc` waits for a `depends on` ticket; the docs
+    /// functions that list tickets for dispatch fill `waits_for`.
+    fn blocked(doc: &DocView) -> bool {
+        !doc.waits_for.is_empty()
     }
 
     /// Starts a plan session for each ready ticket and a master for each
@@ -257,8 +249,7 @@ impl Sessions {
         }
         let config = self.config.get();
         let views = self.runners.views();
-        let mut lists: BTreeMap<String, Vec<DocView>> = BTreeMap::new();
-        self.dispatch_planning(&config, &views, &mut lists, now);
+        self.dispatch_planning(&config, &views, now);
         let queue = docs::queue(&self.state_dir, &config);
         if queue.is_empty() {
             return;
@@ -267,7 +258,7 @@ impl Sessions {
             if docs::paused(&self.state_dir, &config, &plan.repo) {
                 continue;
             }
-            if self.blocked(&config, &mut lists, &plan) {
+            if Self::blocked(&plan) {
                 continue;
             }
             let Ok(selectors) = parse_runs_on(&plan.runs_on) else {
@@ -356,15 +347,9 @@ impl Sessions {
     /// finished and that nobody plans yet: on the runner that wrote its
     /// plan when it has one (it waits while that runner is away), else on
     /// the first session host its first `Runs on` matches, else the first.
-    fn dispatch_planning(
-        &self,
-        config: &CiConfig,
-        views: &BTreeMap<String, RunnerView>,
-        lists: &mut BTreeMap<String, Vec<DocView>>,
-        now: u64,
-    ) {
+    fn dispatch_planning(&self, config: &CiConfig, views: &BTreeMap<String, RunnerView>, now: u64) {
         for ticket in docs::ready(&self.state_dir, config) {
-            if self.blocked(config, lists, &ticket) {
+            if Self::blocked(&ticket) {
                 continue;
             }
             let mut book = lock(&self.book);
@@ -934,7 +919,7 @@ mod tests {
         use tokio::sync::mpsc::UnboundedReceiver;
         use zeughaus_link::enlist::Offer;
 
-        use zeughaus_link::{DocLink, LinkKind, Planner};
+        use zeughaus_link::Planner;
 
         use crate::config::CiConfig;
 
@@ -1148,23 +1133,20 @@ mod tests {
         }
 
         fn open_ticket(f: &Fixture, depends: &[u64]) -> u64 {
-            let links: Vec<DocLink> = depends
-                .iter()
-                .map(|&number| DocLink {
-                    kind: LinkKind::DependsOn,
-                    number,
-                })
-                .collect();
+            let mut body = String::from("# t\n");
+            if !depends.is_empty() {
+                let refs: Vec<String> = depends.iter().map(|n| format!("#{n}")).collect();
+                body.push_str(&format!("Depends on: {}\n", refs.join(", ")));
+            }
+            body.push_str("\nbody\n");
             docs::create(
                 &f.state,
                 &f.config,
                 "demo",
                 docs::NewDoc {
                     kind: DocKind::Ticket,
-                    title: "t",
-                    body: "body",
+                    body: &body,
                     source: "elsewhere",
-                    links: &links,
                     runs_on: &[],
                     onboard: None,
                 },

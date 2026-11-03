@@ -12,7 +12,7 @@ use iced::widget::{Space, button, markdown, row, text, text_input};
 use iced::{Alignment, Element, Length, Task};
 use zeughaus_link::{
     CiReply, CiRequest, ClaimSubject, DocKind, DocState, DocView, MachineView, SessionKind,
-    SessionState, SessionView, blocked_by,
+    SessionState, SessionView,
 };
 use zeughaus_mux::TerminalId;
 use zeughaus_theme::Theme;
@@ -241,11 +241,12 @@ impl CiClient {
         }
         match result {
             Ok(Some(doc)) => {
-                // A ticket's note is said in its action row; an onboarding
-                // request's text says what it asks for.
+                // A ticket's note is said in its action row and its title in
+                // the header; an onboarding request's text says what it asks
+                // for.
                 let shown_text = match doc.kind {
                     DocKind::Onboarding => doc.shown_text(),
-                    DocKind::Ticket => doc.body.clone(),
+                    DocKind::Ticket => zeughaus_link::text_without_title(&doc.body).to_owned(),
                 };
                 let body = markdown::Content::parse(&shown_text);
                 // Each section's text without its heading, which its card
@@ -344,7 +345,7 @@ fn acting_on(request: &CiRequest) -> Option<(u64, &'static str)> {
         CiRequest::DocRefine { number, .. } => Some((*number, "refining")),
         CiRequest::DocRunsOn { number, .. }
         | CiRequest::DocEdit { number, .. }
-        | CiRequest::DocLinks { number, .. } => Some((*number, "saving")),
+        | CiRequest::DocAutoApprove { number, .. } => Some((*number, "saving")),
         _ => None,
     }
 }
@@ -928,22 +929,28 @@ impl App {
                 bar = bar.push(tip(refine, what.to_owned()));
             }
         }
-        if open_or_ready {
+        let unfinished = !matches!(
+            doc.state,
+            DocState::Done | DocState::Dismissed | DocState::Merged
+        );
+        if ticket && unfinished {
             let mut edit = pill("Edit", false);
             if !state.acting {
                 edit = edit.on_press(Message::Ticket(TicketMsg::Edit));
             }
-            bar = bar.push(tip(edit, "Change its title and proposal".to_owned()));
+            bar = bar.push(tip(
+                edit,
+                "Change its text, title and links included".to_owned(),
+            ));
         }
         let mut waits = Vec::new();
-        if matches!(doc.state, DocState::Ready | DocState::Approved) {
-            let blocked: Vec<String> = blocked_by(doc, state.docs())
+        if matches!(doc.state, DocState::Ready | DocState::Approved) && !doc.waits_for.is_empty() {
+            let refs: Vec<String> = doc
+                .waits_for
                 .iter()
-                .map(|n| format!("#{n}"))
+                .map(|link| link.reference(&doc.repo))
                 .collect();
-            if !blocked.is_empty() {
-                waits.push(format!("waits for {}", blocked.join(", ")));
-            }
+            waits.push(format!("waits for {}", refs.join(", ")));
         }
         if doc.state == DocState::Ready
             && let Some(planner) = &doc.planner

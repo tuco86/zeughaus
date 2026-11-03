@@ -25,8 +25,7 @@ use iced::{Alignment, Border, Color, Element, Length, Task};
 use iced_tabs::scroll;
 use zeughaus_link::{
     ActivityKind, ActivityState, AgentRole, AgentState, ClaimSubject, ClaimView, DocGroup,
-    DocState, DocView, RepoDocsView, SessionKind, SessionState, SessionView, blocked_by,
-    doc_groups,
+    DocState, DocView, RepoDocsView, SessionKind, SessionState, SessionView, doc_groups,
 };
 use zeughaus_mux::TerminalId;
 use zeughaus_theme::Theme;
@@ -252,9 +251,7 @@ fn board_columns(
             let slot = match group {
                 DocGroup::Open if claimed(number) => PLANNING,
                 DocGroup::Open => PROPOSALS,
-                DocGroup::Planning
-                    if doc.state == DocState::Ready && !blocked_by(doc, docs).is_empty() =>
-                {
+                DocGroup::Planning if doc.state == DocState::Ready && !doc.waits_for.is_empty() => {
                     PROPOSALS
                 }
                 DocGroup::Planning => PLANNING,
@@ -1721,8 +1718,12 @@ impl App {
                 doc.state,
                 DocState::Ready | DocState::Approved | DocState::Open
             ) {
-                for number in blocked_by(doc, state.docs()) {
-                    second = second.push(text(format!("after #{number}")).size(11).color(muted));
+                for link in &doc.waits_for {
+                    second = second.push(
+                        text(format!("after {}", link.reference(&doc.repo)))
+                            .size(11)
+                            .color(muted),
+                    );
                 }
             }
             if doc.revision > 0 {
@@ -2140,6 +2141,8 @@ mod tests {
             feedback: String::new(),
             onboard: None,
             note: String::new(),
+            waits_for: Vec::new(),
+            filed: Vec::new(),
         }
     }
 
@@ -2163,9 +2166,10 @@ mod tests {
     #[test]
     fn tickets_fall_into_the_lifecycle_slots_and_done_keeps_the_newest() {
         let mut blocked = doc(2, DocState::Ready, 1);
-        blocked.links = vec![zeughaus_link::DocLink {
+        blocked.waits_for = vec![zeughaus_link::DocLink {
             kind: zeughaus_link::LinkKind::DependsOn,
             number: 1,
+            repo: None,
         }];
         let mut docs = vec![
             doc(1, DocState::Open, 1),

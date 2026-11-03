@@ -517,7 +517,7 @@ pub enum CiMsg {
         result: Result<Option<Box<zeughaus_link::DocView>>, String>,
     },
     /// The user asked the CI something its answer to is `Accepted`: a
-    /// `DocState`, `DocDelete`, `DocRunsOn`, `DocEdit`, `DocLinks`,
+    /// `DocState`, `DocDelete`, `DocRunsOn`, `DocEdit`, `DocAutoApprove`,
     /// `DocRefine`, `QueuePaused` or `CloseSession`.
     DocAct {
         view: u64,
@@ -568,16 +568,13 @@ pub enum TicketMsg {
     },
     Close,
     Tab(TicketTab),
-    /// The title and proposal of an open or ready ticket become editable.
+    /// The text of a ticket that is not finished becomes editable.
     Edit,
-    EditTitle(String),
     EditBody(iced::widget::text_editor::Action),
     EditSave,
     EditCancel,
-    /// The `#12` typed beside the link buttons.
-    LinkInput(String),
-    LinkAdd(zeughaus_link::LinkKind),
-    LinkRemove(zeughaus_link::LinkKind, u64),
+    /// Pre-approves the ticket's plan, or takes that back.
+    PreApprove(bool),
     /// The new ticket goes to the CI, and its answer.
     Create,
     Created(Result<u64, String>),

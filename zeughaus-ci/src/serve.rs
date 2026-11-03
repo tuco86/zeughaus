@@ -186,19 +186,15 @@ impl CiServer {
             CiRequest::DocCreate {
                 repo,
                 kind,
-                title,
                 body,
                 source,
-                links,
                 runs_on,
                 onboard,
             } => {
                 let new = docs::NewDoc {
                     kind,
-                    title: &title,
                     body: &body,
                     source: &source,
-                    links: &links,
                     runs_on: &runs_on,
                     onboard: onboard.as_ref(),
                 };
@@ -217,12 +213,11 @@ impl CiServer {
                 spec,
                 tickets,
             } => {
+                let body = zeughaus_link::compose_text(&title, &[], &body);
                 let request = docs::NewDoc {
                     kind: zeughaus_link::DocKind::Onboarding,
-                    title: &title,
                     body: &body,
                     source: "user",
-                    links: &[],
                     runs_on: &[],
                     onboard: Some(&spec),
                 };
@@ -239,9 +234,19 @@ impl CiServer {
                 repo,
                 number,
                 state,
-            } => accepted(self.change_docs(&repo, |dir, config, now| {
-                docs::set_state(dir, config, &repo, number, state, now).map(|()| ((), true))
-            })),
+            } => {
+                let moved = self.change_docs(&repo, |dir, config, now| {
+                    docs::set_state(dir, config, &repo, number, state, now).map(|()| ((), true))
+                });
+                // An approval that failed may still have filed some sections.
+                if state == zeughaus_link::DocState::Approved {
+                    if moved.is_err() {
+                        let _ = self.docs_changed.send(repo.clone());
+                    }
+                    self.announce_filed(&repo, number);
+                }
+                accepted(moved)
+            }
             CiRequest::DocDelete { repo, number } => {
                 accepted(self.change_docs(&repo, |dir, config, _| {
                     docs::delete(dir, config, &repo, number).map(|()| ((), true))
@@ -254,20 +259,18 @@ impl CiServer {
             } => accepted(self.change_docs(&repo, |dir, config, now| {
                 docs::set_runs_on(dir, config, &repo, number, runs_on, now).map(|()| ((), true))
             })),
-            CiRequest::DocEdit {
+            CiRequest::DocEdit { repo, number, body } => {
+                accepted(self.change_docs(&repo, |dir, config, now| {
+                    docs::edit(dir, config, &repo, number, &body, now).map(|()| ((), true))
+                }))
+            }
+            CiRequest::DocAutoApprove {
                 repo,
                 number,
-                title,
-                body,
+                auto_approve,
             } => accepted(self.change_docs(&repo, |dir, config, now| {
-                docs::edit(dir, config, &repo, number, &title, &body, now).map(|()| ((), true))
-            })),
-            CiRequest::DocLinks {
-                repo,
-                number,
-                links,
-            } => accepted(self.change_docs(&repo, |dir, config, now| {
-                docs::set_links(dir, config, &repo, number, links, now).map(|()| ((), true))
+                docs::set_auto_approve(dir, config, &repo, number, auto_approve, now)
+                    .map(|()| ((), true))
             })),
             CiRequest::DocRefine {
                 repo,
@@ -299,7 +302,10 @@ impl CiServer {
                         .map(|number| (number, true))
                 });
                 match written {
-                    Ok(number) => CiReply::DocCreated { number },
+                    Ok(number) => {
+                        self.announce_filed(&repo, number);
+                        CiReply::DocCreated { number }
+                    }
                     Err(e) => error(&e),
                 }
             }
@@ -423,6 +429,21 @@ impl CiServer {
             let _ = self.docs_changed.send(repo.to_owned());
         }
         Ok(done)
+    }
+
+    /// Announces the repositories, other than `repo`, that ticket `number`'s
+    /// plan sections were filed in.
+    fn announce_filed(&self, repo: &str, number: u64) {
+        let Some(doc) = docs::load(&self.state_dir, &self.config.get(), repo, number) else {
+            return;
+        };
+        let mut announced: Vec<&str> = Vec::new();
+        for filed in &doc.filed {
+            if filed.repo != repo && !announced.contains(&filed.repo.as_str()) {
+                announced.push(&filed.repo);
+                let _ = self.docs_changed.send(filed.repo.clone());
+            }
+        }
     }
 
     /// The records of `repo`. The name comes from a request and is joined
@@ -3371,10 +3392,8 @@ mod tests {
             let made = server.answer(CiRequest::DocCreate {
                 repo: "demo".to_owned(),
                 kind: zeughaus_link::DocKind::Ticket,
-                title: "  Smoke ticket ".to_owned(),
-                body: "Please smoke.\n".to_owned(),
+                body: "#   Smoke ticket \n\nPlease smoke.\n".to_owned(),
                 source: "user".to_owned(),
-                links: Vec::new(),
                 runs_on: Vec::new(),
                 onboard: None,
             });
@@ -3462,10 +3481,8 @@ mod tests {
             let made = server.answer(CiRequest::DocCreate {
                 repo: "scan-rs".to_owned(),
                 kind: zeughaus_link::DocKind::Onboarding,
-                title: "Join".to_owned(),
-                body: "Scans.\n".to_owned(),
+                body: "# Join\n\nScans.\n".to_owned(),
                 source: "scan-rs".to_owned(),
-                links: Vec::new(),
                 runs_on: Vec::new(),
                 onboard: Some(zeughaus_link::OnboardSpec {
                     url: "git@git.example.org:o/scan-rs.git".to_owned(),

@@ -573,6 +573,8 @@ mod tests {
             feedback: String::new(),
             onboard: None,
             note: String::new(),
+            waits_for: Vec::new(),
+            filed: Vec::new(),
         };
         let mut view = zeughaus();
         view.docs = vec![
@@ -633,6 +635,8 @@ mod tests {
             feedback: String::new(),
             onboard: None,
             note: String::new(),
+            waits_for: Vec::new(),
+            filed: Vec::new(),
         };
         assert_eq!(
             pending_text("git@host:o/scan-rs.git", &request),

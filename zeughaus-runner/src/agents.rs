@@ -179,9 +179,16 @@ fn omp_program() -> std::ffi::OsString {
 }
 
 /// What the master tells omp to do with its ticket's plan; `machines` is
-/// whether `ZEUGHAUS_MACHINES` names other hosts.
+/// whether `ZEUGHAUS_MACHINES` names other hosts, `filed` the tickets the
+/// plan's sections became, which the attached plan leaves out.
 #[cfg(unix)]
-fn instruction(repo: &str, number: u64, branch: &str, machines: bool) -> String {
+fn instruction(
+    repo: &str,
+    number: u64,
+    branch: &str,
+    machines: bool,
+    filed: &[zeughaus_link::FiledTicket],
+) -> String {
     let mut text = format!(
         "Execute the plan of the attached approved zeughaus ticket #{number} of {repo} from \
          top to bottom. When its work is complete (gate passed, committed and pushed as \
@@ -194,6 +201,24 @@ fn instruction(repo: &str, number: u64, branch: &str, machines: bool) -> String 
             " This session has the machines in ZEUGHAUS_MACHINES (name=ssh destination) for \
              work on other hosts.",
         );
+    }
+    if !filed.is_empty() {
+        let tickets: Vec<String> = filed
+            .iter()
+            .map(|ticket| {
+                let reference = if ticket.repo == repo {
+                    format!("#{}", ticket.number)
+                } else {
+                    format!("#{}-{}", ticket.repo, ticket.number)
+                };
+                format!("{reference} ({})", ticket.title)
+            })
+            .collect();
+        text.push_str(&format!(
+            " Its sections for other tickets were filed as tickets of their own and are left \
+             out of the attached plan: {}.",
+            tickets.join(", ")
+        ));
     }
     text
 }
@@ -231,24 +256,27 @@ fn replan_instruction(repo: &str, number: u64) -> String {
 
 /// The ticket a plan session is given: its title, what it asks for and its
 /// links both ways, each with the linked ticket's title and state when
-/// `docs` has it.
+/// `docs` (its repository's tickets) has it.
 #[cfg(unix)]
 fn ticket_brief(doc: &zeughaus_link::DocView, docs: &[zeughaus_link::DocView]) -> String {
     use zeughaus_link::LinkKind;
     let mut text = format!("# #{} {}\n\n", doc.number, doc.title);
-    if doc.body.trim().is_empty() {
+    let proposal = zeughaus_link::text_without_title(&doc.body);
+    if proposal.trim().is_empty() {
         text.push_str("(no proposal text: this ticket started as a plan)\n");
     } else {
-        text.push_str(doc.body.trim_end());
+        text.push_str(proposal.trim_end());
         text.push('\n');
     }
-    let line = |verb: &str, number: u64| match docs.iter().find(|d| d.number == number) {
+    let line = |verb: &str, reference: String, same: Option<u64>| match same
+        .and_then(|number| docs.iter().find(|d| d.number == number))
+    {
         Some(other) => format!(
-            "- {verb} #{number} {} ({})\n",
+            "- {verb} {reference} {} ({})\n",
             other.title,
             other.state.name()
         ),
-        None => format!("- {verb} #{number}\n"),
+        None => format!("- {verb} {reference}\n"),
     };
     let mut links = String::new();
     for link in &doc.links {
@@ -256,14 +284,15 @@ fn ticket_brief(doc: &zeughaus_link::DocView, docs: &[zeughaus_link::DocView]) -
             LinkKind::DependsOn => "depends on",
             LinkKind::Related => "related to",
         };
-        links.push_str(&line(verb, link.number));
+        let same = link.repo.is_none().then_some(link.number);
+        links.push_str(&line(verb, link.reference(&doc.repo), same));
     }
     for (kind, number) in zeughaus_link::linked_from(doc.number, docs) {
         let verb = match kind {
             LinkKind::DependsOn => "blocks",
             LinkKind::Related => "related to",
         };
-        links.push_str(&line(verb, number));
+        links.push_str(&line(verb, format!("#{number}"), Some(number)));
     }
     if !links.is_empty() {
         text.push_str("\n## Links\n\n");
@@ -825,7 +854,8 @@ mod unix {
             .join("agents")
             .join(&plan.repo)
             .join(format!("plan-{}.md", plan.number));
-        if let Err(e) = crate::files::write_atomic(&file, plan.plan_text.as_bytes()) {
+        let text = zeughaus_link::without_sections(&plan.plan_text, &plan.filed);
+        if let Err(e) = crate::files::write_atomic(&file, text.as_bytes()) {
             eprintln!("[master] {e}");
             return ExitCode::FAILURE;
         }
@@ -833,7 +863,13 @@ mod unix {
         let machines = std::env::var_os("ZEUGHAUS_MACHINES").is_some_and(|m| !m.is_empty());
         let status = Command::new(omp_program())
             .arg(format!("@{}", file.display()))
-            .arg(instruction(&plan.repo, plan.number, branch, machines))
+            .arg(instruction(
+                &plan.repo,
+                plan.number,
+                branch,
+                machines,
+                &plan.filed,
+            ))
             .env("ZEUGHAUS_PLAN", format!("{}#{}", plan.repo, plan.number))
             .current_dir(root)
             .status();
@@ -949,7 +985,7 @@ pub fn work(_args: &[String], _state_dir: &Path) -> ExitCode {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use zeughaus_link::{DocKind, DocLink, DocState, DocView, LinkKind};
+    use zeughaus_link::{DocKind, DocLink, DocState, DocView, FiledTicket, LinkKind};
 
     #[test]
     fn work_takes_one_origin_and_an_optional_branch() {
@@ -1113,19 +1149,30 @@ mod tests {
             feedback: String::new(),
             onboard: None,
             note: String::new(),
+            waits_for: Vec::new(),
+            filed: Vec::new(),
         }
     }
 
     #[test]
     fn a_ticket_brief_names_its_links_both_ways() {
-        let link = |kind, number| DocLink { kind, number };
+        let link = |kind, number, repo: Option<&str>| DocLink {
+            kind,
+            number,
+            repo: repo.map(str::to_owned),
+        };
         let mut planned = ticket(
             3,
             "Tickets",
             DocState::Planning,
-            vec![link(LinkKind::DependsOn, 1), link(LinkKind::Related, 9)],
+            vec![
+                link(LinkKind::DependsOn, 1, None),
+                link(LinkKind::Related, 9, None),
+                // weida's #5 is another ticket than this repository's.
+                link(LinkKind::DependsOn, 5, Some("weida")),
+            ],
         );
-        planned.body = "Do it.\n\n".to_owned();
+        planned.body = "# Tickets\n\nDo it.\n\n".to_owned();
         let docs = vec![
             ticket(1, "Claims", DocState::Done, Vec::new()),
             planned.clone(),
@@ -1133,7 +1180,7 @@ mod tests {
                 5,
                 "Popout",
                 DocState::Open,
-                vec![link(LinkKind::DependsOn, 3)],
+                vec![link(LinkKind::DependsOn, 3, None)],
             ),
         ];
         assert_eq!(
@@ -1141,12 +1188,39 @@ mod tests {
             "# #3 Tickets\n\nDo it.\n\n## Links\n\n\
              - depends on #1 Claims (done)\n\
              - related to #9\n\
+             - depends on #weida-5\n\
              - blocks #5 Popout (open)\n"
         );
         let bare = ticket(4, "Plan only", DocState::Planning, Vec::new());
         assert_eq!(
             ticket_brief(&bare, &[]),
             "# #4 Plan only\n\n(no proposal text: this ticket started as a plan)\n"
+        );
+    }
+
+    #[test]
+    fn a_master_is_told_which_sections_were_filed_elsewhere() {
+        let plain = instruction("demo", 4, "main", false, &[]);
+        assert!(!plain.contains("sections"), "{plain}");
+        let filed = [
+            FiledTicket {
+                repo: "weida".to_owned(),
+                number: 7,
+                title: "Keep the corpus".to_owned(),
+            },
+            FiledTicket {
+                repo: "demo".to_owned(),
+                number: 5,
+                title: "Later".to_owned(),
+            },
+        ];
+        let told = instruction("demo", 4, "main", false, &filed);
+        assert!(
+            told.ends_with(
+                " Its sections for other tickets were filed as tickets of their own and are \
+                 left out of the attached plan: #weida-7 (Keep the corpus), #5 (Later)."
+            ),
+            "{told}"
         );
     }
 }

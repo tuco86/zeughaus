@@ -562,7 +562,6 @@ impl Toolbox {
         let ProposalArgs {
             path,
             repo,
-            title,
             body,
             runs_on,
         } = args;
@@ -595,10 +594,8 @@ impl Toolbox {
         let request = CiRequest::DocCreate {
             repo: repo.clone(),
             kind: DocKind::Ticket,
-            title,
             body,
             source,
-            links: Vec::new(),
             runs_on,
             onboard: None,
         };
@@ -628,7 +625,6 @@ impl Toolbox {
             path,
             url,
             name,
-            title,
             body,
             default_branch,
             grants,
@@ -648,10 +644,8 @@ impl Toolbox {
         let request = CiRequest::DocCreate {
             repo: name.clone(),
             kind: DocKind::Onboarding,
-            title,
             body,
             source,
-            links: Vec::new(),
             runs_on: Vec::new(),
             onboard: Some(OnboardSpec {
                 url: origin,
@@ -1164,7 +1158,6 @@ struct StateDeleteArgs {
 struct ProposalArgs {
     path: Option<String>,
     repo: Option<String>,
-    title: String,
     body: String,
     #[serde(default)]
     runs_on: Vec<String>,
@@ -1176,7 +1169,6 @@ struct OnboardArgs {
     path: Option<String>,
     url: Option<String>,
     name: String,
-    title: String,
     body: String,
     default_branch: Option<String>,
     #[serde(default)]
@@ -2158,13 +2150,12 @@ fn definitions() -> Vec<Value> {
                     "description": "The receiving repository's name as ci_status lists it, \
                                     instead of path.",
                 },
-                "title": {
-                    "type": "string",
-                    "description": "One line, at most 200 bytes.",
-                },
                 "body": {
                     "type": "string",
-                    "description": "The proposal in Markdown.",
+                    "description": "The ticket in Markdown: its first line `# <title>`, then \
+                                    optional `Depends on:` and `Related:` lines (`#12` for a \
+                                    ticket of the receiving repository, `#<repo>-<n>` for \
+                                    another), then the text.",
                 },
                 "runs_on": {
                     "type": "array",
@@ -2174,7 +2165,7 @@ fn definitions() -> Vec<Value> {
                                     [\"os=windows\"]",
                 },
             }),
-            &["title", "body"],
+            &["body"],
             false,
         ),
         tool(
@@ -2202,13 +2193,9 @@ fn definitions() -> Vec<Value> {
                     "type": "string",
                     "description": "The repository name in ci.toml, [a-z0-9][a-z0-9-]*.",
                 },
-                "title": {
-                    "type": "string",
-                    "description": "One line, at most 200 bytes.",
-                },
                 "body": {
                     "type": "string",
-                    "description": "The request in Markdown.",
+                    "description": "The request in Markdown, starting with its `# <title>` line.",
                 },
                 "default_branch": {
                     "type": "string",
@@ -2227,7 +2214,7 @@ fn definitions() -> Vec<Value> {
                                     each, for example a sudo rule for an install script.",
                 },
             }),
-            &["name", "title", "body"],
+            &["name", "body"],
             false,
         ),
         tool(
@@ -3460,6 +3447,8 @@ mod tests {
             feedback: String::new(),
             onboard: None,
             note: String::new(),
+            waits_for: Vec::new(),
+            filed: Vec::new(),
         }
     }
 
@@ -4266,7 +4255,7 @@ mod tests {
             let text = tools
                 .call(
                     "proposal_write",
-                    json!({ "path": receiving, "title": "Expose the clock", "body": "Why." }),
+                    json!({ "path": receiving, "body": "# Expose the clock\n\nWhy." }),
                 )
                 .await
                 .expect("stored");
@@ -4276,18 +4265,16 @@ mod tests {
                 Some(&CiRequest::DocCreate {
                     repo: "demo".to_owned(),
                     kind: DocKind::Ticket,
-                    title: "Expose the clock".to_owned(),
-                    body: "Why.".to_owned(),
+                    body: "# Expose the clock\n\nWhy.".to_owned(),
                     source: "weida".to_owned(),
-                    links: Vec::new(),
                     runs_on: Vec::new(),
                     onboard: None,
                 })
             );
 
             for both_or_neither in [
-                json!({ "title": "t", "body": "b" }),
-                json!({ "path": receiving, "repo": "demo", "title": "t", "body": "b" }),
+                json!({ "body": "# t\n" }),
+                json!({ "path": receiving, "repo": "demo", "body": "# t\n" }),
             ] {
                 let err = tools
                     .call("proposal_write", both_or_neither)
@@ -4312,7 +4299,7 @@ mod tests {
             let err = tools
                 .call(
                     "proposal_write",
-                    json!({ "path": receiving, "title": "t", "body": "b" }),
+                    json!({ "path": receiving, "body": "# t\n" }),
                 )
                 .await
                 .expect_err("not in the CI");
@@ -4352,8 +4339,7 @@ mod tests {
                     json!({
                         "path": joining,
                         "name": "scan-rs",
-                        "title": "Join",
-                        "body": "Scans.",
+                        "body": "# Join\n\nScans.",
                         "grants": { "DEPLOY_KEY": ["push main"] },
                         "prerequisites": ["a sudo rule"],
                     }),
@@ -4375,10 +4361,8 @@ mod tests {
                 Some(&CiRequest::DocCreate {
                     repo: "scan-rs".to_owned(),
                     kind: DocKind::Onboarding,
-                    title: "Join".to_owned(),
-                    body: "Scans.".to_owned(),
+                    body: "# Join\n\nScans.".to_owned(),
                     source,
-                    links: Vec::new(),
                     runs_on: Vec::new(),
                     onboard: Some(OnboardSpec {
                         url: "git@example.invalid:o/scan-rs.git".to_owned(),
@@ -4392,8 +4376,8 @@ mod tests {
             );
 
             for both_or_neither in [
-                json!({ "name": "x", "title": "t", "body": "b" }),
-                json!({ "path": joining, "url": "https://h/o/x", "name": "x", "title": "t", "body": "b" }),
+                json!({ "name": "x", "body": "# t\n" }),
+                json!({ "path": joining, "url": "https://h/o/x", "name": "x", "body": "# t\n" }),
             ] {
                 let err = tools
                     .call("onboard_request", both_or_neither)

@@ -360,7 +360,7 @@ fn retries(request: &CiRequest) -> bool {
         | CiRequest::DocDelete { .. }
         | CiRequest::DocRunsOn { .. }
         | CiRequest::DocEdit { .. }
-        | CiRequest::DocLinks { .. }
+        | CiRequest::DocAutoApprove { .. }
         | CiRequest::DocRefine { .. }
         | CiRequest::PlanWrite { .. }
         | CiRequest::QueuePaused { .. }

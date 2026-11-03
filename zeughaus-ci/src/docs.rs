@@ -10,15 +10,19 @@
 //! mutating functions (one lock shared by the `/ci` server and the session
 //! dispatcher): numbering relies on it.
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use zeughaus_link::NewTicket;
 use zeughaus_link::ci::{
     DocKind, DocLink, DocState, DocView, LinkKind, MAX_DOC_BYTES, MAX_DOC_TITLE_BYTES, OnboardSpec,
     Planner, RepoDocsView, normalize_origin, plan_title, runs_on_named,
 };
 use zeughaus_link::selector::parse_runs_on;
+use zeughaus_link::{
+    FiledTicket, NewTicket, TicketRef, compose_text, filing_order, plan_sections, section_text,
+    ticket_text,
+};
 
 use crate::config::{CiConfig, valid_name};
 use crate::files::{read_json, write_atomic, write_json};
@@ -36,10 +40,10 @@ const MAX_SOURCE_BYTES: usize = 100;
 /// What [`create`] stores.
 pub struct NewDoc<'a> {
     pub kind: DocKind,
-    pub title: &'a str,
+    /// The Markdown text: its `# ` title line, a ticket's link lines, the
+    /// rest.
     pub body: &'a str,
     pub source: &'a str,
-    pub links: &'a [DocLink],
     pub runs_on: &'a [String],
     /// An onboarding request: the repository it asks for.
     pub onboard: Option<&'a OnboardSpec>,
@@ -198,7 +202,8 @@ fn read_all(dir: &Path) -> Vec<DocView> {
 }
 
 /// Every document of `repo` without its proposal, plan and review, in
-/// number order; nothing for a repository that is not in `ci.toml`.
+/// number order, `waits_for` filled; nothing for a repository that is not
+/// in `ci.toml`.
 pub fn list(state_dir: &Path, config: &CiConfig, repo: &str) -> Vec<DocView> {
     let Ok(dir) = dir(state_dir, config, repo) else {
         return Vec::new();
@@ -209,13 +214,16 @@ pub fn list(state_dir: &Path, config: &CiConfig, repo: &str) -> Vec<DocView> {
         doc.plan_text.clear();
         doc.feedback.clear();
     }
+    fill_waits(state_dir, &mut docs);
     docs
 }
 
-/// Document `number` of `repo` with its body.
+/// Document `number` of `repo` with its body, `waits_for` filled.
 pub fn load(state_dir: &Path, config: &CiConfig, repo: &str, number: u64) -> Option<DocView> {
     let dir = dir(state_dir, config, repo).ok()?;
-    read_json(&path_of(&dir, number)).ok()
+    let mut doc: DocView = read_json(&path_of(&dir, number)).ok()?;
+    fill_waits(state_dir, std::slice::from_mut(&mut doc));
+    Some(doc)
 }
 
 fn missing(repo: &str, number: u64) -> String {
@@ -258,66 +266,98 @@ fn check_body(body: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `links` of ticket `number` without duplicates, or why they are refused:
-/// too many, a link to itself, a target that is no ticket of `repo`, or a
-/// dependency that closes a cycle through the stored tickets.
+/// `links` of ticket `number` of `repo` without duplicates, a link into
+/// `repo` itself written without its repository, or why they are refused:
+/// too many, a link to itself, a target that is no ticket, or a
+/// dependency that closes a cycle through the stored tickets of any
+/// repository.
 fn check_links(
-    dir: &Path,
+    state_dir: &Path,
+    config: &CiConfig,
     repo: &str,
     number: u64,
     links: &[DocLink],
 ) -> Result<Vec<DocLink>, String> {
     let mut clean: Vec<DocLink> = Vec::with_capacity(links.len());
     for link in links {
-        if !clean.contains(link) {
-            clean.push(link.clone());
+        let mut link = link.clone();
+        if link.repo.as_deref() == Some(repo) {
+            link.repo = None;
+        }
+        if !clean.contains(&link) {
+            clean.push(link);
         }
     }
     if clean.len() > MAX_LINKS {
         return Err(format!("a ticket has at most {MAX_LINKS} links"));
     }
-    let stored = read_all(dir);
+    // Each repository's tickets, read once.
+    let cache: RefCell<BTreeMap<String, Vec<DocView>>> = RefCell::new(BTreeMap::new());
+    let stored = |of: &str, n: u64| -> Option<(DocKind, Vec<DocLink>)> {
+        if !valid_name(of) {
+            return None;
+        }
+        let mut cache = cache.borrow_mut();
+        let docs = cache
+            .entry(of.to_owned())
+            .or_insert_with(|| read_all(&docs_root(state_dir).join(of)));
+        docs.iter()
+            .find(|doc| doc.number == n)
+            .map(|doc| (doc.kind, doc.links.clone()))
+    };
     for link in &clean {
-        if link.number == number {
+        let target = link.repo.as_deref().unwrap_or(repo);
+        if link.repo.is_some() {
+            dir(state_dir, config, target)?;
+        } else if link.number == number {
             return Err(format!("#{number} cannot link to itself"));
         }
-        match stored.iter().find(|doc| doc.number == link.number) {
-            None => return Err(format!("no ticket #{} in {repo}", link.number)),
-            Some(doc) if doc.kind != DocKind::Ticket => {
-                return Err(format!("#{} is no ticket", link.number));
+        match stored(target, link.number) {
+            None => return Err(format!("no ticket #{} in {target}", link.number)),
+            Some((kind, _)) if kind != DocKind::Ticket => {
+                return Err(format!("{} is no ticket", link.reference(repo)));
             }
             Some(_) => {}
         }
     }
-    // Who each ticket depends on, with the new set in place of `number`'s.
-    let depends = |of: u64| -> Vec<u64> {
-        let links = if of == number {
-            &clean
-        } else {
-            match stored.iter().find(|doc| doc.number == of) {
-                Some(doc) => &doc.links,
-                None => return Vec::new(),
-            }
-        };
+    let own = (repo.to_owned(), number);
+    let absolute = |of: &str, links: &[DocLink]| -> Vec<(String, u64)> {
         links
             .iter()
             .filter(|link| link.kind == LinkKind::DependsOn)
-            .map(|link| link.number)
+            .map(|link| (link.repo.as_deref().unwrap_or(of).to_owned(), link.number))
             .collect()
     };
+    // Who each ticket depends on, with the new set in place of `number`'s.
+    let depends = |node: &(String, u64)| -> Vec<(String, u64)> {
+        if *node == own {
+            return absolute(repo, &clean);
+        }
+        stored(&node.0, node.1)
+            .map(|(_, links)| absolute(&node.0, &links))
+            .unwrap_or_default()
+    };
+    let named = |node: &(String, u64)| {
+        if node.0 == repo {
+            format!("#{}", node.1)
+        } else {
+            format!("#{}-{}", node.0, node.1)
+        }
+    };
     for link in clean.iter().filter(|link| link.kind == LinkKind::DependsOn) {
-        if let Some(path) = path_to(link.number, number, &depends) {
+        let target = (link.repo.as_deref().unwrap_or(repo).to_owned(), link.number);
+        if let Some(path) = path_to(target, &own, &depends) {
             let through = &path[1..path.len() - 1];
             if through.is_empty() {
                 return Err(format!(
-                    "#{number} depends on #{}, which depends on #{number}",
-                    link.number
+                    "#{number} depends on {}, which depends on #{number}",
+                    link.reference(repo)
                 ));
             }
-            let names: Vec<String> = through.iter().map(|n| format!("#{n}")).collect();
+            let names: Vec<String> = through.iter().map(named).collect();
             return Err(format!(
-                "a dependency on #{} would close a cycle through {}",
-                link.number,
+                "a dependency on {} would close a cycle through {}",
+                link.reference(repo),
                 names.join(", ")
             ));
         }
@@ -327,32 +367,97 @@ fn check_links(
 
 /// A dependency path from `from` to `to`, both included, by a depth-first
 /// walk over `depends`; `None` when `to` is not reached.
-fn path_to(from: u64, to: u64, depends: &dyn Fn(u64) -> Vec<u64>) -> Option<Vec<u64>> {
-    let mut seen = BTreeSet::new();
-    let mut path = vec![from];
-    fn walk(
-        at: u64,
-        to: u64,
-        depends: &dyn Fn(u64) -> Vec<u64>,
-        seen: &mut BTreeSet<u64>,
-        path: &mut Vec<u64>,
+fn path_to<N: Clone + Ord>(from: N, to: &N, depends: &dyn Fn(&N) -> Vec<N>) -> Option<Vec<N>> {
+    fn walk<N: Clone + Ord>(
+        at: &N,
+        to: &N,
+        depends: &dyn Fn(&N) -> Vec<N>,
+        seen: &mut BTreeSet<N>,
+        path: &mut Vec<N>,
     ) -> bool {
         if at == to {
             return true;
         }
-        if !seen.insert(at) {
+        if !seen.insert(at.clone()) {
             return false;
         }
         for next in depends(at) {
-            path.push(next);
-            if walk(next, to, depends, seen, path) {
+            path.push(next.clone());
+            if walk(&next, to, depends, seen, path) {
                 return true;
             }
             path.pop();
         }
         false
     }
-    walk(from, to, depends, &mut seen, &mut path).then_some(path)
+    let mut seen = BTreeSet::new();
+    let mut path = vec![from.clone()];
+    walk(&from, to, depends, &mut seen, &mut path).then_some(path)
+}
+
+/// What a waiting ticket needs to know of a target: its state and the
+/// ticket it is merged into.
+type Found = (DocState, Option<u64>);
+
+/// The `depends on` targets of `doc` that are not finished, in link order.
+/// A target's repository is the link's, else `doc`'s; `find` answers what
+/// it knows of a ticket. Finished is `done` or `dismissed`, a ticket `find`
+/// does not know (deleted), or `merged` into a ticket that is itself
+/// finished; a target merged into `doc` itself is its own work and blocks
+/// nothing.
+fn waits_for(doc: &DocView, find: &mut dyn FnMut(&str, u64) -> Option<Found>) -> Vec<DocLink> {
+    let finished = |state: DocState| matches!(state, DocState::Done | DocState::Dismissed);
+    let mut waiting = Vec::new();
+    for link in doc
+        .links
+        .iter()
+        .filter(|link| link.kind == LinkKind::DependsOn)
+    {
+        let repo = link.repo.as_deref().unwrap_or(&doc.repo);
+        let Some((state, into)) = find(repo, link.number) else {
+            continue;
+        };
+        let open = match (state, into) {
+            (DocState::Merged, None) => false,
+            (DocState::Merged, Some(into)) => {
+                !(repo == doc.repo && into == doc.number)
+                    && find(repo, into).is_some_and(|(state, _)| !finished(state))
+            }
+            (state, _) => !finished(state),
+        };
+        if open {
+            waiting.push(link.clone());
+        }
+    }
+    waiting
+}
+
+/// Fills `waits_for` of every document in `docs`, looking targets up in
+/// `docs` first and then in their repositories' stored tickets.
+fn fill_waits(state_dir: &Path, docs: &mut [DocView]) {
+    let known: BTreeMap<(String, u64), Found> = docs
+        .iter()
+        .map(|doc| ((doc.repo.clone(), doc.number), (doc.state, doc.into)))
+        .collect();
+    let mut others: BTreeMap<String, Vec<DocView>> = BTreeMap::new();
+    for doc in docs.iter_mut() {
+        let mut find = |repo: &str, number: u64| {
+            if let Some(&found) = known.get(&(repo.to_owned(), number)) {
+                return Some(found);
+            }
+            if !valid_name(repo) {
+                return None;
+            }
+            others
+                .entry(repo.to_owned())
+                .or_insert_with(|| read_all(&docs_root(state_dir).join(repo)))
+                .iter()
+                .find(|other| other.number == number)
+                .map(|other| (other.state, other.into))
+        };
+        let waiting = waits_for(doc, &mut find);
+        doc.waits_for = waiting;
+    }
 }
 
 /// Stores a new document and answers its number. A ticket and an
@@ -383,7 +488,7 @@ pub fn create(
     } else {
         dir(state_dir, config, repo)?
     };
-    let title = checked_title(new.title)?;
+    let text = ticket_text(new.body)?;
     check_body(new.body)?;
     if !valid_source(new.source) {
         return Err(format!(
@@ -391,7 +496,7 @@ pub fn create(
         ));
     }
     parse_runs_on(new.runs_on)?;
-    if !new.links.is_empty() {
+    if !text.links.is_empty() {
         if new.kind != DocKind::Ticket {
             return Err("only a ticket has links".to_owned());
         }
@@ -402,12 +507,12 @@ pub fn create(
         }
     }
     let number = last_number(&dir) + 1;
-    let links = check_links(&dir, repo, number, new.links)?;
+    let links = check_links(state_dir, config, repo, number, &text.links)?;
     let doc = DocView {
         repo: repo.to_owned(),
         number,
         kind: new.kind,
-        title: title.to_owned(),
+        title: text.title,
         state: DocState::Open,
         source: new.source.to_owned(),
         created: now,
@@ -427,6 +532,8 @@ pub fn create(
         feedback: String::new(),
         onboard,
         note: String::new(),
+        waits_for: Vec::new(),
+        filed: Vec::new(),
     };
     write_json(&path_of(&dir, number), &doc)?;
     write_atomic(&dir.join("last"), number.to_string().as_bytes())?;
@@ -436,9 +543,10 @@ pub fn create(
 /// Onboards `repo` in one step for its owner: stores its onboarding
 /// request already `approved` (the onboarding worker takes it from there)
 /// and `tickets` behind it, `ready` and in their order, each linked to the
-/// tickets it depends on by their index. The tickets wait in the planning
-/// queue until the repository has joined `ci.toml`. Answers the request's
-/// number and the tickets'. A refusal writes nothing.
+/// tickets it depends on by their index and stored as Markdown with those
+/// links. The tickets wait in the planning queue until the repository has
+/// joined `ci.toml`. Answers the request's number and the tickets'. A
+/// refusal writes nothing.
 pub fn onboard(
     state_dir: &Path,
     config: &CiConfig,
@@ -451,7 +559,10 @@ pub fn onboard(
         return Err("an onboarding request names the repository it asks for".to_owned());
     };
     let spec = crate::onboard::check_request(state_dir, config, repo, spec)?;
-    let title = checked_title(request.title)?;
+    let text = ticket_text(request.body)?;
+    if !text.links.is_empty() {
+        return Err("only a ticket has links".to_owned());
+    }
     check_body(request.body)?;
     if !valid_source(request.source) {
         return Err(format!(
@@ -480,15 +591,15 @@ pub fn onboard(
             ));
         }
     }
-    let depends = |of: u64| -> Vec<u64> {
+    let depends = |of: &u64| -> Vec<u64> {
         tickets
-            .get(of as usize)
+            .get(*of as usize)
             .map(|t| t.depends_on.iter().map(|&on| on as u64).collect())
             .unwrap_or_default()
     };
     for (at, ticket) in tickets.iter().enumerate() {
         for &on in &ticket.depends_on {
-            if path_to(on as u64, at as u64, &depends).is_some() {
+            if path_to(on as u64, &(at as u64), &depends).is_some() {
                 return Err(format!(
                     "the onboarding's tickets {} and {} depend on each other",
                     at + 1,
@@ -524,6 +635,8 @@ pub fn onboard(
         feedback: String::new(),
         onboard: None,
         note: String::new(),
+        waits_for: Vec::new(),
+        filed: Vec::new(),
     };
     let mut written = vec![DocView {
         approved: Some(now),
@@ -532,7 +645,7 @@ pub fn onboard(
             first,
             DocKind::Onboarding,
             DocState::Approved,
-            title,
+            &text.title,
             request.body,
         )
     }];
@@ -542,22 +655,19 @@ pub fn onboard(
             let link = DocLink {
                 kind: LinkKind::DependsOn,
                 number: numbers[on],
+                repo: None,
             };
             if !links.contains(&link) {
                 links.push(link);
             }
         }
+        let title = ticket.title.trim();
+        let body = compose_text(title, &links, &ticket.body);
         written.push(DocView {
             released: Some(now),
             links,
             auto_approve: ticket.auto_approve,
-            ..doc(
-                number,
-                DocKind::Ticket,
-                DocState::Ready,
-                ticket.title.trim(),
-                &ticket.body,
-            )
+            ..doc(number, DocKind::Ticket, DocState::Ready, title, &body)
         });
     }
     // The tickets first, the request last: the onboarding worker acts on
@@ -579,40 +689,14 @@ fn read_ticket(path: &Path, repo: &str, number: u64) -> Result<DocView, String> 
     Ok(doc)
 }
 
-/// Replaces the title and proposal of an open or ready ticket.
+/// Replaces the text of a ticket that is not finished; its title and links
+/// are read from it again.
 pub fn edit(
     state_dir: &Path,
     config: &CiConfig,
     repo: &str,
     number: u64,
-    title: &str,
     body: &str,
-    now: u64,
-) -> Result<(), String> {
-    let dir = dir(state_dir, config, repo)?;
-    let path = path_of(&dir, number);
-    let mut doc = read_ticket(&path, repo, number)?;
-    if !matches!(doc.state, DocState::Open | DocState::Ready) {
-        return Err(format!(
-            "#{number} is {}; its text is fixed",
-            doc.state.name()
-        ));
-    }
-    let title = checked_title(title)?;
-    check_body(body)?;
-    doc.title = title.to_owned();
-    doc.body = body.to_owned();
-    doc.changed = now;
-    write_json(&path, &doc)
-}
-
-/// Replaces the outgoing links of a ticket that is not finished.
-pub fn set_links(
-    state_dir: &Path,
-    config: &CiConfig,
-    repo: &str,
-    number: u64,
-    links: Vec<DocLink>,
     now: u64,
 ) -> Result<(), String> {
     let dir = dir(state_dir, config, repo)?;
@@ -623,11 +707,47 @@ pub fn set_links(
         DocState::Done | DocState::Dismissed | DocState::Merged
     ) {
         return Err(format!(
-            "#{number} is {}; its links are fixed",
+            "#{number} is {}; its text is fixed",
             doc.state.name()
         ));
     }
-    doc.links = check_links(&dir, repo, number, &links)?;
+    let text = ticket_text(body)?;
+    check_body(body)?;
+    if !text.links.is_empty() && !config.repos.contains_key(repo) {
+        return Err(format!(
+            "{repo} is not in ci.toml yet; links wait for its onboarding"
+        ));
+    }
+    doc.links = check_links(state_dir, config, repo, number, &text.links)?;
+    doc.title = text.title;
+    doc.body = body.to_owned();
+    doc.changed = now;
+    write_json(&path, &doc)
+}
+
+/// Pre-approves the plan of a ticket that is open, ready or planning, or
+/// takes that back: a pre-approved plan is approved as it arrives.
+pub fn set_auto_approve(
+    state_dir: &Path,
+    config: &CiConfig,
+    repo: &str,
+    number: u64,
+    on: bool,
+    now: u64,
+) -> Result<(), String> {
+    let dir = dir(state_dir, config, repo)?;
+    let path = path_of(&dir, number);
+    let mut doc = read_ticket(&path, repo, number)?;
+    if !matches!(
+        doc.state,
+        DocState::Open | DocState::Ready | DocState::Planning
+    ) {
+        return Err(format!(
+            "#{number} is {}; pre-approval is set before its plan is written",
+            doc.state.name()
+        ));
+    }
+    doc.auto_approve = on;
     doc.changed = now;
     write_json(&path, &doc)
 }
@@ -724,9 +844,10 @@ fn settle_merged(
 /// Moves document `number` to `to`, where [`allowed`] lets it. Releasing a
 /// ticket stamps `released`, which orders the planning queue; approving it
 /// stamps `approved`, which orders the masters' queue, and a requeued
-/// ticket keeps its stamp and with it its place. The tickets a plan
-/// includes follow it: `done` with it, back to `open` when it is dismissed
-/// or its plan discarded.
+/// ticket keeps its stamp and with it its place. Approving a plan files
+/// its sections for other tickets first; one that cannot be filed keeps the
+/// ticket in review. The tickets a plan includes follow it: `done` with
+/// it, back to `open` when it is dismissed or its plan discarded.
 pub fn set_state(
     state_dir: &Path,
     config: &CiConfig,
@@ -758,6 +879,10 @@ pub fn set_state(
             doc.note.clear();
         }
         (DocState::Review, DocState::Approved) => {
+            if doc.kind == DocKind::Ticket {
+                file_sections(state_dir, config, repo, &mut doc, &path, now)
+                    .map_err(|e| format!("its sections were not filed: {e}"))?;
+            }
             doc.approved = Some(now);
             doc.feedback.clear();
         }
@@ -788,7 +913,8 @@ pub fn set_state(
 /// new ticket without one, and answers the ticket's number; either is then
 /// in `review`. The tickets the plan includes become `merged` into it, and
 /// those an earlier revision included and this one does not go back to
-/// `open`. A refusal writes nothing.
+/// `open`. Its sections for other tickets must resolve. A refusal writes
+/// nothing.
 pub fn write_plan(
     state_dir: &Path,
     config: &CiConfig,
@@ -816,6 +942,7 @@ pub fn write_plan(
     if plan.includes.len() > MAX_LINKS {
         return Err(format!("a plan includes at most {MAX_LINKS} tickets"));
     }
+    check_sections(state_dir, config, repo, plan.plan)?;
     let fresh = number.is_none();
     let (number, mut doc) = match number {
         Some(n) => {
@@ -854,6 +981,8 @@ pub fn write_plan(
                 feedback: String::new(),
                 onboard: None,
                 note: String::new(),
+                waits_for: Vec::new(),
+                filed: Vec::new(),
             };
             (n, doc)
         }
@@ -918,7 +1047,122 @@ pub fn write_plan(
         included.changed = now;
         write_json(&path_of(&dir, included.number), &included)?;
     }
+    // A ticket approved as its plan arrives files its sections now; should
+    // that fail, it waits in review with the reason.
+    if doc.state == DocState::Approved {
+        let path = path_of(&dir, number);
+        if let Err(e) = file_sections(state_dir, config, repo, &mut doc, &path, now) {
+            doc.state = DocState::Review;
+            doc.approved = None;
+            doc.note = format!("its sections were not filed: {e}");
+            write_json(&path, &doc)?;
+        }
+    }
     Ok(number)
+}
+
+/// Whether `name` is a repository a plan's section may be filed in: one of
+/// `ci.toml`, or one with a pending onboarding request.
+fn known_repo(state_dir: &Path, config: &CiConfig, name: &str) -> bool {
+    config.repos.contains_key(name) || pending_request(state_dir, config, name).is_some()
+}
+
+/// Why `plan` of `repo` cannot be stored: a section whose references do
+/// not resolve to stored tickets, or with link lines for a repository that
+/// has only an onboarding request.
+fn check_sections(
+    state_dir: &Path,
+    config: &CiConfig,
+    repo: &str,
+    plan: &str,
+) -> Result<(), String> {
+    let sections = plan_sections(plan, |name| known_repo(state_dir, config, name))?;
+    for section in &sections {
+        let refs: Vec<&TicketRef> = section.depends.iter().chain(&section.related).collect();
+        if !refs.is_empty() && !config.repos.contains_key(&section.repo) {
+            return Err(format!(
+                "{} is not in ci.toml yet; its section \"{}\" cannot carry Depends on or Related lines",
+                section.repo, section.title
+            ));
+        }
+        for link in refs {
+            let (target, number) = match link {
+                TicketRef::Same(number) => (repo, *number),
+                TicketRef::Other { repo, number } => (repo.as_str(), *number),
+                TicketRef::SelfRef | TicketRef::Label(_) => continue,
+            };
+            let dir = dir(state_dir, config, target)?;
+            match read_json::<DocView>(&path_of(&dir, number)) {
+                Ok(doc) if doc.kind == DocKind::Ticket => {}
+                _ => return Err(format!("no ticket #{number} in {target}")),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Files each section of `doc`'s plan for another ticket that is not filed
+/// yet as a `ready` ticket of its repository, in [`filing_order`], and
+/// records it in `doc.filed`, written to `path` after each, so a failure
+/// keeps what was filed and a later approval files only the rest.
+fn file_sections(
+    state_dir: &Path,
+    config: &CiConfig,
+    repo: &str,
+    doc: &mut DocView,
+    path: &Path,
+    now: u64,
+) -> Result<(), String> {
+    let sections = plan_sections(&doc.plan_text, |name| known_repo(state_dir, config, name))?;
+    let filed_as = |filed: &[FiledTicket], repo: &str, title: &str| {
+        filed
+            .iter()
+            .find(|ticket| ticket.repo == repo && ticket.title == title)
+            .map(|ticket| ticket.number)
+    };
+    let mut labels: BTreeMap<String, (String, u64)> = BTreeMap::new();
+    for section in &sections {
+        if let (Some(label), Some(number)) = (
+            &section.label,
+            filed_as(&doc.filed, &section.repo, &section.title),
+        ) {
+            labels.insert(label.clone(), (section.repo.clone(), number));
+        }
+    }
+    for at in filing_order(&sections) {
+        let section = &sections[at];
+        if filed_as(&doc.filed, &section.repo, &section.title).is_some() {
+            continue;
+        }
+        let links_allowed = config.repos.contains_key(&section.repo);
+        let body = section_text(section, repo, doc.number, &labels, links_allowed)?;
+        let new = NewDoc {
+            kind: DocKind::Ticket,
+            body: &body,
+            source: repo,
+            runs_on: &[],
+            onboard: None,
+        };
+        let number = create(state_dir, config, &section.repo, new, now)?;
+        set_state(
+            state_dir,
+            config,
+            &section.repo,
+            number,
+            DocState::Ready,
+            now,
+        )?;
+        if let Some(label) = &section.label {
+            labels.insert(label.clone(), (section.repo.clone(), number));
+        }
+        doc.filed.push(FiledTicket {
+            repo: section.repo.clone(),
+            number,
+            title: section.title.clone(),
+        });
+        write_json(path, doc)?;
+    }
+    Ok(())
 }
 
 /// Sends the user's review back to the plan session of a ticket in review:
@@ -1191,8 +1435,9 @@ pub fn summary(state_dir: &Path, config: &CiConfig) -> Vec<RepoDocsView> {
 }
 
 /// Rewrites every stored proposal and plan from before tickets as a
-/// ticket, and answers how many documents it changed. A file that does
-/// not parse is left alone.
+/// ticket, and every text from before Markdown tickets with its title and
+/// links in it, and answers how many documents it changed. A file that
+/// does not parse is left alone.
 pub fn migrate(state_dir: &Path) -> Result<usize, String> {
     let mut changed = 0;
     for repo in doc_dirs(state_dir) {
@@ -1207,13 +1452,39 @@ pub fn migrate(state_dir: &Path) -> Result<usize, String> {
             let Ok(mut doc) = read_json::<serde_json::Value>(&path) else {
                 continue;
             };
-            if migrate_doc(&mut doc) {
+            let ticket = migrate_doc(&mut doc);
+            let mut view = serde_json::from_value::<DocView>(doc.clone()).ok();
+            if let Some(view) = view.take_if(markdown_migrated) {
+                write_json(&path, &view)?;
+            } else if ticket {
                 write_json(&path, &doc)?;
-                changed += 1;
+            } else {
+                continue;
             }
+            changed += 1;
         }
     }
     Ok(changed)
+}
+
+/// A ticket's or onboarding request's text from before Markdown tickets,
+/// whose first line is not its `# ` title, as its title line, a ticket's
+/// link lines and the old text. Answers whether it changed anything.
+fn markdown_migrated(doc: &mut DocView) -> bool {
+    let titled = doc
+        .body
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .is_none_or(|line| line.starts_with("# "));
+    if titled {
+        return false;
+    }
+    let links: &[DocLink] = match doc.kind {
+        DocKind::Ticket => &doc.links,
+        DocKind::Onboarding => &[],
+    };
+    doc.body = compose_text(&doc.title, links, &doc.body);
+    true
 }
 
 /// One stored document from before tickets as a ticket: a proposal keeps
@@ -1394,6 +1665,129 @@ mod tests {
         }
     }
 
+    fn ticket(
+        repo: &str,
+        number: u64,
+        state: DocState,
+        depends: &[(Option<&str>, u64)],
+    ) -> DocView {
+        DocView {
+            repo: repo.to_owned(),
+            number,
+            kind: DocKind::Ticket,
+            title: "T".to_owned(),
+            state,
+            source: "s".to_owned(),
+            created: 1,
+            changed: 1,
+            approved: None,
+            released: None,
+            links: depends
+                .iter()
+                .map(|&(repo, number)| DocLink {
+                    kind: LinkKind::DependsOn,
+                    number,
+                    repo: repo.map(str::to_owned),
+                })
+                .collect(),
+            merged: Vec::new(),
+            into: None,
+            runs_on: Vec::new(),
+            placement: Vec::new(),
+            body: String::new(),
+            plan_text: String::new(),
+            revision: 0,
+            planner: None,
+            auto_approve: false,
+            feedback: String::new(),
+            onboard: None,
+            note: String::new(),
+            waits_for: Vec::new(),
+            filed: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn only_unfinished_dependencies_hold_a_ticket_back_across_repositories() {
+        let mut docs = vec![
+            ticket("demo", 1, Done, &[]),
+            ticket("demo", 2, Dismissed, &[]),
+            ticket("demo", 3, Open, &[]),
+            ticket("demo", 4, Merged, &[]),
+            ticket("demo", 5, Review, &[]),
+            ticket("weida", 3, Done, &[]),
+            ticket("weida", 7, Ready, &[]),
+        ];
+        docs[3].into = Some(5);
+        // Depends on the done, the dismissed, a deleted (#9), the open and
+        // the merged ticket, weida's done #3 and weida's ready #7.
+        let mut waiting = ticket(
+            "demo",
+            6,
+            Ready,
+            &[
+                (None, 1),
+                (None, 2),
+                (None, 9),
+                (None, 3),
+                (None, 4),
+                (Some("weida"), 3),
+                (Some("weida"), 7),
+            ],
+        );
+        waiting.links.push(DocLink {
+            kind: LinkKind::Related,
+            number: 5,
+            repo: None,
+        });
+        let numbers = |docs: &[DocView], waiting: &DocView| -> Vec<(Option<String>, u64)> {
+            let mut find = |repo: &str, number: u64| {
+                docs.iter()
+                    .find(|d| d.repo == repo && d.number == number)
+                    .map(|d| (d.state, d.into))
+            };
+            waits_for(waiting, &mut find)
+                .into_iter()
+                .map(|link| (link.repo, link.number))
+                .collect()
+        };
+        assert_eq!(
+            numbers(&docs, &waiting),
+            vec![(None, 3), (None, 4), (Some("weida".to_owned()), 7)]
+        );
+        // The merged ticket follows the one that includes it.
+        docs[4].state = Done;
+        docs[6].state = Done;
+        assert_eq!(numbers(&docs, &waiting), vec![(None, 3)]);
+        docs[2].state = Dismissed;
+        assert!(numbers(&docs, &waiting).is_empty());
+        // A ticket merged into the waiting one is its own work.
+        docs[3].into = Some(6);
+        docs[4].state = Open;
+        assert!(numbers(&docs, &waiting).is_empty());
+    }
+
+    #[test]
+    fn a_text_from_before_markdown_tickets_gets_its_title_and_links() {
+        let mut old = ticket("demo", 4, Open, &[(None, 2), (Some("weida"), 3)]);
+        old.title = "Keep it".to_owned();
+        old.body = "Please keep it.\n".to_owned();
+        assert!(markdown_migrated(&mut old));
+        assert_eq!(
+            old.body,
+            "# Keep it\nDepends on: #2, #weida-3\n\nPlease keep it.\n"
+        );
+        assert!(!markdown_migrated(&mut old));
+        // A ticket that started as a plan has no text to migrate.
+        let mut planned = ticket("demo", 5, Review, &[]);
+        assert!(!markdown_migrated(&mut planned));
+        let mut request = ticket("demo", 6, Open, &[(None, 2)]);
+        request.kind = DocKind::Onboarding;
+        request.body = "Join.".to_owned();
+        assert!(markdown_migrated(&mut request));
+        assert_eq!(request.body, "# T\n\nJoin.\n");
+    }
+
     /// Tests that touch the filesystem: the integration tier.
     mod io {
         use super::*;
@@ -1409,18 +1803,29 @@ mod tests {
             CiConfig::parse(
                 "default_runner = \"x\"\n\
                  [runners.x]\nfingerprint = \"sha256:0000000000000000000000000000000000000000000000000000000000000001\"\n\
-                 [repos.demo]\nurl = \"https://git.example.org/o/demo.git\"\n",
+                 [repos.demo]\nurl = \"https://git.example.org/o/demo.git\"\n\
+                 [repos.weida]\nurl = \"https://git.example.org/o/weida.git\"\n",
             )
             .expect("a valid ci.toml")
         }
 
-        fn new<'a>(title: &'a str, links: &'a [DocLink]) -> NewDoc<'a> {
+        /// The text of a ticket titled `title` that depends on tickets
+        /// `depends` of its own repository.
+        fn text(title: &str, depends: &[u64]) -> String {
+            let mut text = format!("# {title}\n");
+            if !depends.is_empty() {
+                let refs: Vec<String> = depends.iter().map(|n| format!("#{n}")).collect();
+                text.push_str(&format!("Depends on: {}\n", refs.join(", ")));
+            }
+            text.push_str("\nbody\n");
+            text
+        }
+
+        fn new(body: &str) -> NewDoc<'_> {
             NewDoc {
                 kind: DocKind::Ticket,
-                title,
-                body: "body",
+                body,
                 source: "weida",
-                links,
                 runs_on: &[],
                 onboard: None,
             }
@@ -1443,6 +1848,7 @@ mod tests {
                 .map(|&number| DocLink {
                     kind: LinkKind::DependsOn,
                     number,
+                    repo: None,
                 })
                 .collect()
         }
@@ -1462,12 +1868,12 @@ mod tests {
         fn numbers_rise_across_kinds_and_a_deleted_one_is_not_reused() {
             let state = scratch("numbers");
             let config = config();
-            let a = create(&state, &config, "demo", new("a", &[]), 1);
+            let a = create(&state, &config, "demo", new(&text("a", &[])), 1);
             let b = write_plan(&state, &config, "demo", None, plan(&[]), 2);
             assert_eq!((a, b), (Ok(1), Ok(2)));
             set_state(&state, &config, "demo", 2, Dismissed, 3).expect("dismiss");
             delete(&state, &config, "demo", 2).expect("delete");
-            let c = create(&state, &config, "demo", new("c", &[]), 4);
+            let c = create(&state, &config, "demo", new(&text("c", &[])), 4);
             assert_eq!(c, Ok(3));
             let numbers: Vec<u64> = list(&state, &config, "demo")
                 .iter()
@@ -1481,7 +1887,7 @@ mod tests {
             );
             assert_eq!(
                 load(&state, &config, "demo", 3).expect("stored").body,
-                "body"
+                "# c\n\nbody\n"
             );
         }
 
@@ -1490,7 +1896,7 @@ mod tests {
             let state = scratch("includes");
             let config = config();
             for title in ["main", "a", "b", "c"] {
-                create(&state, &config, "demo", new(title, &[]), 1).unwrap();
+                create(&state, &config, "demo", new(&text(title, &[])), 1).unwrap();
             }
             set_state(&state, &config, "demo", 4, Dismissed, 1).unwrap();
             set_state(&state, &config, "demo", 1, Ready, 2).unwrap();
@@ -1546,7 +1952,7 @@ mod tests {
             let state = scratch("follow");
             let config = config();
             for title in ["a", "b", "c", "d"] {
-                create(&state, &config, "demo", new(title, &[]), 1).unwrap();
+                create(&state, &config, "demo", new(&text(title, &[])), 1).unwrap();
             }
             planned(&state, &config, 1, &[2], 2);
             // Discarding the plan reopens what it included.
@@ -1576,50 +1982,206 @@ mod tests {
         fn a_dependency_that_closes_a_cycle_is_refused() {
             let state = scratch("cycles");
             let config = config();
-            create(&state, &config, "demo", new("a", &[]), 1).unwrap();
-            create(&state, &config, "demo", new("b", &depends(&[1])), 1).unwrap();
-            create(&state, &config, "demo", new("c", &depends(&[2])), 1).unwrap();
+            create(&state, &config, "demo", new(&text("a", &[])), 1).unwrap();
+            create(&state, &config, "demo", new(&text("b", &[1])), 1).unwrap();
+            create(&state, &config, "demo", new(&text("c", &[2])), 1).unwrap();
+            let edit_to = |body: &str| edit(&state, &config, "demo", 1, body, 2);
             assert_eq!(
-                set_links(&state, &config, "demo", 1, depends(&[2]), 2),
+                edit_to(&text("a", &[2])),
                 Err("#1 depends on #2, which depends on #1".to_owned())
             );
             assert_eq!(
-                set_links(&state, &config, "demo", 1, depends(&[3]), 2),
+                edit_to(&text("a", &[3])),
                 Err("a dependency on #3 would close a cycle through #2".to_owned())
             );
             assert_eq!(
-                set_links(&state, &config, "demo", 1, depends(&[1]), 2),
+                edit_to(&text("a", &[1])),
                 Err("#1 cannot link to itself".to_owned())
             );
             assert_eq!(
-                set_links(&state, &config, "demo", 1, depends(&[9]), 2),
+                edit_to(&text("a", &[9])),
                 Err("no ticket #9 in demo".to_owned())
             );
             // A related link closes no cycle, and duplicates collapse.
-            let related = DocLink {
-                kind: LinkKind::Related,
-                number: 3,
-            };
-            set_links(
+            edit_to("# a2\nRelated: #3, #3, #demo-3\n").unwrap();
+            let edited = load(&state, &config, "demo", 1).unwrap();
+            assert_eq!(edited.title, "a2");
+            assert_eq!(
+                edited.links,
+                vec![DocLink {
+                    kind: LinkKind::Related,
+                    number: 3,
+                    repo: None,
+                }]
+            );
+        }
+
+        #[test]
+        fn a_ticket_reads_its_title_and_links_from_its_text_across_repositories() {
+            let state = scratch("markdown");
+            let config = config();
+            create(&state, &config, "weida", new(&text("w", &[])), 1).unwrap();
+            create(
                 &state,
                 &config,
                 "demo",
-                1,
-                vec![related.clone(), related.clone()],
-                3,
+                new("# Follow weida \nDepends on: #weida-1\n\nbody\n"),
+                2,
             )
             .unwrap();
+            let made = load(&state, &config, "demo", 1).unwrap();
+            assert_eq!(made.title, "Follow weida");
             assert_eq!(
-                load(&state, &config, "demo", 1).unwrap().links,
-                vec![related]
+                made.links,
+                vec![DocLink {
+                    kind: LinkKind::DependsOn,
+                    number: 1,
+                    repo: Some("weida".to_owned()),
+                }]
             );
+            assert_eq!(made.waits_for, made.links);
+            assert_eq!(
+                create(&state, &config, "demo", new("body\n"), 3),
+                Err("a ticket's text starts with its \"# <title>\" line".to_owned())
+            );
+            assert_eq!(
+                create(
+                    &state,
+                    &config,
+                    "demo",
+                    new("# x\nDepends on: #weida-9\n"),
+                    3
+                ),
+                Err("no ticket #9 in weida".to_owned())
+            );
+            assert_eq!(
+                create(
+                    &state,
+                    &config,
+                    "demo",
+                    new("# x\nDepends on: #other-1\n"),
+                    3
+                ),
+                Err("no repository other".to_owned())
+            );
+            // weida #1 waiting for demo #1 closes a cycle across both.
+            assert_eq!(
+                edit(&state, &config, "weida", 1, "# w\nDepends on: #demo-1\n", 4),
+                Err("#1 depends on #demo-1, which depends on #1".to_owned())
+            );
+            // Done, it holds nothing back, in lists too.
+            assert_eq!(list(&state, &config, "demo")[0].waits_for.len(), 1);
+            set_state(&state, &config, "weida", 1, Dismissed, 5).unwrap();
+            assert!(list(&state, &config, "demo")[0].waits_for.is_empty());
+            assert_eq!(
+                edit(&state, &config, "weida", 1, "# w\n", 6),
+                Err("#1 is dismissed; its text is fixed".to_owned())
+            );
+        }
+
+        const SECTIONS: &str = "# Job state\n\
+            \n\
+            ## weida - Keep the fuzz corpus #fuzz\n\
+            Depends on: #self\n\
+            \n\
+            fuzz.sh restores the corpus.\n\
+            \n\
+            ## demo - Follow up\n\
+            Depends on: #fuzz\n\
+            \n\
+            Then this.\n";
+
+        fn sections_plan(text: &str) -> PlanText<'_> {
+            PlanText {
+                title: "Job state",
+                plan: text,
+                includes: &[],
+                runs_on: &[],
+                source: "demo",
+                planner: None,
+            }
+        }
+
+        #[test]
+        fn a_plan_with_sections_that_do_not_resolve_is_refused() {
+            let state = scratch("sections-refused");
+            let config = config();
+            let unknown = SECTIONS.replace("#fuzz\n\nThen", "#nolabel\n\nThen");
+            assert_eq!(
+                write_plan(&state, &config, "demo", None, sections_plan(&unknown), 1),
+                Err("#nolabel names no section of this plan".to_owned())
+            );
+            let missing = SECTIONS.replace("Depends on: #self", "Depends on: #self, #weida-4");
+            assert_eq!(
+                write_plan(&state, &config, "demo", None, sections_plan(&missing), 1),
+                Err("no ticket #4 in weida".to_owned())
+            );
+            assert!(list(&state, &config, "demo").is_empty());
+        }
+
+        #[test]
+        fn approving_a_plan_files_its_sections_once() {
+            let state = scratch("sections");
+            let config = config();
+            let number =
+                write_plan(&state, &config, "demo", None, sections_plan(SECTIONS), 1).unwrap();
+            assert!(list(&state, &config, "weida").is_empty());
+            set_state(&state, &config, "demo", number, Approved, 2).unwrap();
+
+            let fuzz = load(&state, &config, "weida", 1).expect("filed in weida");
+            assert_eq!(
+                (fuzz.state, fuzz.title.as_str(), fuzz.source.as_str()),
+                (Ready, "Keep the fuzz corpus", "demo")
+            );
+            assert_eq!(
+                fuzz.body,
+                "# Keep the fuzz corpus\nDepends on: #demo-1\n\nfuzz.sh restores the corpus.\n"
+            );
+            assert_eq!(
+                fuzz.links,
+                vec![DocLink {
+                    kind: LinkKind::DependsOn,
+                    number: 1,
+                    repo: Some("demo".to_owned()),
+                }]
+            );
+            let follow = load(&state, &config, "demo", 2).expect("filed in demo");
+            assert_eq!(
+                follow.body,
+                "# Follow up\nDepends on: #weida-1\nRelated: #1\n\nThen this.\n"
+            );
+            assert_eq!(follow.state, Ready);
+            let plan = load(&state, &config, "demo", number).unwrap();
+            assert_eq!(
+                plan.filed,
+                vec![
+                    FiledTicket {
+                        repo: "weida".to_owned(),
+                        number: 1,
+                        title: "Keep the fuzz corpus".to_owned(),
+                    },
+                    FiledTicket {
+                        repo: "demo".to_owned(),
+                        number: 2,
+                        title: "Follow up".to_owned(),
+                    },
+                ]
+            );
+            // The filed tickets wait for the plan's ticket.
+            assert_eq!(fuzz.waits_for.len(), 1);
+
+            // Back to review and approved again: nothing is filed twice.
+            set_state(&state, &config, "demo", number, Review, 3).unwrap();
+            set_state(&state, &config, "demo", number, Approved, 4).unwrap();
+            assert_eq!(list(&state, &config, "weida").len(), 1);
+            assert_eq!(list(&state, &config, "demo").len(), 2);
         }
 
         #[test]
         fn a_planning_ticket_without_a_plan_goes_back_with_a_note() {
             let state = scratch("planning-ended");
             let config = config();
-            create(&state, &config, "demo", new("a", &[]), 1).unwrap();
+            create(&state, &config, "demo", new(&text("a", &[])), 1).unwrap();
             set_state(&state, &config, "demo", 1, Ready, 2).unwrap();
             assert_eq!(
                 start_planning(&state, &config, "demo", 1, 3).unwrap().state,
@@ -1713,7 +2275,7 @@ mod tests {
             let state = scratch("outside");
             let config = config();
             for repo in ["other", "../x"] {
-                let made = create(&state, &config, repo, new("a", &[]), 1);
+                let made = create(&state, &config, repo, new(&text("a", &[])), 1);
                 assert_eq!(made, Err(format!("no repository {repo}")));
                 assert!(list(&state, &config, repo).is_empty());
                 assert!(start(&state, &config, repo, 1, Vec::new(), 1).is_err());
@@ -1770,10 +2332,8 @@ mod tests {
         fn request<'a>(spec: &'a OnboardSpec) -> NewDoc<'a> {
             NewDoc {
                 kind: DocKind::Onboarding,
-                title: "join",
-                body: "body",
+                body: "# join\n\nbody\n",
                 source: "scan-rs",
-                links: &[],
                 runs_on: &[],
                 onboard: Some(spec),
             }
@@ -1836,7 +2396,7 @@ mod tests {
         fn a_ticket_that_runs_through_is_approved_as_its_plan_arrives() {
             let state = scratch("auto");
             let config = config();
-            create(&state, &config, "demo", new("routine", &[]), 1).unwrap();
+            create(&state, &config, "demo", new(&text("routine", &[])), 1).unwrap();
             let path = path_of(&docs_root(&state).join("demo"), 1);
             let mut doc: DocView = read_json(&path).unwrap();
             doc.auto_approve = true;
@@ -1862,9 +2422,12 @@ mod tests {
                 "https://git.example.org/o/scan-rs.git"
             );
             assert_eq!(stored.state, Open);
-            assert_eq!(create(&state, &config, "scan-rs", new("p", &[]), 2), Ok(2));
             assert_eq!(
-                create(&state, &config, "scan-rs", new("q", &depends(&[2])), 3),
+                create(&state, &config, "scan-rs", new(&text("p", &[])), 2),
+                Ok(2)
+            );
+            assert_eq!(
+                create(&state, &config, "scan-rs", new(&text("q", &[2])), 3),
                 Err("scan-rs is not in ci.toml yet; links wait for its onboarding".to_owned())
             );
             assert_eq!(

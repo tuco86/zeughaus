@@ -1421,9 +1421,10 @@ impl App {
             Message::PaletteConfirm => {
                 if !self.palette_open {
                     // Enter outside the palette acts on the row under the
-                    // CI page's cursor.
+                    // CI page's cursor, unless the ticket popout lies over
+                    // it: its editors take Enter themselves.
                     #[cfg(not(target_arch = "wasm32"))]
-                    if self.page.open {
+                    if self.page.open && self.ticket.is_none() {
                         return self.apply_page(Message::PageEnter);
                     }
                     return Task::none();

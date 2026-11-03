@@ -45,6 +45,7 @@ pub mod manual;
 pub mod projects;
 pub mod runs;
 pub mod selector;
+pub mod ticket_text;
 
 pub use activity::{
     ACTIVITY_PATH, AGENT_VAR, ActivityEntry, ActivityKind, ActivityReply, ActivityRequest,
@@ -57,8 +58,8 @@ pub use ci::{
     DocView, JobDefView, JobTiming, JobView, LinkKind, MAX_CI_REPLY_BYTES, MAX_CI_REQUEST_BYTES,
     MAX_DOC_BYTES, MAX_DOC_TITLE_BYTES, MachineJob, MachineView, OnboardSpec, PipelineView,
     Planner, QueuedView, RepoDocsView, RepoView, SessionKind, SessionMachine, SessionState,
-    SessionView, StateVersionView, StateView, TimedLine, TransferView, blocked_by, doc_groups,
-    linked_from, normalize_origin, pipeline_load, query_param, responsible,
+    SessionView, StateVersionView, StateView, TimedLine, TransferView, doc_groups, linked_from,
+    normalize_origin, pipeline_load, query_param, responsible,
 };
 pub use events::{
     ErrorRow, MAX_EVENT_BYTES, MAX_SNAPSHOT_BYTES, MAX_TRIGGER_BYTES, OutputRow, RejectionRow,
@@ -76,6 +77,11 @@ pub use projects::{
 pub use runs::{
     HoldReply, HoldRequest, MAX_HOLD_BYTES, MAX_RUN_CHUNK_BYTES, MAX_RUN_REPLY_BYTES,
     MAX_RUN_REQUEST_BYTES, RunFileReply, RunFileRequest,
+};
+pub use ticket_text::{
+    FiledTicket, PlanSection, ProposalHeading, TicketRef, TicketText, compose_text, filing_order,
+    parse_ref, plan_sections, proposal_heading, section_text, text_without_title, ticket_text,
+    without_sections,
 };
 
 /// The endpoint a viewer dials for frames. Opaque to weida and matched

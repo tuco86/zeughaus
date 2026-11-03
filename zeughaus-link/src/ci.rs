@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::selector::Selector;
+use crate::ticket_text::{FiledTicket, text_without_title};
 
 /// The largest body of one ticket's proposal or plan, in bytes.
 pub const MAX_DOC_BYTES: usize = 256 << 10;
@@ -23,7 +24,7 @@ pub const MAX_DOC_BYTES: usize = 256 << 10;
 pub const MAX_DOC_TITLE_BYTES: usize = 200;
 
 /// How many lines under its title a plan may carry its header lines in.
-const HEADER_LINES: usize = 20;
+pub(crate) const HEADER_LINES: usize = 20;
 
 /// The title of a plan file: its first `# ` heading, cut to
 /// [`MAX_DOC_TITLE_BYTES`] on a character boundary.
@@ -251,12 +252,10 @@ pub enum CiRequest {
         /// Renamed on the wire: `kind` is the request's own tag.
         #[serde(rename = "doc_kind")]
         kind: DocKind,
-        title: String,
+        /// The Markdown text (see [`crate::ticket_text`]): its title and
+        /// links are read from it.
         body: String,
         source: String,
-        /// The ticket's outgoing links.
-        #[serde(default)]
-        links: Vec<DocLink>,
         /// One label selector per machine the work needs, the first hosting
         /// the session (see [`crate::selector`]).
         #[serde(default)]
@@ -281,19 +280,19 @@ pub enum CiRequest {
         number: u64,
         runs_on: Vec<String>,
     },
-    /// Replaces the title and proposal of an open or ready ticket. Answers
-    /// [`CiReply::Accepted`].
+    /// Replaces the text of a ticket that is not finished; its title and
+    /// links are read from it again. Answers [`CiReply::Accepted`].
     DocEdit {
         repo: String,
         number: u64,
-        title: String,
         body: String,
     },
-    /// Replaces a ticket's outgoing links. Answers [`CiReply::Accepted`].
-    DocLinks {
+    /// Pre-approves the plan of a ticket that is open, ready or planning,
+    /// or takes that back. Answers [`CiReply::Accepted`].
+    DocAutoApprove {
         repo: String,
         number: u64,
-        links: Vec<DocLink>,
+        auto_approve: bool,
     },
     /// Sends a review back to the plan session of a ticket in review: the
     /// ticket becomes ready again and its planner resumes. Answers
@@ -969,6 +968,20 @@ impl LinkKind {
 pub struct DocLink {
     pub kind: LinkKind,
     pub number: u64,
+    /// The target's repository; `None` is the ticket's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+}
+
+impl DocLink {
+    /// The target as a ticket of `own_repo` writes it: `#12` in its own
+    /// repository, `#weida-12` in another.
+    pub fn reference(&self, own_repo: &str) -> String {
+        match &self.repo {
+            Some(repo) if repo != own_repo => format!("#{repo}-{}", self.number),
+            _ => format!("#{}", self.number),
+        }
+    }
 }
 
 /// Where a ticket's plan was made: the runner its plan session ran on and
@@ -1066,6 +1079,13 @@ pub struct DocView {
     /// session that ended without a plan.
     #[serde(default)]
     pub note: String,
+    /// The `depends on` targets not finished yet, across repositories; the
+    /// CI fills it in its answers and never stores it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waits_for: Vec<DocLink>,
+    /// The tickets its plan's sections were filed as.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filed: Vec<FiledTicket>,
 }
 
 impl DocView {
@@ -1076,7 +1096,7 @@ impl DocView {
         if !self.note.is_empty() {
             text.push_str(&format!("> Last attempt failed: {}\n\n", self.note));
         }
-        text.push_str(&self.body);
+        text.push_str(text_without_title(&self.body));
         if let Some(spec) = &self.onboard {
             let grants = if spec.grants.is_empty() {
                 "none".to_owned()
@@ -1102,44 +1122,17 @@ impl DocView {
     }
 }
 
-/// The `depends on` targets of `doc` that are not finished, in link order.
-/// Finished is `done` or `dismissed`, a number missing from `docs`
-/// (deleted), or `merged` into a ticket that is itself done or dismissed;
-/// a target merged into `doc` itself is its own work and blocks nothing.
-pub fn blocked_by(doc: &DocView, docs: &[DocView]) -> Vec<u64> {
-    let closed = |number: u64| {
-        docs.iter()
-            .find(|d| d.number == number)
-            .is_none_or(|d| matches!(d.state, DocState::Done | DocState::Dismissed))
-    };
-    doc.links
-        .iter()
-        .filter(|link| link.kind == LinkKind::DependsOn)
-        .map(|link| link.number)
-        .filter(|&number| {
-            let Some(target) = docs.iter().find(|d| d.number == number) else {
-                return false;
-            };
-            match target.state {
-                DocState::Done | DocState::Dismissed => false,
-                DocState::Merged => {
-                    target.into != Some(doc.number) && !target.into.is_none_or(closed)
-                }
-                _ => true,
-            }
-        })
-        .collect()
-}
-
 /// The links that point at ticket `number`: every `(kind, n)` where ticket
-/// `n` links to it, in number order.
+/// `n` of the same repository links to it, in number order.
 pub fn linked_from(number: u64, docs: &[DocView]) -> Vec<(LinkKind, u64)> {
     let mut incoming: Vec<(LinkKind, u64)> = docs
         .iter()
         .flat_map(|doc| {
             doc.links
                 .iter()
-                .filter(move |link| link.number == number && doc.number != number)
+                .filter(move |link| {
+                    link.repo.is_none() && link.number == number && doc.number != number
+                })
                 .map(move |link| (link.kind, doc.number))
         })
         .collect();
@@ -1872,23 +1865,16 @@ mod tests {
             CiRequest::DocCreate {
                 repo: "griasdi".to_owned(),
                 kind: DocKind::Ticket,
-                title: "Ticket".to_owned(),
-                body: "Body\n".to_owned(),
+                body: "# Ticket\nDepends on: #2\n\nBody\n".to_owned(),
                 source: "griasdi".to_owned(),
-                links: vec![DocLink {
-                    kind: LinkKind::DependsOn,
-                    number: 2,
-                }],
                 runs_on: vec!["os=linux".to_owned(), "os=windows".to_owned()],
                 onboard: None,
             },
             CiRequest::DocCreate {
                 repo: "scan-rs".to_owned(),
                 kind: DocKind::Onboarding,
-                title: "Join".to_owned(),
-                body: "Body".to_owned(),
+                body: "# Join\n\nBody".to_owned(),
                 source: "scan-rs".to_owned(),
-                links: Vec::new(),
                 runs_on: Vec::new(),
                 onboard: Some(spec()),
             },
@@ -1909,16 +1895,12 @@ mod tests {
             CiRequest::DocEdit {
                 repo: "griasdi".to_owned(),
                 number: 3,
-                title: "T".to_owned(),
-                body: "B".to_owned(),
+                body: "# T\n\nB".to_owned(),
             },
-            CiRequest::DocLinks {
+            CiRequest::DocAutoApprove {
                 repo: "griasdi".to_owned(),
                 number: 3,
-                links: vec![DocLink {
-                    kind: LinkKind::Related,
-                    number: 1,
-                }],
+                auto_approve: true,
             },
             CiRequest::DocRefine {
                 repo: "griasdi".to_owned(),
@@ -2354,10 +2336,18 @@ mod tests {
             changed: 20,
             approved: None,
             released: Some(15),
-            links: vec![DocLink {
-                kind: LinkKind::Related,
-                number: 1,
-            }],
+            links: vec![
+                DocLink {
+                    kind: LinkKind::Related,
+                    number: 1,
+                    repo: None,
+                },
+                DocLink {
+                    kind: LinkKind::DependsOn,
+                    number: 12,
+                    repo: Some("weida".to_owned()),
+                },
+            ],
             merged: Vec::new(),
             into: Some(4),
             runs_on: vec!["os=windows".to_owned()],
@@ -2370,6 +2360,16 @@ mod tests {
             feedback: String::new(),
             onboard: None,
             note: String::new(),
+            waits_for: vec![DocLink {
+                kind: LinkKind::DependsOn,
+                number: 12,
+                repo: Some("weida".to_owned()),
+            }],
+            filed: vec![FiledTicket {
+                repo: "weida".to_owned(),
+                number: 13,
+                title: "Keep the corpus".to_owned(),
+            }],
         }
     }
 
@@ -2405,6 +2405,11 @@ mod tests {
              - host prerequisites, confirmed by the owner:\n  - [ ] a sudo rule for install.sh"
         );
         assert_eq!(doc().shown_text(), "Body");
+        let titled = DocView {
+            body: "\n# Expose the clock\n\nRelated: #1\n".to_owned(),
+            ..doc()
+        };
+        assert_eq!(titled.shown_text(), "Related: #1\n");
         let granted = DocView {
             onboard: Some(spec()),
             ..doc()
@@ -2445,10 +2450,8 @@ mod tests {
         let wire = CiRequest::DocCreate {
             repo: "r".to_owned(),
             kind: DocKind::Ticket,
-            title: "t".to_owned(),
-            body: "b".to_owned(),
+            body: "# t\n".to_owned(),
             source: "s".to_owned(),
-            links: Vec::new(),
             runs_on: Vec::new(),
             onboard: None,
         }
@@ -2549,35 +2552,11 @@ mod tests {
                 .map(|&number| DocLink {
                     kind: LinkKind::DependsOn,
                     number,
+                    repo: None,
                 })
                 .collect(),
             ..doc()
         }
-    }
-
-    #[test]
-    fn only_unfinished_dependencies_block_a_ticket() {
-        let mut docs = vec![
-            ticket(1, DocState::Done, &[]),
-            ticket(2, DocState::Dismissed, &[]),
-            ticket(3, DocState::Open, &[]),
-            ticket(4, DocState::Merged, &[]),
-            ticket(5, DocState::Review, &[]),
-            // Depends on the done, the dismissed, a deleted (#9), the open
-            // and the merged ticket, and is related to #5.
-            ticket(6, DocState::Ready, &[1, 2, 9, 3, 4]),
-        ];
-        docs[3].into = Some(5);
-        docs[5].links.push(DocLink {
-            kind: LinkKind::Related,
-            number: 5,
-        });
-        assert_eq!(blocked_by(&docs[5], &docs), vec![3, 4]);
-        // The merged ticket follows the one that includes it.
-        docs[4].state = DocState::Done;
-        assert_eq!(blocked_by(&docs[5], &docs), vec![3]);
-        docs[2].state = DocState::Dismissed;
-        assert!(blocked_by(&docs[5], &docs).is_empty());
     }
 
     #[test]
@@ -2590,6 +2569,13 @@ mod tests {
         docs[2].links.push(DocLink {
             kind: LinkKind::Related,
             number: 1,
+            repo: None,
+        });
+        // The same number in another repository is another ticket.
+        docs[2].links.push(DocLink {
+            kind: LinkKind::DependsOn,
+            number: 1,
+            repo: Some("weida".to_owned()),
         });
         assert_eq!(
             linked_from(1, &docs),

@@ -27,6 +27,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ci plan-save` and `ci planned` are replaced by `ci plan-write`, and a
   claim is on a `ticket`.
 
+- Tickets are Markdown: the first line `# <title>`, then `Depends on:`
+  (alias `Blocked by:`) and `Related:` lines with `#12` or, across
+  repositories, `#weida-12`; the CI reads title and links from the text
+  (`DocCreate` and `DocEdit` carry only the body, `DocLinks` is gone, and
+  stored texts are migrated at its start). The popout edits a ticket in one
+  Markdown box with the title and links read from it beside it, in every
+  state but done, dismissed and merged, and pre-approves a ticket's plan
+  (`DocAutoApprove`). A plan carries the work of another repository, or a
+  later ticket of its own, in a section `## <repo> - <title> [#label]`
+  whose link lines may name `#self` and other sections' labels:
+  `ci plan-write` refuses a section that does not resolve, approving the
+  plan files each section as a ready ticket of its repository (`filed`),
+  and the master's plan leaves those sections out. A ticket waits for its
+  `depends on` targets in any repository (`waits_for`). The omp plugin
+  (0.12.0) tells plan sessions about such sections; `proposal_write` and
+  `onboard_request` take the title from the body's first line.
+
 - The CI page: the CI leaves the tab bar for a chip in the titlebar
   (`N need you`, `M working`) and a full-window page over the workspace.
   Its Overview lists what needs the user (agents that wait, plans to

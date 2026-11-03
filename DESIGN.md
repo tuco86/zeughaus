@@ -1883,7 +1883,27 @@ when `PlanWrite` stores a plan (`ci plan-write`, the plugin's
 master starts. A plan's `Includes:` line makes those tickets `merged` into
 it; they close with it, and go back to `open` when it is dismissed or its
 plan discarded. A link that would close a dependency cycle is refused. At
-start the CI rewrites documents stored before tickets (`docs::migrate`).
+start the CI rewrites documents stored before tickets, and texts from
+before Markdown tickets (`docs::migrate`).
+
+A ticket's text is Markdown (`zeughaus_link::ticket_text`): its first line
+is `# <title>` and its link lines (`Depends on:`, alias `Blocked by:`, and
+`Related:`, among the 20 lines under the title and outside fenced code) name
+`#12` in its own repository or `#weida-12` in another. `create` and `edit`
+read title and links from it; a link may cross repositories (`DocLink.repo`)
+and the cycle check walks every repository's tickets. Answers fill
+`waits_for`, the `depends on` targets not finished yet, which the dispatcher
+and the Board read; it is never stored. A plan carries the work of another
+repository, or a later ticket of its own, in sections `## <repo> - <title>
+[#label]` (`plan_sections`) whose link lines may also name `#self` (the
+plan's ticket) and other sections' labels. `PlanWrite` refuses a plan whose
+sections do not resolve. Approving it (or its arrival, when pre-approved)
+files each section not yet in `filed` as a `ready` ticket of its repository,
+its references written relative to that repository, plus a `Related` link
+to the plan's ticket; a section that cannot be filed keeps the ticket in
+review with the reason. The master's plan leaves the filed sections out
+(`without_sections`).
+
 The `/ci` server, the dispatcher and the scheduler serialize every mutation
 behind one lock and announce each on `/events` as `CiDocs`.
 

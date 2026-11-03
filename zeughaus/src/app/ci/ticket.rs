@@ -6,13 +6,12 @@
 
 use iced::widget::{
     Space, button, column, container, markdown, mouse_area, opaque, row, rule, text, text_editor,
-    text_input,
 };
 use iced::{Alignment, Border, Element, Font, Length, Shadow, Task, Vector};
 use iced_tabs::scroll;
 use zeughaus_link::{
-    AgentRole, CiRequest, ClaimSubject, DocKind, DocLink, DocState, DocView, LinkKind, SessionKind,
-    linked_from,
+    AgentRole, CiRequest, ClaimSubject, DocKind, DocState, DocView, LinkKind, SessionKind,
+    compose_text, linked_from, proposal_heading, ticket_text,
 };
 use zeughaus_mux::TerminalId;
 use zeughaus_theme::Theme;
@@ -31,7 +30,8 @@ use crate::workspace::RunnerKey;
 
 /// The widest the popout grows.
 const DIALOG_MAX_WIDTH: f32 = 1100.0;
-/// The side column of links, sessions and state.
+/// The side column of links, sessions and state, and the panel beside a
+/// ticket's editor.
 const SIDE_WIDTH: f32 = 280.0;
 /// The proposal's editor.
 const EDITOR_HEIGHT: f32 = 400.0;
@@ -50,10 +50,8 @@ pub(in crate::app) struct TicketPopout {
     /// `None` while a new ticket is written.
     pub(super) number: Option<u64>,
     tab: TicketTab,
-    /// The title and proposal being edited.
+    /// The text being edited.
     editing: Option<Editing>,
-    /// The `#12` typed beside the link buttons.
-    link_input: String,
     /// The new ticket being written.
     creating: Option<Editing>,
     /// What an editor shows before its review exists: the first action on
@@ -69,26 +67,16 @@ impl TicketPopout {
             number,
             tab,
             editing: None,
-            link_input: String::new(),
             creating: None,
             blank: text_editor::Content::new(),
         }
     }
 }
 
-/// A title and a proposal being typed.
+/// A ticket's Markdown text being typed: its title and links are read
+/// from it.
 struct Editing {
-    title: String,
     body: text_editor::Content,
-}
-
-/// `#12` or `12`: a ticket number.
-fn ticket_number(text: &str) -> Option<u64> {
-    let digits = text.trim().trim_start_matches('#');
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok().filter(|&n| n >= 1)
 }
 
 /// A title cut to `CHIP_TITLE` characters.
@@ -207,7 +195,6 @@ impl App {
                 }
                 let mut popout = TicketPopout::new(ci, view, None, TicketTab::Proposal);
                 popout.creating = Some(Editing {
-                    title: String::new(),
                     body: text_editor::Content::new(),
                 });
                 self.ticket = Some(popout);
@@ -224,21 +211,22 @@ impl App {
                 Task::none()
             }
             TicketMsg::Edit => {
-                let editing = self.popout_shown().map(|(_, shown)| Editing {
-                    title: shown.doc.title.clone(),
-                    body: text_editor::Content::with_text(&shown.doc.body),
+                // A ticket that started as a plan has no text yet: it starts
+                // from its title and links.
+                let editing = self.popout_shown().map(|(_, shown)| {
+                    let doc = &shown.doc;
+                    let text = if doc.body.trim().is_empty() {
+                        compose_text(&doc.title, &doc.links, "")
+                    } else {
+                        doc.body.clone()
+                    };
+                    Editing {
+                        body: text_editor::Content::with_text(&text),
+                    }
                 });
                 if let (Some(popout), Some(editing)) = (&mut self.ticket, editing) {
                     popout.tab = TicketTab::Proposal;
                     popout.editing = Some(editing);
-                }
-                Task::none()
-            }
-            TicketMsg::EditTitle(title) => {
-                if let Some(popout) = &mut self.ticket
-                    && let Some(editing) = popout.editing.as_mut().or(popout.creating.as_mut())
-                {
-                    editing.title = title;
                 }
                 Task::none()
             }
@@ -260,7 +248,6 @@ impl App {
                 let request = CiRequest::DocEdit {
                     repo: shown.doc.repo.clone(),
                     number: shown.number,
-                    title: editing.title.clone(),
                     body: editing.body.text(),
                 };
                 if let Some(popout) = &mut self.ticket {
@@ -277,54 +264,14 @@ impl App {
                 }
                 Task::none()
             }
-            TicketMsg::LinkInput(input) => {
-                if let Some(popout) = &mut self.ticket {
-                    popout.link_input = input;
-                }
-                Task::none()
-            }
-            TicketMsg::LinkAdd(kind) => {
-                let Some(popout) = &self.ticket else {
-                    return Task::none();
-                };
-                let typed = popout.link_input.trim().to_owned();
-                let Some(target) = ticket_number(&typed) else {
-                    let shown = typed.trim_start_matches('#');
-                    self.ticket_notice(format!("#{shown} is no ticket number"));
-                    return Task::none();
-                };
+            TicketMsg::PreApprove(on) => {
                 let Some(doc) = self.popout_doc() else {
                     return Task::none();
                 };
-                let mut links = doc.links.clone();
-                links.push(DocLink {
-                    kind,
-                    number: target,
-                });
-                let request = CiRequest::DocLinks {
+                let request = CiRequest::DocAutoApprove {
                     repo: doc.repo.clone(),
                     number: doc.number,
-                    links,
-                };
-                if let Some(popout) = &mut self.ticket {
-                    popout.link_input.clear();
-                }
-                self.ticket_act(request)
-            }
-            TicketMsg::LinkRemove(kind, target) => {
-                let Some(doc) = self.popout_doc() else {
-                    return Task::none();
-                };
-                let links: Vec<DocLink> = doc
-                    .links
-                    .iter()
-                    .filter(|link| !(link.kind == kind && link.number == target))
-                    .cloned()
-                    .collect();
-                let request = CiRequest::DocLinks {
-                    repo: doc.repo.clone(),
-                    number: doc.number,
-                    links,
+                    auto_approve: on,
                 };
                 self.ticket_act(request)
             }
@@ -345,10 +292,8 @@ impl App {
                 let request = CiRequest::DocCreate {
                     repo: state.repo.clone(),
                     kind: DocKind::Ticket,
-                    title: creating.title.clone(),
                     body: creating.body.text(),
                     source: "user".to_owned(),
-                    links: Vec::new(),
                     runs_on: Vec::new(),
                     onboard: None,
                 };
@@ -456,7 +401,7 @@ impl App {
         let client = self.ci.get(&popout.ci)?;
         let state = client.plans.get(&popout.view)?;
         let dialog = match popout.number {
-            None => self.new_ticket_dialog(popout, state),
+            None => self.new_ticket_dialog(popout, client, state),
             Some(number) => self.ticket_dialog(popout, client, state, number),
         };
         let panel = container(dialog)
@@ -546,10 +491,12 @@ impl App {
             })
     }
 
-    /// A new ticket: its title and proposal, Create and Cancel.
+    /// A new ticket: its Markdown text beside what is read from it, Create
+    /// and Cancel.
     fn new_ticket_dialog<'a>(
         &'a self,
         popout: &'a TicketPopout,
+        client: &'a CiClient,
         state: &'a PlansState,
     ) -> Element<'a, Message, Theme> {
         let muted = self.theme.muted();
@@ -563,16 +510,15 @@ impl App {
         ]
         .spacing(SP_3)
         .align_y(Alignment::Center);
-        let title = text_input("Title", &creating.title)
-            .size(TEXT_MD)
-            .on_input(|title| Message::Ticket(TicketMsg::EditTitle(title)));
+        let typed = creating.body.text();
         let body = text_editor(&creating.body)
-            .placeholder("What the ticket asks for, in Markdown")
+            .placeholder(
+                "# Title\nDepends on: #12, #weida-3\n\nWhat the ticket asks for, in Markdown",
+            )
             .height(EDITOR_HEIGHT)
             .on_action(|action| Message::Ticket(TicketMsg::EditBody(action)));
-        let ready = !creating.title.trim().is_empty() && !creating.body.text().trim().is_empty();
         let mut create = self.ticket_pill("Create", true);
-        if ready {
+        if ticket_text(&typed).is_ok() {
             create = create.on_press(Message::Ticket(TicketMsg::Create));
         }
         let mut actions = row![
@@ -589,10 +535,66 @@ impl App {
                     .color(self.theme.error()),
             );
         }
-        column![header, title, body, actions]
+        let editor = row![
+            container(body).width(Length::Fill),
+            rule::vertical(1),
+            container(self.text_panel(popout, client, state, &typed)).width(SIDE_WIDTH),
+        ]
+        .spacing(SP_3);
+        column![header, editor, actions].spacing(SP_3).into()
+    }
+
+    /// What a ticket's text says, beside its editor: its title and links,
+    /// or why the CI would refuse it.
+    fn text_panel<'a>(
+        &'a self,
+        popout: &'a TicketPopout,
+        client: &'a CiClient,
+        state: &'a PlansState,
+        body: &str,
+    ) -> Element<'a, Message, Theme> {
+        let muted = self.theme.muted();
+        let block =
+            |label: &'a str, content: Element<'a, Message, Theme>| -> Element<'a, Message, Theme> {
+                column![text(label).size(TEXT_SM).color(muted), content]
+                    .spacing(SP_1)
+                    .into()
+            };
+        let parsed = match ticket_text(body) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                return column![text(e).size(TEXT_SM).color(self.theme.error())]
+                    .padding([0.0, SP_2])
+                    .into();
+            }
+        };
+        let mut panel = column![block("Title", text(parsed.title).size(TEXT_SM).into())]
             .spacing(SP_3)
-            .max_width(BODY_MAX_WIDTH)
-            .into()
+            .padding([0.0, SP_2]);
+        for (label, kind) in [
+            ("Depends on", LinkKind::DependsOn),
+            ("Related", LinkKind::Related),
+        ] {
+            let mut chips = column![].spacing(SP_1);
+            let mut any = false;
+            for link in parsed.links.iter().filter(|link| link.kind == kind) {
+                let repo = link.repo.as_deref().unwrap_or(&state.repo);
+                chips = chips.push(self.ref_chip(
+                    popout,
+                    client,
+                    state,
+                    &state.repo,
+                    repo,
+                    link.number,
+                ));
+                any = true;
+            }
+            if !any {
+                chips = chips.push(text("none").size(TEXT_SM).color(muted));
+            }
+            panel = panel.push(block(label, chips.into()));
+        }
+        panel.into()
     }
 
     /// One ticket: header, actions, tabs, then its proposal or plan beside
@@ -619,13 +621,7 @@ impl App {
             .into();
         };
         let t = Tokens::of(&self.theme);
-        let title: Element<'a, Message, Theme> = match &popout.editing {
-            Some(editing) => text_input("Title", &editing.title)
-                .size(TEXT_MD)
-                .on_input(|title| Message::Ticket(TicketMsg::EditTitle(title)))
-                .into(),
-            None => text(doc.title.as_str()).size(20).width(Length::Fill).into(),
-        };
+        let title = text(doc.title.as_str()).size(20).width(Length::Fill);
         let tone = state_tone(doc.state);
         let chip = container(
             text(doc.state.name().replace('_', " "))
@@ -672,8 +668,8 @@ impl App {
                 let words = state.shown_error.as_deref().unwrap_or("Loading.");
                 text(words).size(TEXT_SM).color(muted).into()
             }
-            (TicketTab::Proposal, Some(shown)) => self.proposal_part(popout, shown),
-            (TicketTab::Plan, Some(shown)) => self.plan_part(popout, doc, shown),
+            (TicketTab::Proposal, Some(shown)) => self.proposal_part(popout, client, state, shown),
+            (TicketTab::Plan, Some(shown)) => self.plan_part(popout, client, state, doc, shown),
         };
         let main = scroll::vertical(
             container(main)
@@ -697,30 +693,46 @@ impl App {
         .into()
     }
 
-    /// The Proposal tab: the proposal, or its editor.
+    /// The Proposal tab: the proposal, or its editor beside what is read
+    /// from it.
     fn proposal_part<'a>(
         &'a self,
         popout: &'a TicketPopout,
+        client: &'a CiClient,
+        state: &'a PlansState,
         shown: &'a Shown,
     ) -> Element<'a, Message, Theme> {
         if let Some(editing) = &popout.editing {
+            let typed = editing.body.text();
             let body = text_editor(&editing.body)
                 .height(EDITOR_HEIGHT)
                 .on_action(|action| Message::Ticket(TicketMsg::EditBody(action)));
+            let mut save = self.ticket_pill("Save", true);
+            if ticket_text(&typed).is_ok() {
+                save = save.on_press(Message::Ticket(TicketMsg::EditSave));
+            }
             let buttons = row![
-                self.ticket_pill("Save", true)
-                    .on_press(Message::Ticket(TicketMsg::EditSave)),
+                save,
                 self.ticket_pill("Cancel", false)
                     .on_press(Message::Ticket(TicketMsg::EditCancel)),
             ]
             .spacing(SP_2);
+            let body = row![
+                container(body).width(Length::Fill),
+                rule::vertical(1),
+                container(self.text_panel(popout, client, state, &typed)).width(SIDE_WIDTH),
+            ]
+            .spacing(SP_3);
             return column![body, buttons].spacing(SP_2).into();
         }
-        if shown.doc.body.trim().is_empty() && shown.doc.onboard.is_none() {
-            return text("No proposal text: this ticket started as a plan.")
-                .size(TEXT_SM)
-                .color(self.theme.muted())
-                .into();
+        let rest = zeughaus_link::text_without_title(&shown.doc.body);
+        if rest.trim().is_empty() && shown.doc.onboard.is_none() {
+            let words = if shown.doc.body.trim().is_empty() {
+                "No proposal text: this ticket started as a plan."
+            } else {
+                "No text beyond its title."
+            };
+            return text(words).size(TEXT_SM).color(self.theme.muted()).into();
         }
         let ci = popout.ci.clone();
         markdown::view(shown.body.items(), self.markdown_settings())
@@ -732,6 +744,8 @@ impl App {
     fn plan_part<'a>(
         &'a self,
         popout: &'a TicketPopout,
+        client: &'a CiClient,
+        state: &'a PlansState,
         doc: &'a DocView,
         shown: &'a Shown,
     ) -> Element<'a, Message, Theme> {
@@ -808,16 +822,47 @@ impl App {
             } else {
                 self.theme.extended().background.base.text
             };
+            // Fill: a long title wraps instead of pushing the buttons out.
             head = head.push(
                 text(section.title.as_str())
                     .size(size)
                     .font(strong)
-                    .color(title_color),
+                    .color(title_color)
+                    .width(Length::Fill),
             );
             if gone {
                 head = head.push(text("deleted").size(TEXT_SM).color(self.theme.error()));
             }
-            head = head.push(Space::new().width(Length::Fill));
+            // A section for a ticket of its own: where it is filed on
+            // approval, and the ticket it became.
+            let mut filing = None;
+            if section.level == 2
+                && let Some(heading) =
+                    proposal_heading(&section.title, |name| client.repos.contains_key(name))
+            {
+                let mut badge = format!("to {}", heading.repo);
+                if let Some(label) = &heading.label {
+                    badge.push_str(&format!(" #{label}"));
+                }
+                let mut line = row![text(badge).size(TEXT_SM).color(self.theme.accent())]
+                    .spacing(SP_2)
+                    .align_y(Alignment::Center);
+                if let Some(filed) = doc
+                    .filed
+                    .iter()
+                    .find(|f| f.repo == heading.repo && f.title == heading.title)
+                {
+                    line = line.push(self.ref_chip(
+                        popout,
+                        client,
+                        state,
+                        &doc.repo,
+                        &filed.repo,
+                        filed.number,
+                    ));
+                }
+                filing = Some(line);
+            }
             if review {
                 head = head.push(tip(
                     icon_button(EDIT, None).on_press(Message::Ticket(TicketMsg::Annotate(at))),
@@ -844,7 +889,11 @@ impl App {
                 text_color: gone.then_some(faded),
                 ..container::Style::default()
             });
-            let mut card = column![head, body].spacing(SP_1);
+            let mut card = column![head].spacing(SP_1);
+            if let Some(filing) = filing {
+                card = card.push(filing);
+            }
+            card = card.push(body);
             if review
                 && let Some(draft) = draft
                 && draft.open_notes.contains(&at)
@@ -867,41 +916,58 @@ impl App {
         part.into()
     }
 
-    /// A chip of a linked ticket: its state's glyph, number and title; a
-    /// press opens it.
-    fn link_chip<'a>(
+    /// A chip of a referenced ticket. One of `own_repo` shows its state's
+    /// glyph, number and title; one of another repository its `#repo-n`.
+    /// A press opens it, on the Board of its repository; a repository the
+    /// CI does not know gives plain text.
+    fn ref_chip<'a>(
         &self,
         popout: &TicketPopout,
+        client: &CiClient,
         state: &'a PlansState,
+        own_repo: &str,
+        repo: &str,
         number: u64,
     ) -> Element<'a, Message, Theme> {
         let muted = self.theme.muted();
-        let linked = state.doc(number);
-        let words = match linked {
-            Some(doc) => format!("#{number} {}", shortened(&doc.title)),
-            None => format!("#{number}"),
+        let (words, glyph_of, view) = if repo == own_repo {
+            let linked = state.doc(number);
+            let words = match linked {
+                Some(doc) => format!("#{number} {}", shortened(&doc.title)),
+                None => format!("#{number}"),
+            };
+            let glyph_of = linked.map_or(glyph::DOT, |doc| state_glyph(doc.state));
+            (words, glyph_of, Some(popout.view))
+        } else {
+            (
+                format!("#{repo}-{number}"),
+                glyph::DOT,
+                client.plans_view_of(repo),
+            )
         };
-        let glyph_of = linked.map_or(glyph::DOT, |doc| state_glyph(doc.state));
-        let (ci, view) = (popout.ci.clone(), popout.view);
-        button(
-            row![icon(glyph_of, TEXT_SM, muted), text(words).size(TEXT_SM)]
-                .spacing(SP_1)
-                .align_y(Alignment::Center),
-        )
-        .padding([2.0, SP_2])
-        .style(style::secondary_button(&Tokens::of(&self.theme)))
-        .on_press_with(move || {
-            Message::Ticket(TicketMsg::Open {
-                ci: ci.clone(),
-                view,
-                number,
+        let content = row![icon(glyph_of, TEXT_SM, muted), text(words).size(TEXT_SM)]
+            .spacing(SP_1)
+            .align_y(Alignment::Center);
+        let Some(view) = view else {
+            return container(content).padding([2.0, SP_2]).into();
+        };
+        let ci = popout.ci.clone();
+        button(content)
+            .padding([2.0, SP_2])
+            .style(style::secondary_button(&Tokens::of(&self.theme)))
+            .on_press_with(move || {
+                Message::Ticket(TicketMsg::Open {
+                    ci: ci.clone(),
+                    view,
+                    number,
+                })
             })
-        })
-        .into()
+            .into()
     }
 
-    /// The side column: state, source, `Runs on`, links both ways, what it
-    /// includes, its sessions and who holds it.
+    /// The side column: state, source, `Runs on`, links both ways (edited
+    /// in its text), the tickets its plan's sections became, pre-approval,
+    /// what it includes, its sessions and who holds it.
     fn side_column<'a>(
         &'a self,
         popout: &'a TicketPopout,
@@ -939,49 +1005,23 @@ impl App {
         if doc.kind != DocKind::Ticket {
             return side.into();
         }
-        let fixed = matches!(
-            doc.state,
-            DocState::Done | DocState::Dismissed | DocState::Merged
-        );
         let incoming = linked_from(doc.number, state.docs());
+        let chip =
+            |repo: &str, number: u64| self.ref_chip(popout, client, state, &doc.repo, repo, number);
         let outgoing = |kind: LinkKind| -> Element<'a, Message, Theme> {
             let mut chips = column![].spacing(SP_1);
             for link in doc.links.iter().filter(|link| link.kind == kind) {
-                let mut chip = row![self.link_chip(popout, state, link.number)]
-                    .spacing(SP_1)
-                    .align_y(Alignment::Center);
-                if !fixed {
-                    chip = chip.push(
-                        icon_button(glyph::CLOSE, None)
-                            .on_press(Message::Ticket(TicketMsg::LinkRemove(kind, link.number))),
-                    );
-                }
-                chips = chips.push(chip);
+                chips = chips.push(chip(link.repo.as_deref().unwrap_or(&doc.repo), link.number));
             }
             if kind == LinkKind::Related {
                 for (_, number) in incoming.iter().filter(|(k, _)| *k == LinkKind::Related) {
-                    chips = chips.push(self.link_chip(popout, state, *number));
+                    chips = chips.push(chip(&doc.repo, *number));
                 }
             }
             chips.into()
         };
         side = side.push(block("Depends on", outgoing(LinkKind::DependsOn)));
         side = side.push(block("Related", outgoing(LinkKind::Related)));
-        if !fixed {
-            let add = row![
-                text_input("#12", &popout.link_input)
-                    .size(TEXT_SM)
-                    .width(Length::Fixed(70.0))
-                    .on_input(|input| Message::Ticket(TicketMsg::LinkInput(input))),
-                self.ticket_pill("depends on", false)
-                    .on_press(Message::Ticket(TicketMsg::LinkAdd(LinkKind::DependsOn))),
-                self.ticket_pill("related", false)
-                    .on_press(Message::Ticket(TicketMsg::LinkAdd(LinkKind::Related))),
-            ]
-            .spacing(SP_1)
-            .align_y(Alignment::Center);
-            side = side.push(add);
-        }
         let blocks: Vec<u64> = incoming
             .iter()
             .filter(|(kind, _)| *kind == LinkKind::DependsOn)
@@ -990,19 +1030,49 @@ impl App {
         if !blocks.is_empty() {
             let mut chips = column![].spacing(SP_1);
             for number in blocks {
-                chips = chips.push(self.link_chip(popout, state, number));
+                chips = chips.push(chip(&doc.repo, number));
             }
             side = side.push(block("Blocks", chips.into()));
         }
+        if !doc.filed.is_empty() {
+            let mut chips = column![].spacing(SP_1);
+            for filed in &doc.filed {
+                chips = chips.push(chip(&filed.repo, filed.number));
+            }
+            side = side.push(block("Filed", chips.into()));
+        }
+        let review: Element<'a, Message, Theme> = if matches!(
+            doc.state,
+            DocState::Open | DocState::Ready | DocState::Planning
+        ) {
+            let words = if doc.auto_approve {
+                "pre-approved"
+            } else {
+                "pre-approve"
+            };
+            let mut pill = self.ticket_pill(words, doc.auto_approve);
+            if !state.acting {
+                pill = pill.on_press(Message::Ticket(TicketMsg::PreApprove(!doc.auto_approve)));
+            }
+            tip(
+                pill,
+                "A pre-approved plan is approved as it arrives".to_owned(),
+            )
+        } else if doc.auto_approve {
+            line("pre-approved".to_owned())
+        } else {
+            line("reviewed".to_owned())
+        };
+        side = side.push(block("Plan review", review));
         if !doc.merged.is_empty() {
             let mut chips = column![].spacing(SP_1);
             for number in &doc.merged {
-                chips = chips.push(self.link_chip(popout, state, *number));
+                chips = chips.push(chip(&doc.repo, *number));
             }
             side = side.push(block("Includes", chips.into()));
         }
         if let Some(into) = doc.into {
-            side = side.push(block("Merged into", self.link_chip(popout, state, into)));
+            side = side.push(block("Merged into", chip(&doc.repo, into)));
         }
         let mut sessions: Vec<_> = client
             .sessions()
@@ -1076,19 +1146,5 @@ impl App {
             side = side.push(block("Claimed by", holder.into()));
         }
         side.into()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_link_names_a_ticket_with_or_without_its_hash() {
-        assert_eq!(ticket_number("#12"), Some(12));
-        assert_eq!(ticket_number(" 7 "), Some(7));
-        for bad in ["", "#", "#0", "x1", "#1a", "-3"] {
-            assert_eq!(ticket_number(bad), None, "{bad:?}");
-        }
     }
 }
