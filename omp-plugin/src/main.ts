@@ -301,7 +301,7 @@ function block(c: CiContext): string | undefined {
         c.text,
         "Tests before a push: only the unit tier of the crates or packages the change touches (Rust: cargo nextest run -p <crate>; Python: uv run pytest tests/unit). Never the whole suite, the integration or the end-to-end tier locally: the push pipeline runs what its jobs select right after the push, and integration and end-to-end tests belong to the nightly and release pipelines.",
         "Builds and tests on another platform go through run_jobs, never by hand over ssh; skill://zeughaus-ci says how to debug a job or platform with it and how jobs are written.",
-        'Tickets of this repository live in the CI, one number from proposal through plan to execution: read them with the zeughaus MCP tools docs and doc_read. A plan that also does the work of other tickets names them in a line "Includes: #3, #5" directly under its title. The user stores a finished plan as a ticket in review with /zeughaus save.',
+        'Tickets of this repository live in the CI, one number from proposal through plan to execution: read them with the zeughaus MCP tools docs and doc_read. A plan that also does the work of other tickets names them in a line "Includes: #3, #5" directly under its title. The user stores a finished plan as a ticket in review with /zeughaus save. Work for another repository goes in a "## <repo> - <title>" section of the plan; it becomes a ticket there when the plan is approved.',
       );
     case "unknown":
       return wrap(
