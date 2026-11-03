@@ -2148,27 +2148,12 @@ mod tests {
             CiReply::Advice {
                 advice: Box::new(crate::advice::AdviceView {
                     origin: "github.com/o/site".to_owned(),
+                    title: "Weida's website".to_owned(),
                     summary: "A site.".to_owned(),
-                    status: vec!["on GitHub only".to_owned()],
-                    onboard: crate::advice::OnboardSettings {
-                        name: "site".to_owned(),
-                        default_branch: "main".to_owned(),
-                        grants: [("DEPLOY".to_owned(), vec!["push main".to_owned()])].into(),
-                        prerequisites: vec!["a served directory".to_owned()],
-                    },
                     cards: vec![crate::advice::Card {
-                        kind: crate::advice::CardKind::Follow,
                         title: "Follow weida".to_owned(),
                         body: "Rebuild with it.".to_owned(),
                         chosen: true,
-                        tickets: vec![crate::advice::CardTicket {
-                            key: "jobs".to_owned(),
-                            title: "Build jobs".to_owned(),
-                            proposal: "Write .zeughaus-ci/.".to_owned(),
-                            skills: vec!["zeughaus-ci".to_owned()],
-                            depends_on: Vec::new(),
-                            auto: true,
-                        }],
                     }],
                     refusal: Some("not on the Forgejo".to_owned()),
                     model: "claude-haiku-5-5".to_owned(),

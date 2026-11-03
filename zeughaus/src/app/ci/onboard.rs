@@ -1,36 +1,35 @@
-//! The Board of a project no CI builds: what it is and where it stands,
-//! cards of work to choose, and a preview of what `Onboard` files.
+//! The Board of a project no CI builds: the CI's small plan document for
+//! it, its `## ` sections as cards to choose, and what `Onboard` files.
 //!
 //! Showing the Board asks the local runner for the facts about the project
 //! (the skills installed there, its listing, its work checkout or its
-//! forge) and hands them to the first CI, whose `[advice]` model answers
-//! with a summary, the onboarding's settings and cards: pieces of work,
-//! each the tickets it files, which may depend on tickets of other cards.
-//! The owner picks cards and switches a ticket between running through
-//! (its plan is approved as it arrives) and waiting for review. `Onboard`
-//! files the request already approved together with the chosen tickets in
-//! one step; the CI joins the repository, and the tickets go through
-//! planning and the queue in the order their dependencies allow.
+//! forge) and hands them to the first CI, whose `[advice]` model writes the
+//! plan: a `# ` title and the text under it, then one `## ` section per
+//! piece of work. The owner picks sections and switches each between
+//! running through (its plan is approved as it arrives) and waiting for
+//! review. `Onboard` files the request already approved together with one
+//! ticket per chosen section in one step, each waiting for the one before
+//! it; the CI joins the repository and the tickets follow in that order.
 
 use std::collections::HashMap;
 
-use iced::widget::{button, column, container, mouse_area, row, rule, scrollable, text};
+use iced::widget::{button, column, container, markdown, mouse_area, row, rule, scrollable, text};
 use iced::{Alignment, Border, Element, Length, Task};
 use zeughaus_link::{
-    AdviceView, Card, CiReply, CiRequest, NewTicket, OnboardSettings, OnboardSpec, ProjectsRequest,
+    AdviceView, Card, CiReply, CiRequest, NewTicket, OnboardSpec, ProjectsRequest,
 };
 use zeughaus_theme::Theme;
 
 use super::{ago, now};
 use crate::app::App;
-use crate::message::{Message, OnboardMsg};
+use crate::message::{CiMsg, Message, OnboardMsg};
 use crate::notices::Severity;
 use crate::style::{self, Tokens};
 
 /// The widest the Board's column grows.
 const MAX_WIDTH: f32 = 1040.0;
-/// The width of a card.
-const CARD_WIDTH: f32 = 320.0;
+/// The width of a card: two side by side in the widest column.
+const CARD_WIDTH: f32 = 490.0;
 /// Text of a line, and of a caption.
 const ROW_TEXT: f32 = 13.0;
 const CAPTION_TEXT: f32 = 12.0;
@@ -46,8 +45,13 @@ pub(in crate::app) struct Draft {
     /// Ask the CI past its kept answer.
     refresh: bool,
     advice: Option<AdviceView>,
-    /// The advice's cards as the owner has chosen and switched them.
+    /// The advice's cards as the owner has chosen them.
     cards: Vec<Card>,
+    /// Per card: its ticket runs through instead of waiting for review.
+    through: Vec<bool>,
+    /// The summary and each card's text, parsed once.
+    summary: Option<markdown::Content>,
+    bodies: Vec<markdown::Content>,
     /// Why no advice arrived.
     error: Option<String>,
     filing: bool,
@@ -55,129 +59,60 @@ pub(in crate::app) struct Draft {
     refused: Option<String>,
 }
 
-/// One ticket `Onboard` files, as the preview shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Planned {
-    card: usize,
-    ticket: usize,
-    /// Places among the filed tickets of the ones it waits for.
-    depends_on: Vec<usize>,
-    /// Titles of the tickets it would wait for whose card is not chosen.
-    dropped: Vec<String>,
+/// The repository's name in `ci.toml` for `origin`: its last segment in
+/// lowercase, `_` and `.` made dashes.
+fn repo_name(origin: &str) -> String {
+    origin
+        .rsplit('/')
+        .next()
+        .unwrap_or(origin)
+        .to_lowercase()
+        .replace(['_', '.'], "-")
 }
 
-/// The tickets of the chosen cards in filing order, their dependencies
-/// as places in that order; a dependency on a ticket of a card that is
-/// not chosen is dropped and named.
-fn planned(cards: &[Card]) -> Vec<Planned> {
-    let mut places: HashMap<&str, usize> = HashMap::new();
-    let mut order = Vec::new();
-    for (at, card) in cards.iter().enumerate().filter(|(_, card)| card.chosen) {
-        for (ticket_at, ticket) in card.tickets.iter().enumerate() {
-            places.insert(ticket.key.as_str(), order.len());
-            order.push((at, ticket_at));
-        }
-    }
-    let titles: HashMap<&str, &str> = cards
-        .iter()
-        .flat_map(|card| &card.tickets)
-        .map(|ticket| (ticket.key.as_str(), ticket.title.as_str()))
-        .collect();
-    order
-        .into_iter()
-        .map(|(card, ticket_at)| {
-            let ticket = &cards[card].tickets[ticket_at];
-            let mut depends_on = Vec::new();
-            let mut dropped = Vec::new();
-            for on in &ticket.depends_on {
-                match places.get(on.as_str()) {
-                    Some(&place) => depends_on.push(place),
-                    None => {
-                        dropped.push(titles.get(on.as_str()).unwrap_or(&on.as_str()).to_string())
-                    }
-                }
-            }
-            Planned {
-                card,
-                ticket: ticket_at,
-                depends_on,
-                dropped,
-            }
-        })
-        .collect()
-}
-
-/// The `Onboard` request: the onboarding with the chosen cards' tickets.
+/// The `Onboard` request: the onboarding of `origin` with one ticket per
+/// chosen card in the plan's order, each waiting for the one before.
 fn onboarding(
     origin: &str,
-    summary: &str,
-    settings: &OnboardSettings,
+    branch: &str,
+    advice: Option<&AdviceView>,
     cards: &[Card],
+    through: &[bool],
 ) -> CiRequest {
-    let planned = planned(cards);
+    let name = repo_name(origin);
     let mut body = format!("Onboarded from the editor: {origin}.\n");
-    if !summary.trim().is_empty() {
-        body.push_str(&format!("\n{}\n", summary.trim()));
-    }
-    let chosen: Vec<&Card> = cards.iter().filter(|card| card.chosen).collect();
-    if !chosen.is_empty() {
-        body.push_str("\nCards:\n");
-        for card in &chosen {
-            body.push_str(&format!("- {} ({})\n", card.title, card.kind.name()));
+    if let Some(advice) = advice {
+        if !advice.title.is_empty() {
+            body.push_str(&format!("\n# {}\n", advice.title));
+        }
+        if !advice.summary.is_empty() {
+            body.push_str(&format!("\n{}\n", advice.summary));
         }
     }
-    let tickets = planned
-        .iter()
-        .map(|planned| {
-            let card = &cards[planned.card];
-            let ticket = &card.tickets[planned.ticket];
-            let mut body = ticket.proposal.trim().to_owned();
-            if !ticket.skills.is_empty() {
-                let skills: Vec<String> = ticket
-                    .skills
-                    .iter()
-                    .map(|s| format!("skill://{s}"))
-                    .collect();
-                body.push_str(&format!("\n\nSkills to read first: {}.", skills.join(", ")));
-            }
-            body.push_str(&format!(
-                "\n\nFrom the onboarding of {origin}, card \"{}\".\n",
-                card.title
-            ));
-            NewTicket {
-                title: ticket.title.clone(),
-                body,
-                depends_on: planned.depends_on.clone(),
-                auto_approve: ticket.auto,
-            }
-        })
-        .collect();
+    let mut tickets: Vec<NewTicket> = Vec::new();
+    for (at, card) in cards.iter().enumerate().filter(|(_, card)| card.chosen) {
+        let depends_on = tickets.len().checked_sub(1).into_iter().collect();
+        tickets.push(NewTicket {
+            title: card.title.clone(),
+            body: format!(
+                "{}\n\nFrom the onboarding plan of {origin}.\n",
+                card.body.trim()
+            ),
+            depends_on,
+            auto_approve: through.get(at).copied().unwrap_or(false),
+        });
+    }
     CiRequest::Onboard {
-        repo: settings.name.clone(),
-        title: format!("Onboard {}", settings.name),
+        repo: name.clone(),
+        title: format!("Onboard {name}"),
         body,
         spec: OnboardSpec {
             url: format!("https://{origin}"),
-            default_branch: settings.default_branch.clone(),
-            grants: settings.grants.clone(),
-            prerequisites: settings.prerequisites.clone(),
+            default_branch: branch.to_owned(),
+            grants: Default::default(),
+            prerequisites: Vec::new(),
         },
         tickets,
-    }
-}
-
-/// The settings without advice: the origin's last segment as the name,
-/// `branch` as the default branch.
-fn plain_settings(origin: &str, branch: &str) -> OnboardSettings {
-    OnboardSettings {
-        name: origin
-            .rsplit('/')
-            .next()
-            .unwrap_or(origin)
-            .to_lowercase()
-            .replace(['_', '.'], "-"),
-        default_branch: branch.to_owned(),
-        ..OnboardSettings::default()
     }
 }
 
@@ -267,15 +202,6 @@ impl App {
             .map_or_else(|| "main".to_owned(), |p| p.default_branch)
     }
 
-    /// The settings `Onboard` files for `origin`: the advice's, else plain
-    /// ones.
-    fn settings_of(&self, origin: &str, draft: &Draft) -> OnboardSettings {
-        match &draft.advice {
-            Some(advice) if !advice.onboard.name.is_empty() => advice.onboard.clone(),
-            _ => plain_settings(origin, &self.default_branch_of(origin)),
-        }
-    }
-
     /// What a Board of a project no CI builds is told.
     pub(in crate::app) fn apply_onboard(
         &mut self,
@@ -304,6 +230,13 @@ impl App {
                     Ok(advice) => {
                         draft.error = None;
                         draft.cards = advice.cards.clone();
+                        draft.through = vec![false; advice.cards.len()];
+                        draft.summary = Some(markdown::Content::parse(&advice.summary));
+                        draft.bodies = advice
+                            .cards
+                            .iter()
+                            .map(|card| markdown::Content::parse(&card.body))
+                            .collect();
                         draft.advice = Some(*advice);
                     }
                     Err(e) => draft.error = Some(e),
@@ -314,13 +247,9 @@ impl App {
                     card.chosen = !card.chosen;
                 }
             }
-            OnboardMsg::Mode(card, ticket) => {
-                if let Some(ticket) = draft
-                    .cards
-                    .get_mut(card)
-                    .and_then(|card| card.tickets.get_mut(ticket))
-                {
-                    ticket.auto = !ticket.auto;
+            OnboardMsg::Mode(at) => {
+                if let Some(through) = draft.through.get_mut(at) {
+                    *through = !*through;
                 }
             }
             OnboardMsg::Onboarded(result) => {
@@ -362,20 +291,19 @@ impl App {
             return Task::none();
         };
         let endpoint = client.endpoint.clone();
-        let Some(draft) = self.page.onboard.get(origin) else {
+        let branch = self.default_branch_of(origin);
+        let Some(draft) = self.page.onboard.get_mut(origin) else {
             return Task::none();
         };
-        let settings = self.settings_of(origin, draft);
-        let summary = draft
-            .advice
-            .as_ref()
-            .map(|a| a.summary.clone())
-            .unwrap_or_default();
-        let request = onboarding(origin, &summary, &settings, &draft.cards);
-        if let Some(draft) = self.page.onboard.get_mut(origin) {
-            draft.filing = true;
-            draft.refused = None;
-        }
+        let request = onboarding(
+            origin,
+            &branch,
+            draft.advice.as_ref(),
+            &draft.cards,
+            &draft.through,
+        );
+        draft.filing = true;
+        draft.refused = None;
         let origin = origin.to_owned();
         Task::perform(
             async move {
@@ -403,20 +331,24 @@ impl App {
         let draft = self.page.onboard.get(origin);
         let advice = draft.and_then(|d| d.advice.as_ref());
 
-        // What it is and where it stands.
-        let mut facts = vec!["not built by a CI".to_owned()];
+        // Where it stands, and the plan's title over it.
+        let mut facts = vec![origin.to_owned(), "not built by a CI".to_owned()];
         if let Some(listed) = &listed {
             facts.push(format!("default branch {}", listed.default_branch));
             if listed.checkout {
                 facts.push(format!("checked out in ~/work/{origin}"));
             }
         }
+        let title = advice
+            .map(|a| a.title.as_str())
+            .filter(|title| !title.is_empty())
+            .unwrap_or(origin);
         let mut head = row![
             column![
-                text(origin).size(18),
+                text(title).size(22),
                 text(facts.join(" \u{b7} ")).size(CAPTION_TEXT).color(muted),
             ]
-            .spacing(4)
+            .spacing(6)
             .width(Length::Fill),
         ]
         .spacing(12)
@@ -424,7 +356,7 @@ impl App {
         if let Some(advice) = advice.filter(|a| !a.model.is_empty()) {
             head = head.push(
                 text(format!(
-                    "advice by {}, {}",
+                    "plan by {}, {}",
                     advice.model,
                     ago(advice.created, now())
                 ))
@@ -448,11 +380,11 @@ impl App {
                 .on_press_maybe((!asking).then(|| send(OnboardMsg::Refresh))),
             );
         }
-        let mut body = column![head].spacing(16);
-        if self.ci.is_empty() {
+        let mut body = column![head].spacing(20);
+        let Some(ci) = self.ci.keys().next() else {
             body = body.push(text("No CI configured").size(ROW_TEXT).color(muted));
             return page(body);
-        }
+        };
         let Some(draft) = draft else {
             body = body.push(
                 button(text("Ask the CI about it").size(CAPTION_TEXT))
@@ -476,139 +408,142 @@ impl App {
                     .color(self.theme.error()),
             );
         }
-        if let Some(advice) = advice {
-            if !advice.summary.is_empty() {
-                body = body.push(text(advice.summary.as_str()).size(ROW_TEXT));
-            }
-            if !advice.status.is_empty() {
-                let mut lines = column![].spacing(2);
-                for line in &advice.status {
-                    lines = lines.push(
-                        text(format!("\u{2022} {line}"))
-                            .size(CAPTION_TEXT)
-                            .color(muted),
-                    );
-                }
-                body = body.push(lines);
-            }
-            if let Some(error) = &advice.error {
-                body = body.push(
-                    text(format!("No advice: {error}"))
-                        .size(CAPTION_TEXT)
-                        .color(muted),
-                );
-            }
+        if let Some(error) = advice.and_then(|a| a.error.as_ref()) {
+            body = body.push(
+                text(format!("No plan: {error}"))
+                    .size(CAPTION_TEXT)
+                    .color(muted),
+            );
+        }
+        if let Some(summary) = &draft.summary {
+            let ci = ci.clone();
+            body = body.push(
+                container(
+                    markdown::view(summary.items(), self.markdown_settings())
+                        .map(move |uri| Message::Ci(ci.clone(), CiMsg::OpenLink(uri))),
+                )
+                .max_width(760),
+            );
         }
         if !draft.cards.is_empty() {
-            body = body.push(caption("Choose the work", muted));
+            body = body.push(caption("The plan, one ticket per chosen section", muted));
             let mut cards = row![].spacing(12);
+            let mut place = 0;
             for (at, card) in draft.cards.iter().enumerate() {
-                cards = cards.push(self.card_view(t, origin, at, card, &draft.cards));
+                let step = card.chosen.then(|| {
+                    place += 1;
+                    place
+                });
+                cards = cards.push(self.card_view(t, ci, origin, draft, at, step));
             }
             body = body.push(cards.wrap().vertical_spacing(12));
         }
         body = body
             .push(rule::horizontal(1))
-            .push(caption("Onboard files", muted))
             .push(self.preview(t, origin, draft));
         page(body)
     }
 
-    /// One card: its kind, title and what it brings, and its tickets, each
-    /// with its mode, skills and what it waits for. A press chooses or
-    /// drops it; a press on a ticket's mode switches it.
+    /// One card: its place among the chosen ones, its heading and text,
+    /// and its mode. A press chooses or drops it; a press on the mode
+    /// switches it.
     fn card_view<'a>(
         &'a self,
         t: &Tokens,
+        ci: &'a crate::workspace::RunnerKey,
         origin: &'a str,
+        draft: &'a Draft,
         at: usize,
-        card: &'a Card,
-        cards: &'a [Card],
+        step: Option<usize>,
     ) -> Element<'a, Message, Theme> {
         let send = move |message: OnboardMsg| Message::Onboard(origin.to_owned(), message);
         let (muted, accent, surface) = (self.theme.muted(), self.theme.accent(), t.surface);
+        let card = &draft.cards[at];
         let chosen = card.chosen;
-        let mut lines = column![
-            row![
-                chip(t, card.kind.name(), chosen),
-                text(card.title.as_str()).size(ROW_TEXT).width(Length::Fill),
-                text(if chosen { "\u{2713}" } else { "" })
-                    .size(ROW_TEXT)
-                    .color(accent),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
-            text(card.body.as_str()).size(CAPTION_TEXT).color(muted),
+        let through = draft.through.get(at).copied().unwrap_or(false);
+        let number = container(
+            text(step.map_or_else(|| "\u{2013}".to_owned(), |n| n.to_string()))
+                .size(CAPTION_TEXT)
+                .color(if chosen { surface } else { muted }),
+        )
+        .center_x(22)
+        .center_y(22)
+        .style(move |_: &Theme| container::Style {
+            background: chosen.then(|| accent.into()),
+            border: Border {
+                color: if chosen { accent } else { muted },
+                width: 1.0,
+                radius: 11.0.into(),
+            },
+            ..container::Style::default()
+        });
+        let mode =
+            button(text(if through { "runs through" } else { "review" }).size(11)).padding([1, 8]);
+        let mode = if through {
+            mode.style(style::pill_button(t))
+        } else {
+            mode.style(style::secondary_button(t))
+        };
+        let mode = mode.on_press_maybe(chosen.then(|| send(OnboardMsg::Mode(at))));
+        let title_color = if chosen {
+            self.theme.extended().background.base.text
+        } else {
+            muted
+        };
+        let head = row![
+            number,
+            text(card.title.as_str())
+                .size(15)
+                .color(title_color)
+                .width(Length::Fill),
+            mode,
         ]
-        .spacing(6);
-        for (ticket_at, ticket) in card.tickets.iter().enumerate() {
-            let mode = button(
-                text(if ticket.auto {
-                    "runs through"
-                } else {
-                    "review"
-                })
-                .size(11),
-            )
-            .padding([0, 6]);
-            let mode = if ticket.auto {
-                mode.style(style::pill_button(t))
-            } else {
-                mode.style(style::secondary_button(t))
-            }
-            .on_press(send(OnboardMsg::Mode(at, ticket_at)));
-            let mut line = row![mode, text(ticket.title.as_str()).size(CAPTION_TEXT)]
-                .spacing(6)
-                .align_y(Alignment::Center);
-            for skill in &ticket.skills {
-                line = line.push(chip(t, skill, false));
-            }
-            let mut ticket_lines = column![line.wrap().vertical_spacing(4)].spacing(2);
-            let waits: Vec<&str> = ticket
-                .depends_on
-                .iter()
-                .filter_map(|on| {
-                    cards
-                        .iter()
-                        .flat_map(|c| &c.tickets)
-                        .find(|other| &other.key == on)
-                        .map(|other| other.title.as_str())
-                })
-                .collect();
-            if !waits.is_empty() {
-                ticket_lines = ticket_lines.push(
-                    text(format!("after {}", waits.join(", ")))
-                        .size(11)
-                        .color(muted),
-                );
-            }
-            lines = lines.push(ticket_lines);
+        .spacing(10)
+        .align_y(Alignment::Center);
+        let mut lines = column![head].spacing(8);
+        if let Some(content) = draft.bodies.get(at) {
+            let ci = ci.clone();
+            let faded = muted.scale_alpha(0.8);
+            lines = lines.push(
+                container(
+                    markdown::view(content.items(), self.markdown_settings())
+                        .map(move |uri| Message::Ci(ci.clone(), CiMsg::OpenLink(uri))),
+                )
+                .style(move |_: &Theme| container::Style {
+                    text_color: (!chosen).then_some(faded),
+                    ..container::Style::default()
+                }),
+            );
         }
-        let card = container(lines)
+        let tile = container(lines)
             .width(CARD_WIDTH)
-            .padding(10)
+            .padding(14)
             .style(move |_: &Theme| container::Style {
-                background: Some(surface.into()),
+                background: Some(if chosen {
+                    accent.scale_alpha(0.06).into()
+                } else {
+                    surface.into()
+                }),
                 border: Border {
                     color: if chosen {
                         accent
                     } else {
                         muted.scale_alpha(0.3)
                     },
-                    width: if chosen { 2.0 } else { 1.0 },
-                    radius: 6.0.into(),
+                    width: if chosen { 1.5 } else { 1.0 },
+                    radius: 8.0.into(),
                 },
                 ..container::Style::default()
             });
-        mouse_area(card)
+        mouse_area(tile)
             .interaction(iced::mouse::Interaction::Pointer)
             .on_press(send(OnboardMsg::Card(at)))
             .into()
     }
 
-    /// What `Onboard` files: the request with its settings, then each
-    /// chosen ticket in filing order with its mode and what it waits for;
-    /// and the button.
+    /// What `Onboard` files, numbered as the CI will number it in a new
+    /// repository: the request, then the chosen sections in order; and the
+    /// button.
     fn preview<'a>(
         &'a self,
         t: &Tokens,
@@ -617,57 +552,41 @@ impl App {
     ) -> Element<'a, Message, Theme> {
         let send = move |message: OnboardMsg| Message::Onboard(origin.to_owned(), message);
         let muted = self.theme.muted();
-        let settings = self.settings_of(origin, draft);
-        let mut request = format!(
-            "1. Onboarding request for `{}`, branch {}, approved",
-            settings.name, settings.default_branch
-        );
-        for (secret, events) in &settings.grants {
-            request.push_str(&format!("; secret {secret} for {}", events.join(", ")));
-        }
-        let mut list = column![text(request).size(ROW_TEXT)].spacing(4);
-        for line in &settings.prerequisites {
-            list = list.push(
-                text(format!("   host prerequisite: {line}"))
-                    .size(CAPTION_TEXT)
-                    .color(muted),
-            );
-        }
-        let planned = planned(&draft.cards);
-        for (place, planned) in planned.iter().enumerate() {
-            let ticket = &draft.cards[planned.card].tickets[planned.ticket];
+        let mut list = column![
+            caption("Onboard files", muted),
+            text(format!(
+                "1. Onboarding request for `{}`, branch {}, approved",
+                repo_name(origin),
+                self.default_branch_of(origin)
+            ))
+            .size(ROW_TEXT),
+        ]
+        .spacing(4);
+        let chosen: Vec<(usize, &Card)> = draft
+            .cards
+            .iter()
+            .enumerate()
+            .filter(|(_, card)| card.chosen)
+            .collect();
+        for (place, (at, card)) in chosen.iter().enumerate() {
+            let through = draft.through.get(*at).copied().unwrap_or(false);
             let mut line = format!(
                 "{}. {} \u{2014} {}",
                 place + 2,
-                ticket.title,
-                if ticket.auto {
+                card.title,
+                if through {
                     "runs through"
                 } else {
                     "plan for review"
                 }
             );
-            if !planned.depends_on.is_empty() {
-                let after: Vec<String> = planned
-                    .depends_on
-                    .iter()
-                    .map(|p| format!("{}", p + 2))
-                    .collect();
-                line.push_str(&format!(", after {}", after.join(", ")));
+            if place > 0 {
+                line.push_str(&format!(", after {}", place + 1));
             }
             list = list.push(text(line).size(ROW_TEXT));
-            if !planned.dropped.is_empty() {
-                list = list.push(
-                    text(format!(
-                        "   no longer waits for {} (its card is not chosen)",
-                        planned.dropped.join(", ")
-                    ))
-                    .size(CAPTION_TEXT)
-                    .color(muted),
-                );
-            }
         }
         let refusal = draft.advice.as_ref().and_then(|a| a.refusal.as_ref());
-        let words = match (draft.filing, planned.len()) {
+        let words = match (draft.filing, chosen.len()) {
             (true, _) => "Onboarding\u{2026}".to_owned(),
             (false, 0) => "Onboard".to_owned(),
             (false, 1) => "Onboard with 1 ticket".to_owned(),
@@ -683,7 +602,7 @@ impl App {
                 ),
             text(
                 "The CI adds its bot and push hook and builds the default branch; then the \
-                 tickets are planned in the order they wait for each other."
+                 tickets are planned one after the other."
             )
             .size(CAPTION_TEXT)
             .color(muted)
@@ -722,86 +641,40 @@ fn page<'a>(body: iced::widget::Column<'a, Message, Theme>) -> Element<'a, Messa
 }
 
 /// A caption over a part of the Board.
-fn caption<'a>(words: &'a str, muted: iced::Color) -> Element<'a, Message, Theme> {
+fn caption<'a>(words: &str, muted: iced::Color) -> Element<'a, Message, Theme> {
     text(words.to_uppercase())
         .size(CAPTION_TEXT)
         .color(muted)
         .into()
 }
 
-/// A small label.
-fn chip<'a>(t: &Tokens, words: &'a str, accent: bool) -> Element<'a, Message, Theme> {
-    container(text(words).size(11))
-        .padding([0, 6])
-        .style(style::badge(t, accent))
-        .into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeughaus_link::{CardKind, CardTicket};
 
-    fn ticket(key: &str, depends_on: &[&str], auto: bool) -> CardTicket {
-        CardTicket {
-            key: key.to_owned(),
-            title: format!("Do {key}"),
-            proposal: format!("Do {key} well."),
-            skills: if key == "jobs" {
-                vec!["zeughaus-ci".to_owned()]
-            } else {
-                Vec::new()
-            },
-            depends_on: depends_on.iter().map(|on| (*on).to_owned()).collect(),
-            auto,
-        }
-    }
-
-    fn card(title: &str, chosen: bool, tickets: Vec<CardTicket>) -> Card {
+    fn card(title: &str, chosen: bool) -> Card {
         Card {
-            kind: CardKind::Build,
             title: title.to_owned(),
-            body: String::new(),
+            body: format!("Do {title}.\n"),
             chosen,
-            tickets,
         }
     }
 
     #[test]
-    fn the_chosen_cards_file_their_tickets_with_dependencies_by_place() {
-        let cards = vec![
-            card("Docs", false, vec![ticket("docs", &[], true)]),
-            card(
-                "Deploy",
-                true,
-                vec![ticket("deploy", &["jobs", "docs"], false)],
-            ),
-            card("Jobs", true, vec![ticket("jobs", &[], true)]),
+    fn the_chosen_sections_become_tickets_each_after_the_one_before() {
+        let cards = [
+            card("Jobs", true),
+            card("Docs", false),
+            card("Deploy", true),
+            card("Follow", true),
         ];
-        assert_eq!(
-            planned(&cards),
-            [
-                Planned {
-                    card: 1,
-                    ticket: 0,
-                    depends_on: vec![1],
-                    dropped: vec!["Do docs".to_owned()],
-                },
-                Planned {
-                    card: 2,
-                    ticket: 0,
-                    depends_on: Vec::new(),
-                    dropped: Vec::new(),
-                },
-            ]
-        );
-        let settings = plain_settings("git.example.org/o/My_Site", "trunk");
+        let through = [true, true, false, true];
         let CiRequest::Onboard {
             repo,
             spec,
             tickets,
             ..
-        } = onboarding("git.example.org/o/My_Site", "A site.", &settings, &cards)
+        } = onboarding("git.example.org/o/My_Site", "trunk", None, &cards, &through)
         else {
             panic!("an onboarding");
         };
@@ -810,26 +683,21 @@ mod tests {
             (spec.url.as_str(), spec.default_branch.as_str()),
             ("https://git.example.org/o/My_Site", "trunk")
         );
+        let filed: Vec<(&str, Vec<usize>, bool)> = tickets
+            .iter()
+            .map(|t| (t.title.as_str(), t.depends_on.clone(), t.auto_approve))
+            .collect();
         assert_eq!(
-            tickets,
+            filed,
             [
-                NewTicket {
-                    title: "Do deploy".to_owned(),
-                    body: "Do deploy well.\n\nFrom the onboarding of git.example.org/o/My_Site, \
-                           card \"Deploy\".\n"
-                        .to_owned(),
-                    depends_on: vec![1],
-                    auto_approve: false,
-                },
-                NewTicket {
-                    title: "Do jobs".to_owned(),
-                    body: "Do jobs well.\n\nSkills to read first: skill://zeughaus-ci.\n\n\
-                           From the onboarding of git.example.org/o/My_Site, card \"Jobs\".\n"
-                        .to_owned(),
-                    depends_on: Vec::new(),
-                    auto_approve: true,
-                },
+                ("Jobs", vec![], true),
+                ("Deploy", vec![0], false),
+                ("Follow", vec![1], true),
             ]
+        );
+        assert_eq!(
+            tickets[1].body,
+            "Do Deploy.\n\nFrom the onboarding plan of git.example.org/o/My_Site.\n"
         );
     }
 }

@@ -322,20 +322,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[claude]` sign-in. The editor's local runner gathers the
   project's facts on `/projects` (its work checkout at HEAD, or what its
   forge says, and the skills omp has there); the CI answers `Advise` with
-  a summary, status lines, the onboarding's settings and up to six cards of
-  work, each one to four tickets with proposals, skills and dependencies on
-  tickets of other cards, kept per origin until the facts change, and says
-  by itself why it cannot onboard an origin (not on its Forgejo, already in
-  `ci.toml`).
+  a small plan document in Markdown (a `# ` title and summary, one `## `
+  section per piece of work), kept per origin until the facts change, and
+  says by itself why it cannot onboard an origin (not on its Forgejo,
+  already in `ci.toml`).
 - CI: `Onboard` files an onboarding request already approved together with
   its tickets, ready and linked, in one step. A ticket that `runs through`
   (`auto_approve`) has its plan approved as it arrives.
 
 ### Changed
 
-- The Board of a project no CI builds shows the CI's advice as cards to
-  choose and a preview of the request and tickets `Onboard with N tickets`
-  files, in place of a bare `Onboard` button.
+- The Board of a project no CI builds shows the CI's plan for it: its
+  summary, then its sections as cards to choose, and a preview of what
+  `Onboard with N tickets` files (one ticket per chosen section, each after
+  the one before), in place of a bare `Onboard` button.
 - A job's transcript opens in a tab of its own (`#<n> <job>`) right after
   its channel's tab in the project's group, instead of beside the
   pipeline list; pressing the job again brings the tab to the front, and

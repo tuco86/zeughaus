@@ -1939,19 +1939,21 @@ at `HEAD` with its top level, CI folders, manifests, README, remotes and
 last commit, or else what the forge's API says, with push mirrors and a
 same-named repository on a Forgejo) and sends them in `CiRequest::Advise`.
 The CI adds what it knows of itself (its Forgejo, platforms, runners with
-labels, repositories), forces one tool call on the Messages API through
-curl with the token on stdin (a bearer token, the Claude Code and OAuth
-betas, and Claude Code's identity as the first system block, without
-which a subscription token is refused). The answer is a summary, status
-lines, the onboarding's settings (name, default branch, grants, host
-prerequisites; the CI keeps a valid name and secret names, granted to
-event patterns that parse) and up to six cards (`Card`: a kind, title,
-body, whether it is advised, and up to four tickets with a key, title,
-proposal, the skills to read first, the keys of tickets of any card it
-waits for, and whether it runs through); the CI drops duplicate keys and
-dependencies on unknown keys or that close a cycle. The Board shows the
-cards to choose, a ticket's mode to switch, and the request and tickets
-`Onboard` files with their numbers in filing order. The answer is kept under
+labels, repositories) and asks the Messages API through curl with the token
+on stdin (a bearer token, the Claude Code and OAuth betas, and Claude
+Code's identity as the first system block, without which a subscription
+token is refused) for a small plan document in Markdown: a `# ` title and
+the text under it (what the project is, where it stands), then 2 to 6
+`## ` sections in the order they are to be done, a heading ending in
+`(optional)` for work the owner may skip, skills named as `skill://<name>`.
+`zeughaus_link::parse_plan` takes it apart (headings inside fenced code do
+not count, `###` stays in its section) into `AdviceView::title`,
+`summary` and `cards` (`Card`: heading, text, chosen). The Board renders
+the summary and each card's text as Markdown; `Onboard` files one ticket
+per chosen card with its text as the proposal, each depending on the one
+before, named after the origin's last segment and the listed default
+branch, without grants (a secret is granted later in
+`ci/onboarded/<name>.toml`). The answer is kept under
 `ci/advice/<sha256 of the origin>.json` with the SHA-256 of the request, so
 the same facts against the same configuration are answered from disk
 unless `refresh`. `AdviceView::refusal` (already in `ci.toml`, not on the

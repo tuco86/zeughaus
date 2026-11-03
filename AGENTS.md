@@ -147,16 +147,17 @@ sections that are folded, deleted or annotated with an overall note for
 `Refine`, and a side column with its state, `Runs on`, links (`depends
 on`, `related`, added by `#n`), the tickets it includes, its sessions and
 who holds it. The Board of a project no CI builds
-shows what the first CI advises (its `[advice]` model's summary, status
-lines and cards of work, from the facts the local runner gathers about the
-project, the skills installed there among them; `Ask again` asks past the
-CI's kept answer). A card files one to four tickets with proposals, the
-skills to read first and links to tickets of other cards; a press chooses
-it, a ticket's chip switches it between `runs through` (its plan is
-approved as it arrives) and `review`. Below them the preview lists what
-`Onboard with N tickets` files in one step: the onboarding request,
-already approved, and the chosen tickets, ready and linked, which wait
-for the join and then run in the order their links allow. A channel
+shows the plan the first CI's `[advice]` model writes for it from the
+facts the local runner gathers (the skills installed there among them;
+`Ask again` asks past the CI's kept answer): a small Markdown document
+whose `# ` title and text say what the project is and where it stands,
+and whose `## ` sections are cards. A press chooses or drops a card (a
+heading ending in `(optional)` starts dropped), its chip switches its
+ticket between `review` and `runs through` (its plan is approved as it
+arrives). Below them the preview lists what `Onboard with N tickets` files
+in one step: the onboarding request, already approved, and one ready
+ticket per chosen card with the section as its proposal, each waiting for
+the one before; they start once the CI has joined the repository. A channel
 lists its pipelines one
 row each, newest on top and open with its jobs, a cable animating while its
 artifact set moves, failures with their cause and log excerpt, `Rerun` and

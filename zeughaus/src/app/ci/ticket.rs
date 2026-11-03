@@ -504,7 +504,7 @@ impl App {
     }
 
     /// Markdown in the editor's face, with theme roles for inline code.
-    fn markdown_settings(&self) -> markdown::Settings {
+    pub(super) fn markdown_settings(&self) -> markdown::Settings {
         let palette = self.theme.base().palette();
         let mut style = markdown::Style::from_palette(palette);
         style.font = crate::font::UI;

@@ -418,8 +418,8 @@ pub enum OnboardMsg {
     /// Choose or drop a card, by its place.
     Card(usize),
     /// Switch a card's ticket between running through and waiting for
-    /// review, by the card's and the ticket's place.
-    Mode(usize, usize),
+    /// review, by the card's place.
+    Mode(usize),
     /// File the onboarding with the chosen cards' tickets.
     Onboard,
     /// The request's number and the tickets', or why not.
