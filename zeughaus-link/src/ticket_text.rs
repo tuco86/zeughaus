@@ -70,7 +70,7 @@ pub struct FiledTicket {
 }
 
 /// `[a-z0-9][a-z0-9-]*`, the names of `ci.toml`'s repositories.
-fn repo_name(s: &str) -> bool {
+pub(crate) fn repo_name(s: &str) -> bool {
     let mut bytes = s.bytes();
     bytes
         .next()

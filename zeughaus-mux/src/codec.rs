@@ -29,8 +29,8 @@ use crate::input::{MAX_TEXT_BYTES, TerminalCommand};
 use crate::message::{ControlAttached, MAX_FETCH_ROWS, Message, Resource, RowFetch, RowPage};
 use crate::terminal::{
     CellPixels, Dimensions, INSET_UNIT, MAX_COLS, MAX_IMAGE_BYTES, MAX_IMAGE_SIDE, MAX_LINK_BYTES,
-    MAX_NOTIFICATION_BYTES, MAX_ROWS, MAX_SPAN_BYTES, RowData, TerminalDelta, TerminalEvent,
-    TerminalHead,
+    MAX_NOTIFICATION_BYTES, MAX_ROWS, MAX_SHOW_REPO_BYTES, MAX_SPAN_BYTES, RowData, TerminalDelta,
+    TerminalEvent, TerminalHead,
 };
 use crate::workspace::{
     MAX_TITLE_BYTES, MAX_TREE_DEPTH, MIN_RATIO, PaneNode, TopologyCommand, WorkspaceSnapshot,
@@ -602,6 +602,11 @@ fn validate_delta(d: &TerminalDelta) -> Result<(), CodecError> {
     }) {
         return Err(CodecError::Invalid("notification too long"));
     }
+    if d.ordered_events.iter().any(|event| {
+        matches!(event, TerminalEvent::ShowTicket { repo, .. } if repo.len() > MAX_SHOW_REPO_BYTES)
+    }) {
+        return Err(CodecError::Invalid("ticket repository too long"));
+    }
     validate_rows(&d.row_replacements)
 }
 
@@ -988,6 +993,10 @@ mod tests {
                 TerminalEvent::Notification {
                     title: Some("build".into()),
                     body: "done".into(),
+                },
+                TerminalEvent::ShowTicket {
+                    repo: "weida".into(),
+                    number: 12,
                 },
             ],
             cell: Some(CellPixels {

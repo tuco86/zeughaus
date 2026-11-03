@@ -177,6 +177,52 @@ fn cut_chars(text: &mut String, max: usize) {
     }
 }
 
+/// The terminal user variable the zeughaus omp plugin sets when its user
+/// picks a ticket link: base64 of JSON
+/// `{"v":1,"repo":"weida","number":12,"at":<ms>}`.
+pub const SHOW_VAR: &str = "zeughaus_show";
+
+/// How old a [`SHOW_VAR`] request may be, in milliseconds: a replayed or
+/// stale value must not reopen a popout.
+const MAX_SHOW_AGE_MS: u64 = 30_000;
+
+/// A request to show ticket `number` of the CI repository `repo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShowTicket {
+    pub repo: String,
+    pub number: u64,
+}
+
+/// The plugin's wire object for [`SHOW_VAR`].
+#[derive(Deserialize)]
+struct ShowWire {
+    v: u32,
+    repo: String,
+    number: u64,
+    at: u64,
+}
+
+impl ShowTicket {
+    /// The request of the plugin's JSON object, `None` for another version,
+    /// a repository that is no CI name, ticket 0, malformed JSON, and a
+    /// request made more than 30 s away from `now_ms`.
+    pub fn parse(json: &str, now_ms: u64) -> Option<ShowTicket> {
+        let wire: ShowWire = serde_json::from_str(json).ok()?;
+        if wire.v != 1
+            || !crate::ticket_text::repo_name(&wire.repo)
+            || wire.repo.len() > MAX_AGENT_REPO
+            || wire.number == 0
+            || now_ms.abs_diff(wire.at) > MAX_SHOW_AGE_MS
+        {
+            return None;
+        }
+        Some(ShowTicket {
+            repo: wire.repo,
+            number: wire.number,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivityRequest {
     /// The most entries wanted, capped at [`MAX_ACTIVITY_ENTRIES`].
@@ -288,5 +334,29 @@ mod tests {
         let json = format!(r#"{{"v":1,"state":"failed","detail":"{detail}"}}"#);
         let status = AgentStatus::parse(&json).unwrap();
         assert_eq!(status.detail.chars().count(), 200);
+    }
+
+    #[test]
+    fn a_fresh_show_request_parses_and_anything_else_does_not() {
+        let now = 1_700_000_040_000;
+        let show = |v: u32, repo: &str, number: u64, at: u64| {
+            format!(r#"{{"v":{v},"repo":"{repo}","number":{number},"at":{at}}}"#)
+        };
+        assert_eq!(
+            ShowTicket::parse(&show(1, "weida", 12, now - 1_000), now),
+            Some(ShowTicket {
+                repo: "weida".to_owned(),
+                number: 12,
+            })
+        );
+        assert_eq!(
+            ShowTicket::parse(&show(1, "weida", 12, now - 31_000), now),
+            None
+        );
+        assert_eq!(ShowTicket::parse(&show(2, "weida", 12, now), now), None);
+        assert_eq!(ShowTicket::parse(&show(1, "Weida", 12, now), now), None);
+        assert_eq!(ShowTicket::parse(&show(1, "../x", 12, now), now), None);
+        assert_eq!(ShowTicket::parse(&show(1, "weida", 0, now), now), None);
+        assert_eq!(ShowTicket::parse(r#"{"v":1,"repo":"weida""#, now), None);
     }
 }

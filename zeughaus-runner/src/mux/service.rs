@@ -27,7 +27,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use weida::{IncomingRequest, Replier, TransferMeta};
 use zeughaus_job::{RunExit, read_run_end, record_run_end};
-use zeughaus_link::{AGENT_VAR, ActivityEntry, ActivityKind, ActivityState, AgentStatus};
+use zeughaus_link::{
+    AGENT_VAR, ActivityEntry, ActivityKind, ActivityState, AgentStatus, SHOW_VAR, ShowTicket,
+};
 use zeughaus_mux::message::{Capability, Command, ErrorCode};
 use zeughaus_mux::workspace::ProfileId;
 use zeughaus_mux::{
@@ -329,7 +331,7 @@ impl MuxService {
             ) {
                 Ok(session) => {
                     self.follow_title(&session);
-                    self.follow_agent(&session);
+                    self.follow_user_vars(&session);
                     restored.insert(terminal.id, session);
                     meta.insert(
                         terminal.id,
@@ -517,7 +519,7 @@ impl MuxService {
         let session = Session::spawn(id, &profile, size, wal, &self.inner.host)
             .map_err(|e| format!("cannot start {}: {e}", profile.label))?;
         self.follow_title(&session);
-        self.follow_agent(&session);
+        self.follow_user_vars(&session);
         let meta = TerminalMeta {
             label: profile.label,
             scrollback_rows: profile.scrollback_rows,
@@ -1371,14 +1373,15 @@ impl MuxService {
         });
     }
 
-    /// Reports the agent status an omp in `session` sets as the user
-    /// variable [`AGENT_VAR`] as activity of its terminal.
-    fn follow_agent(&self, session: &Session) {
+    /// Follows the user variables an omp in `session` sets: [`AGENT_VAR`]
+    /// reports its agent status as activity of its terminal, [`SHOW_VAR`]
+    /// asks the editor driving it to show a ticket.
+    fn follow_user_vars(&self, session: &Session) {
         // Weak: the service owns the session, which owns this listener.
         let inner = Arc::downgrade(&self.inner);
         let terminal = session.id();
         session.on_user_var(move |name| {
-            if name != AGENT_VAR {
+            if name != AGENT_VAR && name != SHOW_VAR {
                 return;
             }
             let Some(inner) = inner.upgrade() else {
@@ -1388,6 +1391,10 @@ impl MuxService {
             let Some(session) = service.session(terminal) else {
                 return;
             };
+            if name == SHOW_VAR {
+                service.show(&session);
+                return;
+            }
             let agent = agent_status(&session);
             let entry = {
                 let metas = service.inner.meta.lock().unwrap_or_else(|e| e.into_inner());
@@ -1398,6 +1405,27 @@ impl MuxService {
             };
             service.emit(entry);
         });
+    }
+
+    /// Passes a live [`SHOW_VAR`] request of `session` to its viewers as an
+    /// ordered event; a replayed terminal asks nothing.
+    fn show(&self, session: &Session) {
+        let live = self
+            .inner
+            .meta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&session.id())
+            .is_some_and(|meta| !meta.replay);
+        if !live {
+            return;
+        }
+        let Some(json) = session.user_var(SHOW_VAR) else {
+            return;
+        };
+        if let Some(show) = ShowTicket::parse(&json, now_millis()) {
+            session.show_ticket(show.repo, show.number);
+        }
     }
 
     /// The session behind a terminal id, if it still exists.
@@ -1613,7 +1641,7 @@ impl MuxService {
                     let mut metas = self.inner.meta.lock().unwrap_or_else(|e| e.into_inner());
                     for (id, session, meta) in spawned {
                         self.follow_title(&session);
-                        self.follow_agent(&session);
+                        self.follow_user_vars(&session);
                         running.push(self.entry(id, &meta, ActivityState::Running, None, None));
                         sessions.insert(id, session);
                         metas.insert(id, meta);
@@ -1703,6 +1731,13 @@ fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// Unix milliseconds now.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// The agent status the omp in `session` last reported, if it reports one.

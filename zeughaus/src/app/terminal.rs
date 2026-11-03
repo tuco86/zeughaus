@@ -417,6 +417,21 @@ impl App {
                     );
                 }
             }
+            // Only the editor whose user picked the link opens it: the one
+            // driving the terminal, or without a driver the one looking at it.
+            TerminalEvent::ShowTicket { repo, number } => {
+                let controller = {
+                    let guard = live.view.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.as_ref().and_then(|view| view.controller.clone())
+                };
+                let ours = match controller {
+                    Some(controller) => controller.client == mux::client_instance(),
+                    None => self.watched(&key, terminal),
+                };
+                if ours {
+                    return self.show_ticket(&repo, number);
+                }
+            }
             // The task cleared the view and ended; attaching again asks for
             // a fresh head.
             TerminalEvent::Desynced => {

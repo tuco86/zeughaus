@@ -172,6 +172,23 @@ impl App {
         self.apply_ci(ci, CiMsg::DocAct { view, request })
     }
 
+    /// Opens ticket `number` of `repo` in the popout, on the first CI that
+    /// lists the repository.
+    pub(in crate::app) fn show_ticket(&mut self, repo: &str, number: u64) -> Task<Message> {
+        let found = self
+            .ci
+            .iter()
+            .find_map(|(key, client)| Some((key.clone(), client.plans_view_of(repo)?)));
+        let Some((ci, view)) = found else {
+            self.hint = Some((
+                format!("#{repo}-{number}: no CI lists the repository {repo}"),
+                iced::time::Instant::now(),
+            ));
+            return Task::none();
+        };
+        self.apply_ticket(TicketMsg::Open { ci, view, number })
+    }
+
     /// What the popout's messages do.
     pub(in crate::app) fn apply_ticket(&mut self, message: TicketMsg) -> Task<Message> {
         match message {

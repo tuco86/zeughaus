@@ -214,7 +214,9 @@ impl TerminalView {
                     self.controller = controller.clone();
                     changed = true;
                 }
-                TerminalEvent::Bell | TerminalEvent::Notification { .. } => {}
+                TerminalEvent::Bell
+                | TerminalEvent::Notification { .. }
+                | TerminalEvent::ShowTicket { .. } => {}
             }
             self.events.push_back(event);
         }

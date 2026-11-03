@@ -49,7 +49,7 @@ pub mod ticket_text;
 
 pub use activity::{
     ACTIVITY_PATH, AGENT_VAR, ActivityEntry, ActivityKind, ActivityReply, ActivityRequest,
-    ActivityState, AgentRole, AgentState, AgentStatus, MAX_ACTIVITY_ENTRIES,
+    ActivityState, AgentRole, AgentState, AgentStatus, MAX_ACTIVITY_ENTRIES, SHOW_VAR, ShowTicket,
 };
 pub use advice::{AdviceView, Card, MAX_CARDS, MAX_FACTS_BYTES, NewTicket, parse_plan};
 pub use ci::{

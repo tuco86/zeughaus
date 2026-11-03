@@ -759,6 +759,15 @@ impl Session {
         self.inner.publish();
     }
 
+    /// Tells every viewer, as an ordered event, that the child asked the one
+    /// driving it to show a ticket.
+    pub fn show_ticket(&self, repo: String, number: u64) {
+        self.inner
+            .model()
+            .record(TerminalEvent::ShowTicket { repo, number });
+        self.inner.publish();
+    }
+
     /// Apply one client command.
     ///
     /// `Viewport` is a no-op: which rows a client watches is the runner

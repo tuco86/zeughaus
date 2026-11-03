@@ -451,10 +451,20 @@ pub enum TerminalEvent {
         title: Option<String>,
         body: String,
     },
+    /// The child asked the viewer that drives this terminal to show ticket
+    /// `number` of the CI repository `repo`. The repository is at most
+    /// [`MAX_SHOW_REPO_BYTES`].
+    ShowTicket {
+        repo: String,
+        number: u64,
+    },
 }
 
 /// Longest notification title or body on the wire.
 pub const MAX_NOTIFICATION_BYTES: usize = 1024;
+
+/// Longest repository name of a [`TerminalEvent::ShowTicket`] on the wire.
+pub const MAX_SHOW_REPO_BYTES: usize = 100;
 
 /// The change between two sequence numbers of one terminal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

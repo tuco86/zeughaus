@@ -118,6 +118,11 @@ pub enum TerminalEvent {
         title: Option<String>,
         body: String,
     },
+    /// The child asked the viewer driving it to show a ticket.
+    ShowTicket {
+        repo: String,
+        number: u64,
+    },
     /// A delta did not fit the view's sequence. The view was cleared and
     /// the stream ended; attaching again asks for a fresh head, which is
     /// the only correct resync.
@@ -538,7 +543,8 @@ pub fn terminal(
                         };
                         // Drained here, the one reader: the exit and the
                         // lease are state the view keeps, and nothing else
-                        // but a notification needs acting on.
+                        // but a notification or a ticket to show needs
+                        // acting on.
                         let notifications: Vec<TerminalEvent> = guard
                             .as_mut()
                             .map(|view| view.take_events())
@@ -547,6 +553,9 @@ pub fn terminal(
                             .filter_map(|event| match event {
                                 zeughaus_mux::TerminalEvent::Notification { title, body } => {
                                     Some(TerminalEvent::Notification { title, body })
+                                }
+                                zeughaus_mux::TerminalEvent::ShowTicket { repo, number } => {
+                                    Some(TerminalEvent::ShowTicket { repo, number })
                                 }
                                 _ => None,
                             })
