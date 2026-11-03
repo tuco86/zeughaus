@@ -187,6 +187,31 @@ fn state_var(place: &Place, run_dir: &Path) -> String {
     }
 }
 
+/// The file a `done` follower's upstream results are written to.
+const UPSTREAM_RESULTS_FILE: &str = "upstream-results.json";
+
+/// Where the upstream results go: the file on this host, and
+/// `CI_UPSTREAM_RESULTS` as the job sees it. A container mounts the run
+/// directory at `/ci/run`; a machine's file goes into `<run>/vm/` with
+/// `inner.ps1`, which the launcher copies into the guest's run directory.
+fn upstream_results_path(place: &Place, run_dir: &Path, run: &str) -> (PathBuf, String) {
+    match place {
+        Place::Host => {
+            let file = run_dir.join(UPSTREAM_RESULTS_FILE);
+            let var = file.to_string_lossy().into_owned();
+            (file, var)
+        }
+        Place::Container { .. } => (
+            run_dir.join(UPSTREAM_RESULTS_FILE),
+            format!("/ci/run/{UPSTREAM_RESULTS_FILE}"),
+        ),
+        Place::Machine { .. } => (
+            run_dir.join("vm").join(UPSTREAM_RESULTS_FILE),
+            format!(r"{}\{UPSTREAM_RESULTS_FILE}", launch::guest_run_dir(run)),
+        ),
+    }
+}
+
 /// The run id as one path component of `<state>/ci/`.
 pub(super) fn safe_run(run: &str) -> bool {
     !run.contains('/') && parse_run_id(run).is_some()
@@ -491,6 +516,11 @@ impl Executor {
         }
         if !a.state.is_empty() {
             env.push(("CI_STATE".to_owned(), state_var(&a.place, run_dir)));
+        }
+        if let Some(results) = &a.upstream_results {
+            let (file, var) = upstream_results_path(&a.place, run_dir, &a.run);
+            write_atomic(&file, results.as_bytes())?;
+            env.push(("CI_UPSTREAM_RESULTS".to_owned(), var));
         }
 
         let write = |path: &Path, text: &str| write_atomic(path, text.as_bytes());
@@ -1257,6 +1287,7 @@ mod tests {
             checkout: Checkout::Clean,
             upload: None,
             state: Vec::new(),
+            upstream_results: None,
         }
     }
 
@@ -1388,6 +1419,37 @@ mod tests {
             run_dir.join("state")
         );
         assert_eq!(state_var(&container("trixie"), &run_dir), "/ci/run/state");
+    }
+
+    /// `CI_UPSTREAM_RESULTS` names the file in the run directory where the
+    /// job sees it; a machine's file travels in `vm/` to the guest's run.
+    #[test]
+    fn upstream_results_are_in_the_run_directory_as_the_job_sees_it() {
+        let run_dir = Path::new("/s/runs/4");
+        let run = "demo.7.build";
+        // Joined, so a Windows host's separator is the one the var shows.
+        let file = run_dir.join("upstream-results.json");
+        assert_eq!(
+            upstream_results_path(&Place::Host, run_dir, run),
+            (file.clone(), file.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            upstream_results_path(&container("trixie"), run_dir, run),
+            (file.clone(), "/ci/run/upstream-results.json".to_owned())
+        );
+        assert_eq!(
+            upstream_results_path(
+                &Place::Machine {
+                    name: "win11".to_owned()
+                },
+                run_dir,
+                run
+            ),
+            (
+                Path::new("/s/runs/4/vm/upstream-results.json").to_path_buf(),
+                r"W:\ci\runs\demo.7.build\upstream-results.json".to_owned()
+            )
+        );
     }
 
     #[test]

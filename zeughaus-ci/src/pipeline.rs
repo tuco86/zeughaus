@@ -15,10 +15,12 @@ pub enum Pattern {
     /// `nightly`: the repository's nightly, which the CI's nightly round queues.
     Nightly,
     /// `push <glob> of <repo>`: a push to a branch of another repository of
-    /// ci.toml.
+    /// ci.toml; `done <glob> of <repo>` (`done = true`): the end of that
+    /// push's pipeline.
     Upstream {
         glob: String,
         repo: String,
+        done: bool,
     },
 }
 
@@ -70,6 +72,7 @@ impl Pattern {
                 [glob, "of", repo] if crate::config::valid_name(repo) => Ok(Pattern::Upstream {
                     glob: glob.to_owned(),
                     repo: repo.to_owned(),
+                    done: false,
                 }),
                 [_, "of", repo] => Err(format!(
                     "`of` names `{repo}`, which is no repository name ([a-z0-9][a-z0-9-]*)"
@@ -78,9 +81,22 @@ impl Pattern {
                     "`push` takes one glob, or a glob, `of` and a repository, got `{rest}`"
                 )),
             },
+            "done" => match rest.split_whitespace().collect::<Vec<_>>()[..] {
+                [glob, "of", repo] if crate::config::valid_name(repo) => Ok(Pattern::Upstream {
+                    glob: glob.to_owned(),
+                    repo: repo.to_owned(),
+                    done: true,
+                }),
+                [_, "of", repo] => Err(format!(
+                    "`of` names `{repo}`, which is no repository name ([a-z0-9][a-z0-9-]*)"
+                )),
+                _ => Err(format!(
+                    "`done` takes a glob, `of` and a repository, got `{rest}`"
+                )),
+            },
             "tag" => Ok(Pattern::Tag(single_glob(kind, rest)?)),
             other => Err(format!(
-                "unknown pattern kind `{other}` (push, tag or nightly)"
+                "unknown pattern kind `{other}` (push, tag, done or nightly)"
             )),
         }
     }
@@ -92,12 +108,13 @@ impl Pattern {
             }
             Pattern::Tag(glob) => event.kind == EventKind::Tag && glob_match(glob, &event.git_ref),
             Pattern::Nightly => event.kind == EventKind::Nightly,
-            Pattern::Upstream { glob, repo } => {
+            Pattern::Upstream { glob, repo, done } => {
                 event.kind == EventKind::Upstream
-                    && event
-                        .upstream
-                        .as_ref()
-                        .is_some_and(|up| &up.repo == repo && glob_match(glob, &up.git_ref))
+                    && event.upstream.as_ref().is_some_and(|up| {
+                        &up.repo == repo
+                            && glob_match(glob, &up.git_ref)
+                            && up.done.is_some() == *done
+                    })
             }
         }
     }
@@ -109,7 +126,11 @@ impl fmt::Display for Pattern {
             Pattern::Push(glob) => write!(f, "push {glob}"),
             Pattern::Tag(glob) => write!(f, "tag {glob}"),
             Pattern::Nightly => f.write_str("nightly"),
-            Pattern::Upstream { glob, repo } => write!(f, "push {glob} of {repo}"),
+            Pattern::Upstream { glob, repo, done } => write!(
+                f,
+                "{} {glob} of {repo}",
+                if *done { "done" } else { "push" }
+            ),
         }
     }
 }
@@ -333,6 +354,7 @@ mod tests {
                 repo: repo.into(),
                 git_ref: git_ref.into(),
                 sha: "a".into(),
+                done: None,
             }),
             ..ev(EventKind::Upstream, "main")
         }
@@ -373,6 +395,39 @@ mod tests {
     }
 
     #[test]
+    fn a_done_pattern_matches_the_end_of_the_named_repositorys_pipeline() {
+        let done_ev = |repo: &str| {
+            let mut e = upstream_ev(repo, "main");
+            e.upstream.as_mut().unwrap().done = Some(crate::event::UpstreamDone {
+                pipeline: 7,
+                jobs: vec![],
+            });
+            e
+        };
+        let follow = Pattern::parse("done main of weida").unwrap();
+        assert!(follow.matches(&done_ev("weida")));
+        assert!(!follow.matches(&upstream_ev("weida", "main")));
+        assert!(!follow.matches(&done_ev("other")));
+        assert!(
+            !Pattern::parse("push main of weida")
+                .unwrap()
+                .matches(&done_ev("weida"))
+        );
+        assert_eq!(follow.to_string(), "done main of weida");
+        assert_eq!(Pattern::parse(&follow.to_string()).unwrap(), follow);
+
+        let err = Pattern::parse("done main").unwrap_err();
+        assert!(
+            err.starts_with("`done` takes a glob, `of` and a repository"),
+            "{err}"
+        );
+        assert_eq!(
+            Pattern::parse("done main of Weida_X").unwrap_err(),
+            "`of` names `Weida_X`, which is no repository name ([a-z0-9][a-z0-9-]*)"
+        );
+    }
+
+    #[test]
     fn the_nightly_pattern_takes_no_argument_and_cron_is_gone() {
         let nightly = Pattern::parse(" nightly ").unwrap();
         assert_eq!(nightly, Pattern::Nightly);
@@ -384,7 +439,7 @@ mod tests {
         );
         assert_eq!(
             Pattern::parse("cron 0 3 * * *").unwrap_err(),
-            "unknown pattern kind `cron` (push, tag or nightly)"
+            "unknown pattern kind `cron` (push, tag, done or nightly)"
         );
     }
 

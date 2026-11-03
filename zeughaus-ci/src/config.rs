@@ -1018,6 +1018,7 @@ forge = "none"
                 repo: "griasdi".into(),
                 git_ref: git_ref.into(),
                 sha: "a".into(),
+                done: None,
             }),
             ..event(EventKind::Upstream, "main")
         };

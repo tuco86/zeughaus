@@ -27,7 +27,7 @@ A header with an `env` table:
 
 | key | value | rule |
 |---|---|---|
-| `on` | list of patterns | `push <glob>`, `push <glob> of <repo>`, `tag <glob>` or `nightly`. A glob is one word; `*` matches any run of characters, `/` and nothing included, everything else is literal (`main`, `v*`, `release/*`). `nightly` takes no argument: the CI's nightly round (ci.toml `[nightly] at`, the CI host's local time) runs it against the default branch's head, one repository after another in name order. `push <glob> of <repo>` follows another repository of ci.toml: a push to a matching branch of `<repo>` starts an `upstream` pipeline of this repository's default-branch head (see Following another repository). Empty when the job has `needs` |
+| `on` | list of patterns | `push <glob>`, `push <glob> of <repo>`, `done <glob> of <repo>`, `tag <glob>` or `nightly`. A glob is one word; `*` matches any run of characters, `/` and nothing included, everything else is literal (`main`, `v*`, `release/*`). `nightly` takes no argument: the CI's nightly round (ci.toml `[nightly] at`, the CI host's local time) runs it against the default branch's head, one repository after another in name order. `push <glob> of <repo>` follows another repository of ci.toml: a push to a matching branch of `<repo>` starts an `upstream` pipeline of this repository's default-branch head; `done <glob> of <repo>` does so once that push's pipeline has ended (see Following another repository). Empty when the job has `needs` |
 | `needs` | list of job names | Each names another job of the folder; no cycles. The job is selected only when all its needs are selected, and is skipped when one of them fails or is skipped. A need that succeeded and left output is staged as `$CI_INPUTS/<need>` |
 | `channels` | list of channel names | Only with `needs` (a job with `on` is selected by its own patterns). The job joins a pipeline only in these channels; without the key, in every channel that selects what it needs. A name is a channel of `channels.toml`, or `tags`, `nightly` or `upstream` (`zeughaus-ci check` refuses others) |
 | `image` | name | `[a-z0-9][a-z0-9-]*` with a file `.zeughaus-ci/<image>.Containerfile`. The job runs in a container built from it (build context `.zeughaus-ci/`) on the platform's runner, else on the default runner. A unix runner only. Exclusive with `machine` |
@@ -57,11 +57,13 @@ Rules across keys:
 
 A job with `on = ["push main of weida"]` runs when weida's `main` is pushed. When the CI sets up the pipeline of a push of `weida`, it reads the `.zeughaus-ci/` of every other repository's default branch from that repository's mirror (no fetch) and queues an `upstream` event for each one with a job that the push selects. That pipeline fetches the follower and runs its default-branch head; `CI_UPSTREAM_REPO`, `CI_UPSTREAM_REF` and `CI_UPSTREAM_SHA` name the push.
 
+A job with `on = ["done main of weida"]` runs once the pipeline of such a push has ended (succeeded, failed or cancelled), not when it is set up, and only while its commit is still the branch's head. Besides the three variables it sees `CI_UPSTREAM_PIPELINE`, the upstream pipeline's number, and `CI_UPSTREAM_RESULTS`, the path of a JSON file with one entry per upstream job: `{"job", "platform", "status", "duration_s"}` (`status` is `succeeded`, `failed` or `skipped`; `platform` and `duration_s`, the program's run time, are `null` when the job has none or never started). A push pipeline that never ran a job (a setup error, no selected job) queues no `done` follower.
+
 - Only a push whose commit is still its branch's head fans out, so a rerun of an older commit moves no follower. Tags, nightlies, manual runs and upstream pipelines never fan out, so there are no chains.
 - A follower needs a mirror: a newly registered repository follows nothing until its first pipeline (`zeughaus-ci run <repo> push main`) has fetched it.
 - Pushes queued behind a running upstream pipeline of the same follower collapse into one run for the newest upstream commit: the queue key covers the upstream repository and branch, not the commit.
 - An upstream pipeline counts toward the follower's default-branch streak and raises red alerts, like a nightly. Without a matching channel it lands in `upstream`.
-- `zeughaus-ci check` with a ci.toml refuses a pattern that names no repository of it; ci.toml refuses such a grant. `zeughaus-ci plan [DIR] push <ref> of <repo>` shows what a push selects.
+- `zeughaus-ci check` with a ci.toml refuses a pattern that names no repository of it; ci.toml refuses such a grant. `zeughaus-ci plan [DIR] push <ref> of <repo>` and `plan [DIR] done <ref> of <repo>` show what a push and its pipeline's end select.
 
 ## Placement
 
@@ -127,6 +129,7 @@ Set by the CI:
 | `CI_JOB` | The job's name |
 | `CI_ACTOR` | Who caused it: the forge user of a push or tag, `nightly`, `rerun of #<n>`, `manual` for `zeughaus-ci run`, `<user>@<host>` of a manual run or of an event `ci_run` queued, `<actor> via <repo>` for an upstream event |
 | `CI_UPSTREAM_REPO`, `CI_UPSTREAM_REF`, `CI_UPSTREAM_SHA` | `upstream` only: the followed repository's name in ci.toml, the pushed branch and the commit it resolved to |
+| `CI_UPSTREAM_PIPELINE` | `done <glob> of <repo>` followers only: the number of the upstream push's pipeline whose end queued this one |
 | `CI_PLATFORM` | The job's `platform`; set only when the header has one |
 
 Set by the runner:
@@ -140,6 +143,7 @@ Set by the runner:
 | `CI_CPUS`, `CARGO_BUILD_JOBS` | The CPU count of the place: the runner's, the container's or the VM's |
 | `CI_SIBLINGS` | Manual runs only: the directory of the sibling checkouts, `<workspace>/.zci-siblings` (`/work/.zci-siblings` in a container). `$CI_SIBLINGS/<dir>` is the path dependency `<dir>` |
 | `CI_STATE` | Jobs with `state` only: the directory with one directory per store, `<run>/state` on the host, `/ci/run/state` in a container. `$CI_STATE/<name>` is the store `<name>`; `ci_state`, `ci_state_get` and `ci_state_delete` list, download and delete its versions |
+| `CI_UPSTREAM_RESULTS` | `done <glob> of <repo>` followers only: the JSON file of the upstream pipeline's job results, `<run>/upstream-results.json` on the host, `/ci/run/upstream-results.json` in a container, in the guest's run directory on a machine |
 
 Besides these: the header's `env`, and the granted `secrets` by name. A `.ps1` job reads all of them as `$env:NAME`.
 

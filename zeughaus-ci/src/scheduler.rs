@@ -25,7 +25,7 @@ use zeughaus_link::enlist::{
 use crate::channels::{self, Channels};
 use crate::config::{CiConfig, RepoConfig, RunnerOs, Shared};
 use crate::docs::{self, Filed};
-use crate::event::{self, CiEvent, EventKind, Upstream};
+use crate::event::{self, CiEvent, EventKind, Upstream, UpstreamDone, UpstreamJob};
 use crate::forge::{self, State, Status};
 use crate::header::JobDef;
 use crate::runners::Runners;
@@ -254,6 +254,24 @@ pub(crate) fn mirror_dir(state_dir: &Path, repo: &str) -> PathBuf {
     crate::ci_dir(state_dir)
         .join("mirrors")
         .join(format!("{repo}.git"))
+}
+
+/// How each job of a finished pipeline ended, as its `done` followers see it
+/// in `CI_UPSTREAM_RESULTS`.
+fn upstream_jobs(pipeline: &Pipeline) -> Vec<UpstreamJob> {
+    pipeline
+        .jobs
+        .iter()
+        .map(|record| UpstreamJob {
+            job: record.def.name.clone(),
+            platform: record.def.platform.clone(),
+            status: record.status.as_str().to_owned(),
+            duration_s: match (record.started, record.finished) {
+                (Some(started), Some(finished)) => Some(finished.saturating_sub(started)),
+                _ => None,
+            },
+        })
+        .collect()
 }
 
 impl Pipeline {
@@ -959,7 +977,13 @@ impl Scheduler {
         let sha = event_commit(&mirror, event)?;
         pipeline.sha = Some(sha.clone());
         if event.kind == EventKind::Push {
-            self.queue_followers(name, event, &mirror, &sha);
+            let upstream = Upstream {
+                repo: name.to_owned(),
+                git_ref: event.git_ref.clone(),
+                sha: sha.clone(),
+                done: None,
+            };
+            self.queue_followers(&event.actor, upstream, &mirror);
         }
         // Only shown, so a commit git cannot describe leaves it empty.
         pipeline.subject = git(&mirror, &["log", "-1", "--format=%s", &sha], &[])
@@ -986,18 +1010,29 @@ impl Scheduler {
     }
 
     /// Queues an `upstream` event for every other repository of ci.toml whose
-    /// default branch, as its mirror last saw it, has a job that the push
-    /// follows. Only a push whose commit is still its branch's head fans
-    /// out, so a rerun of an older commit does not move a follower back. A
+    /// default branch, as its mirror last saw it, has a job that follows
+    /// `upstream`. It is called for a push when it is set up (followers with
+    /// `push .. of`) and when its pipeline ends (followers with `done .. of`);
+    /// in both cases only while the push's commit is still its branch's
+    /// head, so a rerun of an older commit does not move a follower back. A
     /// repository without a mirror yet follows nothing until its first
     /// pipeline has fetched it. An upstream event never fans out itself.
-    fn queue_followers(&self, upstream: &str, event: &CiEvent, mirror: &Path, sha: &str) {
-        match rev_parse(mirror, &format!("refs/heads/{}^{{commit}}", event.git_ref)) {
-            Ok(head) if head == sha => {}
+    fn queue_followers(&self, actor: &str, upstream: Upstream, mirror: &Path) {
+        match rev_parse(
+            mirror,
+            &format!("refs/heads/{}^{{commit}}", upstream.git_ref),
+        ) {
+            Ok(head) if head == upstream.sha => {}
             _ => return,
         }
+        let sha7 = &upstream.sha[..upstream.sha.len().min(7)];
+        let after = upstream
+            .done
+            .as_ref()
+            .map(|done| format!(" after #{}", done.pipeline))
+            .unwrap_or_default();
         for (name, repo) in &self.config.repos {
-            if name == upstream {
+            if *name == upstream.repo {
                 continue;
             }
             let follower = mirror_dir(&self.state_dir, name);
@@ -1009,14 +1044,10 @@ impl Scheduler {
                 kind: EventKind::Upstream,
                 git_ref: repo.default_branch.clone(),
                 sha: None,
-                actor: format!("{} via {upstream}", event.actor),
+                actor: format!("{actor} via {}", upstream.repo),
                 delivery: None,
                 upload: None,
-                upstream: Some(Upstream {
-                    repo: upstream.to_owned(),
-                    git_ref: event.git_ref.clone(),
-                    sha: sha.to_owned(),
-                }),
+                upstream: Some(upstream.clone()),
                 received: crate::now_secs(),
             };
             let Ok((files, containerfiles)) =
@@ -1037,11 +1068,10 @@ impl Scheduler {
             }
             match event::write_inbox(&self.state_dir, &downstream) {
                 Ok(_) => eprintln!(
-                    "[ci] {name}: upstream {upstream} {} {} queued",
-                    event.git_ref,
-                    &sha[..sha.len().min(7)]
+                    "[ci] {name}: upstream {} {} {sha7} queued{after}",
+                    upstream.repo, upstream.git_ref
                 ),
-                Err(e) => eprintln!("[ci] {name}: upstream {upstream}: {e}"),
+                Err(e) => eprintln!("[ci] {name}: upstream {}: {e}", upstream.repo),
             }
         }
     }
@@ -1196,6 +1226,24 @@ impl Scheduler {
             if pipeline.status == PipelineStatus::Failed && pipeline.event.kind != EventKind::Manual
             {
                 self.alert_red(&pipeline);
+            }
+            if pipeline.event.kind == EventKind::Push
+                && let Some(sha) = pipeline.sha.clone()
+            {
+                let upstream = Upstream {
+                    repo: pipeline.repo.clone(),
+                    git_ref: pipeline.event.git_ref.clone(),
+                    sha,
+                    done: Some(UpstreamDone {
+                        pipeline: pipeline.number,
+                        jobs: upstream_jobs(&pipeline),
+                    }),
+                };
+                self.queue_followers(
+                    &pipeline.event.actor,
+                    upstream,
+                    &mirror_dir(&self.state_dir, &pipeline.repo),
+                );
             }
             self.ready_since.retain(|(repo, number, _), _| {
                 !(*repo == pipeline.repo && *number == pipeline.number)
@@ -1745,6 +1793,9 @@ impl Scheduler {
             env.push(("CI_UPSTREAM_REPO".into(), up.repo.clone()));
             env.push(("CI_UPSTREAM_REF".into(), up.git_ref.clone()));
             env.push(("CI_UPSTREAM_SHA".into(), up.sha.clone()));
+            if let Some(done) = &up.done {
+                env.push(("CI_UPSTREAM_PIPELINE".into(), done.pipeline.to_string()));
+            }
         }
         if let Some(platform) = &job.platform {
             env.push(("CI_PLATFORM".into(), platform.clone()));
@@ -1765,6 +1816,15 @@ impl Scheduler {
                 },
             });
         }
+
+        let upstream_results = pipeline
+            .event
+            .upstream
+            .as_ref()
+            .and_then(|up| up.done.as_ref())
+            .map(|done| serde_json::to_string(&done.jobs))
+            .transpose()
+            .map_err(|e| format!("cannot encode the upstream results: {e}"))?;
 
         let run = run_id(&pipeline.repo, pipeline.number, &job.name);
         let (handoff, accessor) = match granted {
@@ -1796,6 +1856,7 @@ impl Scheduler {
             checkout: checkout_of(pipeline, ji),
             upload,
             state,
+            upstream_results,
         };
         Ok((assignment, accessor))
     }
@@ -3257,6 +3318,40 @@ mod tests {
     }
 
     #[test]
+    fn upstream_results_give_each_jobs_status_platform_and_run_time() {
+        let mut build = record("build", &[], "x", JobStatus::Succeeded);
+        build.def.platform = Some("linux-amd64".to_owned());
+        build.started = Some(100);
+        build.finished = Some(160);
+        let check = record("check", &["build"], "x", JobStatus::Skipped);
+        let jobs = upstream_jobs(&numbered(1, vec![build, check]));
+        assert_eq!(
+            jobs,
+            [
+                UpstreamJob {
+                    job: "build".to_owned(),
+                    platform: Some("linux-amd64".to_owned()),
+                    status: "succeeded".to_owned(),
+                    duration_s: Some(60),
+                },
+                UpstreamJob {
+                    job: "check".to_owned(),
+                    platform: None,
+                    status: "skipped".to_owned(),
+                    duration_s: None,
+                },
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(&jobs).unwrap(),
+            serde_json::json!([
+                {"job": "build", "platform": "linux-amd64", "status": "succeeded", "duration_s": 60},
+                {"job": "check", "platform": null, "status": "skipped", "duration_s": null},
+            ])
+        );
+    }
+
+    #[test]
     fn the_checkout_wipes_only_where_a_clean_pipeline_first_uses_a_place() {
         use JobStatus::{Pending, Skipped, Succeeded};
         let mut p = numbered(
@@ -3841,6 +3936,7 @@ mod tests {
                     repo: "up".to_owned(),
                     git_ref: "main".to_owned(),
                     sha: up_head.clone(),
+                    done: None,
                 })
             );
 
@@ -3879,6 +3975,7 @@ mod tests {
                     env("CI_UPSTREAM_REPO"),
                     env("CI_UPSTREAM_REF"),
                     env("CI_UPSTREAM_SHA"),
+                    env("CI_UPSTREAM_PIPELINE"),
                 ],
                 [
                     Some("upstream"),
@@ -3886,7 +3983,181 @@ mod tests {
                     Some("up"),
                     Some("main"),
                     Some(up_head.as_str()),
+                    None,
                 ]
+            );
+            assert_eq!(a.upstream_results, None);
+            for dir in [up, down, state] {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+
+        #[test]
+        fn a_settled_upstream_push_pipeline_queues_its_done_follower() {
+            let up = scratch("done-up");
+            let down = scratch("done-down");
+            let state = scratch("done-state");
+            let author = [
+                ("GIT_AUTHOR_NAME".to_owned(), "t".to_owned()),
+                ("GIT_AUTHOR_EMAIL".to_owned(), "t@t".to_owned()),
+                ("GIT_COMMITTER_NAME".to_owned(), "t".to_owned()),
+                ("GIT_COMMITTER_EMAIL".to_owned(), "t@t".to_owned()),
+            ];
+            git(&up, &["init", "-q", "-b", "main"], &author).unwrap();
+            git(
+                &up,
+                &["commit", "-q", "--allow-empty", "-m", "one"],
+                &author,
+            )
+            .unwrap();
+            let older = rev_parse(&up, "HEAD").unwrap();
+            git(
+                &up,
+                &["commit", "-q", "--allow-empty", "-m", "two"],
+                &author,
+            )
+            .unwrap();
+            let up_head = rev_parse(&up, "HEAD").unwrap();
+
+            let ci = down.join(CI_DIR);
+            std::fs::create_dir_all(&ci).unwrap();
+            std::fs::write(
+                ci.join("site.sh"),
+                "# /// ci\n# on = [\"done main of up\"]\n# ///\necho\n",
+            )
+            .unwrap();
+            std::fs::write(
+                ci.join("update.sh"),
+                "# /// ci\n# on = [\"push main of up\"]\n# ///\necho\n",
+            )
+            .unwrap();
+            git(&down, &["init", "-q", "-b", "main"], &author).unwrap();
+            git(&down, &["add", "."], &author).unwrap();
+            git(&down, &["commit", "-q", "-m", "ci"], &author).unwrap();
+
+            let config = Arc::new(
+                CiConfig::parse(&format!(
+                    "default_runner = \"x\"\n\
+                     [runners.x]\nfingerprint = \"{FP_1}\"\n\
+                     [repos.up]\nurl = '{}'\n\
+                     [repos.down]\nurl = '{}'\n",
+                    up.display(),
+                    down.display()
+                ))
+                .expect("a valid config"),
+            );
+            let mut s = scheduler_over(&state, Arc::clone(&config));
+            s.fetch("down", &config.repos["down"])
+                .expect("the follower's mirror");
+            s.fetch("up", &config.repos["up"])
+                .expect("the upstream's mirror");
+
+            let push = CiEvent {
+                repo: "up".to_owned(),
+                kind: EventKind::Push,
+                git_ref: "main".to_owned(),
+                sha: None,
+                actor: "hannes".to_owned(),
+                delivery: None,
+                upload: None,
+                upstream: None,
+                received: 0,
+            };
+            // Setting the push up queues only the follower of the push itself.
+            let mut p = pipeline("");
+            p.repo = "up".to_owned();
+            p.event = push.clone();
+            assert!(matches!(
+                s.set_up("up", &config.repos["up"], &push, &mut p),
+                Ok(None)
+            ));
+            event::drain_inbox(&state);
+            let queued = event::queued(&state);
+            assert_eq!(queued.len(), 1);
+            assert_eq!(queued[0].1.upstream.as_ref().unwrap().done, None);
+
+            let finished = |number: u64, kind: EventKind, sha: &str| {
+                let mut build = record("build", &[], "x", JobStatus::Succeeded);
+                build.def.platform = Some("linux-amd64".to_owned());
+                build.started = Some(100);
+                build.finished = Some(160);
+                let mut check = record("check", &[], "x", JobStatus::Failed);
+                check.started = Some(160);
+                check.finished = Some(170);
+                let mut p = pipeline("dev");
+                p.repo = "up".to_owned();
+                p.number = number;
+                p.event = CiEvent {
+                    kind,
+                    ..push.clone()
+                };
+                p.sha = Some(sha.to_owned());
+                p.jobs = vec![build, check];
+                p
+            };
+            let results = vec![
+                UpstreamJob {
+                    job: "build".to_owned(),
+                    platform: Some("linux-amd64".to_owned()),
+                    status: "succeeded".to_owned(),
+                    duration_s: Some(60),
+                },
+                UpstreamJob {
+                    job: "check".to_owned(),
+                    platform: None,
+                    status: "failed".to_owned(),
+                    duration_s: Some(10),
+                },
+            ];
+            s.running.push(finished(7, EventKind::Push, &up_head));
+            s.finish_pipelines();
+            event::drain_inbox(&state);
+            let queued = event::queued(&state);
+            assert_eq!(queued.len(), 2);
+            let (path, follow) = queued
+                .into_iter()
+                .find(|(_, e)| e.upstream.as_ref().is_some_and(|up| up.done.is_some()))
+                .expect("the done follower");
+            assert_eq!(follow.kind, EventKind::Upstream);
+            assert_eq!(
+                follow.upstream.as_ref().unwrap().done,
+                Some(UpstreamDone {
+                    pipeline: 7,
+                    jobs: results.clone(),
+                })
+            );
+
+            // An older commit of the branch and a nightly pipeline move no
+            // follower.
+            s.running.push(finished(8, EventKind::Push, &older));
+            s.running.push(finished(9, EventKind::Nightly, &up_head));
+            s.finish_pipelines();
+            event::drain_inbox(&state);
+            assert_eq!(event::queued(&state).len(), 2);
+
+            let mut x = connect(&s.runners, "x", 0);
+            let key = event::queue_key(&follow);
+            s.start_pipeline(&path, follow, key);
+            s.advance();
+            let jobs: Vec<&str> = s.running[0]
+                .jobs
+                .iter()
+                .map(|j| j.def.name.as_str())
+                .collect();
+            assert_eq!(jobs, ["site"]);
+            let a = assigned(&mut x);
+            let env = |name: &str| {
+                a.env
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.as_str())
+            };
+            assert_eq!(env("CI_UPSTREAM_PIPELINE"), Some("7"));
+            assert_eq!(env("CI_UPSTREAM_SHA"), Some(up_head.as_str()));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(a.upstream_results.as_deref().unwrap())
+                    .unwrap(),
+                serde_json::to_value(&results).unwrap()
             );
             for dir in [up, down, state] {
                 let _ = std::fs::remove_dir_all(dir);

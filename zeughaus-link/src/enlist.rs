@@ -21,7 +21,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The protocol major a runner and the CI must share.
-pub const ENLIST_MAJOR: u32 = 12;
+pub const ENLIST_MAJOR: u32 = 13;
 
 /// The most addresses a runner's `Hello` announces.
 pub const MAX_ADDRESSES: usize = 8;
@@ -285,6 +285,11 @@ pub struct Assignment {
     /// The job state stores the run starts from and may save.
     #[serde(default)]
     pub state: Vec<StateMount>,
+    /// The JSON array of the upstream pipeline's job results for a job that
+    /// follows its end (`done <glob> of <repo>`); the runner writes it to a
+    /// file the job finds through `CI_UPSTREAM_RESULTS`.
+    #[serde(default)]
+    pub upstream_results: Option<String>,
 }
 
 /// The CI's hand-off of a job's secrets: a single-use wrapping token of a
@@ -863,6 +868,7 @@ fn sample_assignment() -> Assignment {
             version: Some(4),
             save: StateSave::Always,
         }],
+        upstream_results: None,
     }
 }
 
@@ -1282,7 +1288,7 @@ mod id_tests {
     fn an_assignment_from_an_older_runner_still_loads() {
         let mut old = serde_json::to_value(sample_assignment()).unwrap();
         let fields = old.as_object_mut().unwrap();
-        for key in ["checkout", "upload"] {
+        for key in ["checkout", "upload", "upstream_results"] {
             assert!(fields.remove(key).is_some(), "{key}");
         }
         fields.insert("workspace".to_owned(), "linux".into());
@@ -1291,5 +1297,6 @@ mod id_tests {
         let loaded: Assignment = serde_json::from_value(old).unwrap();
         assert_eq!(loaded.checkout, Checkout::Clean);
         assert_eq!(loaded.upload, None);
+        assert_eq!(loaded.upstream_results, None);
     }
 }

@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Following an upstream pipeline's end: a job header's `on = ["done main
+  of weida"]` runs once a push pipeline of weida's `main` has ended
+  (succeeded, failed or cancelled) while its commit is still the branch's
+  head. The follower's jobs see `CI_UPSTREAM_PIPELINE` (the upstream
+  pipeline's number) and `CI_UPSTREAM_RESULTS`, the path of a JSON file
+  with one `{"job", "platform", "status", "duration_s"}` entry per upstream
+  job. `zeughaus-ci plan [DIR] done <ref> of <repo>` shows what it selects;
+  channels and grants take the pattern too. The results travel with the
+  assignment; the enlist protocol is major 13. The omp plugin's skill
+  (0.12.1) documents it.
+
 - Tickets: a proposal and its plan are one ticket with one number from
   proposal through planning, review and execution to done (`open`,
   `ready`, `planning`, `review`, `approved`, `in_progress`, `done`, or

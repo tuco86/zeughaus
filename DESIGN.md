@@ -827,7 +827,8 @@ as `ci = ["<endpoint>"]` next to `remotes` in `zeughaus.toml`. In production:
 between `# /// ci` and `# ///` is a job named after its file. The header
 holds these keys:
 
-- `on`: `push <glob>`, `push <glob> of <repo>`, `tag <glob>`, or `nightly`;
+- `on`: `push <glob>`, `push <glob> of <repo>`, `done <glob> of <repo>`,
+  `tag <glob>`, or `nightly`;
 - `needs`: exactly one of `on` and `needs` is set;
 - `channels`: only with `needs`; the channels the job is added in (names from
   `channels.toml`, or `tags`, `nightly`, `upstream`); without it a job with `needs`
@@ -914,6 +915,18 @@ follower pipeline collapse into one for the newest commit through the
 queue key. An upstream pipeline counts toward the default branch's streak,
 like a nightly. Grants take the same pattern; `ci.toml` and `zeughaus-ci
 check` refuse one that names no repository.
+
+`done <glob> of <repo>` follows the end of such a push's pipeline instead:
+when a push pipeline of `<repo>` that ran jobs ends (succeeded, failed or
+cancelled, `finish_pipelines`) and its commit is still the branch's head,
+`queue_followers` runs again with `upstream.done` set to the pipeline's
+number and one `UpstreamJob` per job (`job`, `platform`, `status`,
+`duration_s`). The queue key adds `done\n`, so a queued push follower and
+a queued done follower of the same branch stay apart. The follower's jobs
+also see `CI_UPSTREAM_PIPELINE`, and the assignment carries the results as
+a JSON array (`Assignment::upstream_results`), which the runner writes to
+`upstream-results.json` in the run directory (in `vm/` for a machine,
+copied into the guest with `inner.ps1`) and names in `CI_UPSTREAM_RESULTS`.
 
 **Pipelines** (`scheduler.rs`, one thread):
 

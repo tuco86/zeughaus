@@ -7,6 +7,7 @@
 //! check [DIR]
 //! plan [DIR] <push|tag> <ref>
 //! plan [DIR] push <ref> of <repo>
+//! plan [DIR] done <ref> of <repo>
 //! plan [DIR] nightly
 //! run <repo> <push|tag> <ref> [<sha>]
 //! run <repo> nightly
@@ -38,7 +39,7 @@ use zeughaus_link::credentials;
 use crate::CI_DIR;
 use crate::channels::{CHANNELS_FILE, Channels};
 use crate::config::CiConfig;
-use crate::event::{self, CiEvent, EventKind, Upstream};
+use crate::event::{self, CiEvent, EventKind, Upstream, UpstreamDone};
 use crate::excerpt;
 use crate::header::JobDef;
 use crate::pipeline::{self, Pattern};
@@ -48,7 +49,7 @@ use crate::streak;
 
 const USAGE: &str = "usage: zeughaus-ci [--state-dir DIR] serve --listen <host:port> \
 [--hook <host:port>] | check [DIR] | plan [DIR] <push|tag> <ref> | plan [DIR] push <ref> of <repo> | \
-plan [DIR] nightly | \
+plan [DIR] done <ref> of <repo> | plan [DIR] nightly | \
 run <repo> <push|tag> <ref> [<sha>] | run <repo> nightly | status [N] | \
 log <repo> <pipeline> <job> [--tail N] | forget <repo> <pipeline> | forge-check <repo> | \
 secrets-check | job-policies | version | \
@@ -299,7 +300,7 @@ fn parse_event(
 }
 
 fn plan(args: &[String]) -> Result<(), String> {
-    let starts_event = |arg: &String| matches!(arg.as_str(), "push" | "tag" | "nightly");
+    let starts_event = |arg: &String| matches!(arg.as_str(), "push" | "tag" | "done" | "nightly");
     let (dir, rest) = match args.first() {
         Some(first) if !starts_event(first) => (first.as_str(), &args[1..]),
         _ => (CI_DIR, args),
@@ -308,7 +309,7 @@ fn plan(args: &[String]) -> Result<(), String> {
         return Err(USAGE.to_owned());
     };
     let event = match (kind.as_str(), rest) {
-        ("push", [git_ref, of, upstream]) if of == "of" => CiEvent {
+        (kind @ ("push" | "done"), [git_ref, of, upstream]) if of == "of" => CiEvent {
             repo: String::new(),
             kind: EventKind::Upstream,
             git_ref: "main".to_owned(),
@@ -320,6 +321,10 @@ fn plan(args: &[String]) -> Result<(), String> {
                 repo: upstream.clone(),
                 git_ref: git_ref.clone(),
                 sha: String::new(),
+                done: (kind == "done").then(|| UpstreamDone {
+                    pipeline: 0,
+                    jobs: Vec::new(),
+                }),
             }),
             received: crate::now_secs(),
         },

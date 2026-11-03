@@ -515,11 +515,13 @@ fn launch_sh_windows_vm(launch: &Launch<'_>) -> String {
             "; ssh -o ConnectTimeout=15 {host} {remove_guest} </dev/null >/dev/null 2>&1 || true"
         ),
     );
+    // Every file of `<run>/vm/` (inner.ps1, the upstream results) lands in
+    // the guest's run directory.
     let _ = write!(
         out,
         "run={run}\n\
          ssh {host} {mkdir} </dev/null || exit 75\n\
-         scp -q \"$run/vm/inner.ps1\" \"$run/src.bundle\" \"$secret_dir/env.ps1\" {host}:{dest} || exit 75\n\
+         scp -q \"$run\"/vm/* \"$run/src.bundle\" \"$secret_dir/env.ps1\" {host}:{dest} || exit 75\n\
          scp -q -r \"$run/inputs\" {host}:{dest_in} || exit 75\n\
          exec 3<&0\n\
          ssh -tt {host} {inner} <&3 &\n\
@@ -590,6 +592,7 @@ mod tests {
             checkout: Checkout::Clean,
             upload: None,
             state: Vec::new(),
+            upstream_results: None,
         }
     }
 
@@ -1068,6 +1071,10 @@ mod tests {
             for dir in [&bin, &run, &secret] {
                 std::fs::create_dir_all(dir).unwrap();
             }
+            let vm = run.join("vm");
+            std::fs::create_dir_all(&vm).unwrap();
+            std::fs::write(vm.join("inner.ps1"), "").unwrap();
+            std::fs::write(vm.join("upstream-results.json"), "[]").unwrap();
             // `ssh` logs its arguments and answers the read of the guest's exit
             // code with `$STUB_GUEST_RC`; `scp` only logs.
             let log = base.join("log");
@@ -1114,6 +1121,12 @@ mod tests {
 
             let (code, calls) = launch("3");
             assert_eq!(code, Some(3), "{calls}");
+            for file in ["inner.ps1", "upstream-results.json"] {
+                assert!(
+                    calls.contains(&vm.join(file).display().to_string()),
+                    "every file of vm/ goes to the guest: {calls}"
+                );
+            }
             assert_eq!(calls.matches("ssh -tt").count(), 1, "{calls}");
             assert!(
                 !calls.contains("debug.ps1") && !calls.contains("-NoExit"),

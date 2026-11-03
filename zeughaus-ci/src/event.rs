@@ -72,6 +72,28 @@ pub struct Upstream {
     pub repo: String,
     pub git_ref: String,
     pub sha: String,
+    /// Set when the event follows the end of the upstream push's pipeline
+    /// (`done <glob> of <repo>`); `None` when it follows the push itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done: Option<UpstreamDone>,
+}
+
+/// The upstream pipeline a `done` follower runs after, and how each of its jobs ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamDone {
+    pub pipeline: u64,
+    pub jobs: Vec<UpstreamJob>,
+}
+
+/// One entry of `CI_UPSTREAM_RESULTS`; serialized as it is handed to the job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamJob {
+    pub job: String,
+    pub platform: Option<String>,
+    /// `JobStatus::as_str` of the job's end: `succeeded`, `failed` or `skipped`.
+    pub status: String,
+    /// `finished - started` in seconds; `None` for a job whose program never started.
+    pub duration_s: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,7 +139,8 @@ pub fn write_inbox(state_dir: &Path, event: &CiEvent) -> Result<PathBuf, String>
 /// `<repo>.<kind>.<first 12 hex of sha256(git_ref \n)>`, and for a manual
 /// run `<repo>.manual.<upload>`: every manual run runs, none replaces another.
 /// An upstream event's hash also covers `<upstream repo> \n <upstream ref> \n`
-/// (not its commit), so a newer push of that branch replaces the queued one.
+/// (not its commit), so a newer push of that branch replaces the queued one,
+/// and `done\n` for an event that follows the upstream pipeline's end.
 pub fn queue_key(event: &CiEvent) -> String {
     if let (EventKind::Manual, Some(upload)) = (event.kind, &event.upload) {
         return format!("{}.manual.{upload}", event.repo);
@@ -130,6 +153,9 @@ pub fn queue_key(event: &CiEvent) -> String {
         hasher.update(b"\n");
         hasher.update(up.git_ref.as_bytes());
         hasher.update(b"\n");
+        if up.done.is_some() {
+            hasher.update(b"done\n");
+        }
     }
     let digest = hex::encode(hasher.finalize());
     format!("{}.{}.{}", event.repo, event.kind, &digest[..12])
@@ -311,6 +337,7 @@ mod tests {
             repo: "weida".into(),
             git_ref: "main".into(),
             sha: "a".into(),
+            done: None,
         });
         let key = queue_key(&a);
         assert!(key.starts_with("smoke.upstream."));
@@ -333,6 +360,40 @@ mod tests {
         assert!(old.as_object_mut().unwrap().remove("upstream").is_some());
         let old: CiEvent = serde_json::from_value(old).unwrap();
         assert_eq!(old.upstream, None);
+    }
+
+    #[test]
+    fn a_done_followers_key_differs_from_the_push_followers() {
+        let mut a = event("x", 0);
+        a.kind = EventKind::Upstream;
+        a.sha = None;
+        a.upstream = Some(Upstream {
+            repo: "weida".into(),
+            git_ref: "main".into(),
+            sha: "a".into(),
+            done: None,
+        });
+        let mut b = a.clone();
+        b.upstream.as_mut().unwrap().done = Some(UpstreamDone {
+            pipeline: 7,
+            jobs: vec![],
+        });
+        assert_ne!(queue_key(&b), queue_key(&a));
+        let mut later = b.clone();
+        later
+            .upstream
+            .as_mut()
+            .unwrap()
+            .done
+            .as_mut()
+            .unwrap()
+            .pipeline = 8;
+        assert_eq!(queue_key(&later), queue_key(&b));
+
+        let json = serde_json::to_value(&a).unwrap();
+        assert!(json["upstream"].get("done").is_none());
+        let back: CiEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(back.upstream.unwrap().done, None);
     }
 
     #[test]
