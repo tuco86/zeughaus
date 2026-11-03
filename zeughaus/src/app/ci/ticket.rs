@@ -5,10 +5,11 @@
 //! it.
 
 use iced::widget::{
-    Space, button, column, container, markdown, mouse_area, opaque, row, rule, scrollable, text,
-    text_editor, text_input,
+    Space, button, column, container, markdown, mouse_area, opaque, row, rule, text, text_editor,
+    text_input,
 };
 use iced::{Alignment, Border, Element, Font, Length, Shadow, Task, Vector};
+use iced_tabs::scroll;
 use zeughaus_link::{
     AgentRole, CiRequest, ClaimSubject, DocKind, DocLink, DocState, DocView, LinkKind, SessionKind,
     linked_from,
@@ -674,14 +675,14 @@ impl App {
             (TicketTab::Proposal, Some(shown)) => self.proposal_part(popout, shown),
             (TicketTab::Plan, Some(shown)) => self.plan_part(popout, doc, shown),
         };
-        let main = scrollable(
+        let main = scroll::vertical(
             container(main)
                 .padding([0.0, SP_3])
                 .max_width(BODY_MAX_WIDTH),
         )
         .width(Length::Fill)
         .height(Length::Fill);
-        let side = scrollable(self.side_column(popout, client, state, doc))
+        let side = scroll::vertical(self.side_column(popout, client, state, doc))
             .width(SIDE_WIDTH)
             .height(Length::Fill);
         column![

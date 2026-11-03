@@ -13,8 +13,9 @@
 
 use std::collections::HashMap;
 
-use iced::widget::{button, column, container, markdown, mouse_area, row, rule, scrollable, text};
+use iced::widget::{button, column, container, markdown, mouse_area, row, rule, text};
 use iced::{Alignment, Border, Element, Length, Task};
+use iced_tabs::scroll;
 use zeughaus_link::{
     AdviceView, Card, CiReply, CiRequest, NewTicket, OnboardSpec, ProjectsRequest,
 };
@@ -631,7 +632,7 @@ impl App {
 
 /// The Board's column, scrollable, as wide as reads well.
 fn page<'a>(body: iced::widget::Column<'a, Message, Theme>) -> Element<'a, Message, Theme> {
-    scrollable(
+    scroll::vertical(
         container(body.max_width(MAX_WIDTH).padding(24))
             .width(Length::Fill)
             .center_x(Length::Fill),

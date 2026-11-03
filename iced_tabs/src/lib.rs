@@ -8,6 +8,8 @@
 //! whether the press was a click (activate) or the start of a drag, and
 //! feeds the hovered [`Target`] back as the [`Marker`] of the next pass.
 
+pub mod scroll;
+
 use std::any::Any;
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -486,6 +488,7 @@ where
     <Theme as Catalog>::Class<'a>: 'a,
     <Theme as button::Catalog>::Class<'a>: From<button::StyleFn<'a, Theme>>,
     <Theme as container::Catalog>::Class<'a>: From<container::StyleFn<'a, Theme>>,
+    <Theme as scrollable::Catalog>::Class<'a>: From<scrollable::StyleFn<'a, Theme>>,
 {
     let builder = Builder {
         handlers: &handlers,
@@ -513,17 +516,12 @@ where
             // the row overflows, so it never moves a tab.
             let mut row = Row::new()
                 .push(SidewaysWheel::new(
-                    scrollable(
+                    scroll::horizontal(
                         Row::with_children(sections)
                             .spacing(12)
                             .height(Length::Fill),
                     )
                     .id(BAR)
-                    .direction(scrollable::Direction::Horizontal(
-                        scrollable::Scrollbar::new()
-                            .width(SCROLLBAR)
-                            .scroller_width(SCROLLBAR),
-                    ))
                     .height(Length::Fill),
                 ))
                 .height(Length::Fill);
@@ -541,13 +539,12 @@ where
         Placement::Left => {
             let mut column = Column::new()
                 .push(
-                    scrollable(
+                    scroll::vertical(
                         Column::with_children(sections)
                             .spacing(6)
                             .width(Length::Fill),
                     )
                     .id(BAR)
-                    .direction(scrollable::Direction::Vertical(scrollable::Scrollbar::new()))
                     .height(Length::Shrink),
                 )
                 .width(Length::Fill)
@@ -575,9 +572,6 @@ const BAR: widget::Id = widget::Id::new("iced_tabs.bar");
 
 /// The front tab, as reported to a widget operation by its body.
 const ACTIVE_TAB: widget::Id = widget::Id::new("iced_tabs.active");
-
-/// Thickness of the scrollbar under a bar on top.
-const SCROLLBAR: f32 = 4.0;
 
 /// Scrolls the tab bar just far enough that the front tab is fully inside
 /// it: sideways on top, vertically at the left. It does nothing when the tab

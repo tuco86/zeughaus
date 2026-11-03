@@ -19,9 +19,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Space, button, column, container, mouse_area, row, rule, scrollable, stack, text, text_input,
+    Space, button, column, container, mouse_area, row, rule, stack, text, text_input,
 };
 use iced::{Alignment, Border, Color, Element, Length, Task};
+use iced_tabs::scroll;
 use zeughaus_link::{
     ActivityKind, ActivityState, AgentRole, AgentState, ClaimSubject, ClaimView, DocGroup,
     DocState, DocView, RepoDocsView, SessionKind, SessionState, SessionView, blocked_by,
@@ -1155,7 +1156,9 @@ impl App {
             _ => self.overview_runners(t),
         };
         row![
-            scrollable(list).width(LIST_WIDTH).height(Length::Fill),
+            scroll::vertical(list)
+                .width(LIST_WIDTH)
+                .height(Length::Fill),
             rule::vertical(1),
             container(detail).width(Length::Fill).height(Length::Fill),
         ]
@@ -1468,7 +1471,7 @@ impl App {
                         p,
                     ));
                 }
-                let list = scrollable(list).height(Length::Fill);
+                let list = scroll::vertical(list).height(Length::Fill);
                 let body: Element<'_, Message, Theme> = if lane {
                     // A guide down the lane's middle, breathing.
                     let guide = faded(accent, 0.25 + 0.35 * pulse(p));
@@ -1489,12 +1492,7 @@ impl App {
                 columns = columns.push(column![head, body].spacing(8).width(width));
             }
             if narrow {
-                scrollable(columns)
-                    .direction(scrollable::Direction::Horizontal(
-                        scrollable::Scrollbar::new(),
-                    ))
-                    .height(Length::Fill)
-                    .into()
+                scroll::horizontal(columns).height(Length::Fill).into()
             } else {
                 columns.into()
             }
@@ -2011,7 +2009,7 @@ impl App {
             }
             list = list.push(container(line).padding([4, 8]));
         }
-        scrollable(list).height(Length::Fill).into()
+        scroll::vertical(list).height(Length::Fill).into()
     }
 
     /// The titlebar's chip: a dot in the colour of the worst that needs the

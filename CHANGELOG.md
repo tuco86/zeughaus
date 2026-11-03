@@ -355,6 +355,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The omp plugin (0.11.0) resolves `${secret:hannes/omp/<doc...>/<FIELD>}`
   in bash commands when they run and adds the `secrets` tool, which lists
   documents and field names.
+- Scrollbars in the editor are a 4 px thumb without a track (`iced_tabs::scroll`):
+  hidden until the cursor rests on the bar for 400 ms or the view scrolls,
+  then held for 1 s and faded out over 300 ms. The tab bar, the palette,
+  the CI pages, the Board, the ticket popout and the notice center use them.
 
 - The Board of a project no CI builds shows the CI's plan for it: its
   summary, then its sections as cards to choose, and a preview of what

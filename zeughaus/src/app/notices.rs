@@ -7,10 +7,10 @@
 use std::time::SystemTime;
 
 use iced::widget::{
-    Space, Stack, button, column, container, float, mouse_area, opaque, row, scrollable, text,
-    tooltip,
+    Space, Stack, button, column, container, float, mouse_area, opaque, row, text, tooltip,
 };
 use iced::{Alignment, Background, Border, Element, Length, Padding, Vector};
+use iced_tabs::scroll;
 use zeughaus_theme::Theme;
 
 use super::App;
@@ -121,7 +121,7 @@ fn panel<'a>(app: &'a App, t: &Tokens) -> Element<'a, Message, Theme> {
     )
     .spacing(6);
     opaque(
-        container(column![header, scrollable(boxes).height(Length::Fill)].spacing(10))
+        container(column![header, scroll::vertical(boxes).height(Length::Fill)].spacing(10))
             .padding(12)
             .width(CENTER_WIDTH)
             .height(Length::Fill)

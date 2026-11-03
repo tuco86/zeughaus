@@ -41,7 +41,7 @@ zeughaus-db/           # plugin: Database container, Table, Insert, Query, SQL; 
 zeughaus-record/       # plugin: Recorder (frames + values to disk) and Player (the same dataset as a source)
 zeughaus-job/          # plugin: Job (a process in a runner-owned terminal, log per run under the state dir) and the ProcessHost trait the runner implements
 iced_terminal/         # the terminal widget: one wgpu primitive per pane, bundled ComicShannsMono Nerd Font Mono (the editor bundles the Propo variant as its UI and icon face)
-iced_tabs/             # the tab tree the workspace shell uses: runner sections, groups, drop markers
+iced_tabs/             # the tab tree the workspace shell uses: runner sections, groups, drop markers; `scroll`, the thin self-hiding scrollable every editor view uses
 zeughaus-theme/        # the editor's theme: iced theme paired with a terminal colour scheme, catalogs for every widget, bundled pack, WezTerm scheme parser
 vm/win11/              # scripts: headless Windows 11 guest under QEMU/KVM, the service runner's `win11` machine (boot, toolchain, per-boot prepare.ps1); toolchain.ps1 also provisions a Windows runner host
 deploy/                # bootstrap.sh (downloads, checks and runs a build's `install <profile>`), setup-service-runner.sh, setup-sadala.sh, setup-windows.sh (the one-time part of a host); systemd user unit for the runner, desktop entry template, macos-app.sh and the bundle's Info.plist; runner/ (unit, ssh config, enlist.toml.example) and ci/ (CI unit, ci.toml.example, openbao.sh), macos/ (launchd agent), windows/ (host setup, bootstrap.ps1, maintain.toml)

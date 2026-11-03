@@ -371,9 +371,10 @@ pub fn view<'a>(
     selected_index: usize,
 ) -> Element<'a, Message, Theme> {
     use iced::widget::{
-        Column, button, column, container, mouse_area, opaque, row, scrollable, text, text_input,
+        Column, button, column, container, mouse_area, opaque, row, text, text_input,
     };
     use iced::{Alignment, Border, Length, Padding, Shadow, Vector};
+    use iced_tabs::scroll;
 
     let filtered = filter_commands(input, commands);
     let mut rows = Column::new().spacing(2.0).width(Length::Fill);
@@ -460,7 +461,7 @@ pub fn view<'a>(
     let header = row![search, close_button()]
         .spacing(SP_2)
         .align_y(Alignment::Center);
-    let list = container(scrollable(rows).id(LIST_ID).spacing(SP_2)).max_height(LIST_HEIGHT);
+    let list = container(scroll::vertical(rows).id(LIST_ID).spacing(SP_2)).max_height(LIST_HEIGHT);
     let panel = container(column![header, list].spacing(SP_2).padding(SP_2))
         .max_width(PANEL_WIDTH)
         .style(|theme: &Theme| container::Style {

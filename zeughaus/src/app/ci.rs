@@ -25,6 +25,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Color, Element, Length, Padding, Point, Size, Task};
 use iced_nodegraph_sdf::Shape;
+use iced_tabs::scroll;
 use zeughaus_core::NodeId;
 use zeughaus_link::{
     CiOverview, CiReply, CiRequest, JobView, MachineJob, MachineView, PipelineView, QueuedView,
@@ -1588,7 +1589,9 @@ impl App {
                 .style(crate::style::row_highlight(&t, active)),
             );
         }
-        let body = scrollable(table).width(Length::Fill).height(Length::Fill);
+        let body = scroll::vertical(table)
+            .width(Length::Fill)
+            .height(Length::Fill);
         column![toolbar, rule::horizontal(1), body].into()
     }
 
@@ -1874,11 +1877,9 @@ impl App {
                     .padding(SP_4),
                 );
             }
-            scrollable(list)
+            scroll::vertical(list)
                 .id(list_id(view))
-                .direction(scrollable::Direction::Vertical(
-                    scrollable::Scrollbar::new().spacing(SP_1),
-                ))
+                .spacing(SP_1)
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
@@ -2293,10 +2294,8 @@ impl App {
         let mut detail = column![actions].spacing(SP_3);
         if !shown.jobs.cards.is_empty() {
             detail = detail.push(
-                scrollable(self.job_graph(runner, view, shown, now))
-                    .direction(scrollable::Direction::Horizontal(
-                        scrollable::Scrollbar::default().spacing(SP_1),
-                    ))
+                scroll::horizontal(self.job_graph(runner, view, shown, now))
+                    .spacing(SP_1)
                     .width(Length::Fill),
             );
         }
