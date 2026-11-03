@@ -1,6 +1,5 @@
 //! The Claude subscription the CI signs in to, keeps renewed and hands out
-//! through OpenBao, in place of a login per machine (`[claude]` of
-//! `ci.toml`).
+//! over `/ci`, in place of a login per machine (`[claude]` of `ci.toml`).
 //!
 //! The sign-in is Claude Code's own OAuth client (authorization code with
 //! PKCE), whose only redirect is `localhost`: `zeughaus-runner claude
@@ -14,10 +13,13 @@
 //! ends about 30 days after the sign-in, after which the owner signs in
 //! again.
 //!
-//! A thread renews the access token well before it expires and patches it
-//! into the `publish` documents as `CLAUDE_ACCESS_TOKEN`, where omp on every
-//! machine reads it (`get-secret`); the CI's own requests use it from
-//! memory. The refresh token never leaves the CI's document.
+//! A renewal revokes the previous access token, so the CI is the only one
+//! that holds the token and every machine asks it for the current one
+//! (`CiRequest::ClaudeToken`, `zeughaus-runner claude token`): an omp whose
+//! token was revoked asks again and gets the new one. The access token and
+//! its expiry are kept in the CI's document too, so a restart (every update
+//! is one) goes on with the token it had instead of renewing; a thread
+//! renews it [`RENEW_BEFORE`] it expires.
 
 use std::collections::HashMap;
 use std::process::Command;
@@ -51,14 +53,21 @@ pub const IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Cl
 /// The betas a Messages request with the token announces.
 pub const MESSAGES_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
 
-/// The field the access token is published as.
-pub const ACCESS_FIELD: &str = "CLAUDE_ACCESS_TOKEN";
-/// The CI's own fields: the refresh token, the account, when it signed in.
+/// The CI's own fields: the refresh token, the account, when it signed in,
+/// and the access token with its expiry, so a restart keeps it.
 const REFRESH_FIELD: &str = "CLAUDE_REFRESH_TOKEN";
 const ACCOUNT_FIELD: &str = "CLAUDE_ACCOUNT";
 const SIGNED_IN_FIELD: &str = "CLAUDE_SIGNED_IN";
+const ACCESS_FIELD: &str = "CLAUDE_ACCESS_TOKEN";
+const EXPIRES_FIELD: &str = "CLAUDE_ACCESS_EXPIRES";
 /// The fields of the CI's own document the sign-in writes.
-pub const OWN_FIELDS: [&str; 3] = [REFRESH_FIELD, ACCOUNT_FIELD, SIGNED_IN_FIELD];
+pub const OWN_FIELDS: [&str; 5] = [
+    REFRESH_FIELD,
+    ACCOUNT_FIELD,
+    SIGNED_IN_FIELD,
+    ACCESS_FIELD,
+    EXPIRES_FIELD,
+];
 
 /// How long a started sign-in waits for its code.
 const PENDING_FOR: Duration = Duration::from_secs(600);
@@ -91,11 +100,9 @@ struct State {
     signed_in: u64,
     /// The access token and when it expires, in seconds since the epoch.
     access: Option<(String, u64)>,
-    /// The sign-in has changed since it last reached OpenBao.
+    /// The sign-in or the access token has changed since it last reached
+    /// OpenBao.
     unsaved: bool,
-    /// The access token has changed since it last reached every `publish`
-    /// document.
-    unpublished: bool,
     error: Option<String>,
 }
 
@@ -177,7 +184,6 @@ impl Claude {
             signed_in: now,
             access: Some((answer.access_token, now + answer.expires_in)),
             unsaved: true,
-            unpublished: true,
             error: None,
         };
         self.store(&mut state);
@@ -185,22 +191,23 @@ impl Claude {
         Ok(account)
     }
 
-    /// An access token good for at least a minute, renewed first when it
-    /// is not.
-    pub fn access_token(&self, now: u64) -> Result<String, String> {
+    /// The access token and its expiry, good for at least a minute, renewed
+    /// first when it is not.
+    pub fn current(&self, now: u64) -> Result<(String, u64), String> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         self.load(&mut state);
         if let Some((token, expires)) = &state.access
             && *expires > now + 60
         {
-            return Ok(token.clone());
+            return Ok((token.clone(), *expires));
         }
         self.renew(&mut state, now)?;
-        state
-            .access
-            .as_ref()
-            .map(|(token, _)| token.clone())
-            .ok_or_else(|| self.signed_out(&state))
+        state.access.clone().ok_or_else(|| self.signed_out(&state))
+    }
+
+    /// The access token, as [`Claude::current`].
+    pub fn access_token(&self, now: u64) -> Result<String, String> {
+        self.current(now).map(|(token, _)| token)
     }
 
     /// The renewal thread's round: renews a token that expires within
@@ -211,11 +218,7 @@ impl Claude {
         if state.refresh.is_none() {
             return;
         }
-        if state
-            .access
-            .as_ref()
-            .is_none_or(|(_, expires)| *expires < now + RENEW_BEFORE)
-        {
+        if renewal_due(&state, now) {
             if let Err(e) = self.renew(&mut state, now) {
                 eprintln!("[ci] claude: {e}");
             }
@@ -241,26 +244,14 @@ impl Claude {
         }
     }
 
-    /// Reads the sign-in from OpenBao once.
+    /// Reads the sign-in and the access token from OpenBao once.
     fn load(&self, state: &mut State) {
         if state.loaded {
             return;
         }
-        let field = |name: &str| match self.secrets.get(name) {
-            Ok(value) => Ok(Some(value)),
-            Err(SecretError::Absent(_)) => Ok(None),
-            Err(e) => Err(e.to_string()),
-        };
-        match field(REFRESH_FIELD) {
-            Ok(refresh) => {
-                state.loaded = true;
-                state.refresh = refresh.filter(|r| !r.is_empty());
-                state.account = field(ACCOUNT_FIELD).ok().flatten().unwrap_or_default();
-                state.signed_in = field(SIGNED_IN_FIELD)
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
+        match self.secrets.get(REFRESH_FIELD) {
+            Ok(_) | Err(SecretError::Absent(_)) => {
+                *state = stored_state(|name| self.secrets.get(name).ok());
             }
             Err(e) => state.error = Some(format!("the sign-in was not read: {e}")),
         }
@@ -285,12 +276,15 @@ impl Claude {
             Ok(answer) => {
                 if let Some(rotated) = answer.refresh_token {
                     state.refresh = Some(rotated);
-                    state.unsaved = true;
                 }
                 state.access = Some((answer.access_token, now + answer.expires_in));
-                state.unpublished = true;
+                state.unsaved = true;
                 state.error = None;
                 self.store(state);
+                eprintln!(
+                    "[ci] claude: renewed; the token expires in {} minutes",
+                    answer.expires_in / 60
+                );
                 Ok(())
             }
             Err(e) if e.contains("invalid_grant") => {
@@ -308,42 +302,30 @@ impl Claude {
         }
     }
 
-    /// Writes what changed to OpenBao: the sign-in to the CI's document,
-    /// the access token to every `publish` document. What fails is tried
-    /// again on the next round.
+    /// Writes the sign-in and the access token to the CI's document. What
+    /// fails is tried again on the next round.
     fn store(&self, state: &mut State) {
-        if state.unsaved {
-            let signed_in = state.signed_in.to_string();
-            let fields = [
-                (REFRESH_FIELD, state.refresh.as_deref().unwrap_or("")),
-                (ACCOUNT_FIELD, state.account.as_str()),
-                (SIGNED_IN_FIELD, signed_in.as_str()),
-            ];
-            match self.secrets.patch(None, &fields) {
-                Ok(()) => state.unsaved = false,
-                Err(e) => {
-                    eprintln!("[ci] claude: the sign-in did not reach OpenBao: {e}");
-                    state.error = Some(format!("the sign-in did not reach OpenBao: {e}"));
-                }
-            }
+        if !state.unsaved {
+            return;
         }
-        if state.unpublished {
-            let access = state
-                .access
-                .as_ref()
-                .map_or("", |(token, _)| token.as_str());
-            let mut all = true;
-            for document in &self.config.publish {
-                if let Err(e) = self
-                    .secrets
-                    .patch(Some(document), &[(ACCESS_FIELD, access)])
-                {
-                    eprintln!("[ci] claude: {document}: {e}");
-                    state.error = Some(format!("{document}: {e}"));
-                    all = false;
-                }
+        let signed_in = state.signed_in.to_string();
+        let (access, expires) = match &state.access {
+            Some((token, expires)) => (token.as_str(), expires.to_string()),
+            None => ("", String::new()),
+        };
+        let fields = [
+            (REFRESH_FIELD, state.refresh.as_deref().unwrap_or("")),
+            (ACCOUNT_FIELD, state.account.as_str()),
+            (SIGNED_IN_FIELD, signed_in.as_str()),
+            (ACCESS_FIELD, access),
+            (EXPIRES_FIELD, expires.as_str()),
+        ];
+        match self.secrets.patch(None, &fields) {
+            Ok(()) => state.unsaved = false,
+            Err(e) => {
+                eprintln!("[ci] claude: the sign-in did not reach OpenBao: {e}");
+                state.error = Some(format!("the sign-in did not reach OpenBao: {e}"));
             }
-            state.unpublished = !all;
         }
     }
 
@@ -351,6 +333,38 @@ impl Claude {
         let why = state.error.as_deref().unwrap_or("not signed in");
         format!("Claude: {why}; sign in with `zeughaus-runner claude login`")
     }
+}
+
+/// The state the CI's document holds, by `field` (`None`: absent). The
+/// access token is taken only with its expiry and a refresh token.
+fn stored_state(field: impl Fn(&str) -> Option<String>) -> State {
+    let field = |name: &str| field(name).filter(|value| !value.is_empty());
+    let refresh = field(REFRESH_FIELD);
+    let expires = field(EXPIRES_FIELD).and_then(|s| s.parse::<u64>().ok());
+    let access = match (&refresh, field(ACCESS_FIELD), expires) {
+        (Some(_), Some(token), Some(expires)) => Some((token, expires)),
+        _ => None,
+    };
+    State {
+        loaded: true,
+        refresh,
+        account: field(ACCOUNT_FIELD).unwrap_or_default(),
+        signed_in: field(SIGNED_IN_FIELD)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+        access,
+        unsaved: false,
+        error: None,
+    }
+}
+
+/// Whether the renewal thread renews now: without an access token, or
+/// within [`RENEW_BEFORE`] of its expiry.
+fn renewal_due(state: &State, now: u64) -> bool {
+    state
+        .access
+        .as_ref()
+        .is_none_or(|(_, expires)| *expires < now + RENEW_BEFORE)
 }
 
 /// 32 random bytes as base64url without padding.
@@ -461,5 +475,47 @@ mod tests {
         );
         assert_eq!(query_param(query, "code_challenge"), Some(challenge));
         assert_eq!(query_param(query, "state").as_deref(), Some("st"));
+    }
+
+    fn stored(fields: &[(&str, &str)]) -> State {
+        stored_state(|name| {
+            fields
+                .iter()
+                .find(|(field, _)| *field == name)
+                .map(|(_, value)| (*value).to_owned())
+        })
+    }
+
+    #[test]
+    fn a_restart_keeps_a_stored_token_until_it_is_due() {
+        let now = 1_000_000;
+        let expires = (now + 8 * 3600).to_string();
+        let state = stored(&[
+            (REFRESH_FIELD, "r"),
+            (ACCESS_FIELD, "a"),
+            (EXPIRES_FIELD, &expires),
+        ]);
+        assert_eq!(state.access, Some(("a".to_owned(), now + 8 * 3600)));
+        assert!(!renewal_due(&state, now), "a restart must not renew");
+        assert!(!renewal_due(&state, now + 6 * 3600 - 1));
+        assert!(renewal_due(&state, now + 6 * 3600 + 1));
+    }
+
+    #[test]
+    fn without_a_stored_token_or_its_expiry_the_first_round_renews() {
+        for fields in [
+            &[(REFRESH_FIELD, "r")][..],
+            &[(REFRESH_FIELD, "r"), (ACCESS_FIELD, "a")],
+            &[
+                (REFRESH_FIELD, "r"),
+                (ACCESS_FIELD, "a"),
+                (EXPIRES_FIELD, ""),
+            ],
+        ] {
+            assert!(renewal_due(&stored(fields), 1), "{fields:?}");
+        }
+        // Signed out: an access token left behind is not served.
+        let signed_out = stored(&[(ACCESS_FIELD, "a"), (EXPIRES_FIELD, "99999999")]);
+        assert_eq!(signed_out.access, None);
     }
 }

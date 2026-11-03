@@ -326,8 +326,8 @@ generated `<NAME>_WEBHOOK_SECRET` in OpenBao, writes
 the first push pipeline. The configuration is one swappable snapshot:
 SIGHUP (`systemctl --user reload zeughaus-ci`) re-reads `[repos]` and
 `ci/onboarded/`, and refuses any other change. `[claude]` of `ci.toml`
-(`account`, the only email that may sign in; `publish`, OpenBao documents
-such as `zeughaus/omp`) is the Claude subscription the CI holds, in place of
+(`account`, the only email that may sign in) is the Claude subscription
+the CI holds, in place of
 omp's `/login anthropic` on every machine. A sign-in is the normal OAuth
 flow of Claude Code's client on the owner's machine: `zeughaus-runner
 claude login` (also `/zeughaus claude login` in omp, and the Overview's
@@ -335,12 +335,15 @@ Claude row in the editor) asks the CI to start one (`ClaudeStart`; the CI
 keeps state and PKCE verifier), opens the browser at claude.ai, takes the
 redirect on `localhost:54545` and hands code and state to the CI
 (`ClaudeFinish`) over `/ci`, which exchanges them. The CI keeps the
-refresh token in its own document (`CLAUDE_REFRESH_TOKEN`,
-`CLAUDE_ACCOUNT`, `CLAUDE_SIGNED_IN`, written back at every renewal
-because each refresh rotates it), renews the access token two hours before
-it expires and patches it into every `publish` document as
-`CLAUDE_ACCESS_TOKEN`, where omp reads it (`providers.anthropic.apiKey:
-"!get-secret secret/zeughaus/omp/CLAUDE_ACCESS_TOKEN"` in `models.yml`). A
+refresh token and the current access token in its own document
+(`CLAUDE_REFRESH_TOKEN`, `CLAUDE_ACCOUNT`, `CLAUDE_SIGNED_IN`,
+`CLAUDE_ACCESS_TOKEN`, `CLAUDE_ACCESS_EXPIRES`, written back at every
+renewal because each refresh rotates it, and read at start, so a restart
+renews nothing) and renews the access token two hours before it expires.
+A renewal revokes the previous token, so machines keep no copy: omp runs
+`zeughaus-runner claude token` (`providers.anthropic.apiKey: "!zeughaus-runner
+claude token"` in `models.yml`), which asks the CI over `/ci` for the
+current one, and runs it again after a 401. A
 sign-in ends about 30 days after it was made; the Overview asks for a new
 one three days before, and while the CI is signed out; `zeughaus-runner
 claude status` says where it stands. `[advice]` (`model`, by

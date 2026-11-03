@@ -90,13 +90,11 @@ timeout_seconds = 5
 
 # The Claude subscription the CI holds (Claude Code's OAuth client), signed
 # in with `zeughaus-runner claude login` on a machine with a browser. It
-# keeps the refresh token in [secrets]' document and patches the renewed
-# access token into every `publish` document as CLAUDE_ACCESS_TOKEN (the
-# AppRole needs patch there: deploy/ci/openbao.sh). Adding it takes a
-# restart.
+# keeps the refresh and access tokens in [secrets]' document and hands the
+# access token out over /ci (`zeughaus-runner claude token`). Adding it
+# takes a restart.
 # [claude]
 # account = "owner@example.org"
-# publish = ["zeughaus/omp"]
 
 # The language model the CI asks with that sign-in about a project that
 # has not joined, for the editor's Board of it. Without it the Board still

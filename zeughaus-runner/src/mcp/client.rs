@@ -347,7 +347,9 @@ fn retries(request: &CiRequest) -> bool {
         | CiRequest::Doc { .. }
         | CiRequest::Session { .. }
         | CiRequest::Responsible { .. }
-        | CiRequest::States { .. } => true,
+        | CiRequest::States { .. }
+        // The token in memory: a renewal it may trigger is not repeated.
+        | CiRequest::ClaudeToken => true,
         CiRequest::OpenTranscript { .. }
         | CiRequest::CloseTranscript { .. }
         | CiRequest::Rerun { .. }

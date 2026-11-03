@@ -332,10 +332,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- omp gets the Claude token from the CI instead of OpenBao:
+  `zeughaus-runner claude token` asks the CI (`CiRequest::ClaudeToken`)
+  and prints the current access token, and `models.yml` uses it as the
+  `apiKey` command. A renewal revokes the previous token; omp runs the
+  command again after the 401 and gets the new one, where a copy in
+  OpenBao could be stale. The CI keeps the access token and its expiry in
+  its own document and goes on with it after a restart, so an update no
+  longer renews (and revokes) the token, and it logs every renewal.
+  `[claude] publish` is gone; a `ci.toml` that still has it is refused.
+
 - Secrets in OpenBao are organised by user, then by reader: the CI's own
   document is `zeughaus/zeughaus`, a job's granted secrets come from
-  `zeughaus/<origin>/shell`, then `zeughaus/shell`, and omp reads the
-  Claude token from `zeughaus/omp`. The CI no longer reads job secrets
+  `zeughaus/<origin>/shell`, then `zeughaus/shell`. The CI no longer reads job secrets
   itself: it mints a wrapped, single-use job token per run (token role
   `zeughaus-job`, policy `zeughaus-job-<repo>`, from the new
   `zeughaus-ci job-policies`), and the runner redeems it, reads the

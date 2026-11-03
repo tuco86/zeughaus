@@ -343,6 +343,11 @@ pub enum CiRequest {
     /// Finishes it with what came to the callback. Answers
     /// [`CiReply::ClaudeSignedIn`].
     ClaudeFinish { code: String, state: String },
+    /// The CI's current Claude access token, for omp on the asker's machine
+    /// (`zeughaus-runner claude token`). Answers [`CiReply::ClaudeToken`].
+    /// Every machine asks the CI instead of keeping a copy: a renewal
+    /// revokes the previous token, and the next ask gets the new one.
+    ClaudeToken,
     /// Onboards a repository from the editor in one step: files the
     /// onboarding request of `repo` already approved (the owner asks), and
     /// with it `tickets`, released for planning; they wait until the
@@ -571,6 +576,12 @@ pub enum CiReply {
     /// The account the CI is signed in to now.
     ClaudeSignedIn {
         account: String,
+    },
+    /// The current access token and when it expires (seconds since the
+    /// UNIX epoch).
+    ClaudeToken {
+        token: String,
+        expires: u64,
     },
     /// The onboarding request's number and its tickets', in their order.
     Onboarded {
@@ -1962,6 +1973,7 @@ mod tests {
                 code: "c".to_owned(),
                 state: "s".to_owned(),
             },
+            CiRequest::ClaudeToken,
             CiRequest::Advise {
                 origin: "git.doodleshnookie.net/tuco86/scan-rs".to_owned(),
                 facts: "- forge: forgejo\n".to_owned(),
@@ -2140,6 +2152,10 @@ mod tests {
             },
             CiReply::ClaudeSignedIn {
                 account: "me@example.org".to_owned(),
+            },
+            CiReply::ClaudeToken {
+                token: "t".to_owned(),
+                expires: 9,
             },
             CiReply::Onboarded {
                 request: 4,

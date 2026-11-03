@@ -20,16 +20,12 @@ BAO_TOKEN=$(sed -n 's/^Initial Root Token: //p' /root/openbao-init.txt)
 export BAO_TOKEN
 
 # The CI reads and patches its own document (webhook secrets onboarding
-# generates, the Claude sign-in it keeps) and patches the Claude access token
-# into zeughaus/omp, where every omp reads it. It reaches no document of
+# generates, the Claude sign-in it keeps). It reaches no document of
 # hannes/. A job's secrets it never reads: it mints a job token through the
 # token role and hands it on wrapped, then revokes it by its accessor.
 bao policy write zeughaus - >/dev/null <<'POLICY'
 path "secret/data/zeughaus/zeughaus" {
   capabilities = ["read", "patch"]
-}
-path "secret/data/zeughaus/omp" {
-  capabilities = ["patch"]
 }
 path "auth/token/create/zeughaus-job" {
   capabilities = ["update"]

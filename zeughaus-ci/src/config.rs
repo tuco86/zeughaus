@@ -64,17 +64,13 @@ pub struct CiConfig {
     pub advice: Option<AdviceConfig>,
 }
 
-/// `[claude]`: who may sign in, and which OpenBao documents receive the
-/// current access token.
+/// `[claude]`: who may sign in. The CI hands the access token out over
+/// `/ci` (`CiRequest::ClaudeToken`).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaudeConfig {
     /// The only Claude account the sign-in accepts, by its email address.
     pub account: String,
-    /// Documents below the `[secrets]` mount (`zeughaus/omp`) the access token
-    /// is patched into as `CLAUDE_ACCESS_TOKEN` each time it is renewed.
-    #[serde(default)]
-    pub publish: Vec<String>,
 }
 
 /// `[advice]`: the Anthropic Messages API the CI asks for advice on a
@@ -592,16 +588,6 @@ impl CiConfig {
                 return Err(
                     "[claude]: `account` is the email address of the Claude account".into(),
                 );
-            }
-            if let Some(bad) = claude.publish.iter().find(|path| {
-                path.is_empty()
-                    || path.starts_with('/')
-                    || path.ends_with('/')
-                    || path.contains("..")
-            }) {
-                return Err(format!(
-                    "[claude]: `publish` holds `{bad}`, which is no document path like zeughaus/omp"
-                ));
             }
             if self.secrets.is_none() {
                 return Err(

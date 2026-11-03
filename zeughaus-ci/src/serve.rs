@@ -392,6 +392,15 @@ impl CiServer {
                 Some(Err(e)) => error(&e),
                 None => error("the CI has no [claude] in ci.toml"),
             },
+            CiRequest::ClaudeToken => match self
+                .claude
+                .as_deref()
+                .map(|claude| claude.current(crate::now_secs()))
+            {
+                Some(Ok((token, expires))) => CiReply::ClaudeToken { token, expires },
+                Some(Err(e)) => error(&e),
+                None => error("the CI has no [claude] in ci.toml"),
+            },
         }
     }
 

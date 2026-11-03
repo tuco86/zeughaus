@@ -1,13 +1,15 @@
-//! `zeughaus-runner claude login|status`: the CI's Claude sign-in, from the
-//! machine the browser runs on.
+//! `zeughaus-runner claude login|status|token`: the CI's Claude sign-in,
+//! from the machine the browser runs on, and its current access token.
 //!
 //! `login` asks the CI to start a sign-in (`CiRequest::ClaudeStart`: the CI
 //! keeps state and PKCE verifier), opens the browser at the claude.ai
 //! address it answers, takes the redirect on `localhost:54545`, the only
 //! one Claude Code's OAuth client accepts, and hands code and state to the
 //! CI (`CiRequest::ClaudeFinish`), which exchanges them and from then on
-//! renews the token and hands it out through OpenBao. It dials the CI the
-//! way an editor of this state directory does, with its `client.pem`.
+//! renews the token. `token` prints the CI's current access token
+//! (`CiRequest::ClaudeToken`) for omp's `models.yml`; omp runs it again
+//! after a 401 and so follows every renewal. Each dials the CI the way an
+//! editor of this state directory does, with its `client.pem`.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -29,8 +31,8 @@ const WAIT: Duration = Duration::from_secs(600);
 /// The most of a request line and headers read.
 const MAX_HEAD: usize = 16 << 10;
 
-const USAGE: &str =
-    "usage: zeughaus-runner claude login [--ci <url>] [--no-browser] | status [--ci <url>]";
+const USAGE: &str = "usage: zeughaus-runner claude login [--ci <url>] [--no-browser] | \
+                     status [--ci <url>] | token [--ci <url>]";
 
 pub fn run(args: &[String], state_dir: &Path) -> ExitCode {
     let mut ci = None;
@@ -49,6 +51,14 @@ pub fn run(args: &[String], state_dir: &Path) -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("login") => login(ci, state_dir, browser),
         Some("status") => status(ci, state_dir),
+        Some("token") => match token(ci, state_dir) {
+            // Without a line end: omp takes stdout as the key.
+            Ok(token) => {
+                print!("{token}");
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => Err(e),
+        },
         _ => Err(USAGE.to_owned()),
     };
     match result {
@@ -150,6 +160,13 @@ fn status(ci: Option<String>, state_dir: &Path) -> Result<String, String> {
         line.push_str(&format!("\nlast error: {error}"));
     }
     Ok(line)
+}
+
+fn token(ci: Option<String>, state_dir: &Path) -> Result<String, String> {
+    match ask(ci, state_dir, CiRequest::ClaudeToken)? {
+        CiReply::ClaudeToken { token, .. } => Ok(token),
+        other => Err(crate::mcp::unexpected(&other)),
+    }
 }
 
 /// The callback's listeners: IPv4, and IPv6 where there is one, since a

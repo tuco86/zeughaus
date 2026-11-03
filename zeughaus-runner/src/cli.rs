@@ -34,7 +34,7 @@
 //! zeughaus-runner master <repo> --ticket <n> --branch <branch> --origin <origin>
 //! zeughaus-runner maintain
 //! zeughaus-runner tidy [--dry-run] [--list]
-//! zeughaus-runner claude login [--ci <url>] [--no-browser] | status [--ci <url>]
+//! zeughaus-runner claude login [--ci <url>] [--no-browser] | status [--ci <url>] | token [--ci <url>]
 //! zeughaus-runner timeout <seconds> -- <program> [args..]
 //! zeughaus-runner release keygen <file>
 //! zeughaus-runner release bundle --channel <c> --build <n> --sha <sha> --version <v> --out <dir> <file>...
@@ -76,7 +76,7 @@ usage: zeughaus-runner [--state-dir <dir>] [--feed-addr <host:port>] [--keep-run
        zeughaus-runner master <repo> --ticket <n> --branch <branch> --origin <origin>
        zeughaus-runner maintain
        zeughaus-runner tidy [--dry-run] [--list]
-       zeughaus-runner claude login [--ci <url>] [--no-browser] | status [--ci <url>]
+       zeughaus-runner claude login [--ci <url>] [--no-browser] | status [--ci <url>] | token [--ci <url>]
        zeughaus-runner timeout <seconds> -- <program> [args..]
        zeughaus-runner release keygen <file>
        zeughaus-runner release bundle --channel <c> --build <n> --sha <sha> --version <v> --out <dir> <file>...

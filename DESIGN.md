@@ -1928,7 +1928,7 @@ approve its plan as it arrives instead of putting it up for review.
 **Claude sign-in.** `[claude]` of `ci.toml` (`zeughaus-ci/src/claude.rs`)
 makes the CI the one holder of the owner's Claude subscription: omp on the
 workstations and the CI's own requests use the access token it hands out
-through OpenBao, and nothing signs in per machine. It is Claude Code's
+over `/ci`, and nothing signs in per machine. It is Claude Code's
 public OAuth client (authorization code with PKCE S256, the scopes Claude
 Code asks for), whose only redirect is `http://localhost:54545/callback`
 (`zeughaus_link::CLAUDE_CALLBACK`), so the sign-in runs where the browser
@@ -1943,18 +1943,23 @@ the owner's machines can sign the CI in. The account of the answer (or of
 the `claude_cli/bootstrap` lookup) must be `account`; then the refresh
 token, the account and the time go into the CI's own document by merge
 patch. A thread looks every minute: two hours before the access token
-expires it refreshes (one at a time, under the state's lock), writes the
-rotated refresh token back at once, and patches the access token into
-every `publish` document as `CLAUDE_ACCESS_TOKEN`; a write that fails is
-kept in memory and retried the next minute. An `invalid_grant` ends the
+expires it refreshes (one at a time, under the state's lock) and writes the
+rotated refresh token and the new access token with its expiry back at
+once; a write that fails is kept in memory and retried the next minute. A
+start reads the access token too and goes on with it, so a restart (every
+update is one) renews nothing. A refresh revokes the previous access token,
+so no machine keeps a copy: `zeughaus-runner claude token` asks the CI
+(`ClaudeToken`, an editor's request like `ClaudeStart`) and prints the
+current token, which omp's `models.yml` runs as its `apiKey` command. omp
+caches it and runs the command again after a 401, so a renewal costs one
+retried request. An `invalid_grant` ends the
 sign-in (the stored refresh token is emptied), which happens about 30
 days after it was made. `ClaudeView` in the overview carries the account,
 when the sign-in ends, the token's expiry and the last error; the editor's
 Overview lists it under Needs you while the CI is signed out, three days
 before the sign-in ends, or while renewing fails, and a press runs
 `zeughaus-runner claude login` beside the editor and reports the result as
-a notice; omp's plugin offers `/zeughaus claude [login]`. The CI's AppRole
-may patch `secret/zeughaus/omp`.
+a notice; omp's plugin offers `/zeughaus claude [login]`.
 
 **Advice.** `[advice]` of `ci.toml` (a `model`, by default
 `claude-haiku-5-5`, and the `api` base) is the language model the CI asks
