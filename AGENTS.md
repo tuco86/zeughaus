@@ -685,7 +685,7 @@ section as its body, and it must equal the workspace version). Two secrets
 in OpenBao `secret/zeughaus/ci` back it, granted to `push main`, `nightly`
 and `tag v*`: `ZEUGHAUS_UPDATE_KEY` (the signing seed) and
 `ZEUGHAUS_GITHUB_TOKEN` (contents write on `tuco86/zeughaus`).
-Forgejo reaches the CI as the bot user `zeughaus-ci`
+Forgejo reaches the CI as the bot user `zeughaus`
 (write on zeughaus, read on weida); its tokens and the webhook secret are
 in OpenBao under `secret/zeughaus/ci`. A change to `.zeughaus-ci/` is checked with
 `zeughaus-ci check` before it is pushed. `DESIGN.md` section 14 describes how it

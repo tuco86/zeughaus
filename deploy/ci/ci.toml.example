@@ -79,9 +79,9 @@ timeout_seconds = 5
 # those files; any other change of this file takes a restart.
 # [onboarding]
 # api = "https://git.doodleshnookie.net"
-# bot = "zeughaus-ci"
+# bot = "zeughaus"
 # bot_token = "FORGEJO_TOKEN"
-# admin_token = "FORGEJO_ADMIN_TOKEN"
+# admin_token = "FORGEJO_ADMIN_TOKEN"   # the owner's token, write:repository
 # hook_url = "https://ci.doodleshnookie.net/hook"
 
 # The Claude subscription the CI holds (Claude Code's OAuth client), signed
@@ -115,7 +115,7 @@ webhook_secret = "GRIASDI_WEBHOOK_SECRET"
 [repos.griasdi.grants]             # secret -> event patterns it is released to
 GRIASDI_GITHUB_TOKEN = ["tag v*", "nightly"]
 
-# zeughaus itself, on Forgejo. The bot user `zeughaus-ci` is a collaborator
+# zeughaus itself, on Forgejo. The bot user `zeughaus` is a collaborator
 # with write on zeughaus (fetch, statuses). weida comes from its public GitHub
 # mirror, so the jobs need no token for it.
 [repos.zeughaus]
@@ -125,7 +125,7 @@ slug = "tuco86/zeughaus"
 api = "https://git.doodleshnookie.net"
 default_branch = "main"
 fetch_token = "FORGEJO_TOKEN"
-fetch_user = "zeughaus-ci"
+fetch_user = "zeughaus"
 status_token = "FORGEJO_TOKEN"
 webhook_secret = "ZEUGHAUS_WEBHOOK_SECRET"
 

@@ -370,7 +370,7 @@ mod tests {
     fn onboarding() -> OnboardingConfig {
         OnboardingConfig {
             api: "https://git.doodleshnookie.net".to_owned(),
-            bot: "zeughaus-ci".to_owned(),
+            bot: "zeughaus".to_owned(),
             bot_token: "FORGEJO_TOKEN".to_owned(),
             admin_token: "FORGEJO_ADMIN_TOKEN".to_owned(),
             hook_url: "https://ci.doodleshnookie.net/hook".to_owned(),
@@ -456,7 +456,7 @@ mod tests {
                             let mut body = String::new();
                             let _ = request.as_reader().read_to_string(&mut body);
                             let hooks = format!("{REPO_API}/hooks");
-                            let collaborators = format!("{REPO_API}/collaborators/zeughaus-ci");
+                            let collaborators = format!("{REPO_API}/collaborators/zeughaus");
                             let (code, answer) = match (method.as_str(), path.as_str()) {
                                 ("POST", "/v1/auth/approle/login") => {
                                     (200, json!({ "auth": { "client_token": "tok" } }))
@@ -533,7 +533,7 @@ mod tests {
                     "default_runner = \"r\"\n[runners.r]\n\
                      fingerprint = \"sha256:0000000000000000000000000000000000000000000000000000000000000001\"\n\
                      [secrets]\naddr = \"{url}\"\npath = \"zeughaus/ci\"\nrole_id = \"role\"\n\
-                     [onboarding]\napi = \"{url}\"\nbot = \"zeughaus-ci\"\nbot_token = \"FORGEJO_TOKEN\"\n\
+                     [onboarding]\napi = \"{url}\"\nbot = \"zeughaus\"\nbot_token = \"FORGEJO_TOKEN\"\n\
                      admin_token = \"FORGEJO_ADMIN_TOKEN\"\nhook_url = \"https://ci.example.org/hook\"\n",
                     url = stand_in.url
                 ),
@@ -609,7 +609,7 @@ mod tests {
                 Some("SCAN_RS_WEBHOOK_SECRET")
             );
             assert_eq!(repo.slug, "tuco86/scan-rs");
-            assert_eq!(repo.fetch_user, "zeughaus-ci");
+            assert_eq!(repo.fetch_user, "zeughaus");
 
             let calls = stand_in.calls.lock().unwrap().clone();
             let order: Vec<(&str, &str)> = calls
@@ -619,10 +619,7 @@ mod tests {
             assert_eq!(
                 order,
                 [
-                    (
-                        "PUT",
-                        "/api/v1/repos/tuco86/scan-rs/collaborators/zeughaus-ci"
-                    ),
+                    ("PUT", "/api/v1/repos/tuco86/scan-rs/collaborators/zeughaus"),
                     ("PATCH", DOCUMENT),
                     ("GET", "/api/v1/repos/tuco86/scan-rs/hooks"),
                     ("POST", "/api/v1/repos/tuco86/scan-rs/hooks"),
