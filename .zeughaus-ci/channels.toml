@@ -16,3 +16,9 @@ clean = true
 name = "release"
 on = ["tag v*"]
 clean = true
+
+# A tag omp-plugin-v<version> publishes the omp plugin to the Forgejo npm registry.
+[[channel]]
+name = "omp-plugin"
+on = ["tag omp-plugin-v*"]
+clean = true

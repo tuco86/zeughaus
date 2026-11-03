@@ -412,6 +412,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The omp plugin (0.15.0) asks the CI itself, over its weida API with
+  `@tuco86/weida`, instead of running `zeughaus-runner ci` for every
+  question; only `claude login|status` still runs the runner. The texts
+  the runner prints around the CI's answers (the `<zeughaus-ci>` block, a
+  late job's report, a session's description, the claim lines, the plan
+  header) are ported and held to the Rust originals by shared cases in
+  `omp-plugin/fixtures/`. The plugin is the npm package
+  `@tuco86/zeughaus-omp` in the Forgejo registry, published by a tag
+  `omp-plugin-v<version>` (channel `omp-plugin`); the marketplace catalog
+  `.omp-plugin/` is gone.
+
 - omp gets the Claude token from the CI instead of OpenBao:
   `zeughaus-runner claude token` asks the CI (`CiRequest::ClaudeToken`)
   and prints the current access token, and `models.yml` uses it as the

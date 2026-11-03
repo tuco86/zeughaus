@@ -16,3 +16,6 @@ plan/
 # target directory, the weida checkout, the staged archives. A checkout
 # cleans untracked files but keeps ignored ones.
 .ci-cache/
+
+# The omp plugin's installed dependencies; bun.lock is the record.
+omp-plugin/node_modules/

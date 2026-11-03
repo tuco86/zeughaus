@@ -1,10 +1,33 @@
 {
-  "name": "zeughaus-ci",
-  "version": "0.14.0",
-  "private": true,
+  "name": "@tuco86/zeughaus-omp",
+  "version": "0.15.0",
+  "description": "zeughaus-ci in omp: the checkout's CI at session start, push watching, plans stored on their tickets, the CI skill, over the CI's weida API",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "files": [
+    "src/agent-status.ts",
+    "src/ask.ts",
+    "src/calls.ts",
+    "src/client.ts",
+    "src/main.ts",
+    "src/plan-mode.ts",
+    "src/protocol.ts",
+    "src/secrets.ts",
+    "src/session-env.ts",
+    "src/shell.ts",
+    "src/text.ts",
+    "src/tickets.ts",
+    "skills/"
+  ],
   "omp": {
     "extensions": [
       "./src/main.ts"
     ]
+  },
+  "dependencies": {
+    "@tuco86/weida": "0.1.0-alpha.11"
+  },
+  "publishConfig": {
+    "registry": "https://git.doodleshnookie.net/api/packages/tuco86/npm/"
   }
 }

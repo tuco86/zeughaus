@@ -1,6 +1,8 @@
 // What the environment says about the kind of session this omp runs: a master's, a plan
 // session's, a session the CI opened.
 
+import type { ClaimHolder } from "./protocol.ts";
+
 /** `ZEUGHAUS_PLAN=<repo>#<n>`: the plan a master started this session on. */
 export function masterPlan(): { repo: string; number: number } | undefined {
   const m = /^([a-z0-9][a-z0-9-]*)#([1-9][0-9]*)$/.exec(process.env.ZEUGHAUS_PLAN ?? "");
@@ -21,10 +23,16 @@ export function sessionId(): number | undefined {
   return /^[1-9][0-9]*$/.test(id) ? Number(id) : undefined;
 }
 
-/** `ZEUGHAUS_RUNNER`, `ZEUGHAUS_TERMINAL`: the zeughaus terminal this omp runs in, which holds its claims. */
-export function claimHolder(): { runner: string; terminal: number } | undefined {
+/**
+ * `ZEUGHAUS_RUNNER`, `ZEUGHAUS_TERMINAL`: the zeughaus terminal this omp runs in, which holds its
+ * claims, with the CI session (`ZEUGHAUS_SESSION`) running in it, if any.
+ */
+export function claimHolder(): ClaimHolder | undefined {
   const runner = process.env.ZEUGHAUS_RUNNER ?? "";
   const terminal = process.env.ZEUGHAUS_TERMINAL ?? "";
   if (!/^[a-z0-9][a-z0-9-]*$/.test(runner) || !/^[0-9]+$/.test(terminal)) return undefined;
-  return { runner, terminal: Number(terminal) };
+  const session = process.env.ZEUGHAUS_SESSION ?? "";
+  return /^[0-9]+$/.test(session)
+    ? { runner, terminal: Number(terminal), session: Number(session) }
+    : { runner, terminal: Number(terminal) };
 }

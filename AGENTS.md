@@ -46,7 +46,7 @@ zeughaus-theme/        # the editor's theme: iced theme paired with a terminal c
 vm/win11/              # scripts: headless Windows 11 guest under QEMU/KVM, the service runner's `win11` machine (boot, toolchain, per-boot prepare.ps1); toolchain.ps1 also provisions a Windows runner host
 deploy/                # bootstrap.sh (downloads, checks and runs a build's `install <profile>`), setup-service-runner.sh, setup-sadala.sh, setup-windows.sh (the one-time part of a host); systemd user unit for the runner, desktop entry template, macos-app.sh and the bundle's Info.plist; runner/ (unit, ssh config, enlist.toml.example) and ci/ (CI unit, ci.toml.example, openbao.sh), macos/ (launchd agent), windows/ (host setup, bootstrap.ps1, maintain.toml)
 third_party/           # its own workspace: wezterm's terminal crates at the pinned revision, published as zeughaus-* packages
-omp-plugin/            # the zeughaus-ci omp plugin (skill + extension); catalog in .omp-plugin/marketplace.json; bump its three versions together
+omp-plugin/            # the zeughaus-ci omp plugin (skill + extension), published as the npm package @tuco86/zeughaus-omp; it asks the CI over weida-js; fixtures/ holds the texts it shares with zeughaus-runner
 ```
 
 weida (the QUIC transport) is a git dependency on its public GitHub mirror,
@@ -277,27 +277,37 @@ overdue <repo> <number> <job>`, `ci session [--json] <id>`, `ci claim
 ticket|pipeline <n>]`, `ci responsible [--json] <repo> <n>`, `ci ask
 <file>` and `ci ask-close` answer
 the same for a script (exit 3: the origin is no repository of `ci.toml`;
-2: no CI, no answer or a refusal); the
-`zeughaus-ci` omp plugin in `omp-plugin/` uses them for its session
-context, its push watch, `submit_plan` and `/zeughaus save` (`ci overdue`
-prints the late report of one running job, which the push watch sends at
-each multiple of the job's expected time).
+2: no CI, no answer or a refusal). The
+`zeughaus-ci` omp plugin in `omp-plugin/` asks the same questions itself:
+it speaks the CI's `/ci` API over `@tuco86/weida` (`client.ts`, dialled as
+`mcp` does, with the state directory's `client.pem`) for its session
+context, its push watch, claims, asks, `submit_plan` and `/zeughaus save`,
+and renders what these commands print around the replies (`text.ts`; the
+cases in `omp-plugin/fixtures/` hold both sides to the same text, and a
+change to one of those Rust texts changes the fixture and the port). It
+runs `zeughaus-runner` only for `claude login|status`. The package is
+`@tuco86/zeughaus-omp` in the Forgejo npm registry: a tag
+`omp-plugin-v<version>` (equal to `omp-plugin/package.json`) publishes it
+(channel `omp-plugin`, jobs `check-omp-plugin` and `publish-omp-plugin`
+with `FORGEJO_NPM_TOKEN`); the dotfiles install it on every unix host and
+keep it at the newest version. It does not run on Windows (no weida-js
+prebuild there).
 
 Asks: in a zeughaus terminal the omp plugin shadows omp's `ask`. The
-native dialog stays open while `ci ask <file>` (`{"repo", "doc",
-"questions"}`) posts the same questions for the terminal (`AskPost`) and
-polls them every 2 s (`AskPoll`, which renews them); the CI keeps open asks
-in memory only (`Book.asks`) and drops one not polled for 30 s, and a
+native dialog stays open while the plugin posts the same questions for the
+terminal (`AskPost`, with the repository and ticket the session works on)
+and polls them every 2 s (`AskPoll`, which renews them); the CI keeps open
+asks in memory only (`Book.asks`) and drops one not polled for 30 s, and a
 restarted CI is answered by posting again. An editor shows an open ask in
 Needs you (beside the agent's docked terminal when the agent has a row)
 and in the popout of the ticket the asking session works on; its `Send`
-answers it (`AskAnswer`), and `ci ask` prints `{"replies": [..]}` for the
-plugin, which closes the terminal's dialog and returns what omp's own ask
-would have. An answer in the terminal first kills `ci ask` and drops the
-ask (`ci ask-close`). omp's plan review in a zeughaus terminal whose
-checkout the CI builds (not in a master) stores the plan as a ticket in
-review, as `submit_plan` does, and ends the session; a failure to store it
-leaves omp's own review open.
+answers it (`AskAnswer`), and the plugin closes the terminal's dialog and
+returns what omp's own ask would have. An answer in the terminal first
+stops the polling and drops the ask (`AskClose`); `ci ask <file>` and `ci
+ask-close` do the same for a script. omp's plan review in a zeughaus
+terminal whose checkout the CI builds (not in a master) stores the plan as
+a ticket in review, as `submit_plan` does, and ends the session; a failure
+to store it leaves omp's own review open.
 
 Claims: the CI keeps who is responsible for a ticket or a pipeline as
 leased claims in `<state-dir>/ci/sessions.json` (`Book.claims`). A claim

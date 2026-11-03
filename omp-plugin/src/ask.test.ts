@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { type AskQuestion, askQuestions, askResult, parseReplies } from "./ask.ts";
+import { type AskQuestion, askQuestions, askResult } from "./ask.ts";
 
 const db: AskQuestion = {
   id: "db",
@@ -76,21 +76,6 @@ describe("askResult", () => {
         },
       ],
     });
-  });
-});
-
-describe("parseReplies", () => {
-  test("the line ci ask prints", () => {
-    expect(parseReplies('{"replies":[{"id":"db","selected":["Postgres"]}]}\n')).toEqual([
-      { id: "db", selected: ["Postgres"] },
-    ]);
-  });
-
-  test("malformed output is no answer", () => {
-    expect(parseReplies("")).toBeUndefined();
-    expect(parseReplies("closed\n")).toBeUndefined();
-    expect(parseReplies('{"replies":[{"id":"db"}]}')).toBeUndefined();
-    expect(parseReplies('{"replies":{"id":"db","selected":[]}}')).toBeUndefined();
   });
 });
 

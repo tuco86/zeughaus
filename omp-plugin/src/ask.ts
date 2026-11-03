@@ -1,5 +1,5 @@
-// omp's `ask`, forwarded to zeughaus: the questions as `zeughaus-runner ci ask` posts them, its
-// answer, and the tool result omp's own ask gives for the same answer, so that an answer from the
+// omp's `ask`, forwarded to zeughaus: the questions as the CI's `ask_post` carries them, and the
+// tool result omp's own ask gives for the answer an editor sends, so that an answer from the
 // editor reads to the agent like one from the terminal.
 
 export interface AskOption {
@@ -54,33 +54,6 @@ export function askQuestions(params: Record<string, unknown>): AskQuestion[] | u
     const index = typeof recommended === "number" && Number.isInteger(recommended) && recommended >= 0;
     return index ? q : rest;
   });
-}
-
-function isReply(value: unknown): value is AskReply {
-  return (
-    isObject(value) &&
-    typeof value.id === "string" &&
-    Array.isArray(value.selected) &&
-    value.selected.every((label) => typeof label === "string") &&
-    (value.custom === undefined || typeof value.custom === "string")
-  );
-}
-
-/** The replies `zeughaus-runner ci ask` printed (`{"replies":[...]}`); `undefined` for anything else. */
-export function parseReplies(stdout: string): AskReply[] | undefined {
-  try {
-    const parsed: unknown = JSON.parse(stdout);
-    if (!isObject(parsed) || !Array.isArray(parsed.replies) || !parsed.replies.every(isReply)) {
-      return undefined;
-    }
-    return parsed.replies.map((r) => ({
-      id: r.id,
-      selected: r.selected,
-      ...(r.custom !== undefined ? { custom: r.custom } : {}),
-    }));
-  } catch {
-    return undefined;
-  }
 }
 
 interface Answered {

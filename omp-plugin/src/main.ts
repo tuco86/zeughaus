@@ -1,28 +1,28 @@
 // The zeughaus-ci plugin for omp. In a checkout that zeughaus-ci builds it
 //
-// - asks the CI at session start (`zeughaus-runner ci repo --json`) and puts the answer into the
+// - asks the CI at session start which repository the checkout is and puts the answer into the
 //   system prompt as a <zeughaus-ci> block and into the status line;
-// - after a `git push` of this checkout polls `zeughaus-runner ci find --json` and reports the
-//   first failed job of the pushed commit's pipeline into the session, each multiple of its
-//   expected time a running job reaches, or its success;
+// - after a `git push` of this checkout polls the CI for the pushed commit's pipeline and reports
+//   its first failed job into the session, each multiple of its expected time a running job
+//   reaches, or its success;
 // - answers /zeughaus with the current state, and /zeughaus save stores the session's plan in
-//   the CI as a ticket in review (`zeughaus-runner ci plan-write`) and starts a fresh session;
+//   the CI as a ticket in review and starts a fresh session;
 // - claims the tickets a plan includes when the plan is executed from omp's own review;
 // - in a session a master started on a ticket (`ZEUGHAUS_PLAN=<repo>#<n>`), ends the session
 //   once that ticket is done and the agent is idle, so the master goes on with the next one;
 // - in a session `zeughaus-runner plan` started (`ZEUGHAUS_PLAN_SESSION=<repo>`, with
 //   `ZEUGHAUS_TICKET=<n>` for a ticket), supplies the plan mode: its prompt, a read-only working
 //   tree and a turn-end reminder; the `submit_plan` tool stores the plan on the ticket for the
-//   user's review in zeughaus (`ci plan-write`, with this session's file, which a Refine
-//   resumes) and ends the session.
+//   user's review in zeughaus (with this session's file, which a Refine resumes) and ends the
+//   session.
 // - in a zeughaus terminal (`ZEUGHAUS_TERMINAL`), reports the main agent's state (idle, working,
 //   waiting, asking, review, failed) to the runner, which shows it on the tab (agent-status.ts).
 // - in a zeughaus terminal (`ZEUGHAUS_RUNNER`, `ZEUGHAUS_TERMINAL`), holds claims in the CI for
 //   that terminal: a plan session claims its ticket (and is told who has it when another
 //   session does), a plan executed from its review claims the tickets it includes, the push
-//   watch claims the pipeline it watches; a heartbeat (`ci renew`) keeps them, and the
-//   session's end releases them. A failure the watch reports names who is responsible for it
-//   when that is another session.
+//   watch claims the pipeline it watches; a heartbeat keeps them, and the session's end
+//   releases them. A failure the watch reports names who is responsible for it when that is
+//   another session.
 // - resolves `${secret:hannes/omp/<doc...>/<FIELD>}` placeholders in bash commands when they run
 //   (secrets.ts), and offers the `secrets` tool, which lists secret documents and field names.
 // - draws `#12` and `#weida-12` in replies as links of `zeughaus-ticket:`; in a zeughaus terminal
@@ -30,26 +30,34 @@
 // - adds `Ticket: <repo>#<n>` and `Omp-Session: <id>` trailers to the `git commit`s of a session
 //   that works on a ticket (shell.ts).
 // - in a zeughaus terminal, shadows omp's `ask`: the native dialog stays open in the terminal while
-//   the same questions are posted to the CI (`zeughaus-runner ci ask`), where the editor shows them
-//   in Needs you and the ticket's popout; the first answer wins (ask.ts).
+//   the same questions are posted to the CI, where the editor shows them in Needs you and the
+//   ticket's popout; the first answer wins (ask.ts).
 // - in a zeughaus terminal whose checkout the CI builds (masters aside), hands omp's plan review to
 //   zeughaus: the plan is stored as a ticket in review, as `submit_plan` does, and the session ends;
 //   the review happens in the ticket's popout, and its Refine resumes this session.
+//
+// Every exchange with the CI is a request on its weida API (`/ci`, client.ts and calls.ts), made
+// as this machine's editor (`client.pem` of the zeughaus state directory); only git, get-secret
+// and `zeughaus-runner claude` run as programs.
 //
 // The factory only registers: `omp plugin install` runs it against a throwaway API, so it must
 // do no work at load. Every handler skips subagents, which have prompts of their own, except the
 // read-only guard of a plan session, the secret placeholders and the commit trailers. Nothing here
 // may reject out of a detached promise or a timer: omp ends the whole session on it.
 
-import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { agentReporter } from "./agent-status.ts";
-import { type AskReply, askQuestions, askResult, parseReplies } from "./ask.ts";
+import { type AskReply, askQuestions, askResult } from "./ask.ts";
+import * as calls from "./calls.ts";
+import { CiClient } from "./client.ts";
 import { planModePrompt } from "./plan-mode.ts";
+import { type JobView, type PipelineView, type RepoView, withoutCredentials } from "./protocol.ts";
 import { rewrite } from "./secrets.ts";
 import { claimHolder, masterPlan, planSession, sessionId } from "./session-env.ts";
 import { branchPushes, withTrailers } from "./shell.ts";
+import { includesNamed } from "./text.ts";
 import { LINK_SCHEME, type TicketRef, linkTickets, parseTicketLink, showSequence } from "./tickets.ts";
 
 // The parts of omp's extension API this plugin uses; omp ships no type package to import.
@@ -181,31 +189,6 @@ interface ToolDefinition {
   ): Promise<ToolResult>;
 }
 
-// What `zeughaus-runner ci` prints (zeughaus-link/src/ci.rs); only the fields used here.
-interface JobView {
-  name: string;
-  place: string;
-  status: string;
-  note?: string;
-  code?: number | null;
-  cause?: string | null;
-  excerpt?: string | null;
-  started?: number | null;
-  expected_secs?: number | null;
-}
-interface PipelineView {
-  number: number;
-  channel: string;
-  status: string;
-  note?: string;
-  jobs: JobView[];
-}
-interface RepoView {
-  name: string;
-  branch: string;
-  head?: { status: string } | null;
-}
-
 type CiContext =
   | { kind: "none" }
   | { kind: "repo"; root: string; view: RepoView; text: string; head: string }
@@ -257,9 +240,8 @@ const ASK_DESCRIPTION =
   "Prompts the user for one or more option-picker or free-form answers: questions[] of { id, question, options[{ label, description?, preview? }], header?, multi?, recommended? (0-based index) }.";
 const NOT_INTERACTIVE = "Ask tool requires interactive mode";
 
-// Whether `ask` is shadowed in this process, and the number of the last ask file written.
+// Whether `ask` is shadowed in this process.
 let askShadowed = false;
-let askSeq = 0;
 
 /** Runs a program; one that cannot start (not installed) answers like a shell, with 127. */
 async function exec(
@@ -284,49 +266,31 @@ function failure(r: Exec, what: string): string {
   return line?.trim() || (r.killed ? `${what} timed out` : `${RUNNER} exited with ${r.code}`);
 }
 
-function parseRepo(stdout: string): { repo: RepoView; text: string } | undefined {
-  try {
-    const v = JSON.parse(stdout) as { repo?: RepoView; text?: unknown };
-    const { repo, text } = v;
-    if (repo && typeof repo.name === "string" && typeof repo.branch === "string") {
-      if (typeof text === "string") return { repo, text };
-    }
-  } catch {
-    // Not JSON: the caller reports an unreadable answer.
-  }
-  return undefined;
-}
-
-/** The pipeline, `null` when the CI has none for the commit, `undefined` for an unreadable answer. */
-function parsePipeline(stdout: string): PipelineView | null | undefined {
-  try {
-    const v = JSON.parse(stdout) as PipelineView | null;
-    if (v === null) return null;
-    if (typeof v.number === "number" && typeof v.status === "string" && Array.isArray(v.jobs)) {
-      return v;
-    }
-  } catch {
-    // Not JSON: the caller counts a failed poll.
-  }
-  return undefined;
-}
+const reason = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 /** What the CI says about the checkout of `cwd`; never rejects. */
-async function loadContext(pi: Pi, cwd: string): Promise<CiContext> {
+async function loadContext(pi: Pi, ci: calls.Ci, cwd: string): Promise<CiContext> {
   const top = await exec(pi, "git", ["rev-parse", "--show-toplevel"], cwd, GIT_TIMEOUT_MS);
   const root = top.stdout.trim();
   if (top.code !== 0 || root === "" || !existsSync(join(root, ".zeughaus-ci"))) {
     return { kind: "none" };
   }
-  const r = await exec(pi, RUNNER, ["ci", "repo", "--json", root], root, CONTEXT_TIMEOUT_MS);
-  if (r.code === 3) return { kind: "unknown", root };
-  if (r.code !== 0) return { kind: "unreachable", root, reason: failure(r, "ci repo") };
-  const answer = parseRepo(r.stdout);
-  if (!answer) {
-    return { kind: "unreachable", root, reason: `${RUNNER} gave an unreadable answer` };
+  const remote = await exec(pi, "git", ["remote", "get-url", "origin"], root, GIT_TIMEOUT_MS);
+  const origin = remote.code === 0 ? withoutCredentials(remote.stdout.trim()) : "";
+  if (origin === "") {
+    return { kind: "unreachable", root, reason: `${root} has no origin remote, so no CI repository can be named` };
   }
-  const head = answer.repo.head?.status ?? "unbuilt";
-  return { kind: "repo", root, view: answer.repo, text: answer.text.trim(), head };
+  // `--verify --quiet`: a checkout without a commit is an answer, not git's complaint.
+  const rev = await exec(pi, "git", ["rev-parse", "--verify", "--quiet", "HEAD"], root, GIT_TIMEOUT_MS);
+  const head = rev.code === 0 && rev.stdout.trim() !== "" ? rev.stdout.trim() : null;
+  try {
+    const answer = await calls.repoAnswer(ci, origin, head, AbortSignal.timeout(CONTEXT_TIMEOUT_MS));
+    if (!answer) return { kind: "unknown", root };
+    const status = answer.repo.head?.status ?? "unbuilt";
+    return { kind: "repo", root, view: answer.repo, text: answer.text.trim(), head: status };
+  } catch (e) {
+    return { kind: "unreachable", root, reason: reason(e) };
+  }
 }
 
 const wrap = (...lines: string[]): string => [OPEN, ...lines, CLOSE].join("\n");
@@ -477,20 +441,12 @@ function newestPlan(ctx: Ctx): string | undefined {
 // The <zeughaus-session> block, asked for once per session.
 let sessionBlock: Promise<string> | undefined;
 
-/** What `zeughaus-runner ci session <id>` says about this session and the runners around it. */
-async function describeSession(pi: Pi, id: number, cwd: string): Promise<string> {
-  const r = await exec(pi, RUNNER, ["ci", "session", String(id)], cwd, CONTEXT_TIMEOUT_MS);
-  const text = r.code === 0 ? r.stdout.trim() : `zeughaus session ${id}: ${failure(r, "ci session")}`;
+/** What the CI says about session `id` and the runners around it, as a prompt block. */
+async function sessionPrompt(ci: calls.Ci, id: number): Promise<string> {
+  const text = await calls
+    .describeSession(ci, id, AbortSignal.timeout(CONTEXT_TIMEOUT_MS))
+    .then((described) => described.trim(), (e: unknown) => `zeughaus session ${id}: ${reason(e)}`);
   return `<zeughaus-session>\n${text}\n</zeughaus-session>`;
-}
-
-/** The tickets the `Includes:` line near a plan's top names, as the CI reads them. */
-function includesNamed(body: string): number[] {
-  const line = body
-    .split("\n")
-    .slice(0, 20)
-    .find((l) => l.startsWith("Includes:"));
-  return line ? [...line.matchAll(/#(\d+)/g)].map((m) => Number(m[1])) : [];
 }
 
 /**
@@ -521,17 +477,6 @@ function writesTree(tool: string, input: Record<string, unknown>): boolean {
   return false;
 }
 
-/** One field of a JSON object a `zeughaus-runner ci --json` command printed; `undefined` else. */
-function jsonField(stdout: string, key: string): unknown {
-  let value: unknown;
-  try {
-    value = JSON.parse(stdout);
-  } catch {
-    return undefined;
-  }
-  return value !== null && typeof value === "object" ? Reflect.get(value, key) : undefined;
-}
-
 // ---- The extension --------------------------------------------------------------------------
 
 export default function zeughausCi(pi: Pi): void {
@@ -557,10 +502,14 @@ export default function zeughausCi(pi: Pi): void {
   let mainSession: string | undefined;
   // The tickets a plan executed from omp's own review includes; the next such plan replaces them.
   let includedTickets: TicketRef[] = [];
+  // The CI's weida API; dials nothing until the first question.
+  const ci = new CiClient();
 
   /** Releases every claim of this terminal; nothing to do outside a zeughaus terminal. */
-  const releaseClaims = (cwd: string): void => {
-    if (claimHolder()) void exec(pi, RUNNER, ["ci", "release"], cwd, FIND_TIMEOUT_MS);
+  const releaseClaims = async (): Promise<void> => {
+    const holder = claimHolder();
+    if (!holder) return;
+    await calls.releaseClaims(ci, holder, null, AbortSignal.timeout(FIND_TIMEOUT_MS)).catch(() => undefined);
   };
 
   const isMain = (ctx: Ctx): boolean => !ctx.agent || ctx.agent.kind === "main";
@@ -613,7 +562,7 @@ export default function zeughausCi(pi: Pi): void {
   });
 
   const contextFor = (cwd: string): Promise<CiContext> => {
-    if (!loaded || loaded.cwd !== cwd) loaded = { cwd, context: loadContext(pi, cwd) };
+    if (!loaded || loaded.cwd !== cwd) loaded = { cwd, context: loadContext(pi, ci, cwd) };
     return loaded.context;
   };
 
@@ -650,13 +599,12 @@ export default function zeughausCi(pi: Pi): void {
     showStatus(w.ctx);
     if (failed) {
       let message = failedMessage(w.name, sha7, p, failed);
-      const args = ["ci", "responsible", "--json", w.name, String(p.number)];
-      const r = await exec(pi, RUNNER, args, w.root, FIND_TIMEOUT_MS);
+      const responsible = await calls
+        .whoIsResponsible(ci, w.name, p.number, claimHolder(), AbortSignal.timeout(FIND_TIMEOUT_MS))
+        .catch(() => undefined);
       if (watch !== w) return;
-      const text = r.code === 0 ? jsonField(r.stdout, "text") : undefined;
-      const claim = r.code === 0 ? jsonField(r.stdout, "claim") : undefined;
-      if (jsonField(r.stdout, "ours") === false && claim != null && typeof text === "string") {
-        message += `\nResponsible: ${text}. Leave this fix to that session and ci_wait for the channel's next pipeline instead of fixing it in parallel.`;
+      if (responsible && !responsible.ours && responsible.claim) {
+        message += `\nResponsible: ${responsible.text}. Leave this fix to that session and ci_wait for the channel's next pipeline instead of fixing it in parallel.`;
       }
       send(message, "aside", true);
       w.ctx.ui.notify(message.split("\n")[0] ?? message, "error");
@@ -687,15 +635,14 @@ export default function zeughausCi(pi: Pi): void {
       const multiple = Math.floor(elapsed / expected);
       if (multiple < 1 || multiple <= (w.late.get(job.name) ?? 0)) continue;
       w.late.set(job.name, multiple);
-      const args = ["ci", "overdue", w.name, String(p.number), job.name];
-      const r = await exec(pi, RUNNER, args, w.root, FIND_TIMEOUT_MS);
+      const overdue = await calls
+        .overdueReport(ci, w.name, p.number, job.name, AbortSignal.timeout(FIND_TIMEOUT_MS))
+        .catch(() => undefined);
       if (watch !== w) return;
       const head = `zeughaus-ci: ${w.name} #${p.number} (${sha7}, ${p.channel}): ${job.name} runs ${multiple}x its expected time`;
-      // An installed runner from before `ci overdue` answers with usage; say it without it.
       const body =
-        r.code === 0 && r.stdout.trim() !== ""
-          ? r.stdout.trimEnd()
-          : `${job.name} on ${job.place} runs ${elapsed} s, ${multiple}x its expected ${expected} s. ci_log number=${p.number} job=${job.name} tail=20 shows its last lines, ci_status what else runs there; ci_cancel number=${p.number} stops it, ci_wait number=${p.number} waits on.`;
+        overdue?.trimEnd() ||
+        `${job.name} on ${job.place} runs ${elapsed} s, ${multiple}x its expected ${expected} s. ci_log number=${p.number} job=${job.name} tail=20 shows its last lines, ci_status what else runs there; ci_cancel number=${p.number} stops it, ci_wait number=${p.number} waits on.`;
       send(`${head}\n${body}`, "aside", true);
       w.ctx.ui.notify(head, "warning");
     }
@@ -709,25 +656,27 @@ export default function zeughausCi(pi: Pi): void {
         endWatch(w, false);
         return;
       }
-      const args = ["ci", "find", "--json", w.name, w.sha];
-      const r = await exec(pi, RUNNER, args, w.root, FIND_TIMEOUT_MS);
-      if (watch !== w) return;
       const sha7 = w.sha.slice(0, 7);
-      const p = r.code === 0 ? parsePipeline(r.stdout) : undefined;
-      if (p === undefined) {
+      let p: PipelineView | null;
+      try {
+        p = await calls.findPipeline(ci, w.name, w.sha, AbortSignal.timeout(FIND_TIMEOUT_MS));
+      } catch (e) {
+        if (watch !== w) return;
         w.failures += 1;
         if (w.failures >= MAX_FIND_FAILURES) {
-          const why = r.code === 0 ? "unreadable answer" : failure(r, "ci find");
-          w.ctx.ui.notify(`zeughaus-ci: cannot watch ${sha7}: ${why}`, "warning");
+          w.ctx.ui.notify(`zeughaus-ci: cannot watch ${sha7}: ${reason(e)}`, "warning");
           endWatch(w, false);
         }
         return;
       }
+      if (watch !== w) return;
       w.failures = 0;
       if (p !== null) {
-        if (!w.claimed) {
+        const holder = claimHolder();
+        if (!w.claimed && holder) {
           w.claimed = true;
-          void exec(pi, RUNNER, ["ci", "claim", w.name, "pipeline", String(p.number)], w.root, FIND_TIMEOUT_MS);
+          const subject = { on: "pipeline" as const, repo: w.name, number: p.number };
+          void calls.takeClaim(ci, subject, holder, AbortSignal.timeout(FIND_TIMEOUT_MS)).catch(() => undefined);
         }
         await report(w, p);
         if (watch === w) await reportLate(w, p);
@@ -774,10 +723,8 @@ export default function zeughausCi(pi: Pi): void {
       if (m.busy || master !== m) return;
       m.busy = true;
       try {
-        const args = ["ci", "doc", "--json", plan.repo, String(plan.number)];
-        const r = await exec(pi, RUNNER, args, ctx.cwd, FIND_TIMEOUT_MS);
-        if (r.code !== 0 || master !== m) return;
-        const state = jsonField(r.stdout, "state");
+        const state = await calls.docState(ci, plan.repo, plan.number, AbortSignal.timeout(FIND_TIMEOUT_MS));
+        if (master !== m) return;
         if (state !== "done" || !ctx.isIdle()) return;
         ctx.clearTimer(m.timer);
         master = undefined;
@@ -795,30 +742,12 @@ export default function zeughausCi(pi: Pi): void {
    * Stores the plan at `path` as a ticket in review (`ticket` when a plan session works on
    * one), with this session's file for a Refine to resume; its number. Throws why it failed.
    */
-  const storePlan = async (
-    ctx: Ctx,
-    repo: string,
-    path: string,
-    ticket: number | undefined,
-    cwd: string,
-  ): Promise<number> => {
-    const session = ompSession(ctx);
-    const args = [
-      "ci",
-      "plan-write",
-      "--json",
-      ...(ticket !== undefined ? ["--ticket", String(ticket)] : []),
-      ...(session ? ["--omp-session", session] : []),
-      repo,
-      path,
-    ];
-    const r = await exec(pi, RUNNER, args, cwd, CONTEXT_TIMEOUT_MS);
-    const number = r.code === 0 ? jsonField(r.stdout, "number") : undefined;
-    if (typeof number !== "number") {
-      throw new Error(r.code === 0 ? "unreadable answer" : failure(r, "ci plan-write"));
-    }
-    return number;
-  };
+  const storePlan = (ctx: Ctx, repo: string, path: string, ticket: number | undefined): Promise<number> =>
+    calls.planWrite(
+      ci,
+      { repo, ticket: ticket ?? null, path, ompSession: ompSession(ctx) ?? null },
+      AbortSignal.timeout(CONTEXT_TIMEOUT_MS),
+    );
 
   /** Ends the session once the current tool call or event handler has returned. */
   const endSession = (ctx: Ctx): void => {
@@ -848,62 +777,47 @@ export default function zeughausCi(pi: Pi): void {
     ctx: Ctx,
   ): Promise<ToolResult> => {
     const questions = isMain(ctx) ? askQuestions(params) : undefined;
-    if (!questions) {
+    const holder = claimHolder();
+    if (!questions || !holder) {
       if (!ctx.invokeTool) throw new Error(NOT_INTERACTIVE);
       return ctx.invokeTool(params);
     }
-    const file = join(tmpdir(), `zeughaus-ask-${process.pid}-${++askSeq}.json`);
-    try {
-      const { repo, doc } = await askTarget(ctx);
-      writeFileSync(file, JSON.stringify({ repo, doc, questions }), { mode: 0o600 });
-      const remoteStop = new AbortController();
-      const localStop = new AbortController();
-      const outer = signal ? [signal] : [];
-      const remote: Promise<AskReply[] | undefined> = pi
-        .exec(RUNNER, ["ci", "ask", file], {
-          cwd: ctx.cwd,
-          signal: AbortSignal.any([remoteStop.signal, ...outer]),
-        })
-        .then(
-          (r) => (r.code === 0 ? parseReplies(r.stdout) : undefined),
-          () => undefined,
-        );
-      const local = ctx.invokeTool?.(params, { signal: AbortSignal.any([localStop.signal, ...outer]) });
-      if (!local) {
-        const replies = await remote;
-        if (!replies) throw new Error(NOT_INTERACTIVE);
-        return askResult(questions, replies);
-      }
-      type Outcome =
-        | { from: "remote"; replies: AskReply[] }
-        | { from: "local"; result: ToolResult }
-        | { from: "local"; error: unknown };
-      // A remote without an answer leaves the race to the terminal.
-      const fromRemote = remote.then((replies) =>
-        replies ? ({ from: "remote", replies } as const) : new Promise<never>(() => undefined),
-      );
-      const fromLocal = local.then(
-        (result) => ({ from: "local", result }) as const,
-        (error: unknown) => ({ from: "local", error }) as const,
-      );
-      const first: Outcome = await Promise.race([fromRemote, fromLocal]);
-      if (first.from === "remote") {
-        localStop.abort();
-        await local.catch(() => undefined);
-        ctx.ui.notify("answered in zeughaus", "info");
-        return askResult(questions, first.replies);
-      }
-      remoteStop.abort();
-      void exec(pi, RUNNER, ["ci", "ask-close"], ctx.cwd, FIND_TIMEOUT_MS);
-      if ("error" in first) throw first.error;
-      return first.result;
-    } finally {
-      try {
-        unlinkSync(file);
-      } catch {
-        // Never written, or gone already.
-      }
+    const { repo, doc } = await askTarget(ctx);
+    const remoteStop = new AbortController();
+    const localStop = new AbortController();
+    const outer = signal ? [signal] : [];
+    const remote: Promise<AskReply[] | undefined> = calls
+      .askInZeughaus(ci, holder, { repo, doc, questions }, AbortSignal.any([remoteStop.signal, ...outer]))
+      .catch(() => undefined);
+    const local = ctx.invokeTool?.(params, { signal: AbortSignal.any([localStop.signal, ...outer]) });
+    if (!local) {
+      const replies = await remote;
+      if (!replies) throw new Error(NOT_INTERACTIVE);
+      return askResult(questions, replies);
     }
+    type Outcome =
+      | { from: "remote"; replies: AskReply[] }
+      | { from: "local"; result: ToolResult }
+      | { from: "local"; error: unknown };
+    // A remote without an answer leaves the race to the terminal.
+    const fromRemote = remote.then((replies) =>
+      replies ? ({ from: "remote", replies } as const) : new Promise<never>(() => undefined),
+    );
+    const fromLocal = local.then(
+      (result) => ({ from: "local", result }) as const,
+      (error: unknown) => ({ from: "local", error }) as const,
+    );
+    const first: Outcome = await Promise.race([fromRemote, fromLocal]);
+    if (first.from === "remote") {
+      localStop.abort();
+      await local.catch(() => undefined);
+      ctx.ui.notify("answered in zeughaus", "info");
+      return askResult(questions, first.replies);
+    }
+    remoteStop.abort();
+    void calls.closeAsk(ci, holder, AbortSignal.timeout(FIND_TIMEOUT_MS)).catch(() => undefined);
+    if ("error" in first) throw first.error;
+    return first.result;
   };
 
   /** Shadows omp's ask with the forwarding one, once per process; without a native ask, none. */
@@ -952,25 +866,30 @@ export default function zeughausCi(pi: Pi): void {
     const doc = plan?.number ?? session?.ticket ?? null;
     agent.setRepo(plan?.repo ?? session?.repo ?? basename(ctx.cwd), doc);
     agent.report(ctx, "idle");
-    if (claimHolder()) {
+    const holder = claimHolder();
+    if (holder) {
       if (!renewing) {
         renewing = true;
-        ctx.setInterval(() => void exec(pi, RUNNER, ["ci", "renew"], ctx.cwd, FIND_TIMEOUT_MS), CLAIM_RENEW_MS);
+        ctx.setInterval(
+          () => void calls.renewClaims(ci, holder, AbortSignal.timeout(FIND_TIMEOUT_MS)).catch(() => undefined),
+          CLAIM_RENEW_MS,
+        );
       }
       const ticket = session?.ticket;
       if (session && ticket !== undefined) {
-        void (async () => {
-          const args = ["ci", "claim", "--json", session.repo, "ticket", String(ticket)];
-          const r = await exec(pi, RUNNER, args, ctx.cwd, FIND_TIMEOUT_MS);
-          const text = jsonField(r.stdout, "text");
-          if (r.code !== 0 || jsonField(r.stdout, "ours") !== false || typeof text !== "string") return;
-          const line = `zeughaus-ci: ${text}. Leave this ticket to that session; plan something else or ask the user.`;
-          send(line, "aside", true);
-          ctx.ui.notify(line, "warning");
-        })().catch(() => undefined);
+        const subject = { on: "ticket" as const, repo: session.repo, number: ticket };
+        void calls
+          .takeClaim(ci, subject, holder, AbortSignal.timeout(FIND_TIMEOUT_MS))
+          .then(({ ours, text }) => {
+            if (ours) return;
+            const line = `zeughaus-ci: ${text}. Leave this ticket to that session; plan something else or ask the user.`;
+            send(line, "aside", true);
+            ctx.ui.notify(line, "warning");
+          })
+          .catch(() => undefined);
       }
     }
-    if (claimHolder() && !askShadowed) shadowAsk();
+    if (holder && !askShadowed) shadowAsk();
     void contextFor(ctx.cwd)
       .then((c) => {
         if (c.kind === "repo") agent.setRepo(c.view.name, doc);
@@ -989,16 +908,16 @@ export default function zeughausCi(pi: Pi): void {
     if (!claimHolder() || masterPlan() || !path) return;
     void (async () => {
       const session = planSession();
-      let target: { repo: string; ticket: number | undefined; cwd: string };
+      let target: { repo: string; ticket: number | undefined };
       if (session) {
-        target = { repo: session.repo, ticket: session.ticket, cwd: ctx.cwd };
+        target = { repo: session.repo, ticket: session.ticket };
       } else {
         const c = await contextFor(ctx.cwd);
         if (c.kind !== "repo") return;
-        target = { repo: c.view.name, ticket: undefined, cwd: c.root };
+        target = { repo: c.view.name, ticket: undefined };
       }
       try {
-        const n = await storePlan(ctx, target.repo, path, target.ticket, target.cwd);
+        const n = await storePlan(ctx, target.repo, path, target.ticket);
         decided = true;
         planFile = undefined;
         ctx.ui.notify(`stored plan as ticket #${n} for review in zeughaus; ending this session`, "info");
@@ -1020,11 +939,19 @@ export default function zeughausCi(pi: Pi): void {
     void (async () => {
       const c = await contextFor(ctx.cwd);
       if (c.kind !== "repo") return;
-      const included = includesNamed(readFileSync(path, "utf8"));
+      let included: number[];
+      try {
+        included = includesNamed(readFileSync(path, "utf8"));
+      } catch {
+        // A malformed Includes line claims nothing.
+        included = [];
+      }
       includedTickets = included.map((n) => ({ repo: c.view.name, number: n }));
-      if (!claimHolder()) return;
+      const holder = claimHolder();
+      if (!holder) return;
       for (const n of included) {
-        await exec(pi, RUNNER, ["ci", "claim", c.view.name, "ticket", String(n)], c.root, FIND_TIMEOUT_MS);
+        const subject = { on: "ticket" as const, repo: c.view.name, number: n };
+        await calls.takeClaim(ci, subject, holder, AbortSignal.timeout(FIND_TIMEOUT_MS)).catch(() => undefined);
       }
     })().catch(() => undefined);
   });
@@ -1135,7 +1062,11 @@ export default function zeughausCi(pi: Pi): void {
   pi.on("session_shutdown", (_event, ctx) => {
     if (!isMain(ctx)) return;
     agent.report(ctx, "ended");
-    releaseClaims(ctx.cwd);
+    // The client closes after the release, so the CI sees this omp leave.
+    void (async () => {
+      await releaseClaims();
+      await ci.close();
+    })().catch(() => undefined);
   });
 
   // A plan session's turn ends with ask or submit_plan; the second stop is let through, so the
@@ -1151,7 +1082,7 @@ export default function zeughausCi(pi: Pi): void {
     if (!isMain(ctx)) return;
     mainSession = ctx.sessionManager.getSessionId();
     agent.report(ctx, "idle");
-    releaseClaims(ctx.cwd);
+    void releaseClaims();
     if (watch) endWatch(watch, false);
     loaded = undefined;
     latest = { kind: "none" };
@@ -1173,7 +1104,7 @@ export default function zeughausCi(pi: Pi): void {
     }
     const id = sessionId();
     if (id !== undefined) {
-      sessionBlock ??= describeSession(pi, id, ctx.cwd);
+      sessionBlock ??= sessionPrompt(ci, id);
       const described = await sessionBlock;
       if (!event.systemPrompt.includes(described)) added.push(described);
     }
@@ -1210,7 +1141,7 @@ export default function zeughausCi(pi: Pi): void {
         planFile = path;
         let number: number;
         try {
-          number = await storePlan(ctx, planned.repo, path, planned.ticket, ctx.cwd);
+          number = await storePlan(ctx, planned.repo, path, planned.ticket);
         } catch (e) {
           const why = e instanceof Error ? e.message : String(e);
           throw new Error(`Storing the plan failed: ${why}. Fix what it names and call submit_plan again.`);
@@ -1264,7 +1195,7 @@ export default function zeughausCi(pi: Pi): void {
         return;
       }
       // Only the status line and this answer are fresh; the prompt block stays as it was.
-      latest = await loadContext(pi, ctx.cwd);
+      latest = await loadContext(pi, ci, ctx.cwd);
       if (!watch) progress = undefined;
       showStatus(ctx);
       ctx.ui.notify(explain(latest), "info");
@@ -1302,17 +1233,15 @@ export default function zeughausCi(pi: Pi): void {
       ctx.ui.notify("no plan file in this session", "warning");
       return;
     }
-    const r = await exec(
-      pi,
-      RUNNER,
-      ["ci", "plan-write", "--json", c.view.name, path],
-      c.root,
-      CONTEXT_TIMEOUT_MS,
-    );
-    const number = r.code === 0 ? jsonField(r.stdout, "number") : undefined;
-    if (typeof number !== "number") {
-      const why = r.code === 0 ? `${RUNNER} gave an unreadable answer` : failure(r, "ci plan-write");
-      ctx.ui.notify(why, "error");
+    let number: number;
+    try {
+      number = await calls.planWrite(
+        ci,
+        { repo: c.view.name, ticket: null, path, ompSession: null },
+        AbortSignal.timeout(CONTEXT_TIMEOUT_MS),
+      );
+    } catch (e) {
+      ctx.ui.notify(reason(e), "error");
       return;
     }
     ctx.ui.notify(`stored plan as ticket #${number} for review in zeughaus`, "info");
