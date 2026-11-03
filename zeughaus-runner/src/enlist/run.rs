@@ -470,6 +470,9 @@ impl Executor {
 
         let place_dir = a.place.workspace();
         let workspace = work_dir(&self.state_dir, &a.repo, &place_dir);
+        // Held until the run ends: the budget sweep that another run's end
+        // starts must not remove the workspace this run checks out into.
+        let claim = self.workspaces.for_run(workspace.clone());
         let (cpus, workspace_var, output_var, inputs_var) = match &a.place {
             Place::Host => (
                 self.cpus,
@@ -644,6 +647,7 @@ impl Executor {
         };
 
         *lock(&ctl.live) = Some(run_dir.to_path_buf());
+        *lock(&ctl.workspace) = Some(claim);
         let assigned = Assigned {
             assignment: a.clone(),
             run_dir: run_dir.to_path_buf(),
@@ -884,7 +888,11 @@ impl Executor {
                 None => "signal".to_owned(),
             }
         );
+        // Given back only after this run's own sweep: the workspace it just
+        // used is the warmest, and the next job of its place shares the
+        // claim instead of waiting for it.
         self.housekeeping(a);
+        drop(lock(&ctl.workspace).take());
         remove_inputs(&run_dir.join("inputs"));
         remove_state(&run_dir.join("state"));
     }
@@ -942,22 +950,7 @@ impl Executor {
     /// while an image build holds the images lock; the end of the next
     /// container run prunes instead.
     fn housekeeping(&self, finished: &Assignment) {
-        let live: Vec<Arc<RunCtl>> = lock(&self.runs).values().cloned().collect();
-        let active: Vec<&Arc<RunCtl>> = live
-            .iter()
-            .filter(|ctl| ctl.running_in().is_some())
-            .collect();
-        let in_use: HashSet<PathBuf> = active
-            .iter()
-            .map(|ctl| {
-                work_dir(
-                    &self.state_dir,
-                    &ctl.assignment.repo,
-                    &ctl.assignment.place.workspace(),
-                )
-            })
-            .collect();
-        cleanup::enforce_budget(&self.state_dir, self.config.budget_gb, &in_use);
+        cleanup::enforce_budget(&self.state_dir, self.config.budget_gb, &self.workspaces);
         if self.containers && matches!(finished.place, Place::Container { .. }) {
             // Serializes `images.json` between threads, so a busy lock below
             // is a build and never another housekeeping.
@@ -1026,6 +1019,14 @@ impl Executor {
             let ended = end.is_some();
             let ctl = Arc::new(RunCtl::new(assignment));
             *lock(&ctl.live) = Some(run_dir.clone());
+            if end.is_none() {
+                let workspace = work_dir(
+                    &self.state_dir,
+                    &ctl.assignment.repo,
+                    &ctl.assignment.place.workspace(),
+                );
+                *lock(&ctl.workspace) = Some(self.workspaces.for_run(workspace));
+            }
             *lock(&ctl.end) = end;
             lock(&self.runs).insert(run.clone(), Arc::clone(&ctl));
             eprintln!(

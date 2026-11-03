@@ -146,6 +146,8 @@ pub struct RunCtl {
     pub live: Mutex<Option<PathBuf>>,
     /// How it ended, once it did and its artifacts are kept.
     pub end: Mutex<Option<RunEnd>>,
+    /// The run's hold on its workspace, from staging to its end.
+    pub workspace: Mutex<Option<cleanup::WorkspaceClaim>>,
     /// The granted secret values, longest first, masked in the log the CI
     /// stores. Set once the hand-off is redeemed; never persisted, so a run
     /// recovered by a restarted runner is delivered unmasked.
@@ -161,6 +163,7 @@ impl RunCtl {
             active_millis: Default::default(),
             live: Mutex::new(None),
             end: Mutex::new(None),
+            workspace: Mutex::new(None),
             masks: OnceLock::new(),
         }
     }
@@ -210,6 +213,8 @@ pub struct Executor {
     sessions_lock: Mutex<()>,
     /// Serializes image housekeeping and `<state-dir>/ci/images.json`.
     images_lock: Mutex<()>,
+    /// Which workspaces runs hold, so the budget sweep leaves them alone.
+    workspaces: Arc<cleanup::WorkspaceClaims>,
 }
 
 /// Starts enlisting: the executor's threads and the connection task. Called
@@ -277,6 +282,7 @@ pub fn start(
         agents,
         sessions_lock: Mutex::new(()),
         images_lock: Mutex::new(()),
+        workspaces: Arc::default(),
     });
     // An earlier process fetched sets early for jobs it knew of; a job
     // assigned now fetches its inputs itself.

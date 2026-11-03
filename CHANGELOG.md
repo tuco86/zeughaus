@@ -607,6 +607,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- CI: a runner's workspace budget no longer deletes a workspace a job is
+  using. The sweep after a job's end only spared jobs whose process had
+  already started, so the next job of the same place, assigned the moment
+  the CI learned of that end, lost its checkout mid-run (atik: `Cargo.toml`
+  gone between clippy and nextest, cargo's dep-info files vanishing). A run
+  now holds its workspace from staging until after its own sweep, and the
+  sweep removes only workspaces no run holds; a job that arrives while its
+  workspace is being removed waits for the removal and checks out afresh.
 - CI: a pipeline of an annotated tag runs, reports and releases the commit
   the tag points at. It carried the tag object's sha from the forge's
   push, which GitHub refused as a release target, so the `v0.2.0` and

@@ -2,10 +2,11 @@
 //! superseded or unused for two weeks, and the removal of trees a container
 //! job may have left files in.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::SystemTime;
 
 use super::stage::Engine;
@@ -56,9 +57,81 @@ fn last_used(workspace: &Path) -> SystemTime {
         .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
+/// Who holds the workspaces under `ci/work`: runs share one from staging
+/// to their end, and the budget sweep holds one alone while it removes it.
+/// The CI assigns the next job of a place as soon as the previous one ends,
+/// so a workspace that looks idle when a sweep starts can be checked out
+/// again before the sweep reaches it.
+#[derive(Default)]
+pub struct WorkspaceClaims {
+    held: Mutex<HashMap<PathBuf, Holder>>,
+    freed: Condvar,
+}
+
+enum Holder {
+    Runs(usize),
+    Sweep,
+}
+
+/// A claim on one workspace; dropping it gives the workspace back.
+pub struct WorkspaceClaim {
+    claims: Arc<WorkspaceClaims>,
+    path: PathBuf,
+}
+
+impl WorkspaceClaims {
+    fn held(&self) -> MutexGuard<'_, HashMap<PathBuf, Holder>> {
+        self.held.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Claims `path` for a run, waiting while the sweep removes it.
+    pub fn for_run(self: &Arc<Self>, path: PathBuf) -> WorkspaceClaim {
+        let mut held = self.held();
+        while matches!(held.get(&path), Some(Holder::Sweep)) {
+            held = self.freed.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+        match held.get_mut(&path) {
+            Some(Holder::Runs(count)) => *count += 1,
+            _ => {
+                held.insert(path.clone(), Holder::Runs(1));
+            }
+        }
+        WorkspaceClaim {
+            claims: Arc::clone(self),
+            path,
+        }
+    }
+
+    /// Claims `path` for its removal; `None` while a run holds it.
+    pub fn for_sweep(self: &Arc<Self>, path: &Path) -> Option<WorkspaceClaim> {
+        let mut held = self.held();
+        if held.contains_key(path) {
+            return None;
+        }
+        held.insert(path.to_owned(), Holder::Sweep);
+        Some(WorkspaceClaim {
+            claims: Arc::clone(self),
+            path: path.to_owned(),
+        })
+    }
+}
+
+impl Drop for WorkspaceClaim {
+    fn drop(&mut self) {
+        let mut held = self.claims.held();
+        match held.get_mut(&self.path) {
+            Some(Holder::Runs(count)) if *count > 1 => *count -= 1,
+            _ => {
+                held.remove(&self.path);
+            }
+        }
+        self.claims.freed.notify_all();
+    }
+}
+
 /// Deletes the least recently used workspaces until the rest fit in
-/// `budget_gb`. Workspaces in `in_use` are never touched.
-pub fn enforce_budget(state_dir: &Path, budget_gb: u64, in_use: &HashSet<PathBuf>) {
+/// `budget_gb`. A workspace a run holds in `claims` is never touched.
+pub fn enforce_budget(state_dir: &Path, budget_gb: u64, claims: &Arc<WorkspaceClaims>) {
     let budget = budget_gb.saturating_mul(1 << 30);
     let mut sized: Vec<(SystemTime, u64, PathBuf)> = workspaces(state_dir)
         .into_iter()
@@ -70,9 +143,9 @@ pub fn enforce_budget(state_dir: &Path, budget_gb: u64, in_use: &HashSet<PathBuf
         if total <= budget {
             break;
         }
-        if in_use.contains(&ws) {
+        let Some(_removing) = claims.for_sweep(&ws) else {
             continue;
-        }
+        };
         match remove_tree(&ws) {
             Ok(()) => {
                 eprintln!(
@@ -309,6 +382,29 @@ mod tests {
         assert!(record.is_empty());
     }
 
+    /// Runs share a workspace, the sweep gets it only once no run holds it,
+    /// and runs get it back once the sweep has let go.
+    #[test]
+    fn the_sweep_takes_a_workspace_only_while_no_run_holds_it() {
+        let claims = Arc::new(WorkspaceClaims::default());
+        let ws = PathBuf::from("/ci/work/zeughaus/host");
+        let build = claims.for_run(ws.clone());
+        let check = claims.for_run(ws.clone());
+        assert!(claims.for_sweep(&ws).is_none());
+        drop(build);
+        assert!(claims.for_sweep(&ws).is_none(), "the check still holds it");
+        drop(check);
+        let sweep = claims.for_sweep(&ws).expect("nobody holds it");
+        assert!(claims.for_sweep(&ws).is_none(), "one removal at a time");
+        assert!(
+            claims.for_sweep(Path::new("/ci/work/weida/host")).is_some(),
+            "another workspace is free"
+        );
+        drop(sweep);
+        let _run = claims.for_run(ws.clone());
+        assert!(claims.for_sweep(&ws).is_none());
+    }
+
     /// Tests that touch the filesystem, network, processes or real time: the
     /// integration tier (`.config/nextest.toml`).
     mod io {
@@ -374,6 +470,30 @@ mod tests {
             ));
             drop(held);
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Over budget, the sweep removes the idle workspace and keeps the
+        /// one a run holds, however old.
+        #[test]
+        fn the_budget_keeps_a_workspace_a_run_holds() {
+            let state =
+                std::env::temp_dir().join(format!("zci-budget-claims-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&state);
+            let held = crate::enlist::work_dir(&state, "zeughaus", "host");
+            let idle = crate::enlist::work_dir(&state, "weida", "host");
+            marked(&held.join(".git/zci-last-used"), 100);
+            marked(&idle.join(".git/zci-last-used"), 200);
+            std::fs::write(held.join("Cargo.toml"), "x").unwrap();
+            std::fs::write(idle.join("Cargo.toml"), "x").unwrap();
+            let claims = Arc::new(WorkspaceClaims::default());
+            let run = claims.for_run(held.clone());
+            enforce_budget(&state, 0, &claims);
+            assert!(held.join("Cargo.toml").exists());
+            assert!(!idle.exists());
+            drop(run);
+            enforce_budget(&state, 0, &claims);
+            assert!(!held.exists());
+            let _ = std::fs::remove_dir_all(&state);
         }
     }
 }
