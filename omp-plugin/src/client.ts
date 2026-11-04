@@ -1,6 +1,6 @@
 // The CI's `/ci` API over weida, the way zeughaus-runner/src/mcp/client.rs asks it: the pinned URL
 // names the CI's fingerprint, and this machine's client key (the editor's `client.pem`) is what
-// the CI admits. The only module that imports @tuco86/weida, and only at the first question, so
+// the CI admits. The only module that imports weida, and only at the first question, so
 // loading the extension never fails where the addon has no prebuild.
 //
 // One runtime and one connected requester are made on first use and kept; a requester whose
@@ -9,7 +9,7 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import type * as Weida from "@tuco86/weida";
+import type * as Weida from "weida";
 import {
   type CiReply,
   type CiRequest,
@@ -145,7 +145,7 @@ export class CiClient {
   async #resolve(): Promise<Link> {
     if (this.#link) return this.#link;
     // On a platform without a prebuild this rejects with weida's own reason.
-    const weida = await import("@tuco86/weida");
+    const weida = await import("weida");
     const dir = stateDir(process.env, process.platform);
     const editor = join(dir, "zeughaus.toml");
     const enlist = join(dir, "enlist.toml");

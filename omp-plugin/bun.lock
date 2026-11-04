@@ -5,11 +5,11 @@
     "": {
       "name": "@tuco86/zeughaus-omp",
       "dependencies": {
-        "@tuco86/weida": "0.1.0-alpha.11",
+        "weida": "0.1.0-alpha.14",
       },
     },
   },
   "packages": {
-    "@tuco86/weida": ["@tuco86/weida@0.1.0-alpha.11", "https://git.doodleshnookie.net/api/packages/tuco86/npm/%40tuco86%2Fweida/-/0.1.0-alpha.11/weida-0.1.0-alpha.11.tgz", {}, "sha512-9xMQUDG4M/Fd3jsX8v3XUiWKEsckEC3NcBjUUnUgSWccUx5mubU8CO5u1FbaSk+Wwgj0hpb7TUVDzHzM68l+NQ=="],
+    "weida": ["weida@0.1.0-alpha.14", "", {}, "sha512-zAHWskCbT1OAk3kqiAodDSlfJEfTSUq0BUTxAR5CgoSRFoCwJ+pgXTnJBjsE3aPXXUA/eflsCTih+ZSsjMQ5zQ=="],
   }
 }

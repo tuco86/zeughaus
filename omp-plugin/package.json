@@ -1,6 +1,6 @@
 {
   "name": "@tuco86/zeughaus-omp",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "description": "zeughaus-ci in omp: the checkout's CI at session start, push watching, plans stored on their tickets, the CI skill, over the CI's weida API",
   "license": "MIT OR Apache-2.0",
   "type": "module",
@@ -25,7 +25,7 @@
     ]
   },
   "dependencies": {
-    "@tuco86/weida": "0.1.0-alpha.11"
+    "weida": "0.1.0-alpha.14"
   },
   "publishConfig": {
     "registry": "https://git.doodleshnookie.net/api/packages/tuco86/npm/"

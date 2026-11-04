@@ -13,4 +13,4 @@ set -eu
 cd omp-plugin
 step bun install --frozen-lockfile
 step bun test
-step bun -e 'const w = await import("@tuco86/weida"); console.log(w.version())'
+step bun -e 'const w = await import("weida"); console.log(w.version())'
