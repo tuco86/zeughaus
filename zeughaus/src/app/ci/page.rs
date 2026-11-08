@@ -2294,6 +2294,7 @@ mod tests {
             filed: Vec::new(),
             comments: Vec::new(),
             suggestion: None,
+            report: None,
         }
     }
 

@@ -237,16 +237,15 @@ impl App {
     pub(in crate::app) fn apply_ticket(&mut self, message: TicketMsg) -> Task<Message> {
         match message {
             TicketMsg::Open { ci, view, number } => {
-                let planned = self
+                let listed = self
                     .ci
                     .get(&ci)
                     .and_then(|client| client.plans.get(&view))
-                    .and_then(|state| state.doc(number))
-                    .is_some_and(|doc| doc.revision > 0);
-                let tab = if planned {
-                    TicketTab::Plan
-                } else {
-                    TicketTab::Proposal
+                    .and_then(|state| state.doc(number));
+                let tab = match listed {
+                    Some(doc) if doc.report.is_some() => TicketTab::Report,
+                    Some(doc) if doc.revision > 0 => TicketTab::Plan,
+                    _ => TicketTab::Proposal,
                 };
                 if self.palette_open {
                     self.palette_close();
@@ -778,15 +777,23 @@ impl App {
             );
         }
         let mut tabs = row![].spacing(SP_2);
-        let proposal = popout.tab == TicketTab::Proposal;
         tabs = tabs.push(
-            self.ticket_pill("Proposal", proposal)
+            self.ticket_pill("Proposal", popout.tab == TicketTab::Proposal)
                 .on_press(Message::Ticket(TicketMsg::Tab(TicketTab::Proposal))),
         );
         if doc.revision > 0 {
             tabs = tabs.push(
-                self.ticket_pill(format!("Plan v{}", doc.revision), !proposal)
-                    .on_press(Message::Ticket(TicketMsg::Tab(TicketTab::Plan))),
+                self.ticket_pill(
+                    format!("Plan v{}", doc.revision),
+                    popout.tab == TicketTab::Plan,
+                )
+                .on_press(Message::Ticket(TicketMsg::Tab(TicketTab::Plan))),
+            );
+        }
+        if doc.report.is_some() {
+            tabs = tabs.push(
+                self.ticket_pill("Report", popout.tab == TicketTab::Report)
+                    .on_press(Message::Ticket(TicketMsg::Tab(TicketTab::Report))),
             );
         }
         top = top.push(tabs);
@@ -797,6 +804,7 @@ impl App {
             }
             (TicketTab::Proposal, Some(shown)) => self.proposal_part(popout, client, state, shown),
             (TicketTab::Plan, Some(shown)) => self.plan_part(popout, client, state, doc, shown),
+            (TicketTab::Report, Some(shown)) => self.report_part(popout, shown),
         };
         let main = match shown {
             Some(shown) if doc.kind == DocKind::Ticket => {
@@ -966,6 +974,34 @@ impl App {
         let ci = popout.ci.clone();
         markdown::view(shown.body.items(), self.markdown_settings())
             .map(move |uri| Message::Ci(ci.clone(), CiMsg::OpenLink(uri)))
+    }
+
+    /// The Report tab: what the session that executed the plan reported,
+    /// and whether it wrote it or it was taken from its transcript.
+    fn report_part<'a>(
+        &'a self,
+        popout: &'a TicketPopout,
+        shown: &'a Shown,
+    ) -> Element<'a, Message, Theme> {
+        let muted = self.theme.muted();
+        let (Some(report), Some(content)) = (&shown.doc.report, &shown.report) else {
+            return text("No report yet.").size(TEXT_SM).color(muted).into();
+        };
+        let source = if report.from_transcript {
+            "Taken from the master's transcript: it ended without plan_done"
+        } else {
+            "Written by the master with plan_done"
+        };
+        let ci = popout.ci.clone();
+        column![
+            text(format!("{source} \u{b7} {}", ago(report.written, now())))
+                .size(TEXT_SM)
+                .color(muted),
+            markdown::view(content.items(), self.markdown_settings())
+                .map(move |uri| Message::Ci(ci.clone(), CiMsg::OpenLink(uri))),
+        ]
+        .spacing(SP_2)
+        .into()
     }
 
     /// The Plan tab: the plan in its sections, which are deleted and

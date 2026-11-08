@@ -46,6 +46,8 @@ pub(super) struct Shown {
     pub(super) body: markdown::Content,
     /// The plan in its sections, each with its own Markdown.
     pub(super) sections: Vec<(super::review::Section, markdown::Content)>,
+    /// The executing session's report.
+    pub(super) report: Option<markdown::Content>,
 }
 
 /// One repository's tickets.
@@ -267,11 +269,16 @@ impl CiClient {
                         (section, markdown::Content::parse(body))
                     })
                     .collect();
+                let report = doc
+                    .report
+                    .as_ref()
+                    .map(|report| markdown::Content::parse(&report.text));
                 state.shown = Some(Shown {
                     number,
                     doc: *doc,
                     body,
                     sections,
+                    report,
                 });
             }
             Ok(None) => state.shown_error = Some(format!("#{number} is gone")),

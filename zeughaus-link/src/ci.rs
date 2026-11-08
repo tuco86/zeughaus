@@ -23,6 +23,15 @@ pub const MAX_DOC_BYTES: usize = 256 << 10;
 /// The longest comment on a ticket, in bytes.
 pub const MAX_COMMENT_BYTES: usize = 8 << 10;
 
+/// The longest report a ticket keeps, in bytes.
+pub const MAX_REPORT_BYTES: usize = 64 << 10;
+
+/// `text` trimmed and cut to [`MAX_REPORT_BYTES`] on a character boundary.
+pub fn report_text(text: &str) -> &str {
+    let text = text.trim();
+    text[..text.floor_char_boundary(MAX_REPORT_BYTES)].trim_end()
+}
+
 /// The most comments one ticket takes; with [`MAX_COMMENT_BYTES`] a ticket
 /// with its texts still fits [`MAX_CI_REPLY_BYTES`].
 pub const MAX_COMMENTS: usize = 100;
@@ -277,6 +286,15 @@ pub enum CiRequest {
         repo: String,
         number: u64,
         state: DocState,
+    },
+    /// Marks ticket `number`, which is in progress, done with the report of
+    /// the session that executed its plan (Markdown, 1 to
+    /// [`MAX_REPORT_BYTES`] bytes once trimmed); the tickets its plan
+    /// includes close with it. Answers [`CiReply::Accepted`].
+    DocDone {
+        repo: String,
+        number: u64,
+        report: String,
     },
     /// Deletes a finished document. Answers [`CiReply::Accepted`].
     DocDelete { repo: String, number: u64 },
@@ -1102,6 +1120,18 @@ pub struct Planner {
     pub omp_session: String,
 }
 
+/// What the session that executed a ticket's plan reported at its end.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketReport {
+    /// Markdown; empty in lists.
+    pub text: String,
+    /// Seconds since the UNIX epoch.
+    pub written: u64,
+    /// Taken from the transcript of a master that ended without plan_done.
+    #[serde(default)]
+    pub from_transcript: bool,
+}
+
 /// The repository an onboarding request asks the CI to add.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OnboardSpec {
@@ -1201,6 +1231,9 @@ pub struct DocView {
     /// The last re-evaluation's answer; `None` in lists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<TicketSuggestion>,
+    /// The executing session's report; its text is empty in lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<TicketReport>,
 }
 
 impl DocView {
@@ -2587,6 +2620,7 @@ mod tests {
                 model: "claude-haiku-5-5".to_owned(),
                 created: 8,
             }),
+            report: None,
         }
     }
 

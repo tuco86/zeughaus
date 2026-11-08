@@ -84,6 +84,10 @@ pub fn suggestion_text(suggestion: &TicketSuggestion, now: u64) -> String {
 /// ## Plan (revision 1)
 ///
 /// <plan>
+///
+/// ## Report (2h ago)
+///
+/// <report>
 /// ```
 pub fn doc_text(doc: &DocView, docs: &[DocView], now: u64) -> String {
     let mut text = format!(
@@ -143,11 +147,27 @@ pub fn doc_text(doc: &DocView, docs: &[DocView], now: u64) -> String {
     if !doc.plan_text.is_empty() {
         parts.push(format!(
             "## Plan (revision {})\n\n{}",
-            doc.revision, doc.plan_text
+            doc.revision,
+            doc.plan_text.trim_end()
+        ));
+    }
+    if let Some(report) = &doc.report {
+        let from = if report.from_transcript {
+            "from the master's transcript, "
+        } else {
+            ""
+        };
+        parts.push(format!(
+            "## Report ({from}{} ago)\n\n{}",
+            age(now.saturating_sub(report.written)),
+            report.text.trim_end()
         ));
     }
     parts.retain(|part| !part.is_empty());
-    text.push_str(&parts.join("\n\n"));
+    if !parts.is_empty() {
+        text.push_str(&parts.join("\n\n"));
+        text.push('\n');
+    }
     text
 }
 
@@ -189,7 +209,7 @@ pub fn docs_text(docs: &[DocView], now: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use zeughaus_link::{DocKind, DocLink, FiledTicket};
+    use zeughaus_link::{DocKind, DocLink, FiledTicket, TicketReport};
 
     use super::*;
 
@@ -222,6 +242,7 @@ mod tests {
             filed: Vec::new(),
             comments: Vec::new(),
             suggestion: None,
+            report: None,
         }
     }
 
@@ -269,6 +290,30 @@ mod tests {
         assert_eq!(
             doc_text(&bare, &[], 1_000),
             "#5 ticket open: Doc 5\nfrom weida\ncreated 0m ago\n\n"
+        );
+    }
+
+    #[test]
+    fn a_done_ticket_ends_with_its_report() {
+        let mut ticket = doc(6, DocKind::Ticket, DocState::Done);
+        ticket.plan_text = "# Doc 6\n\nDo it.\n".to_owned();
+        ticket.revision = 1;
+        ticket.report = Some(TicketReport {
+            text: "Did it.".into(),
+            written: 1_000,
+            from_transcript: false,
+        });
+        assert_eq!(
+            doc_text(&ticket, &[], 1_000 + 7200),
+            "#6 ticket done: Doc 6\nfrom weida\ncreated 2h ago\n\n\
+             ## Plan (revision 1)\n\n# Doc 6\n\nDo it.\n\n## Report (2h ago)\n\nDid it.\n"
+        );
+        if let Some(report) = &mut ticket.report {
+            report.from_transcript = true;
+        }
+        assert!(
+            doc_text(&ticket, &[], 1_000 + 7200)
+                .ends_with("## Report (from the master's transcript, 2h ago)\n\nDid it.\n")
         );
     }
 

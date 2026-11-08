@@ -41,6 +41,9 @@ struct Record {
     /// `(code, killed)` once it ended and the CI was not told yet.
     #[serde(default)]
     end: Option<(Option<i32>, bool)>,
+    /// The repository and ticket of a master session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    master: Option<(String, u64)>,
 }
 
 fn path(state_dir: &Path) -> PathBuf {
@@ -94,16 +97,21 @@ impl Executor {
             match host.open(&spec) {
                 Ok(terminal) => {
                     eprintln!("[enlist] session {id} in terminal {terminal}");
+                    let master = spec
+                        .doc
+                        .filter(|_| spec.kind == zeughaus_link::SessionKind::Master)
+                        .map(|n| (spec.repo.clone(), n));
                     exec.change_sessions(|records| {
                         records.retain(|r| r.id != id);
                         records.push(Record {
                             id,
                             terminal,
                             end: None,
+                            master: master.clone(),
                         });
                     });
                     exec.send(FromRunner::SessionOpened { id, terminal });
-                    exec.watch_session(id, terminal);
+                    exec.watch_session(id, terminal, master);
                 }
                 Err(message) => {
                     eprintln!("[enlist] session {id} refused: {message}");
@@ -128,8 +136,10 @@ impl Executor {
         }
     }
 
-    /// Watches the terminal of session `id` on this thread until it ends.
-    fn watch_session(self: &Arc<Self>, id: u64, terminal: u64) {
+    /// Watches the terminal of session `id` on this thread until it ends;
+    /// the end of a master (`master`: its repository and ticket) carries
+    /// its last words.
+    fn watch_session(self: &Arc<Self>, id: u64, terminal: u64, master: Option<(String, u64)>) {
         let Some(host) = self.agents.clone() else {
             return;
         };
@@ -141,10 +151,14 @@ impl Executor {
             }
         };
         eprintln!("[enlist] session {id} ended");
+        let report = master
+            .as_ref()
+            .and_then(|(repo, n)| crate::agents::transcript_report(&self.state_dir, repo, *n));
         let sent = self.send(FromRunner::SessionEnded {
             id,
             code: end.0,
             killed: end.1,
+            report,
         });
         self.change_sessions(|records| {
             if sent {
@@ -173,20 +187,29 @@ impl Executor {
         for record in load(&self.state_dir) {
             if record.end.is_none() {
                 let exec = Arc::clone(self);
-                std::thread::spawn(move || exec.watch_session(record.id, record.terminal));
+                std::thread::spawn(move || {
+                    exec.watch_session(record.id, record.terminal, record.master)
+                });
             }
         }
     }
 
-    /// The sessions this runner holds, for `Hello`.
+    /// The sessions this runner holds, for `Hello`; an ended master's
+    /// carries its last words.
     pub(super) fn session_reports(&self) -> Vec<SessionReport> {
-        let _held = lock(&self.sessions_lock);
-        load(&self.state_dir)
+        let records = {
+            let _held = lock(&self.sessions_lock);
+            load(&self.state_dir)
+        };
+        records
             .into_iter()
             .map(|r| SessionReport {
                 id: r.id,
                 terminal: r.terminal,
                 end: r.end,
+                report: r.end.and(r.master.as_ref()).and_then(|(repo, n)| {
+                    crate::agents::transcript_report(&self.state_dir, repo, *n)
+                }),
             })
             .collect()
     }

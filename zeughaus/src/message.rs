@@ -610,6 +610,7 @@ pub enum CiMsg {
 pub enum TicketTab {
     Proposal,
     Plan,
+    Report,
 }
 
 /// What the ticket popout over the workspace says; `ci` and `view` name the

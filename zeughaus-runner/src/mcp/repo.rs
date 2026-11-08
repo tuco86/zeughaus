@@ -577,6 +577,7 @@ mod tests {
             filed: Vec::new(),
             comments: Vec::new(),
             suggestion: None,
+            report: None,
         };
         let mut view = zeughaus();
         view.docs = vec![
@@ -641,6 +642,7 @@ mod tests {
             filed: Vec::new(),
             comments: Vec::new(),
             suggestion: None,
+            report: None,
         };
         assert_eq!(
             pending_text("git@host:o/scan-rs.git", &request),

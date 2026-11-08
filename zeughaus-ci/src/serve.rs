@@ -247,6 +247,13 @@ impl CiServer {
                 }
                 accepted(moved)
             }
+            CiRequest::DocDone {
+                repo,
+                number,
+                report,
+            } => accepted(self.change_docs(&repo, |dir, config, now| {
+                docs::finish(dir, config, &repo, number, &report, now).map(|()| ((), true))
+            })),
             CiRequest::DocDelete { repo, number } => {
                 accepted(self.change_docs(&repo, |dir, config, _| {
                     docs::delete(dir, config, &repo, number).map(|()| ((), true))

@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- A ticket keeps the final report of the master that executed it.
+  `plan_done` requires a `report` (Markdown, up to 64 KiB) and the master's
+  instructions ask for it; the CI stores it on the ticket as it marks it
+  done. A master that stops with its ticket still in progress leaves its
+  last assistant text from its omp transcript there, marked as such.
+  `doc_read`, `ticket://` and `zeughaus-runner ci doc` show it after the
+  plan, and the ticket popout opens on a `Report` tab. The enlist protocol
+  is at major 14: runners and the CI refuse each other until both run it.
+
 - Back and Forward in the editor. Every change of what the window shows
   (a tab, the Overview, a Board, a channel, a job's transcript, the ticket
   popout over any of them) is a place in an undo tree: the mouse's thumb

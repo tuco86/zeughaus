@@ -497,8 +497,9 @@ impl Sessions {
     /// code (the runner or a signal killed it) or went away with its runner,
     /// which requeues its ticket for that runner to resume; a master stopped
     /// with `close` or exiting by itself leaves the ticket in progress with
-    /// a note. The caller holds the book.
-    fn master_gone(&self, session: &SessionView, lost: bool, now: u64) {
+    /// a note and keeps `report`, its last words from its transcript. The
+    /// caller holds the book.
+    fn master_gone(&self, session: &SessionView, lost: bool, report: Option<&str>, now: u64) {
         let stopped = lock(&self.stopping).remove(&session.id);
         let (SessionKind::Master, Some(number)) = (session.kind, session.doc) else {
             return;
@@ -514,7 +515,15 @@ impl Sessions {
         let config = self.config.get();
         let ended = {
             let _held = lock(&self.docs_lock);
-            docs::master_ended(&self.state_dir, &config, &session.repo, number, end, now)
+            docs::master_ended(
+                &self.state_dir,
+                &config,
+                &session.repo,
+                number,
+                end,
+                report,
+                now,
+            )
         };
         match ended {
             Ok(true) => {
@@ -564,6 +573,7 @@ impl Sessions {
                         &session.repo,
                         number,
                         docs::MasterEnd::Refused(message),
+                        None,
                         now,
                     )
                 };
@@ -609,7 +619,12 @@ impl Sessions {
                 eprintln!("[ci] {name}: session {id} failed: {message}");
                 self.fail(&mut book, id, &message, now);
             }
-            FromRunner::SessionEnded { code, killed, .. } => {
+            FromRunner::SessionEnded {
+                code,
+                killed,
+                report,
+                ..
+            } => {
                 let book = &mut *book;
                 if let Some(session) = book.list.iter_mut().find(|s| s.id == id) {
                     end(session, code, killed, now);
@@ -622,7 +637,7 @@ impl Sessions {
                     let session = session.clone();
                     self.plan_ended(&session, "the plan session ended without a plan", now);
                     // No exit code: the runner or a signal killed it.
-                    self.master_gone(&session, killed || code.is_none(), now);
+                    self.master_gone(&session, killed || code.is_none(), report.as_deref(), now);
                 }
             }
             _ => {}
@@ -647,14 +662,15 @@ impl Sessions {
                 None => {
                     end(session, None, true, now);
                     session.message = "the runner no longer holds it".to_owned();
-                    ended.push((session.clone(), true));
+                    ended.push((session.clone(), true, None));
                 }
                 Some(SessionReport {
                     end: Some((code, killed)),
+                    report,
                     ..
                 }) => {
                     end(session, *code, *killed, now);
-                    ended.push((session.clone(), *killed || code.is_none()));
+                    ended.push((session.clone(), *killed || code.is_none(), report.clone()));
                 }
                 Some(report) => {
                     session.state = SessionState::Running;
@@ -662,10 +678,10 @@ impl Sessions {
                 }
             }
         }
-        for (session, lost) in ended {
+        for (session, lost, report) in ended {
             claims::release_session(&mut book.claims, session.id, name, session.terminal);
             self.plan_ended(&session, "the plan session ended with its runner", now);
-            self.master_gone(&session, lost, now);
+            self.master_gone(&session, lost, report.as_deref(), now);
         }
         if touched {
             self.changed(book);
@@ -1224,6 +1240,7 @@ mod tests {
                     id: spec.id,
                     code: Some(0),
                     killed: false,
+                    report: None,
                 },
                 12,
             );
@@ -1279,6 +1296,7 @@ mod tests {
                     id: kept.id,
                     terminal: 7,
                     end: None,
+                    report: None,
                 }],
                 4,
             );
@@ -1313,10 +1331,14 @@ mod tests {
                     id: spec.id,
                     code: None,
                     killed: false,
+                    report: Some("lost words".to_owned()),
                 },
                 20,
             );
             assert_eq!(state_of(&f, number), DocState::Approved);
+            // A lost master resumes: its last words are not kept.
+            let doc = docs::load(&f.state, &f.config, "demo", number).unwrap();
+            assert_eq!(doc.report, None);
 
             // Its runner takes it back even while cooling down.
             lock(&f.sessions.cooldown).insert("a".into(), 1000);
@@ -1346,12 +1368,21 @@ mod tests {
                     id: spec.id,
                     code: None,
                     killed: true,
+                    report: Some("  stuck at step 2\n".to_owned()),
                 },
                 23,
             );
             let doc = docs::load(&f.state, &f.config, "demo", number).unwrap();
             assert_eq!(doc.state, DocState::InProgress);
             assert!(doc.note.ends_with("Requeue resumes it"), "{}", doc.note);
+            assert_eq!(
+                doc.report,
+                Some(zeughaus_link::TicketReport {
+                    text: "stuck at step 2".into(),
+                    written: 23,
+                    from_transcript: true,
+                })
+            );
             f.sessions.dispatch(30);
             assert!(a.try_recv().is_err());
         }
@@ -1458,6 +1489,7 @@ mod tests {
                     id: spec.id,
                     code: Some(0),
                     killed: false,
+                    report: None,
                 },
                 11,
             );
@@ -1563,6 +1595,7 @@ mod tests {
                     id: session.id,
                     code: Some(0),
                     killed: false,
+                    report: None,
                 },
                 4,
             );

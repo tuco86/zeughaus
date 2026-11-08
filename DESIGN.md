@@ -2126,6 +2126,18 @@ user stopped (`close`) or that exited by itself leaves the ticket in
 progress with a note, and the latter alerts. The Board shows a ticket's
 note on its card.
 
+**Reports.** A master ends with `plan_done` and its final report
+(`CiRequest::DocDone`, `docs::finish`): the ticket becomes `done` and keeps
+the report as `DocView.report`, a `TicketReport` of at most
+`MAX_REPORT_BYTES` (64 KiB), whose text lists leave empty. A runner records
+the repository and ticket of each master it holds; when one ends, its
+`SessionEnded` (or the `SessionReport` of a later `Hello`) carries the last
+assistant text of the newest omp session file of the ticket's masters, and
+`master_ended` keeps it, marked `from_transcript`, only for a master that
+stopped with its ticket still in progress. A new plan revision or a
+discarded plan drops the report. `doc_read` shows it after the plan, the
+ticket popout as a `Report` tab it opens on.
+
 **Runners by name.** A runner's `Hello` carries its endpoint and the
 addresses it answers at; the overview lists each runner's fingerprint,
 labels and addresses, and the editor dials a runner only a CI announces as

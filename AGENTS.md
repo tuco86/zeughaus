@@ -349,7 +349,10 @@ start. A ticket is `open` (a proposal: `proposal_write`, `New ticket`),
 `ready` once the user releases it with `Plan`, `planning` while its plan
 session runs, `review` once the plan is stored, `approved` in the editor,
 `in_progress` once the CI starts a master for it, then `done`
-(`plan_done`); it leaves as `dismissed`, or as `merged` into the ticket
+(`plan_done` with the master's final report, which the ticket keeps and
+`doc_read` and the popout's `Report` tab show; a master that stops with
+its ticket in progress leaves its last assistant text from its transcript
+there instead); it leaves as `dismissed`, or as `merged` into the ticket
 whose plan includes it in an `Includes: #3, #5` line under its title,
 which it then follows (done with it, `open` again when that plan is
 discarded or dismissed). Tickets link to each other: `depends on` (neither

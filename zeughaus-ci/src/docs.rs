@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 
 use zeughaus_link::ci::{
     DocKind, DocLink, DocState, DocView, LinkKind, MAX_COMMENT_BYTES, MAX_COMMENTS, MAX_DOC_BYTES,
-    MAX_DOC_TITLE_BYTES, OnboardSpec, Planner, RepoDocsView, TicketComment, TicketSuggestion,
-    normalize_origin, plan_title, runs_on_named,
+    MAX_DOC_TITLE_BYTES, MAX_REPORT_BYTES, OnboardSpec, Planner, RepoDocsView, TicketComment,
+    TicketReport, TicketSuggestion, normalize_origin, plan_title, report_text, runs_on_named,
 };
 use zeughaus_link::selector::parse_runs_on;
 use zeughaus_link::{
@@ -203,8 +203,8 @@ fn read_all(dir: &Path) -> Vec<DocView> {
 }
 
 /// Every document of `repo` without its proposal, plan, review, comments
-/// and suggestion, in number order, `waits_for` filled; nothing for a
-/// repository that is not in `ci.toml`.
+/// and suggestion and with its report's text empty, in number order,
+/// `waits_for` filled; nothing for a repository that is not in `ci.toml`.
 pub fn list(state_dir: &Path, config: &CiConfig, repo: &str) -> Vec<DocView> {
     let Ok(dir) = dir(state_dir, config, repo) else {
         return Vec::new();
@@ -216,6 +216,9 @@ pub fn list(state_dir: &Path, config: &CiConfig, repo: &str) -> Vec<DocView> {
         doc.feedback.clear();
         doc.comments.clear();
         doc.suggestion = None;
+        if let Some(report) = &mut doc.report {
+            report.text.clear();
+        }
     }
     fill_waits(state_dir, &mut docs);
     docs
@@ -230,7 +233,7 @@ pub fn load(state_dir: &Path, config: &CiConfig, repo: &str, number: u64) -> Opt
 }
 
 /// The tickets of `repo` that are not finished, with their proposals but
-/// without plan, review, comments and suggestion, in number order.
+/// without plan, review, comments, suggestion and report, in number order.
 pub fn unfinished(state_dir: &Path, config: &CiConfig, repo: &str) -> Vec<DocView> {
     let Ok(dir) = dir(state_dir, config, repo) else {
         return Vec::new();
@@ -253,6 +256,7 @@ pub fn unfinished(state_dir: &Path, config: &CiConfig, repo: &str) -> Vec<DocVie
         doc.feedback.clear();
         doc.comments.clear();
         doc.suggestion = None;
+        doc.report = None;
     }
     docs
 }
@@ -567,6 +571,7 @@ pub fn create(
         filed: Vec::new(),
         comments: Vec::new(),
         suggestion: None,
+        report: None,
     };
     write_json(&path_of(&dir, number), &doc)?;
     write_atomic(&dir.join("last"), number.to_string().as_bytes())?;
@@ -672,6 +677,7 @@ pub fn onboard(
         filed: Vec::new(),
         comments: Vec::new(),
         suggestion: None,
+        report: None,
     };
     let mut written = vec![DocView {
         approved: Some(now),
@@ -988,6 +994,7 @@ pub fn set_state(
             doc.plan_text.clear();
             doc.planner = None;
             doc.feedback.clear();
+            doc.report = None;
         }
         _ => {}
     }
@@ -1009,6 +1016,31 @@ pub fn set_state(
         settle_merged(&dir, number, &merged, close, now)?;
     }
     Ok(())
+}
+
+/// Marks in-progress ticket `number` done, as [`set_state`] does, and keeps
+/// `report`, the executing session's final report, on it.
+pub fn finish(
+    state_dir: &Path,
+    config: &CiConfig,
+    repo: &str,
+    number: u64,
+    report: &str,
+    now: u64,
+) -> Result<(), String> {
+    let text = report.trim();
+    if text.is_empty() || text.len() > MAX_REPORT_BYTES {
+        return Err(format!("a report is 1 to {MAX_REPORT_BYTES} bytes"));
+    }
+    set_state(state_dir, config, repo, number, DocState::Done, now)?;
+    let path = path_of(&dir(state_dir, config, repo)?, number);
+    let mut doc = read_ticket(&path, repo, number)?;
+    doc.report = Some(TicketReport {
+        text: text.to_owned(),
+        written: now,
+        from_transcript: false,
+    });
+    write_json(&path, &doc)
 }
 
 /// Stores a plan on ticket `number`, which a plan session works on, or as a
@@ -1087,6 +1119,7 @@ pub fn write_plan(
                 filed: Vec::new(),
                 comments: Vec::new(),
                 suggestion: None,
+                report: None,
             };
             (n, doc)
         }
@@ -1124,6 +1157,7 @@ pub fn write_plan(
     doc.planner = plan.planner;
     doc.feedback.clear();
     doc.suggestion = None;
+    doc.report = None;
     doc.note.clear();
     if !plan.runs_on.is_empty() {
         doc.runs_on = plan.runs_on.to_vec();
@@ -1458,13 +1492,15 @@ pub enum MasterEnd<'a> {
 /// master puts the ticket back into the queue with the reason and without
 /// its placement; a lost one puts it back with its placement, so its runner
 /// takes it again and resumes; a stopped one leaves it in progress with a
-/// note. `approved` is kept, so a requeued ticket keeps its place.
+/// note and keeps `report`, its last words, on it. `approved` is kept, so a
+/// requeued ticket keeps its place.
 pub fn master_ended(
     state_dir: &Path,
     config: &CiConfig,
     repo: &str,
     number: u64,
     end: MasterEnd<'_>,
+    report: Option<&str>,
     now: u64,
 ) -> Result<bool, String> {
     let dir = dir(state_dir, config, repo)?;
@@ -1486,6 +1522,13 @@ pub fn master_ended(
         MasterEnd::Stopped(why) => {
             doc.note =
                 format!("the master ended ({why}) with the ticket in progress; Requeue resumes it");
+            if let Some(text) = report.map(report_text).filter(|text| !text.is_empty()) {
+                doc.report = Some(TicketReport {
+                    text: text.to_owned(),
+                    written: now,
+                    from_transcript: true,
+                });
+            }
         }
     }
     doc.changed = now;
@@ -1862,6 +1905,7 @@ mod tests {
             filed: Vec::new(),
             comments: Vec::new(),
             suggestion: None,
+            report: None,
         }
     }
 
@@ -2475,6 +2519,71 @@ mod tests {
                 Err("#3 is review; only an approved ticket starts".to_owned())
             );
             assert!(queue(&state, &config).is_empty());
+        }
+
+        #[test]
+        fn a_ticket_keeps_its_report_and_a_stopped_master_its_last_words() {
+            let state = scratch("report");
+            let config = config();
+            create(&state, &config, "demo", new(&text("a", &[])), 1).unwrap();
+            planned(&state, &config, 1, &[], 2);
+            set_state(&state, &config, "demo", 1, Approved, 3).unwrap();
+            start(&state, &config, "demo", 1, vec!["x".into()], 4).unwrap();
+
+            let ended = master_ended(
+                &state,
+                &config,
+                "demo",
+                1,
+                MasterEnd::Stopped("exit 1"),
+                Some("  stuck at step 2\n"),
+                5,
+            );
+            assert_eq!(ended, Ok(true));
+            let doc = load(&state, &config, "demo", 1).unwrap();
+            assert_eq!(doc.state, InProgress);
+            assert_eq!(
+                doc.report,
+                Some(TicketReport {
+                    text: "stuck at step 2".into(),
+                    written: 5,
+                    from_transcript: true,
+                })
+            );
+
+            assert_eq!(
+                finish(&state, &config, "demo", 1, " \n", 6),
+                Err("a report is 1 to 65536 bytes".to_owned())
+            );
+            assert_eq!(state_of(&state, &config, 1), InProgress);
+
+            finish(
+                &state,
+                &config,
+                "demo",
+                1,
+                "# Done\n\nAll targets met.\n",
+                7,
+            )
+            .unwrap();
+            let doc = load(&state, &config, "demo", 1).unwrap();
+            assert_eq!(doc.state, Done);
+            assert_eq!(
+                doc.report,
+                Some(TicketReport {
+                    text: "# Done\n\nAll targets met.".into(),
+                    written: 7,
+                    from_transcript: false,
+                })
+            );
+            let listed = list(&state, &config, "demo");
+            let report = listed[0].report.as_ref().expect("listed with its report");
+            assert_eq!((report.text.as_str(), report.written), ("", 7));
+
+            assert_eq!(
+                finish(&state, &config, "demo", 1, "again", 8),
+                Err("#1 is done; it cannot become done".to_owned())
+            );
         }
 
         #[test]

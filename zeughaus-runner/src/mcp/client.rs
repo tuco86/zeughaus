@@ -366,6 +366,7 @@ fn retries(request: &CiRequest) -> bool {
         | CiRequest::Cancel { .. }
         | CiRequest::DocCreate { .. }
         | CiRequest::DocState { .. }
+        | CiRequest::DocDone { .. }
         | CiRequest::DocDelete { .. }
         | CiRequest::DocRunsOn { .. }
         | CiRequest::DocEdit { .. }

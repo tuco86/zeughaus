@@ -297,9 +297,12 @@ fn instruction(
     let mut text = format!(
         "Execute the plan of the attached approved zeughaus ticket #{number} of {repo} from \
          top to bottom. When its work is complete (gate passed, committed and pushed as \
-         AGENTS.md describes), call the zeughaus MCP tool plan_done with repo {repo} and \
-         number {number}. Other plans of this repository may be executing on other runners at \
-         the same time: fetch and rebase onto origin/{branch} right before every push."
+         AGENTS.md describes), write your final report (what was done, the verification run \
+         with its figures, every target of the plan met or missed, anything left open or \
+         deviating from the plan), call the zeughaus MCP tool plan_done with repo {repo}, \
+         number {number} and that report as report, and end the session with the same text. \
+         Other plans of this repository may be executing on other runners at the same time: \
+         fetch and rebase onto origin/{branch} right before every push."
     );
     if machines {
         text.push_str(
@@ -335,8 +338,11 @@ fn resume_instruction(repo: &str, number: u64, branch: &str, holds: Holds) -> St
         "This omp session executes zeughaus ticket #{number} of {repo} and was interrupted; the \
          master clone keeps what it had ({}). Look at git status and git log \
          origin/{branch}..HEAD, then go on with the plan where it stopped. Fetch and rebase onto \
-         origin/{branch} right before every push, and call the zeughaus MCP tool plan_done with \
-         repo {repo} and number {number} once its work is complete.",
+         origin/{branch} right before every push, and once its work is complete write your \
+         final report (what was done, the verification run with its figures, every target of \
+         the plan met or missed, anything left open or deviating from the plan), call the \
+         zeughaus MCP tool plan_done with repo {repo}, number {number} and that report as \
+         report, and end the session with the same text.",
         holds.text()
     )
 }
@@ -429,7 +435,27 @@ fn refine_text(doc: &zeughaus_link::DocView, now: u64) -> String {
     text
 }
 
-pub use self::host::{Agents, master, plan};
+/// The text of the last assistant message that has any in an omp session
+/// file (JSON lines), its text parts joined by a blank line; `None`
+/// without one. Lines that do not parse are skipped.
+fn last_assistant_text(jsonl: &str) -> Option<String> {
+    jsonl.lines().rev().find_map(|line| {
+        let entry: serde_json::Value = serde_json::from_str(line).ok()?;
+        if entry["type"] != "message" || entry["message"]["role"] != "assistant" {
+            return None;
+        }
+        let texts: Vec<&str> = entry["message"]["content"]
+            .as_array()?
+            .iter()
+            .filter(|part| part["type"] == "text")
+            .filter_map(|part| part["text"].as_str())
+            .filter(|text| !text.trim().is_empty())
+            .collect();
+        (!texts.is_empty()).then(|| texts.join("\n\n"))
+    })
+}
+
+pub use self::host::{Agents, master, plan, transcript_report};
 #[cfg(unix)]
 pub use self::host::{work, work_profile};
 
@@ -445,9 +471,9 @@ mod host {
 
     use super::{
         Holds, MASTER_RECORD, MAX_QUICK, QUICK_OMP, SESSION_LOCK, SessionArgs, Start, agent_root,
-        clone_url, instruction, master_dir, master_sessions, omp_program, parse_args,
-        plan_clone_dir, refine_instruction, refine_text, refusal_text, replan_instruction,
-        resume_instruction, start_of, ticket_brief, ticket_instruction,
+        clone_url, instruction, last_assistant_text, master_dir, master_sessions, omp_program,
+        parse_args, plan_clone_dir, refine_instruction, refine_text, refusal_text,
+        replan_instruction, resume_instruction, start_of, ticket_brief, ticket_instruction,
     };
     #[cfg(unix)]
     use super::{checkout_of, parse_work_args, work_root};
@@ -1063,6 +1089,16 @@ mod host {
             .map(|(_, path)| path)
     }
 
+    /// What the master of ticket `number` of `repo` said last: from the
+    /// newest omp session file of the ticket's masters, cut to
+    /// `MAX_REPORT_BYTES`; `None` when there is none or it says nothing.
+    pub fn transcript_report(state_dir: &Path, repo: &str, number: u64) -> Option<String> {
+        let file = earlier_session(&master_sessions(state_dir, repo, number))?;
+        let text = last_assistant_text(&std::fs::read_to_string(file).ok()?)?;
+        let report = zeughaus_link::report_text(&text);
+        (!report.is_empty()).then(|| report.to_owned())
+    }
+
     /// How the master of `ticket` starts in `root`; `Ok` is `Fresh` or
     /// `Resume`, a refusal is `Err` with its reason.
     fn master_start(
@@ -1264,6 +1300,25 @@ mod tests {
     use zeughaus_link::{
         DocKind, DocLink, DocState, DocView, FiledTicket, LinkKind, TicketComment,
     };
+
+    #[test]
+    fn the_report_is_the_last_assistant_text() {
+        let jsonl = [
+            r#"{"type":"session","id":"s"}"#,
+            r##"{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"# Report\n\nAll done."}]}}"##,
+            r#"{"type":"message","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hm"},{"type":"toolCall","name":"bash"}]}}"#,
+            r#"{"type":"message","message":{"role":"toolResult","content":[{"type":"text","text":"ok"}]}}"#,
+            "not json",
+            r#"{"type":"custom","customType":"session_exit"}"#,
+        ]
+        .join("\n");
+        assert_eq!(
+            last_assistant_text(&jsonl).as_deref(),
+            Some("# Report\n\nAll done.")
+        );
+        let user_only = r#"{"type":"message","message":{"role":"user","content":[{"type":"text","text":"go"}]}}"#;
+        assert_eq!(last_assistant_text(user_only), None);
+    }
 
     #[test]
     fn work_takes_one_origin_and_an_optional_branch() {
@@ -1468,6 +1523,7 @@ mod tests {
             filed: Vec::new(),
             comments: Vec::new(),
             suggestion: None,
+            report: None,
         }
     }
 

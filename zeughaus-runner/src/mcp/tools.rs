@@ -17,8 +17,8 @@ use zeughaus_link::ci::{
 };
 use zeughaus_link::manual::{MAX_MANUAL_JOBS, RunReply};
 use zeughaus_link::{
-    CiOverview, CiReply, CiRequest, ClaimHolder, ClaimSubject, DocKind, DocState, DocView,
-    JobTiming, JobView, MachineView, OnboardSpec, PipelineView, StateView, TransferView,
+    CiOverview, CiReply, CiRequest, ClaimHolder, ClaimSubject, DocKind, DocView, JobTiming,
+    JobView, MachineView, OnboardSpec, PipelineView, StateView, TransferView,
 };
 
 use super::client::Client;
@@ -42,9 +42,10 @@ omitted. Tickets of a repository live in the CI too, one number from proposal th
 execution: docs lists them, doc_read reads one with its proposal, plan and links, \
 proposal_write stores an open ticket for another repository of the CI (instead of a \
 PROPOSAL-*.md in its root), onboard_request asks for a project the CI does not build yet to \
-join it, and a session executing a ticket's plan from zeughaus calls plan_done once its \
-work is committed and pushed. A ticket is also the resource ticket://<repo>/<number>, which read \
-shows like a file: #12 in a text names ticket 12 of the repository at hand, #weida-12 ticket 12 \
+join it, and a session executing a ticket's plan from zeughaus calls plan_done with its final \
+report once its work is committed and pushed. A ticket is also the resource \
+ticket://<repo>/<number>, which read shows like a file: #12 in a text names ticket 12 of the \
+repository at hand, #weida-12 ticket 12 \
 of weida. A job that names `state = [..]` in its header keeps data from one \
 pipeline to the next: ci_state lists those stores and their versions, ci_state_get downloads one \
 version into a directory and ci_state_delete removes a version or a whole store. The session \
@@ -665,13 +666,14 @@ impl Toolbox {
         }
     }
 
-    /// `plan_done`: the ticket this session executed is finished.
-    async fn plan_done(&self, args: PipelineArgs) -> Result<String, String> {
+    /// `plan_done`: the ticket this session executed is finished, with the
+    /// session's final report.
+    async fn plan_done(&self, args: PlanDoneArgs) -> Result<String, String> {
         let repo = self.repo_or_checkout(args.repo).await?;
-        let request = CiRequest::DocState {
+        let request = CiRequest::DocDone {
             repo: repo.clone(),
             number: args.number,
-            state: DocState::Done,
+            report: args.report,
         };
         match self.client.ci(request).await? {
             CiReply::Accepted => Ok(format!("ticket #{} of {repo} is done", args.number)),
@@ -1230,6 +1232,14 @@ struct PipelinesArgs {
 struct PipelineArgs {
     repo: Option<String>,
     number: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanDoneArgs {
+    repo: Option<String>,
+    number: u64,
+    report: String,
 }
 
 #[derive(Deserialize)]
@@ -2285,9 +2295,21 @@ fn definitions() -> Vec<Value> {
         tool(
             "plan_done",
             "Mark the ticket this session executed as done, once its work is committed and \
-             pushed. The ticket must be in progress; the tickets its plan includes close with it.",
-            json!({ "repo": repo, "number": doc_number }),
-            &["number"],
+             pushed, with the session's final report. The ticket must be in progress; the \
+             tickets its plan includes close with it.",
+            json!({
+                "repo": repo,
+                "number": doc_number,
+                "report": {
+                    "type": "string",
+                    "description": "The session's final report in Markdown, the same text it \
+                                    ends with: what was done, the verification run with its \
+                                    figures, every target of the plan met or missed, and \
+                                    anything left open or deviating from the plan. It is \
+                                    shown on the ticket after its plan.",
+                },
+            }),
+            &["number", "report"],
             false,
         ),
         tool(
@@ -2372,7 +2394,7 @@ fn tool(
 
 #[cfg(test)]
 mod tests {
-    use zeughaus_link::{ChannelView, MachineJob, MachineView, QueuedView, TimedLine};
+    use zeughaus_link::{ChannelView, DocState, MachineJob, MachineView, QueuedView, TimedLine};
 
     use super::*;
 
@@ -3432,8 +3454,8 @@ mod tests {
                 CiRequest::DocCreate { .. } | CiRequest::PlanWrite { .. } => {
                     CiReply::DocCreated { number: 7 }
                 }
-                CiRequest::DocState { number: 2, .. } => CiReply::Accepted,
-                CiRequest::DocState { number, .. } => CiReply::Error {
+                CiRequest::DocDone { number: 2, .. } => CiReply::Accepted,
+                CiRequest::DocDone { number, .. } => CiReply::Error {
                     message: format!("no document #{number} in demo"),
                 },
                 CiRequest::Claim { subject, holder } => CiReply::Claim {
@@ -3558,6 +3580,7 @@ mod tests {
             filed: Vec::new(),
             comments: Vec::new(),
             suggestion: None,
+            report: None,
         }
     }
 
@@ -3634,20 +3657,34 @@ mod tests {
         let ci = fake_ci(0, None).await;
         let tools = toolbox_for(&ci);
         let text = tools
-            .call("plan_done", json!({ "repo": "demo", "number": 2 }))
+            .call(
+                "plan_done",
+                json!({ "repo": "demo", "number": 2, "report": "# Done\n\nAll targets met." }),
+            )
             .await
             .expect("done");
         assert_eq!(text, "ticket #2 of demo is done");
         assert_eq!(
             ci.seen.asked.lock().unwrap().last(),
-            Some(&CiRequest::DocState {
+            Some(&CiRequest::DocDone {
                 repo: "demo".to_owned(),
                 number: 2,
-                state: DocState::Done,
+                report: "# Done\n\nAll targets met.".to_owned(),
             })
         );
         let err = tools
-            .call("plan_done", json!({ "repo": "demo", "number": 5 }))
+            .call("plan_done", json!({ "repo": "demo", "number": 2 }))
+            .await
+            .expect_err("no report");
+        assert!(
+            err.starts_with("invalid arguments: missing field `report`"),
+            "{err}"
+        );
+        let err = tools
+            .call(
+                "plan_done",
+                json!({ "repo": "demo", "number": 5, "report": "Done." }),
+            )
             .await
             .expect_err("refused");
         assert_eq!(err, "no document #5 in demo");

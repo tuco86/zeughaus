@@ -21,7 +21,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The protocol major a runner and the CI must share.
-pub const ENLIST_MAJOR: u32 = 13;
+pub const ENLIST_MAJOR: u32 = 14;
 
 /// The most addresses a runner's `Hello` announces.
 pub const MAX_ADDRESSES: usize = 8;
@@ -96,6 +96,9 @@ pub enum FromRunner {
         id: u64,
         code: Option<i32>,
         killed: bool,
+        /// A master's last words from its transcript, at most
+        /// `MAX_REPORT_BYTES`.
+        report: Option<String>,
     },
 }
 
@@ -106,6 +109,9 @@ pub struct SessionReport {
     pub id: u64,
     pub terminal: u64,
     pub end: Option<(Option<i32>, bool)>,
+    /// A master's last words from its transcript, at most
+    /// `MAX_REPORT_BYTES`.
+    pub report: Option<String>,
 }
 
 /// An agent session the CI asks a runner to open.
@@ -1111,6 +1117,7 @@ mod tests {
                 id: 3,
                 code: Some(0),
                 killed: false,
+                report: None,
             },
         ];
         for message in &from {
