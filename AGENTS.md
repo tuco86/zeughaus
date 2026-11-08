@@ -46,7 +46,7 @@ zeughaus-theme/        # the editor's theme: iced theme paired with a terminal c
 vm/win11/              # scripts: headless Windows 11 guest under QEMU/KVM, the service runner's `win11` machine (boot, toolchain, per-boot prepare.ps1); toolchain.ps1 also provisions a Windows runner host
 deploy/                # bootstrap.sh (downloads, checks and runs a build's `install <profile>`), setup-service-runner.sh, setup-sadala.sh, setup-windows.sh (the one-time part of a host); systemd user unit for the runner, desktop entry template, macos-app.sh and the bundle's Info.plist; runner/ (unit, ssh config, enlist.toml.example) and ci/ (CI unit, ci.toml.example, openbao.sh), macos/ (launchd agent), windows/ (host setup, bootstrap.ps1, maintain.toml)
 third_party/           # its own workspace: wezterm's terminal crates at the pinned revision, published as zeughaus-* packages
-omp-plugin/            # the zeughaus-ci omp plugin (skill + extension), published as the npm package @tuco86/zeughaus-omp; it asks the CI over weida-js; fixtures/ holds the texts it shares with zeughaus-runner
+omp-plugin/            # the zeughaus-ci omp plugin (skill + extension), published as the npm package @tuco86/zeughaus-omp; it asks the CI over the npm package weida (npmjs.org); fixtures/ holds the texts it shares with zeughaus-runner
 ```
 
 weida (the QUIC transport) is a git dependency on its public GitHub mirror,
@@ -291,19 +291,23 @@ ticket|pipeline <n>]`, `ci responsible [--json] <repo> <n>`, `ci ask
 the same for a script (exit 3: the origin is no repository of `ci.toml`;
 2: no CI, no answer or a refusal). The
 `zeughaus-ci` omp plugin in `omp-plugin/` asks the same questions itself:
-it speaks the CI's `/ci` API over `@tuco86/weida` (`client.ts`, dialled as
-`mcp` does, with the state directory's `client.pem`) for its session
-context, its push watch, claims, asks, `submit_plan` and `/zeughaus save`,
-and renders what these commands print around the replies (`text.ts`; the
-cases in `omp-plugin/fixtures/` hold both sides to the same text, and a
-change to one of those Rust texts changes the fixture and the port). It
-runs `zeughaus-runner` only for `claude login|status`. The package is
-`@tuco86/zeughaus-omp` in the Forgejo npm registry: a tag
-`omp-plugin-v<version>` (equal to `omp-plugin/package.json`) publishes it
-(channel `omp-plugin`, jobs `check-omp-plugin` and `publish-omp-plugin`
-with `FORGEJO_NPM_TOKEN`); the dotfiles install it on every unix host and
-keep it at the newest version. It does not run on Windows (no weida-js
-prebuild there).
+it speaks the CI's `/ci` API over `weida` from npmjs.org (`client.ts`,
+dialled as `mcp` does, with the state directory's `client.pem`) for its
+session context, its push watch, claims, asks, `submit_plan` and
+`/zeughaus save`, and renders what these commands print around the
+replies (`text.ts`; the cases in `omp-plugin/fixtures/` hold both sides to
+the same text, and a change to one of those Rust texts changes the
+fixture and the port). It runs `zeughaus-runner` only for `claude
+login|status`. The package is `@tuco86/zeughaus-omp` in the Forgejo npm
+registry: a tag `omp-plugin-v<version>` (equal to
+`omp-plugin/package.json`) publishes it (channel `omp-plugin`, jobs
+`check-omp-plugin` and `publish-omp-plugin` with `FORGEJO_NPM_TOKEN`); the
+dotfiles install it on every host and keep it at the newest version
+(wohnzimmer through the `zeughaus-omp` task of
+`deploy/windows/maintain.toml`). `weida` carries prebuilt addons for
+linux-x64, linux-arm64, darwin-arm64 and win32-x64; `@tuco86/zeughaus-omp`
+itself still resolves through the `@tuco86` scope mapping to the Forgejo
+registry.
 
 Asks: in a zeughaus terminal the omp plugin shadows omp's `ask`. The
 native dialog stays open while the plugin posts the same questions for the

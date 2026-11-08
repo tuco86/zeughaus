@@ -449,6 +449,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `omp-plugin-v<version>` (channel `omp-plugin`); the marketplace catalog
   `.omp-plugin/` is gone.
 
+- The omp plugin (0.16.0) depends on `weida` from npmjs.org instead of
+  `@tuco86/weida` from the Forgejo registry, which stops at
+  0.1.0-alpha.13 and is to be deleted there; the API is the same. With
+  weida's win32-x64 prebuild the plugin runs on Windows too, and
+  `omp-plugin/bunfig.toml`, which mapped `@tuco86` to the forge for the
+  plugin's own install, is gone.
+
 - omp gets the Claude token from the CI instead of OpenBao:
   `zeughaus-runner claude token` asks the CI (`CiRequest::ClaudeToken`)
   and prints the current access token, and `models.yml` uses it as the
