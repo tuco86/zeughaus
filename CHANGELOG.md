@@ -619,6 +619,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The omp plugin (0.16.1) finds a session's `local://` plan where omp
+  keeps it: on Windows, when the artifacts path is long, and without an
+  artifacts directory, omp writes `local://` files under
+  `<tmpdir>/omp-local/<session id>/`, so `submit_plan` on wohnzimmer
+  answered `No plan at local://...`. `submit_plan`, omp's plan-review
+  hand-off and `/zeughaus save` now look in both roots, the artifacts one
+  first.
+
 - CI: a runner's workspace budget no longer deletes a workspace a job is
   using. The sweep after a job's end only spared jobs whose process had
   already started, so the next job of the same place, assigned the moment

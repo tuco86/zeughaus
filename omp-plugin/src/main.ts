@@ -46,12 +46,13 @@
 // may reject out of a detached promise or a timer: omp ends the whole session on it.
 
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { agentReporter } from "./agent-status.ts";
 import { type AskReply, askQuestions, askResult } from "./ask.ts";
 import * as calls from "./calls.ts";
 import { CiClient } from "./client.ts";
+import { localFile, localRoots } from "./local.ts";
 import { planModePrompt } from "./plan-mode.ts";
 import { type JobView, type PipelineView, type RepoView, withoutCredentials } from "./protocol.ts";
 import { rewrite } from "./secrets.ts";
@@ -410,30 +411,39 @@ async function pushedHead(
 
 // ---- Plans ----------------------------------------------------------------------------------
 
-/** A plan file path as omp names it: `local://<name>` in the session's artifacts, or a path. */
+/** The directories omp may keep this session's `local://` files in (local.ts). */
+function sessionLocalRoots(ctx: Ctx): string[] {
+  let id: string | undefined;
+  try {
+    id = ctx.sessionManager.getSessionId() || undefined;
+  } catch {
+    id = undefined;
+  }
+  return localRoots(ctx.sessionManager.getArtifactsDir(), id, tmpdir());
+}
+
+/** A plan file path as omp names it: `local://<name>` where omp keeps the session's local files (local.ts), or a path. */
 function resolvePlan(path: string, ctx: Ctx): string | undefined {
   if (path.startsWith("local://")) {
-    const artifacts = ctx.sessionManager.getArtifactsDir();
-    return artifacts ? join(artifacts, "local", path.slice("local://".length)) : undefined;
+    return localFile(path.slice("local://".length), sessionLocalRoots(ctx), existsSync);
   }
   return resolve(ctx.cwd, path);
 }
 
-/** The newest `*plan.md` among the session's local artifacts, the one omp's own review picks. */
+/** The newest `*plan.md` among the session's local files (every root omp may use), the one omp's own review picks. */
 function newestPlan(ctx: Ctx): string | undefined {
-  const artifacts = ctx.sessionManager.getArtifactsDir();
-  if (!artifacts) return undefined;
-  const dir = join(artifacts, "local");
   let newest: { path: string; mtime: number } | undefined;
-  try {
-    for (const name of readdirSync(dir)) {
-      if (!/plan\.md$/i.test(name)) continue;
-      const path = join(dir, name);
-      const mtime = statSync(path).mtimeMs;
-      if (!newest || mtime > newest.mtime) newest = { path, mtime };
+  for (const dir of sessionLocalRoots(ctx)) {
+    try {
+      for (const name of readdirSync(dir)) {
+        if (!/plan\.md$/i.test(name)) continue;
+        const path = join(dir, name);
+        const mtime = statSync(path).mtimeMs;
+        if (!newest || mtime > newest.mtime) newest = { path, mtime };
+      }
+    } catch {
+      // No local files in this root.
     }
-  } catch {
-    // No local artifacts yet.
   }
   return newest?.path;
 }
