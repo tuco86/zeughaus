@@ -916,6 +916,42 @@ pub fn file_request(
     Ok(Filed::Queued(number))
 }
 
+/// Stores a ticket that runs through, already approved: `body` is its text
+/// (title and links read as [`create`] reads them), `plan` its plan, whose
+/// `Runs on` line places it. A refusal before the ticket is stored writes
+/// nothing.
+pub fn file_approved(
+    state_dir: &Path,
+    config: &CiConfig,
+    repo: &str,
+    body: &str,
+    plan: &str,
+    source: &str,
+    now: u64,
+) -> Result<u64, String> {
+    if plan.is_empty() || plan.len() > MAX_DOC_BYTES {
+        return Err(format!("a plan is 1 to {MAX_DOC_BYTES} bytes"));
+    }
+    let runs_on = runs_on_named(plan)?;
+    let new = NewDoc {
+        kind: DocKind::Ticket,
+        body,
+        source,
+        runs_on: &runs_on,
+        onboard: None,
+    };
+    let number = create(state_dir, config, repo, new, now)?;
+    let path = path_of(&dir(state_dir, config, repo)?, number);
+    let mut doc = read_ticket(&path, repo, number)?;
+    doc.plan_text = plan.to_owned();
+    doc.revision = 1;
+    doc.auto_approve = true;
+    doc.state = DocState::Approved;
+    doc.approved = Some(now);
+    write_json(&path, &doc)?;
+    Ok(number)
+}
+
 /// The tickets merged into `number`: back to `open`, or `done` with it.
 fn settle_merged(
     dir: &Path,

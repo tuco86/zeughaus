@@ -1983,6 +1983,25 @@ and files nothing while a ticket of that job in review, approved or in
 progress has the same plan. A manual run or a cancelled pipeline files none. What
 became of the request is a fragment of the job's note.
 
+**Nightly repair.** A nightly of a repository with `nightly_repair` that
+fails (a job failed, or the pipeline could not be set up) becomes a round
+of tickets that run through (`zeughaus-ci/src/repair.rs`, from
+`Scheduler::finish_pipelines` and the setup's error path): one approved
+ticket per group of failed jobs, then one that depends on all of them,
+carries no `Runs on` and queues the nightly again with `ci_run` without
+waiting for it. A group is the jobs that need the same `Runs on`:
+`os=<os>,arch=<arch>` of where they ran (a container is Linux, a machine
+Windows, on their runner's arch) when a connected session host has those
+labels, else `runner=<runner>` when their runner hosts sessions, else none.
+Jobs whose cause line is the same (bracketed parts and path separators
+aside) under several selectors are one group instead, placed by the first
+of them. Each plan carries the failed jobs' notes, causes and excerpts and
+the steps: `ci_log`, reproduce here or with `run_jobs`, fix, gate, push,
+`plan_done`. The tickets are the only state: their sources are
+`nightly.<n>` and `nightly.<n>.rerun`, no round is filed while one of them
+is unfinished, and none after `repair::MAX_ROUNDS` (3) reruns created since
+the newest nightly that succeeded, which raises an alert instead.
+
 **Onboarding.** A third kind, `onboarding`, is a project's request to join:
 an `OnboardSpec` (its origin, made the canonical url of `[onboarding] api`'s
 Forgejo, its default branch, grants and host prerequisites) under the name

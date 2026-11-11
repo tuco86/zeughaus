@@ -116,6 +116,23 @@ pub fn place(
     Some(chosen)
 }
 
+/// The connected runners that may host sessions, with their labels, in
+/// name order.
+pub(crate) fn session_hosts(
+    config: &CiConfig,
+    views: &BTreeMap<String, RunnerView>,
+) -> Vec<(String, Vec<String>)> {
+    config
+        .runners
+        .iter()
+        .filter(|(_, runner)| runner.sessions)
+        .filter_map(|(name, _)| {
+            let view = views.get(name)?;
+            Some((name.clone(), config.labels_of(name, Some(&view.offer))))
+        })
+        .collect()
+}
+
 impl Sessions {
     pub fn new(
         state_dir: PathBuf,
@@ -202,20 +219,6 @@ impl Sessions {
             .collect()
     }
 
-    /// The connected runners that may host sessions, with their labels.
-    fn session_hosts(&self, views: &BTreeMap<String, RunnerView>) -> Vec<(String, Vec<String>)> {
-        let config = self.config.get();
-        config
-            .runners
-            .iter()
-            .filter(|(_, runner)| runner.sessions)
-            .filter_map(|(name, _)| {
-                let view = views.get(name)?;
-                Some((name.clone(), config.labels_of(name, Some(&view.offer))))
-            })
-            .collect()
-    }
-
     /// What a session needs to know of runner `name` as one of its machines.
     fn machine(&self, name: &str, views: &BTreeMap<String, RunnerView>) -> SessionMachine {
         let view = views.get(name);
@@ -289,8 +292,7 @@ impl Sessions {
             // and omp session: it may take the ticket back while cooling
             // down, and it comes first.
             let previous = plan.placement.first();
-            let mut hosts: Vec<(String, Vec<String>)> = self
-                .session_hosts(&views)
+            let mut hosts: Vec<(String, Vec<String>)> = session_hosts(&config, &views)
                 .into_iter()
                 .filter(|(name, _)| {
                     free(name)
@@ -393,7 +395,7 @@ impl Sessions {
             }) {
                 continue;
             }
-            let hosts = self.session_hosts(views);
+            let hosts = session_hosts(config, views);
             let host = match &ticket.planner {
                 Some(planner) => hosts
                     .iter()
@@ -709,7 +711,7 @@ impl Sessions {
             return Ok(live.clone());
         }
         let views = self.runners.views();
-        let hosts = self.session_hosts(&views);
+        let hosts = session_hosts(&config, &views);
         let host = match runner {
             Some(named) => hosts
                 .iter()

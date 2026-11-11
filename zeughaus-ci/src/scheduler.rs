@@ -28,6 +28,7 @@ use crate::docs::{self, Filed};
 use crate::event::{self, CiEvent, EventKind, Upstream, UpstreamDone, UpstreamJob};
 use crate::forge::{self, State, Status};
 use crate::header::JobDef;
+use crate::repair::{self, Outcome};
 use crate::runners::Runners;
 use crate::secrets::Secrets;
 use crate::streak::{self, Streak};
@@ -865,6 +866,9 @@ impl Scheduler {
                         .unwrap_or_else(|| channels::fallback(&event));
                 }
                 pipeline.save(&self.state_dir, &self.changes);
+                if pipeline.event.kind == EventKind::Nightly {
+                    self.repair(&pipeline);
+                }
                 self.post(
                     &pipeline,
                     "ci",
@@ -1226,6 +1230,11 @@ impl Scheduler {
             if pipeline.status == PipelineStatus::Failed && pipeline.event.kind != EventKind::Manual
             {
                 self.alert_red(&pipeline);
+            }
+            if pipeline.status == PipelineStatus::Failed
+                && pipeline.event.kind == EventKind::Nightly
+            {
+                self.repair(&pipeline);
             }
             if pipeline.event.kind == EventKind::Push
                 && let Some(sha) = pipeline.sha.clone()
@@ -2387,6 +2396,67 @@ impl Scheduler {
             title,
             body: lines.join("\n"),
         });
+    }
+
+    /// Files a round of repair tickets for failed nightly `pipeline` when
+    /// its repository has `nightly_repair` (see [`repair`]).
+    fn repair(&self, pipeline: &Pipeline) {
+        if !self
+            .config
+            .repos
+            .get(&pipeline.repo)
+            .is_some_and(|r| r.nightly_repair)
+        {
+            return;
+        }
+        let views = self.runners.views();
+        let hosts = crate::sessions::session_hosts(&self.config, &views);
+        let offers = views
+            .into_iter()
+            .map(|(name, view)| (name, view.offer))
+            .collect();
+        let since = repair::last_green(&load_repo_pipelines(&self.state_dir, &pipeline.repo));
+        let filed = {
+            let _docs = self
+                .docs_lock
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            repair::file(
+                &self.state_dir,
+                &self.config,
+                pipeline,
+                &offers,
+                &hosts,
+                since,
+                crate::now_secs(),
+            )
+        };
+        let (repo, number) = (&pipeline.repo, pipeline.number);
+        match filed {
+            Ok(Outcome::Nothing) => {}
+            Ok(Outcome::Filed { fixes, rerun }) => {
+                let _ = self.docs_tx.send(repo.clone());
+                let fixes: Vec<String> = fixes.iter().map(|n| format!("#{n}")).collect();
+                eprintln!(
+                    "[ci] {repo} #{number}: nightly repair {}, then #{rerun}",
+                    fixes.join(", ")
+                );
+            }
+            Ok(Outcome::Open(open)) => {
+                eprintln!("[ci] {repo} #{number}: nightly repair still open as #{open}");
+            }
+            Ok(Outcome::Exhausted) => {
+                let title = format!("{repo} nightly repair stopped (#{number})");
+                let body = format!(
+                    "{} rounds of repair tickets without a nightly that succeeded; \
+                     the next round waits for one",
+                    repair::MAX_ROUNDS
+                );
+                eprintln!("[ci] {title}: {body}");
+                let _ = self.alerts.send(Alert { title, body });
+            }
+            Err(e) => eprintln!("[ci] {repo} #{number}: nightly repair: {e}"),
+        }
     }
 
     // ------------------------------------------------------------ lost runners

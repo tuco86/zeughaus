@@ -286,6 +286,10 @@ pub struct RepoConfig {
     /// in `CI_OUTPUT`), which the CI files as approved plans.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub agent_sessions: bool,
+    /// A failed nightly of this repository becomes a round of tickets that
+    /// run through (see [`crate::repair`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nightly_repair: bool,
 }
 
 impl RepoConfig {
@@ -310,6 +314,15 @@ impl RepoConfig {
             .iter()
             .chain(&self.status_token)
             .chain(&self.webhook_secret)
+    }
+}
+
+/// The `arch=` label of a runner reporting `arch` (Rust's name for it).
+pub fn arch_label(arch: &str) -> &str {
+    match arch {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
     }
 }
 
@@ -353,12 +366,7 @@ impl CiConfig {
         labels.push(format!("runner={name}"));
         if let Some(offer) = offer {
             labels.push(format!("os={}", offer.os));
-            let arch = match offer.arch.as_str() {
-                "x86_64" => "amd64",
-                "aarch64" => "arm64",
-                other => other,
-            };
-            labels.push(format!("arch={arch}"));
+            labels.push(format!("arch={}", arch_label(&offer.arch)));
         }
         labels.sort();
         labels

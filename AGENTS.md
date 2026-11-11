@@ -370,7 +370,15 @@ a repository with `agent_sessions = true` in `ci.toml` requests a session
 by writing a plan (at most 32 KiB) to `$CI_OUTPUT/agent-session.md`, on any
 exit status: the CI files it as an approved ticket with source `job.<job>`,
 unless a ticket of that job with the same plan is still in review, approved
-or in progress, and says so in the job's note; manual runs file none. Each
+or in progress, and says so in the job's note; manual runs file none. A
+failed nightly of a repository with `nightly_repair = true` files a round
+of tickets that run through (sources `nightly.<n>`): one per platform its
+failed jobs ran on, `Runs on: os=<os>,arch=<arch>` when a session host has
+it (else their runner, else anywhere), jobs failing the same way on
+several platforms sharing one, and a last unplaced ticket that depends on
+them and queues the nightly again (`nightly.<n>.rerun`); none while a
+round is unfinished, none after three rounds without a nightly that
+succeeded. Each
 change is announced as `CiDocs` on `/events`. An onboarding request
 (`onboard_request`, kind `onboarding`) is how a project outside `ci.toml`
 asks to join: it gives the

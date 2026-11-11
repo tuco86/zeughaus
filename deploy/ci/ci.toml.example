@@ -114,6 +114,7 @@ fetch_user = "x-access-token"
 status_token = "GRIASDI_GITHUB_TOKEN"
 webhook_secret = "GRIASDI_WEBHOOK_SECRET"
 # agent_sessions = true            # jobs may request agent sessions ($CI_OUTPUT/agent-session.md)
+# nightly_repair = true            # a failed nightly files tickets that run through: a fix per platform, then a rerun
 
 [repos.griasdi.grants]             # secret -> event patterns it is released to (from its project document)
 GRIASDI_GITHUB_TOKEN = ["tag v*", "nightly"]

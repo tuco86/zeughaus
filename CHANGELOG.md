@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Nightly repair. A repository with `nightly_repair = true` in `ci.toml`
+  gets a round of tickets that run through when its nightly fails: one per
+  platform the failed jobs ran on, placed there (`Runs on:
+  os=<os>,arch=<arch>`) when a session host has it, else on their runner
+  or anywhere, with the failures' causes and excerpts and the steps to
+  repair them; jobs that failed the same way on several platforms share
+  one ticket. A last, unplaced ticket depends on them and queues the
+  nightly again. No round is filed while one is open, and none after three
+  rounds without a nightly that succeeded (an alert says so).
+
 - A ticket keeps the final report of the master that executed it.
   `plan_done` requires a `report` (Markdown, up to 64 KiB) and the master's
   instructions ask for it; the CI stores it on the ticket as it marks it

@@ -75,6 +75,7 @@ pub fn repo_config(
         webhook_secret: Some(webhook_secret_name(name)),
         grants: spec.grants.clone(),
         agent_sessions: false,
+        nightly_repair: false,
     }
 }
 
