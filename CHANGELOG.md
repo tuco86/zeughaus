@@ -449,12 +449,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminal, a work shell's included, keeps omp's own ask and plan review;
   `/zeughaus save` still stores its plan as a ticket by hand.
 
-- A project's work shell is a terminal glyph in its group's header, left
-  of the channels, instead of a tab: a press brings it to the front, its
-  colour follows the agent working or waiting there, and a dim one opens a
-  shell while there is none (the `~/work/<name>` button is gone). The
-  Projects header's project search is a search glyph beside its label in
-  both bar placements.
+- A project group without a work shell no longer spends a tab on the
+  `~/work/<name>` button: a terminal glyph in the group's header, left of
+  the channels, opens the shell, or brings it to the front once it is open
+  (it stays a tab of the group). The Projects header's project search is a
+  search glyph beside its label in both bar placements.
 
 - The Board has no QUEUE column any more: RUNNING lists the running
   tickets, then a `queued N` separator (`queued N, paused` while the queue

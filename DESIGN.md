@@ -312,17 +312,16 @@ After the runners the `Projects` section holds one locked group per project
 (saved as `projects` in `editor.toml`) and every one a runner has a project
 group for (`GroupSnapshot::project`), unless the user closed its group and
 no tab came since. The group is named after the repository, tinted by its
-name, and its header carries a terminal glyph per work shell (bringing it
-to the front, in its agent's colour while one works or waits there; a dim
-one while there is none asks this machine's runner for one with
-`OpenProject`), then one glyph per CI channel (dev, nightly, release, the
-rest) in the colour of its newest pipeline, each opening that channel's
-view as a tab of the group. Its tabs are the project's Board, its masters,
-its plan sessions, its other runner tabs and the channel views opened, in
-that order; the runner tabs stay their runners' and carry their host's
-glyph. A collapsed group repeats the badge of a tab whose agent waits.
-Ctrl+PageDown and Ctrl+PageUp walk all of it in the bar's order, a group's
-work shells before its Board. In both bar placements tabs are
+name, and its header carries a terminal glyph that brings its work shell
+to the front (dim while there is none: then it asks this machine's runner
+for one with `OpenProject`), then one glyph per CI channel (dev, nightly,
+release, the rest) in the colour of its newest pipeline, each opening that
+channel's view as a tab of the group. Its tabs are the project's Board,
+its work shells, its masters, its plan sessions, its other runner tabs and
+the channel views opened, in that order; the runner tabs stay their
+runners' and carry their host's glyph. A collapsed group repeats the badge
+of a tab whose agent waits. Ctrl+PageDown and Ctrl+PageUp walk all of it
+in the bar's order. In both bar placements tabs are
 dragged into and out of groups (collapsed ones too), onto another tab's
 content to split it, and a pane is dragged by its grip back into the bar to
 become a tab (`zeughaus/src/workspace.rs`, `drop_allowed`). A tab dropped on
