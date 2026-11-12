@@ -1022,9 +1022,8 @@ where
         }
     }
 
-    /// Chevron, label and one button per control. In the sidebar the
-    /// controls get a row of their own, wrapping when they outgrow it: next
-    /// to the label they would leave it no width at all.
+    /// Chevron, label and one button per control, on one row: in the
+    /// sidebar the label takes the width the controls leave.
     fn section_header(
         &self,
         id: &S,
@@ -1035,13 +1034,13 @@ where
         let placement = self.placement;
         let text_color = move |theme: &Theme| Catalog::section_header(theme, placement).text;
 
-        let mut title = Row::new().spacing(4).align_y(Alignment::Center);
-        title = title.push(
+        let mut content = Row::new().spacing(4).align_y(Alignment::Center);
+        content = content.push(
             flat_button(self.chevron(collapsed), text_color)
                 .padding([1, 3])
                 .on_press((self.handlers.on_toggle_section)(id.clone())),
         );
-        title = title.push(
+        content = content.push(
             container(
                 text(shorten(label, self.label_limit()))
                     .size(12)
@@ -1050,23 +1049,9 @@ where
             .width(self.fill_left())
             .clip(true),
         );
-        let mut buttons = Row::new().spacing(4).align_y(Alignment::Center);
         for control in controls {
-            buttons = buttons.push(self.control(id, control, text_color));
+            content = content.push(self.control(id, control, text_color));
         }
-        let content: Element<'a, Message, Theme> = match placement {
-            Placement::Top => title.push(buttons).into(),
-            Placement::Left => Column::new()
-                .push(title)
-                .push(
-                    container(buttons.wrap().vertical_spacing(2.0)).padding(Padding {
-                        left: 18.0,
-                        ..Padding::ZERO
-                    }),
-                )
-                .spacing(2)
-                .into(),
-        };
 
         self.header(content)
             .style(move |theme: &Theme| container_style(Catalog::section_header(theme, placement)))

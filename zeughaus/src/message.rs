@@ -382,9 +382,9 @@ pub enum Message {
     /// in the bar's order, the Projects section's included.
     CycleTab(isize),
     // The Projects section of the bar: a press on a tab the editor made
-    // there (a Board, the button that starts a work shell, a channel view),
-    // opening a project with a shell or only its Board, closing a project's
-    // group, a channel badge of its header.
+    // there (a Board, a channel view), opening a project with a shell (also
+    // its header's shell glyph while it has none) or only its Board, closing
+    // a project's group, a channel badge of its header.
     #[cfg(not(target_arch = "wasm32"))]
     ProjectTab(zeughaus_mux::TabId),
     #[cfg(not(target_arch = "wasm32"))]
@@ -395,9 +395,9 @@ pub enum Message {
     DismissProject(String),
     #[cfg(not(target_arch = "wasm32"))]
     OpenChannelView(String, String),
-    // The Overview's project list: the section's `+` focuses its search,
-    // typing filters it, `Refresh` asks the forges again, and the local
-    // runner's answer.
+    // The Overview's project list: the section's search glyph focuses its
+    // search, typing filters it, `Refresh` asks the forges again, and the
+    // local runner's answer.
     #[cfg(not(target_arch = "wasm32"))]
     OpenProjectSearch,
     #[cfg(not(target_arch = "wasm32"))]

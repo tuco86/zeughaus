@@ -1,19 +1,20 @@
 //! The Projects section of the tab bar: one locked group per project the
 //! user opened or that has tabs on a runner, whatever runner they run on.
 //!
-//! A group holds the project's Board, its work shell (or a button that
-//! starts one), its masters, its plan sessions, the rest of its runner tabs
-//! and the channel views the user opened, each followed by the jobs opened
-//! from it, in that order. The runner tabs come from the runners' project
-//! groups (`GroupSnapshot::project`); the Board, the button and the views
-//! are the editor's own and carry ids it mints, under
+//! A group's header carries a terminal glyph per work shell (one that
+//! starts a shell while no runner has one) left of its channels. Its tabs
+//! are the project's Board, its masters, its plan sessions, the rest of its
+//! runner tabs and the channel views the user opened, each followed by the
+//! jobs opened from it, in that order. The runner tabs come from the
+//! runners' project groups (`GroupSnapshot::project`); the Board and the
+//! views are the editor's own and carry ids it mints, under
 //! [`RunnerKey::PROJECTS`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use iced::Task;
-use zeughaus_link::{ActivityKind, ProjectView, ProjectsReply};
+use zeughaus_link::{ActivityKind, AgentState, ProjectView, ProjectsReply};
 use zeughaus_mux::{GroupId, GroupSnapshot, TabId, TerminalId, TopologyCommand};
 
 use super::App;
@@ -80,8 +81,6 @@ fn ordered_views<'a>(views: &'a [(String, ViewKey)], origin: &str) -> Vec<&'a Vi
 pub(super) enum ViewSlot {
     /// A project's Board; its id also names the project's group.
     Board(String),
-    /// The button that opens the work shell.
-    Start(String),
     View(String, ViewKey),
 }
 
@@ -123,8 +122,6 @@ pub(super) struct ComposeInput<'a, K, N> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum GroupTab {
     Board,
-    /// The button that starts the work shell, while no runner has one.
-    Start,
     Runner(TabRef),
     View(ViewKey),
 }
@@ -134,6 +131,8 @@ pub(super) enum GroupTab {
 pub(super) struct ProjectGroup {
     pub origin: String,
     pub name: String,
+    /// The work shells, drawn as glyphs of the group's header.
+    pub work: Vec<TabRef>,
     pub tabs: Vec<GroupTab>,
 }
 
@@ -183,17 +182,15 @@ where
                 runner_tabs
                     .iter()
                     .filter(move |(k, _)| *k == kind)
-                    .map(|(_, tab)| GroupTab::Runner(tab.clone()))
+                    .map(|(_, tab)| tab.clone())
             };
             let mut tabs = vec![GroupTab::Board];
-            let work: Vec<GroupTab> = of_kind(TabKind::Work).collect();
-            if work.is_empty() {
-                tabs.push(GroupTab::Start);
-            }
-            tabs.extend(work);
-            tabs.extend(of_kind(TabKind::Master));
-            tabs.extend(of_kind(TabKind::Plan));
-            tabs.extend(of_kind(TabKind::Other));
+            tabs.extend(
+                [TabKind::Master, TabKind::Plan, TabKind::Other]
+                    .into_iter()
+                    .flat_map(of_kind)
+                    .map(GroupTab::Runner),
+            );
             tabs.extend(
                 ordered_views(input.views, origin)
                     .into_iter()
@@ -202,6 +199,7 @@ where
             ProjectGroup {
                 origin: origin.to_owned(),
                 name: (input.names)(origin),
+                work: of_kind(TabKind::Work).collect(),
                 tabs,
             }
         })
@@ -422,15 +420,9 @@ impl App {
                     .insert(CollapseKey::Group(RunnerKey::projects(), GroupId(board)));
             }
             for tab in &group.tabs {
-                match tab {
-                    GroupTab::Start => {
-                        self.projects.mint(ViewSlot::Start(group.origin.clone()));
-                    }
-                    GroupTab::View(view) => {
-                        self.projects
-                            .mint(ViewSlot::View(group.origin.clone(), view.clone()));
-                    }
-                    GroupTab::Board | GroupTab::Runner(_) => {}
+                if let GroupTab::View(view) = tab {
+                    self.projects
+                        .mint(ViewSlot::View(group.origin.clone(), view.clone()));
                 }
             }
         }
@@ -479,8 +471,8 @@ impl App {
         })
     }
 
-    /// Every tab of the bar in the order it is drawn, without the buttons
-    /// that start a work shell.
+    /// Every tab of the bar in the order it is drawn, a project's work
+    /// shells (its header's glyphs) before its Board.
     fn bar_order(&self) -> Vec<BarTab> {
         let mut order = Vec::new();
         for section in self.workspace.sections() {
@@ -501,6 +493,7 @@ impl App {
             }
         }
         for group in &self.projects.groups {
+            order.extend(group.work.iter().cloned().map(BarTab::Runner));
             for tab in &group.tabs {
                 let slot = match tab {
                     GroupTab::Board => ViewSlot::Board(group.origin.clone()),
@@ -509,7 +502,6 @@ impl App {
                         order.push(BarTab::Runner(tab.clone()));
                         continue;
                     }
-                    GroupTab::Start => continue,
                 };
                 if let Some(id) = self.projects.id(&slot) {
                     order.push(BarTab::Project(TabId(id)));
@@ -548,7 +540,6 @@ impl App {
             Some(ViewSlot::Board(origin)) => {
                 self.apply_page(Message::PageShow(PageView::Board(origin)))
             }
-            Some(ViewSlot::Start(origin)) => self.open_project(origin),
             Some(ViewSlot::View(_, ViewKey::Channel(ci, view))) => {
                 self.apply_page(Message::PageShow(PageView::Channel(ci, view)))
             }
@@ -656,11 +647,14 @@ impl App {
             .groups
             .iter()
             .filter(|group| group.origin == origin)
-            .flat_map(|group| &group.tabs)
-            .filter_map(|tab| match tab {
-                GroupTab::Runner(tab) => Some((tab.runner.clone(), tab.tab)),
-                _ => None,
+            .flat_map(|group| {
+                let listed = group.tabs.iter().filter_map(|tab| match tab {
+                    GroupTab::Runner(tab) => Some(tab),
+                    _ => None,
+                });
+                group.work.iter().chain(listed)
             })
+            .map(|tab| (tab.runner.clone(), tab.tab))
             .collect();
         if let PageView::Board(shown) = &self.page.view
             && *shown == origin
@@ -803,6 +797,51 @@ impl App {
         ))
     }
 
+    /// The glyph a work shell of `group` is in its header, and what a press
+    /// on it does: bring the shell to the front, in its agent's colour while
+    /// one works or waits there.
+    fn shell_badge(
+        &self,
+        group: &ProjectGroup,
+        tab: &TabRef,
+    ) -> Option<(iced_tabs::Badge<'static>, Message)> {
+        let snapshot = self
+            .workspace
+            .section(&tab.runner)?
+            .snapshot
+            .tabs()
+            .find(|t| t.id == tab.tab)?;
+        let terminal = snapshot.root.terminals().next()?;
+        let agent = self
+            .runtime
+            .agents()
+            .find(|(key, entry)| {
+                *key == &tab.runner && snapshot.root.terminals().any(|t| t.0 == entry.terminal)
+            })
+            .and_then(|(_, entry)| entry.agent.as_ref());
+        let color = match agent.map(|a| a.state) {
+            None | Some(AgentState::Idle | AgentState::Ended) => {
+                self.theme.extended().background.base.text
+            }
+            Some(state) => super::agents::agent_color(state, &self.theme),
+        };
+        let host = self
+            .host_of(&tab.runner)
+            .map(|(_, name)| format!(" on {name}"))
+            .unwrap_or_default();
+        let state = agent
+            .map(|a| format!(", agent {}", super::agents::state_word(a.state)))
+            .unwrap_or_default();
+        Some((
+            iced_tabs::Badge {
+                glyph: super::GLYPH_SHELL,
+                color,
+                tooltip: format!("~/work/{}{host}{state}", group.name).into(),
+            },
+            Message::RevealTerminal(tab.runner.clone(), terminal),
+        ))
+    }
+
     /// The Projects section as the tab tree draws it, with what each
     /// group's close button and badges mean: the group's origin and one
     /// message per badge.
@@ -821,6 +860,20 @@ impl App {
                 .contains(&CollapseKey::Group(projects.clone(), gid));
             let mut badges = Vec::new();
             let mut actions = Vec::new();
+            for tab in &group.work {
+                if let Some((badge, action)) = self.shell_badge(group, tab) {
+                    badges.push(badge);
+                    actions.push(action);
+                }
+            }
+            if group.work.is_empty() {
+                badges.push(iced_tabs::Badge {
+                    glyph: super::GLYPH_SHELL,
+                    color: self.theme.muted(),
+                    tooltip: format!("Open a shell in ~/work/{}", group.name).into(),
+                });
+                actions.push(Message::OpenProject(group.origin.clone()));
+            }
             for badge in self.channel_badges(&group.origin) {
                 actions.push(Message::OpenChannelView(
                     group.origin.clone(),
@@ -843,11 +896,6 @@ impl App {
                 let entry = match tab {
                     GroupTab::Board => synthetic(ViewSlot::Board(group.origin.clone()))
                         .map(|id| iced_tabs::Tab::new(id, "Board").closable(false)),
-                    GroupTab::Start => synthetic(ViewSlot::Start(group.origin.clone())).map(|id| {
-                        iced_tabs::Tab::new(id, format!("~/work/{}", group.name))
-                            .host('\u{ea60}', "Open a shell in the work checkout")
-                            .closable(false)
-                    }),
                     GroupTab::View(view) => {
                         let label = match view {
                             ViewKey::Channel(ci, channel_view) => self
@@ -908,9 +956,9 @@ impl App {
                 header: true,
                 collapsed: false,
                 controls: vec![
-                    iced_tabs::Control::new("open-project", '\u{ea60}'.to_string())
+                    iced_tabs::Control::new("open-project", '\u{ea6d}'.to_string())
                         .font(crate::font::UI)
-                        .tooltip("Open a project"),
+                        .tooltip("Search the projects"),
                 ],
                 items,
             },
@@ -992,7 +1040,7 @@ mod tests {
     }
 
     #[test]
-    fn a_group_orders_board_work_masters_plans_rest_and_views_local_runner_first() {
+    fn a_group_orders_board_masters_plans_rest_and_views_local_runner_first() {
         let remote = group("h/o/zeughaus", &[30, 20, 10, 1]);
         let local = group("h/o/zeughaus", &[11]);
         let open = BTreeSet::new();
@@ -1015,9 +1063,12 @@ mod tests {
             [ProjectGroup {
                 origin: "h/o/zeughaus".to_owned(),
                 name: "zeughaus".to_owned(),
+                work: vec![TabRef {
+                    runner: key("remote"),
+                    tab: TabId(1),
+                }],
                 tabs: vec![
                     GroupTab::Board,
-                    at("remote", 1),
                     at("local", 11),
                     at("remote", 10),
                     at("remote", 20),
@@ -1029,7 +1080,7 @@ mod tests {
     }
 
     #[test]
-    fn an_open_project_without_tabs_offers_its_board_and_the_start_button() {
+    fn an_open_project_without_tabs_offers_its_board_and_no_shell() {
         let open: BTreeSet<String> = ["h/o/weida".to_owned(), "h/o/demo".to_owned()].into();
         let dismissed = HashMap::new();
         let master = group("h/o/weida", &[10]);
@@ -1041,18 +1092,15 @@ mod tests {
             names: name,
             views: &[],
         });
-        let tabs: Vec<(&str, &[GroupTab])> = groups
+        let tabs: Vec<(&str, usize, &[GroupTab])> = groups
             .iter()
-            .map(|g| (g.name.as_str(), g.tabs.as_slice()))
+            .map(|g| (g.name.as_str(), g.work.len(), g.tabs.as_slice()))
             .collect();
         assert_eq!(
             tabs,
             [
-                ("demo", &[GroupTab::Board, GroupTab::Start][..]),
-                (
-                    "weida",
-                    &[GroupTab::Board, GroupTab::Start, at("local", 10)][..]
-                ),
+                ("demo", 0, &[GroupTab::Board][..]),
+                ("weida", 0, &[GroupTab::Board, at("local", 10)][..]),
             ]
         );
     }

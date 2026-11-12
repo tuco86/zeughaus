@@ -115,16 +115,18 @@ group of a runner other than this machine's carries its host's glyph (the
 `device=` label of `ci.toml`: laptop, desktop, media, server). The toolbar's
 terminal, graph and folder glyphs open a shell, a graph or a group on this
 machine's runner, the choice beside each on another runner. After them the
-`Projects` section has one locked group per project the user opened (its
-`+` searches the projects on the Overview) or that a runner has a project
-group for: its header shows the dev, nightly and release channels in the
+`Projects` section has one locked group per project the user opened (the
+search glyph beside `Projects` searches the projects on the Overview) or
+that a runner has a project group for: its header shows a terminal glyph
+for its work shell in `~/work/<origin>` (a press brings it to the front; a
+dim one, while there is none, opens one on this machine's runner, cloning
+the checkout first), then the dev, nightly and release channels in the
 colour of their newest pipeline (a press opens the channel as a tab of the
-group), and its tabs are the project's Board, its work shell in
-`~/work/<origin>` (or `~/work/<name>`, which opens one on this machine's
-runner, cloning the checkout first), its masters, its plan sessions and the
-opened channels; closing the group hides it until it is opened again or a
-new tab of it appears. A runner lists the projects (`/projects`): what the
-forges of `[projects]` in its `zeughaus.toml` let the user push to
+group), and its tabs are the project's Board, its masters, its plan
+sessions and the opened channels; closing the group hides it until it is
+opened again or a new tab of it appears. A runner lists the projects
+(`/projects`): what the forges of `[projects]` in its `zeughaus.toml` let
+the user push to
 (`primary`, `[[projects.forge]]` with `kind = "forgejo"`/`"github"`, `url`
 for Forgejo and `token` as an argv such as `["get-secret", "..."]`) and the
 checkouts under its work root. A chip at the right end of the status bar
