@@ -29,12 +29,13 @@
 //   picking one shows the ticket in the editor that drives it (tickets.ts).
 // - adds `Ticket: <repo>#<n>` and `Omp-Session: <id>` trailers to the `git commit`s of a session
 //   that works on a ticket (shell.ts).
-// - in a zeughaus terminal, shadows omp's `ask`: the native dialog stays open in the terminal while
-//   the same questions are posted to the CI, where the editor shows them in Needs you and the
-//   ticket's popout; the first answer wins (ask.ts).
-// - in a zeughaus terminal whose checkout the CI builds (masters aside), hands omp's plan review to
-//   zeughaus: the plan is stored as a ticket in review, as `submit_plan` does, and the session ends;
-//   the review happens in the ticket's popout, and its Refine resumes this session.
+// - in a master or a plan session, shadows omp's `ask`: the native dialog stays open in the
+//   terminal while the same questions are posted to the CI, where the editor shows them in Needs
+//   you and the ticket's popout; the first answer wins (ask.ts). Every other omp keeps omp's own.
+// - in a plan session, hands omp's plan review to zeughaus: the plan is stored on the ticket, as
+//   `submit_plan` does, and the session ends; the review happens in the ticket's popout, and its
+//   Refine resumes this session. Every other omp keeps omp's own review; /zeughaus save stores
+//   its plan by hand.
 //
 // Every exchange with the CI is a request on its weida API (`/ci`, client.ts and calls.ts), made
 // as this machine's editor (`client.pem` of the zeughaus state directory); only git, get-secret
@@ -56,7 +57,7 @@ import { localFile, localRoots } from "./local.ts";
 import { planModePrompt } from "./plan-mode.ts";
 import { type JobView, type PipelineView, type RepoView, withoutCredentials } from "./protocol.ts";
 import { rewrite } from "./secrets.ts";
-import { claimHolder, masterPlan, planSession, sessionId } from "./session-env.ts";
+import { claimHolder, masterPlan, planSession, sessionId, ticketSession } from "./session-env.ts";
 import { branchPushes, withTrailers } from "./shell.ts";
 import { includesNamed } from "./text.ts";
 import { LINK_SCHEME, type TicketRef, linkTickets, parseTicketLink, showSequence } from "./tickets.ts";
@@ -899,7 +900,7 @@ export default function zeughausCi(pi: Pi): void {
           .catch(() => undefined);
       }
     }
-    if (holder && !askShadowed) shadowAsk();
+    if (holder && ticketSession() && !askShadowed) shadowAsk();
     void contextFor(ctx.cwd)
       .then((c) => {
         if (c.kind === "repo") agent.setRepo(c.view.name, doc);
@@ -912,20 +913,13 @@ export default function zeughausCi(pi: Pi): void {
     agent.report(ctx, "review", typeof event.title === "string" ? event.title : "");
     if (typeof event.planFilePath !== "string") return;
     planFile = resolvePlan(event.planFilePath, ctx);
-    // The review happens in zeughaus: the plan becomes a ticket in review and the session ends.
-    // A master reviews nothing; a checkout the CI does not build keeps omp's own review.
+    // The review of a plan session happens in zeughaus: the plan goes on its ticket and the
+    // session ends. A master reviews nothing; every other omp keeps omp's own review.
     const path = planFile;
-    if (!claimHolder() || masterPlan() || !path) return;
+    const session = planSession();
+    if (!claimHolder() || !session || !path) return;
     void (async () => {
-      const session = planSession();
-      let target: { repo: string; ticket: number | undefined };
-      if (session) {
-        target = { repo: session.repo, ticket: session.ticket };
-      } else {
-        const c = await contextFor(ctx.cwd);
-        if (c.kind !== "repo") return;
-        target = { repo: c.view.name, ticket: undefined };
-      }
+      const target = { repo: session.repo, ticket: session.ticket };
       try {
         const n = await storePlan(ctx, target.repo, path, target.ticket);
         decided = true;

@@ -309,7 +309,9 @@ linux-x64, linux-arm64, darwin-arm64 and win32-x64; `@tuco86/zeughaus-omp`
 itself still resolves through the `@tuco86` scope mapping to the Forgejo
 registry.
 
-Asks: in a zeughaus terminal the omp plugin shadows omp's `ask`. The
+Asks: in a master or a plan session (`ZEUGHAUS_PLAN` or
+`ZEUGHAUS_PLAN_SESSION` set) the omp plugin shadows omp's `ask`; every
+other omp, a work shell's included, keeps omp's own. The
 native dialog stays open while the plugin posts the same questions for the
 terminal (`AskPost`, with the repository and ticket the session works on)
 and polls them every 2 s (`AskPoll`, which renews them); the CI keeps open
@@ -320,10 +322,11 @@ and in the popout of the ticket the asking session works on; its `Send`
 answers it (`AskAnswer`), and the plugin closes the terminal's dialog and
 returns what omp's own ask would have. An answer in the terminal first
 stops the polling and drops the ask (`AskClose`); `ci ask <file>` and `ci
-ask-close` do the same for a script. omp's plan review in a zeughaus
-terminal whose checkout the CI builds (not in a master) stores the plan as
-a ticket in review, as `submit_plan` does, and ends the session; a failure
-to store it leaves omp's own review open.
+ask-close` do the same for a script. omp's plan review in a plan session
+stores the plan on its ticket, as `submit_plan` does, and ends the
+session; a failure to store it leaves omp's own review open. Any other omp
+keeps omp's own review; `/zeughaus save` stores its plan as a ticket in
+review by hand.
 
 Claims: the CI keeps who is responsible for a ticket or a pipeline as
 leased claims in `<state-dir>/ci/sessions.json` (`Book.claims`). A claim

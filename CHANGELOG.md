@@ -443,6 +443,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The omp plugin (0.17.0) shadows omp's `ask` only in masters and plan
+  sessions (`ZEUGHAUS_PLAN`, `ZEUGHAUS_PLAN_SESSION`), and hands omp's plan
+  review to zeughaus only in plan sessions. Every other omp in a zeughaus
+  terminal, a work shell's included, keeps omp's own ask and plan review;
+  `/zeughaus save` still stores its plan as a ticket by hand.
+
 - The Board has no QUEUE column any more: RUNNING lists the running
   tickets, then a `queued N` separator (`queued N, paused` while the queue
   is paused) and the approved tickets below it in the order masters take

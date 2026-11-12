@@ -1,6 +1,6 @@
 {
   "name": "@tuco86/zeughaus-omp",
-  "version": "0.16.1",
+  "version": "0.17.0",
   "description": "zeughaus-ci in omp: the checkout's CI at session start, push watching, plans stored on their tickets, the CI skill, over the CI's weida API",
   "license": "MIT OR Apache-2.0",
   "type": "module",

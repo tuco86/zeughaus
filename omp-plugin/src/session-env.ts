@@ -24,6 +24,14 @@ export function sessionId(): number | undefined {
 }
 
 /**
+ * A master or a plan session: the sessions whose questions and plans belong to zeughaus. Any
+ * other omp, a work shell's or a pane's included, keeps omp's own `ask` and plan review.
+ */
+export function ticketSession(): boolean {
+  return masterPlan() !== undefined || planSession() !== undefined;
+}
+
+/**
  * `ZEUGHAUS_RUNNER`, `ZEUGHAUS_TERMINAL`: the zeughaus terminal this omp runs in, which holds its
  * claims, with the CI session (`ZEUGHAUS_SESSION`) running in it, if any.
  */
