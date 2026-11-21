@@ -89,12 +89,16 @@ fi
 
 [ "$CI_EVENT" = push ] && exit 0
 
-# GitHub. The token goes to curl through a header file, never through argv.
+# GitHub. The token goes to curl through a header file and to git through a
+# config file, never through argv.
 : "${ZEUGHAUS_GITHUB_TOKEN:?secret ZEUGHAUS_GITHUB_TOKEN is not available to this event}"
 hdr="$work/github.hdr"
+gitconfig="$work/github.gitconfig"
 (
     umask 077
     printf 'Authorization: Bearer %s\n' "$ZEUGHAUS_GITHUB_TOKEN" >"$hdr"
+    printf '[http "https://github.com/"]\n\textraHeader = Authorization: Basic %s\n' \
+        "$(printf 'x-access-token:%s' "$ZEUGHAUS_GITHUB_TOKEN" | base64 | tr -d '\n')" >"$gitconfig"
 )
 unset ZEUGHAUS_GITHUB_TOKEN
 
@@ -159,6 +163,24 @@ case "$code" in
 404) ;;
 *)
     echo "looking up release $tag: HTTP $code"
+    exit 1
+    ;;
+esac
+
+# The release's commit has to be on GitHub. Nothing mirrors Forgejo there:
+# GitHub has what checkouts pushing to both forges pushed, so a commit pushed
+# from anywhere else (an agent's clone) is missing and the release would be
+# refused with 422. The tag carries it there; the release then takes the tag.
+code=$(gh_status "$api/commits/$CI_SHA")
+case "$code" in
+200) ;;
+404 | 422)
+    GIT_TERMINAL_PROMPT=0 git -c "include.path=$gitconfig" push -q \
+        "https://github.com/$GITHUB_REPO.git" "$CI_SHA:refs/tags/$tag"
+    echo "pushed $CI_SHA to GitHub as $tag"
+    ;;
+*)
+    echo "looking up commit $CI_SHA: HTTP $code"
     exit 1
     ;;
 esac

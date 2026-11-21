@@ -664,6 +664,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-interactive desktop, and from then on every GPU test of a CI job
   there crashed with an access violation in `ntdll.dll` (nightly #226).
 
+- CI: a nightly or tag of a commit GitHub does not have yet still becomes
+  a GitHub release. Nothing mirrors Forgejo to GitHub; only checkouts that
+  push to both forges carry commits there, so a commit pushed from an
+  agent's clone was missing and GitHub refused the release with 422
+  (nightly #228). `publish` now pushes the commit as the release's tag
+  first when GitHub does not know it.
+
 - The omp plugin (0.16.1) finds a session's `local://` plan where omp
   keeps it: on Windows, when the artifacts path is long, and without an
   artifacts directory, omp writes `local://` files under
