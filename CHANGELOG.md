@@ -657,6 +657,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Windows: a terminal whose child exited closes its pseudo console. ConPTY
+  keeps its output open until then, so the reader never ended and every
+  terminal the runner ever ran left a `conhost.exe` behind (wohnzimmer had
+  1075 after nine days). They used up the desktop heap of the runner's
+  non-interactive desktop, and from then on every GPU test of a CI job
+  there crashed with an access violation in `ntdll.dll` (nightly #226).
+
 - The omp plugin (0.16.1) finds a session's `local://` plan where omp
   keeps it: on Windows, when the artifacts path is long, and without an
   artifacts directory, omp writes `local://` files under

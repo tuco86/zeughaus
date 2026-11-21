@@ -178,7 +178,9 @@ impl std::error::Error for SpawnError {}
 /// What drives the child: the PTY in this process, or a shim's socket.
 enum Io {
     Local {
-        master: Mutex<Box<dyn MasterPty + Send>>,
+        /// `None` once the child has exited on Windows, where the pseudo
+        /// console is closed then (see [`close_pseudo_console`]).
+        master: Mutex<Option<Box<dyn MasterPty + Send>>>,
         killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
         /// The child's pid, which is also its process group id; 0 if unknown.
         #[cfg(unix)]
@@ -369,7 +371,7 @@ impl Session {
             &profile.label,
             writer,
             Io::Local {
-                master: Mutex::new(master),
+                master: Mutex::new(Some(master)),
                 killer: Mutex::new(killer),
                 #[cfg(unix)]
                 pid,
@@ -842,11 +844,14 @@ impl Session {
                 // of an older build only knows grids.
                 self.inner.model().resize(*size, *cell);
                 match &self.inner.io {
-                    Io::Local { master, .. } => master
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .resize(pty_size(*size))
-                        .map_err(|e| e.to_string())?,
+                    Io::Local { master, .. } => {
+                        // A child that is gone has no console to resize.
+                        if let Some(master) =
+                            master.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+                        {
+                            master.resize(pty_size(*size)).map_err(|e| e.to_string())?;
+                        }
+                    }
                     #[cfg(unix)]
                     Io::Shim { sender } => sender
                         .send(&crate::shim::proto::ToShim::Resize {
@@ -1139,6 +1144,28 @@ fn wait_loop(inner: Arc<Inner>, mut child: Box<dyn Child + Send + Sync>) {
     };
     inner.model().set_exit(exit);
     inner.publish();
+    #[cfg(windows)]
+    close_pseudo_console(&inner);
+}
+
+/// Closes the pseudo console of a terminal whose child has exited.
+///
+/// ConPTY keeps its output pipe open past the child's exit, until the pseudo
+/// console is closed. Left open, the reader never sees EOF, its thread keeps
+/// [`Inner`] and with it the pseudo console alive, and every terminal that
+/// ever ran leaves its `conhost.exe` behind. Each of those holds memory of
+/// the runner's desktop heap, which is small on the non-interactive desktop
+/// a service runs on; once it is used up, anything else that needs it there
+/// fails, GPU drivers among them. Closing makes conhost send its last frame,
+/// which the reader drains, and exit, which ends the reader.
+#[cfg(windows)]
+fn close_pseudo_console(inner: &Inner) {
+    if let Io::Local { master, .. } = &inner.io {
+        // Taken out first: the close waits for the reader to drain, and a
+        // resize must not wait on that under the lock.
+        let master = master.lock().unwrap_or_else(|e| e.into_inner()).take();
+        drop(master);
+    }
 }
 
 /// The child's single input, shared by the terminal and by committed text.
@@ -1377,6 +1404,67 @@ mod tests {
                 last - first >= 900_000,
                 "chunks {first} and {last} are not a second apart"
             );
+        }
+    }
+}
+
+/// The pseudo console's lifetime, the one part of a local PTY that is
+/// Windows' own.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// Tests that touch the filesystem, network, processes or real time: the
+    /// integration tier (`.config/nextest.toml`).
+    mod io {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        /// A terminal whose child exited lets go of its pseudo console: its
+        /// last output still arrives, and then its reader ends, so the only
+        /// handle left on it is the caller's. A reader that never ends keeps
+        /// a `conhost.exe` per terminal for the life of the runner.
+        #[test]
+        fn an_exited_child_releases_its_pseudo_console() {
+            let profile = Profile {
+                label: "test".to_string(),
+                program: Some(PathBuf::from("cmd.exe")),
+                args: vec![
+                    "/d".to_string(),
+                    "/c".to_string(),
+                    "echo hello& exit 3".to_string(),
+                ],
+                cwd: None,
+                env: Vec::new(),
+                scrollback_rows: 64,
+            };
+            let session = Session::spawn(
+                TerminalId(10),
+                &profile,
+                Dimensions { cols: 40, rows: 6 },
+                Wal::Off,
+                &TerminalHost::Local,
+            )
+            .expect("spawn cmd.exe");
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Arc::strong_count(&session.inner) > 1 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            assert_eq!(
+                Arc::strong_count(&session.inner),
+                1,
+                "the reader still holds the terminal after its child exited"
+            );
+            assert_eq!(session.exit(), Some(ExitState::Exited { code: 3 }));
+            let text: String = session
+                .head(0)
+                .rows
+                .iter()
+                .flat_map(|row| row.spans.iter().map(|span| span.text.as_str()))
+                .collect();
+            assert!(text.contains("hello"), "the last output is lost: {text:?}");
         }
     }
 }
