@@ -443,6 +443,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The omp plugin has no channel of its own: `check-omp-plugin` runs in the
+  `dev`, `nightly` and `release` pipelines like the builds, and
+  `publish-omp-plugin` publishes from a push to `main` once
+  `omp-plugin/package.json` names a version the registry does not have.
+  The `omp-plugin-v<version>` tags are gone.
+
 - The omp plugin (0.17.0) shadows omp's `ask` only in masters and plan
   sessions (`ZEUGHAUS_PLAN`, `ZEUGHAUS_PLAN_SESSION`), and hands omp's plan
   review to zeughaus only in plan sessions. Every other omp in a zeughaus

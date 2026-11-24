@@ -302,9 +302,10 @@ replies (`text.ts`; the cases in `omp-plugin/fixtures/` hold both sides to
 the same text, and a change to one of those Rust texts changes the
 fixture and the port). It runs `zeughaus-runner` only for `claude
 login|status`. The package is `@tuco86/zeughaus-omp` in the Forgejo npm
-registry: a tag `omp-plugin-v<version>` (equal to
-`omp-plugin/package.json`) publishes it (channel `omp-plugin`, jobs
-`check-omp-plugin` and `publish-omp-plugin` with `FORGEJO_NPM_TOKEN`); the
+registry: a push to `main` whose `omp-plugin/package.json` names a version
+the registry does not have yet publishes it (jobs `check-omp-plugin`, which
+runs with every build, and `publish-omp-plugin` in the `dev` channel, with
+`FORGEJO_NPM_TOKEN`); the
 dotfiles install it on every host and keep it at the newest version
 (wohnzimmer through the `zeughaus-omp` task of
 `deploy/windows/maintain.toml`). `weida` carries prebuilt addons for

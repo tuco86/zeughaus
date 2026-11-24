@@ -1,6 +1,6 @@
 #!/bin/sh
 # /// ci
-# on = ["push main", "tag omp-plugin-v*"]
+# on = ["push main", "tag v*", "nightly"]
 # platform = "linux-arm64"
 # image = "js"
 # timeout_minutes = 10
