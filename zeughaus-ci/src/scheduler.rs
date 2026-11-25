@@ -438,6 +438,20 @@ pub fn channel_before(
         .map(Pipeline::channel)
 }
 
+/// The number of the nightly that already passed at `sha`: the
+/// repository's newest nightly pipeline (by number, any actor), when it
+/// ran for `sha` and succeeded. A later nightly at the same sha that
+/// failed or still runs answers `None`, so the round runs again after a
+/// failure.
+fn passed_nightly(pipelines: &[Pipeline], sha: &str) -> Option<u64> {
+    pipelines
+        .iter()
+        .filter(|p| p.event.kind == EventKind::Nightly)
+        .max_by_key(|p| p.number)
+        .filter(|p| p.sha.as_deref() == Some(sha) && p.status == PipelineStatus::Succeeded)
+        .map(|p| p.number)
+}
+
 /// Deletes the record of finished pipeline `number` of `repo` and its
 /// transcripts (`<n>.runs/`). Refuses a running pipeline, whose record the
 /// scheduler writes again, and the repository's newest one, whose number
@@ -981,6 +995,15 @@ impl Scheduler {
         let mirror = self.fetch(name, repo)?;
         let sha = event_commit(&mirror, event)?;
         pipeline.sha = Some(sha.clone());
+        if event.is_nightly_round()
+            && let Some(number) = passed_nightly(&load_repo_pipelines(&self.state_dir, name), &sha)
+        {
+            eprintln!(
+                "[ci] {name} nightly: {} already passed in #{number}; round skipped",
+                &sha[..sha.len().min(7)]
+            );
+            return Ok(Some(Vec::new()));
+        }
         if event.kind == EventKind::Push {
             let upstream = Upstream {
                 repo: name.to_owned(),
@@ -3009,6 +3032,35 @@ mod tests {
             ..push
         };
         assert_eq!(channel_before(&records, &other, "main"), None);
+    }
+
+    #[test]
+    fn the_nightly_round_skips_only_a_commit_whose_newest_nightly_passed() {
+        let record = |number, kind, sha: &str, status| {
+            let mut p = pipeline("nightly");
+            p.number = number;
+            p.event.kind = kind;
+            p.sha = Some(sha.to_owned());
+            p.status = status;
+            p
+        };
+        let passed = record(3, EventKind::Nightly, "aaa", PipelineStatus::Succeeded);
+        assert_eq!(
+            passed_nightly(std::slice::from_ref(&passed), "aaa"),
+            Some(3)
+        );
+
+        let failed_again = record(4, EventKind::Nightly, "aaa", PipelineStatus::Failed);
+        assert_eq!(passed_nightly(&[passed.clone(), failed_again], "aaa"), None);
+
+        let moved = record(4, EventKind::Nightly, "bbb", PipelineStatus::Succeeded);
+        assert_eq!(passed_nightly(&[passed.clone(), moved], "aaa"), None);
+
+        let push = record(5, EventKind::Push, "aaa", PipelineStatus::Succeeded);
+        assert_eq!(passed_nightly(&[push], "aaa"), None);
+
+        let running = record(4, EventKind::Nightly, "aaa", PipelineStatus::Running);
+        assert_eq!(passed_nightly(&[passed, running], "aaa"), None);
     }
 
     #[test]

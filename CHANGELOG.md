@@ -443,6 +443,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CI: the nightly round skips a repository whose default branch is at the
+  commit its newest nightly already passed (`[ci] <repo> nightly: <sha>
+  already passed in #<n>; round skipped`): no pipeline, no status, no daily
+  cleanup. After a failed nightly at that commit the round runs again; a
+  nightly queued by hand and a rerun always run.
+
 - Board: Enter or a press on a ticket's card opens its popout in every
   state, planning and running included; only a plan session without a
   ticket still brings its tab to the front. The session line of a card
