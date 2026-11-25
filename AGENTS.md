@@ -842,16 +842,22 @@ push only after the gate:
 - `cargo fmt --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo nextest run -p <crate>` for each crate the change touches: the unit
-  tier, the only tests an agent runs locally
+  tier
 
 The pipelines run the rest: a push runs the unit tier and the doctests on
 every platform, the nightly and a release tag also the integration
-tier (`--profile ci`). Never run the whole suite, `--profile integration`
-or `--profile ci` locally before a push. An I/O test lives in a `mod io`
-inside its `#[cfg(test)] mod tests`; `.config/nextest.toml` holds the
-tiers and each tier's expected time per test (the `slow-timeout` period,
-reported as SLOW); no profile kills a test, and a run past its budget is a
-finding to look at, not a failure.
+tier (`--profile ci`). Integration tests are expensive: run only those the
+change touches or the one that failed, by name (`cargo nextest run -p
+<crate> --profile integration -E 'test(<name>)'`), and name the expected
+duration first; never the whole suite, an unfiltered `--profile
+integration` or `--profile ci`, or a nightly (`ci_run` nightly, `ci_rerun`
+of a nightly) to check a change. The scheduled nightly confirms a fix. An
+I/O test lives in a `mod io` inside its `#[cfg(test)] mod tests`;
+`.config/nextest.toml` holds the tiers, each tier's expected time per test
+(the `slow-timeout` period, reported as SLOW) and its ceiling at 12 periods
+(`terminate-after = 12`), where nextest ends the test as TIMEOUT and prints
+its output. A run past its budget is a finding to look at; a run that
+reaches the ceiling is a hang.
 
 `cargo publish --workspace --dry-run` belongs to the release (`RELEASING.md`
 step 4), not to a change: it builds every crate again from its package and

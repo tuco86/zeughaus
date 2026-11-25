@@ -2,25 +2,28 @@
 # filesystem, network, processes, a PTY, a GPU, the environment or real time
 # lives in a module named `io`; everything else is a unit test.
 #
-# No profile kills a test: a `slow-timeout` period is the expected time of one
-# test, nextest prints SLOW at each multiple and the test runs on. The CI
-# job's `timeout_minutes` is the only hard limit.
+# Each profile's `slow-timeout` period is the expected time of one test:
+# nextest prints SLOW at each multiple and the test runs on. At 12 periods
+# (`terminate-after`) it ends the test as TIMEOUT and prints its captured
+# output, so a hang ends in minutes, frees the job's workspace and shows what
+# it waited for. 12 is twice the slowdown load has caused on a runner, so no
+# healthy run reaches it.
 nextest-version = { required = "0.9.115" }
 
 # Unit tier: `cargo nextest run`. No I/O, so a second per test is already slow.
 [profile.default]
 default-filter = 'not test(/(^|::)io::/)'
-slow-timeout = { period = "1s" }
+slow-timeout = { period = "1s", terminate-after = 12 }
 
 # I/O tier: `cargo nextest run --profile integration`.
 [profile.integration]
 default-filter = 'test(/(^|::)io::/)'
-slow-timeout = { period = "10s" }
+slow-timeout = { period = "10s", terminate-after = 12 }
 
 # Both tiers, as the nightly and release checks run them.
 [profile.ci]
 default-filter = 'all()'
-slow-timeout = { period = "10s" }
+slow-timeout = { period = "10s", terminate-after = 12 }
 
 # The NVIDIA Vulkan driver on Windows hangs when devices are created
 # concurrently; nextest runs each test in its own process, so the in-process
