@@ -42,6 +42,7 @@
 //! zeughaus-runner image-lock <file> -- <program> [args..]
 //! zeughaus-runner release keygen <file>
 //! zeughaus-runner release bundle --channel <c> --build <n> --sha <sha> --version <v> --out <dir> <file>...
+//! zeughaus-runner release stamp <build> <file>...
 //! zeughaus-runner release verify <dir>
 //! zeughaus-runner version
 //! zeughaus-runner update status|rollback
@@ -88,6 +89,7 @@ usage: zeughaus-runner [--state-dir <dir>] [--feed-addr <host:port>] [--keep-run
        zeughaus-runner image-lock <file> -- <program> [args..]
        zeughaus-runner release keygen <file>
        zeughaus-runner release bundle --channel <c> --build <n> --sha <sha> --version <v> --out <dir> <file>...
+       zeughaus-runner release stamp <build> <file>...
        zeughaus-runner release verify <dir>
        zeughaus-runner version
        zeughaus-runner update status|rollback

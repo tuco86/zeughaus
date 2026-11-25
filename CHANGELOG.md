@@ -449,6 +449,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cleanup. After a failed nightly at that commit the round runs again; a
   nightly queued by hand and a rerun always run.
 
+- CI: the build number is no longer compiled in from `ZEUGHAUS_BUILD`. A
+  binary carries a slot of zeros that the build job fills with the pipeline
+  number after linking (`zeughaus-runner release stamp <build> <file>...`,
+  signed again on macOS), so a warm build recompiles only what the commit
+  changed instead of zeughaus-runner and zeughaus-ci every time. The
+  darwin build compiles the editor and the runner in one cargo invocation,
+  with one feature resolution.
+
 - Board: Enter or a press on a ticket's card opens its popout in every
   state, planning and running included; only a plan session without a
   ticket still brings its tab to the front. The session line of a card

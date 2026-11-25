@@ -3,6 +3,7 @@
 //! ```text
 //! zeughaus-runner release keygen <file>
 //! zeughaus-runner release bundle --channel <c> --build <n> --sha <sha> --version <v> --out <dir> <file>...
+//! zeughaus-runner release stamp <build> <file>...
 //! zeughaus-runner release verify <dir>
 //! ```
 //!
@@ -30,6 +31,7 @@ pub const SEED_ENV: &str = "ZEUGHAUS_UPDATE_KEY";
 pub enum Command {
     Keygen { file: PathBuf },
     Bundle(Bundle),
+    Stamp { build: u64, files: Vec<PathBuf> },
     Verify { dir: PathBuf },
 }
 
@@ -47,7 +49,7 @@ pub struct Bundle {
 /// Parses what follows `release`.
 pub fn parse(args: &[String]) -> Result<Command, String> {
     let Some((subcommand, rest)) = args.split_first() else {
-        return Err("release needs keygen, bundle or verify".to_owned());
+        return Err("release needs keygen, bundle, stamp or verify".to_owned());
     };
     match subcommand.as_str() {
         "keygen" => match rest {
@@ -55,6 +57,18 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             _ => Err("release keygen takes one file".to_owned()),
         },
         "bundle" => parse_bundle(rest).map(Command::Bundle),
+        "stamp" => match rest {
+            [build, files @ ..] if !files.is_empty() => {
+                let build = build
+                    .parse()
+                    .map_err(|_| format!("release stamp: build {build:?} is not a number"))?;
+                Ok(Command::Stamp {
+                    build,
+                    files: files.iter().map(PathBuf::from).collect(),
+                })
+            }
+            _ => Err("release stamp takes a build number and at least one file".to_owned()),
+        },
         "verify" => match rest {
             [dir] => Ok(Command::Verify { dir: dir.into() }),
             _ => Err("release verify takes one directory".to_owned()),
@@ -124,9 +138,24 @@ impl Command {
         match self {
             Command::Keygen { file } => keygen(file),
             Command::Bundle(bundle) => bundle.run(&seed_from_env()?, manifest::TRUSTED_KEYS),
+            Command::Stamp { build, files } => stamp(*build, files),
             Command::Verify { dir } => verify(manifest::TRUSTED_KEYS, dir),
         }
     }
+}
+
+/// Writes `build` into the build slot of each binary in `files`, in place,
+/// so each keeps its mode.
+fn stamp(build: u64, files: &[PathBuf]) -> Result<String, String> {
+    for file in files {
+        let mut bytes = read(file)?;
+        manifest::stamp(&mut bytes, build).map_err(|e| format!("{}: {e}", file.display()))?;
+        std::fs::write(file, bytes).map_err(|e| format!("cannot write {}: {e}", file.display()))?;
+    }
+    Ok(format!(
+        "stamped build {build} into {} file(s)",
+        files.len()
+    ))
 }
 
 /// The seed in [`SEED_ENV`]. An error never quotes the value.
@@ -327,6 +356,13 @@ mod tests {
                 files: vec!["a.tar.gz".into(), "b.zip".into()],
             }))
         );
+        assert_eq!(
+            parse(&args(&["stamp", "7", "a", "b"])),
+            Ok(Command::Stamp {
+                build: 7,
+                files: vec!["a".into(), "b".into()],
+            })
+        );
         for bad in [
             &[][..],
             &["keygen"][..],
@@ -334,6 +370,9 @@ mod tests {
             &["verify"][..],
             &["sign", "x"][..],
             &["bundle"][..],
+            &["stamp"][..],
+            &["stamp", "7"][..],
+            &["stamp", "x", "a"][..],
         ] {
             assert!(parse(&args(bad)).is_err(), "{bad:?}");
         }

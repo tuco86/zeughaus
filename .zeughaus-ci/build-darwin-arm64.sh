@@ -11,13 +11,11 @@ set -eu
 
 . "$CI_WORKSPACE/.zeughaus-ci/build.sh"
 cargo_env
-export ZEUGHAUS_BUILD="$CI_PIPELINE"
 
 triple=aarch64-apple-darwin
 stage_dir
 stage_share deploy/macos/net.doodleshnookie.zeughaus-runner.plist
 step sh deploy/macos-app.sh "$stage" "$triple"
-step cargo build --locked --release --target "$triple" -p zeughaus-runner
 cp "$CARGO_TARGET_DIR/$triple/release/zeughaus-runner" "$stage/"
-"$stage/zeughaus-runner" --help >/dev/null
+step stamp_build "$CARGO_TARGET_DIR/$triple/release/zeughaus-runner" "$stage/zeughaus-runner"
 step pack_tar

@@ -280,15 +280,50 @@ fn platform_of(os: &str, arch: &str) -> Option<&'static str> {
     })
 }
 
-/// The CI pipeline number this binary was built by (`ZEUGHAUS_BUILD` at
-/// compile time); 0 for a build made anywhere else, which is older than every
-/// published one.
+/// What precedes the build number in the build slot.
+const BUILD_MARK: &[u8] = b"zeughaus-build-slot:";
+/// The slot `release stamp` writes the build number into in a finished
+/// binary: `BUILD_MARK`, then the number as 20 zero-padded ASCII digits.
+/// Not compiled in from the environment: the number changes every
+/// pipeline, and every crate that read it would be rebuilt.
+#[used]
+static BUILD_SLOT: [u8; 40] = *b"zeughaus-build-slot:00000000000000000000";
+
+/// The CI pipeline number this binary was stamped with; 0 for a binary
+/// nobody stamped, which is older than every published one.
 pub fn own_build() -> u64 {
-    build_from(option_env!("ZEUGHAUS_BUILD"))
+    // SAFETY: a read of an initialized static. Volatile, so the compiler
+    // cannot fold the zeros it compiled: the stamp changes them later.
+    let slot = unsafe { std::ptr::read_volatile(&raw const BUILD_SLOT) };
+    build_in(&slot[BUILD_MARK.len()..])
 }
 
-fn build_from(env: Option<&str>) -> u64 {
-    env.and_then(|build| build.parse().ok()).unwrap_or(0)
+fn build_in(digits: &[u8]) -> u64 {
+    std::str::from_utf8(digits)
+        .ok()
+        .and_then(|d| d.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Writes `build` into the one build slot of the binary `bytes`. A slot
+/// is `BUILD_MARK` followed by 20 ASCII digits; anything but exactly one
+/// slot is an error.
+pub fn stamp(bytes: &mut [u8], build: u64) -> Result<(), String> {
+    let digits = BUILD_SLOT.len() - BUILD_MARK.len();
+    let slots: Vec<usize> = bytes
+        .windows(BUILD_SLOT.len())
+        .enumerate()
+        .filter(|(_, w)| {
+            w.starts_with(BUILD_MARK) && w[BUILD_MARK.len()..].iter().all(u8::is_ascii_digit)
+        })
+        .map(|(at, _)| at)
+        .collect();
+    let [at] = slots[..] else {
+        return Err(format!("{} build slots, expected one", slots.len()));
+    };
+    let start = at + BUILD_MARK.len();
+    bytes[start..start + digits].copy_from_slice(format!("{build:0digits$}").as_bytes());
+    Ok(())
 }
 
 fn key_pair(seed: &[u8; 32]) -> Ed25519KeyPair {
@@ -592,11 +627,36 @@ mod tests {
     }
 
     #[test]
-    fn the_own_build_is_zero_unless_the_ci_set_it() {
-        assert_eq!(build_from(Some("1234")), 1234);
-        for bad in [None, Some(""), Some("dev"), Some("-1"), Some("12 ")] {
-            assert_eq!(build_from(bad), 0, "{bad:?}");
-        }
+    fn the_build_is_read_from_the_slot_digits() {
+        assert_eq!(build_in(b"00000000000000001234"), 1234);
+        assert_eq!(build_in(b"00000000000000000000"), 0);
+    }
+
+    #[test]
+    fn a_stamp_writes_the_build_into_the_one_slot() {
+        let mut bytes = b"junk\0before".to_vec();
+        let at = bytes.len();
+        bytes.extend_from_slice(&BUILD_SLOT);
+        bytes.extend_from_slice(b"after\xff junk");
+        let digits = at + BUILD_MARK.len()..at + BUILD_SLOT.len();
+
+        stamp(&mut bytes, 243).unwrap();
+        assert_eq!(build_in(&bytes[digits.clone()]), 243);
+        stamp(&mut bytes, 244).unwrap();
+        assert_eq!(build_in(&bytes[digits]), 244);
+    }
+
+    #[test]
+    fn a_stamp_refuses_anything_but_exactly_one_slot() {
+        assert!(stamp(&mut b"no slot in here".to_vec(), 1).is_err());
+
+        let mut two = BUILD_SLOT.to_vec();
+        two.extend_from_slice(&BUILD_SLOT);
+        assert!(stamp(&mut two, 1).is_err());
+
+        let mut not_digits = BUILD_MARK.to_vec();
+        not_digits.extend_from_slice(b"0000000000000000000x");
+        assert!(stamp(&mut not_digits, 1).is_err());
     }
 
     /// Tests that touch the filesystem, network, processes or real time: the

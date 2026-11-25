@@ -1,9 +1,9 @@
 #!/bin/sh
-# Builds the editor and wraps it in Zeughaus.app (macOS).
+# Builds the editor and the runner and wraps the editor in Zeughaus.app (macOS).
 #
 #   deploy/macos-app.sh [destination [target-triple]]
 #
-# destination defaults to ~/Applications. With a target triple the editor is
+# destination defaults to ~/Applications. With a target triple both are
 # built for it (`--target`).
 #
 # A macOS app has its icon and its name in the Info.plist of the bundle it
@@ -12,9 +12,10 @@
 # deploy/macos/Info.plist plus an icns that render.py draws at the ten sizes
 # iconutil wants, around a release build of the editor.
 #
-# Only the editor. The runner is a headless process with no Dock presence;
-# `zeughaus-runner install macos` installs the runner as a launchd agent and
-# this bundle from the release.
+# The runner is built in the same invocation, so both binaries share one
+# feature resolution and compile their dependencies once, as the release
+# does. The bundle holds only the editor: `zeughaus-runner install macos`
+# installs the runner as a launchd agent.
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -25,12 +26,12 @@ version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)
 
 say() { printf '[deploy] %s\n' "$*"; }
 
-say "building the editor"
+say "building the editor and the runner"
 if [ -n "$triple" ]; then
-    cargo build --locked --release --manifest-path "$root/Cargo.toml" -p zeughaus --target "$triple"
+    cargo build --locked --release --manifest-path "$root/Cargo.toml" -p zeughaus -p zeughaus-runner --target "$triple"
     release=${CARGO_TARGET_DIR:-$root/target}/$triple/release
 else
-    cargo build --locked --release --manifest-path "$root/Cargo.toml" -p zeughaus
+    cargo build --locked --release --manifest-path "$root/Cargo.toml" -p zeughaus -p zeughaus-runner
     release=${CARGO_TARGET_DIR:-$root/target}/release
 fi
 

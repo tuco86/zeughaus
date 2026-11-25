@@ -702,9 +702,10 @@ A runner or CI follows a release channel by itself when
 (`dev`, `nightly` or `release`) and optionally `url`. The CI hosts too, so
 the safety net is the checks below, not a host left out. Once a minute it
 reads `<url>/<channel>/latest`, a CI build number. A build newer than its own
-(`ZEUGHAUS_BUILD` at compile time, the CI pipeline number; 0 for a build
-made anywhere else, so a `cargo install` is replaced by the first published
-one) is downloaded with `curl` into `<state-dir>/updates/<build>/`, its
+(the CI pipeline number the build job stamped into the binary with
+`zeughaus-runner release stamp`; 0 for a build made anywhere else, so a
+`cargo install` is replaced by the first published one) is downloaded
+with `curl` into `<state-dir>/updates/<build>/`, its
 `manifest.json` checked against `manifest.sig` with the keys compiled in
 (`TRUSTED_KEYS`, `zeughaus-update/src/manifest.rs`), then the archive for the
 host's platform against the size and SHA-256 the manifest gives, and
@@ -749,11 +750,12 @@ updater keeps for the installed and the previous build; a changed unit gets
 and service are not touched. `tuco-pc-hannes`, atik, the `tuco-pc` service
 runner, sadala (runner and CI) and wohnzimmer all have `channel = "dev"`.
 
-`zeughaus-runner release keygen <file>|bundle|verify <dir>` makes the
-signing key (seed in a 0600 file, public half printed for `TRUSTED_KEYS`),
-bundles the platform archives into a signed release directory
-(`manifest.json`, `manifest.sig`, `SHA256SUMS`; the seed comes from
-`ZEUGHAUS_UPDATE_KEY`, never from an argument) and checks one.
+`zeughaus-runner release keygen <file>|bundle|stamp <build> <file>...|verify <dir>`
+makes the signing key (seed in a 0600 file, public half printed for
+`TRUSTED_KEYS`), bundles the platform archives into a signed release
+directory (`manifest.json`, `manifest.sig`, `SHA256SUMS`; the seed comes
+from `ZEUGHAUS_UPDATE_KEY`, never from an argument), writes a build number
+into finished binaries and checks a release directory.
 
 This repository is one of its repos: a push to `main`, a `v*` tag and the
 CI's nightly round (`[nightly] at = "03:00"` in its `ci.toml`) run a build

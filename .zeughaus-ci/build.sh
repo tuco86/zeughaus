@@ -2,9 +2,9 @@
 # Run from the workspace root, with CI_PLATFORM set by the job's `platform`.
 
 # Cargo's home and target directory live in the workspace, which the jobs of
-# one place share and keep warm. The build number is not set here: it
-# changes every pipeline and would rebuild every unit that reads it; the
-# build jobs export ZEUGHAUS_BUILD themselves.
+# one place share and keep warm. The build number is not compiled in: it
+# changes every pipeline and would rebuild every unit that read it, so the
+# build jobs stamp it into the staged binaries after the build.
 cargo_env() {
     cache="$CI_WORKSPACE/.ci-cache"
     export CARGO_HOME="$cache/cargo"
@@ -68,6 +68,26 @@ stage_dir() {
     rm -rf "$stage"
     mkdir -p "$stage"
     cp LICENSE-MIT LICENSE-APACHE "$stage/"
+}
+
+# Writes the pipeline number into staged binaries with the runner the job
+# built (`release stamp`), signs them again on macOS (the stamp breaks the
+# linker's ad-hoc signature, and macOS kills a binary whose signature does
+# not match), and checks that each answers `version` with it.
+stamp_build() {
+    tool=$1
+    shift
+    "$tool" release stamp "$CI_PIPELINE" "$@"
+    for bin in "$@"; do
+        case "$CI_PLATFORM" in
+            darwin-*) codesign --force --sign - "$bin" ;;
+        esac
+        answer=$("$bin" version)
+        if [ "$answer" != "$version build $CI_PIPELINE" ]; then
+            echo "$bin version: $answer, expected $version build $CI_PIPELINE" >&2
+            return 1
+        fi
+    done
 }
 
 # Copies repository files into the archive's share/, under their paths in

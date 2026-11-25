@@ -6,7 +6,6 @@
 # The windows-amd64 release archive: editor and runner built on the Windows
 # runner, zipped into the job's output for publish.sh.
 . (Join-Path $env:CI_WORKSPACE '.zeughaus-ci\windows.ps1')
-$env:ZEUGHAUS_BUILD = $env:CI_PIPELINE
 
 # The workspace version names the archive and its top directory.
 $version = $null
@@ -33,7 +32,14 @@ Copy-Item 'LICENSE-MIT', 'LICENSE-APACHE' $stage
 $share = Join-Path $stage 'share\deploy\windows'
 New-Item -ItemType Directory -Force -Path $share | Out-Null
 Copy-Item (Join-Path $env:CI_WORKSPACE 'deploy\windows\maintain.toml') $share
-Run (Join-Path $stage 'zeughaus-runner.exe') @('--help')
+# The pipeline number is written into the staged binary, not compiled in.
+$runner = Join-Path $stage 'zeughaus-runner.exe'
+Run (Join-Path $env:CARGO_TARGET_DIR 'release\zeughaus-runner.exe') @('release', 'stamp', $env:CI_PIPELINE, $runner)
+$answer = & $runner version
+if ($answer -ne "$version build $($env:CI_PIPELINE)") {
+    Write-Host "$runner version: $answer, expected $version build $($env:CI_PIPELINE)"
+    exit 1
+}
 
 # Windows' bsdtar rather than Compress-Archive: Windows PowerShell 5.1 writes
 # backslashes into zip entry names, which unzip elsewhere reads as file names.

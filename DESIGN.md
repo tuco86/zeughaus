@@ -1731,9 +1731,13 @@ on `darwin-arm64` `deploy/macos/net.doodleshnookie.zeughaus-runner.plist`; on
 `windows-amd64` `deploy/windows/maintain.toml`. They are files of the archive
 and not `include_str!`, because every crate is published and a package
 cannot include files outside its directory. The build number
-`CI_PIPELINE` is compiled in as `ZEUGHAUS_BUILD` by the build jobs, not by
-`cargo_env`: it changes with every pipeline and would rebuild every unit
-that reads it in the shared workspace. A binary made anywhere else has
+`CI_PIPELINE` is not compiled in: it changes with every pipeline and would
+rebuild every unit that read it in the shared workspace. The binary carries
+a 20-digit slot of zeros instead (`BUILD_SLOT` in
+`zeughaus-update/src/manifest.rs`), and the build job writes the number into
+the staged copies with `zeughaus-runner release stamp <n> <file>...`
+(`stamp_build` in `build.sh`, which signs them again on macOS and checks
+that each answers `version` with the number). A binary nobody stamped has
 build 0. Per platform one check job, `check-<platform>`, `needs` the build
 job, so it runs in the workspace the build left, at the same place: it runs
 `cargo clippy --workspace --all-targets -- -D warnings`, the tests (`cargo
