@@ -1684,18 +1684,6 @@ impl Scheduler {
             self.handoffs.insert(run.clone(), accessor);
         }
         self.runners.assign(&run, &runner);
-        if !self.runners.send(
-            &runner,
-            ToRunner::Assign {
-                assignment: Box::new(assignment),
-            },
-        ) {
-            // The runner dropped between the check and the send.
-            self.runners.unassign(&run);
-            self.revoke_handoff(&run);
-            return;
-        }
-        self.ready_since.remove(&key);
         let expected = expected::expected_secs(
             &load_repo_pipelines(&self.state_dir, &pipeline.repo),
             pipeline.event.kind,
@@ -1703,14 +1691,34 @@ impl Scheduler {
             &runner,
             &place,
         );
+        // The runner asks the artifact server for the run's state and inputs
+        // as soon as `Assign` arrives, and the server checks the saved record:
+        // it says `starting` before the message leaves.
         let record = &mut self.running[pi].jobs[ji];
         record.status = JobStatus::Starting;
         record.started = Some(now);
         record.assigned = Some(now);
         record.expected_secs = expected;
         record.note.clear();
-        let touched = share(&mut self.running, pi, ji, &runner);
         self.running[pi].save(&self.state_dir, &self.changes);
+        if !self.runners.send(
+            &runner,
+            ToRunner::Assign {
+                assignment: Box::new(assignment),
+            },
+        ) {
+            // The runner dropped between the check and the send.
+            self.running[pi].jobs[ji] = pipeline.jobs[ji].clone();
+            self.running[pi].save(&self.state_dir, &self.changes);
+            self.runners.unassign(&run);
+            self.revoke_handoff(&run);
+            return;
+        }
+        self.ready_since.remove(&key);
+        let touched = share(&mut self.running, pi, ji, &runner);
+        if self.running[pi].jobs[ji].shared_with != pipeline.jobs[ji].shared_with {
+            self.running[pi].save(&self.state_dir, &self.changes);
+        }
         for qi in touched {
             self.running[qi].save(&self.state_dir, &self.changes);
         }
@@ -3797,6 +3805,35 @@ mod tests {
             s.running[0].jobs[0].status = Succeeded;
             s.assign(1, 0);
             assert_eq!(assigned(&mut x).run, "view.2.a");
+            let _ = std::fs::remove_dir_all(&state);
+        }
+
+        #[test]
+        fn a_job_its_runner_cannot_take_is_saved_pending_again() {
+            let state = scratch("assign-dropped");
+            let mut s = scheduler(&state);
+            // Connected, but its end of the channel is gone: the send fails.
+            drop(connect(&s.runners, "x", 0));
+            s.running
+                .push(numbered(1, vec![record("a", &[], "x", JobStatus::Pending)]));
+            s.running[0].save(&state, &s.changes);
+
+            s.assign(0, 0);
+            let job = &s.running[0].jobs[0];
+            assert_eq!(
+                (job.status, job.started, job.assigned),
+                (JobStatus::Pending, None, None)
+            );
+            let saved = load_pipeline(&state, "view", 1).unwrap();
+            assert_eq!(saved.jobs[0].status, JobStatus::Pending);
+            assert_eq!(s.runners.assigned_to("view.1.a"), None);
+
+            // Once the runner is back, the job goes out saved as starting.
+            let mut x = connect(&s.runners, "x", 0);
+            s.assign(0, 0);
+            assert_eq!(assigned(&mut x).run, "view.1.a");
+            let saved = load_pipeline(&state, "view", 1).unwrap();
+            assert_eq!(saved.jobs[0].status, JobStatus::Starting);
             let _ = std::fs::remove_dir_all(&state);
         }
 

@@ -1116,6 +1116,30 @@ mod tests {
                 Ok(())
             );
         }
+        // Saved as starting before its runner hears of it, the job restores
+        // at once; a record not yet starting is refused (weida #515).
+        assert_eq!(
+            state_access(
+                &keeps_corpus("starting", "nightly"),
+                "fuzz",
+                "corpus",
+                "x",
+                Some("x"),
+                false
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            state_access(
+                &keeps_corpus("pending", "nightly"),
+                "fuzz",
+                "corpus",
+                "x",
+                Some("x"),
+                false
+            ),
+            Err("demo #2 fuzz is not running".to_owned())
+        );
         assert_eq!(
             state_access(&running, "fuzz", "other", "x", Some("x"), false),
             Err("job fuzz of demo #2 keeps no state other".to_owned())
