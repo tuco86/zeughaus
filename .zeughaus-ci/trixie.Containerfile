@@ -5,7 +5,7 @@
 # The same file serves amd64 under podman and arm64 under Apple `container`.
 # A changed file is a new image tag. The rust tag equals the channel of
 # rust-toolchain.toml; change both together.
-FROM docker.io/library/rust:1.99.1-trixie
+FROM docker.io/library/rust:1.100.0-trixie
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

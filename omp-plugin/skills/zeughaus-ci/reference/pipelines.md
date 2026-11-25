@@ -7,7 +7,7 @@ zeughaus's own `.zeughaus-ci/` is the worked example: one Rust workspace, built 
 | file | role |
 |---|---|
 | `channels.toml` | `dev` on `push main`; `nightly` on `nightly` and `release` on `tag v*`, both `clean` |
-| `trixie.Containerfile` | The image of the Linux jobs: `rust:1.99.1-trixie`, the libraries the workspace links, clippy, rustfmt and the wasm target |
+| `trixie.Containerfile` | The image of the Linux jobs: `rust:1.100.0-trixie`, the libraries the workspace links, clippy, rustfmt and the wasm target |
 | `build-<p>.sh`, `build-windows-amd64.ps1` | The release archive of platform `<p>`, written to `$CI_OUTPUT` |
 | `check-<p>.sh`, `check-windows-amd64.ps1` | The gate of `<p>`: clippy, the tests (the unit tier on a push or manual run, both tiers nightly and on a tag) and the doctests. `check-linux-amd64` also runs `fmt` |
 | `publish.sh` | Needs all eight; bundles, signs and publishes the archives. The only job with release secrets |
@@ -85,13 +85,13 @@ The build is selected by its `on`. The check has no `on`: its `needs` select it 
 
 ```toml
 [toolchain]
-channel = "1.99.1"
+channel = "1.100.0"
 components = ["clippy", "rustfmt"]
 targets = ["wasm32-unknown-unknown"]
 ```
 
 ```
-FROM docker.io/library/rust:1.99.1-trixie
+FROM docker.io/library/rust:1.100.0-trixie
 ```
 
 - Why: all places build with one compiler, so a result on one platform means the same on the others and no place rebuilds because it drifted. A bump rebuilds each place's cache once.
