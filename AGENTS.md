@@ -599,11 +599,15 @@ in a container of that image, `ci/work/<repo>/machine-<vm>` on a VM.
 Pipeline jobs and manual runs build in it one at a time, the oldest first
 (by pipeline number, then the job's place in the pipeline); order between
 jobs is their `needs`. A checkout fetches, checks out with `--force` and
-runs `git clean -ffd`, so ignored files such as `target/` stay. `clean =
-true` on a `[[channel]]` of `.zeughaus-ci/channels.toml` makes the first job
-of that channel's pipelines at each place start from nothing (`git clean
--ffdx`). The header keys `context` and `cache` still parse and do nothing;
-`zeughaus-ci check` warns about them.
+runs `git clean -ffd`, so ignored files such as `target/` stay.
+`daily_cleanup = true` on a `[[channel]]` of `.zeughaus-ci/channels.toml`
+whose `on` names `nightly` makes the first job of the pipeline the CI's
+nightly round starts in that channel start each place from nothing (`git
+clean -ffdx`), once a day, so `target/` does not grow across days; a
+nightly queued by hand (`ci_run`) or a rerun builds warm, and `/ci` refuses
+the round's actor `nightly` for one queued by hand. The header keys
+`context` and `cache` and the former channel key `clean` still parse and do
+nothing; `zeughaus-ci check` warns about them.
 
 A manual run executes named jobs of a repository's pipeline from the
 uploader's working tree, uncommitted files and sibling path dependencies
@@ -761,8 +765,9 @@ and a tag; `check-linux-amd64` also runs `fmt`): `linux-amd64` (tuco-pc,
 in the `.zeughaus-ci/trixie.Containerfile` image), `linux-arm64` (atik, the same
 image in an Apple `container`), `windows-amd64` (the `wohnzimmer` runner's
 host), `darwin-arm64` (atik's host; the editor as `Zeughaus.app` through
-`deploy/macos-app.sh`). The `nightly` and `release` channels are `clean`:
-their pipelines start from empty workspaces. `.zeughaus-ci/build.sh` (and
+`deploy/macos-app.sh`). The `nightly` channel has `daily_cleanup`: the
+nightly round's pipeline starts from empty workspaces, while a nightly queued
+by hand, a rerun and a tag build warm. `.zeughaus-ci/build.sh` (and
 `windows.ps1` on Windows) is their shared helper. `publish.sh` runs on
 sadala after all eight,
 bundles and signs them (the `zeughaus-runner` of the `linux-arm64` archive is

@@ -668,6 +668,10 @@ impl CiServer {
             return error("an actor is 1 to 64 letters, digits, '.', '_', '@' or '-'");
         }
         let kind = if nightly {
+            // The round's own actor would make this nightly clean up.
+            if actor == event::NIGHTLY_ROUND {
+                return error("the actor `nightly` is the CI's nightly round's");
+            }
             EventKind::Nightly
         } else {
             EventKind::Push
@@ -3130,6 +3134,11 @@ mod tests {
             assert_eq!(
                 queue("plain", true, ""),
                 error("an actor is 1 to 64 letters, digits, '.', '_', '@' or '-'")
+            );
+            // Only the round cleans up, so nobody else may queue as it.
+            assert_eq!(
+                queue("plain", true, "nightly"),
+                error("the actor `nightly` is the CI's nightly round's")
             );
             event::drain_inbox(&state);
             assert!(event::queued(&state).is_empty());

@@ -443,6 +443,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CI: the channel key `clean` is now `daily_cleanup`, and wipes only for
+  the nightly round. The pipeline the CI's nightly round starts in a channel
+  with `daily_cleanup = true` starts each place's workspace from nothing,
+  once a day, so `target/` does not grow across days of development; a
+  nightly queued by hand (`ci_run`), a rerun and a tag build warm. The
+  channel's `on` must name `nightly`. `/ci` refuses the round's actor
+  `nightly` for a nightly queued by hand. `clean = true` still parses,
+  does nothing, and `zeughaus-ci check` warns about it. zeughaus's
+  `nightly` channel has `daily_cleanup`; `release` no longer wipes.
+
 - The omp plugin has no channel of its own: `check-omp-plugin` runs in the
   `dev`, `nightly` and `release` pipelines like the builds, and
   `publish-omp-plugin` publishes from a push to `main` once

@@ -963,8 +963,15 @@ are grouped the same way. The channel is decided in setup and kept in the
 record; an invalid file fails the setup like an invalid job header. `check`
 lists the channels, `plan` starts with the one an event selects, and
 `status` shows it per pipeline. Retention counts per channel (**Disk**).
-`clean = true` on a channel marks the pipelines it gets `clean` (kept in the
-record): the first of their jobs at a place starts its workspace from nothing (**Workspaces**).
+`daily_cleanup = true` on a channel whose `on` names `nightly` marks the
+pipeline the CI's nightly round starts in it `clean` (kept in the record): the
+first of its jobs at a place starts its workspace from nothing
+(**Workspaces**), once a day, so `target/` does not grow across days of
+development. The round's events carry the actor `nightly`
+(`event::NIGHTLY_ROUND`, `CiEvent::is_nightly_round`), which `/ci` refuses
+for a nightly queued by hand; such a nightly and a rerun build on what the
+workspace holds. The former `clean = true` still parses, does nothing, and
+`check` warns about it.
 
 **The enlist protocol** (`zeughaus-link/src/enlist.rs`, `ENLIST_MAJOR` 8) is
 one long exchange on `/enlist` (req/rep) per runner. Frames are a 4-byte
@@ -1005,7 +1012,7 @@ little-endian length and a postcard body, at most `MAX_ENLIST_FRAME_BYTES`
   refused.
 
 **Job state.** A job's `state = ["fuzz-corpus"]` names stores the CI keeps
-for it, apart from workspaces, `clean` and runner budgets (`state.rs`).
+for it, apart from workspaces, the daily cleanup and runner budgets (`state.rs`).
 A version of a store is a `SetManifest` under
 `ci/state/sets/<repo>.<number>.<name>.set` (`number` is the pipeline that
 saved it, the file's mtime when) whose files are zstd blobs in the store
@@ -1257,11 +1264,11 @@ one.
 `Checkout` is `Clean` or `Wipe` (`checkout_of`, `build_assignment`). `Clean`,
 the default, fetches, runs `git checkout --force` and then `git clean -ffd`:
 untracked files go, ignored files such as `target/` stay. `Wipe` is the same
-with `git clean -ffdx`: nothing stays. A job gets `Wipe` only in a pipeline
-whose channel is `clean`, and only when no earlier job of that pipeline with
-the same runner and workspace has started: the first use of a place in the
-pipeline starts it from nothing, the rest build on it. A manual run is never
-`clean`.
+with `git clean -ffdx`: nothing stays. A job gets `Wipe` only in a `clean`
+pipeline (the nightly round's in a `daily_cleanup` channel), and only when
+no earlier job of that pipeline with the same runner and workspace has
+started: the first use of a place in the pipeline starts it from nothing, the
+rest build on it. A manual run is never `clean`.
 
 **Manual runs** run named jobs of the repository's pipeline from the working
 trees of an editor's agent: uncommitted files and the sibling path

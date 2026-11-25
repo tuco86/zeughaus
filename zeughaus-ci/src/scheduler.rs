@@ -229,8 +229,9 @@ pub struct Pipeline {
     /// and it ends as [`PipelineStatus::Cancelled`].
     #[serde(default)]
     pub cancelled: bool,
-    /// The pipeline's channel is marked `clean` (see [`channels`]): the first
-    /// job to use a place's workspace starts it from nothing.
+    /// The nightly round's pipeline in a channel marked `daily_cleanup` (see
+    /// [`channels`]): the first job to use a place's workspace starts it from
+    /// nothing.
     #[serde(default)]
     pub clean: bool,
 }
@@ -788,7 +789,7 @@ impl Scheduler {
                 kind: EventKind::Nightly,
                 git_ref: repo.default_branch.clone(),
                 sha: None,
-                actor: "nightly".to_owned(),
+                actor: event::NIGHTLY_ROUND.to_owned(),
                 delivery: None,
                 upload: None,
                 upstream: None,
@@ -996,7 +997,7 @@ impl Scheduler {
         let (files, containerfiles) = read_ci(&mirror, &sha)?;
         let channels = Channels::from_files(&files)?;
         pipeline.channel = channels.of(event);
-        pipeline.clean = channels.is_clean(&pipeline.channel);
+        pipeline.clean = event.is_nightly_round() && channels.daily_cleanup(&pipeline.channel);
         // git has no empty directories: nothing listed is no folder.
         if files.is_empty() && containerfiles.is_empty() {
             return Ok(None);
@@ -2810,8 +2811,8 @@ fn place_label(job: &JobRecord) -> String {
 }
 
 /// How the launcher treats the workspace of job `ji`: it starts it from
-/// nothing where a clean channel's pipeline first uses it, else cleans it and
-/// keeps the ignored files a build left.
+/// nothing where the nightly round's pipeline of a `daily_cleanup` channel
+/// first uses it, else cleans it and keeps the ignored files a build left.
 fn checkout_of(pipeline: &Pipeline, ji: usize) -> Checkout {
     let job = &pipeline.jobs[ji];
     let workspace = job.place.as_ref().map(Place::workspace);
@@ -3847,10 +3848,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&state);
         }
 
-        /// A repository with a clean `nightly` channel and two jobs whose headers
-        /// still carry a `context`, read the way a pipeline is set up.
+        /// A repository whose `nightly` channel has `daily_cleanup` and two jobs
+        /// whose headers still carry a `context`, read the way a pipeline is set up.
         #[test]
-        fn setting_up_marks_a_clean_pipeline_and_runs_jobs_that_carry_a_context() {
+        fn setting_up_cleans_only_for_the_nightly_round_and_runs_jobs_that_carry_a_context() {
             let origin = scratch("setup-origin");
             let state = scratch("setup-state");
             let author = [
@@ -3870,7 +3871,7 @@ mod tests {
             }
             std::fs::write(
                 ci.join("channels.toml"),
-                "[[channel]]\nname = \"nightly\"\non = [\"nightly\"]\nclean = true\n",
+                "[[channel]]\nname = \"nightly\"\non = [\"nightly\"]\ndaily_cleanup = true\n",
             )
             .unwrap();
             git(&origin, &["init", "-q", "-b", "main"], &author).unwrap();
@@ -3888,12 +3889,16 @@ mod tests {
             );
             let mut s = scheduler_over(&state, Arc::clone(&config));
             let repo = config.repos["view"].clone();
-            for (kind, channel, clean) in [
-                (EventKind::Push, "main", false),
-                (EventKind::Nightly, "nightly", true),
+            for (kind, actor, channel, clean) in [
+                (EventKind::Push, "hannes", "main", false),
+                (EventKind::Nightly, event::NIGHTLY_ROUND, "nightly", true),
+                // Queued by hand or rerun: builds on what the workspace holds.
+                (EventKind::Nightly, "hannes@tuco-pc", "nightly", false),
+                (EventKind::Nightly, "rerun of #4", "nightly", false),
             ] {
                 let mut p = pipeline("");
                 p.event.kind = kind;
+                p.event.actor = actor.to_owned();
                 let event = p.event.clone();
                 let planned = s
                     .set_up("view", &repo, &event, &mut p)

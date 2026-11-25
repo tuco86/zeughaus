@@ -349,8 +349,8 @@ pub enum Checkout {
     /// as `target/` stay.
     #[default]
     Clean,
-    /// The same with `git clean -ffdx`: nothing stays. A clean channel's
-    /// first use of a workspace in a pipeline.
+    /// The same with `git clean -ffdx`: nothing stays. The nightly round's
+    /// first use of a workspace in a `daily_cleanup` channel.
     Wipe,
 }
 

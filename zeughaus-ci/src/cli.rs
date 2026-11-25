@@ -195,6 +195,11 @@ fn check(state_dir: &Path, args: &[String]) -> Result<(), String> {
     for warning in ignored_key_warnings(&jobs) {
         eprintln!("[ci] warning: {warning}");
     }
+    for name in channels.ignoring_clean() {
+        eprintln!(
+            "[ci] warning: {CI_DIR}/{CHANNELS_FILE}: channel `{name}`: `clean` is ignored: the nightly round of a channel with `daily_cleanup = true` starts from empty workspaces"
+        );
+    }
     check_job_channels(&jobs, &channels)?;
     let config = match CiConfig::load(state_dir) {
         Ok(Some(config)) => Some(config),
@@ -262,10 +267,14 @@ fn check(state_dir: &Path, args: &[String]) -> Result<(), String> {
         }
         println!("{:<20} {:<20} {}", job.name, place_name(&job), triggers);
     }
-    for (name, patterns, clean) in channels.names() {
+    for (name, patterns, daily_cleanup) in channels.names() {
         let on: Vec<String> = patterns.iter().map(Pattern::to_string).collect();
-        let clean = if clean { " (clean)" } else { "" };
-        println!("channel {name}{clean}  on: {}", on.join(", "));
+        let daily_cleanup = if daily_cleanup {
+            " (daily cleanup)"
+        } else {
+            ""
+        };
+        println!("channel {name}{daily_cleanup}  on: {}", on.join(", "));
     }
     Ok(())
 }

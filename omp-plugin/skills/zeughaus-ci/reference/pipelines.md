@@ -6,7 +6,7 @@ zeughaus's own `.zeughaus-ci/` is the worked example: one Rust workspace, built 
 
 | file | role |
 |---|---|
-| `channels.toml` | `dev` on `push main`; `nightly` on `nightly` and `release` on `tag v*`, both `clean` |
+| `channels.toml` | `dev` on `push main`; `nightly` on `nightly` with `daily_cleanup`, `release` on `tag v*` |
 | `trixie.Containerfile` | The image of the Linux jobs: `rust:1.100.0-trixie`, the libraries the workspace links, clippy, rustfmt and the wasm target |
 | `build-<p>.sh`, `build-windows-amd64.ps1` | The release archive of platform `<p>`, written to `$CI_OUTPUT` |
 | `check-<p>.sh`, `check-windows-amd64.ps1` | The gate of `<p>`: clippy, the tests (the unit tier on a push or manual run, both tiers nightly and on a tag) and the doctests. `check-linux-amd64` also runs `fmt` |
@@ -55,7 +55,7 @@ The build is selected by its `on`. The check has no `on`: its `needs` select it 
 
 - Keep cargo's home and target directory, tool downloads and sibling clones in one gitignored directory of the workspace. zeughaus: `.ci-cache/`; `cargo_env` in `build.sh` points `CARGO_HOME` and `CARGO_TARGET_DIR` into it, and `.gitignore` lists it, as it does `target/`.
 - Why: the jobs of one repository at one place share one workspace, pipeline jobs and manual runs alike. Each checkout resets tracked files and runs `git clean -ffd`: untracked files go, ignored files stay. An ignored directory is the warm cache; anything else is gone before the next job.
-- A workspace is a cache, not state. A `clean` channel wipes it (`git clean -ffdx`) at the first use of each place in a pipeline, and a runner deletes the least recently used workspaces beyond its budget. Write every job so that it also works from an empty workspace.
+- A workspace is a cache, not state. The nightly round's pipeline of a `daily_cleanup` channel wipes it (`git clean -ffdx`) at the first use of each place, once a day, and a runner deletes the least recently used workspaces beyond its budget. Write every job so that it also works from an empty workspace.
 
 ### 4. Empty what you publish
 
@@ -103,14 +103,14 @@ FROM docker.io/library/rust:1.100.0-trixie
 
 ### 10. channels.toml
 
-- `dev` on `push main`; `nightly` on `nightly` and `release` on `tag v*`, both with `clean = true`.
-- Why: a channel is a stream of pipelines (`ci_pipelines` takes one). `clean` starts every place's workspace from nothing in that channel's pipelines, so what nightly and release publish is built from empty workspaces, not from warm caches, and a cache gone bad shows within a day.
+- `dev` on `push main`; `nightly` on `nightly` with `daily_cleanup = true`; `release` on `tag v*`.
+- Why: a channel is a stream of pipelines (`ci_pipelines` takes one). `daily_cleanup` starts every place's workspace from nothing in the pipeline the nightly round starts, once a day, so `target/` does not grow across days of development and a cache gone bad shows within a day. A nightly queued by hand to run every test tier stays warm, and so do reruns and release tags.
 - A channel starts nothing; a job's `on` does. zeughaus's jobs name only `push main`, `tag v*` and `nightly`, so a push to any other branch starts no pipeline, and no channel is named after a branch.
 
 ### 11. Unit tests on a push, every tier nightly and on a release
 
 - A check job runs the unit tier on `push` and `manual`, and the integration and end-to-end tiers too on `nightly` and `tag`: it chooses by `CI_EVENT`. zeughaus: `check_platform` in `build.sh` and `check-windows-amd64.ps1` run `cargo nextest run --profile default` or `--profile ci`; the doctests run on every event.
-- Why: agents run only the unit tier of the touched crates before a push, so the push pipeline is where that tier runs on every platform, fast enough to answer the push. The I/O tiers are slower and depend on the machine; they run once a day in `clean` workspaces and before a release is published.
+- Why: agents run only the unit tier of the touched crates before a push, so the push pipeline is where that tier runs on every platform, fast enough to answer the push. The I/O tiers are slower and depend on the machine; they run once a day, from empty workspaces, and before a release is published.
 - A manual run follows a push, so `run_jobs` reproduces the push pipeline. For an integration failure, edit the job's test command temporarily (skill section 4).
 
 ## Review checklist

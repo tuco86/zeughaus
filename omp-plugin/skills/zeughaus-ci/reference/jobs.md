@@ -36,7 +36,7 @@ A header with an `env` table:
 | `secrets` | list of names | Each `[A-Z_][A-Z0-9_]*`. A secret reaches the job as an environment variable of that name when the repository's `grants` in ci.toml release it to the event (`push main`, `tag v*`, `nightly`, `push main of weida`). Otherwise the job fails with `secret <name> is not granted for <event> <ref>`. The value comes from OpenBao `secret/zeughaus/<origin>/shell`, else `secret/zeughaus/shell`; a name in neither fails the job. Each value of at least 4 bytes shows as `*` in the log the CI keeps. A manual run gives none |
 | `env` | table of strings | More variables for the job. Names `[A-Z_][A-Z0-9_]*`, none starting with `CI_` or `ZEUGHAUS_` |
 | `timeout_minutes` | integer | 1..=1440, default 240. At the deadline the job gets SIGTERM and, 60 s later, SIGKILL. Its note is `timed out after <n> min` |
-| `state` | list of names | At most 8, each `[a-z0-9][a-z0-9-]*`, none twice. Stores the CI keeps for this job from one pipeline to the next, independent of workspaces, `clean` and runner budgets (a fuzz corpus, a cache that must survive a clean nightly). Before the job starts, `$CI_STATE/<name>/` holds the store's newest version (empty while it has none); when the job ends, that directory becomes the pipeline's version. The CI keeps the 3 newest versions, each at most `state_max_mb` of ci.toml (1024 MB by default). Not on a Windows VM. Manual runs read the stores and never save |
+| `state` | list of names | At most 8, each `[a-z0-9][a-z0-9-]*`, none twice. Stores the CI keeps for this job from one pipeline to the next, independent of workspaces, the daily cleanup and runner budgets (a fuzz corpus, a cache that must survive the nightly round's wipe). Before the job starts, `$CI_STATE/<name>/` holds the store's newest version (empty while it has none); when the job ends, that directory becomes the pipeline's version. The CI keeps the 3 newest versions, each at most `state_max_mb` of ci.toml (1024 MB by default). Not on a Windows VM. Manual runs read the stores and never save |
 | `state_save` | `success` or `always` | Only with `state`; default `success`: save when the job exits 0. `always` saves after any end but a kill (a timeout too). A failed save fails the job; its note says what became of each store |
 | `context`, `cache`, `when_busy` | any | Parsed and ignored: a repository's jobs at one place share one workspace, a checkout keeps ignored files, and no runner is ever busy. `zeughaus-ci check` warns; remove them |
 
@@ -85,7 +85,7 @@ A job with `on = ["done main of weida"]` runs once the pipeline of such a push h
 
 - One workspace per repository, runner and place: `<runner state dir>/ci/work/<repo>/<ws>`, `/work` inside a container. `<ws>` is `host`, `image-<image>` or `machine-<vm>`.
 - Every job of the repository at that place uses it, pipeline jobs and manual runs alike, one at a time, oldest first (by pipeline number, then position in the pipeline). A job finds what the one before left, `target/` included.
-- Before each job: fetch, `git checkout --force --detach`, `git clean -ffd`. Tracked files are reset, untracked files removed, ignored files stay. In a pipeline of a `clean` channel the first job at each place gets `git clean -ffdx`: nothing stays.
+- Before each job: fetch, `git checkout --force --detach`, `git clean -ffd`. Tracked files are reset, untracked files removed, ignored files stay. In the pipeline the CI's nightly round starts in a `daily_cleanup` channel, the first job at each place gets `git clean -ffdx`: nothing stays. A nightly queued by hand (`ci_run`) or a rerun does not wipe.
 - A manual run checks out its uploaded working tree the same way and never wipes. Its sibling checkouts sit in `<workspace>/.zci-siblings/<dir>`, which `git clean` leaves alone.
 - A runner deletes the least recently used workspaces beyond its `budget_gb` (50). A workspace is a cache, not state.
 
@@ -99,18 +99,18 @@ on = ["push main"]
 [[channel]]
 name = "nightly"
 on = ["nightly"]
-clean = true
+daily_cleanup = true
 ```
 
 | key | rule |
 |---|---|
 | `name` | `[a-z0-9][a-z0-9-]*`, unique |
 | `on` | Non-empty list of patterns as in a job's `on` |
-| `clean` | Boolean, default false. The first job of a pipeline of this channel at each place starts its workspace from nothing |
+| `daily_cleanup` | Boolean, default false; needs `nightly` in `on`. The pipeline the CI's nightly round starts in this channel starts each place's workspace from nothing, once a day. A nightly queued by hand and a rerun build warm |
 
-- The first channel in file order whose `on` matches the event names the pipeline's channel. Unknown keys are an error.
+- The first channel in file order whose `on` matches the event names the pipeline's channel. Unknown keys are an error, except the former `clean`, which does nothing and `zeughaus-ci check` warns about.
 - No match, or no file: a push goes to a channel named after its branch, a tag to `tags`, a nightly to `nightly`, an upstream event to `upstream`. A manual run goes to the channel a push to the default branch selects.
-- A channel sorts pipelines (`ci_pipelines` takes one; the CI keeps the 200 newest per channel) and sets `clean`. It starts nothing: a job's `on` does.
+- A channel sorts pipelines (`ci_pipelines` takes one; the CI keeps the 200 newest per channel) and sets `daily_cleanup`. It starts nothing: a job's `on` does.
 
 ## Job environment
 

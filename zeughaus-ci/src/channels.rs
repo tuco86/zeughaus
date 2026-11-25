@@ -4,11 +4,12 @@
 //! ```toml
 //! # the first channel whose `on` matches an event gets its pipeline
 //! [[channel]]
-//! name = "release"
-//! on = ["tag v*"]
-//! # the first job of a pipeline in this channel to use a place's workspace
-//! # starts it from nothing
-//! clean = true
+//! name = "nightly"
+//! on = ["nightly"]
+//! # the pipeline the CI's nightly round starts in this channel starts each
+//! # place's workspace from nothing; a nightly queued by hand or a rerun
+//! # builds on what is there
+//! daily_cleanup = true
 //! ```
 //!
 //! An event no channel matches lands in a channel named after what it is
@@ -38,7 +39,11 @@ struct Def {
     name: String,
     on: Vec<String>,
     #[serde(default)]
-    clean: bool,
+    daily_cleanup: bool,
+    /// Replaced by `daily_cleanup`; parses and does nothing, and `check`
+    /// warns about it.
+    #[serde(default)]
+    clean: Option<bool>,
 }
 
 /// A repository's channels in file order.
@@ -49,7 +54,9 @@ pub struct Channels(Vec<Entry>);
 struct Entry {
     name: String,
     on: Vec<Pattern>,
-    clean: bool,
+    daily_cleanup: bool,
+    /// The channel still says `clean`.
+    ignores_clean: bool,
 }
 
 impl Channels {
@@ -81,10 +88,17 @@ impl Channels {
                 .map(|p| Pattern::parse(p))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| fail(format!("channel `{}`: {e}", def.name)))?;
+            if def.daily_cleanup && !patterns.contains(&Pattern::Nightly) {
+                return Err(fail(format!(
+                    "channel `{}`: `daily_cleanup` needs `nightly` in `on`: only the nightly round cleans up",
+                    def.name
+                )));
+            }
             channels.push(Entry {
                 name: def.name,
                 on: patterns,
-                clean: def.clean,
+                daily_cleanup: def.daily_cleanup,
+                ignores_clean: def.clean.is_some(),
             });
         }
         Ok(Channels(channels))
@@ -98,19 +112,31 @@ impl Channels {
             .map_or_else(|| fallback(event), |entry| entry.name.clone())
     }
 
-    /// Whether `channel` is a channel of the file marked `clean`; a name
-    /// only [`fallback`] made up is not.
-    pub fn is_clean(&self, channel: &str) -> bool {
+    /// Whether `channel` is a channel of the file marked `daily_cleanup`; a
+    /// name only [`fallback`] made up is not.
+    pub fn daily_cleanup(&self, channel: &str) -> bool {
         self.0
             .iter()
-            .any(|entry| entry.clean && entry.name == channel)
+            .any(|entry| entry.daily_cleanup && entry.name == channel)
     }
 
-    /// Name, patterns and `clean` flag of every channel in file order.
+    /// Name, patterns and `daily_cleanup` flag of every channel in file order.
     pub fn names(&self) -> impl Iterator<Item = (&str, &[Pattern], bool)> {
+        self.0.iter().map(|entry| {
+            (
+                entry.name.as_str(),
+                entry.on.as_slice(),
+                entry.daily_cleanup,
+            )
+        })
+    }
+
+    /// The channels that still carry `clean`, which does nothing.
+    pub fn ignoring_clean(&self) -> impl Iterator<Item = &str> {
         self.0
             .iter()
-            .map(|entry| (entry.name.as_str(), entry.on.as_slice(), entry.clean))
+            .filter(|entry| entry.ignores_clean)
+            .map(|entry| entry.name.as_str())
     }
 }
 
@@ -210,12 +236,38 @@ on = ["tag v*"]
     }
 
     #[test]
-    fn clean_marks_a_channel_and_no_fallback() {
+    fn daily_cleanup_marks_a_channel_and_no_fallback() {
         let channels = load(
             r#"
 [[channel]]
 name = "nightly"
 on = ["nightly"]
+daily_cleanup = true
+[[channel]]
+name = "dev"
+on = ["push main"]
+"#,
+        )
+        .unwrap();
+        assert!(channels.daily_cleanup("nightly"));
+        assert!(!channels.daily_cleanup("dev"));
+        // Named after a branch no channel matched: nothing marked it.
+        assert!(!channels.daily_cleanup("feature/x"));
+        assert!(!Channels::default().daily_cleanup("nightly"));
+        let listed: Vec<(&str, bool)> = channels
+            .names()
+            .map(|(name, _, daily)| (name, daily))
+            .collect();
+        assert_eq!(listed, [("nightly", true), ("dev", false)]);
+    }
+
+    #[test]
+    fn the_old_clean_key_still_parses_and_marks_nothing() {
+        let channels = load(
+            r#"
+[[channel]]
+name = "release"
+on = ["tag v*"]
 clean = true
 [[channel]]
 name = "dev"
@@ -223,16 +275,8 @@ on = ["push main"]
 "#,
         )
         .unwrap();
-        assert!(channels.is_clean("nightly"));
-        assert!(!channels.is_clean("dev"));
-        // Named after a branch no channel matched: nothing marked it.
-        assert!(!channels.is_clean("feature/x"));
-        assert!(!Channels::default().is_clean("nightly"));
-        let listed: Vec<(&str, bool)> = channels
-            .names()
-            .map(|(name, _, clean)| (name, clean))
-            .collect();
-        assert_eq!(listed, [("nightly", true), ("dev", false)]);
+        assert!(!channels.daily_cleanup("release"));
+        assert_eq!(channels.ignoring_clean().collect::<Vec<_>>(), ["release"]);
     }
 
     #[test]
@@ -249,8 +293,13 @@ on = ["push main"]
                 "[[channel]]\nname = \"a\"\non = [\"branch main\"]\n",
             ),
             (
-                "clean type",
-                "[[channel]]\nname = \"a\"\non = [\"push *\"]\nclean = \"yes\"\n",
+                "daily_cleanup type",
+                "[[channel]]\nname = \"a\"\non = [\"nightly\"]\ndaily_cleanup = \"yes\"\n",
+            ),
+            // The tag of a release never is the nightly round.
+            (
+                "daily_cleanup without nightly",
+                "[[channel]]\nname = \"a\"\non = [\"tag v*\"]\ndaily_cleanup = true\n",
             ),
         ];
         for (what, text) in cases {

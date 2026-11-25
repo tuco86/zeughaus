@@ -117,6 +117,18 @@ pub struct CiEvent {
     pub received: u64,
 }
 
+/// The actor of the events the CI's nightly round queues. `/ci` refuses it
+/// for a nightly queued by hand, so it names the round alone; jobs see it as
+/// `CI_ACTOR`.
+pub const NIGHTLY_ROUND: &str = "nightly";
+
+impl CiEvent {
+    /// Queued by the CI's nightly round, once a day: not by hand, not a rerun.
+    pub fn is_nightly_round(&self) -> bool {
+        self.kind == EventKind::Nightly && self.actor == NIGHTLY_ROUND
+    }
+}
+
 fn inbox_dir(state_dir: &Path) -> PathBuf {
     ci_dir(state_dir).join("inbox")
 }
