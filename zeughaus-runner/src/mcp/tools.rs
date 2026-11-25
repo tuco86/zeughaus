@@ -36,7 +36,10 @@ build is incremental; it is the way to build, test or debug on another platform.
 for a pipeline or one job, also for the pipeline a push is about to start; ci_status, \
 ci_pipelines, ci_pipeline and ci_log show the CI's state and output; ci_timing says where the \
 time went; ci_run queues the default branch's push or nightly pipeline now, ci_rerun a pipeline \
-again. ci_repo says which repository of the CI the current checkout is, its jobs and where \
+again. A nightly runs every test tier and takes half an hour or more; it is the owner's, never \
+a check of a change: run the tests the change touches or the test that failed by name instead, \
+locally or with run_jobs filtered to them. ci_repo says which repository of the CI the current \
+checkout is, its jobs and where \
 each runs, and whether HEAD and the default branch are green; in such a checkout `repo` can be \
 omitted. Tickets of a repository live in the CI too, one number from proposal through plan to \
 execution: docs lists them, doc_read reads one with its proposal, plan and links, \
@@ -2141,7 +2144,8 @@ fn definitions() -> Vec<Value> {
             "ci_rerun",
             "Queue the pipeline's event again, pinned to the commit it ran for. Answers with \
              the new pipeline's number once the CI has numbered it. A manual run cannot be \
-             rerun: start a new one with run_jobs.",
+             rerun: start a new one with run_jobs. A nightly is not rerun to check a fix: run \
+             the failed test by name instead.",
             json!({ "repo": repo, "number": number }),
             &["number"],
             false,
@@ -2315,10 +2319,11 @@ fn definitions() -> Vec<Value> {
         tool(
             "ci_run",
             "Queue a pipeline for the repository's default branch at its current head, as a \
-             push to it or the CI's nightly round would start it: the way to run the \
-             nightly now, or the push pipeline again on the newest commit. Tags (releases) are \
-             not queued here. Answers with the new pipeline's number once the CI has numbered \
-             it.",
+             push to it or the CI's nightly round would start it: the push pipeline again on \
+             the newest commit, or the nightly for the owner. A nightly runs every test tier \
+             and is no check of a change: run the tests the change touches or the test that \
+             failed by name instead. Tags (releases) are not queued here. Answers with the new \
+             pipeline's number once the CI has numbered it.",
             json!({
                 "repo": repo,
                 "event": {

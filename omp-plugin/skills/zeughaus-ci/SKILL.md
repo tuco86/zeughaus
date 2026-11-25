@@ -19,13 +19,14 @@ zeughaus-ci is the user's own CI. Its runners are the machines they own, one per
 - An origin the CI does not know (`<origin> is no repository of the CI's ci.toml`): pushes start no pipeline and `run_jobs` is refused. Ask the user, then file an onboarding request (`skill://zeughaus-ci/reference/onboarding.md`); do not work around it. An origin with a pending request says so (`onboarding request #<n> for <name> is open|approved`, and the last failure).
 - `ci_repo` ends with `setup:` lines: the hook's last delivery, the bot's push access, the secrets the repository names and whether every job secret is granted to some event.
 
-## 2. Tests before a push: the unit tier only
+## 2. Tests before a push: unit tier, integration tests by name
 
-- Run the unit tests of the crates or packages your change touches, and nothing more: Rust `cargo nextest run -p <crate>` (nextest's default profile is the unit tier where `.config/nextest.toml` defines tiers), Python `uv run pytest tests/unit`.
-- Never run the whole suite locally: no `cargo test --workspace`, `--profile ci` or `--profile integration`, no end-to-end run, even where the project's `AGENTS.md` lists them in a gate.
-- Why: the push pipeline runs the tests again right after the push, on every platform, and a local whole-suite run costs minutes per change.
+- Run the unit tests of the crates or packages your change touches: Rust `cargo nextest run -p <crate>` (nextest's default profile is the unit tier where `.config/nextest.toml` defines tiers), Python `uv run pytest tests/unit`.
+- Integration and end-to-end tests are expensive. Run them only tightly scoped: the tests your change touches or the test that failed, by name or filter (`cargo nextest run -p <crate> --profile integration -E 'test(<name>)'`, `uv run pytest tests/integration/<file>::<test>`), locally, or with `run_jobs` filtered the same way for a platform you do not have (section 4). Name the expected duration first.
+- Never a whole tier or the whole suite: no `cargo test --workspace`, no unfiltered `--profile integration` or `--profile ci`, no unfiltered end-to-end run, even where the project's `AGENTS.md` lists them in a gate. Never a nightly to check a change: no `ci_run` with `event: "nightly"`, no `ci_rerun` of a nightly. The scheduled nightly runs every tier while the owner sleeps; nobody waits for one.
+- Why: the push pipeline runs the unit tier again right after the push, on every platform, and a whole-tier run or a nightly costs from minutes to half an hour per change.
 - What runs where: a push runs what its jobs select (zeughaus: the unit tier and the doctests); the nightly and a release tag also run the integration and end-to-end tiers. Their failures reach you like any other (section 5).
-- An integration or end-to-end failure from nightly or release: reproduce it with `run_jobs` of that platform's check job, its test command temporarily switched to the integration tier and filtered to the failing test (section 4), not locally.
+- A nightly or release failure: reproduce it by the failing test's name, locally or with `run_jobs` of that platform's check job, its test command temporarily switched to the integration tier and filtered to that test (section 4). Fix it, verify it the same way and push. The next scheduled nightly confirms it: a plan's acceptance may be "green in the next scheduled nightly", and `plan_done` does not wait for it.
 
 ## 3. Debug a job or another platform
 
@@ -43,7 +44,7 @@ zeughaus-ci is the user's own CI. Its runners are the machines they own, one per
 
 ## 4. Narrow a failure without a commit
 
-- A manual run executes the jobs of the working tree. Edit the job file under `.zeughaus-ci/` temporarily (a test filter, another test tier such as nextest's `--profile ci`, `--nocapture`, `-v`, `RUST_BACKTRACE=1`) and `run_jobs` that one job.
+- A manual run executes the jobs of the working tree. Edit the job file under `.zeughaus-ci/` temporarily (a test filter, with it another test tier such as nextest's `--profile integration`, `--nocapture`, `-v`, `RUST_BACKTRACE=1`) and `run_jobs` that one job.
 - Undo the edit before committing: `git checkout -- .zeughaus-ci/<file>`, when the temporary edit was the file's only change.
 - A job that hangs: `ci_log` with `timestamps` shows where its output stopped. `ci_timing` with `job` names the lines the longest pauses follow; while the job runs, the last pause lasts until now, so that line is the stuck step or test. Then `ci_cancel` the pipeline: it kills the running jobs and skips the rest.
 - A job without `timeout_minutes` may run 240 minutes and holds its place's workspace meanwhile; every later job at that place waits.
@@ -55,8 +56,8 @@ zeughaus-ci is the user's own CI. Its runners are the machines they own, one per
 - Responsibility: the session that starts or waits on a pipeline holds it (the extension and the MCP tools claim it for your zeughaus terminal). A failed pipeline's `responsible:` line in `ci_pipeline` and `ci_wait` (and the extension's failure report) names who fixes it: the holder of the earliest earlier pipeline of the channel that failed one of the same jobs, else the pipeline's own. When that is another session, leave the fix to it and `ci_wait` for the channel's next pipeline instead of fixing it in parallel. `zeughaus-runner ci responsible <repo> <n>` asks the same from a script.
 - Without the extension: `ci_wait`, or `zeughaus-runner ci wait <repo> <number|sha>` as a background command for a long one. Without `number` or `sha`, `ci_wait` waits for the commit at HEAD, and for a pipeline that does not exist yet.
 - A push starts a pipeline only when some job's `on` matches the ref (zeughaus: pushes to `main`, tags `v*`, the nightly). A push to another branch starts nothing; that is not a failure.
-- Manual runs post no forge status and cannot be rerun. `ci_rerun` queues the event of a pipeline a push or a nightly started, pinned to its commit, and answers with the new pipeline's number.
-- `ci_run` queues a pipeline of the default branch at its current head: `event: "push"` as a push would, `event: "nightly"` to run the repository's nightly now. The CI runs one nightly at a time across all repositories (its round starts at ci.toml's `[nightly] at`), so a nightly may wait behind another. It answers with the new pipeline's number. Never ssh to the CI host to queue an event.
+- Manual runs post no forge status and cannot be rerun. `ci_rerun` queues the event of a pipeline a push or a nightly started, pinned to its commit, and answers with the new pipeline's number. Never rerun a nightly to check a fix (section 2).
+- `ci_run` queues a pipeline of the default branch at its current head: `event: "push"` as a push would, `event: "nightly"` the repository's nightly, which is the owner's and never a check of a change (section 2). The CI runs one nightly at a time across all repositories (its round starts at ci.toml's `[nightly] at`), so a nightly may wait behind another. It answers with the new pipeline's number. Never ssh to the CI host to queue an event.
 - Whether the hosts installed a published build: `ci_status` shows each runner's build; do not run `update status` over ssh.
 
 ## 6. What manual runs do not have

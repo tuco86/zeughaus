@@ -110,7 +110,8 @@ FROM docker.io/library/rust:1.100.0-trixie
 ### 11. Unit tests on a push, every tier nightly and on a release
 
 - A check job runs the unit tier on `push` and `manual`, and the integration and end-to-end tiers too on `nightly` and `tag`: it chooses by `CI_EVENT`. zeughaus: `check_platform` in `build.sh` and `check-windows-amd64.ps1` run `cargo nextest run --profile default` or `--profile ci`; the doctests run on every event.
-- Why: agents run only the unit tier of the touched crates before a push, so the push pipeline is where that tier runs on every platform, fast enough to answer the push. The I/O tiers are slower and depend on the machine; they run once a day, from empty workspaces, and before a release is published.
+- Why: agents run the unit tier of the touched crates before a push and integration tests only by name, so the push pipeline is where the unit tier runs on every platform, fast enough to answer the push. The I/O tiers are slower and depend on the machine; they run once a day, from empty workspaces, and before a release is published.
+- Every test runner has a per-test ceiling far above the expected time: nextest `slow-timeout = { period = "<budget>", terminate-after = 12 }` in every profile (zeughaus: 1 s unit, 10 s I/O, so 12 s and 120 s), pytest-timeout at 12 times the budget. Why: a hung test ends in minutes instead of at the job's `timeout_minutes`, its place's workspace is free for the next job, and nextest prints the killed test's captured output (`TIMEOUT [`), so a "still waiting for ..." line names the wait that hung. 12 is twice the slowdown load has caused on a runner, so no healthy run reaches it.
 - A manual run follows a push, so `run_jobs` reproduces the push pipeline. For an integration failure, edit the job's test command temporarily (skill section 4).
 
 ## Review checklist
@@ -125,5 +126,6 @@ Walk a repository's `.zeughaus-ci/` with these; every hit is a finding.
 - The toolchain is unpinned, or the image's tag floats or differs from `rust-toolchain.toml`.
 - A cache lives in a tracked or non-ignored path: `git clean -ffd` deletes it before every job, or it gets committed.
 - A job has no `timeout_minutes` and can hang: it holds its place's workspace for the default 240 minutes while every later job at that place waits.
+- A test runner without a per-test ceiling (a nextest profile without `terminate-after`, pytest without `--timeout`): a hung test holds its place's workspace until the job's `timeout_minutes`, and its captured output never reaches the log.
 - A job is not part of a `build-<p>` / `check-<p>` pair where agents will look for one.
 - A check job runs the integration or end-to-end tier on a push, or no `nightly` or `tag` event ever runs it.
