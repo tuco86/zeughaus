@@ -457,6 +457,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   darwin build compiles the editor and the runner in one cargo invocation,
   with one feature resolution.
 
+- CI: check builds carry line tables only
+  (`CARGO_PROFILE_DEV_DEBUG=line-tables-only`), which keeps file:line in
+  panics and backtraces and shrinks the warm target directories; local
+  builds keep full debug info. nextest's `ci` profile (nightly and tag)
+  runs without fail-fast, so one crashing test no longer cancels the rest.
+
 - Board: Enter or a press on a ticket's card opens its popout in every
   state, planning and running included; only a plan session without a
   ticket still brings its tab to the front. The session line of a card

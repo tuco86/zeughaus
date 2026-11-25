@@ -1,5 +1,6 @@
 # Dot-sourced by the Windows build and check jobs; no header, so not a job.
-# Sets `Run`, `Install-Nextest`, `$cache` and CARGO_TARGET_DIR.
+# Sets `Run`, `Install-Nextest`, `$cache`, CARGO_TARGET_DIR and
+# CARGO_PROFILE_DEV_DEBUG.
 $ErrorActionPreference = 'Stop'
 
 # Runs a native command and ends the script with its exit code when it fails.
@@ -29,6 +30,10 @@ function Run([string]$Command, [string[]]$Arguments = @()) {
 
 $cache = Join-Path $env:CI_WORKSPACE '.ci-cache'
 $env:CARGO_TARGET_DIR = Join-Path $cache 'target'
+# Test and clippy builds keep file:line for panics and backtraces, while
+# target directories shrink and links get faster. The test profile inherits
+# it; release builds are unaffected; local builds keep full debug info.
+$env:CARGO_PROFILE_DEV_DEBUG = 'line-tables-only'
 
 # cargo-nextest from its prebuilt release into `$cache\bin`, kept between runs
 # by the warm workspace; on PATH so `cargo nextest` finds it.

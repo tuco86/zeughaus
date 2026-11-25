@@ -1745,7 +1745,11 @@ nextest run --workspace`: the unit tier on a push or manual run, `--profile
 ci` with the integration tier on the nightly and a tag) and `cargo test
 --workspace --doc` (`check_platform` in `build.sh`; `windows.ps1` for the
 Windows jobs), and on `linux-amd64` also `cargo fmt --check`. Every OS
-therefore passes the gate. The build is a release build
+therefore passes the gate. The CI's dev units carry line tables only
+(`CARGO_PROFILE_DEV_DEBUG=line-tables-only` in `cargo_env` and
+`windows.ps1`): panics and backtraces keep file and line, the target
+directories stay small and links fast. The `ci` profile runs without
+fail-fast, so one crash does not cancel the rest. The build is a release build
 and the check a dev one, so they share the workspace's cargo home and
 checkouts but no compiled units: the order puts the archive out early (the
 CI moves it towards `publish` while the checks run) and skips the check of a

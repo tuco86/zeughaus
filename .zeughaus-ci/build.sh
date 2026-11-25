@@ -10,6 +10,11 @@ cargo_env() {
     export CARGO_HOME="$cache/cargo"
     export CARGO_TARGET_DIR="$cache/target"
     export CARGO_TERM_COLOR=always
+    # Test and clippy builds keep file:line for panics and backtraces, while
+    # target directories shrink and links get faster. The test profile
+    # inherits it; release builds are unaffected; local builds keep full
+    # debug info.
+    export CARGO_PROFILE_DEV_DEBUG=line-tables-only
 }
 
 # Runs one command as a visible, timed step. Its failure returns the
