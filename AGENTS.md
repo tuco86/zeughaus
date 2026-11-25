@@ -143,8 +143,10 @@ dots over the columns PROPOSALS, REVIEW, RUNNING (the queue below a
 `queued` separator) and DONE, with the
 lanes PLANNING and STARTING between them while a ticket is planned or a
 master starts: `h`/`l`
-and `j`/`k` (or the arrows) move between cards, Enter opens a ticket's
-popout (or the agent tab of a card in a lane or a running one), `a`, `r` and `p`
+and `j`/`k` (or the arrows) move between cards, Enter or a press opens a
+ticket's popout in any state (a plan session without a ticket brings its
+tab to the front); a card's session line, its `after #n` and included
+tickets and its held pipelines are links; `a`, `r` and `p`
 approve, dismiss and release for planning; `New ticket` writes one. The
 popout lies over the workspace (Escape or the scrim closes it): the
 ticket's actions, its proposal (`Edit` while open or ready), its plan in

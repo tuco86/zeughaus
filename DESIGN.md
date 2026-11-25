@@ -1467,16 +1467,19 @@ number, title, age, `Runs on`, the tickets it includes and `plan v<n>`; a
 card in a lane or a running one adds its holder's host glyph and its
 agent's role and state, a running ticket the pipelines its master holds
 (`waits on`, `fixing`, `holds`), and an action on its way
-its verb. A lane card has a flowing bar and a breathing border, as has a
-card an action is on; the page ticks every 50 ms while anything pulses.
-`h`/`l` and Left/Right change the column, `j`/`k` and Up/Down the card,
-Enter on a card of the lanes or a running one brings its session's (else
-its claim holder's) tab to the front and on any other opens the ticket's
-popout, and `a`, `r` and `p` approve, dismiss and release for planning
+its verb. The references on a card are links: an included ticket and an
+`after #n` open that ticket's popout, the holder line brings its session's
+(else its claim holder's) tab to the front, a held pipeline opens its
+channel at that pipeline. A lane card has a flowing bar and a breathing
+border, as has a card an action is on; the page ticks every 50 ms while
+anything pulses. `h`/`l` and Left/Right change the column, `j`/`k` and
+Up/Down the card, Enter or a press on a ticket's card opens its popout in
+any state, and on a plan session without a ticket brings that session's
+tab to the front; `a`, `r` and `p` approve, dismiss and release for planning
 where the ticket offers it. The popout (`ci/ticket.rs`) lies over the
 workspace under the history tree, the notices and the palette: the ticket's number,
 title and state, its actions (`Edit` of an open or ready ticket, what it
-waits for, the note of a session that ended without a plan), the tabs
+waits for as links to those tickets, the note of a session that ended without a plan), the tabs
 `Proposal` and `Plan v<n>`, and a side column with its state, source,
 `Runs on`, links both ways (added by number, removed), the tickets it
 includes, its sessions and its claim's holder. A plan in review is drawn

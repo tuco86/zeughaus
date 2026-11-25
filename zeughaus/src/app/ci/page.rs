@@ -186,8 +186,9 @@ const DONE: usize = 5;
 /// A repository's cards in their slots.
 type Slots = [Vec<Card>; 6];
 
-/// Whether a card in slot `at` is work a session does: it opens that
-/// session's tab. The queued tickets RUNNING also lists have no session.
+/// Whether a card in slot `at` is work a session does: it names that
+/// session, as a link to its tab. The queued tickets RUNNING also lists
+/// have no session.
 fn active(at: usize) -> bool {
     matches!(at, PLANNING | STARTING | RUNNING)
 }
@@ -993,9 +994,10 @@ impl App {
         self.redock()
     }
 
-    /// Enter on the Board, and a press on a card: a card of work a session
-    /// does brings that session's tab to the front; any other opens the
-    /// ticket's popout.
+    /// Enter on the Board, and a press on a card: a ticket's card opens its
+    /// popout, whatever state it is in (its card and popout link its
+    /// session); a plan session without a ticket brings its tab to the
+    /// front.
     fn board_enter(&mut self, origin: &str) -> Task<Message> {
         let Some((ci, view, repo, cards)) = self.board_cards(origin) else {
             return Task::none();
@@ -1005,17 +1007,45 @@ impl App {
             return Task::none();
         };
         self.page.board.card = Some(card);
-        if active(column)
-            && let Some((runner, terminal)) = self.card_holder(&ci, &repo, card)
-        {
-            return self.apply_page(Message::PageOpen(AttentionTarget::Terminal(
-                runner, terminal,
-            )));
+        match card {
+            Card::Doc(number) => self.apply_ticket(TicketMsg::Open { ci, view, number }),
+            Card::Session(_) => match self.card_holder(&ci, &repo, card) {
+                Some((runner, terminal)) => self.apply_page(Message::PageOpen(
+                    AttentionTarget::Terminal(runner, terminal),
+                )),
+                None => Task::none(),
+            },
+            Card::Opening => Task::none(),
         }
-        let Card::Doc(number) = card else {
-            return Task::none();
+    }
+
+    /// A reference to ticket `number` of `repo` as a link that opens its
+    /// popout; plain text while this editor shows no Plans view of `repo`.
+    pub(super) fn ticket_link<'a>(
+        &self,
+        ci: &RunnerKey,
+        client: &CiClient,
+        repo: &str,
+        number: u64,
+        words: String,
+        size: f32,
+    ) -> Element<'a, Message, Theme> {
+        let label = text(words).size(size);
+        let Some(view) = client.plans_view_of(repo) else {
+            return label.color(self.theme.muted()).into();
         };
-        self.apply_ticket(TicketMsg::Open { ci, view, number })
+        let ci = ci.clone();
+        button(label)
+            .padding(0)
+            .style(super::link_style)
+            .on_press_with(move || {
+                Message::Ticket(TicketMsg::Open {
+                    ci: ci.clone(),
+                    view,
+                    number,
+                })
+            })
+            .into()
     }
 
     /// The live session of a card: a ticket's master or plan session, a
@@ -1835,18 +1865,33 @@ impl App {
                 second = second.push(chip(selector.clone()));
             }
             for number in &doc.merged {
-                second = second.push(chip(format!("#{number}")));
+                second = second.push(
+                    container(self.ticket_link(
+                        ci,
+                        client,
+                        &doc.repo,
+                        *number,
+                        format!("#{number}"),
+                        11.0,
+                    ))
+                    .padding([0, 6])
+                    .style(style::badge(t, false)),
+                );
             }
             if matches!(
                 doc.state,
                 DocState::Ready | DocState::Approved | DocState::Open
             ) {
                 for link in &doc.waits_for {
-                    second = second.push(
-                        text(format!("after {}", link.reference(&doc.repo)))
-                            .size(11)
-                            .color(muted),
-                    );
+                    second = second.push(text("after").size(11).color(muted));
+                    second = second.push(self.ticket_link(
+                        ci,
+                        client,
+                        link.repo.as_deref().unwrap_or(&doc.repo),
+                        link.number,
+                        link.reference(&doc.repo),
+                        11.0,
+                    ));
                 }
             }
             if doc.revision > 0 {
@@ -1879,17 +1924,23 @@ impl App {
         }
         if working {
             let opening = card == Card::Opening;
-            lines = lines.push(match self.card_holder(ci, &repo.repo, card) {
-                Some((runner, terminal)) => self.running_line(runner, terminal),
-                None => text(if opening {
-                    "requesting session"
-                } else {
-                    "no session"
-                })
-                .size(CAPTION_TEXT)
-                .color(muted)
-                .into(),
-            });
+            let session_line: Element<'a, Message, Theme> =
+                match self.card_holder(ci, &repo.repo, card) {
+                    Some((runner, terminal)) => button(self.running_line(runner.clone(), terminal))
+                        .padding(0)
+                        .style(super::link_style)
+                        .on_press(Message::RevealTerminal(runner, terminal))
+                        .into(),
+                    None => text(if opening {
+                        "requesting session"
+                    } else {
+                        "no session"
+                    })
+                    .size(CAPTION_TEXT)
+                    .color(muted)
+                    .into(),
+                };
+            lines = lines.push(session_line);
         }
         let acting = match (state.acting_on, card) {
             (Some((number, verb)), Card::Doc(on)) if number == on => Some(verb),
@@ -1909,7 +1960,21 @@ impl App {
                 claim.holder.session == Some(master.id)
                     && matches!(claim.subject, ClaimSubject::Pipeline { .. })
             }) {
-                lines = lines.push(self.wait_line(client, claim, p));
+                let line = self.wait_line(client, claim, p);
+                lines = lines.push(
+                    match client.channel_view(claim.subject.repo(), &claim.channel) {
+                        Some(view) => button(line)
+                            .padding(0)
+                            .style(super::link_style)
+                            .on_press(Message::PagePipeline(
+                                ci.clone(),
+                                view,
+                                claim.subject.number(),
+                            ))
+                            .into(),
+                        None => line,
+                    },
+                );
             }
         }
         let lane = SLOTS[column].1;

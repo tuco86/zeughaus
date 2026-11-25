@@ -443,6 +443,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Board: Enter or a press on a ticket's card opens its popout in every
+  state, planning and running included; only a plan session without a
+  ticket still brings its tab to the front. The session line of a card
+  brings its session's tab to the front, its `after #n` and included
+  tickets open those tickets, and a pipeline its master holds opens the
+  channel at that pipeline. The popout's `waits for` names link too.
+
 - CI: the channel key `clean` is now `daily_cleanup`, and wipes only for
   the nightly round. The pipeline the CI's nightly round starts in a channel
   with `daily_cleanup = true` starts each place's workspace from nothing,

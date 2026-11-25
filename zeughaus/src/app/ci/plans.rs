@@ -1026,15 +1026,23 @@ impl App {
                     .to_owned(),
             ));
         }
-        let mut waits = Vec::new();
         if matches!(doc.state, DocState::Ready | DocState::Approved) && !doc.waits_for.is_empty() {
-            let refs: Vec<String> = doc
-                .waits_for
-                .iter()
-                .map(|link| link.reference(&doc.repo))
-                .collect();
-            waits.push(format!("waits for {}", refs.join(", ")));
+            let mut refs = row![text("waits for").size(TEXT_SM).color(muted)]
+                .spacing(SP_1)
+                .align_y(Alignment::Center);
+            for link in &doc.waits_for {
+                refs = refs.push(self.ticket_link(
+                    runner,
+                    client,
+                    link.repo.as_deref().unwrap_or(&doc.repo),
+                    link.number,
+                    link.reference(&doc.repo),
+                    TEXT_SM,
+                ));
+            }
+            bar = bar.push(refs);
         }
+        let mut waits = Vec::new();
         if doc.state == DocState::Ready
             && let Some(planner) = &doc.planner
             && !client.hosts_sessions(&planner.runner)
