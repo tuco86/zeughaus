@@ -14,6 +14,12 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <!-- TN3179: a launchd agent's network use is attributed to the app it
+         names here, so Local Network shows one "Zeughaus" row. -->
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>net.doodleshnookie.Zeughaus</string>
+    </array>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>

@@ -136,6 +136,8 @@ webhook_secret = "ZEUGHAUS_WEBHOOK_SECRET"
 [repos.zeughaus.grants]
 ZEUGHAUS_UPDATE_KEY = ["push main", "nightly", "tag v*"]
 ZEUGHAUS_GITHUB_TOKEN = ["push main", "nightly", "tag v*"]
+ZEUGHAUS_MACOS_SIGNING_P12 = ["push main", "nightly", "tag v*"]
+ZEUGHAUS_MACOS_SIGNING_PASSWORD = ["push main", "nightly", "tag v*"]
 
 [repos.smoke]
 url = "/var/lib/zeughaus-ci/smoke.git"

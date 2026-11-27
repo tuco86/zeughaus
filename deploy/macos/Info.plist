@@ -30,5 +30,9 @@
        grid in every terminal pane. -->
   <key>NSHighResolutionCapable</key>
   <true/>
+  <!-- The text the Local Network prompt shows: the runner, whose terminals'
+       programs macOS attributes to this app, reaches the local network. -->
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Programs you run in Zeughaus terminals reach hosts on your local network through it.</string>
 </dict>
 </plist>

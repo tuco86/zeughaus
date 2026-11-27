@@ -75,17 +75,87 @@ stage_dir() {
     cp LICENSE-MIT LICENSE-APACHE "$stage/"
 }
 
+# macOS keys a grant (Local Network, TCC) to a program's designated
+# requirement. An ad-hoc signature's requirement is one build's cdhash, so
+# every update would be a new program; a fixed identifier and certificate
+# make it the same in every build. The certificate is a self-signed one from
+# the job's secrets, imported into a keychain of its own for this job only.
+# Without the secrets (a manual run) the binaries are signed ad-hoc. Runs in
+# the job's shell, not in a subshell or `step`, so its exports and traps
+# stay.
+macos_signing_begin() {
+    if [ -z "${ZEUGHAUS_MACOS_SIGNING_P12:-}" ]; then
+        echo "no ZEUGHAUS_MACOS_SIGNING_P12 (${CI_EVENT:-}): signing ad-hoc"
+        return 0
+    fi
+    signing_dir=$(mktemp -d "${TMPDIR:-/tmp}/zeughaus-signing.XXXXXX")
+    signing_kc="$signing_dir/signing.keychain-db"
+    # Drops a keychain an earlier job left in the search list when it was
+    # killed before its EXIT trap ran.
+    signing_saved=$(security list-keychains -d user | sed 's/^ *"//; s/"$//' | grep -v '/zeughaus-signing\.' || true)
+    # The CI stops a job with SIGTERM, and sh runs the EXIT trap only on exit.
+    trap macos_signing_end EXIT
+    trap 'exit 143' TERM
+    trap 'exit 130' INT
+    kc_pw=$(openssl rand -hex 16)
+    printf %s "$ZEUGHAUS_MACOS_SIGNING_P12" | base64 -D >"$signing_dir/signing.p12"
+    security create-keychain -p "$kc_pw" "$signing_kc"
+    security set-keychain-settings "$signing_kc"
+    security unlock-keychain -p "$kc_pw" "$signing_kc"
+    security import "$signing_dir/signing.p12" -k "$signing_kc" -f pkcs12 \
+        -P "$ZEUGHAUS_MACOS_SIGNING_PASSWORD" -T /usr/bin/codesign >/dev/null
+    # Without it codesign blocks on a keychain access prompt.
+    security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pw" "$signing_kc" >/dev/null
+    rm -f "$signing_dir/signing.p12"
+    # cargo and build scripts never see the secrets.
+    unset ZEUGHAUS_MACOS_SIGNING_P12 ZEUGHAUS_MACOS_SIGNING_PASSWORD kc_pw
+    # One path per field, so $signing_saved stays unquoted.
+    security list-keychains -d user -s "$signing_kc" $signing_saved
+    # All identities, not only valid ones: the self-signed certificate is
+    # untrusted, so `-v` would hide it.
+    ZEUGHAUS_CODESIGN_IDENTITY=$(security find-identity -p codesigning "$signing_kc" | awk '$1 == "1)" {print $2; exit}')
+    if [ -z "$ZEUGHAUS_CODESIGN_IDENTITY" ]; then
+        echo "no code-signing identity in ZEUGHAUS_MACOS_SIGNING_P12" >&2
+        return 1
+    fi
+    export ZEUGHAUS_CODESIGN_IDENTITY
+    export ZEUGHAUS_CODESIGN_KEYCHAIN="$signing_kc"
+    echo "signing with certificate $ZEUGHAUS_CODESIGN_IDENTITY"
+}
+
+# Puts the keychain search list back and deletes the job's keychain.
+macos_signing_end() {
+    security list-keychains -d user -s $signing_saved
+    security delete-keychain "$signing_kc" 2>/dev/null || true
+    rm -rf "$signing_dir"
+}
+
+# Signs one Mach-O or bundle with a fixed identifier: with the job's
+# certificate after macos_signing_begin found one, else ad-hoc. Prints the
+# designated requirement into the log.
+macos_sign() {
+    if [ -n "${ZEUGHAUS_CODESIGN_IDENTITY:-}" ]; then
+        codesign --force --timestamp=none --identifier "$1" \
+            --keychain "$ZEUGHAUS_CODESIGN_KEYCHAIN" --sign "$ZEUGHAUS_CODESIGN_IDENTITY" "$2" || return
+    else
+        codesign --force --identifier "$1" --sign - "$2" || return
+    fi
+    codesign --verify --strict "$2" || return
+    codesign -dv -r- "$2" 2>&1
+}
+
 # Writes the pipeline number into staged binaries with the runner the job
-# built (`release stamp`), signs them again on macOS (the stamp breaks the
-# linker's ad-hoc signature, and macOS kills a binary whose signature does
-# not match), and checks that each answers `version` with it.
+# built (`release stamp`), signs them again on macOS with a fixed identifier
+# (macos_sign; the stamp breaks the linker's ad-hoc signature, and macOS
+# kills a binary whose signature does not match), and checks that each
+# answers `version` with it.
 stamp_build() {
     tool=$1
     shift
     "$tool" release stamp "$CI_PIPELINE" "$@"
     for bin in "$@"; do
         case "$CI_PLATFORM" in
-            darwin-*) codesign --force --sign - "$bin" ;;
+            darwin-*) macos_sign "net.doodleshnookie.${bin##*/}" "$bin" || return ;;
         esac
         answer=$("$bin" version)
         if [ "$answer" != "$version build $CI_PIPELINE" ]; then
